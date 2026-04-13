@@ -8,6 +8,7 @@
 #include "storage_backend.h"
 #include "file_storage.h"
 #include "utils/common.h"
+#include "client_metric.h"
 
 namespace mooncake {
 
@@ -424,6 +425,120 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
             << "key not found in batch_data: " << key;
         EXPECT_EQ(data, found->second);
     }
+}
+
+TEST_F(FileStorageTest, BatchLoadRecordsSsdMetrics) {
+    // Setup: write data to storage backend via BatchOffloadUtil
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+
+    // Create FileStorage WITH SsdMetric
+    SsdMetric ssd_metric;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003",
+                            &ssd_metric);
+
+    // Write test data to disk
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    // Allocate buffers and call BatchLoad (read path)
+    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_res);
+
+    auto load_result =
+        FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
+    ASSERT_TRUE(load_result);
+
+    // Verify SSD read metrics were recorded
+    EXPECT_EQ(ssd_metric.ssd_read_ops.value(),
+              static_cast<int64_t>(allocate_res.value()->slices.size()));
+
+    // Verify bytes: sum of all slice sizes
+    int64_t expected_bytes = 0;
+    for (const auto& [key, slice] : allocate_res.value()->slices) {
+        expected_bytes += slice.size;
+    }
+    EXPECT_EQ(ssd_metric.ssd_read_bytes.value(), expected_bytes);
+    EXPECT_GT(expected_bytes, 0);
+
+    // Verify latency histogram has exactly 1 observation (one BatchLoad call)
+    auto buckets = ssd_metric.ssd_read_latency_us.get_bucket_counts();
+    int64_t total_observations = 0;
+    for (auto& b : buckets) {
+        total_observations += b->value();
+    }
+    EXPECT_EQ(total_observations, 1);
+
+    // Write metrics should remain 0 (BatchOffloadUtil bypasses FileStorage)
+    EXPECT_EQ(ssd_metric.ssd_write_ops.value(), 0);
+    EXPECT_EQ(ssd_metric.ssd_write_bytes.value(), 0);
+
+    LOG(INFO) << "SSD read metrics after BatchLoad: ops="
+              << ssd_metric.ssd_read_ops.value()
+              << ", bytes=" << ssd_metric.ssd_read_bytes.value();
+}
+
+TEST_F(FileStorageTest, BatchLoadFailureDoesNotRecordSsdMetrics) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+
+    SsdMetric ssd_metric;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003",
+                            &ssd_metric);
+
+    // Init storage backend so we can call BatchLoad
+    // But load with keys that don't exist on disk -> should fail
+    std::unordered_map<std::string, Slice> batch_object;
+    char dummy_buf[4096] = {};
+    batch_object["nonexistent_key_1"] = Slice{dummy_buf, 4096};
+    batch_object["nonexistent_key_2"] = Slice{dummy_buf, 8192};
+
+    auto result = FileStorageBatchLoad(fileStorage, batch_object);
+    // Expect failure (keys don't exist on disk)
+    EXPECT_FALSE(result);
+
+    // Metrics should remain 0 - failed operations are not counted
+    EXPECT_EQ(ssd_metric.ssd_read_ops.value(), 0);
+    EXPECT_EQ(ssd_metric.ssd_read_bytes.value(), 0);
+
+    auto buckets = ssd_metric.ssd_read_latency_us.get_bucket_counts();
+    int64_t total_observations = 0;
+    for (auto& b : buckets) {
+        total_observations += b->value();
+    }
+    EXPECT_EQ(total_observations, 0);
+
+    LOG(INFO) << "SSD metrics after failed BatchLoad: ops="
+              << ssd_metric.ssd_read_ops.value()
+              << ", bytes=" << ssd_metric.ssd_read_bytes.value();
+}
+
+TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
+    // FileStorage with nullptr SsdMetric should work fine (no metrics recorded)
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+
+    // nullptr SsdMetric (default)
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_res);
+
+    auto load_result =
+        FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
+    ASSERT_TRUE(load_result);
+    // No crash = success. No metrics pointer, so nothing to verify.
 }
 
 }  // namespace mooncake

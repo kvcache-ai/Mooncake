@@ -57,6 +57,7 @@ add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
+add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(embedded_snapshot_catalog_store_test
                ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp)

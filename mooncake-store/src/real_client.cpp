@@ -683,7 +683,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (enable_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
         file_storage_ = std::make_shared<FileStorage>(
-            file_storage_config, client_, this->local_rpc_addr);
+            file_storage_config, client_, this->local_rpc_addr,
+            client_->GetSsdMetricPtr());
         auto init_result = file_storage_->Init();
         if (!init_result) {
             LOG(ERROR) << "file storage init failed with error: "

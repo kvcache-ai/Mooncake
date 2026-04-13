@@ -6,10 +6,13 @@
 
 namespace mooncake {
 
+struct SsdMetric;
+
 class FileStorage {
    public:
     FileStorage(const FileStorageConfig& config, std::shared_ptr<Client> client,
-                const std::string& local_rpc_addr);
+                const std::string& local_rpc_addr,
+                SsdMetric* ssd_metric = nullptr);
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
@@ -100,6 +103,7 @@ class FileStorage {
     void ClientBufferGCThreadFunc();
 
     std::shared_ptr<Client> client_;
+    SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;

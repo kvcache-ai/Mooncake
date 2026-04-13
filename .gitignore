@@ -205,3 +205,10 @@ _codeql_detected_source_root
 
 # CodeBuddy Memory
 .codebuddy/
+
+ignore/
+# SSD benchmark scripts (local, not for upstream)
+mooncake-store/benchmarks/bench_ssd.sh
+mooncake-store/benchmarks/bench_ssd_metrics.sh
+mooncake-store/benchmarks/run_ssd_benchmark.sh
+mooncake-store/benchmarks/ssd_offload_benchmark.py

@@ -454,6 +454,10 @@ class Client {
         return str;
     }
 
+    SsdMetric* GetSsdMetricPtr() {
+        return metrics_ ? &metrics_->ssd_metric : nullptr;
+    }
+
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }

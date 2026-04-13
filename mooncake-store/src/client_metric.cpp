@@ -58,6 +58,7 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
                            const std::map<std::string, std::string>& labels)
     : transfer_metric(labels),
       master_client_metric(labels),
+      ssd_metric(labels),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds) {
     if (metrics_interval_seconds_ > 0) {
@@ -85,6 +86,7 @@ std::unique_ptr<ClientMetric> ClientMetric::Create(
 void ClientMetric::serialize(std::string& str) {
     transfer_metric.serialize(str);
     master_client_metric.serialize(str);
+    ssd_metric.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {
@@ -93,6 +95,8 @@ std::string ClientMetric::summary_metrics() {
     ss << transfer_metric.summary_metrics();
     ss << "\n";
     ss << master_client_metric.summary_metrics();
+    ss << "\n";
+    ss << ssd_metric.summary_metrics();
     return ss.str();
 }
 
