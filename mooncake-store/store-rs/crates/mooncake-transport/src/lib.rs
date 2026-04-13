@@ -45,6 +45,21 @@ pub struct TransferRequest {
     pub length: u64,
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum TransferPacingMode {
+    LatencySensitive,
+    #[default]
+    Standard,
+    ThroughputOptimized,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TransferBatchHints {
+    pub pacing_group: Option<String>,
+    pub mode: TransferPacingMode,
+    pub max_inflight_bytes: Option<u64>,
+}
+
 pub fn default_upstream_build_dir() -> &'static str {
     mooncake_transport_sys::DEFAULT_UPSTREAM_BUILD_DIR
 }
@@ -71,7 +86,8 @@ pub(crate) fn clamp_registration_size(
 mod tests {
     use super::{
         clamp_registration_size, default_upstream_build_dir, rdma_device_max_registration_size,
-        Opcode, TransferProgress, TransferRequest, TransferStatus, TransportEngineKind,
+        Opcode, TransferBatchHints, TransferPacingMode, TransferProgress, TransferRequest,
+        TransferStatus, TransportEngineKind,
     };
 
     #[test]
@@ -87,9 +103,15 @@ mod tests {
             status: TransferStatus::Completed,
             transferred_bytes: 11,
         };
+        let hints = TransferBatchHints {
+            pacing_group: Some("tenant:default".to_string()),
+            mode: TransferPacingMode::ThroughputOptimized,
+            max_inflight_bytes: Some(11),
+        };
 
         assert_eq!(request.target_id, 7);
         assert_eq!(progress.status, TransferStatus::Completed);
+        assert_eq!(hints.mode, TransferPacingMode::ThroughputOptimized);
         assert_eq!(
             TransportEngineKind::ClassicTe,
             TransportEngineKind::ClassicTe

@@ -1,3 +1,4 @@
+#[derive(Clone)]
 struct ResolvedObject {
     tenant: String,
     key: String,

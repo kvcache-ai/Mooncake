@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use mooncake_store_core::{Result, StoreError};
 use mooncake_transport::{
     ClassicEngineConfig, ClassicTransferEngine, SegmentBuffer, SegmentInfo, SegmentKind,
-    TentEngine, TentEngineConfig, TransferProgress, TransferRequest, TransferStatus,
+    TentEngine, TentEngineConfig, TransferBatchHints, TransferProgress, TransferRequest,
+    TransferStatus,
 };
 use parking_lot::{Mutex, RwLock};
 
@@ -116,6 +117,14 @@ pub trait StoreTransport: Send + Sync {
     fn allocate_batch(&self, batch_size: usize) -> Result<u64>;
     fn free_batch(&self, batch_id: u64) -> Result<()>;
     fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()>;
+    fn submit_with_hints(
+        &self,
+        batch_id: u64,
+        requests: &[TransferRequest],
+        _hints: &TransferBatchHints,
+    ) -> Result<()> {
+        self.submit(batch_id, requests)
+    }
     fn task_status(&self, batch_id: u64, task_id: usize) -> Result<TransferProgress>;
     fn overall_status(&self, batch_id: u64) -> Result<TransferProgress>;
 }
@@ -271,6 +280,15 @@ impl StoreTransport for TentEngine {
     }
 
     fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()> {
+        TentEngine::submit(self, batch_id, requests)
+    }
+
+    fn submit_with_hints(
+        &self,
+        batch_id: u64,
+        requests: &[TransferRequest],
+        _hints: &TransferBatchHints,
+    ) -> Result<()> {
         TentEngine::submit(self, batch_id, requests)
     }
 
@@ -727,7 +745,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use mooncake_store_core::{Result, StoreError};
-    use mooncake_transport::{SegmentInfo, TransferProgress, TransferRequest, TransferStatus};
+    use mooncake_transport::{
+        SegmentInfo, TransferBatchHints, TransferPacingMode, TransferProgress, TransferRequest,
+        TransferStatus,
+    };
     use parking_lot::Mutex;
 
     use super::{
@@ -795,6 +816,16 @@ mod tests {
 
         fn submit(&self, _batch_id: u64, _requests: &[TransferRequest]) -> Result<()> {
             Ok(())
+        }
+
+        fn submit_with_hints(
+            &self,
+            batch_id: u64,
+            requests: &[TransferRequest],
+            hints: &TransferBatchHints,
+        ) -> Result<()> {
+            assert_eq!(hints.mode, TransferPacingMode::Standard);
+            self.submit(batch_id, requests)
         }
 
         fn task_status(&self, batch_id: u64, _task_id: usize) -> Result<TransferProgress> {

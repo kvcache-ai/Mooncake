@@ -15,8 +15,8 @@ use mooncake_store_core::{
     StoreError,
 };
 use mooncake_transport::{
-    Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
-    TransferStatus,
+    Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferBatchHints, TransferPacingMode,
+    TransferProgress, TransferRequest, TransferStatus,
 };
 use parking_lot::Mutex;
 
@@ -39,9 +39,10 @@ use crate::{
     route_directory::{authority_get, authority_replace, build_route_directory},
     snapshot_metrics,
     transport::{StoreTransport, StoreTransportFactory},
-    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
-    MultiBufferPutRequest, NamespaceQuota, ObjectRef, PlacementPlanner, PutFromRequest,
-    PutRequest, ReplicationPolicy, RouteControlMode, StoreClient, StoreClientBuilder,
+    BandwidthShaping, ExecutionFairness, GetRequest, LocalMemoryConfig,
+    MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, NamespaceQuota,
+    ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy,
+    RouteControlMode, StoreClient, StoreClientBuilder,
 };
 
 struct TestTransport {
@@ -72,6 +73,9 @@ struct TestTransportState {
     republish_local_metadata_calls: usize,
     fail_next_submit_segments: BTreeSet<String>,
     max_registration_bytes: Option<usize>,
+    submitted_batch_sizes: Vec<usize>,
+    submitted_batch_bytes: Vec<u64>,
+    submitted_batch_hints: Vec<(Option<String>, TransferPacingMode, Option<u64>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -871,6 +875,9 @@ impl TestTransport {
                 republish_local_metadata_calls: 0,
                 fail_next_submit_segments: BTreeSet::new(),
                 max_registration_bytes: None,
+                submitted_batch_sizes: Vec::new(),
+                submitted_batch_bytes: Vec::new(),
+                submitted_batch_hints: Vec::new(),
             })),
         }
     }
@@ -933,6 +940,18 @@ impl TestTransport {
             .lock()
             .fail_next_submit_segments
             .insert(segment_name.to_string());
+    }
+
+    fn submitted_batch_sizes(&self) -> Vec<usize> {
+        self.state.lock().submitted_batch_sizes.clone()
+    }
+
+    fn submitted_batch_bytes(&self) -> Vec<u64> {
+        self.state.lock().submitted_batch_bytes.clone()
+    }
+
+    fn submitted_batch_hints(&self) -> Vec<(Option<String>, TransferPacingMode, Option<u64>)> {
+        self.state.lock().submitted_batch_hints.clone()
     }
 
     fn republish_local_metadata_calls(&self) -> usize {
@@ -1117,6 +1136,16 @@ impl StoreTransport for TestTransport {
         batch_id: u64,
         requests: &[TransferRequest],
     ) -> mooncake_store_core::Result<()> {
+        let hints = TransferBatchHints::default();
+        self.submit_with_hints(batch_id, requests, &hints)
+    }
+
+    fn submit_with_hints(
+        &self,
+        batch_id: u64,
+        requests: &[TransferRequest],
+        hints: &TransferBatchHints,
+    ) -> mooncake_store_core::Result<()> {
         let mut state = self.state.lock();
         if !state.live_batches.contains(&batch_id) {
             return Err(StoreError::NotFound(format!("batch {batch_id} not found")));
@@ -1139,6 +1168,15 @@ impl StoreTransport for TestTransport {
                 "injected submit failure for segment {segment_name}"
             )));
         }
+        state.submitted_batch_sizes.push(requests.len());
+        state
+            .submitted_batch_bytes
+            .push(requests.iter().map(|request| request.length).sum());
+        state.submitted_batch_hints.push((
+            hints.pacing_group.clone(),
+            hints.mode,
+            hints.max_inflight_bytes,
+        ));
         for request in requests {
             let segment = state
                 .segments_by_handle
@@ -4765,6 +4803,335 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
     assert_eq!(&buf_a, b"alpha-1");
     assert_eq!(&buf_b, b"beta-11");
     assert_eq!(&buf_c, b"gamma-1");
+}
+
+#[test]
+fn batch_get_fairness_limits_remote_items_per_tenant_per_round() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-batch-fairness-segment"));
+    let remote_owner = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-batch-fairness",
+        "seg-batch-fairness",
+        "pool-a",
+        1024,
+        1,
+    );
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-batch-fairness")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "reader-batch-fairness")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config_with_layout(4096, 64, 1))
+        .execution_fairness(ExecutionFairness::new().max_remote_batch_items_per_tenant(1))
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(remote_owner.storage_key());
+    writer
+        .batch_put(&[
+            PutRequest::new("fair-a1", b"aaaa").tenant("tenant-a").replication(policy.clone()),
+            PutRequest::new("fair-a2", b"bbbb").tenant("tenant-a").replication(policy.clone()),
+            PutRequest::new("fair-b1", b"cccc").tenant("tenant-b").replication(policy),
+        ])
+        .expect("remote batch put should succeed");
+
+    let values = reader
+        .batch_get(&[
+            ObjectRef::new("fair-a1").tenant("tenant-a"),
+            ObjectRef::new("fair-a2").tenant("tenant-a"),
+            ObjectRef::new("fair-b1").tenant("tenant-b"),
+        ])
+        .expect("batch_get should honor fairness slicing");
+    assert_eq!(
+        values,
+        vec![b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()]
+    );
+
+    let submitted = transport.submitted_batch_sizes();
+    assert!(submitted.windows(2).any(|window| window == [2, 1]));
+}
+
+#[test]
+fn routed_put_fairness_limits_remote_replica_writes_per_batch() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-put-fairness-segment"));
+    let remote_a = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-put-fairness-a",
+        "seg-put-fairness-a",
+        "pool-a",
+        1024,
+        1,
+    );
+    let remote_b = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-put-fairness-b",
+        "seg-put-fairness-b",
+        "pool-a",
+        1024,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "writer-put-fairness")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .execution_fairness(ExecutionFairness::new().max_remote_batch_items_per_tenant(1))
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    let route = writer
+        .put_with_policy(
+            "put-fairness",
+            b"payload",
+            &ReplicationPolicy::new()
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    remote_a.storage_key(),
+                    remote_b.storage_key(),
+                ]),
+        )
+        .expect("routed put should succeed");
+    assert_eq!(route.replicas.len(), 2);
+
+    let submitted = transport.submitted_batch_sizes();
+    assert_eq!(submitted, vec![1, 1]);
+}
+
+#[test]
+fn batch_get_shaping_caps_remote_batch_bytes() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-batch-shaping-segment"));
+    let remote_owner = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-batch-shaping",
+        "seg-batch-shaping",
+        "pool-a",
+        1024,
+        1,
+    );
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-batch-shaping")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "reader-batch-shaping")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config_with_layout(4096, 64, 1))
+        .bandwidth_shaping(BandwidthShaping::new().max_remote_batch_bytes(4))
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(remote_owner.storage_key());
+    writer
+        .batch_put(&[
+            PutRequest::new("shape-a", b"aaaa").replication(policy.clone()),
+            PutRequest::new("shape-b", b"bbbb").replication(policy.clone()),
+            PutRequest::new("shape-c", b"cccc").replication(policy),
+        ])
+        .expect("remote batch put should succeed");
+
+    let values = reader
+        .batch_get(&[
+            ObjectRef::new("shape-a"),
+            ObjectRef::new("shape-b"),
+            ObjectRef::new("shape-c"),
+        ])
+        .expect("batch_get should honor shaping limit");
+    assert_eq!(
+        values,
+        vec![b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()]
+    );
+
+    let submitted = transport.submitted_batch_bytes();
+    assert!(submitted.iter().filter(|bytes| **bytes == 4).count() >= 3);
+}
+
+#[test]
+fn batch_get_emits_transport_pacing_hints() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-batch-pacing-segment"));
+    let remote_owner = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-batch-pacing",
+        "seg-batch-pacing",
+        "pool-a",
+        1024,
+        1,
+    );
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-batch-pacing")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "reader-batch-pacing")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config_with_layout(4096, 64, 1))
+        .bandwidth_shaping(BandwidthShaping::new().max_inflight_bytes_per_batch(16))
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(remote_owner.storage_key());
+    writer
+        .put_with_policy("paced-get", b"payload", &policy)
+        .expect("remote put should succeed");
+
+    let value = reader.get("paced-get").expect("paced get should succeed");
+    assert_eq!(value, b"payload");
+
+    let hints = transport.submitted_batch_hints();
+    assert!(
+        hints.iter().any(|hint| {
+            hint.0.as_deref() == Some("tenant:default")
+                && hint.1 == TransferPacingMode::LatencySensitive
+                && hint.2 == Some(16)
+        }),
+        "hints: {hints:?}"
+    );
+}
+
+#[test]
+fn routed_put_emits_transport_pacing_hints() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-put-pacing-segment"));
+    let remote_a = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-put-pacing-a",
+        "seg-put-pacing-a",
+        "pool-a",
+        1024,
+        1,
+    );
+    let remote_b = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-put-pacing-b",
+        "seg-put-pacing-b",
+        "pool-a",
+        1024,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "writer-put-pacing")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .bandwidth_shaping(BandwidthShaping::new().max_inflight_bytes_per_batch(9))
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    writer
+        .put_with_policy(
+            "paced-put",
+            b"payload",
+            &ReplicationPolicy::new()
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    remote_a.storage_key(),
+                    remote_b.storage_key(),
+                ]),
+        )
+        .expect("routed put should succeed");
+
+    let hints = transport.submitted_batch_hints();
+    assert!(
+        hints.iter().any(|hint| {
+            hint.0.as_deref() == Some("tenant:default")
+                && hint.1 == TransferPacingMode::ThroughputOptimized
+                && hint.2 == Some(9)
+        }),
+        "hints: {hints:?}"
+    );
+}
+
+#[test]
+fn routed_put_shaping_caps_remote_batch_bytes() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-put-shaping-segment"));
+    let remote_a = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-put-shaping-a",
+        "seg-put-shaping-a",
+        "pool-a",
+        1024,
+        1,
+    );
+    let remote_b = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-put-shaping-b",
+        "seg-put-shaping-b",
+        "pool-a",
+        1024,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "writer-put-shaping")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .bandwidth_shaping(BandwidthShaping::new().max_remote_batch_bytes(7))
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    writer
+        .put_with_policy(
+            "put-shaping",
+            b"payload",
+            &ReplicationPolicy::new()
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    remote_a.storage_key(),
+                    remote_b.storage_key(),
+                ]),
+        )
+        .expect("routed put should succeed");
+
+    let submitted = transport.submitted_batch_bytes();
+    assert_eq!(submitted, vec![7, 7]);
 }
 
 #[test]

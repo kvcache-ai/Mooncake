@@ -17,7 +17,12 @@ use mooncake_store_core::{
     RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
     StoreError,
 };
-use mooncake_transport::{Opcode, SegmentInfo, TentEngine, TransferRequest};
+use mooncake_transport::{
+    Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
+};
+use mooncake_transport::{
+    Opcode, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
+};
 use parking_lot::Mutex;
 use tracing::{debug, info, info_span, warn};
 
@@ -91,6 +96,8 @@ pub struct StoreClient {
     startup_activation_pending: AtomicBool,
     heartbeat_repair_pending: AtomicUsize,
     namespace_quota: Option<NamespaceQuota>,
+    execution_fairness: Option<ExecutionFairness>,
+    bandwidth_shaping: Option<BandwidthShaping>,
     state: Mutex<StoreState>,
 }
 

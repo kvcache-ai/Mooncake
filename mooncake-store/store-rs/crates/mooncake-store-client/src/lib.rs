@@ -7,10 +7,12 @@ mod route_directory;
 mod transport;
 
 pub use client::{
-    stable_phase_spread_ms, GetRequest, HealthChannel, HealthUpdate, HeartbeatLease,
+    BandwidthShaping, ExecutionFairness, GetRequest, HealthChannel, HealthUpdate, HeartbeatLease,
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, NamespaceQuota,
     ObjectRef, PutFromRequest, PutRequest, ReplicationPolicy, StoreClient, StoreClientBuilder,
+    stable_phase_spread_ms,
 };
+pub use mooncake_transport::{TransferBatchHints, TransferPacingMode};
 pub use memory::LocalMemoryConfig;
 pub use mooncake_store_core::RouteControlMode;
 pub use observability::{

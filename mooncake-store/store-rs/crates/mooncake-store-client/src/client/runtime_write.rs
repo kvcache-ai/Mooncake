@@ -83,7 +83,6 @@ impl StoreClient {
                     state.memory_ref()?.plan_scratch(&[value.len()])?
                 };
                 copy_into_region(scratch[0], value);
-                let batch_id = transport.allocate_batch(remote_requests.len())?;
                 let requests = remote_requests
                     .iter()
                     .map(|(_, handle, target_offset)| TransferRequest {
@@ -94,10 +93,24 @@ impl StoreClient {
                         length: value.len() as u64,
                     })
                     .collect::<Vec<_>>();
-                let submit_result = transport.submit(batch_id, &requests);
-                if let Err(error) = submit_result {
-                    let _ = transport.free_batch(batch_id);
-                    return Err(error);
+                let chunk_size = self.remote_write_chunk_limit(value.len(), requests.len());
+                for chunk in requests.chunks(chunk_size) {
+                    let batch_id = transport.allocate_batch(chunk.len())?;
+                    let hints = self.remote_batch_hints(
+                        self.default_tenant(),
+                        (chunk.len() * value.len()) as u64,
+                        TransferPacingMode::ThroughputOptimized,
+                    );
+                    let submit_result = transport.submit_with_hints(batch_id, chunk, &hints);
+                    if let Err(error) = submit_result {
+                        let _ = transport.free_batch(batch_id);
+                        return Err(error);
+                    }
+                    let wait_result =
+                        wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+                    let free_result = transport.free_batch(batch_id);
+                    wait_result?;
+                    free_result?;
                 }
                 let wait_result = wait_for_batch_completion_detailed(
                     transport,
