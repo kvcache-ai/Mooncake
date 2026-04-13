@@ -706,6 +706,9 @@ struct ReplicaPlacementCandidate {
 #[derive(Clone, Debug)]
 struct PendingReclaim {
     due_at_ms: u64,
+    policy_rank: u8,
+    tenant: String,
+    qos_tier: String,
     storage_runtime: ClientRuntimeId,
     segment_name: SegmentName,
     offset_bytes: u64,

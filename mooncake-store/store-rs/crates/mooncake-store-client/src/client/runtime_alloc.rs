@@ -377,11 +377,20 @@ impl StoreClient {
         if grace_ms == 0 {
             return self.release_route_allocations(route);
         }
+        let object_id = mooncake_store_core::route_logical_object_id(route)?;
+        let qos_tier = route
+            .qos_tier
+            .clone()
+            .unwrap_or_else(|| mooncake_store_core::DEFAULT_QOS_TIER.to_string());
+        let policy_rank = Self::reclaim_policy_rank(&qos_tier);
         let mut state = self.state.lock();
         let due_at_ms = now_ms().saturating_add(grace_ms);
         for replica in &route.replicas {
             state.pending_reclaims.push_back(PendingReclaim {
                 due_at_ms,
+                policy_rank,
+                tenant: object_id.scope.tenant.clone(),
+                qos_tier: qos_tier.clone(),
                 storage_runtime: replica.owner.clone(),
                 segment_name: replica.segment_name.clone(),
                 offset_bytes: replica.segment_offset,
@@ -389,6 +398,16 @@ impl StoreClient {
             });
         }
         Ok(())
+    }
+
+
+    fn reclaim_policy_rank(qos_tier: &str) -> u8 {
+        match qos_tier {
+            "critical" => 3,
+            "gold" => 2,
+            "default" => 1,
+            _ => 0,
+        }
     }
 
     fn reclaim_route(&self, route: &ObjectRoute, mode: ReclaimMode) -> Result<()> {

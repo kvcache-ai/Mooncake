@@ -119,6 +119,7 @@ pub struct StoreClientBuilder {
     request_timeout_override: Option<Duration>,
     startup_prewarm_max_delay: Duration,
     activate_on_local_memory_registration: bool,
+    namespace_quota: Option<NamespaceQuota>,
 }
 
 impl StoreClientBuilder {
@@ -142,6 +143,7 @@ impl StoreClientBuilder {
             request_timeout_override: request_timeout_override_from_env(),
             startup_prewarm_max_delay: startup_prewarm_max_delay_from_env(),
             activate_on_local_memory_registration: false,
+            namespace_quota: None,
         }
     }
 
@@ -240,6 +242,11 @@ impl StoreClientBuilder {
 
     pub fn activate_on_local_memory_registration(mut self) -> Self {
         self.activate_on_local_memory_registration = true;
+        self
+    }
+
+    pub fn namespace_quota(mut self, namespace_quota: NamespaceQuota) -> Self {
+        self.namespace_quota = Some(namespace_quota);
         self
     }
 
@@ -412,6 +419,7 @@ impl StoreClientBuilder {
             route_write_gate,
             startup_activation_pending: AtomicBool::new(startup_activation_pending),
             heartbeat_repair_pending: AtomicUsize::new(0),
+            namespace_quota: self.namespace_quota,
             state,
         })
     }

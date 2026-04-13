@@ -1,16 +1,65 @@
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectRef<'a> {
     pub tenant: Option<&'a str>,
+    pub domain: Option<&'a str>,
+    pub object_set: Option<&'a str>,
+    pub qos_tier: Option<&'a str>,
     pub key: &'a str,
 }
 
 impl<'a> ObjectRef<'a> {
     pub fn new(key: &'a str) -> Self {
-        Self { tenant: None, key }
+        Self {
+            tenant: None,
+            domain: None,
+            object_set: None,
+            qos_tier: None,
+            key,
+        }
     }
 
     pub fn tenant(mut self, tenant: &'a str) -> Self {
         self.tenant = Some(tenant);
+        self
+    }
+
+    pub fn domain(mut self, domain: &'a str) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+
+    pub fn object_set(mut self, object_set: &'a str) -> Self {
+        self.object_set = Some(object_set);
+        self
+    }
+
+    pub fn qos_tier(mut self, qos_tier: &'a str) -> Self {
+        self.qos_tier = Some(qos_tier);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamespaceQuota {
+    pub max_bytes: Option<u64>,
+    pub max_objects: Option<usize>,
+}
+
+impl NamespaceQuota {
+    pub fn new() -> Self {
+        Self {
+            max_bytes: None,
+            max_objects: None,
+        }
+    }
+
+    pub fn max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    pub fn max_objects(mut self, max_objects: usize) -> Self {
+        self.max_objects = Some(max_objects);
         self
     }
 }

@@ -1,4 +1,56 @@
 impl StoreClient {
+    fn enforce_namespace_quota(
+        &self,
+        object_id: &LogicalObjectId,
+        value_len: usize,
+        current: Option<&ObjectRoute>,
+    ) -> Result<()> {
+        let Some(quota) = self.namespace_quota.as_ref() else {
+            return Ok(());
+        };
+        let mut live_bytes = 0u64;
+        let mut live_objects = 0usize;
+        for route in self.metadata.list_object_routes()? {
+            if route.namespace.as_ref() != Some(&object_id.scope) || route.state != RouteState::Active {
+                continue;
+            }
+            live_objects = live_objects.saturating_add(1);
+            if let Some(replica) = route.replicas.iter().min_by_key(|replica| replica.priority) {
+                live_bytes = live_bytes.saturating_add(replica.length);
+            }
+        }
+        let replacing_existing = current.is_some();
+        let current_bytes = current
+            .and_then(|route| route.replicas.iter().min_by_key(|replica| replica.priority))
+            .map(|replica| replica.length)
+            .unwrap_or(0);
+        let next_bytes = live_bytes
+            .saturating_sub(current_bytes)
+            .saturating_add(value_len as u64);
+        let next_objects = if replacing_existing {
+            live_objects
+        } else {
+            live_objects.saturating_add(1)
+        };
+        if let Some(max_objects) = quota.max_objects {
+            if next_objects > max_objects {
+                return Err(StoreError::Allocator(format!(
+                    "namespace quota exceeded for {}/{}: objects {} > {}",
+                    object_id.scope.tenant, object_id.scope.domain, next_objects, max_objects
+                )));
+            }
+        }
+        if let Some(max_bytes) = quota.max_bytes {
+            if next_bytes > max_bytes {
+                return Err(StoreError::Allocator(format!(
+                    "namespace quota exceeded for {}/{}: bytes {} > {}",
+                    object_id.scope.tenant, object_id.scope.domain, next_bytes, max_bytes
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn put_scoped_with_policy_current(
         &self,
         tenant: &str,
@@ -12,6 +64,7 @@ impl StoreClient {
         self.flush_due_reclaims()?;
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let scoped_key = ObjectKey::from_logical_id(&object_id);
+        self.enforce_namespace_quota(&object_id, value.len(), current)?;
         let policy = self.resolve_replication_policy(policy)?;
         let max_write_attempts = if policy.with_soft_pin {
             DEFAULT_PUT_WRITE_RETRY_LIMIT

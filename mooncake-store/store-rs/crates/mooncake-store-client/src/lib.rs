@@ -8,8 +8,8 @@ mod transport;
 
 pub use client::{
     stable_phase_spread_ms, GetRequest, HealthChannel, HealthUpdate, HeartbeatLease,
-    MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
-    PutFromRequest, PutRequest, ReplicationPolicy, StoreClient, StoreClientBuilder,
+    MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, NamespaceQuota,
+    ObjectRef, PutFromRequest, PutRequest, ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
 pub use memory::LocalMemoryConfig;
 pub use mooncake_store_core::RouteControlMode;

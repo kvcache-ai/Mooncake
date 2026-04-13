@@ -40,8 +40,8 @@ use crate::{
     snapshot_metrics,
     transport::{StoreTransport, StoreTransportFactory},
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
-    MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
-    ReplicationPolicy, RouteControlMode, StoreClient, StoreClientBuilder,
+    MultiBufferPutRequest, NamespaceQuota, ObjectRef, PlacementPlanner, PutFromRequest,
+    PutRequest, ReplicationPolicy, RouteControlMode, StoreClient, StoreClientBuilder,
 };
 
 struct TestTransport {
@@ -5542,8 +5542,15 @@ fn helper_primitives_and_request_builders_cover_contracts() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();
 
-    let object = ObjectRef::new("alpha").tenant("tenant-a");
+    let object = ObjectRef::new("alpha")
+        .tenant("tenant-a")
+        .domain("domain-a")
+        .object_set("set-a")
+        .qos_tier("gold");
     assert_eq!(object.tenant, Some("tenant-a"));
+    assert_eq!(object.domain, Some("domain-a"));
+    assert_eq!(object.object_set, Some("set-a"));
+    assert_eq!(object.qos_tier, Some("gold"));
     assert_eq!(object.key, "alpha");
 
     let policy = ReplicationPolicy::new()
@@ -5677,13 +5684,17 @@ fn helper_primitives_and_request_builders_cover_contracts() {
         ..CompatibilityDescriptor::default()
     };
     let builder_transport = Arc::new(TestTransport::new("builder-compat-segment"));
-    let built = StoreClientBuilder::new(Arc::new(InMemoryMetadataBackend::new()), "builder-compat")
-        .compatibility(custom_compat.clone())
-        .route_control(RouteControlMode::MetadataOnly)
-        .state(ClientLifecycleState::Active)
-        .transport(builder_transport)
-        .build(test_future_expiry_ms())
-        .expect("builder with compatibility and route_control should succeed");
+    let built = StoreClientBuilder::new(
+        Arc::new(InMemoryMetadataBackend::new()),
+        "builder-compat",
+    )
+    .compatibility(custom_compat.clone())
+    .route_control(RouteControlMode::MetadataOnly)
+    .namespace_quota(NamespaceQuota::new().max_bytes(1024).max_objects(8))
+    .state(ClientLifecycleState::Active)
+    .transport(builder_transport)
+    .build(test_future_expiry_ms())
+    .expect("builder with compatibility and route_control should succeed");
     assert_eq!(built.lease().compatibility, custom_compat);
 }
 
@@ -6052,12 +6063,41 @@ fn heartbeat_recovery_republishes_local_metadata_after_long_redis_outage() {
 }
 
 #[test]
+fn namespace_quota_rejects_over_limit_writes() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("quota-segment"));
+    let client = StoreClientBuilder::new(metadata, "quota-client")
+        .tenant("tenant-a")
+        .namespace_quota(NamespaceQuota::new().max_bytes(5).max_objects(1))
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .build(10_000)
+        .expect("quota client should build");
+
+    client
+        .put("small", b"1234")
+        .expect("first put should fit quota");
+    let bytes_error = client
+        .put("big", b"123456")
+        .expect_err("second put should exceed byte quota");
+    assert!(matches!(bytes_error, StoreError::Allocator(_)));
+    assert!(bytes_error.to_string().contains("namespace quota exceeded"));
+
+    let objects_error = client
+        .put("other", b"1")
+        .expect_err("second object should exceed object quota");
+    assert!(matches!(objects_error, StoreError::Allocator(_)));
+}
+
+#[test]
 fn compatibility_facade_surface_covers_aliases_and_buffers() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("facade-segment"));
     let mut client = StoreClientBuilder::new(metadata.clone(), "facade-client")
         .tenant("tenant-a")
         .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
         .rpc_address("127.0.0.1:7011")
         .transport(transport.clone())
         .transport_factory(transport.factory())
@@ -6283,11 +6323,37 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         .expect("object query should succeed")
         .expect("object route should exist");
     assert_eq!(queried_object.key, queried_tenant.key);
+    let tenant_b_scope = NamespaceScope::with_defaults(Some("tenant-b"), None, None);
     let scoped_routes = client
-        .list_routes_in_scope(&NamespaceScope::with_defaults(Some("tenant-b"), None, None))
+        .list_routes_in_scope(&tenant_b_scope)
         .expect("scope listing should succeed");
     assert!(scoped_routes.iter().any(|route| route.key == queried_tenant.key));
-    assert!(scoped_routes.iter().all(|route| route.namespace.as_ref() == Some(&NamespaceScope::with_defaults(Some("tenant-b"), None, None))));
+    assert!(scoped_routes.iter().all(|route| route.namespace.as_ref() == Some(&tenant_b_scope)));
+
+    let tenant_b_reuse = mooncake_store_core::ReuseIdentity::new(
+        "tenant-b",
+        "default",
+        "tenant-b",
+        "tenant-b/default/default/plain",
+    );
+    let reuse_candidates = client
+        .list_reuse_candidates(&tenant_b_reuse)
+        .expect("reuse lookup should succeed");
+    assert!(reuse_candidates.iter().any(|route| route.key == queried_tenant.key));
+    assert!(reuse_candidates.iter().all(|route| route.namespace.as_ref() == Some(&tenant_b_scope)));
+
+    let tenant_a_reuse = mooncake_store_core::ReuseIdentity::new(
+        "tenant-a",
+        "default",
+        "tenant-a",
+        "tenant-a/default/default/plain",
+    );
+    let tenant_a_candidates = client
+        .list_reuse_candidates(&tenant_a_reuse)
+        .expect("tenant-a reuse lookup should succeed");
+    assert!(tenant_a_candidates.iter().any(|route| route.key == queried.key));
+    assert!(tenant_a_candidates.iter().all(|route| route.namespace.as_ref() == Some(&NamespaceScope::with_defaults(Some("tenant-a"), None, None))));
+    assert!(tenant_a_candidates.iter().all(|route| route.key != queried_tenant.key));
 
     let mut direct_insert = queried.clone();
     direct_insert.key = client.scoped_key("tenant-a", "cas-direct");
@@ -8281,6 +8347,9 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
 
     state.pending_reclaims.push_back(PendingReclaim {
         due_at_ms: 5,
+        policy_rank: 1,
+        tenant: "tenant-a".to_string(),
+        qos_tier: "default".to_string(),
         storage_runtime: owner.clone(),
         segment_name: SegmentName::new("seg-a"),
         offset_bytes: 0,
@@ -8288,6 +8357,9 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     });
     state.pending_reclaims.push_back(PendingReclaim {
         due_at_ms: 50,
+        policy_rank: 0,
+        tenant: "tenant-b".to_string(),
+        qos_tier: "bronze".to_string(),
         storage_runtime: owner,
         segment_name: SegmentName::new("seg-b"),
         offset_bytes: 16,
@@ -8415,4 +8487,46 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
             offset_bytes: orphaned.offset_bytes,
             length_bytes: orphaned.length_bytes,
         }));
+}
+
+#[test]
+fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
+    let mut state = StoreState::default();
+    let owner = ClientRuntimeId::new("owner-a", ClientEpoch(1));
+    state.pending_reclaims.push_back(PendingReclaim {
+        due_at_ms: 5,
+        policy_rank: 2,
+        tenant: "tenant-a".to_string(),
+        qos_tier: "gold".to_string(),
+        storage_runtime: owner.clone(),
+        segment_name: SegmentName::new("seg-a"),
+        offset_bytes: 0,
+        length_bytes: 8,
+    });
+    state.pending_reclaims.push_back(PendingReclaim {
+        due_at_ms: 5,
+        policy_rank: 0,
+        tenant: "tenant-b".to_string(),
+        qos_tier: "bronze".to_string(),
+        storage_runtime: owner.clone(),
+        segment_name: SegmentName::new("seg-b"),
+        offset_bytes: 8,
+        length_bytes: 8,
+    });
+    state.pending_reclaims.push_back(PendingReclaim {
+        due_at_ms: 5,
+        policy_rank: 0,
+        tenant: "tenant-b".to_string(),
+        qos_tier: "default".to_string(),
+        storage_runtime: owner,
+        segment_name: SegmentName::new("seg-c"),
+        offset_bytes: 16,
+        length_bytes: 8,
+    });
+
+    let due = state.take_due_reclaims(10);
+    assert_eq!(due.len(), 3);
+    assert_eq!(due[0].segment_name, SegmentName::new("seg-b"));
+    assert_eq!(due[1].segment_name, SegmentName::new("seg-c"));
+    assert_eq!(due[2].segment_name, SegmentName::new("seg-a"));
 }

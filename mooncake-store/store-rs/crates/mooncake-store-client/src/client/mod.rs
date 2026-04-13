@@ -90,6 +90,7 @@ pub struct StoreClient {
     route_write_gate: SharedRouteWriteGate,
     startup_activation_pending: AtomicBool,
     heartbeat_repair_pending: AtomicUsize,
+    namespace_quota: Option<NamespaceQuota>,
     state: Mutex<StoreState>,
 }
 

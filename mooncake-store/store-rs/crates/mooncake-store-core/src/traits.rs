@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::identity::{ClientRuntimeId, ClientStableId};
+use crate::identity::{ClientRuntimeId, ClientStableId, LogicalObjectId, NamespaceScope, ReuseIdentity};
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
@@ -51,6 +51,33 @@ pub trait MetadataBackend: Send + Sync {
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>>;
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>>;
+
+    fn list_object_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
+        Ok(self
+            .list_object_routes()?
+            .into_iter()
+            .filter(|route| {
+                crate::route_logical_object_id(route)
+                    .map(|object_id| object_id.scope == *scope)
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    fn get_object_route_by_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
+        self.get_object_route(&ObjectKey::from_logical_id(object_id))
+    }
+
+    fn list_reuse_candidates(&self, reuse: &ReuseIdentity) -> Result<Vec<ObjectRoute>> {
+        Ok(self
+            .list_object_routes()?
+            .into_iter()
+            .filter_map(|route| {
+                let candidate = crate::route_reuse_identity(&route).ok()?;
+                (candidate == *reuse).then_some(route)
+            })
+            .collect())
+    }
 
     fn compare_and_swap_object_route(
         &self,

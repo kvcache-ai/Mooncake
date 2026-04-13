@@ -17,7 +17,7 @@ pub use identity::{
 };
 pub use identity_codec::{
     apply_route_identity, parse_legacy_scoped_key, route_logical_object_id,
-    scoped_logical_object_id, scoped_object_key,
+    route_reuse_identity, scoped_logical_object_id, scoped_object_key,
 };
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{
