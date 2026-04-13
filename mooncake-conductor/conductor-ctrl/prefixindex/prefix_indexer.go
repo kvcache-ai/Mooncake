@@ -342,8 +342,23 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank 
 	defer contextData.prefixMu.Unlock()
 	prefixStore := contextData.prefixStore
 	for _, conductorHash := range removeConductorHash {
-		delete(prefixStore.prefixMap, conductorHash)
-		contextData.prefixStore.totalPrefixes--
+		cacheStoreInfo, exists := prefixStore.prefixMap[conductorHash]
+		if !exists {
+			continue
+		}
+
+		// Decrement replica count
+		cacheStoreInfo.TotalReplicaNums.Add(-1)
+
+		// Remove per-instance metadata
+		delete(cacheStoreInfo.engineLastAccessTime, instanceID)
+		delete(cacheStoreInfo.dpRankSet, dpRank)
+
+		// Only delete entry when all replicas are removed
+		if cacheStoreInfo.TotalReplicaNums.Load() <= 0 {
+			delete(prefixStore.prefixMap, conductorHash)
+			prefixStore.totalPrefixes--
+		}
 	}
 
 	return nil
