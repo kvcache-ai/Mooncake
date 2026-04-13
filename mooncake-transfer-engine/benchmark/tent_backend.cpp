@@ -131,7 +131,12 @@ int TENTBenchRunner::allocateBuffers() {
     // Register
     auto allocated_ts = getCurrentTimeInNano();
     std::vector<size_t> buffers_size(num_buffers, total_buffer_size);
-    CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_, buffers_size));
+    MemoryOptions options;
+    if (!xport_type.empty()) {
+        options.type = getTransportType(xport_type);
+    }
+    CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_, buffers_size,
+                                            options));
     auto registered_ts = getCurrentTimeInNano();
 
     LOG(INFO) << "Allocated " << total_buffer_size * num_buffers << " bytes "
