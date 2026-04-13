@@ -18,6 +18,7 @@ use crate::shm::{
 
 static DUMMY_RUNTIME: LazyLock<Runtime> =
     LazyLock::new(|| Runtime::new().expect("dummy runtime should initialize"));
+const DUMMY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct DummySession {
     channel: Channel,
@@ -367,9 +368,23 @@ impl DummySession {
         Fut: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
         DUMMY_RUNTIME
-            .block_on(f(
-                pb::dummy_store_service_client::DummyStoreServiceClient::new(self.channel.clone()),
-            ))
+            .block_on(async {
+                tokio::time::timeout(
+                    DUMMY_RPC_TIMEOUT,
+                    f(
+                        pb::dummy_store_service_client::DummyStoreServiceClient::new(
+                            self.channel.clone(),
+                        ),
+                    ),
+                )
+                .await
+            })
+            .map_err(|_| {
+                StoreError::Transport(format!(
+                    "dummy rpc timed out after {}ms",
+                    DUMMY_RPC_TIMEOUT.as_millis()
+                ))
+            })?
             .map_err(|error| StoreError::Transport(format!("dummy rpc failed: {error}")))
     }
 }

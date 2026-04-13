@@ -324,5 +324,10 @@ fn request_client_id(high: u64, low: u64) -> DummyClientId {
 }
 
 fn executor_status(error: StoreError) -> Status {
-    Status::internal(format!("dummy executor failed: {error}"))
+    match error {
+        StoreError::Transport(message) if message.contains("timed out") => {
+            Status::deadline_exceeded(format!("dummy executor timed out: {message}"))
+        }
+        other => Status::internal(format!("dummy executor failed: {other}")),
+    }
 }
