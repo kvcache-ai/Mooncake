@@ -10,12 +10,12 @@ pub(crate) struct LiveClientCache {
 impl LiveClientCache {
     pub(crate) fn snapshot(&self) -> Option<Vec<ClientLease>> {
         self.refreshed_at?;
-        Some(self.leases.clone())
+        Some(filter_live_client_leases(&self.leases))
     }
 
     pub(crate) fn store(&mut self, leases: Vec<ClientLease>) {
         self.refreshed_at = Some(Instant::now());
-        self.leases = leases;
+        self.leases = filter_live_client_leases(&leases);
     }
 }
 
@@ -62,7 +62,8 @@ impl SuspectRuntimeCache {
 
     fn prune_unobserved(&mut self) {
         let now = Instant::now();
-        self.suspects.retain(|_, entry| entry.is_observed() || !entry.quarantine_elapsed(now));
+        self.suspects
+            .retain(|_, entry| entry.is_observed() || !entry.quarantine_elapsed(now));
     }
 }
 
@@ -105,7 +106,9 @@ impl SuspectRuntimeEntry {
             || self
                 .observed_control_address
                 .as_ref()
-                .is_some_and(|address| lease_control_address(lease).is_some_and(|current| current != *address))
+                .is_some_and(|address| {
+                    lease_control_address(lease).is_some_and(|current| current != *address)
+                })
     }
 }
 
@@ -122,6 +125,44 @@ pub(crate) fn cached_live_client_snapshot(
                 .to_string(),
         )
     })
+}
+
+pub(crate) fn shared_live_client_cache(namespace: &str) -> SharedLiveClientCache {
+    static LIVE_CLIENT_CACHES: OnceLock<Mutex<BTreeMap<String, SharedLiveClientCache>>> =
+        OnceLock::new();
+    let caches = LIVE_CLIENT_CACHES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut guard = caches.lock();
+    guard
+        .entry(namespace.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(LiveClientCache::default())))
+        .clone()
+}
+
+pub(crate) fn shared_suspect_runtime_cache(namespace: &str) -> SharedSuspectRuntimeCache {
+    static SUSPECT_RUNTIME_CACHES: OnceLock<Mutex<BTreeMap<String, SharedSuspectRuntimeCache>>> =
+        OnceLock::new();
+    let caches = SUSPECT_RUNTIME_CACHES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut guard = caches.lock();
+    guard
+        .entry(namespace.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(SuspectRuntimeCache::default())))
+        .clone()
+}
+
+pub(crate) fn filter_live_client_leases(leases: &[ClientLease]) -> Vec<ClientLease> {
+    let now = current_time_ms();
+    leases
+        .iter()
+        .filter(|lease| lease.expires_at_ms >= now)
+        .cloned()
+        .collect()
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time should advance")
+        .as_millis() as u64
 }
 
 #[derive(Default)]
@@ -202,12 +243,14 @@ impl LocalAllocatorState {
     }
 
     fn usage_bytes(&self) -> (u64, u64) {
-        self.segments.values().fold((0u64, 0u64), |(used, capacity), segment| {
-            (
-                used.saturating_add(segment.announcement.used_bytes),
-                capacity.saturating_add(segment.announcement.capacity_bytes),
-            )
-        })
+        self.segments
+            .values()
+            .fold((0u64, 0u64), |(used, capacity), segment| {
+                (
+                    used.saturating_add(segment.announcement.used_bytes),
+                    capacity.saturating_add(segment.announcement.capacity_bytes),
+                )
+            })
     }
 
     fn allocations(&self) -> Vec<AllocationSpan> {
