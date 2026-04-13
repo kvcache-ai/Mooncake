@@ -76,7 +76,7 @@ The compatibility layer supports two real data-plane backends:
 
 | Backend | Compatibility Value | Notes |
 |---------|---------------------|-------|
-| TENT | `tent` | default backend |
+| TENT | `tent` | opt-in compatibility backend |
 | Classic TE | `classic_te` | runtime-selectable compatibility backend |
 
 Selection surfaces:
@@ -90,6 +90,7 @@ Selection surfaces:
 Notes:
 
 - explicit CLI or Python values override the environment variable
+- when no explicit selection is present, the compatibility layer defaults to `classic_te`
 - `classic`, `classic-te`, and `te` are accepted as compatibility aliases by the parser
 - low-level Rust transport construction remains explicit; runtime backend selection is only a compatibility-layer feature
 - current upstream SGLang Mooncake integration does not forward `transport_backend` from `--hicache-storage-backend-extra-config`; use `MC_STORE_RS_TRANSPORT_BACKEND` when SGLang real mode must select `tent` or `classic_te`

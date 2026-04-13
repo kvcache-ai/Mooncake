@@ -88,7 +88,11 @@ struct Args {
     rdma_devices: String,
     #[arg(long, alias = "rpc-server-port")]
     transport_rpc_port: Option<u16>,
-    #[arg(long, value_enum)]
+    #[arg(
+        long,
+        value_enum,
+        help = "Real transport backend; defaults to classic_te"
+    )]
     transport_backend: Option<TransportBackendArg>,
     #[arg(long)]
     stable_id: Option<String>,

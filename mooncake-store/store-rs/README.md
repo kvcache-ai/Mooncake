@@ -350,7 +350,7 @@ Useful knobs:
 - `--model-path` or `MC_STORE_RS_SGLANG_MODEL_PATH` to point at the local model directory used by `sglang.launch_server`
 - `--auto-download-model --model-id Qwen/Qwen3-0.6B` or `MC_STORE_RS_SGLANG_AUTO_DOWNLOAD_MODEL=1` for opt-in Hugging Face download
 - `MC_STORE_RS_SGLANG_SERVER_A_GPU` and `MC_STORE_RS_SGLANG_SERVER_B_GPU` to pin GPU ids
-- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to choose the real data-plane backend during validation and current SGLang real-mode compatibility
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the real data-plane backend during validation and current SGLang real-mode compatibility; the default is `classic_te`
 - `MC_STORE_RS_SGLANG_SKIP_WHEEL_BUILD=1` to reuse an existing local wheel build
 - `MC_STORE_RS_SGLANG_SKIP_PIP_INSTALL=1` to reuse an already prepared SGLang venv
 
@@ -359,7 +359,7 @@ Manual launch patterns:
 - real-mode SGLang with an in-process rw-only client (`global_segment_size=0`)
 
 ```bash
-MC_STORE_RS_TRANSPORT_BACKEND=tent \
+MC_STORE_RS_TRANSPORT_BACKEND=classic_te \
 SGLANG_HICACHE_MOONCAKE_REUSE_TE=0 \
 python -m sglang.launch_server \
   --model-path /models/Qwen3-0.6B \
@@ -389,7 +389,7 @@ python -m sglang.launch_server \
 
   Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. For real-mode compatibility today:
 
-- use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to choose the backend
+- use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the backend; the default is `classic_te`
 - keep SGLang real clients and storage peers on the default metadata keyspace `mc/store-rs/v1`
 - treat `--hicache-storage-backend-extra-config` as a legacy field bridge, not a full Store-RS setup dictionary
 - if a deployment needs custom `keyspace`, explicit `stable_id`, or per-process route labels, use the dummy gateway path or a patched SGLang fork
@@ -596,7 +596,7 @@ store.setup(
     "",
     stable_id="py-store-a",
     labels={"pool": "pool-a", "storage": "true"},
-    transport_backend="tent",
+    transport_backend="classic_te",
 )
 
 store.put("hello", b"world")

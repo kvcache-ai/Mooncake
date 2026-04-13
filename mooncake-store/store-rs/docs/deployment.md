@@ -186,7 +186,7 @@ Manual launch patterns:
 - real-mode SGLang with an in-process rw-only client (`global_segment_size=0`)
 
 ```bash
-MC_STORE_RS_TRANSPORT_BACKEND=tent \
+MC_STORE_RS_TRANSPORT_BACKEND=classic_te \
 SGLANG_HICACHE_MOONCAKE_REUSE_TE=0 \
 python -m sglang.launch_server \
   --model-path /models/Qwen3-0.6B \
@@ -216,7 +216,7 @@ python -m sglang.launch_server \
 
   Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. For real-mode compatibility today:
 
-- use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to choose the backend
+- use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the backend; the default is `classic_te`
 - keep SGLang real clients and storage peers on the default metadata keyspace `mc/store-rs/v1`
 - treat `--hicache-storage-backend-extra-config` as a legacy field bridge, not a full Store-RS setup dictionary
 - if a deployment needs custom `keyspace`, explicit `stable_id`, or per-process route labels, use the dummy gateway path or a patched SGLang fork
@@ -426,7 +426,7 @@ Credentials embedded in `redis://username:password@host:port/db` also work and t
 
 The transport layer is selected by the compatibility runtime and then configured through the matching backend config.
 
-Current repository scripts and examples default to `tent`, but the compatibility layer can also run with `classic_te`.
+Current repository scripts and examples default to `classic_te`; set `MC_STORE_RS_TRANSPORT_BACKEND=tent` only when a deployment explicitly wants TENT.
 
 Runtime selection:
 

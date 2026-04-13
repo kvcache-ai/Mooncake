@@ -127,7 +127,7 @@ fn resolve_transport_backend(explicit: Option<&str>) -> Result<TransportBackend>
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .or_else(|| std::env::var("MC_STORE_RS_TRANSPORT_BACKEND").ok())
-        .unwrap_or_else(|| "tent".to_string());
+        .unwrap_or_else(|| "classic_te".to_string());
     match value.to_ascii_lowercase().as_str() {
         "tent" => Ok(TransportBackend::Tent),
         "classic" | "classic_te" | "classic-te" | "te" => Ok(TransportBackend::ClassicTe),
@@ -556,7 +556,7 @@ mod tests {
             plan.labels.get("storage").map(String::as_str),
             Some("false")
         );
-        assert_eq!(plan.transport_backend, TransportBackend::Tent);
+        assert_eq!(plan.transport_backend, TransportBackend::ClassicTe);
     }
 
     #[test]
@@ -667,9 +667,7 @@ mod tests {
                 assert!(debug.contains("17112"));
                 assert!(debug.contains("transports/rdma/enable"));
             }
-            CompatTransportConfig::ClassicTe(_) => {
-                panic!("default backend should remain tent")
-            }
+            CompatTransportConfig::ClassicTe(_) => {}
         }
     }
 
