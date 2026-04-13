@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compat::CompatibilityDescriptor;
-use crate::identity::{ClientEndpointSet, ClientRuntimeId};
+use crate::identity::{ClientEndpointSet, ClientRuntimeId, LogicalObjectId, NamespaceScope};
 use crate::lifecycle::ClientLifecycleState;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -10,6 +10,14 @@ pub struct ObjectKey(pub String);
 impl ObjectKey {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    pub fn from_scope(scope: &NamespaceScope, logical_key: &str) -> Self {
+        Self::new(format!("{}::{}", scope.tenant, logical_key))
+    }
+
+    pub fn from_logical_id(id: &LogicalObjectId) -> Self {
+        Self::from_scope(&id.scope, &id.logical_key)
     }
 }
 
@@ -72,6 +80,16 @@ pub struct ReplicaRoute {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectRoute {
     pub key: ObjectKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<NamespaceScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qos_tier: Option<String>,
     pub version: RouteVersion,
     pub state: RouteState,
     pub compatibility: CompatibilityDescriptor,
@@ -166,6 +184,7 @@ mod tests {
         default_segment_alignment_bytes, ObjectKey, RouteVersion, SegmentAnnouncement,
         SegmentLifecycleState, SegmentName,
     };
+    use crate::NamespaceScope;
     use crate::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         CompatibilityDescriptor,
@@ -175,6 +194,12 @@ mod tests {
     fn object_and_segment_name_helpers_wrap_strings_directly() {
         assert_eq!(ObjectKey::new("alpha").0, "alpha");
         assert_eq!(SegmentName::new("segment-a").0, "segment-a");
+    }
+
+    #[test]
+    fn object_key_can_be_derived_from_namespace_scope() {
+        let scope = NamespaceScope::new("tenant-a", "domain-a", "set-a");
+        assert_eq!(ObjectKey::from_scope(&scope, "logical-a").0, "tenant-a::logical-a");
     }
 
     #[test]

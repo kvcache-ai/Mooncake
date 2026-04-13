@@ -1210,6 +1210,11 @@ mod tests {
     fn sample_route(version: u64) -> ObjectRoute {
         ObjectRoute {
             key: ObjectKey::new("object-a"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
             version: RouteVersion(version),
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),

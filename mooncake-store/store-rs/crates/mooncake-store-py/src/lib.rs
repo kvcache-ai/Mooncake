@@ -2507,6 +2507,11 @@ mod tests {
     fn sample_route() -> ObjectRoute {
         ObjectRoute {
             key: ObjectKey::new("key-z"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
             version: RouteVersion(4),
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),

@@ -195,6 +195,17 @@ pub(super) fn try_replica_route(replica: pb::ReplicaRoute) -> Result<ReplicaRout
 pub(super) fn pb_object_route(route: &ObjectRoute) -> pb::ObjectRoute {
     pb::ObjectRoute {
         key: route.key.0.clone(),
+        tenant: route.namespace.as_ref().map(|scope| scope.tenant.clone()).unwrap_or_default(),
+        domain: route.namespace.as_ref().map(|scope| scope.domain.clone()).unwrap_or_default(),
+        object_set: route
+            .namespace
+            .as_ref()
+            .map(|scope| scope.object_set.clone())
+            .unwrap_or_default(),
+        logical_key: route.logical_key.clone().unwrap_or_default(),
+        canonical_key: route.canonical_key.clone().unwrap_or_default(),
+        sharing_scope: route.sharing_scope.clone().unwrap_or_default(),
+        qos_tier: route.qos_tier.clone().unwrap_or_default(),
         version: route.version.0,
         state: pb_route_state(route.state),
         compatibility: Some(pb_compatibility(&route.compatibility)),
@@ -210,8 +221,26 @@ pub(super) fn try_object_route(route: pb::ObjectRoute) -> Result<ObjectRoute> {
         .ok_or_else(|| {
             StoreError::Transport("control plane object route is missing compatibility".to_string())
         })?;
+    let namespace = if route.tenant.is_empty() && route.domain.is_empty() && route.object_set.is_empty() {
+        None
+    } else {
+        Some(mooncake_store_core::NamespaceScope::with_defaults(
+            Some(route.tenant.as_str()).filter(|value| !value.is_empty()),
+            Some(route.domain.as_str()).filter(|value| !value.is_empty()),
+            Some(route.object_set.as_str()).filter(|value| !value.is_empty()),
+        ))
+    };
+    let logical_key = (!route.logical_key.is_empty()).then_some(route.logical_key.clone());
+    let canonical_key = (!route.canonical_key.is_empty()).then_some(route.canonical_key.clone());
+    let sharing_scope = (!route.sharing_scope.is_empty()).then_some(route.sharing_scope.clone());
+    let qos_tier = (!route.qos_tier.is_empty()).then_some(route.qos_tier.clone());
     Ok(ObjectRoute {
         key: ObjectKey::new(route.key),
+        namespace,
+        logical_key,
+        canonical_key,
+        sharing_scope,
+        qos_tier,
         version: RouteVersion(route.version),
         state: try_route_state(route.state)?,
         compatibility,

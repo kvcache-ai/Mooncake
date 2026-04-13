@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey, ObjectRoute,
-    ReplicaRoute, RouteCasRequest, RoutePolicy, RoutePolicyDomain, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+    ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, NamespaceScope,
+    ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy, RoutePolicyDomain,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
@@ -2498,6 +2498,17 @@ fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
     assert_eq!(routes.len(), 1);
     let route = &routes[0];
     assert_eq!(route.key, ObjectKey::new("tenant-a::key-a"));
+    assert_eq!(
+        route.namespace,
+        Some(NamespaceScope::with_defaults(Some("tenant-a"), None, None))
+    );
+    assert_eq!(route.logical_key.as_deref(), Some("key-a"));
+    assert_eq!(
+        route.canonical_key.as_deref(),
+        Some("tenant-a/default/default/key-a")
+    );
+    assert_eq!(route.sharing_scope.as_deref(), Some("tenant-a"));
+    assert_eq!(route.qos_tier.as_deref(), Some("default"));
     assert_eq!(route.version.0, 1);
     assert_eq!(route.replicas.len(), 2);
     assert_eq!(
@@ -6099,6 +6110,17 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         .put_in_tenant("tenant-b", "plain", b"world")
         .expect("tenant put should succeed");
     assert_eq!(
+        tenant_plain.namespace,
+        Some(NamespaceScope::with_defaults(Some("tenant-b"), None, None))
+    );
+    assert_eq!(tenant_plain.logical_key.as_deref(), Some("plain"));
+    assert_eq!(
+        tenant_plain.canonical_key.as_deref(),
+        Some("tenant-b/default/default/plain")
+    );
+    assert_eq!(tenant_plain.sharing_scope.as_deref(), Some("tenant-b"));
+    assert_eq!(tenant_plain.qos_tier.as_deref(), Some("default"));
+    assert_eq!(
         client
             .get_in_tenant("tenant-b", "plain")
             .expect("tenant get should succeed"),
@@ -6234,6 +6256,11 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         .expect("tenant query should succeed")
         .expect("tenant route should exist");
     assert_eq!(queried_tenant.key, client.scoped_key("tenant-b", "plain"));
+    assert_eq!(queried_tenant.namespace, tenant_plain.namespace);
+    assert_eq!(queried_tenant.logical_key, tenant_plain.logical_key);
+    assert_eq!(queried_tenant.canonical_key, tenant_plain.canonical_key);
+    assert_eq!(queried_tenant.sharing_scope, tenant_plain.sharing_scope);
+    assert_eq!(queried_tenant.qos_tier, tenant_plain.qos_tier);
 
     let mut direct_insert = queried.clone();
     direct_insert.key = client.scoped_key("tenant-a", "cas-direct");
