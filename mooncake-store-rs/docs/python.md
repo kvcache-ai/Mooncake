@@ -191,7 +191,7 @@ store.setup(
     stable_id="py-store-a",
     tenant="default",
     labels={"pool": "pool-a", "storage": "true"},
-    transport_backend="tent",
+    transport_backend="classic_te",
     transport_rpc_port=17111,
 )
 
@@ -426,7 +426,7 @@ Selection order:
 
 1. explicit `transport_backend=...` argument to `setup(...)`
 2. `MC_STORE_RS_TRANSPORT_BACKEND`
-3. default `tent`
+3. default `classic_te`
 
 The standalone client follows the same rule, except the explicit override is `--transport-backend`.
 
@@ -529,7 +529,7 @@ Manual `sglang.launch_server` patterns:
 - real-mode SGLang with an in-process rw-only client (`global_segment_size=0`)
 
 ```bash
-MC_STORE_RS_TRANSPORT_BACKEND=tent \
+MC_STORE_RS_TRANSPORT_BACKEND=classic_te \
 SGLANG_HICACHE_MOONCAKE_REUSE_TE=0 \
 python -m sglang.launch_server \
   --model-path /models/Qwen3-0.6B \
@@ -560,7 +560,7 @@ python -m sglang.launch_server \
 
   Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. For real-mode compatibility today:
 
-- use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to choose the backend
+- use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the backend; the default is `classic_te`
 - keep SGLang real clients and storage peers on the default metadata keyspace `mc/store-rs/v1`
 - treat `--hicache-storage-backend-extra-config` as a legacy field bridge, not a full Store-RS setup dictionary
 - if a deployment needs custom `keyspace`, explicit `stable_id`, or per-process route labels, use the dummy gateway path or a patched SGLang fork
