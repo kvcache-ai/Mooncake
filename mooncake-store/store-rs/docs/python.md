@@ -526,9 +526,10 @@ Model selection is explicit:
 
 Manual `sglang.launch_server` patterns:
 
-- real-mode SGLang with an in-process routed rw-only client (`storage=0`)
+- real-mode SGLang with an in-process rw-only client (`global_segment_size=0`)
 
 ```bash
+MC_STORE_RS_TRANSPORT_BACKEND=tent \
 SGLANG_HICACHE_MOONCAKE_REUSE_TE=0 \
 python -m sglang.launch_server \
   --model-path /models/Qwen3-0.6B \
@@ -546,21 +547,23 @@ python -m sglang.launch_server \
     "metadata_server": "redis://10.0.0.10:6379/0",
     "master_server_address": "ignored-by-store-rs",
     "global_segment_size": 0,
-    "local_buffer_size": 16777216,
     "protocol": "tcp",
-    "rdma_devices": "",
-    "stable_id": "sglang-rw-0",
-    "tenant": "default",
-    "labels": {"pool": "pool-a", "storage": "false"},
-    "routed_writes": true,
-    "replica_count": 2,
-    "route_topk": 2,
-    "transport_backend": "tent"
+    "device_name": "",
+    "check_server": false
   }'
 ```
 
-  Use this when SGLang should build the real store runtime directly inside the serving process. The `global_segment_size: 0` setting keeps the process rw-only while still allowing routed writes to remote storage peers.
+  Use this when SGLang should build the real store runtime directly inside the serving process. The `global_segment_size: 0` setting keeps the process rw-only while still allowing remote storage placement through the current compatibility path.
   SGLang's current Mooncake backend parser still requires `master_server_address` in real mode for upstream schema compatibility. Store-RS accepts the field but ignores it; the actual control plane comes from `metadata_server=redis://...` or `etcd://...`. If `metadata_server` is omitted, SGLang falls back to `P2PHANDSHAKE`, which Store-RS intentionally rejects.
+
+  Current upstream SGLang only forwards the legacy Mooncake fields from `--hicache-storage-backend-extra-config`: `local_hostname`, `metadata_server`, `global_segment_size`, `protocol`, `device_name`, `master_server_address`, `check_server`, `standalone_storage`, and `client_server_address`.
+
+  Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. For real-mode compatibility today:
+
+- use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to choose the backend
+- keep SGLang real clients and storage peers on the default metadata keyspace `mc/store-rs/v1`
+- treat `--hicache-storage-backend-extra-config` as a legacy field bridge, not a full Store-RS setup dictionary
+- if a deployment needs custom `keyspace`, explicit `stable_id`, or per-process route labels, use the dummy gateway path or a patched SGLang fork
 
 - dummy-mode SGLang through a standalone routed gateway
 

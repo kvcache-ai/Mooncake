@@ -92,6 +92,7 @@ Notes:
 - explicit CLI or Python values override the environment variable
 - `classic`, `classic-te`, and `te` are accepted as compatibility aliases by the parser
 - low-level Rust transport construction remains explicit; runtime backend selection is only a compatibility-layer feature
+- current upstream SGLang Mooncake integration does not forward `transport_backend` from `--hicache-storage-backend-extra-config`; use `MC_STORE_RS_TRANSPORT_BACKEND` when SGLang real mode must select `tent` or `classic_te`
 
 ## Route Control
 
