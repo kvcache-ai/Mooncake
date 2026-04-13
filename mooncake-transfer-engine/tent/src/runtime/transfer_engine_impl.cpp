@@ -1403,20 +1403,23 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
         }
-        if (task_status.s == COMPLETED) {
-            success_tasks++;
-            overall_status.transferred_bytes += task_status.transferred_bytes;
-        } else {
-            overall_status.s = task_status.s;
-        }
         // memorize task result
         task.status = task_status.s;
 
+        // Attempt failover before status aggregation so that a
+        // successfully resubmitted task appears as PENDING and does not
+        // overwrite a permanent FAILED from another task in the batch.
         if (task_status.s == FAILED &&
             resubmitTransferTask(batch, task_id).ok()) {
             task.status = PENDING;
             task_status.s = PENDING;
-            overall_status.s = PENDING;
+        }
+
+        if (task_status.s == COMPLETED) {
+            success_tasks++;
+            overall_status.transferred_bytes += task_status.transferred_bytes;
+        } else if (task_status.s != PENDING) {
+            overall_status.s = task_status.s;
         }
 
         // Record metrics when task transitions to terminal state
