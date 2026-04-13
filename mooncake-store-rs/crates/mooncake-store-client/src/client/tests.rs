@@ -5098,6 +5098,198 @@ fn batch_get_emits_transport_pacing_hints() {
 }
 
 #[test]
+fn namespace_quota_isolated_per_scope() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("quota-scope-segment"));
+    let client = StoreClientBuilder::new(metadata, "quota-scope-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config())
+        .namespace_quota(NamespaceQuota::new().max_bytes(8).max_objects(1))
+        .build(10_000)
+        .expect("client build should succeed");
+
+    let route_a = client
+        .batch_put(&[
+            PutRequest::new("key-a", b"alpha")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("gold"),
+        ])
+        .expect("scope-a write should succeed");
+    assert_eq!(route_a.len(), 1);
+
+    let route_b = client
+        .batch_put(&[
+            PutRequest::new("key-b", b"bravo")
+                .tenant("tenant-a")
+                .domain("domain-b")
+                .object_set("set-b")
+                .qos_tier("silver"),
+        ])
+        .expect("scope-b write should succeed");
+    assert_eq!(route_b.len(), 1);
+
+    let error = client
+        .batch_put(&[
+            PutRequest::new("key-c", b"x")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("gold"),
+        ])
+        .expect_err("same scope should hit quota");
+    assert!(error.to_string().contains("namespace quota exceeded"));
+
+    let scope_a = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a"));
+    let scope_b = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-b"), Some("set-b"));
+    let scope_a_routes = client
+        .list_routes_in_scope(&scope_a)
+        .expect("scope-a listing should succeed");
+    let scope_b_routes = client
+        .list_routes_in_scope(&scope_b)
+        .expect("scope-b listing should succeed");
+    assert_eq!(scope_a_routes.len(), 1);
+    assert_eq!(scope_a_routes[0].logical_key.as_deref(), Some("key-a"));
+    assert_eq!(scope_b_routes.len(), 1);
+    assert_eq!(scope_b_routes[0].logical_key.as_deref(), Some("key-b"));
+}
+
+#[test]
+fn namespace_scoped_placement_and_route_views_stay_isolated() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("namespace-isolation-segment"));
+    publish_labeled_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-domain-a",
+        "seg-domain-a",
+        "pool-a",
+        1024,
+        1,
+        Some("domain-a"),
+        Some("set-a"),
+        Some("gold"),
+    );
+    publish_labeled_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-domain-b",
+        "seg-domain-b",
+        "pool-a",
+        1024,
+        1,
+        Some("domain-b"),
+        Some("set-b"),
+        Some("silver"),
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "namespace-isolation-writer")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    let routes = writer
+        .batch_put(&[
+            PutRequest::new("key-a", b"payload-a")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("gold")
+                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+            PutRequest::new("key-b", b"payload-b")
+                .tenant("tenant-a")
+                .domain("domain-b")
+                .object_set("set-b")
+                .qos_tier("silver")
+                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+        ])
+        .expect("scoped writes should succeed");
+    assert_eq!(routes.len(), 2);
+
+    let route_a = routes
+        .iter()
+        .find(|route| route.logical_key.as_deref() == Some("key-a"))
+        .expect("route-a should exist");
+    let route_b = routes
+        .iter()
+        .find(|route| route.logical_key.as_deref() == Some("key-b"))
+        .expect("route-b should exist");
+    assert_eq!(route_a.replicas[0].owner.stable_id.0, "storage-domain-a");
+    assert_eq!(route_b.replicas[0].owner.stable_id.0, "storage-domain-b");
+    assert_eq!(
+        route_a.namespace.as_ref(),
+        Some(&NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a")))
+    );
+    assert_eq!(
+        route_b.namespace.as_ref(),
+        Some(&NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-b"), Some("set-b")))
+    );
+    assert_eq!(route_a.qos_tier.as_deref(), Some("gold"));
+    assert_eq!(route_b.qos_tier.as_deref(), Some("silver"));
+
+    let queried_a = writer
+        .query_route_by_object_id(&LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a")),
+            "key-a",
+        ))
+        .expect("route-a query should succeed")
+        .expect("route-a should exist");
+    let queried_b = writer
+        .query_route_by_object_id(&LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-b"), Some("set-b")),
+            "key-b",
+        ))
+        .expect("route-b query should succeed")
+        .expect("route-b should exist");
+    assert_eq!(queried_a.namespace, route_a.namespace);
+    assert_eq!(queried_b.namespace, route_b.namespace);
+
+    let scope_a = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a"));
+    let scope_b = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-b"), Some("set-b"));
+    let scope_a_routes = writer
+        .list_routes_in_scope(&scope_a)
+        .expect("scope-a listing should succeed");
+    let scope_b_routes = writer
+        .list_routes_in_scope(&scope_b)
+        .expect("scope-b listing should succeed");
+    assert_eq!(scope_a_routes.len(), 1);
+    assert_eq!(scope_a_routes[0].logical_key.as_deref(), Some("key-a"));
+    assert_eq!(scope_b_routes.len(), 1);
+    assert_eq!(scope_b_routes[0].logical_key.as_deref(), Some("key-b"));
+
+    let reuse_a = writer
+        .list_reuse_candidates(&mooncake_store_core::ReuseIdentity::new(
+            "tenant-a",
+            "domain-a",
+            "tenant-a",
+            "tenant-a/domain-a/set-a/key-a",
+        ))
+        .expect("reuse-a listing should succeed");
+    let reuse_b = writer
+        .list_reuse_candidates(&mooncake_store_core::ReuseIdentity::new(
+            "tenant-a",
+            "domain-b",
+            "tenant-a",
+            "tenant-a/domain-b/set-b/key-b",
+        ))
+        .expect("reuse-b listing should succeed");
+    assert_eq!(reuse_a.len(), 1);
+    assert_eq!(reuse_a[0].logical_key.as_deref(), Some("key-a"));
+    assert_eq!(reuse_b.len(), 1);
+    assert_eq!(reuse_b[0].logical_key.as_deref(), Some("key-b"));
+}
+
+#[test]
 fn put_paths_accept_namespace_dimensions_beyond_routed_fast_path() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-namespace-placement-segment"));
@@ -5488,6 +5680,93 @@ fn registered_buffer_subranges_support_put_from_and_batch_get_into() {
     assert_eq!(sizes, vec![payload_a.len(), payload_b.len()]);
     assert_eq!(&target[..payload_a.len()], payload_a);
     assert_eq!(&target[64..64 + payload_b.len()], payload_b);
+}
+
+#[test]
+fn qos_tier_drives_namespace_governance_and_placement() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("qos-governance-segment"));
+    publish_labeled_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-gold",
+        "seg-gold",
+        "pool-a",
+        1024,
+        1,
+        Some("domain-a"),
+        Some("set-a"),
+        Some("gold"),
+    );
+    publish_labeled_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-bronze",
+        "seg-bronze",
+        "pool-a",
+        1024,
+        1,
+        Some("domain-a"),
+        Some("set-a"),
+        Some("bronze"),
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let client = StoreClientBuilder::new(metadata, "qos-governance-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport)
+        .local_memory(storage_config())
+        .namespace_quota(NamespaceQuota::new().max_bytes(8).max_objects(2))
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("client build should succeed");
+
+    let gold = client
+        .batch_put(&[
+            PutRequest::new("gold-key", b"1234")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("gold")
+                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+        ])
+        .expect("gold write should succeed");
+    let bronze = client
+        .batch_put(&[
+            PutRequest::new("bronze-key", b"5678")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("bronze")
+                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+        ])
+        .expect("bronze write should succeed");
+
+    assert_eq!(gold[0].replicas[0].owner.stable_id.0, "storage-gold");
+    assert_eq!(gold[0].qos_tier.as_deref(), Some("gold"));
+    assert_eq!(bronze[0].qos_tier.as_deref(), Some("bronze"));
+
+    let scope = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a"));
+    let routes = client
+        .list_routes_in_scope(&scope)
+        .expect("scope listing should succeed");
+    assert_eq!(routes.len(), 2);
+    assert!(routes.iter().any(|route| route.logical_key.as_deref() == Some("gold-key")));
+    assert!(routes.iter().any(|route| route.logical_key.as_deref() == Some("bronze-key")));
+
+    let over_quota = client
+        .batch_put(&[
+            PutRequest::new("gold-overflow", b"x")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("gold"),
+        ])
+        .expect_err("namespace quota should ignore qos tier boundaries after shared scope fills up");
+    assert!(over_quota.to_string().contains("namespace quota exceeded"));
 }
 
 #[test]
@@ -9059,6 +9338,59 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
             offset_bytes: orphaned.offset_bytes,
             length_bytes: orphaned.length_bytes,
         }));
+}
+
+#[test]
+fn qos_tier_reclaims_low_priority_before_high_priority() {
+    let mut state = StoreState::default();
+    let owner = ClientRuntimeId::new("owner-a", ClientEpoch(1));
+    state.pending_reclaims.push_back(PendingReclaim {
+        due_at_ms: 5,
+        policy_rank: 3,
+        tenant: "tenant-a".to_string(),
+        qos_tier: "critical".to_string(),
+        storage_runtime: owner.clone(),
+        segment_name: SegmentName::new("seg-critical"),
+        offset_bytes: 0,
+        length_bytes: 8,
+    });
+    state.pending_reclaims.push_back(PendingReclaim {
+        due_at_ms: 5,
+        policy_rank: 2,
+        tenant: "tenant-a".to_string(),
+        qos_tier: "gold".to_string(),
+        storage_runtime: owner.clone(),
+        segment_name: SegmentName::new("seg-gold"),
+        offset_bytes: 8,
+        length_bytes: 8,
+    });
+    state.pending_reclaims.push_back(PendingReclaim {
+        due_at_ms: 5,
+        policy_rank: 0,
+        tenant: "tenant-a".to_string(),
+        qos_tier: "bronze".to_string(),
+        storage_runtime: owner.clone(),
+        segment_name: SegmentName::new("seg-bronze"),
+        offset_bytes: 16,
+        length_bytes: 8,
+    });
+    state.pending_reclaims.push_back(PendingReclaim {
+        due_at_ms: 5,
+        policy_rank: 1,
+        tenant: "tenant-a".to_string(),
+        qos_tier: "default".to_string(),
+        storage_runtime: owner,
+        segment_name: SegmentName::new("seg-default"),
+        offset_bytes: 24,
+        length_bytes: 8,
+    });
+
+    let due = state.take_due_reclaims(10);
+    assert_eq!(due.len(), 4);
+    assert_eq!(due[0].segment_name, SegmentName::new("seg-bronze"));
+    assert_eq!(due[1].segment_name, SegmentName::new("seg-default"));
+    assert_eq!(due[2].segment_name, SegmentName::new("seg-gold"));
+    assert_eq!(due[3].segment_name, SegmentName::new("seg-critical"));
 }
 
 #[test]

@@ -1173,7 +1173,11 @@ impl StoreClient {
                 .iter()
                 .map(|object| {
                     let tenant = object.tenant.unwrap_or(self.default_tenant());
-                    (tenant.to_string(), self.scoped_key(tenant, object.key))
+                    let object_id = LogicalObjectId::new(
+                        NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+                        object.key,
+                    );
+                    (tenant.to_string(), ObjectKey::from_logical_id(&object_id))
                 })
                 .collect::<Vec<_>>();
             let routes = self.route_directory.get_object_routes(
