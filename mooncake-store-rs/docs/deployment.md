@@ -181,6 +181,84 @@ Important inputs:
 - `SGLANG_HICACHE_MOONCAKE_REUSE_TE` defaults to `0` for this validation path
 - logs are written to `target/sglang-true-e2e-*.log`
 
+Manual launch patterns:
+
+- real-mode SGLang with an in-process routed rw-only client (`storage=0`)
+
+```bash
+SGLANG_HICACHE_MOONCAKE_REUSE_TE=0 \
+python -m sglang.launch_server \
+  --model-path /models/Qwen3-0.6B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --enable-hierarchical-cache \
+  --hicache-size 4 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --hicache-storage-backend mooncake \
+  --hicache-storage-prefetch-policy wait_complete \
+  --hicache-storage-backend-extra-config '{
+    "local_hostname": "10.0.0.21:17121",
+    "metadata_server": "redis://10.0.0.10:6379/0",
+    "global_segment_size": 0,
+    "local_buffer_size": 16777216,
+    "protocol": "tcp",
+    "rdma_devices": "",
+    "stable_id": "sglang-rw-0",
+    "tenant": "default",
+    "labels": {"pool": "pool-a", "storage": "false"},
+    "routed_writes": true,
+    "replica_count": 2,
+    "route_topk": 2,
+    "transport_backend": "tent"
+  }'
+```
+
+- dummy-mode SGLang through a standalone routed gateway
+
+```bash
+mooncake-store-client \
+  --local-hostname 10.0.0.21 \
+  --metadata-url redis://10.0.0.10:6379/0 \
+  --storage-bytes 0 \
+  --scratch-bytes 16777216 \
+  --protocol tcp \
+  --transport-rpc-port 17121 \
+  --stable-id sglang-gateway \
+  --tenant default \
+  --label pool=pool-a \
+  --label storage=false \
+  --routed-writes \
+  --replica-count 2 \
+  --route-topk 2 \
+  --client-server-address 0.0.0.0:16590 \
+  --metrics-addr 0.0.0.0:19101
+
+SGLANG_HICACHE_MOONCAKE_REUSE_TE=0 \
+python -m sglang.launch_server \
+  --model-path /models/Qwen3-0.6B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --enable-hierarchical-cache \
+  --hicache-size 4 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --hicache-storage-backend mooncake \
+  --hicache-storage-prefetch-policy wait_complete \
+  --hicache-storage-backend-extra-config '{
+    "standalone_storage": true,
+    "client_server_address": "10.0.0.21:16590",
+    "check_server": false,
+    "prefetch_threshold": 32
+  }'
+```
+
+- real mode uses `setup(...)` and does not use `client_server_address`
+- dummy mode uses `setup_dummy(...)` and only needs `client_server_address`
+- the current `run-sglang-true-e2e.sh` workflow validates the dummy/gateway topology
+
 The runner intentionally does not scan local model caches. A missing model path is a configuration error unless auto-download is explicitly enabled.
 
 ### Multi-client stress benchmark
