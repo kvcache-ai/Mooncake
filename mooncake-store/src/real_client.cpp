@@ -640,6 +640,28 @@ inline std::string get_config(const ConfigDict &config, const std::string &key,
     return (it != config.end()) ? it->second : default_value;
 }
 
+inline bool get_config_bool(const ConfigDict &config, const std::string &key,
+                            bool default_value) {
+    auto it = config.find(key);
+    if (it == config.end()) {
+        return default_value;
+    }
+    std::string value = it->second;
+    // Lowercase for case-insensitive comparison
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (value == "true" || value == "1" || value == "yes" || value == "on") {
+        return true;
+    }
+    if (value == "false" || value == "0" || value == "no" || value == "off") {
+        return false;
+    }
+    LOG(WARNING) << "Invalid boolean value for config key '" << key
+                 << "': " << it->second
+                 << ", using default: " << (default_value ? "true" : "false");
+    return default_value;
+}
+
 inline size_t get_config_size(const ConfigDict &config, const std::string &key,
                               size_t default_value) {
     auto it = config.find(key);
@@ -696,6 +718,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         config, CONFIG_KEY_MASTER_SERVER_ADDR, DEFAULT_MASTER_SERVER_ADDR);
     std::string ipc_socket_path =
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
+    bool enable_offload =
+        get_config_bool(config, CONFIG_KEY_ENABLE_OFFLOAD, false);
 
     // Validate size parameters are within acceptable ranges
     if (global_segment_size < MIN_SEGMENT_SIZE ||
@@ -722,7 +746,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     return setup_internal(local_hostname, metadata_server, global_segment_size,
                           local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path);
+                          master_server_addr, nullptr, ipc_socket_path,
+                          /*local_rpc_port=*/0, enable_offload);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(

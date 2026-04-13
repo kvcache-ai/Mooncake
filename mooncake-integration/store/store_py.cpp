@@ -1607,7 +1607,10 @@ PYBIND11_MODULE(store, m) {
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
             "  master_server_addr: Master server address.\n"
-            "  ipc_socket_path: IPC socket path.")
+            "  ipc_socket_path: IPC socket path.\n"
+            "  enable_offload: Enable LOCAL_DISK offload "
+            "(accepts 'true'/'false', '1'/'0', 'yes'/'no', 'on'/'off'; "
+            "default 'false').")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
