@@ -48,6 +48,7 @@ type BlockRemovedEvent struct {
 	BlockHashes []uint64
 	ModelName   string
 	PodName     string
+	Medium      string
 }
 
 func (e *BlockRemovedEvent) GetType() EventType {

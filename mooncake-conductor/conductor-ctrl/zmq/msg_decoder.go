@@ -89,6 +89,7 @@ func decodeCommonEventBatch(
 		Events:           make([]KVEvent, 0, len(events)),
 		DataParallelRank: dpRank,
 	}
+	slog.Info("Receive batched kv-event", "source", batch.Source, "dpRank", dpRank)
 
 	for i, rawEvent := range events {
 		eventSlice, ok := rawEvent.([]interface{})
@@ -150,6 +151,8 @@ func (p *vllmParser) ParseEvent(raw []interface{}, timestamp interface{}) (KVEve
 	switch eventType {
 	case EventTypeBlockStored:
 		return parseVllmBlockStored(raw, timestamp)
+	case EventTypeBlockRemoved:
+		return parseVllmBlockRemoved(raw, timestamp)
 	default:
 		return nil, fmt.Errorf("unhandled event: %s", eventType)
 	}
@@ -245,14 +248,14 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 		return nil, fmt.Errorf("failed to parse timestamp: %w", err)
 	}
 
-	// // Parse block hashes
+	// Parse block hashes
 	if hashes, err := parseUint64Array(data[1]); err == nil {
 		event.BlockHashes = hashes
 	} else {
 		return nil, fmt.Errorf("failed to parse block_hashes: %w", err)
 	}
 
-	// // Parse token IDs (array of arrays)
+	// Parse token IDs (array of arrays)
 	if tokenIDsRaw, ok := data[3].([]interface{}); ok {
 		tokens, err := parseInt32Array(tokenIDsRaw)
 		if err != nil {
@@ -289,6 +292,30 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 		return nil, fmt.Errorf("failed to parse 'medium' from field at index 6: %w", err)
 	}
 
+	return event, nil
+}
+
+func parseVllmBlockRemoved(data []interface{}, timestamp interface{}) (*BlockRemovedEvent, error) {
+	event := &BlockRemovedEvent{
+		Type: EventTypeBlockRemoved,
+	}
+	for i, elem := range data {
+		slog.Debug("in parseVllmBlockRemoved:", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
+	}
+
+	// Parse block hashes
+	if hashes, err := parseUint64Array(data[1]); err == nil {
+		event.BlockHashes = hashes
+	} else {
+		return nil, fmt.Errorf("failed to parse block_hashes: %w", err)
+	}
+
+	// parse medium
+	if medium, err := safeGetString(data[2]); err == nil {
+		event.Medium = medium
+	} else {
+		return nil, fmt.Errorf("failed to parse 'medium' from field at index 6: %w", err)
+	}
 	return event, nil
 }
 
