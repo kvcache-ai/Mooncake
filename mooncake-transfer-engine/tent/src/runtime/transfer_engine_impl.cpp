@@ -228,19 +228,32 @@ void setLogLevel(const std::string level) {
         FLAGS_minloglevel = google::ERROR;
 }
 
+static std::string readIdentityFile(const char* path) {
+    std::ifstream file(path);
+    if (!file) return "";
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    if (!content.empty() && content.back() == '\n') content.pop_back();
+    return content;
+}
+
 std::string getMachineID() {
-    std::ifstream file("/etc/machine-id");
-    if (file) {
-        std::string content((std::istreambuf_iterator<char>(file)),
-                            std::istreambuf_iterator<char>());
-        if (!content.empty() && content.back() == '\n') content.pop_back();
-        return content;
-    } else {
-        std::string content = "undefined_machine_";
-        for (int i = 0; i < 16; ++i)
-            content += 'a' + SimpleRandom::Get().next(26);
-        return content;
+    const std::string boot_id =
+        readIdentityFile("/proc/sys/kernel/random/boot_id");
+    const std::string machine_id = readIdentityFile("/etc/machine-id");
+
+    if (!boot_id.empty() && !machine_id.empty()) {
+        return boot_id + ":" + machine_id;
     }
+
+    if (!boot_id.empty()) return boot_id;
+    if (!machine_id.empty()) return machine_id;
+
+    std::string content = "undefined_machine_";
+    for (int i = 0; i < 16; ++i)
+        content += 'a' + SimpleRandom::Get().next(26);
+    LOG(WARNING) << "TENT getMachineID source=fallback value=" << content;
+    return content;
 }
 
 Status TransferEngineImpl::setupLocalSegment() {
