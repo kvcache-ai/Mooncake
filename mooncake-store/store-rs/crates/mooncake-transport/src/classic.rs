@@ -4,6 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use mooncake_store_core::{Result, StoreError};
 use mooncake_transport_sys::classic as ffi;
 
+use crate::env::EnvOverrideGuard;
 use crate::{Opcode, TransferProgress, TransferRequest, TransferStatus};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,64 +283,22 @@ fn classic_engine_create_lock() -> &'static Mutex<()> {
 }
 
 struct ClassicCreateEnvGuard {
-    saved_use_tent: Option<String>,
-    saved_use_tev1: Option<String>,
-    saved_tcp_bind_address: Option<String>,
-    saved_redis_username: Option<String>,
-    saved_redis_password: Option<String>,
-    saved_redis_db_index: Option<String>,
+    _env: EnvOverrideGuard,
 }
 
 impl ClassicCreateEnvGuard {
     fn apply(config: &ClassicEngineConfig) -> Self {
-        let saved_use_tent = set_env_override("MC_USE_TENT", None);
-        let saved_use_tev1 = set_env_override("MC_USE_TEV1", None);
-        let saved_tcp_bind_address = set_env_override(
+        let mut env = EnvOverrideGuard::new();
+        env.set_optional("MC_USE_TENT", None);
+        env.set_optional("MC_USE_TEV1", None);
+        env.set_optional(
             "MC_TCP_BIND_ADDRESS",
             (!config.rpc_bind_host().is_empty()).then_some(config.rpc_bind_host()),
         );
-        let saved_redis_username =
-            set_env_override("MC_REDIS_USERNAME", config.redis_username_value());
-        let saved_redis_password =
-            set_env_override("MC_REDIS_PASSWORD", config.redis_password_value());
-        let saved_redis_db_index =
-            set_env_override("MC_REDIS_DB_INDEX", config.redis_db_index_value());
-
-        Self {
-            saved_use_tent,
-            saved_use_tev1,
-            saved_tcp_bind_address,
-            saved_redis_username,
-            saved_redis_password,
-            saved_redis_db_index,
-        }
-    }
-}
-
-impl Drop for ClassicCreateEnvGuard {
-    fn drop(&mut self) {
-        restore_env("MC_USE_TENT", self.saved_use_tent.take());
-        restore_env("MC_USE_TEV1", self.saved_use_tev1.take());
-        restore_env("MC_TCP_BIND_ADDRESS", self.saved_tcp_bind_address.take());
-        restore_env("MC_REDIS_USERNAME", self.saved_redis_username.take());
-        restore_env("MC_REDIS_PASSWORD", self.saved_redis_password.take());
-        restore_env("MC_REDIS_DB_INDEX", self.saved_redis_db_index.take());
-    }
-}
-
-fn set_env_override(key: &str, value: Option<&str>) -> Option<String> {
-    let previous = std::env::var(key).ok();
-    match value {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
-    }
-    previous
-}
-
-fn restore_env(key: &str, value: Option<String>) {
-    match value {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
+        env.set_optional("MC_REDIS_USERNAME", config.redis_username_value());
+        env.set_optional("MC_REDIS_PASSWORD", config.redis_password_value());
+        env.set_optional("MC_REDIS_DB_INDEX", config.redis_db_index_value());
+        Self { _env: env }
     }
 }
 
@@ -416,7 +375,7 @@ mod tests {
 
     use super::{
         check_zero, decode_status, encode_opcode, encode_request, encode_requests, read_c_buffer,
-        restore_env, to_cstring, ClassicCreateEnvGuard, ClassicEngineConfig, ClassicTransferEngine,
+        to_cstring, ClassicCreateEnvGuard, ClassicEngineConfig, ClassicTransferEngine,
         ClassicTransportProtocol,
     };
     use crate::{Opcode, TransferRequest, TransferStatus};
@@ -482,12 +441,12 @@ mod tests {
         let _lock = super::classic_engine_create_lock()
             .lock()
             .expect("classic env test lock poisoned");
-        restore_env("MC_USE_TENT", Some("1".to_string()));
-        restore_env("MC_USE_TEV1", Some("1".to_string()));
-        restore_env("MC_TCP_BIND_ADDRESS", Some("old".to_string()));
-        restore_env("MC_REDIS_USERNAME", Some("old-user".to_string()));
-        restore_env("MC_REDIS_PASSWORD", Some("old-pass".to_string()));
-        restore_env("MC_REDIS_DB_INDEX", Some("9".to_string()));
+        std::env::set_var("MC_USE_TENT", "1");
+        std::env::set_var("MC_USE_TEV1", "1");
+        std::env::set_var("MC_TCP_BIND_ADDRESS", "old");
+        std::env::set_var("MC_REDIS_USERNAME", "old-user");
+        std::env::set_var("MC_REDIS_PASSWORD", "old-pass");
+        std::env::set_var("MC_REDIS_DB_INDEX", "9");
         let config = ClassicEngineConfig::new("redis://127.0.0.1:6379", "127.0.0.1")
             .redis_username("new-user")
             .redis_password("new-pass")
@@ -522,12 +481,12 @@ mod tests {
             Ok("old-pass")
         );
         assert_eq!(std::env::var("MC_REDIS_DB_INDEX").as_deref(), Ok("9"));
-        restore_env("MC_USE_TENT", None);
-        restore_env("MC_USE_TEV1", None);
-        restore_env("MC_TCP_BIND_ADDRESS", None);
-        restore_env("MC_REDIS_USERNAME", None);
-        restore_env("MC_REDIS_PASSWORD", None);
-        restore_env("MC_REDIS_DB_INDEX", None);
+        std::env::remove_var("MC_USE_TENT");
+        std::env::remove_var("MC_USE_TEV1");
+        std::env::remove_var("MC_TCP_BIND_ADDRESS");
+        std::env::remove_var("MC_REDIS_USERNAME");
+        std::env::remove_var("MC_REDIS_PASSWORD");
+        std::env::remove_var("MC_REDIS_DB_INDEX");
     }
 
     #[test]

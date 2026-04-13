@@ -1,4 +1,5 @@
 mod classic;
+mod env;
 mod tent;
 
 use std::ffi::c_void;
