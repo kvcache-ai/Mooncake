@@ -13,11 +13,11 @@ The benchmark targets the prefill stage and reports two primary metrics: Time-To
 
 ## Benchmark Result
 
-![overall performance](ssd_offload_overall.png)
+![overall performance](../image/ssd_offload_overall.png)
 
 The figure above summarizes the end-to-end results on a single DGX node (8 × A100-SXM4-40GB, dual RDMA NICs). Enabling SSD offload cuts average TTFT by **57%** relative to GPU only and by **34%** relative to Mooncake without SSD, while delivering a **2.4×** improvement in input token throughput.
 
-![per-turn performance](ssd_offload_per_turn.png)
+![per-turn performance](../image/ssd_offload_per_turn.png)
 
 To better understand where the gains come from, we break down TTFT and cache hit rate by conversation round. The output length is fixed to 1 token so that decode overhead does not obscure prefill differences.
 
