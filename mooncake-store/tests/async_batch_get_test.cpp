@@ -39,11 +39,11 @@ class AsyncBatchGetTest : public ::testing::Test {
         const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                              ? FLAGS_device_name
                                              : std::string("");
-        ASSERT_EQ(
-            py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                                   16 * 1024 * 1024, 16 * 1024 * 1024,
-                                   FLAGS_protocol, rdma_devices, master_address_),
-            0);
+        ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                         16 * 1024 * 1024, 16 * 1024 * 1024,
+                                         FLAGS_protocol, rdma_devices,
+                                         master_address_),
+                  0);
     }
 
     void TearDown() override {
@@ -196,8 +196,8 @@ TEST_F(AsyncBatchGetTest, TwoPhase_ConsistencyWithSync) {
 
     // Sync path
     void* sync_buf = RegisterBuffer(buf_size);
-    auto sync_results = py_client_->batch_get_into(
-        {key}, {sync_buf}, {buf_size});
+    auto sync_results =
+        py_client_->batch_get_into({key}, {sync_buf}, {buf_size});
     ASSERT_EQ(sync_results.size(), 1u);
     ASSERT_GT(sync_results[0], 0);
 
@@ -281,8 +281,8 @@ TEST_F(AsyncBatchGetTest, Context_MultipleConcurrentSubmits) {
         EXPECT_EQ(results[0], 0);
 
         int idx = token_to_idx[token];
-        EXPECT_EQ(memcmp(buffers[idx], data_vec[idx].data(),
-                         data_vec[idx].size()), 0)
+        EXPECT_EQ(
+            memcmp(buffers[idx], data_vec[idx].data(), data_vec[idx].size()), 0)
             << "Data mismatch for op " << idx;
     }
     EXPECT_EQ(ctx->in_flight(), 0u);
@@ -348,7 +348,8 @@ TEST_F(AsyncBatchGetTest, Context_NonExistentKeyReturnsErrorViaWaitAny) {
     auto [ret_token, results] = ctx->wait_any();
     EXPECT_EQ(ret_token, token);
     ASSERT_EQ(results.size(), 1u);
-    EXPECT_EQ(results[0], -1) << "Non-existent key should report error in results";
+    EXPECT_EQ(results[0], -1)
+        << "Non-existent key should report error in results";
     EXPECT_EQ(ctx->in_flight(), 0u);
 
     UnregisterAndFree(buf);

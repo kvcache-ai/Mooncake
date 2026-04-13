@@ -3646,10 +3646,9 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
 // Two-phase batch_get: RealClient wrappers
 // ============================================================================
 
-BatchGetState RealClient::batch_get_submit(
-    const std::vector<std::string> &keys,
-    const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes) {
+BatchGetState RealClient::batch_get_submit(const std::vector<std::string> &keys,
+                                           const std::vector<void *> &buffers,
+                                           const std::vector<size_t> &sizes) {
     BatchGetState state;
 
     if (!client_) {
@@ -3722,8 +3721,8 @@ BatchGetState RealClient::batch_get_submit(
         return state;
     }
 
-    state = client_->BatchGetSubmit(batch_keys, batch_query_results,
-                                    batch_slices);
+    state =
+        client_->BatchGetSubmit(batch_keys, batch_query_results, batch_slices);
 
     // Re-index from batch keys to original keys
     auto batch_results = std::move(state.results);
@@ -3769,10 +3768,10 @@ std::unique_ptr<AsyncGetContext> RealClient::create_async_context(
 // AsyncGetContext implementation
 // ============================================================================
 
-AsyncGetContext::AsyncGetContext(RealClient* client, size_t max_concurrency)
+AsyncGetContext::AsyncGetContext(RealClient *client, size_t max_concurrency)
     : client_(client), max_concurrency_(max_concurrency) {
-    completion_thread_ = std::thread(&AsyncGetContext::completion_thread_func,
-                                     this);
+    completion_thread_ =
+        std::thread(&AsyncGetContext::completion_thread_func, this);
 }
 
 AsyncGetContext::~AsyncGetContext() {
@@ -3785,17 +3784,16 @@ AsyncGetContext::~AsyncGetContext() {
     // Drain active slots: wait for all in-flight RDMA transfers to complete
     // before destroying state. Otherwise freeBatchID may fail (BatchBusy)
     // leaking batch_desc, and RDMA hardware may DMA into freed buffers.
-    for (auto& slot : active_slots_) {
-        for (auto& pt : slot.state.pending_transfers) {
+    for (auto &slot : active_slots_) {
+        for (auto &pt : slot.state.pending_transfers) {
             pt.future.wait();
         }
     }
 }
 
 AsyncGetContext::Token AsyncGetContext::submit(
-    const std::vector<std::string>& keys,
-    const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes) {
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes) {
     // Atomically reserve a slot (CAS to prevent exceeding max_concurrency)
     size_t current = in_flight_count_.load();
     while (true) {
@@ -3843,9 +3841,7 @@ AsyncGetContext::wait_any() {
     return result;
 }
 
-size_t AsyncGetContext::in_flight() const {
-    return in_flight_count_.load();
-}
+size_t AsyncGetContext::in_flight() const { return in_flight_count_.load(); }
 
 void AsyncGetContext::completion_thread_func() {
     while (running_.load()) {
@@ -3853,9 +3849,9 @@ void AsyncGetContext::completion_thread_func() {
         std::vector<Slot> ready_slots;
         {
             std::lock_guard<std::mutex> lk(slots_mu_);
-            for (auto it = active_slots_.begin(); it != active_slots_.end(); ) {
+            for (auto it = active_slots_.begin(); it != active_slots_.end();) {
                 bool all_ready = true;
-                for (auto& pt : it->state.pending_transfers) {
+                for (auto &pt : it->state.pending_transfers) {
                     if (!pt.future.isReady()) {
                         all_ready = false;
                         break;
@@ -3863,7 +3859,8 @@ void AsyncGetContext::completion_thread_func() {
                 }
 
                 if (all_ready) {
-                    ready_slots.push_back(Slot{it->token, std::move(it->state)});
+                    ready_slots.push_back(
+                        Slot{it->token, std::move(it->state)});
                     it = active_slots_.erase(it);
                 } else {
                     ++it;
@@ -3872,7 +3869,7 @@ void AsyncGetContext::completion_thread_func() {
         }  // slots_mu_ released
 
         // Phase 2: Without lock, complete transfers and enqueue results
-        for (auto& slot : ready_slots) {
+        for (auto &slot : ready_slots) {
             auto results = client_->batch_get_complete(slot.state);
             {
                 std::lock_guard<std::mutex> cq_lk(cq_mu_);

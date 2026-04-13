@@ -33,15 +33,15 @@ class AsyncGetContext {
     using Token = uint64_t;
     static constexpr Token INVALID_TOKEN = static_cast<Token>(-1);
 
-    explicit AsyncGetContext(class RealClient* client, size_t max_concurrency);
+    explicit AsyncGetContext(class RealClient *client, size_t max_concurrency);
     ~AsyncGetContext();
 
-    AsyncGetContext(const AsyncGetContext&) = delete;
-    AsyncGetContext& operator=(const AsyncGetContext&) = delete;
+    AsyncGetContext(const AsyncGetContext &) = delete;
+    AsyncGetContext &operator=(const AsyncGetContext &) = delete;
 
-    Token submit(const std::vector<std::string>& keys,
-                 const std::vector<void*>& buffers,
-                 const std::vector<size_t>& sizes);
+    Token submit(const std::vector<std::string> &keys,
+                 const std::vector<void *> &buffers,
+                 const std::vector<size_t> &sizes);
 
     std::pair<Token, std::vector<int64_t>> wait_any();
 
@@ -55,7 +55,7 @@ class AsyncGetContext {
 
     void completion_thread_func();
 
-    RealClient* client_;
+    RealClient *client_;
     size_t max_concurrency_;
     std::atomic<uint64_t> next_token_{0};
 

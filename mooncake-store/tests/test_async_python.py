@@ -98,13 +98,13 @@ class AsyncGetContextPythonTest(unittest.TestCase):
     def test_multiple_concurrent(self):
         num_ops = 3
         keys = []
-        datas = []
+        data_list = []
         for i in range(num_ops):
             k = f"py_async_concurrent_{i}"
             d = f"concurrent_data_{i}".encode()
             self._put_key(k, d)
             keys.append(k)
-            datas.append(d)
+            data_list.append(d)
 
         ctx = self.store.create_async_context(4)
         bufs = []
@@ -126,7 +126,7 @@ class AsyncGetContextPythonTest(unittest.TestCase):
             self.assertIn(ret_token, token_map)
             idx = token_map[ret_token]
             self.assertEqual(results[0], 0)
-            self.assertEqual(bufs[idx].raw[:len(datas[idx])], datas[idx])
+            self.assertEqual(bufs[idx].raw[:len(data_list[idx])], data_list[idx])
 
         self.assertEqual(ctx.in_flight, 0)
         for ptr in ptrs:

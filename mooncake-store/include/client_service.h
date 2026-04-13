@@ -54,7 +54,6 @@ class QueryResult {
     }
 };
 
-
 /**
  * @brief State captured between BatchGetSubmit and BatchGetComplete.
  * Holds in-flight TransferFutures and per-key metadata needed for completion.

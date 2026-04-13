@@ -1552,35 +1552,36 @@ PYBIND11_MODULE(store, m) {
     // methods
     // AsyncGetContext binding
     py::class_<AsyncGetContext>(m, "AsyncGetContext")
-        .def("submit",
-            [](AsyncGetContext& self,
-               const std::vector<std::string>& keys,
-               const std::vector<uintptr_t>& buffer_ptrs,
-               const std::vector<size_t>& sizes) {
-                std::vector<void*> buffers;
+        .def(
+            "submit",
+            [](AsyncGetContext &self, const std::vector<std::string> &keys,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes) {
+                std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
-                    buffers.push_back(reinterpret_cast<void*>(ptr));
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
                 return self.submit(keys, buffers, sizes);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
             "Submit async batch get. Returns token or -1 if full/failed.")
-        .def("wait_any",
-            [](AsyncGetContext& self) {
+        .def(
+            "wait_any",
+            [](AsyncGetContext &self) {
                 py::gil_scoped_release release;
                 return self.wait_any();
             },
             "Block until any submitted operation completes. "
             "Returns (token, results).")
-        .def_property_readonly("in_flight",
-            [](const AsyncGetContext& self) {
-                return self.in_flight();
-            },
+        .def_property_readonly(
+            "in_flight",
+            [](const AsyncGetContext &self) { return self.in_flight(); },
             "Current number of in-flight operations.")
-        .def_property_readonly_static("INVALID_TOKEN",
-            [](py::object) { return AsyncGetContext::INVALID_TOKEN; });
+        .def_property_readonly_static("INVALID_TOKEN", [](py::object) {
+            return AsyncGetContext::INVALID_TOKEN;
+        });
 
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
@@ -2344,9 +2345,10 @@ PYBIND11_MODULE(store, m) {
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
             "success, error code: 0 if success, non-zero if failure)")
-        .def("create_async_context",
-            [](MooncakeStorePyWrapper& self, size_t max_concurrency)
-                -> std::unique_ptr<AsyncGetContext> {
+        .def(
+            "create_async_context",
+            [](MooncakeStorePyWrapper &self,
+               size_t max_concurrency) -> std::unique_ptr<AsyncGetContext> {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return nullptr;

@@ -3041,7 +3041,6 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     return local_hostname_ == replica_transfer_endpoint;
 }
 
-
 // ============================================================================
 // Two-phase async BatchGet: Submit + Complete
 // Only supports memory replicas. SSD offload replicas are marked as errors.
@@ -3101,8 +3100,8 @@ BatchGetState Client::BatchGetSubmit(
 
         // Only support memory replicas in async path
         if (!replica.is_memory_replica()) {
-            LOG(WARNING) << "BatchGetSubmit: non-memory replica for key="
-                         << key << ", marking as unsupported";
+            LOG(WARNING) << "BatchGetSubmit: non-memory replica for key=" << key
+                         << ", marking as unsupported";
             state.results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
@@ -3129,8 +3128,8 @@ BatchGetState Client::BatchGetSubmit(
         VLOG(1) << "BatchGetSubmit: submitted key=" << key
                 << " strategy=" << static_cast<int>(future->strategy());
 
-        state.pending_transfers.emplace_back(
-            i, key, std::move(*future), replica, cache_used);
+        state.pending_transfers.emplace_back(i, key, std::move(*future),
+                                             replica, cache_used);
     }
 
     return state;
@@ -3168,8 +3167,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetComplete(
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
     for (size_t i = 0; i < state.object_keys.size(); ++i) {
-        if (state.results[i].has_value() &&
-            now >= state.lease_timeouts[i]) {
+        if (state.results[i].has_value() && now >= state.lease_timeouts[i]) {
             LOG(WARNING) << "lease_expired key=" << state.object_keys[i];
             state.results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
