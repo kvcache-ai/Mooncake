@@ -18,6 +18,7 @@
 
 #include "real_client.h"
 #include "client_buffer.hpp"
+#include "common.h"  // parseHostNameWithPort — handles IPv6 brackets
 #include "config.h"
 #include "mutex.h"
 #include "types.h"
@@ -590,12 +591,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         rpc_port_binder_.reset();
     }
 
-    // Start embedded Client RPC server for offload object reads.
-    // This is needed when using Python binding (no standalone server).
-    if (start_client_rpc_server() != 0) {
-        LOG(WARNING) << "Failed to start client RPC server on "
-                     << this->local_rpc_addr
-                     << ". LOCAL_DISK offload reads may not work.";
+    // Start embedded Client RPC server for offload object reads ONLY in
+    // embedded/Python mode.  Standalone (real_client_main.cpp) passes a
+    // non-zero FLAGS_port as local_rpc_port and runs its own
+    // coro_rpc_server afterwards; starting the embedded one here would
+    // bind the same port first and make the main server fail.
+    //
+    // - local_rpc_port == 0: Python auto-assign signal (embedded mode)
+    // - enable_offload == true: the handlers we register
+    //   (batch_get_offload_object, release_offload_buffer,
+    //   service_ready_internal) are only needed for LOCAL_DISK offload
+    if (local_rpc_port == 0 && enable_offload) {
+        if (start_client_rpc_server() != 0) {
+            LOG(WARNING) << "Failed to start client RPC server on "
+                         << this->local_rpc_addr
+                         << ". LOCAL_DISK offload reads may not work.";
+        }
     }
 
     if (FLAGS_enable_http_server) {
@@ -896,15 +907,16 @@ int RealClient::start_client_rpc_server() {
         return -1;
     }
 
-    // Parse host:port from local_rpc_addr
-    size_t colon = this->local_rpc_addr.find_last_of(':');
-    if (colon == std::string::npos) {
-        LOG(ERROR) << "Invalid local_rpc_addr (no port): "
+    // Parse host:port using the shared helper.  This correctly strips
+    // brackets from IPv6 endpoints (e.g. "[::1]:17813") and returns
+    // port 0 on malformed input without throwing — unlike std::stoi,
+    // which would terminate the process on invalid port strings.
+    auto [rpc_host, rpc_port] = parseHostNameWithPort(this->local_rpc_addr);
+    if (rpc_port == 0) {
+        LOG(ERROR) << "Invalid local_rpc_addr (no or malformed port): "
                    << this->local_rpc_addr;
         return -1;
     }
-    std::string rpc_host = this->local_rpc_addr.substr(0, colon);
-    int rpc_port = std::stoi(this->local_rpc_addr.substr(colon + 1));
 
     try {
         client_rpc_server_ =
