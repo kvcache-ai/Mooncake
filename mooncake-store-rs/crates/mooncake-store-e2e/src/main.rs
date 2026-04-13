@@ -57,18 +57,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "dynamic-membership".to_string(),
         ]);
 
-    let target_a_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "target-a-segment"),
-    )?;
-    let target_b_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "target-b-segment"),
-    )?;
-    let target_c_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "target-c-segment"),
-    )?;
+    let target_a_bundle =
+        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "target-a-segment"))?;
+    let target_b_bundle =
+        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "target-b-segment"))?;
+    let target_c_bundle =
+        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "target-c-segment"))?;
     let upgrade_bundle = build_tent_bundle(
         redis_port,
         &scoped_segment_name(run_id, "target-a-upgrade-segment"),
@@ -77,18 +71,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         redis_port,
         &scoped_segment_name(run_id, "target-reclaim-segment"),
     )?;
-    let router_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "router-segment"),
-    )?;
+    let router_bundle =
+        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "router-segment"))?;
     let router_replica_bundle = build_tent_bundle(
         redis_port,
         &scoped_segment_name(run_id, "router-replica-segment"),
     )?;
-    let reader_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "reader-segment"),
-    )?;
+    let reader_bundle =
+        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "reader-segment"))?;
     let elastic_target_bundle = build_tent_bundle(
         redis_port,
         &scoped_segment_name(run_id, "elastic-target-segment"),
