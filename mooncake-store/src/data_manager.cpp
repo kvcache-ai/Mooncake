@@ -130,8 +130,7 @@ std::vector<TierView> DataManager::GetTierViews() const {
 }
 
 void DataManager::ForEachKeyBatch(
-    const std::function<bool(std::vector<ReplicaLocation>&&)>& callback)
-    const {
+    const std::function<bool(std::vector<ReplicaLocation>&&)>& callback) const {
     if (tiered_backend_) {
         tiered_backend_->ForEachKeyBatch(callback);
     }
@@ -142,8 +141,7 @@ AccessStats DataManager::GetHotKeyStats() const {
     return tiered_backend_->GetHotKeyStats();
 }
 
-std::vector<UUID> DataManager::GetReplicaTierIds(
-    const std::string& key) const {
+std::vector<UUID> DataManager::GetReplicaTierIds(const std::string& key) const {
     if (!tiered_backend_) return {};
     return tiered_backend_->GetReplicaTierIds(key);
 }

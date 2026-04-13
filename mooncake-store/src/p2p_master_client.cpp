@@ -94,9 +94,8 @@ P2PMasterClient::BatchSyncReplica(const BatchSyncReplicaRequest& req) {
     timer.LogRequest("adds=", req.add_keys.size(),
                      ", removes=", req.remove_keys.size());
 
-    auto result =
-        invoke_rpc<&WrappedP2PMasterService::BatchSyncReplica,
-                    BatchSyncReplicaResponse>(req);
+    auto result = invoke_rpc<&WrappedP2PMasterService::BatchSyncReplica,
+                             BatchSyncReplicaResponse>(req);
     timer.LogResponseExpected(result);
     return result;
 }

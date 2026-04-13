@@ -534,8 +534,8 @@ class ClientService {
     std::condition_variable heartbeat_cv_;
     std::mutex heartbeat_mtx_;
     ViewVersionId view_version_{0};
-    /// True after MASTER_UNREACHABLE fires; cleared when MASTER_RECONNECTED fires.
-    /// Only accessed from the heartbeat thread — no locking required.
+    /// True after MASTER_UNREACHABLE fires; cleared when MASTER_RECONNECTED
+    /// fires. Only accessed from the heartbeat thread — no locking required.
     bool connection_interrupted_ = false;
 
     // Shutdown protection

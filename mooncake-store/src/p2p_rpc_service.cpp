@@ -20,9 +20,9 @@ void RegisterP2PRpcService(
     server.register_handler<
         &mooncake::WrappedP2PMasterService::BatchRemoveReplica>(
         &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedP2PMasterService::BatchSyncReplica>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedP2PMasterService::BatchSyncReplica>(
+            &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedP2PMasterService::SetSyncCompleted>(
             &wrapped_master_service);

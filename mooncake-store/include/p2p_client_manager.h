@@ -20,8 +20,7 @@ class P2PClientManager final : public ClientManager {
     std::shared_ptr<ClientMeta> CreateClientMeta(
         const RegisterClientRequest& req) override;
 
-    void OnClientRegistered(
-        const std::shared_ptr<ClientMeta>& meta) override {
+    void OnClientRegistered(const std::shared_ptr<ClientMeta>& meta) override {
         auto p2p_meta = std::dynamic_pointer_cast<P2PClientMeta>(meta);
         if (p2p_meta) {
             p2p_meta->SetSyncing(true);

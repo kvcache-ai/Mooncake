@@ -72,11 +72,9 @@ class HAIntegrationTest : public ::testing::Test {
 
     static tl::expected<void, ErrorCode> PutData(
         std::shared_ptr<P2PClientService>& client, const std::string& key,
-        const std::string& data,
-        const WriteRouteRequestConfig& config = {}) {
+        const std::string& data, const WriteRouteRequestConfig& config = {}) {
         std::vector<Slice> slices;
-        slices.emplace_back(
-            Slice{const_cast<char*>(data.data()), data.size()});
+        slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
         return client->Put(key, slices, config);
     }
 
@@ -84,8 +82,7 @@ class HAIntegrationTest : public ::testing::Test {
         std::shared_ptr<P2PClientService>& client, const std::string& key,
         size_t buf_size) {
         std::vector<char> buf(buf_size, 0);
-        auto result =
-            client->Get(key, {(void*)buf.data()}, {buf.size()});
+        auto result = client->Get(key, {(void*)buf.data()}, {buf.size()});
         if (!result.has_value()) {
             return tl::unexpected(result.error());
         }
@@ -114,8 +111,7 @@ class HAIntegrationTest : public ::testing::Test {
             << "Client did not recover to FULL within 10s";
     }
 
-    static void SendManualHeartbeat(
-        std::shared_ptr<P2PClientService>& client) {
+    static void SendManualHeartbeat(std::shared_ptr<P2PClientService>& client) {
         HeartbeatRequest req;
         req.client_id = client->GetClientID();
         auto result = client->GetMasterClient().Heartbeat(req);
@@ -170,8 +166,7 @@ class HAIntegrationTest : public ::testing::Test {
 
     // Per-test setup: ensure both clients are in FULL state.
     void SetUp() override {
-        for (auto* client :
-             {&client1_, &client2_}) {
+        for (auto* client : {&client1_, &client2_}) {
             if ((*client)->ha_manager_ &&
                 (*client)->ha_manager_->GetState() != HAClientState::FULL) {
                 ForceRecover(*client);
@@ -273,8 +268,8 @@ TEST_F(HAIntegrationTest, DegradedModeRemoteOpsFail) {
 
     // Get: local miss → cache miss → degraded check → INACCESSIBLE_MASTER
     std::vector<char> buf(100, 0);
-    auto get = client1_->Get("a3_client2_key", {(void*)buf.data()},
-                             {buf.size()});
+    auto get =
+        client1_->Get("a3_client2_key", {(void*)buf.data()}, {buf.size()});
     EXPECT_FALSE(get.has_value());
     EXPECT_EQ(get.error(), ErrorCode::INACCESSIBLE_MASTER);
 
@@ -295,8 +290,8 @@ TEST_F(HAIntegrationTest, RecoverFromDegradedRemoteGet) {
 
     // Verify Get fails during degradation
     std::vector<char> buf(11, 0);
-    auto get_fail = client1_->Get("a4_client2_key", {(void*)buf.data()},
-                                  {buf.size()});
+    auto get_fail =
+        client1_->Get("a4_client2_key", {(void*)buf.data()}, {buf.size()});
     EXPECT_FALSE(get_fail.has_value());
     EXPECT_EQ(get_fail.error(), ErrorCode::INACCESSIBLE_MASTER);
 
@@ -406,8 +401,7 @@ TEST_F(HAIntegrationTest, MasterSideState) {
             svc.GetClientManager().GetClient((*client)->GetClientID());
         ASSERT_NE(client_meta, nullptr);
 
-        auto p2p_meta =
-            std::dynamic_pointer_cast<P2PClientMeta>(client_meta);
+        auto p2p_meta = std::dynamic_pointer_cast<P2PClientMeta>(client_meta);
         ASSERT_NE(p2p_meta, nullptr);
         EXPECT_FALSE(p2p_meta->IsSyncing());
     }
@@ -437,8 +431,7 @@ TEST_F(HAIntegrationTest, MasterRestartRecovery) {
     builder.set_rpc_port(port);
     builder.set_client_live_ttl_sec(3600);
     builder.set_client_crashed_ttl_sec(7200);
-    ASSERT_TRUE(master_.Start(builder.build()))
-        << "Failed to restart master";
+    ASSERT_TRUE(master_.Start(builder.build())) << "Failed to restart master";
 
     // Reconnect RPC clients to the restarted master (old connections are
     // stale). Retry with backoff since the restarted RPC server may not
@@ -447,8 +440,7 @@ TEST_F(HAIntegrationTest, MasterRestartRecovery) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         auto err = client1_->GetMasterClient().Connect(master_address_);
         if (err == ErrorCode::OK) break;
-        if (attempt == 9)
-            FAIL() << "Reconnect client1 failed after retries";
+        if (attempt == 9) FAIL() << "Reconnect client1 failed after retries";
     }
     {
         auto err = client2_->GetMasterClient().Connect(master_address_);
@@ -458,12 +450,10 @@ TEST_F(HAIntegrationTest, MasterRestartRecovery) {
     // Re-register clients with the restarted master.
     auto reg1 = client1_->RegisterClient();
     ASSERT_TRUE(reg1.has_value())
-        << "Re-register client1 failed: "
-        << static_cast<int>(reg1.error());
+        << "Re-register client1 failed: " << static_cast<int>(reg1.error());
     auto reg2 = client2_->RegisterClient();
     ASSERT_TRUE(reg2.has_value())
-        << "Re-register client2 failed: "
-        << static_cast<int>(reg2.error());
+        << "Re-register client2 failed: " << static_cast<int>(reg2.error());
 
     // Recovery: DEGRADED → SYNCING → FULL
     ForceRecover(client1_);
@@ -503,9 +493,9 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
     {
         QueryClientStatusRequest req;
         req.client_id = tmp1->GetClientID();
-        auto res = short_ttl_master.GetWrapped()
-                       .GetMasterService()
-                       .QueryClientStatus(req);
+        auto res =
+            short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
+                req);
         ASSERT_TRUE(res.has_value());
         ASSERT_EQ(res.value().status, ClientStatus::HEALTH);
     }
@@ -520,9 +510,9 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
     {
         QueryClientStatusRequest req;
         req.client_id = tmp1->GetClientID();
-        auto res = short_ttl_master.GetWrapped()
-                       .GetMasterService()
-                       .QueryClientStatus(req);
+        auto res =
+            short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
+                req);
         ASSERT_TRUE(res.has_value());
         EXPECT_EQ(res.value().status, ClientStatus::DISCONNECTION)
             << "Master should have marked disconnected client";
@@ -532,9 +522,9 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
     {
         QueryClientStatusRequest req;
         req.client_id = tmp2->GetClientID();
-        auto res = short_ttl_master.GetWrapped()
-                       .GetMasterService()
-                       .QueryClientStatus(req);
+        auto res =
+            short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
+                req);
         ASSERT_TRUE(res.has_value());
         EXPECT_EQ(res.value().status, ClientStatus::HEALTH);
     }
@@ -553,9 +543,9 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
     {
         QueryClientStatusRequest req;
         req.client_id = tmp1->GetClientID();
-        auto res = short_ttl_master.GetWrapped()
-                       .GetMasterService()
-                       .QueryClientStatus(req);
+        auto res =
+            short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
+                req);
         ASSERT_TRUE(res.has_value());
         EXPECT_EQ(res.value().status, ClientStatus::HEALTH)
             << "Client should be HEALTH after recovery heartbeat";
