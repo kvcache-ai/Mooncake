@@ -13,7 +13,7 @@ use mooncake_store_client::MooncakeCompatibilityFacade;
 You also need:
 
 - a metadata backend
-- a TENT engine
+- a transport engine
 - a transport factory
 - a `StoreClientBuilder`
 
@@ -84,6 +84,21 @@ fn main() -> Result<()> {
 ```
 
 `rpc_server_port` is the TENT TCP data-plane port. Leaving it at `0` lets TENT choose a random local port, which is fine for single-host demos. For cross-host or cross-container deployments, set a fixed port and make sure peers can reach `rpc_server_hostname:rpc_server_port`.
+
+## Transport Backends
+
+The Rust transport layer exposes two explicit choices:
+
+- `TentEngine` + `TentEngineConfig`
+- `ClassicTransferEngine` + `ClassicEngineConfig`
+
+This guide uses TENT for the concrete examples because it is the default repository path, but Rust applications can construct either backend directly.
+
+Runtime backend selection is implemented by the compatibility layer, not by `StoreClientBuilder` itself:
+
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
+- `mooncake-store-client --transport-backend tent|classic-te`
+- `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
 
 Redis authentication can come from URL-embedded credentials or from `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD`. Prefer environment variables when passwords contain URL-reserved characters such as `@`.
 

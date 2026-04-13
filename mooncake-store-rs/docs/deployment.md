@@ -153,6 +153,36 @@ Deployment note:
 - `client_server_address` does not carry real-mode TENT traffic
 - Python real-mode validation can provide `local_hostname + transport_rpc_port` either explicitly or through `--local_host host:port`
 
+### True SGLang e2e
+
+Run the full HiCache end-to-end validation:
+
+```bash
+./scripts/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
+```
+
+What the script does:
+
+- builds and installs the current Pro wheel into a dedicated SGLang venv unless reuse is requested
+- starts two real storage clients plus one routed rw-only gateway client
+- starts two `python -m sglang.launch_server` processes against that standalone gateway
+- verifies baseline cross-process HiCache write/read through gateway `/metrics`
+- starts an extra storage node and verifies SGLang keeps serving requests after expansion
+- hard-kills one storage node and retries completions until recovery, validating that requests do not stay broken after forced shrink
+- gracefully drains one storage node and retries completions until recovery, validating that requests do not stay broken after shrink
+
+Important inputs:
+
+- `--model-path` or `MC_STORE_RS_SGLANG_MODEL_PATH` must point to the local model directory used by SGLang
+- `--auto-download-model` or `MC_STORE_RS_SGLANG_AUTO_DOWNLOAD_MODEL=1` opts into Hugging Face download when no local model path is provided
+- `--model-id` or `MC_STORE_RS_SGLANG_MODEL_ID` selects the download target; the default is `Qwen/Qwen3-0.6B`
+- `--model-cache` or `MC_STORE_RS_SGLANG_MODEL_CACHE` selects the Hugging Face cache directory for optional downloads
+- `MC_STORE_RS_SGLANG_SERVER_A_GPU` and `MC_STORE_RS_SGLANG_SERVER_B_GPU` control `--base-gpu-id`
+- `SGLANG_HICACHE_MOONCAKE_REUSE_TE` defaults to `0` for this validation path
+- logs are written to `target/sglang-true-e2e-*.log`
+
+The runner intentionally does not scan local model caches. A missing model path is a configuration error unless auto-download is explicitly enabled.
+
 ### Multi-client stress benchmark
 
 Run the process-per-client stress benchmark:
@@ -310,9 +340,23 @@ Credentials embedded in `redis://username:password@host:port/db` also work and t
 
 ### Transport metadata
 
-The transport layer is configured through `TentEngineConfig`.
+The transport layer is selected by the compatibility runtime and then configured through the matching backend config.
 
-Current repository scripts and examples use Redis-backed TENT metadata. In the Python compatibility layer, etcd for store metadata still requires Redis for TENT metadata through `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL`.
+Current repository scripts and examples default to `tent`, but the compatibility layer can also run with `classic_te`.
+
+Runtime selection:
+
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
+- `mooncake-store-client --transport-backend tent|classic-te`
+- `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
+
+When store metadata uses etcd in the Python compatibility layer, transport metadata still requires Redis through `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL`.
+
+Port roles stay the same across backends:
+
+- `transport_rpc_port` is the real data-plane TCP port published to peer real clients
+- `client_server_address` is the dummy compatibility gRPC port
+- `metrics_addr` is the Prometheus `/metrics` listener
 
 ## Routing Modes
 

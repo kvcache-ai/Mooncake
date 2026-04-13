@@ -112,6 +112,8 @@ Main objects:
 
 - `TentEngine`
 - `TentEngineConfig`
+- `ClassicTransferEngine`
+- `ClassicEngineConfig`
 - `TentTransportFactory`
 - transport request and status types
 

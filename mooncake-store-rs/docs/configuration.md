@@ -16,7 +16,7 @@ This document collects the main runtime knobs exposed by the current implementat
 | `state(...)` | `Standby` | use `Active` for serving clients |
 | `tenant(...)` | `"default"` | default tenant for request builders |
 | `local_memory(...)` | `LocalMemoryConfig::default()` | storage and scratch memory layout |
-| `transport(...)` / `with_tent(...)` | none | required for remote transfer paths |
+| `transport(...)` / `with_tent(...)` | none | required for remote transfer paths; low-level Rust transport is wired explicitly |
 | `transport_factory(...)` | none | used to create transports for peers |
 | `routed_writes(...)` | disabled | enables routed placement |
 | `route_control(...)` | `EmbeddedWrh` | selects route control mode |
@@ -69,6 +69,29 @@ Hugepage behavior:
 - if `hugepage_enabled` is `Some(true)`, the client allocates native local memory with `MAP_HUGETLB`
 - if `hugepage_size_bytes` is set, hugepage mode is implicitly enabled
 - if both fields are `None`, the runtime falls back to `MC_STORE_USE_HUGEPAGE` and `MC_STORE_HUGEPAGE_SIZE`
+
+## Transport Backend Selection
+
+The compatibility layer supports two real data-plane backends:
+
+| Backend | Compatibility Value | Notes |
+|---------|---------------------|-------|
+| TENT | `tent` | default backend |
+| Classic TE | `classic_te` | runtime-selectable compatibility backend |
+
+Selection surfaces:
+
+| Surface | Knob |
+|---------|------|
+| Environment | `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` |
+| Standalone client | `--transport-backend tent|classic-te` |
+| Python compatibility | `transport_backend="tent"` or `transport_backend="classic_te"` |
+
+Notes:
+
+- explicit CLI or Python values override the environment variable
+- `classic`, `classic-te`, and `te` are accepted as compatibility aliases by the parser
+- low-level Rust transport construction remains explicit; runtime backend selection is only a compatibility-layer feature
 
 ## Route Control
 
@@ -184,7 +207,7 @@ Notes:
 
 - HTTP metadata endpoints are not supported
 - Redis store metadata accepts URL-embedded credentials or `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD`
-- when store metadata uses etcd, TENT metadata still needs Redis
+- when store metadata uses etcd, transport metadata still needs Redis
 - set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint
 
 ### Redis authentication
@@ -228,12 +251,13 @@ Important Python-only compatibility knobs:
 | `routed_writes` | enable routed placement from Python |
 | `replica_count` | default replica count when routed writes are enabled |
 | `route_topk` | WRH route-authority fanout; must match the policy already stored in the metadata keyspace |
-| `transport_metadata_url` | Redis endpoint for TENT when store metadata uses etcd |
-| `transport_rpc_port` | fixed TENT TCP data-plane port for real-mode peers |
+| `transport_backend` | choose `tent` or `classic_te` for the real transport runtime |
+| `transport_metadata_url` | Redis endpoint for transport metadata when store metadata uses etcd |
+| `transport_rpc_port` | fixed real data-plane TCP port for real-mode peers |
 | `use_hugepage` | enable hugepage-backed local store memory |
 | `hugepage_size` | hugepage size for local store memory; accepts `2MB` or `1GB` |
 
-The config-dict path accepts the same compatibility knobs. For port pinning, both `transport_rpc_port` and `rpc_server_port` map to the real-mode TENT data-plane port.
+The config-dict path accepts the same compatibility knobs. For port pinning, both `transport_rpc_port` and `rpc_server_port` map to the real-mode backend data-plane port.
 
 `local_hostname` accepts either:
 
@@ -244,7 +268,7 @@ If `local_hostname` already embeds a port and `transport_rpc_port` or `rpc_serve
 
 Port role reminder:
 
-- `transport_rpc_port` / `rpc_server_port` is used by real clients and maps to TENT `rpc_server_port`
+- `transport_rpc_port` / `rpc_server_port` is used by real clients and maps to the selected backend `rpc_server_port`
 - `client_server_address` belongs to the dummy compatibility server and is not used by real-mode peers
 - `metrics_addr` only exposes `/metrics`
 
@@ -281,13 +305,14 @@ The current repository uses these environment variables.
 
 | Variable | Used By | Meaning |
 |----------|---------|---------|
+| `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
 | `MC_STORE_RS_TRACE` | e2e and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |
 | `MC_STORE_RS_METRICS_ADDR` | e2e and applications | bind address for the in-process metrics server |
 | `MC_STORE_RS_REDIS_URL` | Rust e2e | metadata Redis URL |
 | `MC_STORE_RS_REDIS_PORT` | local scripts and e2e | local Redis port |
-| `MC_REDIS_USERNAME` | Redis metadata backends and TENT Redis plugin | optional Redis ACL username |
-| `MC_REDIS_PASSWORD` | Redis metadata backends and TENT Redis plugin | optional Redis password; enables auth when set |
+| `MC_REDIS_USERNAME` | Redis metadata backends and transport Redis plugins | optional Redis ACL username |
+| `MC_REDIS_PASSWORD` | Redis metadata backends and transport Redis plugins | optional Redis password; enables auth when set |
 | `MC_STORE_RS_VALUE_SIZE` | Rust e2e | payload size for validation and benchmark loops |
 | `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |

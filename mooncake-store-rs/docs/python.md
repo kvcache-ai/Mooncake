@@ -148,8 +148,9 @@ Start a storage client:
 
 Useful flags:
 
-- `--transport-metadata-url` for TENT Redis when the metadata backend uses etcd
-- `--transport-rpc-port <port>` to pin the TENT TCP data-plane port used by real clients
+- `--transport-metadata-url` for transport Redis when the metadata backend uses etcd
+- `--transport-backend tent|classic-te` to choose the real data-plane backend
+- `--transport-rpc-port <port>` to pin the real data-plane TCP port used by real clients
 - `--routed-writes` and `--replica-count` to enable routed writer mode
 - `--route-topk <n>` to control WRH route-authority fanout; it must be `>= 2` and match the policy already stored in the metadata keyspace
 - `--route-control metadata-only|embedded-wrh` to select the route authority mode
@@ -167,7 +168,7 @@ Role reminder:
 
 Port reminder:
 
-- `transport_rpc_port` / `--transport-rpc-port` is the real-mode TENT data-plane port
+- `transport_rpc_port` / `--transport-rpc-port` is the real-mode data-plane port for the selected backend
 - `client_server_address` / `--client-server-address` is the dummy compatibility gRPC port
 - `metrics_addr` / `--metrics-addr` is only for `/metrics`
 - cross-host real-mode deployments should set both a reachable `local_hostname` and a fixed `transport_rpc_port`
@@ -190,6 +191,7 @@ store.setup(
     stable_id="py-store-a",
     tenant="default",
     labels={"pool": "pool-a", "storage": "true"},
+    transport_backend="tent",
     transport_rpc_port=17111,
 )
 
@@ -268,7 +270,7 @@ python3 ./scripts/real_client_rw.py \
 Current script behavior:
 
 - validates only the current `redis://...` and `etcd://...` metadata modes
-- accepts `host:port` in `--local_host` and normalizes that port into real-mode TENT config
+- accepts `host:port` in `--local_host` and normalizes that port into the real-mode backend config
 - supports `idle`, `write`, `read`, and `both`
 - supports batch put/get validation through `--batch_size`
 - treats `--master_addr` as a deprecated compatibility alias and ignores it
@@ -301,7 +303,7 @@ ptr = allocator.alloc(4096)
 store.register_buffer(ptr, 4096)
 ```
 
-`setup_dummy(...)` only needs `client_server_address`. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and TENT endpoint on behalf of the dummy client.
+`setup_dummy(...)` only needs `client_server_address`. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and data-plane endpoint on behalf of the dummy client.
 
 ## Host Allocator and Hugepages
 
@@ -406,10 +408,27 @@ Credentials embedded in `redis://username:password@host:port/db` are also accept
 
 ### Important note for etcd
 
-When the store metadata backend is etcd, TENT transport metadata still uses Redis. Provide that Redis endpoint through:
+When the store metadata backend is etcd, transport metadata still uses Redis. Provide that Redis endpoint through:
 
 - `transport_metadata_url=...`, or
 - `MC_STORE_RS_TENT_REDIS_URL`
+
+## Transport Backend Selection
+
+The compatibility layer can choose the transport backend at runtime.
+
+Supported values:
+
+- `tent`
+- `classic_te`
+
+Selection order:
+
+1. explicit `transport_backend=...` argument to `setup(...)`
+2. `MC_STORE_RS_TRANSPORT_BACKEND`
+3. default `tent`
+
+The standalone client follows the same rule, except the explicit override is `--transport-backend`.
 
 ## Replication Policy
 
@@ -483,6 +502,27 @@ Run the HiCache compatibility validations:
 ./scripts/run-sglang-hicache-dummy-compat.sh
 ./scripts/run-sglang-hicache-real-compat.sh
 ```
+
+Run the full SGLang HiCache e2e:
+
+```bash
+./scripts/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
+```
+
+This script verifies:
+
+- two real storage `mooncake-store-client` processes plus one routed rw-only gateway
+- two `python -m sglang.launch_server` processes using the packaged Mooncake backend
+- baseline cross-process put/get through Mooncake HiCache
+- storage expansion while requests are still served
+- forced storage kill with retry-based recovery instead of persistent request failure
+- graceful storage shrink with retry-based recovery instead of persistent request failure
+
+Model selection is explicit:
+
+- use `--model-path` or `MC_STORE_RS_SGLANG_MODEL_PATH` for a local model directory
+- use `--auto-download-model --model-id <repo>` only when the runner is allowed to download from Hugging Face
+- use `--model-cache` or `MC_STORE_RS_SGLANG_MODEL_CACHE` to control the optional download cache
 
 Current coverage includes:
 
