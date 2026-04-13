@@ -2159,6 +2159,112 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
 }
 
 #[test]
+fn route_lookup_many_records_miss_after_killed_single_replica_is_quarantined() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("route-lookup-miss-store-segment"));
+    let writer_transport = Arc::new(store_transport.peer("route-lookup-miss-writer-segment"));
+    let reader_transport = Arc::new(store_transport.peer("route-lookup-miss-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store = StoreClientBuilder::new(metadata.clone(), "route-lookup-miss-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "route-lookup-miss-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "route-lookup-miss-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "route-lookup-miss-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "route-lookup-miss-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "route-lookup-miss-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store, &writer, &reader]);
+
+    writer
+        .put_with_policy(
+            "route-lookup-miss-key",
+            b"route-lookup-miss-payload",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owner(store.runtime_id().storage_key()),
+        )
+        .expect("single-replica put should succeed");
+
+    {
+        let mut state = store_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("route-lookup-miss-store-segment")
+            .expect("primary segment handle should exist");
+        state.segments_by_handle.remove(&handle);
+    }
+
+    let first = reader.get("route-lookup-miss-key");
+    assert!(matches!(
+        first,
+        Err(StoreError::NotFound(_))
+            | Err(StoreError::Transport(_))
+            | Err(StoreError::InvalidState(_))
+    ));
+
+    let second = reader.get("route-lookup-miss-key");
+    assert!(matches!(second, Err(StoreError::NotFound(_))));
+
+    let metrics = snapshot_metrics();
+    let ok = metrics
+        .iter()
+        .find(|snapshot| snapshot.operation == "route_lookup_many" && snapshot.status == "ok")
+        .expect("route lookup should record the initial successful resolve");
+    assert!(ok.calls_total >= 1);
+    let miss = metrics
+        .iter()
+        .find(|snapshot| snapshot.operation == "route_lookup_many" && snapshot.status == "miss")
+        .expect("route lookup should record miss after the dead replica is quarantined");
+    assert!(miss.calls_total >= 1);
+    assert!(
+        metrics
+            .iter()
+            .all(|snapshot| !(snapshot.operation == "route_lookup_many"
+                && snapshot.status == "error")),
+        "route lookup miss should not be counted as an error"
+    );
+}
+
+#[test]
 fn suspect_authority_quarantine_is_shared_across_clients() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("shared-suspect-a-segment"));
