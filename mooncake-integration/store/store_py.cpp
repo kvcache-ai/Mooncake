@@ -1563,7 +1563,8 @@ PYBIND11_MODULE(store, m) {
                const std::string &rdma_devices = "",
                const std::string &master_server_addr = "127.0.0.1:50051",
                const py::object &engine = py::none(),
-               bool enable_ssd_offload = false) {
+               bool enable_ssd_offload = false,
+               const std::string &ssd_offload_path = "") {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1581,7 +1582,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none(),
-            py::arg("enable_ssd_offload") = false)
+            py::arg("enable_ssd_offload") = false,
+            py::arg("ssd_offload_path") = "")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -1610,7 +1612,8 @@ PYBIND11_MODULE(store, m) {
             "  rdma_devices: RDMA device list.\n"
             "  master_server_addr: Master server address.\n"
             "  ipc_socket_path: IPC socket path.\n"
-            "  enable_ssd_offload: Enable SSD offload (default false).")
+            "  enable_ssd_offload: Enable SSD offload (default false).\n"
+            "  ssd_offload_path: SSD storage directory path (overrides env var).")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
