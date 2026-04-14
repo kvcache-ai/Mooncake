@@ -242,6 +242,10 @@ pub fn snapshot_metrics() -> MetricsSnapshot {
     registry::snapshot_metrics(process::snapshot_process())
 }
 
+pub fn record_heartbeat_health(runtime: &str, consecutive_failures: u64, last_success_ms: u64) {
+    registry::record_heartbeat_health(runtime, consecutive_failures, last_success_ms);
+}
+
 #[cfg(test)]
 pub fn reset_metrics() {
     registry::reset_metrics();
@@ -572,6 +576,23 @@ mod tests {
                 ClientRuntimeId::new("runtime-a", ClientEpoch(1)).to_string()
             ]),
         );
+    }
+
+    #[test]
+    fn heartbeat_health_metrics_are_rendered() {
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        reset_metrics();
+
+        let runtime = ClientRuntimeId::new("runtime-heartbeat", ClientEpoch(3)).to_string();
+        registry::record_heartbeat_health(&runtime, 2, 123_456);
+
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains(
+            "mooncake_store_heartbeat_consecutive_failures{runtime=\"runtime-heartbeat:3\"} 2"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_heartbeat_last_success_ms{runtime=\"runtime-heartbeat:3\"} 123456"
+        ));
     }
 
     fn http_get(address: &str, path: &str) -> String {

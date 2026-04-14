@@ -1566,7 +1566,7 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
-        LocalMemoryConfig, StoreClient, StoreClientBuilder, StoreTransport,
+        snapshot_metrics, LocalMemoryConfig, StoreClient, StoreClientBuilder, StoreTransport,
     };
     use mooncake_store_core::{
         CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
@@ -1897,35 +1897,32 @@ mod tests {
             .expect("test store client should build")
     }
 
-    struct BlockingLeaseMetadata {
+    struct BlockingHealthMetadata {
         inner: InMemoryMetadataBackend,
-        block_enabled: Arc<AtomicBool>,
+        block_lease: Arc<AtomicBool>,
+        block_state_update: Arc<AtomicBool>,
         release: Arc<AtomicBool>,
         entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     }
 
-    impl BlockingLeaseMetadata {
+    impl BlockingHealthMetadata {
         fn new(
-            block_enabled: Arc<AtomicBool>,
+            block_lease: Arc<AtomicBool>,
+            block_state_update: Arc<AtomicBool>,
             release: Arc<AtomicBool>,
             entered: std::sync::mpsc::Sender<()>,
         ) -> Self {
             Self {
                 inner: InMemoryMetadataBackend::new(),
-                block_enabled,
+                block_lease,
+                block_state_update,
                 release,
                 entered: std::sync::Mutex::new(Some(entered)),
             }
         }
-    }
 
-    impl MetadataBackend for BlockingLeaseMetadata {
-        fn route_namespace(&self) -> String {
-            self.inner.route_namespace()
-        }
-
-        fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
-            if self.block_enabled.load(Ordering::SeqCst) {
+        fn maybe_block(&self, enabled: &AtomicBool) {
+            if enabled.load(Ordering::SeqCst) {
                 if let Some(sender) = self.entered.lock().expect("mutex poisoned").take() {
                     let _ = sender.send(());
                 }
@@ -1933,6 +1930,16 @@ mod tests {
                     sleep(Duration::from_millis(10));
                 }
             }
+        }
+    }
+
+    impl MetadataBackend for BlockingHealthMetadata {
+        fn route_namespace(&self) -> String {
+            self.inner.route_namespace()
+        }
+
+        fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+            self.maybe_block(&self.block_lease);
             self.inner.upsert_client_lease(lease)
         }
 
@@ -1941,6 +1948,7 @@ mod tests {
             runtime: &ClientRuntimeId,
             next: ClientLifecycleState,
         ) -> mooncake_store_core::Result<()> {
+            self.maybe_block(&self.block_state_update);
             self.inner.update_client_state(runtime, next)
         }
 
@@ -3066,8 +3074,9 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let block_enabled = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
-        let metadata = Arc::new(BlockingLeaseMetadata::new(
+        let metadata = Arc::new(BlockingHealthMetadata::new(
             block_enabled.clone(),
+            Arc::new(AtomicBool::new(false)),
             release.clone(),
             entered_tx,
         ));
@@ -3112,6 +3121,23 @@ mod tests {
             "unexpected error: {error}"
         );
 
+        let failed_metrics = snapshot_metrics();
+        let runtime = "dispatcher-heartbeat:1".to_string();
+        let consecutive_failures = failed_metrics
+            .heartbeat_consecutive_failures
+            .iter()
+            .find(|sample| sample.key.runtime == runtime)
+            .map(|sample| sample.value as u64)
+            .unwrap_or_default();
+        let last_success_ms = failed_metrics
+            .heartbeat_last_success_ms
+            .iter()
+            .find(|sample| sample.key.runtime == runtime)
+            .map(|sample| sample.value as u64)
+            .unwrap_or_default();
+        assert_eq!(consecutive_failures, 1);
+        assert_eq!(last_success_ms, 0);
+
         let inflight = dispatcher
             .heartbeat(60_000)
             .expect_err("second heartbeat should see the first publish still in flight");
@@ -3123,10 +3149,93 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         for _ in 0..50 {
             if dispatcher.heartbeat(60_000).is_ok() {
+                let recovered_metrics = snapshot_metrics();
+                let consecutive_failures = recovered_metrics
+                    .heartbeat_consecutive_failures
+                    .iter()
+                    .find(|sample| sample.key.runtime == runtime)
+                    .map(|sample| sample.value as u64)
+                    .unwrap_or_default();
+                let last_success_ms = recovered_metrics
+                    .heartbeat_last_success_ms
+                    .iter()
+                    .find(|sample| sample.key.runtime == runtime)
+                    .map(|sample| sample.value as u64)
+                    .unwrap_or_default();
+                assert_eq!(consecutive_failures, 0);
+                assert!(last_success_ms > 0);
                 return;
             }
             sleep(Duration::from_millis(20));
         }
         panic!("heartbeat should recover after the blocked publish is released");
+    }
+
+    #[test]
+    fn dispatcher_state_update_timeout_does_not_block_shared_requests() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(BlockingHealthMetadata::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            release.clone(),
+            entered_tx,
+        ));
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn_with_heartbeat_timeout(
+                build_client_with_metadata("dispatcher-activate", metadata),
+                "dispatcher-activate".to_string(),
+                Duration::from_millis(200),
+            )
+            .expect("dispatcher should spawn"),
+        );
+
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-state-update-timeout".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || dispatcher.activate()
+            })
+            .expect("state update timeout worker should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("state update publish should enter metadata");
+
+        let started = std::time::Instant::now();
+        let shared = dispatcher
+            .run(|_client| Ok::<_, StoreError>(13usize))
+            .expect("shared request should proceed while state update publish is stuck");
+        assert_eq!(shared, 13);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shared request should not wait for stuck state update"
+        );
+
+        let error = worker
+            .join()
+            .expect("state update timeout worker should join")
+            .expect_err("stuck state update should time out");
+        assert!(
+            matches!(error, StoreError::Transport(ref message) if message.contains("state update publish timed out")),
+            "unexpected error: {error}"
+        );
+
+        let inflight = dispatcher
+            .enter_draining()
+            .expect_err("second health update should see the first publish still in flight");
+        assert!(
+            matches!(inflight, StoreError::Transport(ref message) if message.contains("still in flight")),
+            "unexpected in-flight error: {inflight}"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..50 {
+            if dispatcher.enter_draining().is_ok() {
+                return;
+            }
+            sleep(Duration::from_millis(20));
+        }
+        panic!("state update should recover after the blocked publish is released");
     }
 }

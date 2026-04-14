@@ -129,36 +129,18 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn enter_standby(&mut self) -> Result<()> {
-        let _span = info_span!("store.enter_standby", runtime = %self.lease.runtime).entered();
-        let tracker = OperationTracker::new("enter_standby");
-        self.lease.state = ClientLifecycleState::Standby;
-        let result = self
-            .metadata
-            .update_client_state(&self.lease.runtime, self.lease.state);
-        tracker.finish(&result, 0);
-        result
+        self.prepare_state_update(ClientLifecycleState::Standby, "enter_standby")
+            .publish()
     }
 
     fn activate(&mut self) -> Result<()> {
-        let _span = info_span!("store.activate", runtime = %self.lease.runtime).entered();
-        let tracker = OperationTracker::new("activate");
-        self.lease.state = ClientLifecycleState::Active;
-        let result = self
-            .metadata
-            .update_client_state(&self.lease.runtime, self.lease.state);
-        tracker.finish(&result, 0);
-        result
+        self.prepare_state_update(ClientLifecycleState::Active, "activate")
+            .publish()
     }
 
     fn enter_draining(&mut self) -> Result<()> {
-        let _span = info_span!("store.enter_draining", runtime = %self.lease.runtime).entered();
-        let tracker = OperationTracker::new("enter_draining");
-        self.lease.state = ClientLifecycleState::Draining;
-        let result = self
-            .metadata
-            .update_client_state(&self.lease.runtime, self.lease.state);
-        tracker.finish(&result, 0);
-        result
+        self.prepare_state_update(ClientLifecycleState::Draining, "enter_draining")
+            .publish()
     }
 
     fn plan_handoff(
@@ -1053,10 +1035,16 @@ impl MooncakeCompatibilityFacade for StoreClient {
 impl StoreClient {
     pub fn prepare_heartbeat(&mut self, expires_at_ms: u64) -> HeartbeatLease {
         self.lease.expires_at_ms = expires_at_ms;
-        HeartbeatLease {
-            metadata: self.metadata.clone(),
-            lease: self.lease.clone(),
-        }
+        HealthUpdate::heartbeat(self.metadata.clone(), self.lease.clone())
+    }
+
+    pub fn prepare_state_update(
+        &mut self,
+        next_state: ClientLifecycleState,
+        operation: &'static str,
+    ) -> HealthUpdate {
+        self.lease.state = next_state;
+        HealthUpdate::state_transition(self.metadata.clone(), self.lease.clone(), operation)
     }
 }
 
