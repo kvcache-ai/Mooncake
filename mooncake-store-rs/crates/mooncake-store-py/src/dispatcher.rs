@@ -79,7 +79,12 @@ impl StoreDispatcher {
     }
 
     pub fn register_local_memory(&self) -> Result<(), StoreError> {
-        self.run(|client| client.register_local_memory())
+        let result = self.run(|client| client.register_local_memory());
+        if result.is_ok() {
+            let state = self.run(|client| Ok::<_, StoreError>(client.lifecycle_state()))?;
+            self.health.sync_state(state);
+        }
+        result
     }
 
     pub fn heartbeat(&self, expires_at_ms: u64) -> Result<(), StoreError> {

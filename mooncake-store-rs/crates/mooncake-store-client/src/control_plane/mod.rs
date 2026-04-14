@@ -185,6 +185,13 @@ pub(crate) struct ControlPlaneClient {
     streams: Mutex<BTreeMap<String, Arc<ControlStreamSession>>>,
 }
 
+#[derive(Debug)]
+pub(crate) enum ControlPlaneReachability {
+    Reachable,
+    Unreachable,
+    Unknown(StoreError),
+}
+
 struct ControlStreamSession {
     sender: mpsc::Sender<pb::ControlStreamRequest>,
     pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Result<pb::ControlStreamReply>>>>>,
