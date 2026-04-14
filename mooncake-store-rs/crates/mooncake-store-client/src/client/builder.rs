@@ -334,6 +334,7 @@ impl StoreClientBuilder {
         bootstrap_route_policy(
             self.metadata.as_ref(),
             &provisional_lease,
+            &self.default_tenant,
             self.route_control,
             self.route_topk,
         )?;
@@ -444,10 +445,10 @@ impl StoreClientBuilder {
 fn bootstrap_route_policy(
     metadata: &dyn MetadataBackend,
     lease: &ClientLease,
+    default_tenant: &str,
     route_control: RouteControlMode,
     route_topk: usize,
 ) -> Result<()> {
-    let domain = RoutePolicyDomain::Default;
     let local = RoutePolicy {
         route_topk: route_topk as u32,
         route_control,
@@ -457,20 +458,44 @@ fn bootstrap_route_policy(
             .unwrap_or_default()
             .as_millis() as u64,
     };
+    bootstrap_default_route_policy(metadata, &local)?;
+    let effective = resolve_effective_route_policy(metadata, default_tenant)?;
+    validate_route_policy(&local, &effective)
+}
+
+fn bootstrap_default_route_policy(metadata: &dyn MetadataBackend, local: &RoutePolicy) -> Result<()> {
+    let domain = RoutePolicyDomain::Default;
     match metadata.get_route_policy(&domain)? {
-        Some(existing) => validate_route_policy(&local, &existing),
+        Some(_) => Ok(()),
         None => {
-            if metadata.put_route_policy_if_absent(&domain, &local)? {
+            if metadata.put_route_policy_if_absent(&domain, local)? {
                 return Ok(());
             }
-            let Some(existing) = metadata.get_route_policy(&domain)? else {
-                return Err(StoreError::InvalidState(
-                    "route policy bootstrap raced but no policy was readable afterward".to_string(),
-                ));
-            };
-            validate_route_policy(&local, &existing)
+            metadata
+                .get_route_policy(&domain)?
+                .ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "route policy bootstrap raced but no policy was readable afterward"
+                            .to_string(),
+                    )
+                })
+                .map(|_| ())
         }
     }
+}
+
+fn resolve_effective_route_policy(
+    metadata: &dyn MetadataBackend,
+    default_tenant: &str,
+) -> Result<RoutePolicy> {
+    if let Some(tenant_policy) = metadata.get_route_policy(&RoutePolicyDomain::Tenant(
+        default_tenant.to_string(),
+    ))? {
+        return Ok(tenant_policy);
+    }
+    metadata
+        .get_route_policy(&RoutePolicyDomain::Default)?
+        .ok_or_else(|| StoreError::InvalidState("default route policy is missing".to_string()))
 }
 
 fn validate_route_policy(local: &RoutePolicy, existing: &RoutePolicy) -> Result<()> {

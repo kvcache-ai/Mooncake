@@ -576,9 +576,11 @@ impl StoreClient {
             }
 
             let policy = writer.migration_policy_for_successor_route(&confirmed, successor)?;
-            match writer.put_scoped_with_policy_current(
-                &tenant,
-                &key,
+            let qos_tier = confirmed.qos_tier.as_deref();
+            let object_id = writer.route_object_id(&confirmed)?;
+            match writer.put_object_with_policy_current(
+                &object_id,
+                qos_tier,
                 &payload,
                 Some(&policy),
                 Some(&confirmed),
@@ -1265,7 +1267,7 @@ impl StoreClient {
             .map(|bytes| bytes as usize)
     }
 
-    fn shaping_max_remote_batch_bytes(&self) -> Option<u64> {
+    fn shaping_max_remote_batch_bytes(&self) -> Option<usize> {
         self.bandwidth_shaping
             .as_ref()
             .and_then(|shaping| shaping.max_remote_batch_bytes)

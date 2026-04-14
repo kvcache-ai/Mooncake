@@ -23,11 +23,11 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, encode_lifecycle_state, flatten_slices, now_ms,
-    record_success_metric, refresh_live_client_cache, scatter_into_buffers,
-    shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan, LiveClientCache,
-    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
-    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
-    SuspectRuntimeCache,
+    record_success_metric, refresh_live_client_cache, resolve_effective_route_policy,
+    scatter_into_buffers, shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan,
+    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
+    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
+    StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -41,8 +41,8 @@ use crate::{
     transport::{StoreTransport, StoreTransportFactory},
     BandwidthShaping, ExecutionFairness, GetRequest, LocalMemoryConfig,
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, NamespaceQuota,
-    ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy,
-    RouteControlMode, StoreClient, StoreClientBuilder,
+    ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy, RouteControlMode,
+    StoreClient, StoreClientBuilder,
 };
 
 struct TestTransport {
@@ -585,6 +585,24 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         self.inner.put_route_policy_if_absent(domain, policy)
     }
 
+    fn put_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_route_policy(domain, policy)
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_route_policy(domain)
+    }
+
+    fn list_route_policies(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        self.inner.list_route_policies()
+    }
+
     fn put_handoff(
         &self,
         handoff: &mooncake_store_core::HandoffPlan,
@@ -707,6 +725,24 @@ impl MetadataBackend for CountingMetadataBackend {
         policy: &RoutePolicy,
     ) -> mooncake_store_core::Result<bool> {
         self.inner.put_route_policy_if_absent(domain, policy)
+    }
+
+    fn put_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_route_policy(domain, policy)
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_route_policy(domain)
+    }
+
+    fn list_route_policies(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        self.inner.list_route_policies()
     }
 
     fn put_handoff(
@@ -1458,7 +1494,9 @@ fn publish_labeled_storage_node_with_capacity(
         .labels
         .insert("storage".to_string(), "true".to_string());
     if let Some(domain) = domain {
-        endpoints.labels.insert("domain".to_string(), domain.to_string());
+        endpoints
+            .labels
+            .insert("domain".to_string(), domain.to_string());
     }
     if let Some(object_set) = object_set {
         endpoints
@@ -1659,7 +1697,10 @@ fn query_route_uses_default_tenant_scope() {
         .expect("tenant query should succeed")
         .is_none());
     assert!(client
-        .query_route_in_scope(&NamespaceScope::with_defaults(Some("tenant-a"), None, None), "same-key")
+        .query_route_in_scope(
+            &NamespaceScope::with_defaults(Some("tenant-a"), None, None),
+            "same-key"
+        )
         .expect("scope query should succeed")
         .is_none());
 }
@@ -4913,9 +4954,15 @@ fn batch_get_fairness_limits_remote_items_per_tenant_per_round() {
         .preferred_storage_owner(remote_owner.storage_key());
     writer
         .batch_put(&[
-            PutRequest::new("fair-a1", b"aaaa").tenant("tenant-a").replication(policy.clone()),
-            PutRequest::new("fair-a2", b"bbbb").tenant("tenant-a").replication(policy.clone()),
-            PutRequest::new("fair-b1", b"cccc").tenant("tenant-b").replication(policy),
+            PutRequest::new("fair-a1", b"aaaa")
+                .tenant("tenant-a")
+                .replication(policy.clone()),
+            PutRequest::new("fair-a2", b"bbbb")
+                .tenant("tenant-a")
+                .replication(policy.clone()),
+            PutRequest::new("fair-b1", b"cccc")
+                .tenant("tenant-b")
+                .replication(policy),
         ])
         .expect("remote batch put should succeed");
 
@@ -4975,10 +5022,7 @@ fn routed_put_fairness_limits_remote_replica_writes_per_batch() {
             b"payload",
             &ReplicationPolicy::new()
                 .prefer_local(false)
-                .preferred_storage_owners([
-                    remote_a.storage_key(),
-                    remote_b.storage_key(),
-                ]),
+                .preferred_storage_owners([remote_a.storage_key(), remote_b.storage_key()]),
         )
         .expect("routed put should succeed");
     assert_eq!(route.replicas.len(), 2);
@@ -5112,35 +5156,29 @@ fn namespace_quota_isolated_per_scope() {
         .expect("client build should succeed");
 
     let route_a = client
-        .batch_put(&[
-            PutRequest::new("key-a", b"alpha")
-                .tenant("tenant-a")
-                .domain("domain-a")
-                .object_set("set-a")
-                .qos_tier("gold"),
-        ])
+        .batch_put(&[PutRequest::new("key-a", b"alpha")
+            .tenant("tenant-a")
+            .domain("domain-a")
+            .object_set("set-a")
+            .qos_tier("gold")])
         .expect("scope-a write should succeed");
     assert_eq!(route_a.len(), 1);
 
     let route_b = client
-        .batch_put(&[
-            PutRequest::new("key-b", b"bravo")
-                .tenant("tenant-a")
-                .domain("domain-b")
-                .object_set("set-b")
-                .qos_tier("silver"),
-        ])
+        .batch_put(&[PutRequest::new("key-b", b"bravo")
+            .tenant("tenant-a")
+            .domain("domain-b")
+            .object_set("set-b")
+            .qos_tier("silver")])
         .expect("scope-b write should succeed");
     assert_eq!(route_b.len(), 1);
 
     let error = client
-        .batch_put(&[
-            PutRequest::new("key-c", b"x")
-                .tenant("tenant-a")
-                .domain("domain-a")
-                .object_set("set-a")
-                .qos_tier("gold"),
-        ])
+        .batch_put(&[PutRequest::new("key-c", b"x")
+            .tenant("tenant-a")
+            .domain("domain-a")
+            .object_set("set-a")
+            .qos_tier("gold")])
         .expect_err("same scope should hit quota");
     assert!(error.to_string().contains("namespace quota exceeded"));
 
@@ -5205,13 +5243,21 @@ fn namespace_scoped_placement_and_route_views_stay_isolated() {
                 .domain("domain-a")
                 .object_set("set-a")
                 .qos_tier("gold")
-                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+                .replication(
+                    ReplicationPolicy::new()
+                        .replica_count(1)
+                        .prefer_local(false),
+                ),
             PutRequest::new("key-b", b"payload-b")
                 .tenant("tenant-a")
                 .domain("domain-b")
                 .object_set("set-b")
                 .qos_tier("silver")
-                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+                .replication(
+                    ReplicationPolicy::new()
+                        .replica_count(1)
+                        .prefer_local(false),
+                ),
         ])
         .expect("scoped writes should succeed");
     assert_eq!(routes.len(), 2);
@@ -5228,11 +5274,19 @@ fn namespace_scoped_placement_and_route_views_stay_isolated() {
     assert_eq!(route_b.replicas[0].owner.stable_id.0, "storage-domain-b");
     assert_eq!(
         route_a.namespace.as_ref(),
-        Some(&NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a")))
+        Some(&NamespaceScope::with_defaults(
+            Some("tenant-a"),
+            Some("domain-a"),
+            Some("set-a")
+        ))
     );
     assert_eq!(
         route_b.namespace.as_ref(),
-        Some(&NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-b"), Some("set-b")))
+        Some(&NamespaceScope::with_defaults(
+            Some("tenant-a"),
+            Some("domain-b"),
+            Some("set-b")
+        ))
     );
     assert_eq!(route_a.qos_tier.as_deref(), Some("gold"));
     assert_eq!(route_b.qos_tier.as_deref(), Some("silver"));
@@ -5329,22 +5383,30 @@ fn put_paths_accept_namespace_dimensions_beyond_routed_fast_path() {
         .expect("writer build should succeed");
 
     let batch_route = writer
-        .batch_put(&[
-            PutRequest::new("namespace-key", b"payload")
-                .tenant("tenant-a")
-                .domain("domain-a")
-                .object_set("set-a")
-                .qos_tier("gold")
-                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
-        ])
+        .batch_put(&[PutRequest::new("namespace-key", b"payload")
+            .tenant("tenant-a")
+            .domain("domain-a")
+            .object_set("set-a")
+            .qos_tier("gold")
+            .replication(
+                ReplicationPolicy::new()
+                    .replica_count(1)
+                    .prefer_local(false),
+            )])
         .expect("batch put should accept namespace dimensions");
     assert_eq!(batch_route.len(), 1);
-    assert_eq!(batch_route[0].replicas[0].owner.stable_id.0, "storage-domain-a");
-    assert_eq!(batch_route[0].namespace.as_ref(), Some(&NamespaceScope::with_defaults(
-        Some("tenant-a"),
-        Some("domain-a"),
-        Some("set-a"),
-    )));
+    assert_eq!(
+        batch_route[0].replicas[0].owner.stable_id.0,
+        "storage-domain-a"
+    );
+    assert_eq!(
+        batch_route[0].namespace.as_ref(),
+        Some(&NamespaceScope::with_defaults(
+            Some("tenant-a"),
+            Some("domain-a"),
+            Some("set-a"),
+        ))
+    );
     assert_eq!(batch_route[0].qos_tier.as_deref(), Some("gold"));
 
     let mut source = [0u8; 16];
@@ -5360,36 +5422,54 @@ fn put_paths_accept_namespace_dimensions_beyond_routed_fast_path() {
                 .domain("domain-a")
                 .object_set("set-a")
                 .qos_tier("gold")
-                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+                .replication(
+                    ReplicationPolicy::new()
+                        .replica_count(1)
+                        .prefer_local(false),
+                ),
         ])
         .expect("batch put_from should accept namespace dimensions");
     assert_eq!(from_route.len(), 1);
-    assert_eq!(from_route[0].replicas[0].owner.stable_id.0, "storage-domain-a");
-    assert_eq!(from_route[0].namespace.as_ref(), Some(&NamespaceScope::with_defaults(
-        Some("tenant-a"),
-        Some("domain-a"),
-        Some("set-a"),
-    )));
+    assert_eq!(
+        from_route[0].replicas[0].owner.stable_id.0,
+        "storage-domain-a"
+    );
+    assert_eq!(
+        from_route[0].namespace.as_ref(),
+        Some(&NamespaceScope::with_defaults(
+            Some("tenant-a"),
+            Some("domain-a"),
+            Some("set-a"),
+        ))
+    );
     assert_eq!(from_route[0].qos_tier.as_deref(), Some("gold"));
 
     let slices = [b"multi".as_slice(), b"-gold".as_slice()];
     let multi_route = writer
-        .batch_put_from_multi_buffers(&[
-            MultiBufferPutRequest::new("namespace-multi", &slices)
-                .tenant("tenant-a")
-                .domain("domain-a")
-                .object_set("set-a")
-                .qos_tier("gold")
-                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
-        ])
+        .batch_put_from_multi_buffers(&[MultiBufferPutRequest::new("namespace-multi", &slices)
+            .tenant("tenant-a")
+            .domain("domain-a")
+            .object_set("set-a")
+            .qos_tier("gold")
+            .replication(
+                ReplicationPolicy::new()
+                    .replica_count(1)
+                    .prefer_local(false),
+            )])
         .expect("multi-buffer put should accept namespace dimensions");
     assert_eq!(multi_route.len(), 1);
-    assert_eq!(multi_route[0].replicas[0].owner.stable_id.0, "storage-domain-a");
-    assert_eq!(multi_route[0].namespace.as_ref(), Some(&NamespaceScope::with_defaults(
-        Some("tenant-a"),
-        Some("domain-a"),
-        Some("set-a"),
-    )));
+    assert_eq!(
+        multi_route[0].replicas[0].owner.stable_id.0,
+        "storage-domain-a"
+    );
+    assert_eq!(
+        multi_route[0].namespace.as_ref(),
+        Some(&NamespaceScope::with_defaults(
+            Some("tenant-a"),
+            Some("domain-a"),
+            Some("set-a"),
+        ))
+    );
     assert_eq!(multi_route[0].qos_tier.as_deref(), Some("gold"));
 
     writer
@@ -5437,10 +5517,7 @@ fn routed_put_emits_transport_pacing_hints() {
             b"payload",
             &ReplicationPolicy::new()
                 .prefer_local(false)
-                .preferred_storage_owners([
-                    remote_a.storage_key(),
-                    remote_b.storage_key(),
-                ]),
+                .preferred_storage_owners([remote_a.storage_key(), remote_b.storage_key()]),
         )
         .expect("routed put should succeed");
 
@@ -5495,10 +5572,7 @@ fn routed_put_shaping_caps_remote_batch_bytes() {
             b"payload",
             &ReplicationPolicy::new()
                 .prefer_local(false)
-                .preferred_storage_owners([
-                    remote_a.storage_key(),
-                    remote_b.storage_key(),
-                ]),
+                .preferred_storage_owners([remote_a.storage_key(), remote_b.storage_key()]),
         )
         .expect("routed put should succeed");
 
@@ -5725,24 +5799,28 @@ fn qos_tier_drives_namespace_governance_and_placement() {
         .expect("client build should succeed");
 
     let gold = client
-        .batch_put(&[
-            PutRequest::new("gold-key", b"1234")
-                .tenant("tenant-a")
-                .domain("domain-a")
-                .object_set("set-a")
-                .qos_tier("gold")
-                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
-        ])
+        .batch_put(&[PutRequest::new("gold-key", b"1234")
+            .tenant("tenant-a")
+            .domain("domain-a")
+            .object_set("set-a")
+            .qos_tier("gold")
+            .replication(
+                ReplicationPolicy::new()
+                    .replica_count(1)
+                    .prefer_local(false),
+            )])
         .expect("gold write should succeed");
     let bronze = client
-        .batch_put(&[
-            PutRequest::new("bronze-key", b"5678")
-                .tenant("tenant-a")
-                .domain("domain-a")
-                .object_set("set-a")
-                .qos_tier("bronze")
-                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
-        ])
+        .batch_put(&[PutRequest::new("bronze-key", b"5678")
+            .tenant("tenant-a")
+            .domain("domain-a")
+            .object_set("set-a")
+            .qos_tier("bronze")
+            .replication(
+                ReplicationPolicy::new()
+                    .replica_count(1)
+                    .prefer_local(false),
+            )])
         .expect("bronze write should succeed");
 
     assert_eq!(gold[0].replicas[0].owner.stable_id.0, "storage-gold");
@@ -5754,18 +5832,22 @@ fn qos_tier_drives_namespace_governance_and_placement() {
         .list_routes_in_scope(&scope)
         .expect("scope listing should succeed");
     assert_eq!(routes.len(), 2);
-    assert!(routes.iter().any(|route| route.logical_key.as_deref() == Some("gold-key")));
-    assert!(routes.iter().any(|route| route.logical_key.as_deref() == Some("bronze-key")));
+    assert!(routes
+        .iter()
+        .any(|route| route.logical_key.as_deref() == Some("gold-key")));
+    assert!(routes
+        .iter()
+        .any(|route| route.logical_key.as_deref() == Some("bronze-key")));
 
     let over_quota = client
-        .batch_put(&[
-            PutRequest::new("gold-overflow", b"x")
-                .tenant("tenant-a")
-                .domain("domain-a")
-                .object_set("set-a")
-                .qos_tier("gold"),
-        ])
-        .expect_err("namespace quota should ignore qos tier boundaries after shared scope fills up");
+        .batch_put(&[PutRequest::new("gold-overflow", b"x")
+            .tenant("tenant-a")
+            .domain("domain-a")
+            .object_set("set-a")
+            .qos_tier("gold")])
+        .expect_err(
+            "namespace quota should ignore qos tier boundaries after shared scope fills up",
+        );
     assert!(over_quota.to_string().contains("namespace quota exceeded"));
 }
 
@@ -6535,17 +6617,14 @@ fn helper_primitives_and_request_builders_cover_contracts() {
         ..CompatibilityDescriptor::default()
     };
     let builder_transport = Arc::new(TestTransport::new("builder-compat-segment"));
-    let built = StoreClientBuilder::new(
-        Arc::new(InMemoryMetadataBackend::new()),
-        "builder-compat",
-    )
-    .compatibility(custom_compat.clone())
-    .route_control(RouteControlMode::MetadataOnly)
-    .namespace_quota(NamespaceQuota::new().max_bytes(1024).max_objects(8))
-    .state(ClientLifecycleState::Active)
-    .transport(builder_transport)
-    .build(test_future_expiry_ms())
-    .expect("builder with compatibility and route_control should succeed");
+    let built = StoreClientBuilder::new(Arc::new(InMemoryMetadataBackend::new()), "builder-compat")
+        .compatibility(custom_compat.clone())
+        .route_control(RouteControlMode::MetadataOnly)
+        .namespace_quota(NamespaceQuota::new().max_bytes(1024).max_objects(8))
+        .state(ClientLifecycleState::Active)
+        .transport(builder_transport)
+        .build(test_future_expiry_ms())
+        .expect("builder with compatibility and route_control should succeed");
     assert_eq!(built.lease().compatibility, custom_compat);
 }
 
@@ -6633,8 +6712,14 @@ fn bootstrap_route_policy_bootstraps_once_and_rejects_mismatch() {
         endpoints: ClientEndpointSet::default(),
         expires_at_ms: test_future_expiry_ms(),
     };
-    bootstrap_route_policy(metadata.as_ref(), &writer, RouteControlMode::EmbeddedWrh, 3)
-        .expect("initial route policy bootstrap should succeed");
+    bootstrap_route_policy(
+        metadata.as_ref(),
+        &writer,
+        "default",
+        RouteControlMode::EmbeddedWrh,
+        3,
+    )
+    .expect("initial route policy bootstrap should succeed");
     let stored = metadata
         .get_route_policy(&RoutePolicyDomain::Default)
         .expect("route policy get should succeed")
@@ -6652,6 +6737,7 @@ fn bootstrap_route_policy_bootstraps_once_and_rejects_mismatch() {
     bootstrap_route_policy(
         metadata.as_ref(),
         &follower,
+        "default",
         RouteControlMode::EmbeddedWrh,
         3,
     )
@@ -6659,6 +6745,7 @@ fn bootstrap_route_policy_bootstraps_once_and_rejects_mismatch() {
     let error = bootstrap_route_policy(
         metadata.as_ref(),
         &follower,
+        "default",
         RouteControlMode::EmbeddedWrh,
         4,
     )
@@ -6911,6 +6998,78 @@ fn heartbeat_recovery_republishes_local_metadata_after_long_redis_outage() {
         .get_route_policy(&RoutePolicyDomain::Default)
         .expect("route policy should read after repair")
         .is_some());
+}
+
+#[test]
+fn bootstrap_route_policy_uses_tenant_override_when_present() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let writer = ClientLease {
+        runtime: ClientRuntimeId::new("writer", ClientEpoch(1)),
+        state: ClientLifecycleState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        endpoints: ClientEndpointSet::default(),
+        expires_at_ms: test_future_expiry_ms(),
+    };
+    let default_policy = RoutePolicy {
+        route_topk: 2,
+        route_control: RouteControlMode::EmbeddedWrh,
+        created_by: writer.runtime.clone(),
+        created_at_ms: 10,
+    };
+    let tenant_policy = RoutePolicy {
+        route_topk: 4,
+        route_control: RouteControlMode::MetadataOnly,
+        created_by: writer.runtime.clone(),
+        created_at_ms: 20,
+    };
+    metadata
+        .put_route_policy(&RoutePolicyDomain::Default, &default_policy)
+        .expect("default route policy should be stored");
+    metadata
+        .put_route_policy(
+            &RoutePolicyDomain::Tenant("tenant-a".to_string()),
+            &tenant_policy,
+        )
+        .expect("tenant route policy should be stored");
+
+    bootstrap_route_policy(
+        metadata.as_ref(),
+        &writer,
+        "tenant-a",
+        RouteControlMode::MetadataOnly,
+        4,
+    )
+    .expect("tenant override should satisfy bootstrap");
+
+    let effective = resolve_effective_route_policy(metadata.as_ref(), "tenant-a")
+        .expect("effective route policy should resolve");
+    assert_eq!(effective, tenant_policy);
+}
+
+#[test]
+fn bootstrap_route_policy_falls_back_to_default_when_tenant_override_missing() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let writer = ClientLease {
+        runtime: ClientRuntimeId::new("writer", ClientEpoch(1)),
+        state: ClientLifecycleState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        endpoints: ClientEndpointSet::default(),
+        expires_at_ms: test_future_expiry_ms(),
+    };
+
+    bootstrap_route_policy(
+        metadata.as_ref(),
+        &writer,
+        "tenant-a",
+        RouteControlMode::EmbeddedWrh,
+        3,
+    )
+    .expect("default bootstrap should succeed without tenant override");
+
+    let effective = resolve_effective_route_policy(metadata.as_ref(), "tenant-a")
+        .expect("effective route policy should fall back to default");
+    assert_eq!(effective.route_control, RouteControlMode::EmbeddedWrh);
+    assert_eq!(effective.route_topk, 3);
 }
 
 #[test]
@@ -7178,8 +7337,12 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
     let scoped_routes = client
         .list_routes_in_scope(&tenant_b_scope)
         .expect("scope listing should succeed");
-    assert!(scoped_routes.iter().any(|route| route.key == queried_tenant.key));
-    assert!(scoped_routes.iter().all(|route| route.namespace.as_ref() == Some(&tenant_b_scope)));
+    assert!(scoped_routes
+        .iter()
+        .any(|route| route.key == queried_tenant.key));
+    assert!(scoped_routes
+        .iter()
+        .all(|route| route.namespace.as_ref() == Some(&tenant_b_scope)));
 
     let tenant_b_reuse = mooncake_store_core::ReuseIdentity::new(
         "tenant-b",
@@ -7190,8 +7353,12 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
     let reuse_candidates = client
         .list_reuse_candidates(&tenant_b_reuse)
         .expect("reuse lookup should succeed");
-    assert!(reuse_candidates.iter().any(|route| route.key == queried_tenant.key));
-    assert!(reuse_candidates.iter().all(|route| route.namespace.as_ref() == Some(&tenant_b_scope)));
+    assert!(reuse_candidates
+        .iter()
+        .any(|route| route.key == queried_tenant.key));
+    assert!(reuse_candidates
+        .iter()
+        .all(|route| route.namespace.as_ref() == Some(&tenant_b_scope)));
 
     let tenant_a_reuse = mooncake_store_core::ReuseIdentity::new(
         "tenant-a",
@@ -7202,9 +7369,16 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
     let tenant_a_candidates = client
         .list_reuse_candidates(&tenant_a_reuse)
         .expect("tenant-a reuse lookup should succeed");
-    assert!(tenant_a_candidates.iter().any(|route| route.key == queried.key));
-    assert!(tenant_a_candidates.iter().all(|route| route.namespace.as_ref() == Some(&NamespaceScope::with_defaults(Some("tenant-a"), None, None))));
-    assert!(tenant_a_candidates.iter().all(|route| route.key != queried_tenant.key));
+    assert!(tenant_a_candidates
+        .iter()
+        .any(|route| route.key == queried.key));
+    assert!(tenant_a_candidates
+        .iter()
+        .all(|route| route.namespace.as_ref()
+            == Some(&NamespaceScope::with_defaults(Some("tenant-a"), None, None))));
+    assert!(tenant_a_candidates
+        .iter()
+        .all(|route| route.key != queried_tenant.key));
 
     let mut direct_insert = queried.clone();
     direct_insert.key = client.scoped_key("tenant-a", "cas-direct");
