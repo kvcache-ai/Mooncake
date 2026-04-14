@@ -808,10 +808,9 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
         bool same_machine = (request.target_id == LOCAL_SEGMENT_ID);
         if (!same_machine) {
             auto local_desc = metadata_->segmentManager().getLocal();
-            same_machine =
-                local_desc && !desc->machine_id.empty() &&
-                !local_desc->machine_id.empty() &&
-                desc->machine_id == local_desc->machine_id;
+            same_machine = local_desc && !desc->machine_id.empty() &&
+                           !local_desc->machine_id.empty() &&
+                           desc->machine_id == local_desc->machine_id;
         }
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         for (auto type : entry->transports) {
