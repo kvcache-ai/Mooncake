@@ -37,6 +37,7 @@ struct MnnvlTask {
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
     int cuda_id = 0;
+    cudaEvent_t completion_event = nullptr;
 };
 
 struct MnnvlSubBatch : public Transport::SubBatch {
@@ -83,7 +84,7 @@ class MnnvlTransport : public Transport {
     virtual Status freeLocalMemory(void *addr, size_t size);
 
    private:
-    void startTransfer(MnnvlTask *task, MnnvlSubBatch *batch);
+    void startTransfer(std::vector<MnnvlTask *> &tasks, MnnvlSubBatch *batch);
 
     void *createSharedMemory(const std::string &path, size_t size);
 
