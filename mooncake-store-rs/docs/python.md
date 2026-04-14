@@ -154,7 +154,7 @@ Useful flags:
 - `--routed-writes` and `--replica-count` to enable routed writer mode
 - `--route-topk <n>` to control WRH route-authority fanout; it must be `>= 2` and match the policy already stored in the metadata keyspace
 - `--route-control metadata-only|embedded-wrh` to select the route authority mode
-- `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
+- `--heartbeat-interval-ms`, `--heartbeat-timeout-ms`, and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
 - `--client-server-address host:port` to expose the standalone compatibility server for dummy clients only
 - `--use-hugepage` and `--hugepage-size 2MB|1GB` to enable hugepage-backed local memory
@@ -173,6 +173,14 @@ Port reminder:
 - `metrics_addr` / `--metrics-addr` is only for `/metrics`
 - cross-host real-mode deployments should set both a reachable `local_hostname` and a fixed `transport_rpc_port`
 - `local_hostname` may also be passed as `host:port`; the compatibility layer will split the port into `transport_rpc_port`
+
+Heartbeat behavior:
+
+- heartbeat publish uses a dedicated timeout instead of the generic 5s dispatcher request timeout
+- a single failed heartbeat no longer exits the standalone client process
+- failed heartbeat publishes are retried on a short backoff
+- `--heartbeat-timeout-ms` controls the dedicated heartbeat publish timeout
+- `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` provides the same override for Python or environment-driven launches
 
 ## Basic Real-Mode Example
 

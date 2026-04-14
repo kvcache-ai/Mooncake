@@ -118,6 +118,8 @@ struct Args {
     lease_ttl_ms: u64,
     #[arg(long, default_value_t = 30_000)]
     heartbeat_interval_ms: u64,
+    #[arg(long, default_value_t = 15_000)]
+    heartbeat_timeout_ms: u64,
     #[arg(long)]
     metrics_addr: Option<String>,
     #[arg(long)]
@@ -164,9 +166,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let epoch = runtime.epoch;
     let initial_state = runtime.initial_state;
     let segment_name = runtime.segment_name.clone();
-    let client = Arc::new(StoreDispatcher::spawn(
+    let client = Arc::new(StoreDispatcher::spawn_with_heartbeat_timeout(
         runtime.client,
         format!("mooncake-store-dispatcher-{stable_id}"),
+        Duration::from_millis(args.heartbeat_timeout_ms),
     )?);
     client.register_local_memory()?;
     let dummy_server = match args.client_server_address.as_deref() {
@@ -188,6 +191,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
     );
 
+    let mut heartbeat_state = HeartbeatLoopState::new(now_ms());
     let mut next_heartbeat = now_ms().saturating_add(heartbeat_interval);
     while !shutdown.requested() {
         let now = now_ms();
@@ -200,8 +204,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         if now >= next_heartbeat {
-            client.heartbeat(now.saturating_add(args.lease_ttl_ms))?;
-            next_heartbeat = now.saturating_add(heartbeat_interval);
+            next_heartbeat = refresh_lease_or_retry(
+                &client,
+                &stable_id,
+                now,
+                args.lease_ttl_ms,
+                heartbeat_interval,
+                &mut heartbeat_state,
+            );
             continue;
         }
         let wait_ms = next_heartbeat.saturating_sub(now).max(1);
@@ -280,6 +290,9 @@ fn graceful_shutdown(
 fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
     if args.lease_ttl_ms == 0 {
         return Err("--lease-ttl-ms must be greater than zero".into());
+    }
+    if args.heartbeat_timeout_ms == 0 {
+        return Err("--heartbeat-timeout-ms must be greater than zero".into());
     }
     if args.epoch == 0 {
         return Err("--epoch must be greater than zero".into());
@@ -447,6 +460,67 @@ fn effective_heartbeat_interval(requested_ms: u64, lease_ttl_ms: u64) -> u64 {
     requested_ms
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HeartbeatLoopState {
+    consecutive_failures: u64,
+    last_success_ms: u64,
+}
+
+impl HeartbeatLoopState {
+    fn new(now_ms: u64) -> Self {
+        Self {
+            consecutive_failures: 0,
+            last_success_ms: now_ms,
+        }
+    }
+
+    fn record_success(&mut self, now_ms: u64) -> u64 {
+        let recovered = self.consecutive_failures;
+        self.consecutive_failures = 0;
+        self.last_success_ms = now_ms;
+        recovered
+    }
+
+    fn record_failure(&mut self) -> u64 {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.consecutive_failures
+    }
+}
+
+fn heartbeat_retry_delay_ms(heartbeat_interval_ms: u64) -> u64 {
+    heartbeat_interval_ms.clamp(500, 1_000)
+}
+
+fn refresh_lease_or_retry(
+    client: &StoreDispatcher,
+    stable_id: &str,
+    now_ms: u64,
+    lease_ttl_ms: u64,
+    heartbeat_interval_ms: u64,
+    state: &mut HeartbeatLoopState,
+) -> u64 {
+    match client.heartbeat(now_ms.saturating_add(lease_ttl_ms)) {
+        Ok(()) => {
+            let recovered = state.record_success(now_ms);
+            if recovered != 0 {
+                eprintln!(
+                    "mooncake-store-client heartbeat recovered stable_id={stable_id} recovered_after_failures={recovered}"
+                );
+            }
+            now_ms.saturating_add(heartbeat_interval_ms)
+        }
+        Err(error) => {
+            let failures = state.record_failure();
+            let retry_after_ms = heartbeat_retry_delay_ms(heartbeat_interval_ms);
+            eprintln!(
+                "mooncake-store-client heartbeat failed stable_id={stable_id} consecutive_failures={failures} last_success_age_ms={} retry_after_ms={retry_after_ms} error={error}",
+                now_ms.saturating_sub(state.last_success_ms),
+            );
+            now_ms.saturating_add(retry_after_ms)
+        }
+    }
+}
+
 fn should_follow_handoff(initial_state: ClientLifecycleState, epoch: ClientEpoch) -> bool {
     initial_state == ClientLifecycleState::Standby && epoch.0 > 1
 }
@@ -494,9 +568,10 @@ mod tests {
     use mooncake_store_core::{ClientEpoch, ClientLifecycleState};
 
     use super::{
-        build_runtime_args, drained_message, effective_heartbeat_interval, now_ms,
-        parse_hugepage_size_arg, parse_label, start_metrics_if_needed, started_message,
-        stopped_message, validate_args, Args, InitialStateArg, RouteControlArg,
+        build_runtime_args, drained_message, effective_heartbeat_interval,
+        heartbeat_retry_delay_ms, now_ms, parse_hugepage_size_arg, parse_label,
+        start_metrics_if_needed, started_message, stopped_message, validate_args, Args,
+        HeartbeatLoopState, InitialStateArg, RouteControlArg,
     };
 
     fn sample_args() -> Args {
@@ -522,6 +597,7 @@ mod tests {
             local_segment_name: None,
             lease_ttl_ms: 10_000,
             heartbeat_interval_ms: 3_000,
+            heartbeat_timeout_ms: 15_000,
             metrics_addr: None,
             client_server_address: None,
             use_hugepage: false,
@@ -688,6 +764,10 @@ mod tests {
         assert!(validate_args(&args).is_err());
 
         let mut args = sample_args();
+        args.heartbeat_timeout_ms = 0;
+        assert!(validate_args(&args).is_err());
+
+        let mut args = sample_args();
         args.epoch = 0;
         assert!(validate_args(&args).is_err());
 
@@ -735,6 +815,16 @@ mod tests {
         assert_eq!(effective_heartbeat_interval(15_000, 9_000), 3_000);
         assert_eq!(effective_heartbeat_interval(500, 2_000), 500);
         assert_eq!(effective_heartbeat_interval(1_500, 9_000), 1_500);
+        assert_eq!(heartbeat_retry_delay_ms(10_000), 1_000);
+        assert_eq!(heartbeat_retry_delay_ms(800), 800);
+        assert_eq!(heartbeat_retry_delay_ms(100), 500);
+
+        let mut state = HeartbeatLoopState::new(100);
+        assert_eq!(state.record_failure(), 1);
+        assert_eq!(state.record_failure(), 2);
+        assert_eq!(state.record_success(200), 2);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.last_success_ms, 200);
 
         assert_eq!(
             start_metrics_if_needed(None).expect("disabled metrics should succeed"),

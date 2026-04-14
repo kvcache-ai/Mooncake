@@ -68,6 +68,26 @@ pub struct StoreClient {
     state: Mutex<StoreState>,
 }
 
+pub struct HeartbeatLease {
+    metadata: Arc<dyn MetadataBackend>,
+    lease: ClientLease,
+}
+
+impl HeartbeatLease {
+    pub fn publish(self) -> Result<()> {
+        let _span = info_span!(
+            "store.heartbeat",
+            runtime = %self.lease.runtime,
+            expires_at_ms = self.lease.expires_at_ms
+        )
+        .entered();
+        let tracker = OperationTracker::new("heartbeat");
+        let result = self.metadata.upsert_client_lease(&self.lease);
+        tracker.finish(&result, 0);
+        result
+    }
+}
+
 include!("runtime_core.rs");
 include!("runtime_alloc.rs");
 include!("runtime_io.rs");
