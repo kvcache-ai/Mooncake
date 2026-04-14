@@ -12,7 +12,8 @@ use _store_rs::dummy_service::start_dummy_store_server;
 use _store_rs::runtime::{CompatRuntimeArgs, CompatSetupArgs};
 use clap::{Parser, ValueEnum};
 use mooncake_store_client::{
-    init_tracing, start_metrics_http_server, stop_metrics_http_server, RouteControlMode,
+    init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
+    RouteControlMode,
 };
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
@@ -192,7 +193,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let mut heartbeat_state = HeartbeatLoopState::new(now_ms());
-    let mut next_heartbeat = now_ms().saturating_add(heartbeat_interval);
+    let mut next_heartbeat = now_ms().saturating_add(initial_heartbeat_delay_ms(
+        &stable_id,
+        epoch,
+        heartbeat_interval,
+    ));
     while !shutdown.requested() {
         let now = now_ms();
         if should_follow_handoff(initial_state, epoch) {
@@ -460,6 +465,18 @@ fn effective_heartbeat_interval(requested_ms: u64, lease_ttl_ms: u64) -> u64 {
     requested_ms
 }
 
+fn initial_heartbeat_delay_ms(
+    stable_id: &str,
+    epoch: ClientEpoch,
+    heartbeat_interval_ms: u64,
+) -> u64 {
+    stable_phase_spread_ms(
+        &format!("{stable_id}:{}", epoch.0),
+        heartbeat_interval_ms,
+        "heartbeat",
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HeartbeatLoopState {
     consecutive_failures: u64,
@@ -564,14 +581,14 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use mooncake_store_client::RouteControlMode;
+    use mooncake_store_client::{stable_phase_spread_ms, RouteControlMode};
     use mooncake_store_core::{ClientEpoch, ClientLifecycleState};
 
     use super::{
         build_runtime_args, drained_message, effective_heartbeat_interval,
-        heartbeat_retry_delay_ms, now_ms, parse_hugepage_size_arg, parse_label,
-        start_metrics_if_needed, started_message, stopped_message, validate_args, Args,
-        HeartbeatLoopState, InitialStateArg, RouteControlArg,
+        heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms, parse_hugepage_size_arg,
+        parse_label, start_metrics_if_needed, started_message, stopped_message, validate_args,
+        Args, HeartbeatLoopState, InitialStateArg, RouteControlArg,
     };
 
     fn sample_args() -> Args {
@@ -815,6 +832,15 @@ mod tests {
         assert_eq!(effective_heartbeat_interval(15_000, 9_000), 3_000);
         assert_eq!(effective_heartbeat_interval(500, 2_000), 500);
         assert_eq!(effective_heartbeat_interval(1_500, 9_000), 1_500);
+        assert_eq!(stable_phase_spread_ms("runtime-a:1", 0, "heartbeat"), 0);
+        let first_delay = stable_phase_spread_ms("runtime-a:1", 3_000, "heartbeat");
+        assert!((1..=3_000).contains(&first_delay));
+        assert_eq!(
+            first_delay,
+            stable_phase_spread_ms("runtime-a:1", 3_000, "heartbeat")
+        );
+        let heartbeat_delay = initial_heartbeat_delay_ms("runtime-a", ClientEpoch(3), 3_000);
+        assert!((1..=3_000).contains(&heartbeat_delay));
         assert_eq!(heartbeat_retry_delay_ms(10_000), 1_000);
         assert_eq!(heartbeat_retry_delay_ms(800), 800);
         assert_eq!(heartbeat_retry_delay_ms(100), 500);
