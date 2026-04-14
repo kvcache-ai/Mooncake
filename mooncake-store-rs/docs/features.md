@@ -300,3 +300,14 @@ The compatibility layer exposes two integration modes:
 - dummy mode talks to a standalone `mooncake-store-client` process and exchanges shm buffer registrations over a side channel
 
 Both paths are covered by repository validation scripts.
+
+The standard read/write entry point is:
+
+```bash
+./scripts/test-client-rw-cli.sh
+```
+
+Manual path-specific validators stay available as:
+
+- `scripts/real_client_rw.py`
+- `scripts/dummy_client_rw.py`

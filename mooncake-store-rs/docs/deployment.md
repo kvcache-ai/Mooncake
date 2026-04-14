@@ -515,6 +515,7 @@ The current end-to-end binary covers:
 
 Additional dedicated validation scripts cover:
 
+- CLI-driven real/dummy read-write validation against standalone daemons
 - CLI-driven hot-upgrade handoff with payload preservation
 - CLI-driven eviction with metrics and tracing validation
 - Python hot-upgrade startup argument parsing and wrapper forwarding

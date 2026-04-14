@@ -152,8 +152,20 @@ def parse_args() -> argparse.Namespace:
         "--route-control",
         "--route_control",
         default="embedded_wrh",
-        choices=["embedded_wrh", "metadata_only"],
-        help="Route control mode (default: embedded_wrh)",
+        help="Route control mode: embedded_wrh / embedded-wrh / metadata_only / metadata-only",
+    )
+    parser.add_argument(
+        "--route-topk",
+        "--route_topk",
+        type=int,
+        default=2,
+        help="Embedded WRH route authority replica count (default: 2)",
+    )
+    parser.add_argument(
+        "--transport-backend",
+        "--transport_backend",
+        default=None,
+        help="Real transport backend override: classic_te / classic-te / tent",
     )
     parser.add_argument(
         "--num_kv",
@@ -252,6 +264,7 @@ def apply_compat_defaults(args: argparse.Namespace) -> None:
         args.prefer_local = True
     if args.with_soft_pin is None:
         args.with_soft_pin = True
+    args.route_control = normalize_route_control(args.route_control)
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -268,6 +281,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--batch_size must be greater than zero")
     if args.replica_num <= 0:
         raise SystemExit("--replica_num must be greater than zero")
+    if args.route_topk < 2:
+        raise SystemExit("--route-topk must be greater than or equal to 2")
+    if args.transport_backend is not None:
+        args.transport_backend = normalize_transport_backend(args.transport_backend)
     if args.storage_bytes < 0 or args.scratch_bytes <= 0:
         raise SystemExit("--storage-bytes must be >= 0 and --scratch-bytes must be > 0")
     host, port = normalize_local_endpoint(args.local_host, args.transport_rpc_port)
@@ -284,6 +301,28 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit(
             "rw-only writers require --routed-writes when --storage-bytes is 0"
         )
+
+
+def normalize_route_control(value: str) -> str:
+    normalized = value.strip().lower().replace("-", "_")
+    if normalized in ("embedded_wrh", "wrh"):
+        return "embedded_wrh"
+    if normalized in ("metadata_only", "metadata"):
+        return "metadata_only"
+    raise SystemExit(
+        f"unsupported --route-control {value!r}; expected embedded_wrh or metadata_only"
+    )
+
+
+def normalize_transport_backend(value: str) -> str:
+    normalized = value.strip().lower().replace("-", "_")
+    if normalized == "classic_te":
+        return "classic_te"
+    if normalized == "tent":
+        return "tent"
+    raise SystemExit(
+        f"unsupported --transport-backend {value!r}; expected classic_te or tent"
+    )
 
 
 def normalize_local_endpoint(
@@ -404,6 +443,8 @@ def setup_store(
     transport_metadata_url: str | None,
     transport_rpc_port: int | None,
     route_control: str,
+    route_topk: int,
+    transport_backend: str | None,
 ) -> int:
     modern_kwargs = {
         "stable_id": stable_id,
@@ -412,9 +453,11 @@ def setup_store(
         "labels": labels,
         "routed_writes": routed_writes,
         "replica_count": replica_num,
+        "route_topk": route_topk,
         "keyspace": keyspace,
         "transport_metadata_url": transport_metadata_url,
         "transport_rpc_port": transport_rpc_port,
+        "transport_backend": transport_backend,
         "route_control": route_control,
     }
     try:
@@ -615,8 +658,10 @@ def main() -> int:
     print(f"  mode:                {args.mode}")
     print(f"  batch_size:          {args.batch_size}")
     print(f"  replica_num:         {args.replica_num}")
+    print(f"  route_topk:          {args.route_topk}")
     print(f"  prefer_local:        {args.prefer_local}")
     print(f"  with_soft_pin:       {args.with_soft_pin}")
+    print(f"  transport_backend:   {args.transport_backend}")
 
     rc = setup_store(
         store,
@@ -637,6 +682,8 @@ def main() -> int:
         transport_metadata_url=args.transport_metadata_url,
         transport_rpc_port=transport_rpc_port,
         route_control=args.route_control,
+        route_topk=args.route_topk,
+        transport_backend=args.transport_backend,
     )
     if int(rc) != 0:
         raise RuntimeError(f"setup failed status={rc}")
