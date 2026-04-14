@@ -1,3 +1,9 @@
+#[cfg(not(test))]
+const DEFAULT_STARTUP_PREWARM_MAX_DELAY: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const DEFAULT_STARTUP_PREWARM_MAX_DELAY: Duration = Duration::ZERO;
+const STARTUP_PREWARM_SPREAD_ENV: &str = "MC_STORE_RS_STARTUP_PREWARM_SPREAD_MS";
+
 fn normalize_storage_label(
     local_memory: &LocalMemoryConfig,
     labels: &mut BTreeMap<String, String>,
@@ -29,6 +35,7 @@ pub struct StoreClientBuilder {
     route_control: RouteControlMode,
     route_topk: usize,
     live_client_sync_interval: Duration,
+    startup_prewarm_max_delay: Duration,
 }
 
 impl StoreClientBuilder {
@@ -48,6 +55,7 @@ impl StoreClientBuilder {
             route_control: RouteControlMode::EmbeddedWrh,
             route_topk: DEFAULT_ROUTE_TOPK,
             live_client_sync_interval: DEFAULT_LIVE_CLIENT_SYNC_INTERVAL,
+            startup_prewarm_max_delay: startup_prewarm_max_delay_from_env(),
         }
     }
 
@@ -126,6 +134,11 @@ impl StoreClientBuilder {
 
     pub fn live_client_sync_interval(mut self, interval: Duration) -> Self {
         self.live_client_sync_interval = interval;
+        self
+    }
+
+    pub fn startup_prewarm_max_delay(mut self, delay: Duration) -> Self {
+        self.startup_prewarm_max_delay = delay;
         self
     }
 
@@ -223,6 +236,10 @@ impl StoreClientBuilder {
             expires_at_ms,
         };
         self.metadata.upsert_client_lease(&lease)?;
+        let prewarm_delay = startup_prewarm_delay(&runtime, self.startup_prewarm_max_delay);
+        if !prewarm_delay.is_zero() {
+            std::thread::sleep(prewarm_delay);
+        }
         refresh_live_client_cache(
             self.metadata.as_ref(),
             &live_client_cache,
@@ -307,4 +324,21 @@ fn validate_route_policy(local: &RoutePolicy, existing: &RoutePolicy) -> Result<
         existing.route_control,
         existing.route_topk,
     )))
+}
+
+fn startup_prewarm_max_delay_from_env() -> Duration {
+    std::env::var(STARTUP_PREWARM_SPREAD_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_STARTUP_PREWARM_MAX_DELAY)
+}
+
+fn startup_prewarm_delay(runtime: &ClientRuntimeId, max_delay: Duration) -> Duration {
+    let max_delay_ms = max_delay.as_millis().min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(stable_phase_spread_ms(
+        &runtime.to_string(),
+        max_delay_ms,
+        "startup_prewarm",
+    ))
 }

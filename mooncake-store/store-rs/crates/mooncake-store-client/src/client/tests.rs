@@ -22,9 +22,9 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, flatten_slices, now_ms, record_success_metric,
-    scatter_into_buffers, LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState,
-    LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget, SegmentAllocator, StorageOwnerState,
-    StoreState, SuspectRuntimeCache,
+    scatter_into_buffers, startup_prewarm_delay, LiveClientCache, LocalAllocatorAdapter,
+    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget,
+    SegmentAllocator, StorageOwnerState, StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -1596,6 +1596,21 @@ fn build_prewarms_live_client_snapshot_for_first_routed_put() {
     assert_eq!(
         after_first, after_build,
         "first routed put should use the prewarmed live-client snapshot without an on-request refresh"
+    );
+}
+
+#[test]
+fn startup_prewarm_delay_is_stably_spread_and_bounded() {
+    let runtime = ClientRuntimeId::new("startup-prewarm", ClientEpoch(4));
+    let delay = startup_prewarm_delay(&runtime, Duration::from_millis(250));
+    assert!((1..=250).contains(&delay.as_millis()));
+    assert_eq!(
+        delay,
+        startup_prewarm_delay(&runtime, Duration::from_millis(250))
+    );
+    assert_eq!(
+        startup_prewarm_delay(&runtime, Duration::ZERO),
+        Duration::ZERO
     );
 }
 

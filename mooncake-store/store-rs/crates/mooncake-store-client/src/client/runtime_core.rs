@@ -230,7 +230,8 @@ impl StoreClient {
             .transport(helper_transport)
             .transport_factory(factory)
             .route_control(self.route_control)
-            .route_topk(self.route_topk);
+            .route_topk(self.route_topk)
+            .startup_prewarm_max_delay(Duration::ZERO);
 
         let mut labels = self.lease.endpoints.labels.clone();
         labels.remove(control_address_label());
