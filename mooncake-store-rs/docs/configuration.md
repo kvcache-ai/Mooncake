@@ -2,6 +2,23 @@
 
 This document collects the main runtime knobs exposed by the current implementation.
 
+## Tenant Policy Precedence
+
+Tenant-scoped routing and resource policy should be authored through `mooncake-store-admin policy ...`
+and stored in durable metadata. Runtime-local knobs remain available as compatibility fallbacks.
+
+Precedence is:
+
+1. admin-managed tenant policy in metadata
+2. legacy compatibility metadata reads where still supported during migration
+3. runtime-local builder / Python / standalone client fallback values when metadata does not provide the relevant section
+
+Keep this distinction clear:
+
+- `tenant` selects the default scope used for request builders and startup policy lookup
+- request-scoped APIs and per-request `ReplicationPolicy` remain normal execution-time inputs
+- local route/resource knobs are not the preferred long-term policy authoring surface
+
 ## `StoreClientBuilder`
 
 `StoreClientBuilder` is the main construction surface for Rust clients.
@@ -14,13 +31,13 @@ This document collects the main runtime knobs exposed by the current implementat
 | `rpc_address(...)` | empty | filled from transport when possible |
 | `segment_name(...)` | none | filled from transport when possible |
 | `state(...)` | `Standby` | use `Active` for serving clients |
-| `tenant(...)` | `"default"` | default tenant for request builders |
+| `tenant(...)` | `"default"` | default tenant for request builders and startup policy lookup |
 | `local_memory(...)` | `LocalMemoryConfig::default()` | storage and scratch memory layout |
 | `transport(...)` / `with_tent(...)` | none | required for remote transfer paths; low-level Rust transport is wired explicitly |
 | `transport_factory(...)` | none | used to create transports for peers |
 | `routed_writes(...)` | disabled | enables routed placement |
-| `route_control(...)` | `EmbeddedWrh` | selects route control mode |
-| `route_topk(...)` | `2` | WRH route-authority fanout; stored as cluster policy in the metadata keyspace; must be `>= 2` |
+| `route_control(...)` | `EmbeddedWrh` | compatibility fallback route-control mode; metadata tenant policy wins when present |
+| `route_topk(...)` | `2` | compatibility fallback WRH route-authority fanout; metadata tenant policy wins when present; must be `>= 2` |
 | `live_client_sync_interval(...)` | `1s` | background refresh interval for the live-client membership snapshot; `0` disables the worker |
 
 System-managed behavior:
@@ -123,7 +140,8 @@ Use `MetadataOnly` for bring-up and debugging. Use `EmbeddedWrh` for normal depl
 
 Startup bootstrap is metadata-authoritative:
 
-- every client starts with a local route policy: `route_control + route_topk`
+- admin-managed tenant policy is the preferred source for tenant-scoped routing
+- runtime-local `route_control + route_topk` values are bootstrap/compatibility fallbacks only
 - if the metadata keyspace has no default route policy yet, the first successful client writes it with create-if-absent semantics
 - startup then resolves the effective policy for the client's default tenant: tenant override first, otherwise the default cluster policy
 - later clients must match that effective policy or startup fails immediately
@@ -254,6 +272,9 @@ For Redis 5 password-only deployments, the metadata backend also tolerates conne
 `MooncakeDistributedStore.setup(...)` accepts the core store knobs plus Python-specific convenience parameters.
 
 Important Python-only compatibility knobs:
+
+`tenant` remains a normal default scope selector. `route_topk` and `route_control` are kept for compatibility, but admin-managed tenant policy in metadata is the preferred place to author tenant-scoped routing policy.
+
 
 | Parameter | Meaning |
 |-----------|---------|

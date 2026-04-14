@@ -2,6 +2,16 @@
 
 This document explains how to run `mooncake-store-rs` locally and how to map the runtime to common deployment roles.
 
+## Recommended Tenant Policy Workflow
+
+For tenant-scoped routing and resource policy, prefer this operator workflow:
+
+1. write tenant policy through `mooncake-store-admin policy ...`
+2. launch runtimes with tenant identity plus transport/memory configuration
+3. let Store-RS resolve and enforce the effective policy from metadata at bootstrap and on request paths
+
+Runtime-local CLI, Python, and environment route/resource knobs remain available as compatibility fallbacks, but they are not the preferred long-term policy authoring surface.
+
 ## Requirements
 
 - Rust toolchain
@@ -243,6 +253,8 @@ python -m sglang.launch_server \
   Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. The Python compatibility layer therefore treats environment variables as setup fallbacks when SGLang does not pass the new fields. Explicit Python `setup(...)` arguments still win over environment values.
 
 Use these environment variables for SGLang real mode:
+
+These are compatibility bridges because current upstream SGLang does not forward the full Store-RS setup surface. Prefer admin-managed tenant policy in metadata whenever the integration path allows it.
 
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`; default `classic_te`
 - `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
