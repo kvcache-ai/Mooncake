@@ -1322,6 +1322,46 @@ fn builder_defaults_storage_label_to_false_when_storage_bytes_is_zero() {
             .map(String::as_str),
         Some("false")
     );
+    assert_eq!(
+        client
+            .lease()
+            .endpoints
+            .labels
+            .get("route")
+            .map(String::as_str),
+        Some("false")
+    );
+}
+
+#[test]
+fn builder_keeps_explicit_route_true_for_rw_only_client() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("rw-explicit-route-segment"));
+    let client = StoreClientBuilder::new(metadata, "rw-explicit-route")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .label("route", "true")
+        .build(test_future_expiry_ms())
+        .expect("builder should succeed");
+    assert_eq!(
+        client
+            .lease()
+            .endpoints
+            .labels
+            .get("storage")
+            .map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        client
+            .lease()
+            .endpoints
+            .labels
+            .get("route")
+            .map(String::as_str),
+        Some("true")
+    );
 }
 
 #[test]
@@ -2235,8 +2275,14 @@ fn batch_get_fails_over_within_same_request_after_primary_transport_failure() {
     wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
 
     for (key, payload) in [
-        ("batch-transport-failed-key-a", b"batch-transport-payload-a".as_slice()),
-        ("batch-transport-failed-key-b", b"batch-transport-payload-b".as_slice()),
+        (
+            "batch-transport-failed-key-a",
+            b"batch-transport-payload-a".as_slice(),
+        ),
+        (
+            "batch-transport-failed-key-b",
+            b"batch-transport-payload-b".as_slice(),
+        ),
     ] {
         writer
             .put_with_policy(

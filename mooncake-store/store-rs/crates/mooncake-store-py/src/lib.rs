@@ -35,7 +35,10 @@ enum StoreBackend {
 impl StoreBackend {
     fn close(&self) {
         match self {
-            Self::Real(dispatcher) => dispatcher.shutdown(),
+            Self::Real(dispatcher) => {
+                let _ = dispatcher.enter_offline();
+                dispatcher.shutdown();
+            }
             Self::Dummy(dummy) => dummy.close(),
         }
     }
@@ -1570,7 +1573,7 @@ mod tests {
     };
     use mooncake_store_core::{
         CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
-        CompatibilityDescriptor, HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute,
+        CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute,
         ReplicaRoute, ReplicaTier, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
         SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
     };
@@ -3067,6 +3070,230 @@ mod tests {
             .join()
             .expect("dispatcher shared worker should join")
             .expect("first shared request should finish after release");
+    }
+
+    #[test]
+    fn dispatcher_heartbeat_uses_independent_health_channel() {
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client("dispatcher-health-read-lock"),
+                "dispatcher-health-read-lock".to_string(),
+            )
+            .expect("dispatcher should spawn"),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-health-read-holder".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || {
+                    dispatcher.run(move |_client| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok::<_, StoreError>(())
+                    })
+                }
+            })
+            .expect("dispatcher health read-holder should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("read-holder should enter");
+
+        let started = std::time::Instant::now();
+        dispatcher
+            .heartbeat(60_000)
+            .expect("heartbeat should not wait for read lock");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "heartbeat should use independent health channel"
+        );
+
+        let _ = release_tx.send(());
+        worker
+            .join()
+            .expect("dispatcher health read-holder should join")
+            .expect("read-holder should finish after release");
+    }
+
+    #[test]
+    fn dispatcher_state_updates_use_independent_health_channel() {
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client("dispatcher-state-read-lock"),
+                "dispatcher-state-read-lock".to_string(),
+            )
+            .expect("dispatcher should spawn"),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-state-read-holder".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || {
+                    dispatcher.run(move |_client| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok::<_, StoreError>(())
+                    })
+                }
+            })
+            .expect("dispatcher state read-holder should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("read-holder should enter");
+
+        let started = std::time::Instant::now();
+        dispatcher
+            .enter_draining()
+            .expect("state update should not wait for read lock");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "state update should use independent health channel"
+        );
+
+        let _ = release_tx.send(());
+        worker
+            .join()
+            .expect("dispatcher state read-holder should join")
+            .expect("read-holder should finish after release");
+    }
+
+    #[test]
+    fn real_store_close_publishes_offline_state() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let backend = StoreBackend::Real(
+            StoreDispatcher::spawn(
+                build_client_with_metadata("dispatcher-close-offline", metadata.clone()),
+                "dispatcher-close-offline".to_string(),
+            )
+            .expect("dispatcher should spawn"),
+        );
+        backend.close();
+
+        let runtime = ClientRuntimeId::new("dispatcher-close-offline", ClientEpoch(1));
+        let state = metadata
+            .list_live_clients()
+            .expect("leases should list")
+            .into_iter()
+            .find(|lease| lease.runtime == runtime)
+            .map(|lease| lease.state);
+        assert_eq!(state, Some(ClientLifecycleState::Offline));
+    }
+
+    #[test]
+    fn dispatcher_plan_handoff_does_not_wait_for_read_lock() {
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client("dispatcher-plan-handoff"),
+                "dispatcher-plan-handoff".to_string(),
+            )
+            .expect("dispatcher should spawn"),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-plan-handoff-read-holder".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || {
+                    dispatcher.run(move |_client| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok::<_, StoreError>(())
+                    })
+                }
+            })
+            .expect("dispatcher plan-handoff read-holder should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("read-holder should enter");
+
+        let started = std::time::Instant::now();
+        let plan = dispatcher
+            .plan_handoff(ClientEpoch(2), HandoffKind::HotUpgrade, 7, 1_000, None)
+            .expect("plan_handoff should not wait for read lock");
+        assert_eq!(plan.to.epoch, ClientEpoch(2));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "plan_handoff should use shared dispatcher path"
+        );
+
+        let _ = release_tx.send(());
+        worker
+            .join()
+            .expect("dispatcher plan-handoff read-holder should join")
+            .expect("read-holder should finish after release");
+    }
+
+    #[test]
+    fn dispatcher_targeted_handoff_activation_does_not_wait_for_read_lock() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client_with_metadata("dispatcher-targeted-handoff", metadata.clone()),
+                "dispatcher-targeted-handoff".to_string(),
+            )
+            .expect("dispatcher should spawn"),
+        );
+        dispatcher
+            .enter_standby()
+            .expect("standby transition should succeed");
+        let runtime = dispatcher
+            .run(|client| Ok::<_, StoreError>(client.runtime_id().clone()))
+            .expect("runtime id should load");
+        metadata
+            .put_handoff(&HandoffPlan {
+                stable_id: runtime.stable_id.clone(),
+                from: runtime.clone(),
+                to: runtime.clone(),
+                kind: HandoffKind::HotUpgrade,
+                barrier_version: 9,
+                created_at_ms: 2_000,
+                deadline_ms: None,
+            })
+            .expect("targeted handoff should publish");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-targeted-handoff-read-holder".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || {
+                    dispatcher.run(move |_client| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok::<_, StoreError>(())
+                    })
+                }
+            })
+            .expect("dispatcher targeted-handoff read-holder should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("read-holder should enter");
+
+        let started = std::time::Instant::now();
+        let plan = dispatcher
+            .activate_if_targeted_handoff()
+            .expect("activate_if_targeted_handoff should not wait for read lock")
+            .expect("targeted handoff should activate");
+        assert_eq!(plan.to, runtime);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "activate_if_targeted_handoff should not wait for read lock"
+        );
+
+        let _ = release_tx.send(());
+        worker
+            .join()
+            .expect("dispatcher targeted-handoff read-holder should join")
+            .expect("read-holder should finish after release");
     }
 
     #[test]

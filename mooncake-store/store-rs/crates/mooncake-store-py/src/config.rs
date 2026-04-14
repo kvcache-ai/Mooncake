@@ -100,6 +100,13 @@ impl CompatSetupArgs {
             }
             _ => {}
         }
+        labels.entry("route".to_string()).or_insert_with(|| {
+            if self.global_segment_size == 0 {
+                "false".to_string()
+            } else {
+                "true".to_string()
+            }
+        });
         Ok(CompatBuildPlan {
             metadata,
             transport_backend,
@@ -556,6 +563,7 @@ mod tests {
             plan.labels.get("storage").map(String::as_str),
             Some("false")
         );
+        assert_eq!(plan.labels.get("route").map(String::as_str), Some("false"));
         assert_eq!(plan.transport_backend, TransportBackend::ClassicTe);
     }
 
@@ -738,6 +746,40 @@ mod tests {
             plan.labels.get("storage").map(String::as_str),
             Some("false")
         );
+        assert_eq!(plan.labels.get("route").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn compat_setup_keeps_explicit_route_true_for_rw_only_clients() {
+        let plan = CompatSetupArgs {
+            local_hostname: "node-a".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: None,
+            global_segment_size: 0,
+            local_buffer_size: 1024,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            transport_rpc_port: None,
+            transport_backend: None,
+            stable_id: Some("rw-only-explicit-route".to_string()),
+            tenant: "tenant-a".to_string(),
+            labels: BTreeMap::from([("route".to_string(), "true".to_string())]),
+            routed_writes: true,
+            replica_count: 1,
+            route_topk: 2,
+            keyspace: None,
+            expires_at_ms: Some(10_000),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+        }
+        .build()
+        .expect("rw-only explicit-route plan should build");
+
+        assert_eq!(
+            plan.labels.get("storage").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(plan.labels.get("route").map(String::as_str), Some("true"));
     }
 
     #[test]

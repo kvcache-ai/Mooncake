@@ -20,6 +20,16 @@ fn normalize_storage_label(
     }
 }
 
+fn normalize_route_label(local_memory: &LocalMemoryConfig, labels: &mut BTreeMap<String, String>) {
+    labels.entry("route".to_string()).or_insert_with(|| {
+        if local_memory.has_storage() {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }
+    });
+}
+
 pub struct StoreClientBuilder {
     metadata: Arc<dyn MetadataBackend>,
     stable_id: ClientStableId,
@@ -155,11 +165,8 @@ impl StoreClientBuilder {
         }
 
         let mut endpoints = self.endpoints;
-        endpoints
-            .labels
-            .entry("route".to_string())
-            .or_insert_with(|| "true".to_string());
         normalize_storage_label(&self.local_memory, &mut endpoints.labels)?;
+        normalize_route_label(&self.local_memory, &mut endpoints.labels);
         if let Some(transport) = self.transport.as_ref() {
             if endpoints.rpc_address.is_empty() {
                 let (host, port) = transport.rpc_server_address()?;

@@ -287,6 +287,12 @@ publishes instead of exiting on the first timeout. Use
 `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` when cloud metadata links need a longer
 budget than the default request path.
 
+Control-plane RPCs now run on a dedicated shared Tokio runtime instead of a
+single global caller lock. Use `MC_STORE_RS_CONTROL_PLANE_THREADS` to tune the
+worker count when a deployment needs more concurrent route / allocator RPCs or
+when an embedded client should keep its thread footprint smaller. The default
+is `2`; values must be positive integers.
+
 ## Read-side Membership and Failure Semantics
 
 The client keeps membership refresh out of the steady-state request path.
@@ -330,6 +336,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |
 | `MC_STORE_RS_EXPIRES_AT_MS` | Python wrapper setup fallback | absolute lease expiry timestamp in milliseconds |
 | `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | dedicated dispatcher timeout for heartbeat publish |
+| `MC_STORE_RS_CONTROL_PLANE_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the shared control-plane RPC runtime; default `2`; must be `> 0` |
 | `MC_STORE_RS_TRACE` | Python wrapper setup fallback, e2e, and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |
 | `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |
