@@ -1,5 +1,7 @@
 use crate::error::Result;
-use crate::identity::{ClientRuntimeId, ClientStableId, LogicalObjectId, NamespaceScope, ReuseIdentity};
+use crate::identity::{
+    ClientRuntimeId, ClientStableId, LogicalObjectId, NamespaceScope, ReuseIdentity,
+};
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
@@ -93,6 +95,12 @@ pub trait MetadataBackend: Send + Sync {
         domain: &RoutePolicyDomain,
         policy: &RoutePolicy,
     ) -> Result<bool>;
+
+    fn put_route_policy(&self, domain: &RoutePolicyDomain, policy: &RoutePolicy) -> Result<()>;
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> Result<bool>;
+
+    fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>>;
 
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()>;
 

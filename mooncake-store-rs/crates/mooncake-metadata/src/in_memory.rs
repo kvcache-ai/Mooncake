@@ -204,6 +204,28 @@ impl MetadataBackend for InMemoryMetadataBackend {
         Ok(true)
     }
 
+    fn put_route_policy(&self, domain: &RoutePolicyDomain, policy: &RoutePolicy) -> Result<()> {
+        self.state
+            .write()
+            .route_policies
+            .insert(domain.clone(), policy.clone());
+        Ok(())
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> Result<bool> {
+        Ok(self.state.write().route_policies.remove(domain).is_some())
+    }
+
+    fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        Ok(self
+            .state
+            .read()
+            .route_policies
+            .iter()
+            .map(|(domain, policy)| (domain.clone(), policy.clone()))
+            .collect())
+    }
+
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
         self.state
             .write()
@@ -366,7 +388,42 @@ mod tests {
             metadata
                 .get_route_policy(&RoutePolicyDomain::Tenant("tenant-a".to_string()))
                 .expect("tenant route policy read should succeed"),
-            Some(tenant_policy),
+            Some(tenant_policy.clone()),
+        );
+
+        let replacement = RoutePolicy {
+            route_topk: 6,
+            route_control: RouteControlMode::EmbeddedWrh,
+            created_by: ClientRuntimeId::new("admin", ClientEpoch(0)),
+            created_at_ms: 33,
+        };
+        metadata
+            .put_route_policy(
+                &RoutePolicyDomain::Tenant("tenant-a".to_string()),
+                &replacement,
+            )
+            .expect("tenant route policy overwrite should succeed");
+        assert_eq!(
+            metadata
+                .get_route_policy(&RoutePolicyDomain::Tenant("tenant-a".to_string()))
+                .expect("tenant route policy read should succeed"),
+            Some(replacement.clone()),
+        );
+        assert_eq!(
+            metadata
+                .list_route_policies()
+                .expect("route policy listing should succeed")
+                .len(),
+            2
+        );
+        assert!(metadata
+            .delete_route_policy(&RoutePolicyDomain::Tenant("tenant-a".to_string()))
+            .expect("tenant route policy delete should succeed"));
+        assert_eq!(
+            metadata
+                .get_route_policy(&RoutePolicyDomain::Tenant("tenant-a".to_string()))
+                .expect("tenant route policy read should succeed"),
+            None,
         );
     }
 }

@@ -1,6 +1,7 @@
 use mooncake_store_core::{
     ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName,
 };
+use std::borrow::Cow;
 
 #[derive(Clone, Debug)]
 pub struct MetadataKeyspace {
@@ -93,6 +94,21 @@ impl MetadataKeyspace {
     }
 }
 
+pub fn parse_route_policy_domain(
+    keyspace: &MetadataKeyspace,
+    key: &str,
+) -> Option<RoutePolicyDomain> {
+    let default = keyspace.route_policy(&RoutePolicyDomain::Default);
+    if key == default {
+        return Some(RoutePolicyDomain::Default);
+    }
+    let tenant_prefix = format!("{}/system/route-policy/tenants/", keyspace.prefix());
+    let encoded = key.strip_prefix(&tenant_prefix)?;
+    Some(RoutePolicyDomain::Tenant(
+        decode_key_component(encoded).into_owned(),
+    ))
+}
+
 fn encode_key_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len() * 2);
     for byte in value.as_bytes() {
@@ -109,6 +125,28 @@ fn encode_key_component(value: &str) -> String {
     encoded
 }
 
+fn decode_key_component(value: &str) -> Cow<'_, str> {
+    if !value.contains('%') {
+        return Cow::Borrowed(value);
+    }
+    let mut decoded = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &value[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                decoded.push(byte as char);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index] as char);
+        index += 1;
+    }
+    Cow::Owned(decoded)
+}
+
 impl Default for MetadataKeyspace {
     fn default() -> Self {
         Self::new("mc/store-rs/v1")
@@ -121,7 +159,7 @@ mod tests {
         ClientEpoch, ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName,
     };
 
-    use super::MetadataKeyspace;
+    use super::{parse_route_policy_domain, MetadataKeyspace};
 
     #[test]
     fn keyspace_builds_scoped_keys_and_patterns() {
@@ -171,5 +209,21 @@ mod tests {
     #[test]
     fn default_keyspace_uses_store_rs_namespace() {
         assert_eq!(MetadataKeyspace::default().prefix(), "mc/store-rs/v1");
+    }
+
+    #[test]
+    fn route_policy_domain_parser_round_trips_default_and_tenant_keys() {
+        let keyspace = MetadataKeyspace::new("tenant-a");
+        let default_key = keyspace.route_policy(&RoutePolicyDomain::Default);
+        let tenant_key = keyspace.route_policy(&RoutePolicyDomain::Tenant("tenant/a".to_string()));
+
+        assert_eq!(
+            parse_route_policy_domain(&keyspace, &default_key),
+            Some(RoutePolicyDomain::Default)
+        );
+        assert_eq!(
+            parse_route_policy_domain(&keyspace, &tenant_key),
+            Some(RoutePolicyDomain::Tenant("tenant/a".to_string()))
+        );
     }
 }

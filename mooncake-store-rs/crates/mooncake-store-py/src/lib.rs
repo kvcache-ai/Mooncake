@@ -1,4 +1,4 @@
-mod config;
+pub mod config;
 pub mod dispatcher;
 mod dummy_client;
 pub mod dummy_service;
@@ -2041,6 +2041,27 @@ mod tests {
             policy: &RoutePolicy,
         ) -> mooncake_store_core::Result<bool> {
             self.inner.put_route_policy_if_absent(domain, policy)
+        }
+
+        fn put_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+            policy: &RoutePolicy,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.put_route_policy(domain, policy)
+        }
+
+        fn delete_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+        ) -> mooncake_store_core::Result<bool> {
+            self.inner.delete_route_policy(domain)
+        }
+
+        fn list_route_policies(
+            &self,
+        ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+            self.inner.list_route_policies()
         }
 
         fn put_handoff(&self, handoff: &HandoffPlan) -> mooncake_store_core::Result<()> {
