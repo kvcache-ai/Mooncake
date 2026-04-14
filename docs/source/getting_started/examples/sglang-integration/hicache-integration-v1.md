@@ -454,6 +454,8 @@ mooncake-hicache-sizing \
     --arena-pool-size 56gb
 ```
 
+The `64gb` / `56gb` values above are tuned examples for large multi-GPU HiCache deployments, not defaults. Arena enablement remains opt-in, and the default pool is `8gb` only when you enable the arena via gflag without an explicit env override. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper.
+
 The helper reports two numbers:
 
 * **Baseline floor** = `hicache-size + MOONCAKE_GLOBAL_SEGMENT_SIZE` per rank. Falling below this usually means startup or allocation failure.
@@ -472,7 +474,7 @@ With `2 MiB` pages, `262144` pages equals `512 GiB`; `49152` pages equals `96 Gi
 
 **Memory Allocator Tuning:**
 
-Mooncake uses a lock-free arena allocator by default for mmap buffer allocations used by HiCache host KV cache memory. The arena pre-allocates a large hugepage-backed pool and serves subsequent allocations via atomic bump pointer, reducing per-allocation latency from ~1000ns to ~50ns.
+Mooncake's mmap arena is opt-in for HiCache host KV allocations. Setting `MC_MMAP_ARENA_POOL_SIZE` explicitly enables the arena and sizes the pool; the arena then pre-allocates a hugepage-backed pool and serves subsequent allocations via atomic bump pointer, reducing per-allocation latency from ~1000ns to ~50ns. The `56gb` example below is a benchmark-scale tuning value, not the allocator default.
 
 For HugeTLB-backed runs, export the hugepage and allocator settings together:
 
@@ -483,7 +485,7 @@ export MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb
 export MC_MMAP_ARENA_POOL_SIZE=56gb
 ```
 
-To disable the arena and fall back to direct `mmap()` while keeping the hugepage-backed baseline path:
+To disable the arena and fall back to direct `mmap()` while keeping the hugepage-backed baseline path, set the flag before the first Mooncake mmap-buffer allocation in the process:
 
 ```bash
 export MC_DISABLE_MMAP_ARENA=1

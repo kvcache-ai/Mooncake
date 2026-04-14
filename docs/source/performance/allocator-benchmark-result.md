@@ -2,7 +2,7 @@
 
 Mooncake Store uses two allocators at different layers:
 
-- **MmapArena** — backs the mmap buffer path used by SGLang HiCache for host KV cache memory. Pre-allocates a large hugepage-backed pool at startup and serves allocations via lock-free atomic bump pointer (~50ns per allocation). Configured via `MC_MMAP_ARENA_POOL_SIZE` (default `64gb`) and `MC_DISABLE_MMAP_ARENA`.
+- **MmapArena** — backs the mmap buffer path used by SGLang HiCache for host KV cache memory. When explicitly enabled, it pre-allocates a hugepage-backed pool at startup and serves allocations via lock-free atomic bump pointer (~50ns per allocation). Configured via `MC_MMAP_ARENA_POOL_SIZE` (explicit opt-in) and `MC_DISABLE_MMAP_ARENA`.
 - **OffsetAllocator** — manages object-level allocation within Mooncake Store segments for KV cache entries. Evaluated below.
 
 These are complementary: MmapArena handles the backing memory, OffsetAllocator manages logical object placement within that memory.

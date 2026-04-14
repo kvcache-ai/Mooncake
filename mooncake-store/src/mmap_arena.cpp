@@ -32,10 +32,9 @@ static inline bool safe_align_up(size_t size, size_t alignment,
 MmapArena::MmapArena()
     : pool_base_(nullptr),
       pool_size_(0),
-      alignment_(64)  // Default minimum alignment (cache line)
-      ,
+      alignment_(kMinAlignment),
       alloc_cursor_(0),
-      peak_allocated_(0),
+      peak_reserved_(0),
       num_allocations_(0),
       num_failed_allocs_(0) {}
 
@@ -72,12 +71,12 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
         return false;
     }
 
-    size_t actual_alignment = std::max(alignment, size_t(64));
+    const size_t actual_alignment = std::max(alignment, kMinAlignment);
 
     // Align pool size to 2MB for huge pages with overflow protection
-    const size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
+    constexpr size_t kHugePageSize = 2 * 1024 * 1024;
     size_t aligned_pool_size;
-    if (!safe_align_up(pool_size, HUGE_PAGE_SIZE, &aligned_pool_size)) {
+    if (!safe_align_up(pool_size, kHugePageSize, &aligned_pool_size)) {
         LOG(ERROR) << "Arena pool size overflow: requested=" << pool_size;
         return false;
     }
@@ -99,6 +98,10 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
     if (pool_base == MAP_FAILED) {
         // Retry without huge pages
         flags &= ~MAP_HUGETLB;
+        LOG(WARNING) << "Arena hugepage mmap failed for pool_size="
+                     << aligned_pool_size << " bytes"
+                     << ", errno=" << errno << " (" << strerror(errno)
+                     << "); retrying without huge pages";
         pool_base = mmap(nullptr, aligned_pool_size, PROT_READ | PROT_WRITE,
                          flags, -1, 0);
 
@@ -107,7 +110,9 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
                        << ", errno=" << errno << " (" << strerror(errno) << ")";
             return false;
         }
-        LOG(INFO) << "Arena initialized without huge pages";
+        LOG(WARNING) << "Arena initialized without huge pages for pool_size="
+                     << aligned_pool_size
+                     << " bytes; MAP_POPULATE will prefault regular pages";
     } else {
         LOG(INFO) << "Arena initialized with huge pages";
     }
@@ -120,7 +125,8 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
     // or initialize their own arena.
     if (madvise(pool_base, aligned_pool_size, MADV_DONTFORK) != 0) {
         LOG(WARNING) << "madvise(MADV_DONTFORK) failed: " << strerror(errno)
-                     << " (fork safety not guaranteed)";
+                     << " for pool_size=" << aligned_pool_size
+                     << " bytes (fork safety not guaranteed)";
     }
 
     // Store metadata BEFORE publishing pool_base_.
@@ -132,7 +138,7 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
 
     LOG(INFO) << "Arena initialized: "
               << (aligned_pool_size / (1024.0 * 1024.0 * 1024.0))
-              << " GB, alignment=" << actual_alignment << " bytes";
+              << " GiB, alignment=" << actual_alignment << " bytes";
 
     return true;
 }
@@ -151,6 +157,8 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
     // Effective alignment: max of arena default and caller's request.
     // This honors the caller's alignment contract without weakening
     // the arena's minimum guarantee.
+    // pool_base_ was acquired above; this relaxed load observes the
+    // alignment value published before that release-store in initialize().
     size_t base_alignment = alignment_.load(std::memory_order_relaxed);
     size_t effective_alignment = std::max(base_alignment, alignment);
 
@@ -210,8 +218,8 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
 
     // Update peak statistics using `next` (the actual end of reservation,
     // including any alignment padding before aligned_offset)
-    size_t old_peak = peak_allocated_.load(std::memory_order_relaxed);
-    while (next > old_peak && !peak_allocated_.compare_exchange_weak(
+    size_t old_peak = peak_reserved_.load(std::memory_order_relaxed);
+    while (next > old_peak && !peak_reserved_.compare_exchange_weak(
                                   old_peak, next, std::memory_order_relaxed,
                                   std::memory_order_relaxed)) {
         // CAS loop for peak tracking
@@ -230,8 +238,8 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
 MmapArena::Stats MmapArena::getStats() const {
     Stats stats;
     stats.pool_size = pool_size_.load(std::memory_order_relaxed);
-    stats.allocated_bytes = alloc_cursor_.load(std::memory_order_relaxed);
-    stats.peak_allocated = peak_allocated_.load(std::memory_order_relaxed);
+    stats.reserved_bytes = alloc_cursor_.load(std::memory_order_relaxed);
+    stats.peak_reserved_bytes = peak_reserved_.load(std::memory_order_relaxed);
     stats.num_allocations = num_allocations_.load(std::memory_order_relaxed);
     stats.num_failed_allocs =
         num_failed_allocs_.load(std::memory_order_relaxed);

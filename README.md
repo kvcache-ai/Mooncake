@@ -242,7 +242,7 @@ docker run --gpus all \
   -it mooncake:from-source /bin/bash
 ```
 
-The same sizing helper is also installed inside the runtime image as `mooncake-hicache-sizing`. Set `MC_DISABLE_MMAP_ARENA=1` instead of `MC_MMAP_ARENA_POOL_SIZE=...` when you want the baseline direct-`mmap()` path.
+The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not allocator defaults. The arena is off by default. Setting `MC_MMAP_ARENA_POOL_SIZE=...` explicitly both enables and sizes the arena; if you enable it via gflag instead, the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) instead when you want the baseline direct-`mmap()` path. Like the arena size itself, this must be set before the first Mooncake mmap-buffer allocation in the process. Arena bring-up is a one-shot lazy init, so after a failed first attempt you need to restart the process to retry with corrected env / hugepage settings.
 
 > [!NOTE]
 > Make sure you build the image from the repository root so that Git metadata and submodules are available inside the build context.

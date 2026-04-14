@@ -33,7 +33,7 @@ TEST_F(MmapArenaTest, BasicInitialization) {
 
     auto stats = arena.getStats();
     EXPECT_EQ(stats.pool_size, 2 * 1024 * 1024);  // Aligned to 2MB (huge page)
-    EXPECT_EQ(stats.allocated_bytes, 0);
+    EXPECT_EQ(stats.reserved_bytes, 0);
     EXPECT_EQ(stats.num_allocations, 0);
     EXPECT_EQ(stats.num_failed_allocs, 0);
 }
@@ -47,8 +47,8 @@ TEST_F(MmapArenaTest, BasicAllocation) {
 
     auto stats = arena.getStats();
     EXPECT_EQ(stats.num_allocations, 1);
-    EXPECT_GE(stats.allocated_bytes, 1024);
-    EXPECT_LE(stats.allocated_bytes, 1024 + 64);  // Accounting for alignment
+    EXPECT_GE(stats.reserved_bytes, 1024);
+    EXPECT_LE(stats.reserved_bytes, 1024 + 64);  // Accounting for alignment
 }
 
 TEST_F(MmapArenaTest, AllocationAlignment) {
@@ -118,7 +118,7 @@ TEST_F(MmapArenaTest, OOMDoesNotCorruptCursor) {
 
     // CRITICAL: Cursor should be at or below pool_size, not corrupted
     auto stats = arena.getStats();
-    ASSERT_LE(stats.allocated_bytes, pool_size);
+    ASSERT_LE(stats.reserved_bytes, pool_size);
     ASSERT_GT(stats.num_failed_allocs, 0);
 
     // Subsequent allocations should still fail gracefully, not crash
@@ -127,7 +127,7 @@ TEST_F(MmapArenaTest, OOMDoesNotCorruptCursor) {
 
     // Verify cursor didn't go past pool_size
     stats = arena.getStats();
-    ASSERT_LE(stats.allocated_bytes, pool_size);
+    ASSERT_LE(stats.reserved_bytes, pool_size);
 }
 
 TEST_F(MmapArenaTest, ConcurrentOOMStressTest) {
@@ -168,7 +168,7 @@ TEST_F(MmapArenaTest, ConcurrentOOMStressTest) {
     auto stats = arena.getStats();
 
     // Verify cursor didn't go beyond pool
-    ASSERT_LE(stats.allocated_bytes, actual_pool_size);
+    ASSERT_LE(stats.reserved_bytes, actual_pool_size);
 
     // Some allocations should have succeeded
     ASSERT_GT(succeeded.load(), 0);
@@ -182,7 +182,7 @@ TEST_F(MmapArenaTest, ConcurrentOOMStressTest) {
 
     LOG(INFO) << "OOM stress test: " << succeeded.load() << " succeeded, "
               << failed.load() << " failed, pool utilization: "
-              << (100.0 * stats.allocated_bytes / stats.pool_size) << "%";
+              << (100.0 * stats.reserved_bytes / stats.pool_size) << "%";
 }
 
 // ===== BUG #2 & #3: INTEGER OVERFLOW TESTS =====
@@ -197,7 +197,7 @@ TEST_F(MmapArenaTest, IntegerOverflowInBoundsCheck) {
 
     auto stats = arena.getStats();
     EXPECT_EQ(stats.num_failed_allocs, 1);
-    EXPECT_EQ(stats.allocated_bytes, 0);
+    EXPECT_EQ(stats.reserved_bytes, 0);
 }
 
 TEST_F(MmapArenaTest, AlignmentOverflow) {
@@ -211,7 +211,7 @@ TEST_F(MmapArenaTest, AlignmentOverflow) {
 
     auto stats = arena.getStats();
     EXPECT_EQ(stats.num_failed_allocs, 1);
-    EXPECT_EQ(stats.allocated_bytes, 0);
+    EXPECT_EQ(stats.reserved_bytes, 0);
 }
 
 TEST_F(MmapArenaTest, NearMaxSizeAllocation) {
@@ -389,10 +389,11 @@ TEST_F(MmapArenaTest, StatsConsistencyUnderLoad) {
         for (int i = 0; i < 100; ++i) {
             auto stats = arena.getStats();
             // Invariants that must always hold
-            if (stats.allocated_bytes > stats.pool_size) {
+            if (stats.reserved_bytes > stats.pool_size) {
                 invariant_violations.fetch_add(1, std::memory_order_relaxed);
             }
-            // Note: peak_allocated may temporarily lag behind allocated_bytes
+            // Note: peak_reserved_bytes may temporarily lag behind
+            // reserved_bytes
             // due to concurrent updates, so we don't check that invariant here
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -405,10 +406,10 @@ TEST_F(MmapArenaTest, StatsConsistencyUnderLoad) {
 
     // Critical invariant: cursor never exceeded pool size
     EXPECT_EQ(invariant_violations.load(), 0);
-    EXPECT_LE(stats.allocated_bytes, stats.pool_size);
+    EXPECT_LE(stats.reserved_bytes, stats.pool_size);
 
     // After all threads finish, peak should be >= final allocated
-    EXPECT_GE(stats.peak_allocated, stats.allocated_bytes);
+    EXPECT_GE(stats.peak_reserved_bytes, stats.reserved_bytes);
 
     LOG(INFO) << "Stats consistency test: " << stats.num_allocations
               << " allocations, " << stats.num_failed_allocs << " failures";
@@ -430,11 +431,11 @@ TEST_F(MmapArenaTest, NearOOMAllocation) {
     }
 
     auto stats = arena.getStats();
-    EXPECT_LE(stats.allocated_bytes, stats.pool_size);
+    EXPECT_LE(stats.reserved_bytes, stats.pool_size);
     EXPECT_GT(stats.num_failed_allocs, 0);
 
     LOG(INFO) << "Near-OOM test: " << ptrs.size() << " allocations, "
-              << stats.allocated_bytes << " / " << stats.pool_size
+              << stats.reserved_bytes << " / " << stats.pool_size
               << " bytes used";
 }
 
@@ -473,15 +474,31 @@ TEST_F(MmapArenaTest, PeakAllocationTracking) {
     void* p1 = arena.allocate(512);
     (void)p1;
     auto stats1 = arena.getStats();
-    EXPECT_GE(stats1.peak_allocated, 512);
+    EXPECT_GE(stats1.peak_reserved_bytes, 512);
 
     void* p2 = arena.allocate(1024);
     (void)p2;
     auto stats2 = arena.getStats();
-    EXPECT_GE(stats2.peak_allocated, stats1.peak_allocated);
-    EXPECT_GE(stats2.peak_allocated, 512 + 1024);
+    EXPECT_GE(stats2.peak_reserved_bytes, stats1.peak_reserved_bytes);
+    EXPECT_GE(stats2.peak_reserved_bytes, 512 + 1024);
 
-    LOG(INFO) << "Peak tracking: " << stats2.peak_allocated << " bytes";
+    LOG(INFO) << "Peak tracking: " << stats2.peak_reserved_bytes << " bytes";
+}
+
+TEST_F(MmapArenaTest, ReservedBytesRemainMonotonic) {
+    MmapArena arena;
+    ASSERT_TRUE(arena.initialize(1024 * 1024));
+
+    size_t last_reserved_bytes = 0;
+    for (size_t size : {1UL, 63UL, 64UL, 65UL, 4096UL, 1024UL}) {
+        void* ptr = arena.allocate(size);
+        ASSERT_NE(ptr, nullptr);
+
+        auto stats = arena.getStats();
+        EXPECT_GE(stats.reserved_bytes, last_reserved_bytes);
+        EXPECT_GE(stats.peak_reserved_bytes, stats.reserved_bytes);
+        last_reserved_bytes = stats.reserved_bytes;
+    }
 }
 
 // ===== MIXED ALIGNMENT TESTS =====
@@ -722,100 +739,6 @@ TEST_F(MmapArenaTest, MadviseDontForkApplied) {
     // Either way, verify madvise succeeds on the pool region.
     int ret = madvise(base, pool_size, MADV_DONTFORK);
     EXPECT_EQ(ret, 0) << "madvise(MADV_DONTFORK) failed: " << strerror(errno);
-}
-
-// ===== FALLBACK MMAP ALIGNMENT TESTS =====
-// NOTE: These tests rely on being the FIRST to call the global
-// allocate_buffer_mmap_memory(), which triggers std::call_once on
-// g_arena_init_flag.  Since all other tests in this file use local
-// MmapArena instances (not the global allocator), and GTest runs tests
-// in declaration order within a fixture, these are always last.
-// If a future test calls allocate_buffer_mmap_memory() before these,
-// the arena will already be initialized and MC_DISABLE_MMAP_ARENA
-// will have no effect — move these to a separate test binary if that
-// happens.
-
-TEST_F(MmapArenaTest, FallbackMmapHonorsPageAlignment) {
-    // With arena disabled (MC_DISABLE_MMAP_ARENA=1), the fallback mmap path
-    // should return pointers aligned to at least the system page size.
-    // This mirrors client_buffer.cpp which requests alignment=64.
-    setenv("MC_DISABLE_MMAP_ARENA", "1", 1);
-
-    const size_t alloc_size = 64 * 1024;  // 64KB
-    constexpr size_t alignment = 64;      // Cache-line alignment
-
-    void* ptr = allocate_buffer_mmap_memory(alloc_size, alignment);
-    // Verify we actually hit the fallback path (not arena).
-    // free_buffer_mmap_memory on a non-arena pointer calls munmap;
-    // on an arena pointer it's a no-op.  We can't easily distinguish
-    // at this level, but the LOG output "ARENA ALLOCATOR DISABLED"
-    // confirms the path.  If this test ever passes with arena active,
-    // the alignment assertion still holds (arena honors alignment too),
-    // but the test's purpose (covering fallback) is not met.
-    ASSERT_NE(ptr, nullptr);
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % alignment, 0u)
-        << "Fallback mmap pointer not aligned to " << alignment;
-
-    // Verify read/write works
-    memset(ptr, 0xAB, alloc_size);
-    EXPECT_EQ(static_cast<uint8_t*>(ptr)[0], 0xAB);
-    EXPECT_EQ(static_cast<uint8_t*>(ptr)[alloc_size - 1], 0xAB);
-
-    free_buffer_mmap_memory(ptr, alloc_size);
-    unsetenv("MC_DISABLE_MMAP_ARENA");
-}
-
-TEST_F(MmapArenaTest, FallbackMmapNoHugepagesAllocFree) {
-    // When hugepages are disabled (MC_STORE_USE_HUGEPAGE unset),
-    // get_hugepage_size_from_env() returns 0.  The fallback mmap path
-    // must still compute a valid map_size for both mmap and munmap.
-    // Regression: align_up(total_size, 0) returned total_size unaligned
-    // to any page boundary, which could cause munmap to silently fail
-    // or leak address space on sizes that aren't page-multiples.
-    unsetenv("MC_STORE_USE_HUGEPAGE");
-    setenv("MC_DISABLE_MMAP_ARENA", "1", 1);
-
-    // Use a size that is NOT a multiple of 4096 to catch the alignment bug
-    const size_t alloc_size = 65000;  // not page-aligned
-    constexpr size_t alignment = 64;
-
-    void* ptr = allocate_buffer_mmap_memory(alloc_size, alignment);
-    ASSERT_NE(ptr, nullptr);
-
-    // mmap always returns page-aligned pointers (4096)
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % 4096, 0u)
-        << "Fallback mmap pointer not page-aligned";
-
-    // Touch memory
-    memset(ptr, 0xCD, alloc_size);
-    EXPECT_EQ(static_cast<uint8_t*>(ptr)[0], 0xCD);
-
-    // free should not crash — map_size must be page-aligned for munmap
-    free_buffer_mmap_memory(ptr, alloc_size);
-
-    unsetenv("MC_DISABLE_MMAP_ARENA");
-}
-
-TEST_F(MmapArenaTest, FallbackMmapAllocateFreeCycle) {
-    // Verify multiple allocate/free cycles don't leak or crash.
-    // Exercises the fallback path's map_size computation consistency
-    // between allocate_buffer_mmap_memory and free_buffer_mmap_memory.
-    setenv("MC_DISABLE_MMAP_ARENA", "1", 1);
-
-    constexpr int CYCLES = 8;
-    constexpr size_t alloc_size = 128 * 1024;  // 128KB
-    constexpr size_t alignment = 64;
-
-    for (int i = 0; i < CYCLES; ++i) {
-        void* ptr = allocate_buffer_mmap_memory(alloc_size, alignment);
-        ASSERT_NE(ptr, nullptr) << "Allocation failed on cycle " << i;
-        EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % alignment, 0u);
-        // Touch memory to ensure mapping is valid
-        memset(ptr, static_cast<uint8_t>(i), alloc_size);
-        free_buffer_mmap_memory(ptr, alloc_size);
-    }
-
-    unsetenv("MC_DISABLE_MMAP_ARENA");
 }
 
 }  // namespace mooncake

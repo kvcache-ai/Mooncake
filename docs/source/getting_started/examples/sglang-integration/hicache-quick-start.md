@@ -31,7 +31,7 @@ sudo sysctl -w vm.nr_hugepages=262144
 grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
 ```
 
-`262144` is an example for `512 GiB` of `2 MiB` pages. Adjust it to match your planned HiCache budget.
+`262144` is an example for `512 GiB` of `2 MiB` pages. The `64gb` / `56gb` sizing inputs above are tuned examples for large multi-GPU runs, not defaults. Adjust them, and the resulting `vm.nr_hugepages`, to match your planned HiCache budget. On smaller hosts, start with an arena pool of `8gb` or `16gb`.
 
 ### 2. Launch the Mooncake master service
 
@@ -57,7 +57,7 @@ MOONCAKE_MASTER=127.0.0.1:50051 python -m sglang.launch_server \
 
 **Key flag:** `--hicache-storage-prefetch-policy {best_effort,wait_complete,timeout}` determines when prefetching from storage should stop. `timeout` usually offers the best balance when Mooncake is the backend.
 
-**Memory allocator:** Mooncake pre-allocates a hugepage-backed arena (default 64GB) for fast buffer allocation. To adjust the pool size, change `MC_MMAP_ARENA_POOL_SIZE`. To disable the arena and use direct `mmap()`, set `MC_DISABLE_MMAP_ARENA=1`. See the [Complete Guide](hicache-integration-v1.md) for the full HugeTLB sizing and troubleshooting flow.
+**Memory allocator:** Mooncake's mmap arena is opt-in. The `56gb` example above is a benchmark-scale tuning value, not the default. Setting `MC_MMAP_ARENA_POOL_SIZE` enables it and chooses the pool size; if you enable it via gflag instead, the default pool size is `8gb`. To force the baseline direct-`mmap()` path, set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) before the first Mooncake mmap-buffer allocation in the process. See the [Complete Guide](hicache-integration-v1.md) for the full HugeTLB sizing and troubleshooting flow.
 
 ## Prefill/Decode Disaggregation
 

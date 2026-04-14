@@ -16,17 +16,16 @@ namespace mooncake {
 /**
  * @brief Simple lock-free arena allocator for mmap'd memory
  *
- * Performance: ~50-60ns per allocation (CAS loop)
- * vs ~1000ns for mmap() calls
- *
  * Thread-safe: allocate() is lock-free (CAS), initialize() is mutex-guarded.
  */
 class MmapArena {
    public:
+    static constexpr size_t kMinAlignment = 64;
+
     struct Stats {
         size_t pool_size;
-        size_t allocated_bytes;
-        size_t peak_allocated;
+        size_t reserved_bytes;
+        size_t peak_reserved_bytes;
         size_t num_allocations;
         size_t num_failed_allocs;
     };
@@ -46,7 +45,7 @@ class MmapArena {
      * @param alignment Allocation alignment (default 64 bytes)
      * @return true on success
      */
-    bool initialize(size_t pool_size, size_t alignment = 64);
+    bool initialize(size_t pool_size, size_t alignment = kMinAlignment);
 
     /**
      * Allocate memory from arena
@@ -96,8 +95,8 @@ class MmapArena {
     std::atomic<size_t>
         alignment_;  // Default allocation alignment (atomic for thread-safety)
 
-    std::atomic<size_t> alloc_cursor_;       // Current allocation offset
-    std::atomic<size_t> peak_allocated_;     // Peak memory usage
+    std::atomic<size_t> alloc_cursor_;       // Monotonic reservation cursor
+    std::atomic<size_t> peak_reserved_;      // Peak reservation cursor
     std::atomic<size_t> num_allocations_;    // Total allocations
     std::atomic<size_t> num_failed_allocs_;  // Failed allocations (OOM)
 

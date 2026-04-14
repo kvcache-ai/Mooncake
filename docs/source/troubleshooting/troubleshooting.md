@@ -169,14 +169,15 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
 
 ## Memory Allocator
 
-Mooncake Store uses a lock-free arena allocator by default for mmap buffer allocations. The arena pre-allocates a large pool (default 64GB) using hugepages and serves subsequent allocations from it. If the arena cannot allocate hugepages, it falls back to regular pages automatically.
+Mooncake Store's mmap arena is opt-in for mmap buffer allocations. Setting `MC_MMAP_ARENA_POOL_SIZE` explicitly enables it and pre-allocates a hugepage-backed pool; if it is enabled via gflag instead, the default pool size is `8gb`. If the arena cannot allocate hugepages, it falls back to regular pages automatically.
 
 If you encounter memory allocation issues related to the arena:
 
 - **HugeTLB pool is too small for the launch:** Run `python3 scripts/check_hicache_hugepage_requirements.py ...` from a source checkout, or `mooncake-hicache-sizing ...` inside the Docker image, using your `--hicache-size`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`, and `MC_MMAP_ARENA_POOL_SIZE` values. If it reports `insufficient_for_baseline`, increase `vm.nr_hugepages`, reduce `--hicache-size`, or shrink `MOONCAKE_GLOBAL_SEGMENT_SIZE`.
-- **Arena pool too large for available hugepages:** Reduce the pool size with `MC_MMAP_ARENA_POOL_SIZE="8gb"` to fit within your hugepage budget.
+- **Arena pool too large for available hugepages:** Reduce the pool size with `MC_MMAP_ARENA_POOL_SIZE="8gb"` to fit within your hugepage budget, or leave `MC_MMAP_ARENA_POOL_SIZE` unset to stay on the baseline direct-`mmap()` path.
 - **Arena only partially fits:** If the helper reports `baseline_fits_arena_may_fallback`, the baseline should start but some arena allocations may spill onto regular pages. Either increase `vm.nr_hugepages` or reduce `MC_MMAP_ARENA_POOL_SIZE`.
-- **Need to disable the arena entirely:** Set `MC_DISABLE_MMAP_ARENA=1` to fall back to per-call `mmap()`.
+- **Need to disable the arena entirely:** Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) before the first Mooncake mmap-buffer allocation to fall back to per-call `mmap()`.
+- **Arena init failed once and the process stayed on the baseline path:** Arena initialization is lazy and one-shot per process. After a failed first attempt, Mooncake keeps using direct `mmap()` until the process restarts. Fix the env / hugepage budget, then restart the process before retrying.
 - **Arena OOM during serving:** The arena logs a warning and falls back to direct `mmap()` for that allocation. If this happens frequently, increase `MC_MMAP_ARENA_POOL_SIZE`.
 - **Direct hugepage mmap fails immediately:** Verify the host really has hugepages reserved with `grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo`. When `MC_STORE_USE_HUGEPAGE=1` is set, direct `mmap()` allocations depend on the OS HugeTLB pool.
 
