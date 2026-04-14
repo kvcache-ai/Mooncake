@@ -37,6 +37,8 @@ const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_LIVE_CLIENT_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_SUSPECT_RUNTIME_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_ROUTE_TOPK: usize = 2;
+const STABLE_PHASE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const STABLE_PHASE_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
 
 include!("types.rs");
 include!("builder.rs");
@@ -143,6 +145,28 @@ include!("runtime_alloc.rs");
 include!("runtime_io.rs");
 include!("runtime_write.rs");
 include!("facade.rs");
+
+pub fn stable_phase_spread_ms(identity: &str, interval_ms: u64, salt: &str) -> u64 {
+    if interval_ms == 0 {
+        return 0;
+    }
+    stable_phase_hash64(identity, salt) % interval_ms + 1
+}
+
+fn stable_phase_hash64(identity: &str, salt: &str) -> u64 {
+    let mut hash = STABLE_PHASE_HASH_OFFSET;
+    for byte in salt.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
+    }
+    hash ^= 0xff;
+    hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
+    for byte in identity.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
+    }
+    hash
+}
 
 #[cfg(test)]
 mod tests;

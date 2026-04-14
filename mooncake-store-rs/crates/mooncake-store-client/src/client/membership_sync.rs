@@ -22,16 +22,27 @@ impl MembershipSyncHandle {
         }
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
         let stable_id = runtime.stable_id.0.clone();
+        let initial_delay = membership_initial_refresh_delay(runtime, interval);
         let thread = std::thread::Builder::new()
             .name(format!("mooncake-membership-sync-{stable_id}"))
             .spawn(move || {
-                while shutdown_rx.recv_timeout(interval).is_err() {
-                    if let Err(error) = refresh_live_client_cache(
-                        metadata.as_ref(),
-                        &live_client_cache,
-                        "live_client_snapshot_refresh",
-                    ) {
-                        tracing::warn!(error = %error, "background live-client refresh failed");
+                let mut wait = initial_delay;
+                loop {
+                    match shutdown_rx.recv_timeout(wait) {
+                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if let Err(error) = refresh_live_client_cache(
+                                metadata.as_ref(),
+                                &live_client_cache,
+                                "live_client_snapshot_refresh",
+                            ) {
+                                tracing::warn!(
+                                    error = %error,
+                                    "background live-client refresh failed"
+                                );
+                            }
+                            wait = interval;
+                        }
                     }
                 }
             })
@@ -150,4 +161,33 @@ pub(crate) fn refresh_live_client_cache(
         return Ok(live_leases);
     }
     result
+}
+
+fn membership_initial_refresh_delay(runtime: &ClientRuntimeId, interval: Duration) -> Duration {
+    let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(stable_phase_spread_ms(
+        &runtime.to_string(),
+        interval_ms,
+        "membership_refresh",
+    ))
+}
+
+#[cfg(test)]
+mod membership_sync_tests {
+    use super::*;
+
+    #[test]
+    fn membership_initial_refresh_delay_is_stably_spread() {
+        let runtime = ClientRuntimeId::new("membership-a", ClientEpoch(7));
+        let delay = membership_initial_refresh_delay(&runtime, Duration::from_millis(3_000));
+        assert!((1..=3_000).contains(&delay.as_millis()));
+        assert_eq!(
+            delay,
+            membership_initial_refresh_delay(&runtime, Duration::from_millis(3_000))
+        );
+        assert_eq!(
+            membership_initial_refresh_delay(&runtime, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
 }
