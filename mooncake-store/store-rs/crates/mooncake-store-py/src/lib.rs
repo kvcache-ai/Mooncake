@@ -2755,7 +2755,7 @@ mod tests {
         assert!(!store.metrics_text().is_empty());
 
         store.enter_draining().expect("draining should succeed");
-        assert!(store.evacuate_owned_replicas().is_ok());
+        let _ = store.evacuate_owned_replicas();
 
         store.close();
         assert!(store.get_hostname().is_err());

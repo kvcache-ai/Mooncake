@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::env;
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -337,8 +336,7 @@ fn tent_base_config(redis_port: u16) -> TentEngineConfig {
 
 #[allow(clippy::arc_with_non_send_sync)]
 fn build_tent_bundle(redis_port: u16, local_segment_name: &str) -> Result<TentBundle> {
-    let rpc_port = reserve_tcp_port()?;
-    let config = tent_base_config(redis_port).set("rpc_server_port", rpc_port.to_string());
+    let config = tent_base_config(redis_port);
     let engine = Arc::new(TentEngine::new(
         &config.clone().set("local_segment_name", local_segment_name),
     )?);
@@ -350,14 +348,6 @@ fn build_tent_bundle(redis_port: u16, local_segment_name: &str) -> Result<TentBu
 
 fn scoped_segment_name(run_id: u64, base: &str) -> String {
     format!("{base}-{run_id}")
-}
-
-fn reserve_tcp_port() -> Result<u16> {
-    TcpListener::bind("127.0.0.1:0")
-        .map_err(|error| StoreError::Transport(format!("reserve tcp port: {error}")))?
-        .local_addr()
-        .map(|addr| addr.port())
-        .map_err(|error| StoreError::Transport(format!("inspect reserved tcp port: {error}")))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -22,9 +22,9 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, flatten_slices, now_ms, record_success_metric,
-    scatter_into_buffers, startup_prewarm_delay, LiveClientCache, LocalAllocatorAdapter,
-    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget,
-    SegmentAllocator, StorageOwnerState, StoreState, SuspectRuntimeCache,
+    scatter_into_buffers, shared_suspect_runtime_cache, startup_prewarm_delay, LiveClientCache,
+    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
+    ReplicaWriteTarget, SegmentAllocator, StorageOwnerState, StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -2576,6 +2576,7 @@ fn route_lookup_many_records_miss_after_killed_single_replica_is_quarantined() {
 #[test]
 fn suspect_authority_quarantine_is_shared_across_clients() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let suspect_runtime_cache = shared_suspect_runtime_cache(&metadata.route_namespace());
     let store_a_transport = Arc::new(TestTransport::new("shared-suspect-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("shared-suspect-b-segment"));
     let writer_transport = Arc::new(store_a_transport.peer("shared-suspect-writer-segment"));
@@ -2678,21 +2679,31 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
         state.segments_by_handle.remove(&handle);
     }
 
+    let dead_runtime = store_a.runtime_id().clone();
     let first = reader_a.get("shared-suspect-key");
     assert!(
         matches!(
+            first,
+            Ok(ref value) if value == b"shared-suspect-payload"
+        ) || matches!(
             first,
             Err(StoreError::NotFound(_))
                 | Err(StoreError::Transport(_))
                 | Err(StoreError::InvalidState(_))
         ),
-        "first reader should discover the dead authority and quarantine it"
+        "first reader should either fail over immediately or surface the dead replica"
+    );
+    assert!(
+        suspect_runtime_cache.lock().contains(&dead_runtime),
+        "first reader should mark the dead replica runtime as suspect in the shared cache"
     );
 
     assert_eq!(
         reader_b
             .get("shared-suspect-key")
-            .expect("second reader should reuse the shared quarantine and avoid a fresh dead-authority failure"),
+            .expect(
+                "second reader should reuse the shared quarantine and avoid a fresh dead-replica failure"
+            ),
         b"shared-suspect-payload"
     );
 }

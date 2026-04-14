@@ -4,7 +4,23 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 
-PYTHON_BIN=${PYTHON:-python3}
+default_python() {
+  if [[ -n "${PYTHON:-}" ]]; then
+    printf '%s\n' "${PYTHON}"
+    return 0
+  fi
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+    printf '%s\n' "${VIRTUAL_ENV}/bin/python"
+    return 0
+  fi
+  if [[ -x "${REPO_ROOT}/.venv-wheel/bin/python" ]]; then
+    printf '%s\n' "${REPO_ROOT}/.venv-wheel/bin/python"
+    return 0
+  fi
+  printf '%s\n' python3
+}
+
+PYTHON_BIN=$(default_python)
 WHEEL_DIR=${WHEEL_DIR:-"${REPO_ROOT}/dist/wheels"}
 WHEEL_PATH=${1:-}
 
