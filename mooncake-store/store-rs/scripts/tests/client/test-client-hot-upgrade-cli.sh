@@ -227,18 +227,6 @@ BASE_ARGS=(
   --drain-on-exit
 )
 
-echo "==> starting standby successor binary"
-"${BIN}" \
-  "${BASE_ARGS[@]}" \
-  --stable-id "${STABLE_ID}" \
-  --epoch 2 \
-  --initial-state standby \
-  --local-segment-name "${SUCCESSOR_SEGMENT}" \
-  >"${SUCCESSOR_LOG}" 2>&1 &
-SUCCESSOR_PID=$!
-PIDS+=("${SUCCESSOR_PID}")
-wait_for_log "${SUCCESSOR_LOG}" "mooncake-store-client started stable_id=${STABLE_ID} epoch=2 initial_state=standby segment=${SUCCESSOR_SEGMENT}"
-
 echo "==> starting active predecessor binary"
 "${BIN}" \
   "${BASE_ARGS[@]}" \
@@ -250,6 +238,18 @@ echo "==> starting active predecessor binary"
 PREDECESSOR_PID=$!
 PIDS+=("${PREDECESSOR_PID}")
 wait_for_log "${PREDECESSOR_LOG}" "mooncake-store-client started stable_id=${STABLE_ID} epoch=1 initial_state=active segment=${PREDECESSOR_SEGMENT}"
+
+echo "==> starting standby successor binary"
+"${BIN}" \
+  "${BASE_ARGS[@]}" \
+  --stable-id "${STABLE_ID}" \
+  --epoch 2 \
+  --initial-state standby \
+  --local-segment-name "${SUCCESSOR_SEGMENT}" \
+  >"${SUCCESSOR_LOG}" 2>&1 &
+SUCCESSOR_PID=$!
+PIDS+=("${SUCCESSOR_PID}")
+wait_for_log "${SUCCESSOR_LOG}" "mooncake-store-client started stable_id=${STABLE_ID} epoch=2 initial_state=standby segment=${SUCCESSOR_SEGMENT}"
 
 echo "==> writing payload through an external routed client and pinning it to predecessor"
 REDIS_URL="${REDIS_URL}" \
