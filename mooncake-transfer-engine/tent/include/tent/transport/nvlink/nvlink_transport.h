@@ -79,7 +79,7 @@ class NVLinkTransport : public Transport {
     virtual const char *getName() const { return "nvlink"; }
 
    private:
-    void startTransfer(NVLinkTask *task, NVLinkSubBatch *batch);
+    void startTransfer(NVLinkSubBatch *batch);
 
     void *createSharedMemory(const std::string &path, size_t size);
 

@@ -81,7 +81,7 @@ class MnnvlTransport : public Transport {
     virtual Status freeLocalMemory(void *addr, size_t size);
 
    private:
-    void startTransfer(MnnvlTask *task, MnnvlSubBatch *batch);
+    void startTransfer(MnnvlSubBatch *batch);
 
     void *createSharedMemory(const std::string &path, size_t size);
 
