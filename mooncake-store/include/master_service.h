@@ -601,11 +601,10 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin, bool enable_hard_pin,
-            std::string tenant_id_, std::string domain_id_,
-            std::string object_set_, std::string sharing_scope_,
-            std::string qos_tier_, std::string logical_key_,
-            std::string canonical_key_)
+            bool enable_soft_pin, bool enable_hard_pin, std::string tenant_id_,
+            std::string domain_id_, std::string object_set_,
+            std::string sharing_scope_, std::string qos_tier_,
+            std::string logical_key_, std::string canonical_key_)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -992,12 +991,12 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
+    void AccountLiveBytes(ObjectMetadata& metadata);
+    void ReleaseLiveBytes(ObjectMetadata& metadata);
     TenantDomainKey BuildTenantDomainKey(const ObjectMetadata& metadata) const;
     TenantDomainKey BuildTenantDomainKey(const ReplicateConfig& config) const;
     std::optional<ReuseKey> MaybeBuildReuseKey(
         const ObjectMetadata& metadata) const;
-    std::optional<ReuseKey> MaybeBuildReuseKey(
-        const AdmissionRequestContext& context) const;
     void IndexMetadata(MetadataShard& shard, const LogicalObjectId& object_id,
                        const ObjectMetadata& metadata) const;
     void UnindexMetadata(MetadataShard& shard, const LogicalObjectId& object_id,
@@ -1007,23 +1006,9 @@ class MasterService {
     FindScopedKeys(const MetadataShard& shard, const std::string& tenant_id,
                    const std::string& domain_id) const;
 
-    AdmissionRequestContext BuildAdmissionRequestContext(
-        AdmissionRequestContext::Operation operation, const std::string& key,
-        uint64_t value_length, const ReplicateConfig& config) const;
-
-    uint64_t ResolveAdmissionBytes(const AdmissionRequestContext& context,
-                                   const MetadataShardAccessorRW& current_shard,
-                                   size_t current_shard_index) const;
-
     std::vector<std::string> ResolvePreferredSegments(
         const MetadataShardAccessorRW& current_shard,
         size_t current_shard_index, const ReplicateConfig& config) const;
-
-    tl::expected<void, ErrorCode> AdmitWrite(
-        AdmissionRequestContext::Operation operation, const std::string& key,
-        uint64_t value_length, const ReplicateConfig& config,
-        const MetadataShardAccessorRW& current_shard,
-        size_t current_shard_index) const;
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -1095,10 +1080,10 @@ class MasterService {
               it_(alias_it_ != shard_guard_->raw_key_to_id.end()
                       ? shard_guard_->metadata.find(alias_it_->second)
                       : shard_guard_->metadata.end()),
-              processing_it_(alias_it_ != shard_guard_->raw_key_to_id.end()
-                                 ? shard_guard_->processing_keys.find(
-                                       alias_it_->second)
-                                 : shard_guard_->processing_keys.end()),
+              processing_it_(
+                  alias_it_ != shard_guard_->raw_key_to_id.end()
+                      ? shard_guard_->processing_keys.find(alias_it_->second)
+                      : shard_guard_->processing_keys.end()),
               replication_task_it_(
                   alias_it_ != shard_guard_->raw_key_to_id.end()
                       ? shard_guard_->replication_tasks.find(alias_it_->second)
@@ -1243,7 +1228,7 @@ class MasterService {
 
         // Deserialize discarded replicas
         tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
-            const msgpack::object& obj, uint64_t* max_restored_replica_id);
+            const msgpack::object& obj);
     };
 
     friend class MetadataAccessor;
@@ -1258,10 +1243,10 @@ class MasterService {
               it_(alias_it_ != shard_guard_->raw_key_to_id.end()
                       ? shard_guard_->metadata.find(alias_it_->second)
                       : shard_guard_->metadata.end()),
-              processing_it_(alias_it_ != shard_guard_->raw_key_to_id.end()
-                                 ? shard_guard_->processing_keys.find(
-                                       alias_it_->second)
-                                 : shard_guard_->processing_keys.end()) {}
+              processing_it_(
+                  alias_it_ != shard_guard_->raw_key_to_id.end()
+                      ? shard_guard_->processing_keys.find(alias_it_->second)
+                      : shard_guard_->processing_keys.end()) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {

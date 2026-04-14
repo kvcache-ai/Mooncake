@@ -74,81 +74,6 @@ int64_t CurrentTimeMs() {
 
 }  // namespace
 
-tl::expected<SnapshotMetadataFields, SerializationError>
-ParseSnapshotMetadataFields(const msgpack::object& object) {
-    if (object.type != msgpack::type::ARRAY) {
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "snapshot metadata entry is not an array"));
-    }
-    if (object.via.array.size < 7) {
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "snapshot metadata entry is too short"));
-    }
-
-    try {
-        SnapshotMetadataFields fields;
-        msgpack::object* array = object.via.array.ptr;
-        uint32_t index = 0;
-
-        std::string client_id_str = array[index++].as<std::string>();
-        if (!StringToUuid(client_id_str, fields.client_id)) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "snapshot metadata entry has invalid client UUID: " +
-                    client_id_str));
-        }
-
-        fields.put_start_time_ms = array[index++].as<uint64_t>();
-        fields.size = array[index++].as<uint64_t>();
-        fields.lease_timeout_ms = array[index++].as<uint64_t>();
-        fields.has_soft_pin_timeout = array[index++].as<bool>();
-        fields.soft_pin_timeout_ms = array[index++].as<uint64_t>();
-
-        const uint32_t legacy_base_size = 7;
-        const uint32_t extended_base_size = 14;
-        const bool has_extended_metadata =
-            object.via.array.size >= extended_base_size &&
-            array[6].type == msgpack::type::STR;
-        if (has_extended_metadata) {
-            fields.tenant_id = array[index++].as<std::string>();
-            fields.domain_id = array[index++].as<std::string>();
-            fields.object_set = array[index++].as<std::string>();
-            fields.sharing_scope = array[index++].as<std::string>();
-            fields.qos_tier = array[index++].as<std::string>();
-            fields.logical_key = array[index++].as<std::string>();
-            fields.canonical_key = array[index++].as<std::string>();
-        }
-
-        fields.replica_count = array[index++].as<uint32_t>();
-        if (object.via.array.size != legacy_base_size + fields.replica_count &&
-            object.via.array.size !=
-                legacy_base_size + fields.replica_count + 1 &&
-            object.via.array.size !=
-                extended_base_size + fields.replica_count &&
-            object.via.array.size !=
-                extended_base_size + fields.replica_count + 1) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                fmt::format("snapshot metadata entry replica count mismatch: "
-                            "replicas={}, total_fields={}",
-                            fields.replica_count, object.via.array.size)));
-        }
-
-        fields.replica_index = index;
-        if (index + fields.replica_count < object.via.array.size) {
-            fields.hard_pinned = array[index + fields.replica_count].as<bool>();
-        }
-        return fields;
-    } catch (const std::exception& e) {
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "failed to parse snapshot metadata entry: " +
-                                   std::string(e.what())));
-    }
-}
-
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -427,23 +352,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 }
 
 void MasterService::AccountLiveBytes(ObjectMetadata& metadata) {
-    if (metadata.AreBytesAccounted()) {
-        return;
-    }
-    MasterMetricManager::instance().inc_labeled_live_bytes(
-        metadata.tenant_id, metadata.domain_id, metadata.object_set,
-        static_cast<int64_t>(metadata.size));
-    metadata.MarkBytesAccounted();
+    (void)metadata;
 }
 
 void MasterService::ReleaseLiveBytes(ObjectMetadata& metadata) {
-    if (!metadata.AreBytesAccounted()) {
-        return;
-    }
-    MasterMetricManager::instance().dec_labeled_live_bytes(
-        metadata.tenant_id, metadata.domain_id, metadata.object_set,
-        static_cast<int64_t>(metadata.size));
-    metadata.ClearBytesAccounted();
+    (void)metadata;
 }
 
 MasterService::TenantDomainKey MasterService::BuildTenantDomainKey(
@@ -464,16 +377,6 @@ std::optional<MasterService::ReuseKey> MasterService::MaybeBuildReuseKey(
     }
     return ReuseKey{metadata.tenant_id, metadata.domain_id,
                     metadata.sharing_scope, metadata.canonical_key};
-}
-
-std::optional<MasterService::ReuseKey> MasterService::MaybeBuildReuseKey(
-    const AdmissionRequestContext& context) const {
-    if (context.sharing_scope != "tenant_shared" ||
-        context.canonical_key.empty()) {
-        return std::nullopt;
-    }
-    return ReuseKey{context.tenant_id, context.domain_id, context.sharing_scope,
-                    context.canonical_key};
 }
 
 void MasterService::IndexMetadata(MetadataShard& shard,
@@ -537,13 +440,13 @@ void MasterService::ClearInvalidHandles() {
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
             if (CleanupStaleHandles(it->second)) {
-                // If the object is empty, we need to erase the iterator and
-                // also erase the key from processing_keys,
-                // replication_tasks, and offloading_tasks.
-                UnindexMetadata(*shard.operator->(), it->first, it->second);
-                shard->processing_keys.erase(it->second.legacy_raw_key);
-                shard->replication_tasks.erase(it->second.legacy_raw_key);
-                shard->offloading_tasks.erase(it->second.legacy_raw_key);
+                // If the object is empty, erase companion indexes/tasks keyed
+                // by the logical object identity before removing metadata.
+                const auto object_id = it->first;
+                UnindexMetadata(*shard.operator->(), object_id, it->second);
+                shard->processing_keys.erase(object_id);
+                shard->replication_tasks.erase(object_id);
+                shard->offloading_tasks.erase(object_id);
                 it = shard->metadata.erase(it);
             } else {
                 ++it;
@@ -650,18 +553,6 @@ auto MasterService::GetAllKeys()
         }
     }
     return all_keys;
-}
-
-auto MasterService::GetAllObjects()
-    -> tl::expected<std::vector<LogicalObjectId>, ErrorCode> {
-    std::vector<LogicalObjectId> all_objects;
-    for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRO shard(this, i);
-        for (const auto& [object_id, _] : shard->metadata) {
-            all_objects.push_back(object_id);
-        }
-    }
-    return all_objects;
 }
 
 auto MasterService::GetAllKeysByScope(const std::string& tenant_id,
@@ -1021,85 +912,6 @@ auto MasterService::GetReplicaList(const std::string& key)
                                   default_kv_lease_ttl_);
 }
 
-AdmissionRequestContext MasterService::BuildAdmissionRequestContext(
-    AdmissionRequestContext::Operation operation, const std::string& key,
-    uint64_t value_length, const ReplicateConfig& config) const {
-    auto object_id = BuildLogicalObjectId(key, config);
-    std::string canonical_key =
-        config.canonical_key.empty()
-            ? BuildCanonicalObjectKey(object_id.tenant_id, object_id.domain_id,
-                                      object_id.object_set,
-                                      object_id.logical_key)
-            : config.canonical_key;
-    return AdmissionRequestContext{operation,
-                                   key,
-                                   value_length,
-                                   value_length,
-                                   config.replica_num,
-                                   object_id.tenant_id,
-                                   object_id.domain_id,
-                                   object_id.object_set,
-                                   config.sharing_scope,
-                                   config.qos_tier,
-                                   std::move(object_id.logical_key),
-                                   std::move(canonical_key)};
-}
-
-uint64_t MasterService::ResolveAdmissionBytes(
-    const AdmissionRequestContext& context,
-    const MetadataShardAccessorRW& current_shard,
-    size_t current_shard_index) const {
-    auto reuse_key = MaybeBuildReuseKey(context);
-    if (!reuse_key.has_value()) {
-        return context.slice_length;
-    }
-
-    auto has_shared_object = [&](const auto& shard) {
-        auto reuse_it = shard->reuse_candidates.find(*reuse_key);
-        if (reuse_it == shard->reuse_candidates.end()) {
-            return false;
-        }
-        for (const auto& existing_id : reuse_it->second) {
-            if (current_shard_index == getShardIndex(context.key) &&
-                existing_id.logical_key == context.logical_key &&
-                existing_id.tenant_id == context.tenant_id &&
-                existing_id.domain_id == context.domain_id &&
-                existing_id.object_set == context.object_set) {
-                continue;
-            }
-            auto metadata_it = shard->metadata.find(existing_id);
-            if (metadata_it == shard->metadata.end()) {
-                continue;
-            }
-            const auto& metadata = metadata_it->second;
-            if (metadata.domain_id != context.domain_id) {
-                continue;
-            }
-            if (!metadata.HasReplica(&Replica::fn_is_completed)) {
-                continue;
-            }
-            return true;
-        }
-        return false;
-    };
-
-    if (has_shared_object(current_shard)) {
-        return 0;
-    }
-
-    for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
-        if (shard_index == current_shard_index) {
-            continue;
-        }
-        MetadataShardAccessorRO shard(this, shard_index);
-        if (has_shared_object(shard)) {
-            return 0;
-        }
-    }
-
-    return context.slice_length;
-}
-
 std::vector<std::string> MasterService::ResolvePreferredSegments(
     const MetadataShardAccessorRW& current_shard, size_t current_shard_index,
     const ReplicateConfig& config) const {
@@ -1170,18 +982,6 @@ std::vector<std::string> MasterService::ResolvePreferredSegments(
     return preferred_segments;
 }
 
-tl::expected<void, ErrorCode> MasterService::AdmitWrite(
-    AdmissionRequestContext::Operation operation, const std::string& key,
-    uint64_t value_length, const ReplicateConfig& config,
-    const MetadataShardAccessorRW& current_shard,
-    size_t current_shard_index) const {
-    auto context =
-        BuildAdmissionRequestContext(operation, key, value_length, config);
-    context.effective_requested_bytes =
-        ResolveAdmissionBytes(context, current_shard, current_shard_index);
-    return admission_controller_->Admit(context);
-}
-
 auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
@@ -1244,7 +1044,7 @@ auto MasterService::AllocateAndInsertMetadata(
             config.qos_tier, object_id.logical_key, canonical_key));
     metadata_it->second.legacy_raw_key = key;
     IndexMetadata(*shard.operator->(), metadata_it->first, metadata_it->second);
-    shard->processing_keys.insert(key);
+    shard->processing_keys.insert(object_id);
 
     return replica_list;
 }
@@ -1281,6 +1081,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                   ? shard->metadata.find(alias_it->second)
                   : shard->metadata.end();
     if (it != shard->metadata.end() && !CleanupStaleHandles(it->second)) {
+        const auto object_id = it->first;
         auto& metadata = it->second;
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
@@ -1294,8 +1095,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     std::move(replicas),
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
-            shard->processing_keys.erase(key);
-            UnindexMetadata(*shard.operator->(), it->first, it->second);
+            shard->processing_keys.erase(object_id);
+            UnindexMetadata(*shard.operator->(), object_id, it->second);
             shard->metadata.erase(it);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -1332,14 +1133,17 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_offload_) {
         auto& shard = accessor.GetShard();
+        const auto object_id = shard->raw_key_to_id.at(key);
         metadata.VisitReplicas(
-            &Replica::fn_is_completed, [this, &key, &shard](Replica& replica) {
+            &Replica::fn_is_completed,
+            [this, &key, &shard, &object_id](Replica& replica) {
                 auto result = PushOffloadingQueue(key, replica);
                 if (result) {
                     replica.inc_refcnt();
                     shard->offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(),
-                                            std::chrono::system_clock::now()});
+                        object_id,
+                        OffloadingTask{replica.id(),
+                                       std::chrono::system_clock::now()});
                 }
             });
     }
@@ -1531,7 +1335,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // If all memory replicas point to unmounted segments (node crashed and
     // restarted), the metadata is useless — erase it and treat as new key.
     if (it != shard->metadata.end() && CleanupStaleHandles(it->second)) {
-        shard->processing_keys.erase(key);
+        const auto object_id = it->first;
+        shard->processing_keys.erase(object_id);
         UnindexMetadata(*shard.operator->(), it->first, it->second);
         shard->metadata.erase(it);
         it = shard->metadata.end();
@@ -1543,23 +1348,25 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
         // Reject if a Copy/Move task is actively reading this key's replicas.
         // Writing during replication would corrupt the copy.
-        if (shard->replication_tasks.count(key) > 0) {
+        if (shard->replication_tasks.count(it->first) > 0) {
             LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
             return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
 
         // Reject if an offload-to-disk task is in progress (same reason).
-        if (shard->offloading_tasks.count(key) > 0) {
+        if (shard->offloading_tasks.count(it->first) > 0) {
             LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
             return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
+
+        const auto object_id = it->first;
 
         // Preempt an in-progress Put/Upsert on the same key.  The previous
         // writer's PROCESSING replicas are moved to discarded_replicas_ with a
         // TTL so they are not freed while the old writer may still be doing
         // RDMA writes.  Unlike PutStart (which only preempts after a timeout),
         // UpsertStart preempts immediately.
-        if (shard->processing_keys.count(key) > 0) {
+        if (shard->processing_keys.count(object_id) > 0) {
             auto processing_replicas =
                 metadata.PopReplicas(&Replica::fn_is_processing);
             if (!processing_replicas.empty()) {
@@ -1568,7 +1375,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     std::move(processing_replicas),
                     now + put_start_release_timeout_sec_);
             }
-            shard->processing_keys.erase(key);
+            shard->processing_keys.erase(object_id);
 
             // If no COMPLETE replicas survive the preemption, this key
             // effectively does not exist — fall through to Case A.
@@ -1590,6 +1397,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
 
     // --- Step 2: key exists with COMPLETE replicas → Case B or C ---
+    const auto object_id = it->first;
     auto& metadata = it->second;
 
     // Reject if any reader holds a reference (refcnt > 0).  Overwriting a
@@ -1628,7 +1436,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             replica.mark_processing();
         });
 
-        shard->processing_keys.insert(key);
+        shard->processing_keys.insert(object_id);
 
         // Return the existing descriptors — same buffer addresses as before.
         std::vector<Replica::Descriptor> replica_list;
@@ -1840,8 +1648,9 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
+    const auto object_id = shard->raw_key_to_id.at(key);
     shard->replication_tasks.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
+        std::piecewise_construct, std::forward_as_tuple(object_id),
         std::forward_as_tuple(client_id, std::chrono::system_clock::now(),
                               ReplicationTask::Type::COPY, source->id(),
                               std::move(replica_ids)));
@@ -2055,8 +1864,9 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
+    const auto object_id = shard->raw_key_to_id.at(key);
     shard->replication_tasks.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
+        std::piecewise_construct, std::forward_as_tuple(object_id),
         std::forward_as_tuple(client_id, std::chrono::system_clock::now(),
                               ReplicationTask::Type::MOVE, source->id(),
                               std::move(replica_ids)));
@@ -2299,8 +2109,7 @@ auto MasterService::RemoveByRegexInScope(const std::string& regex_pattern,
                                     "are complete. Skipping removal.";
                     continue;
                 }
-                if (metadata_shards_[i].replication_tasks.contains(
-                        it->second.legacy_raw_key)) {
+                if (metadata_shards_[i].replication_tasks.contains(it->first)) {
                     LOG(WARNING)
                         << "key=" << it->second.legacy_raw_key
                         << ", matched by regex, but has replication task. "
@@ -2340,8 +2149,7 @@ auto MasterService::RemoveByRegexInScope(const std::string& regex_pattern,
                     ++it;
                     continue;
                 }
-                if (metadata_shards_[i].replication_tasks.contains(
-                        it->second.legacy_raw_key)) {
+                if (metadata_shards_[i].replication_tasks.contains(it->first)) {
                     LOG(WARNING) << "key=" << it->second.legacy_raw_key
                                  << ", matched by regex, but has replication "
                                     "task. Skipping removal.";
@@ -2391,7 +2199,7 @@ long MasterService::RemoveAll(bool force) {
              */
             if ((force || it->second.IsLeaseExpired(now)) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
-                !shard->replication_tasks.contains(it->second.legacy_raw_key)) {
+                !shard->replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
@@ -2451,10 +2259,11 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Clean up stale replica handles (consistent with single Remove)
             if (CleanupStaleHandles(it->second)) {
+                const auto object_id = it->first;
                 UnindexMetadata(*shard.operator->(), it->first, it->second);
-                shard->processing_keys.erase(key);
-                shard->replication_tasks.erase(key);
-                shard->offloading_tasks.erase(key);
+                shard->processing_keys.erase(object_id);
+                shard->replication_tasks.erase(object_id);
+                shard->offloading_tasks.erase(object_id);
                 shard->metadata.erase(it);
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2482,7 +2291,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 continue;
             }
 
-            if (shard->replication_tasks.contains(key)) {
+            if (shard->replication_tasks.contains(it->first)) {
                 LOG(ERROR) << "key=" << key
                            << ", error=object_has_replication_task";
                 results[original_idx] =
@@ -2620,7 +2429,8 @@ auto MasterService::NotifyOffloadSuccess(
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& shard = accessor.GetShard();
-                auto task_it = shard->offloading_tasks.find(key);
+                const auto object_id = shard->raw_key_to_id.at(key);
+                auto task_it = shard->offloading_tasks.find(object_id);
                 if (task_it != shard->offloading_tasks.end()) {
                     auto source =
                         obj_metadata.GetReplicaByID(task_it->second.source_id);
@@ -2743,14 +2553,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // Part 1: Discard expired PutStart operations.
     for (auto key_it = shard->processing_keys.begin();
          key_it != shard->processing_keys.end();) {
-        auto alias_it = shard->raw_key_to_id.find(*key_it);
-        auto it = alias_it != shard->raw_key_to_id.end()
-                      ? shard->metadata.find(alias_it->second)
-                      : shard->metadata.end();
+        auto it = shard->metadata.find(*key_it);
         if (it == shard->metadata.end()) {
-            // The key has been removed from metadata. This should be
-            // impossible.
-            LOG(ERROR) << "Key " << *key_it
+            LOG(ERROR) << "Object " << key_it->logical_key
                        << " was removed while in processing";
             key_it = shard->processing_keys.erase(key_it);
             continue;
@@ -2799,14 +2604,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // Part 2: Discard expired CopyStart/MoveStart operations.
     for (auto task_it = shard->replication_tasks.begin();
          task_it != shard->replication_tasks.end();) {
-        auto alias_it = shard->raw_key_to_id.find(task_it->first);
-        auto metadata_it = alias_it != shard->raw_key_to_id.end()
-                               ? shard->metadata.find(alias_it->second)
-                               : shard->metadata.end();
+        auto metadata_it = shard->metadata.find(task_it->first);
         if (metadata_it == shard->metadata.end()) {
-            // The key has been removed from metadata. This should be
-            // impossible.
-            LOG(ERROR) << "Key " << task_it->first
+            LOG(ERROR) << "Object " << task_it->first.logical_key
                        << " was removed with ongoing replication task";
             task_it = shard->replication_tasks.erase(task_it);
             continue;
@@ -2860,10 +2660,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             continue;
         }
 
-        auto alias_it = shard->raw_key_to_id.find(task_it->first);
-        auto metadata_it = alias_it != shard->raw_key_to_id.end()
-                               ? shard->metadata.find(alias_it->second)
-                               : shard->metadata.end();
+        auto metadata_it = shard->metadata.find(task_it->first);
         if (metadata_it != shard->metadata.end()) {
             auto source =
                 metadata_it->second.GetReplicaByID(task_it->second.source_id);
@@ -3849,8 +3646,6 @@ bool MasterService::TryRestoreStateFromSnapshot(
             }
 
             MasterMetricManager::instance().reset_allocated_mem_size();
-            MasterMetricManager::instance()
-                .reset_all_labeled_inventory_metrics();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
                     .reset_segment_allocated_mem_size(segment_name);
@@ -3975,7 +3770,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long object_count = 0;
     uint64_t total_freed_size = 0;
 
-    // Candidates for second pass eviction
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
 
@@ -3993,318 +3787,115 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
-    // Randomly select a starting shard to avoid imbalance eviction between
-    // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % kNumShards;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    // First pass: evict objects without soft pin and lease expired
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
-
-        // Discard expired processing keys first so that they won't be counted
-        // in later evictions.
         DiscardExpiredProcessingReplicas(shard, now);
-
-        // object_count must be updated at beginning as it will be used later
-        // to compute ideal_evict_num
         object_count += shard->metadata.size();
 
-        for (const auto& [object_id, metadata] : shard->metadata) {
-            if (metadata.AreBytesAccounted()) {
-                tenant_live_bytes[metadata.tenant_id] += metadata.size;
-                group_live_bytes[{metadata.domain_id, metadata.object_set}] +=
-                    metadata.size;
-            }
+        for (const auto& [_, metadata] : shard->metadata) {
             if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                 !can_evict_replicas(metadata)) {
                 continue;
             }
-            auto& bucket = metadata.IsSoftPinned(now) ? soft_pin_buckets
-                                                      : no_pin_buckets;
-            bucket[EvictionTierRank(metadata.qos_tier)]
-                  [{metadata.domain_id, metadata.object_set}][metadata.tenant_id]
-                .push_back(EvictionCandidate{object_id,
-                                             metadata.logical_key,
-                                             metadata.tenant_id,
-                                             metadata.domain_id,
-                                             metadata.object_set,
-                                             metadata.lease_timeout});
+            if (metadata.IsSoftPinned(now)) {
+                soft_pin_objects.push_back(metadata.lease_timeout);
+            } else {
+                no_pin_objects.push_back(metadata.lease_timeout);
+            }
         }
     }
 
-    auto sort_bucket_candidates = [](CandidateBuckets& buckets) {
-        for (auto& [_, group_buckets] : buckets) {
-            for (auto& [_, tenant_buckets] : group_buckets) {
-                for (auto& [_, candidates] : tenant_buckets) {
-                    std::sort(candidates.begin(), candidates.end(),
-                              [](const EvictionCandidate& lhs,
-                                 const EvictionCandidate& rhs) {
-                                  if (lhs.lease_timeout != rhs.lease_timeout) {
-                                      return lhs.lease_timeout <
-                                             rhs.lease_timeout;
-                                  }
-                                  return lhs.logical_key < rhs.logical_key;
-                              });
-                }
-            }
-        }
-    };
-    sort_bucket_candidates(no_pin_buckets);
-    sort_bucket_candidates(soft_pin_buckets);
-
-    auto evict_from_buckets = [&](CandidateBuckets& buckets,
-                                  long target_evict_num,
-                                  bool require_no_soft_pin) {
-        if (target_evict_num <= 0) {
-            return 0L;
-        }
-
-        long evicted = 0;
-        std::unordered_map<std::string, size_t> next_candidate_index;
-        auto bucket_index_key = [](int tier_rank, const GroupKey& group_key,
-                                   const std::string& tenant_id) {
-            return std::to_string(tier_rank) + "\n" + group_key.first + "\n" +
-                   group_key.second + "\n" + tenant_id;
-        };
-        while (evicted < target_evict_num) {
-            int selected_tier = 0;
-            std::optional<GroupKey> selected_group;
-            std::optional<std::string> selected_tenant;
-            uint64_t selected_group_pressure = 0;
-            uint64_t selected_tenant_pressure = 0;
-            auto selected_timeout =
-                std::chrono::system_clock::time_point::max();
-            bool found_candidate = false;
-
-            for (const auto& [tier_rank, group_buckets] : buckets) {
-                for (const auto& [group_key, tenant_buckets] : group_buckets) {
-                    for (const auto& [tenant_id, candidates] : tenant_buckets) {
-                        const auto next_index_key =
-                            bucket_index_key(tier_rank, group_key, tenant_id);
-                        const size_t idx = next_candidate_index[next_index_key];
-                        if (idx >= candidates.size()) {
-                            continue;
-                        }
-                        const uint64_t tenant_pressure =
-                            tenant_live_bytes[tenant_id];
-                        const uint64_t group_pressure =
-                            group_live_bytes[group_key];
-                        const auto timeout = candidates[idx].lease_timeout;
-                        const bool prefer_candidate =
-                            !found_candidate || timeout < selected_timeout ||
-                            (timeout == selected_timeout &&
-                             (group_pressure > selected_group_pressure ||
-                              (group_pressure == selected_group_pressure &&
-                               enable_tenant_fair_eviction_ &&
-                               (tenant_pressure > selected_tenant_pressure ||
-                                (tenant_pressure == selected_tenant_pressure &&
-                                 tenant_id < *selected_tenant))) ||
-                              (group_pressure == selected_group_pressure &&
-                               (!enable_tenant_fair_eviction_) &&
-                               (selected_group == std::nullopt ||
-                                group_key < *selected_group ||
-                                (group_key == *selected_group &&
-                                 tenant_id < *selected_tenant)))));
-                        if (prefer_candidate) {
-                            selected_tier = tier_rank;
-                            selected_group = group_key;
-                            selected_tenant = tenant_id;
-                            selected_group_pressure = group_pressure;
-                            selected_tenant_pressure = tenant_pressure;
-                            selected_timeout = timeout;
-                            found_candidate = true;
-                        }
-                    }
-                }
-                if (found_candidate) {
-                    break;
-                }
-            }
-
-            if (!selected_group || !selected_tenant) {
-                break;
-            }
-
-            auto& tenant_id = *selected_tenant;
-            auto& group_key = *selected_group;
-            auto& candidates = buckets[selected_tier][group_key][tenant_id];
-            auto& idx = next_candidate_index[bucket_index_key(
-                selected_tier, group_key, tenant_id)];
-            const auto candidate = candidates[idx++];
-
-            MetadataShardAccessorRW shard(
-                this, getShardIndex(candidate.object_id.logical_key));
-            auto metadata_it = shard->metadata.find(candidate.object_id);
-            if (metadata_it == shard->metadata.end() ||
-                !metadata_it->second.IsValid()) {
-                continue;
-            }
-
-            auto& metadata = metadata_it->second;
-            if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
-                !can_evict_replicas(metadata) ||
-                (require_no_soft_pin && metadata.IsSoftPinned(now)) ||
-                EvictionTierRank(metadata.qos_tier) != selected_tier) {
-                continue;
-            }
-
-            const size_t object_size = metadata.size;
-            const size_t erased_replicas = evict_replicas(metadata);
-            if (erased_replicas == 0) {
-                continue;
-            }
-
-            ReleaseLiveBytes(metadata);
-            total_freed_size += object_size * erased_replicas;
-            tenant_live_bytes[tenant_id] =
-                tenant_live_bytes[tenant_id] > object_size
-                    ? tenant_live_bytes[tenant_id] - object_size
-                    : 0;
-            group_live_bytes[group_key] =
-                group_live_bytes[group_key] > object_size
-                    ? group_live_bytes[group_key] - object_size
-                    : 0;
-            if (!metadata.IsValid()) {
-                UnindexMetadata(*shard.operator->(), metadata_it->first,
-                                metadata_it->second);
-                shard->metadata.erase(metadata_it);
-            }
-            evicted++;
-        }
-        return evicted;
-    };
-
-    const long first_pass_target = std::min(
-        static_cast<long>(std::ceil(object_count * evict_ratio_target)), [&]() {
-            long total = 0;
-            for (const auto& [_, group_buckets] : no_pin_buckets) {
-                for (const auto& [_, tenant_buckets] : group_buckets) {
-                    for (const auto& [_, candidates] : tenant_buckets) {
-                        total += candidates.size();
-                    }
-                }
-            }
-            return total;
-        }());
-    evicted_count += evict_from_buckets(no_pin_buckets, first_pass_target,
-                                        /*require_no_soft_pin=*/true);
     uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
-
-    // The ideal number of objects to evict in the second pass
     long target_evict_num = std::ceil(object_count * evict_ratio_lowerbound) -
-                            evicted_count - released_discarded_cnt;
-    // The actual number of objects we can evict in the second pass
-    target_evict_num =
-        std::min(target_evict_num,
-                 (long)no_pin_objects.size() + (long)soft_pin_objects.size());
+                            released_discarded_cnt;
+    if (target_evict_num < 0) {
+        target_evict_num = 0;
+    }
 
-    // Do second pass eviction only if 1). there are candidates that can be
-    // evicted AND 2). The evicted number in the first pass is less than
-    // evict_ratio_lowerbound.
-    if (target_evict_num > 0) {
-        // If 1). there are enough candidates without soft pin OR 2). soft pin
-        // candidates are empty, then do second pass A. Otherwise, do second
-        // pass B. Note that the second condition is ensured implicitly by the
-        // calculation of target_evict_num.
-        if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
-            // Second pass A: only evict objects without soft pin. The following
-            // code is error-prone if target_evict_num > no_pin_objects.size().
-
-            std::nth_element(no_pin_objects.begin(),
-                             no_pin_objects.begin() + (target_evict_num - 1),
-                             no_pin_objects.end());
-            auto target_timeout = no_pin_objects[target_evict_num - 1];
-
-            // Evict objects with lease timeout less than or equal to target.
-            // Stop when the target is reached.
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                MetadataShardAccessorRW shard(this,
-                                              (start_idx + i) % kNumShards);
-                auto it = shard->metadata.begin();
-                while (it != shard->metadata.end() && target_evict_num > 0) {
-                    if (!it->second.IsHardPinned() &&
-                        it->second.lease_timeout <= target_timeout &&
-                        !it->second.IsSoftPinned(now) &&
-                        can_evict_replicas(it->second)) {
-                        // Evict this object
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
-                            it = shard->metadata.erase(it);
-                        } else {
-                            ++it;
-                        }
-                        evicted_count++;
-                        target_evict_num--;
-                    } else {
-                        ++it;
-                    }
+    auto evict_matching = [&](bool allow_soft_pin,
+                              const std::chrono::system_clock::time_point*
+                                  soft_pin_target_timeout) {
+        for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+            MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
+            auto it = shard->metadata.begin();
+            while (it != shard->metadata.end() && target_evict_num > 0) {
+                auto& metadata = it->second;
+                if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
+                    !can_evict_replicas(metadata)) {
+                    ++it;
+                    continue;
                 }
-            }
-        } else if (!soft_pin_objects.empty()) {
-            // Second pass B: Prioritize evicting objects without soft pin, but
-            // also allow to evict soft pinned objects. The following code is
-            // error-prone if the soft pin objects are empty.
-
-            const long soft_pin_evict_num =
-                target_evict_num - static_cast<long>(no_pin_objects.size());
-            // For soft pin objects, prioritize to evict the ones with smaller
-            // lease timeout.
-            std::nth_element(
-                soft_pin_objects.begin(),
-                soft_pin_objects.begin() + (soft_pin_evict_num - 1),
-                soft_pin_objects.end());
-            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
-
-            // Stop when the target is reached.
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                MetadataShardAccessorRW shard(this,
-                                              (start_idx + i) % kNumShards);
-
-                auto it = shard->metadata.begin();
-                while (it != shard->metadata.end() && target_evict_num > 0) {
-                    // Skip hard-pinned or not-yet-expired objects
-                    if (it->second.IsHardPinned() ||
-                        !it->second.IsLeaseExpired(now) ||
-                        !can_evict_replicas(it->second)) {
-                        ++it;
-                        continue;
-                    }
-                    // Evict objects with 1). no soft pin OR 2). with soft pin
-                    // and lease timeout less than or equal to target.
-                    if (!it->second.IsSoftPinned(now) ||
-                        it->second.lease_timeout <= soft_target_timeout) {
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
-                            it = shard->metadata.erase(it);
-                        } else {
-                            ++it;
-                        }
-                        evicted_count++;
-                        target_evict_num--;
-                    } else {
-                        ++it;
-                    }
+                if (!allow_soft_pin && metadata.IsSoftPinned(now)) {
+                    ++it;
+                    continue;
                 }
+                if (allow_soft_pin && metadata.IsSoftPinned(now) &&
+                    soft_pin_target_timeout != nullptr &&
+                    metadata.lease_timeout > *soft_pin_target_timeout) {
+                    ++it;
+                    continue;
+                }
+
+                total_freed_size += metadata.size * evict_replicas(metadata);
+                if (!metadata.IsValid()) {
+                    UnindexMetadata(*shard.operator->(), it->first, it->second);
+                    it = shard->metadata.erase(it);
+                } else {
+                    ++it;
+                }
+                evicted_count++;
+                target_evict_num--;
             }
-        } else {
-            // This should not happen.
-            LOG(ERROR) << "Error in second pass eviction: target_evict_num="
-                       << target_evict_num
-                       << ", no_pin_objects.size()=" << no_pin_objects.size()
-                       << ", soft_pin_objects.size()="
-                       << soft_pin_objects.size()
-                       << ", evicted_count=" << evicted_count
-                       << ", object_count=" << object_count
-                       << ", evict_ratio_target=" << evict_ratio_target
-                       << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
         }
+    };
+
+    if (target_evict_num > 0 && !no_pin_objects.empty()) {
+        const long no_pin_target =
+            std::min<long>(target_evict_num, no_pin_objects.size());
+        std::nth_element(no_pin_objects.begin(),
+                         no_pin_objects.begin() + (no_pin_target - 1),
+                         no_pin_objects.end());
+        const auto target_timeout = no_pin_objects[no_pin_target - 1];
+
+        for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+            MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
+            auto it = shard->metadata.begin();
+            while (it != shard->metadata.end() && target_evict_num > 0) {
+                auto& metadata = it->second;
+                if (!metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+                    !metadata.IsSoftPinned(now) &&
+                    can_evict_replicas(metadata) &&
+                    metadata.lease_timeout <= target_timeout) {
+                    total_freed_size +=
+                        metadata.size * evict_replicas(metadata);
+                    if (!metadata.IsValid()) {
+                        UnindexMetadata(*shard.operator->(), it->first,
+                                        it->second);
+                        it = shard->metadata.erase(it);
+                    } else {
+                        ++it;
+                    }
+                    evicted_count++;
+                    target_evict_num--;
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    if (target_evict_num > 0 && allow_evict_soft_pinned_objects_ &&
+        !soft_pin_objects.empty()) {
+        const long soft_pin_target =
+            std::min<long>(target_evict_num, soft_pin_objects.size());
+        std::nth_element(soft_pin_objects.begin(),
+                         soft_pin_objects.begin() + (soft_pin_target - 1),
+                         soft_pin_objects.end());
+        const auto soft_target_timeout = soft_pin_objects[soft_pin_target - 1];
+        evict_matching(true, &soft_target_timeout);
     }
 
     if (evicted_count > 0 || released_discarded_cnt > 0) {
@@ -4313,7 +3904,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                                              total_freed_size);
     } else {
         if (object_count == 0) {
-            // No objects to evict, no need to check again
             need_eviction_ = false;
         }
         MasterMetricManager::instance().inc_eviction_fail();
@@ -4544,6 +4134,8 @@ MasterService::MetadataSerializer::Deserialize(
             ErrorCode::DESERIALIZE_FAIL, "Missing 'shards' field"));
     }
 
+    uint64_t max_restored_replica_id = 0;
+
     // Iterate and deserialize each shard
     for (uint32_t i = 0; i < shards_obj->via.map.size; ++i) {
         // Get shard index
@@ -4597,8 +4189,7 @@ MasterService::MetadataSerializer::Deserialize(
             ErrorCode::DESERIALIZE_FAIL,
             "Missing required field 'discarded_replicas' in snapshot data"));
     }
-    auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj,
-                                                  &max_restored_replica_id);
+    auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj);
     if (!dr_result) {
         return tl::make_unexpected(
             SerializationError(dr_result.error().code,
@@ -4682,8 +4273,10 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
 }
 
 tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
-                                                    MetadataShard& shard) {
+MasterService::MetadataSerializer::DeserializeShard(
+    const msgpack::object& obj, size_t shard_index,
+    uint64_t* max_restored_replica_id) {
+    MetadataShardAccessorRW shard(service_, shard_index);
     if (obj.type != msgpack::type::MAP) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "Invalid shard format: expected map"));
@@ -4716,7 +4309,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                                "Missing or invalid 'metadata' field in shard"));
     }
 
-    shard.metadata.reserve(metadata_array->via.array.size);
+    shard->metadata.reserve(metadata_array->via.array.size);
 
     for (uint32_t j = 0; j < metadata_array->via.array.size; ++j) {
         const msgpack::object& item = metadata_array->via.array.ptr[j];
@@ -4910,13 +4503,30 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         is_hard_pinned = array[index++].as<bool>();
     }
 
+    std::string tenant_id = "default";
+    std::string domain_id = "default";
+    std::string object_set = "default";
+    std::string sharing_scope;
+    std::string qos_tier = "default";
+    std::string logical_key;
+    std::string canonical_key;
+    if (obj.via.array.size >= 14 && array[6].type == msgpack::type::STR) {
+        tenant_id = array[6].as<std::string>();
+        domain_id = array[7].as<std::string>();
+        object_set = array[8].as<std::string>();
+        sharing_scope = array[9].as<std::string>();
+        qos_tier = array[10].as<std::string>();
+        logical_key = array[11].as<std::string>();
+        canonical_key = array[12].as<std::string>();
+    }
+
     auto metadata = std::make_unique<ObjectMetadata>(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), has_soft_pin_timeout, is_hard_pinned,
-        tenant_id, domain_id, object_set, sharing_scope, qos_tier,
-        logical_key, canonical_key);
+        tenant_id, domain_id, object_set, sharing_scope, qos_tier, logical_key,
+        canonical_key);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
@@ -5374,7 +4984,8 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         for (size_t i = 0; i < kNumShards; ++i) {
             MetadataShardAccessorRO shard(this, i);
-            for (const auto& [key, metadata] : shard->metadata) {
+            for (const auto& [object_id, metadata] : shard->metadata) {
+                const auto& key = metadata.legacy_raw_key;
                 for (const auto& source_segment : job.request.segments) {
                     const auto unit_key = MakeDrainUnitKey(key, source_segment);
                     if (job.completed_unit_keys.contains(unit_key) ||
@@ -5393,7 +5004,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 
                     if (metadata.IsHardPinned() || !metadata.IsLeaseExpired() ||
                         !metadata.AllReplicas(&Replica::fn_is_completed) ||
-                        shard->replication_tasks.contains(key)) {
+                        shard->replication_tasks.contains(object_id)) {
                         blocked_unit_keys.insert(unit_key);
                         continue;
                     }
@@ -5406,8 +5017,8 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                     }
 
                     if (plans.size() < slots) {
-                        plans.push_back({key, source_segment, *target,
-                                         metadata.size, unit_key});
+                        plans.push_back(DrainPlan{key, source_segment, *target,
+                                                  metadata.size, unit_key});
                     }
                 }
             }
@@ -5459,7 +5070,8 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         for (size_t i = 0; i < kNumShards; ++i) {
             MetadataShardAccessorRO shard(this, i);
-            for (const auto& [key, metadata] : shard->metadata) {
+            for (const auto& [_, metadata] : shard->metadata) {
+                const auto& key = metadata.legacy_raw_key;
                 const auto replica_segments = metadata.GetReplicaSegmentNames();
                 for (const auto& source_segment : job.request.segments) {
                     if (std::find(replica_segments.begin(),
