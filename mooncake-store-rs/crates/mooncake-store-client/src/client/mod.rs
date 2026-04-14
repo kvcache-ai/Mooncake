@@ -33,15 +33,22 @@ use crate::route_directory::{
     authority_list_routes_by_replica_owner, authority_replace, authority_replace_many,
     build_route_directory,
 };
-use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransportFactory};
+use crate::transport::{wait_for_batch_completion_detailed, StoreTransport, StoreTransportFactory};
 
 const DEFAULT_TENANT: &str = "default";
-const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LIVE_CLIENT_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_SUSPECT_RUNTIME_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_ROUTE_TOPK: usize = 2;
+const DEFAULT_REQUEST_TIMEOUT_BASE: Duration = Duration::from_secs(1);
+const DEFAULT_REQUEST_TIMEOUT_CAP: Duration = Duration::from_secs(60);
+const DEFAULT_REQUEST_FAILOVER_SLACK: Duration = Duration::from_millis(250);
+const DEFAULT_REQUEST_THROUGHPUT_FLOOR_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 const STABLE_PHASE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const STABLE_PHASE_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
+const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
+const LEGACY_TRANSFER_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_TIMEOUT_MS";
+const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
 
 include!("types.rs");
 include!("builder.rs");
@@ -70,6 +77,8 @@ pub struct StoreClient {
     write_mode: WriteMode,
     route_control: RouteControlMode,
     route_topk: usize,
+    transfer_stall_timeout: Duration,
+    request_timeout_override: Option<Duration>,
     lifecycle_state: AtomicU8,
     startup_activation_pending: AtomicBool,
     state: Mutex<StoreState>,
@@ -111,6 +120,74 @@ fn decode_lifecycle_state(encoded: u8) -> ClientLifecycleState {
         3 => ClientLifecycleState::Sealed,
         4 => ClientLifecycleState::Offline,
         _ => ClientLifecycleState::Offline,
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct RequestDeadline {
+    deadline: Instant,
+}
+
+impl RequestDeadline {
+    fn after(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+        }
+    }
+
+    fn instant(self) -> Instant {
+        self.deadline
+    }
+}
+
+fn duration_from_env_ms(keys: &[&str]) -> Option<Duration> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+}
+
+fn transfer_stall_timeout_from_env() -> Duration {
+    duration_from_env_ms(&[TRANSFER_STALL_TIMEOUT_ENV, LEGACY_TRANSFER_TIMEOUT_ENV])
+        .unwrap_or(DEFAULT_TRANSFER_STALL_TIMEOUT)
+}
+
+fn request_timeout_override_from_env() -> Option<Duration> {
+    duration_from_env_ms(&[REQUEST_TIMEOUT_ENV])
+}
+
+fn estimate_request_timeout(
+    bytes: u64,
+    attempts: usize,
+    transfer_stall_timeout: Duration,
+) -> Duration {
+    let attempts = attempts.max(1) as u32;
+    let transfer_ms = if bytes == 0 {
+        0
+    } else {
+        let bytes_per_sec = u128::from(DEFAULT_REQUEST_THROUGHPUT_FLOOR_BYTES_PER_SEC.max(1));
+        let millis = (u128::from(bytes) * 1000).div_ceil(bytes_per_sec);
+        millis.min(u128::from(u64::MAX)) as u64
+    };
+    let failover_slack = DEFAULT_REQUEST_FAILOVER_SLACK.saturating_mul(attempts.saturating_sub(1));
+    let timeout = transfer_stall_timeout
+        .saturating_mul(attempts)
+        .saturating_add(Duration::from_millis(transfer_ms))
+        .saturating_add(DEFAULT_REQUEST_TIMEOUT_BASE)
+        .saturating_add(failover_slack);
+    timeout.clamp(
+        transfer_stall_timeout.saturating_add(DEFAULT_REQUEST_TIMEOUT_BASE),
+        DEFAULT_REQUEST_TIMEOUT_CAP,
+    )
+}
+
+impl StoreClient {
+    fn request_deadline_for_transfer(&self, bytes: u64, attempts: usize) -> RequestDeadline {
+        let timeout = self.request_timeout_override.unwrap_or_else(|| {
+            estimate_request_timeout(bytes, attempts, self.transfer_stall_timeout)
+        });
+        RequestDeadline::after(timeout)
     }
 }
 

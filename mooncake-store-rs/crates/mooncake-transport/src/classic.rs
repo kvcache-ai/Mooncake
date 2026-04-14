@@ -13,6 +13,7 @@ pub struct ClassicEngineConfig {
     rpc_bind_host: String,
     rpc_port: Option<u16>,
     protocol: ClassicTransportProtocol,
+    slice_timeout_ms: Option<u64>,
     redis_username: Option<String>,
     redis_password: Option<String>,
     redis_db_index: Option<String>,
@@ -25,6 +26,7 @@ impl ClassicEngineConfig {
             rpc_bind_host: rpc_bind_host.into(),
             rpc_port: None,
             protocol: ClassicTransportProtocol::Tcp,
+            slice_timeout_ms: None,
             redis_username: None,
             redis_password: None,
             redis_db_index: None,
@@ -38,6 +40,12 @@ impl ClassicEngineConfig {
 
     pub fn rpc_port(mut self, rpc_port: u16) -> Self {
         self.rpc_port = Some(rpc_port);
+        self
+    }
+
+    pub fn slice_timeout(mut self, timeout: std::time::Duration) -> Self {
+        let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.slice_timeout_ms = Some(timeout_ms.max(1));
         self
     }
 
@@ -70,6 +78,10 @@ impl ClassicEngineConfig {
 
     pub fn transport_protocol(&self) -> ClassicTransportProtocol {
         self.protocol
+    }
+
+    pub fn slice_timeout_ms_value(&self) -> Option<u64> {
+        self.slice_timeout_ms
     }
 
     pub fn redis_username_value(&self) -> Option<&str> {
@@ -289,12 +301,16 @@ struct ClassicCreateEnvGuard {
 impl ClassicCreateEnvGuard {
     fn apply(config: &ClassicEngineConfig) -> Self {
         let mut env = EnvOverrideGuard::new();
+        let slice_timeout = config
+            .slice_timeout_ms_value()
+            .map(|value| value.to_string());
         env.set_optional("MC_USE_TENT", None);
         env.set_optional("MC_USE_TEV1", None);
         env.set_optional(
             "MC_TCP_BIND_ADDRESS",
             (!config.rpc_bind_host().is_empty()).then_some(config.rpc_bind_host()),
         );
+        env.set_optional("MC_SLICE_TIMEOUT", slice_timeout.as_deref());
         env.set_optional("MC_REDIS_USERNAME", config.redis_username_value());
         env.set_optional("MC_REDIS_PASSWORD", config.redis_password_value());
         env.set_optional("MC_REDIS_DB_INDEX", config.redis_db_index_value());
@@ -374,9 +390,9 @@ mod tests {
     use mooncake_transport_sys::classic as ffi;
 
     use super::{
-        check_zero, decode_status, encode_opcode, encode_request, encode_requests, read_c_buffer,
-        to_cstring, ClassicCreateEnvGuard, ClassicEngineConfig, ClassicTransferEngine,
-        ClassicTransportProtocol,
+        check_zero, classic_engine_create_lock, decode_status, encode_opcode, encode_request,
+        encode_requests, read_c_buffer, to_cstring, ClassicCreateEnvGuard, ClassicEngineConfig,
+        ClassicTransferEngine, ClassicTransportProtocol,
     };
     use crate::{Opcode, TransferRequest, TransferStatus};
 
@@ -417,6 +433,21 @@ mod tests {
         assert_eq!(decode_status(ffi::STATUS_TIMEOUT), TransferStatus::Timeout);
         assert_eq!(decode_status(ffi::STATUS_FAILED), TransferStatus::Failed);
         assert_eq!(decode_status(i32::MAX), TransferStatus::Failed);
+    }
+
+    #[test]
+    fn classic_env_guard_applies_slice_timeout_override() {
+        let _guard = classic_engine_create_lock()
+            .lock()
+            .expect("classic engine create lock poisoned");
+        std::env::remove_var("MC_SLICE_TIMEOUT");
+        let config = ClassicEngineConfig::new("redis://127.0.0.1:6379/0", "127.0.0.1")
+            .slice_timeout(std::time::Duration::from_millis(1234));
+        {
+            let _env = ClassicCreateEnvGuard::apply(&config);
+            assert_eq!(std::env::var("MC_SLICE_TIMEOUT").as_deref(), Ok("1234"));
+        }
+        assert!(std::env::var("MC_SLICE_TIMEOUT").is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey,
+    ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey, ReplicaRoute,
     RouteCasRequest, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
     SegmentLifecycleState, SegmentName, StoreError,
 };
@@ -24,7 +24,8 @@ use super::{
     control_bind_host, copy_into_region, flatten_slices, now_ms, record_success_metric,
     scatter_into_buffers, shared_suspect_runtime_cache, startup_prewarm_delay, LiveClientCache,
     LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
-    ReplicaWriteTarget, SegmentAllocator, StorageOwnerState, StoreState, SuspectRuntimeCache,
+    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
+    SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -2705,6 +2706,74 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
                 "second reader should reuse the shared quarantine and avoid a fresh dead-replica failure"
             ),
         b"shared-suspect-payload"
+    );
+}
+
+#[test]
+fn request_deadline_failure_does_not_quarantine_remote_runtime() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("deadline-store-segment"));
+    let reader_transport = Arc::new(store_transport.peer("deadline-reader-segment"));
+
+    let store = StoreClientBuilder::new(metadata.clone(), "deadline-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "deadline-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "deadline-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "deadline-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    let replica = ReplicaRoute {
+        owner: store.runtime_id().clone(),
+        segment_name: SegmentName::new("deadline-store-segment"),
+        offset: 0,
+        segment_offset: 0,
+        length: 4,
+        checksum: None,
+        tier: mooncake_store_core::ReplicaTier::Dram,
+        priority: 0,
+    };
+    let resolved = ResolvedObject {
+        tenant: "default".to_string(),
+        key: "deadline-key".to_string(),
+        route: mooncake_store_core::ObjectRoute {
+            key: reader.scoped_key("default", "deadline-key"),
+            version: RouteVersion(1),
+            state: mooncake_store_core::RouteState::Active,
+            compatibility: reader.lease.compatibility.clone(),
+            replicas: vec![replica.clone()],
+        },
+        replica,
+        fallback_replicas: VecDeque::new(),
+    };
+
+    reader.note_remote_read_failure(
+        &[&resolved],
+        &StoreError::Transport("request deadline exceeded".to_string()),
+        "deadline_test",
+        false,
+    );
+
+    assert!(
+        !reader
+            .suspect_runtime_cache
+            .lock()
+            .contains(store.runtime_id()),
+        "request deadline exhaustion must not quarantine a runtime without a stall signal"
     );
 }
 

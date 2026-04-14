@@ -115,6 +115,8 @@ pub struct StoreClientBuilder {
     route_control: RouteControlMode,
     route_topk: usize,
     live_client_sync_interval: Duration,
+    transfer_stall_timeout: Duration,
+    request_timeout_override: Option<Duration>,
     startup_prewarm_max_delay: Duration,
     activate_on_local_memory_registration: bool,
 }
@@ -136,6 +138,8 @@ impl StoreClientBuilder {
             route_control: RouteControlMode::EmbeddedWrh,
             route_topk: DEFAULT_ROUTE_TOPK,
             live_client_sync_interval: DEFAULT_LIVE_CLIENT_SYNC_INTERVAL,
+            transfer_stall_timeout: transfer_stall_timeout_from_env(),
+            request_timeout_override: request_timeout_override_from_env(),
             startup_prewarm_max_delay: startup_prewarm_max_delay_from_env(),
             activate_on_local_memory_registration: false,
         }
@@ -216,6 +220,16 @@ impl StoreClientBuilder {
 
     pub fn live_client_sync_interval(mut self, interval: Duration) -> Self {
         self.live_client_sync_interval = interval;
+        self
+    }
+
+    pub fn transfer_timeout(mut self, timeout: Duration) -> Self {
+        self.transfer_stall_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout_override = Some(timeout.max(Duration::from_millis(1)));
         self
     }
 
@@ -377,6 +391,8 @@ impl StoreClientBuilder {
             write_mode: self.write_mode,
             route_control: self.route_control,
             route_topk: self.route_topk,
+            transfer_stall_timeout: self.transfer_stall_timeout,
+            request_timeout_override: self.request_timeout_override,
             lifecycle_state: AtomicU8::new(encode_lifecycle_state(published_initial_state)),
             startup_activation_pending: AtomicBool::new(startup_activation_pending),
             state,

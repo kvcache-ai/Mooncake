@@ -280,12 +280,33 @@ For cross-host or cross-container real-mode deployments, set a reachable `local_
 
 The compatibility client defaults `lease_ttl_ms` to `30000`. Keep the heartbeat interval comfortably below that TTL so dead peers converge quickly without triggering avoidable churn.
 
-Heartbeat refresh now uses a dedicated publish timeout instead of the generic
-dispatcher request timeout. Standalone clients also retry failed heartbeat
-publishes instead of exiting on the first timeout. Use
-`heartbeat_timeout_ms` / `--heartbeat-timeout-ms` or
-`MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` when cloud metadata links need a longer
-budget than the default request path.
+Timeouts now converge on one shared compatibility helper so the Python wrapper,
+standalone client, dummy client, and transport builder all resolve the same
+knobs with the same precedence rules:
+
+- CLI override, when a standalone binary exposes the flag
+- explicit environment variable
+- built-in default
+
+The compatibility layer exposes four timeout scopes:
+
+| Knob | Default | Scope | Meaning |
+|------|---------|-------|---------|
+| `request_timeout_ms` / `--request-timeout-ms` / `MC_STORE_RS_REQUEST_TIMEOUT_MS` | `65000` | dispatcher request budget, routed read/write request budget, dummy fallback | outer per-request deadline shared across replica failover |
+| `heartbeat_timeout_ms` / `--heartbeat-timeout-ms` / `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | `15000` | standalone client heartbeat / state publish | dedicated health-channel publish budget |
+| `transfer_stall_timeout_ms` / `--transfer-stall-timeout-ms` / `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` | `10000` | TENT / classic transfer engine | inner stall detector for one transfer slice or batch wait |
+| `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` | `65000` | dummy gRPC client | dummy RPC budget; falls back to `request_timeout_ms` when unset |
+
+Design intent:
+
+- request timeout is the outer deadline for one logical store request
+- heartbeat timeout is independent, so a slow health publish does not block the shared data path
+- transfer stall timeout is not a whole-request timeout; it only detects no-progress transport stalls
+- dummy RPC timeout follows request timeout unless explicitly overridden, so compatibility scripts do not hang forever on one slow server
+
+Standalone clients now retry failed heartbeat publishes instead of exiting on
+the first timeout. When cloud metadata links or long transfers need more head
+room, raise the matching timeout scope instead of stretching every timeout.
 
 Control-plane RPCs now run on a dedicated shared Tokio runtime instead of a
 single global caller lock. Use `MC_STORE_RS_CONTROL_PLANE_THREADS` to tune the
@@ -335,7 +356,11 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRANSPORT_RPC_PORT` | Python wrapper setup fallback | fixed real data-plane transport port |
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |
 | `MC_STORE_RS_EXPIRES_AT_MS` | Python wrapper setup fallback | absolute lease expiry timestamp in milliseconds |
+| `MC_STORE_RS_REQUEST_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | outer per-request deadline for dispatcher requests and routed client operations |
 | `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | dedicated dispatcher timeout for heartbeat publish |
+| `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | inner transfer stall detector for TENT / classic TE |
+| `MC_STORE_RS_TRANSFER_TIMEOUT_MS` | legacy compatibility alias | deprecated alias of `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` |
+| `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` | dummy compatibility clients | dummy gRPC timeout; falls back to `MC_STORE_RS_REQUEST_TIMEOUT_MS` when unset |
 | `MC_STORE_RS_CONTROL_PLANE_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the shared control-plane RPC runtime; default `2`; must be `> 0` |
 | `MC_STORE_RS_TRACE` | Python wrapper setup fallback, e2e, and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |

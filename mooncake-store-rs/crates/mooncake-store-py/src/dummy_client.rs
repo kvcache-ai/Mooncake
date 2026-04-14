@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
+use crate::config::CompatTimeoutConfig;
 use crate::dummy_service::pb;
 use crate::shm::{
     dummy_ipc_socket_path, resolve_shared_region, send_shm_register_request,
@@ -18,13 +19,13 @@ use crate::shm::{
 
 static DUMMY_RUNTIME: LazyLock<Runtime> =
     LazyLock::new(|| Runtime::new().expect("dummy runtime should initialize"));
-const DUMMY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct DummySession {
     channel: Channel,
     server_addr: String,
     socket_path: PathBuf,
     client_id: DummyClientId,
+    rpc_timeout: Duration,
     registered_regions: Mutex<BTreeMap<usize, RegisteredRegion>>,
 }
 
@@ -36,6 +37,11 @@ struct RegisteredRegion {
 
 impl DummySession {
     pub fn connect(server_addr: &str) -> Result<Self> {
+        let timeouts = CompatTimeoutConfig::from_env();
+        Self::connect_with_rpc_timeout(server_addr, timeouts.dummy_rpc_timeout)
+    }
+
+    pub fn connect_with_rpc_timeout(server_addr: &str, rpc_timeout: Duration) -> Result<Self> {
         let endpoint_uri = format!("http://{server_addr}");
         let deadline = Instant::now() + Duration::from_secs(2);
         let channel = 'connect: loop {
@@ -60,6 +66,7 @@ impl DummySession {
             server_addr: server_addr.to_string(),
             socket_path: dummy_ipc_socket_path(server_addr),
             client_id: DummyClientId::new(),
+            rpc_timeout: rpc_timeout.max(Duration::from_millis(1)),
             registered_regions: Mutex::new(BTreeMap::new()),
         })
     }
@@ -370,7 +377,7 @@ impl DummySession {
         DUMMY_RUNTIME
             .block_on(async {
                 tokio::time::timeout(
-                    DUMMY_RPC_TIMEOUT,
+                    self.rpc_timeout,
                     f(
                         pb::dummy_store_service_client::DummyStoreServiceClient::new(
                             self.channel.clone(),
@@ -382,7 +389,7 @@ impl DummySession {
             .map_err(|_| {
                 StoreError::Transport(format!(
                     "dummy rpc timed out after {}ms",
-                    DUMMY_RPC_TIMEOUT.as_millis()
+                    self.rpc_timeout.as_millis()
                 ))
             })?
             .map_err(|error| StoreError::Transport(format!("dummy rpc failed: {error}")))

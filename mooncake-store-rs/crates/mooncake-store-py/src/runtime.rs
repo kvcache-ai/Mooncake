@@ -7,7 +7,9 @@ use mooncake_store_client::{
 };
 use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
 
-pub use crate::config::{CompatSetupArgs, CompatTransportConfig};
+pub use crate::config::{
+    CompatSetupArgs, CompatTimeoutCliOverrides, CompatTimeoutConfig, CompatTransportConfig,
+};
 
 pub struct CompatRuntime {
     pub client: StoreClient,
@@ -30,6 +32,7 @@ pub struct CompatRuntimeArgs {
 impl CompatRuntimeArgs {
     pub fn build(self) -> Result<CompatRuntime> {
         let plan = self.setup.build()?;
+        let timeouts = plan.timeouts;
         let planner_metadata = plan.routed_writes.then(|| plan.metadata.clone());
         let stable_id = plan.stable_id.clone();
         let expires_at_ms = plan.expires_at_ms;
@@ -64,6 +67,8 @@ impl CompatRuntimeArgs {
             .local_memory(local_memory)
             .transport(transport)
             .transport_factory(factory)
+            .transfer_timeout(timeouts.transfer_stall_timeout)
+            .request_timeout(timeouts.request_timeout)
             .route_control(self.route_control)
             .route_topk(plan.route_topk);
 
@@ -203,6 +208,7 @@ mod tests {
                 expires_at_ms: Some(now_ms() + 10_000),
                 use_hugepage: None,
                 hugepage_size_bytes: None,
+                timeouts: None,
             },
             local_segment_name: None,
             epoch: ClientEpoch(1),
