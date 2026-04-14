@@ -932,7 +932,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("batch_get");
-        let resolved = self.resolve_objects(objects)?;
+        let mut resolved = self.resolve_objects(objects)?;
         let mut buffers = resolved
             .iter()
             .map(|entry| vec![0u8; entry.replica.length as usize])
@@ -941,7 +941,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .iter_mut()
             .map(Vec::as_mut_slice)
             .collect::<Vec<_>>();
-        self.execute_batch_get_into(&resolved, &mut slices)?;
+        self.execute_batch_get_into(&mut resolved, &mut slices)?;
         let bytes_out = buffers
             .iter()
             .map(|buffer| buffer.len() as u64)
@@ -973,12 +973,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 object
             })
             .collect::<Vec<_>>();
-        let resolved = self.resolve_objects(&objects)?;
+        let mut resolved = self.resolve_objects(&objects)?;
         let mut buffers = requests
             .iter_mut()
             .map(|request| &mut *request.buffer)
             .collect::<Vec<_>>();
-        let sizes = self.execute_batch_get_into(&resolved, &mut buffers)?;
+        let sizes = self.execute_batch_get_into(&mut resolved, &mut buffers)?;
         let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
         let result = Ok(sizes);
         tracker.finish(&result, bytes_out);
