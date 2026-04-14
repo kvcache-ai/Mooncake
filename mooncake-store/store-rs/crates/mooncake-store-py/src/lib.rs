@@ -141,6 +141,7 @@ impl PyMooncakeDistributedStore {
                 expires_at_ms,
                 use_hugepage,
                 hugepage_size_bytes: hugepage_size,
+                timeouts: None,
             },
             local_segment_name,
             epoch,
@@ -2973,8 +2974,9 @@ mod tests {
     #[test]
     fn dummy_rpc_returns_timeout_instead_of_hanging() {
         let server = start_blocking_dummy_server();
-        let session = DummySession::connect(server.address())
-            .expect("dummy client should connect to blocking server");
+        let session =
+            DummySession::connect_with_rpc_timeout(server.address(), Duration::from_millis(200))
+                .expect("dummy client should connect to blocking server");
         let started = std::time::Instant::now();
         let error = session
             .get("blocked", None)
@@ -2992,9 +2994,11 @@ mod tests {
 
     #[test]
     fn dispatcher_async_wait_returns_timeout_instead_of_hanging() {
-        let dispatcher = StoreDispatcher::spawn(
+        let dispatcher = StoreDispatcher::spawn_with_timeouts(
             build_client("dispatcher-timeout"),
             "dispatcher-timeout".to_string(),
+            Duration::from_millis(200),
+            Duration::from_secs(15),
         )
         .expect("dispatcher should spawn");
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();

@@ -11,6 +11,89 @@ use mooncake_transport::{
 };
 use parking_lot::Mutex;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BatchWaitFailureKind {
+    PollFailed,
+    TerminalStatus(TransferStatus),
+    StallTimeout,
+    RequestDeadlineExceeded,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BatchWaitError {
+    kind: BatchWaitFailureKind,
+    error: StoreError,
+}
+
+impl BatchWaitError {
+    fn poll_failed(batch_id: u64, error: StoreError) -> Self {
+        Self {
+            kind: BatchWaitFailureKind::PollFailed,
+            error: StoreError::Transport(format!(
+                "transport batch {batch_id} status poll failed: {error}"
+            )),
+        }
+    }
+
+    fn terminal_status(batch_id: u64, status: TransferStatus, transferred_bytes: u64) -> Self {
+        let kind = match status {
+            TransferStatus::Timeout => BatchWaitFailureKind::StallTimeout,
+            _ => BatchWaitFailureKind::TerminalStatus(status),
+        };
+        let message = match status {
+            TransferStatus::Timeout => format!(
+                "transport batch {batch_id} stalled after {} byte(s) without progress",
+                transferred_bytes
+            ),
+            _ => format!(
+                "transport batch {batch_id} failed with status {:?} after {} byte(s)",
+                status, transferred_bytes
+            ),
+        };
+        Self {
+            kind,
+            error: StoreError::Transport(message),
+        }
+    }
+
+    fn stall_timeout(batch_id: u64, stall_timeout: Duration, transferred_bytes: u64) -> Self {
+        Self {
+            kind: BatchWaitFailureKind::StallTimeout,
+            error: StoreError::Transport(format!(
+                "transport batch {batch_id} stalled for {}ms after {} byte(s)",
+                stall_timeout.as_millis(),
+                transferred_bytes
+            )),
+        }
+    }
+
+    fn request_deadline_exceeded(batch_id: u64, elapsed: Duration, transferred_bytes: u64) -> Self {
+        Self {
+            kind: BatchWaitFailureKind::RequestDeadlineExceeded,
+            error: StoreError::Transport(format!(
+                "request deadline exceeded for transport batch {batch_id} after {}ms with {} byte(s) transferred",
+                elapsed.as_millis(),
+                transferred_bytes
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> BatchWaitFailureKind {
+        self.kind
+    }
+
+    pub(crate) fn marks_runtime_suspect(&self) -> bool {
+        !matches!(self.kind, BatchWaitFailureKind::RequestDeadlineExceeded)
+    }
+}
+
+impl From<BatchWaitError> for StoreError {
+    fn from(error: BatchWaitError) -> Self {
+        error.error
+    }
+}
+
 pub trait StoreTransport: Send + Sync {
     fn segment_name(&self) -> Result<String>;
     fn rpc_server_address(&self) -> Result<(String, u16)>;
@@ -307,27 +390,55 @@ pub fn wait_for_batch_completion(
     batch_id: u64,
     timeout: Duration,
 ) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+    wait_for_batch_completion_detailed(transport, batch_id, timeout, Instant::now() + timeout)
+        .map_err(StoreError::from)
+}
+
+pub(crate) fn wait_for_batch_completion_detailed(
+    transport: &dyn StoreTransport,
+    batch_id: u64,
+    stall_timeout: Duration,
+    request_deadline: Instant,
+) -> std::result::Result<(), BatchWaitError> {
+    let started = Instant::now();
+    let mut last_progress_at = started;
+    let mut last_transferred_bytes = 0u64;
     loop {
-        let status = transport.overall_status(batch_id)?;
-        match status.status {
+        let progress = transport
+            .overall_status(batch_id)
+            .map_err(|error| BatchWaitError::poll_failed(batch_id, error))?;
+        let now = Instant::now();
+        if progress.transferred_bytes > last_transferred_bytes {
+            last_transferred_bytes = progress.transferred_bytes;
+            last_progress_at = now;
+        }
+        match progress.status {
             TransferStatus::Completed => return Ok(()),
             TransferStatus::Failed
             | TransferStatus::Canceled
             | TransferStatus::Invalid
             | TransferStatus::Timeout => {
-                return Err(StoreError::Transport(format!(
-                    "transport batch {batch_id} failed with status {:?}",
-                    status.status
-                )));
+                return Err(BatchWaitError::terminal_status(
+                    batch_id,
+                    progress.status,
+                    last_transferred_bytes,
+                ));
             }
             TransferStatus::Waiting | TransferStatus::Pending => {}
         }
-        if Instant::now() >= deadline {
-            return Err(StoreError::Transport(format!(
-                "transport batch {batch_id} timed out after {:?}",
-                timeout
-            )));
+        if now >= request_deadline {
+            return Err(BatchWaitError::request_deadline_exceeded(
+                batch_id,
+                started.elapsed(),
+                last_transferred_bytes,
+            ));
+        }
+        if now.duration_since(last_progress_at) >= stall_timeout {
+            return Err(BatchWaitError::stall_timeout(
+                batch_id,
+                stall_timeout,
+                last_transferred_bytes,
+            ));
         }
         thread::sleep(Duration::from_millis(2));
     }
@@ -338,20 +449,23 @@ mod tests {
     use std::collections::VecDeque;
     use std::ffi::c_void;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use mooncake_store_core::{Result, StoreError};
     use mooncake_transport::{SegmentInfo, TransferProgress, TransferRequest, TransferStatus};
     use parking_lot::Mutex;
 
-    use super::{parse_rpc_server_address, wait_for_batch_completion, StoreTransport};
+    use super::{
+        parse_rpc_server_address, wait_for_batch_completion, wait_for_batch_completion_detailed,
+        BatchWaitFailureKind, StoreTransport,
+    };
 
     struct ScriptedTransport {
-        statuses: Arc<Mutex<VecDeque<TransferStatus>>>,
+        statuses: Arc<Mutex<VecDeque<TransferProgress>>>,
     }
 
     impl ScriptedTransport {
-        fn new(statuses: impl IntoIterator<Item = TransferStatus>) -> Self {
+        fn new(statuses: impl IntoIterator<Item = TransferProgress>) -> Self {
             Self {
                 statuses: Arc::new(Mutex::new(statuses.into_iter().collect())),
             }
@@ -412,24 +526,33 @@ mod tests {
         }
 
         fn overall_status(&self, _batch_id: u64) -> Result<TransferProgress> {
-            let status = self
+            let progress = self
                 .statuses
                 .lock()
                 .pop_front()
-                .unwrap_or(TransferStatus::Completed);
-            Ok(TransferProgress {
-                status,
-                transferred_bytes: 0,
-            })
+                .unwrap_or(TransferProgress {
+                    status: TransferStatus::Completed,
+                    transferred_bytes: 0,
+                });
+            Ok(progress)
         }
     }
 
     #[test]
     fn wait_for_batch_completion_returns_on_completed_status() {
         let transport = ScriptedTransport::new([
-            TransferStatus::Waiting,
-            TransferStatus::Pending,
-            TransferStatus::Completed,
+            TransferProgress {
+                status: TransferStatus::Waiting,
+                transferred_bytes: 0,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 0,
+            },
+            TransferProgress {
+                status: TransferStatus::Completed,
+                transferred_bytes: 0,
+            },
         ]);
 
         wait_for_batch_completion(&transport, 7, Duration::from_millis(20))
@@ -441,7 +564,10 @@ mod tests {
 
     #[test]
     fn wait_for_batch_completion_reports_terminal_failures() {
-        let transport = ScriptedTransport::new([TransferStatus::Failed]);
+        let transport = ScriptedTransport::new([TransferProgress {
+            status: TransferStatus::Failed,
+            transferred_bytes: 13,
+        }]);
 
         let error = wait_for_batch_completion(&transport, 9, Duration::from_millis(20))
             .expect_err("failed batch should surface transport error");
@@ -452,21 +578,111 @@ mod tests {
     #[test]
     fn wait_for_batch_completion_times_out_when_progress_never_completes() {
         let transport = ScriptedTransport::new([
-            TransferStatus::Waiting,
-            TransferStatus::Pending,
-            TransferStatus::Pending,
-            TransferStatus::Pending,
+            TransferProgress {
+                status: TransferStatus::Waiting,
+                transferred_bytes: 0,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 0,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 0,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 0,
+            },
         ]);
 
         let error = wait_for_batch_completion(&transport, 11, Duration::from_millis(3))
             .expect_err("stuck batch should time out");
         assert!(matches!(error, StoreError::Transport(_)));
-        assert!(error.to_string().contains("timed out"));
+        assert!(
+            error.to_string().contains("stalled")
+                || error.to_string().contains("request deadline exceeded")
+        );
+    }
+
+    #[test]
+    fn wait_for_batch_completion_uses_request_deadline_when_progress_keeps_advancing() {
+        let transport = ScriptedTransport::new([
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 1,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 2,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 3,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 4,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 5,
+            },
+        ]);
+
+        let error = wait_for_batch_completion_detailed(
+            &transport,
+            15,
+            Duration::from_millis(3),
+            Instant::now() + Duration::from_millis(7),
+        )
+        .expect_err("steady progress should consume request budget instead of tripping stall");
+        assert_eq!(error.kind(), BatchWaitFailureKind::RequestDeadlineExceeded);
+        assert!(!error.marks_runtime_suspect());
+        let error = StoreError::from(error);
+        assert!(error.to_string().contains("request deadline exceeded"));
+    }
+
+    #[test]
+    fn wait_for_batch_completion_allows_steady_progress_past_stall_timeout() {
+        let transport = ScriptedTransport::new([
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 1,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 2,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 3,
+            },
+            TransferProgress {
+                status: TransferStatus::Pending,
+                transferred_bytes: 4,
+            },
+            TransferProgress {
+                status: TransferStatus::Completed,
+                transferred_bytes: 4,
+            },
+        ]);
+
+        wait_for_batch_completion_detailed(
+            &transport,
+            17,
+            Duration::from_millis(3),
+            Instant::now() + Duration::from_millis(16),
+        )
+        .expect("steady progress should keep the stall watchdog from firing");
     }
 
     #[test]
     fn scripted_transport_exposes_contract_methods_for_smoke_coverage() {
-        let transport = ScriptedTransport::new([TransferStatus::Completed]);
+        let transport = ScriptedTransport::new([TransferProgress {
+            status: TransferStatus::Completed,
+            transferred_bytes: 0,
+        }]);
         assert!(matches!(
             transport.segment_name(),
             Err(StoreError::Unsupported(_))

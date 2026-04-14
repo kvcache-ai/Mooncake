@@ -282,7 +282,11 @@ impl StoreClient {
             .transport_factory(factory)
             .route_control(self.route_control)
             .route_topk(self.route_topk)
+            .transfer_timeout(self.transfer_stall_timeout)
             .startup_prewarm_max_delay(Duration::ZERO);
+        if let Some(timeout) = self.request_timeout_override {
+            builder = builder.request_timeout(timeout);
+        }
 
         let mut labels = self.lease.endpoints.labels.clone();
         labels.remove(control_address_label());

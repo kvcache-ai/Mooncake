@@ -157,7 +157,10 @@ Useful flags:
 - `--routed-writes` and `--replica-count` to enable routed writer mode
 - `--route-topk <n>` to control WRH route-authority fanout; it must be `>= 2` and match the policy already stored in the metadata keyspace
 - `--route-control metadata-only|embedded-wrh` to select the route authority mode
-- `--heartbeat-interval-ms`, `--heartbeat-timeout-ms`, and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
+- `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
+- `--request-timeout-ms` to set the outer request deadline for routed operations and dispatcher calls
+- `--heartbeat-timeout-ms` to set the dedicated heartbeat / state-publish timeout
+- `--transfer-stall-timeout-ms` to set the inner transport stall detector for TENT / classic TE
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
 - `--client-server-address host:port` to expose the standalone compatibility server for dummy clients only
 - `--use-hugepage` and `--hugepage-size 2MB|1GB` to enable hugepage-backed local memory
@@ -179,11 +182,14 @@ Port reminder:
 
 Heartbeat behavior:
 
-- heartbeat publish uses a dedicated timeout instead of the generic 5s dispatcher request timeout
+- timeout knobs now come from one shared helper across the standalone client, Python compatibility runtime, and dummy client
+- `--request-timeout-ms` / `MC_STORE_RS_REQUEST_TIMEOUT_MS` sets the outer request deadline
+- `--heartbeat-timeout-ms` / `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` sets the dedicated heartbeat publish timeout
+- `--transfer-stall-timeout-ms` / `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` sets the inner transfer stall detector
+- `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` controls dummy gRPC calls and falls back to `MC_STORE_RS_REQUEST_TIMEOUT_MS`
+- heartbeat publish uses a dedicated timeout instead of the generic request deadline
 - a single failed heartbeat no longer exits the standalone client process
 - failed heartbeat publishes are retried on a short backoff
-- `--heartbeat-timeout-ms` controls the dedicated heartbeat publish timeout
-- `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` provides the same override for Python or environment-driven launches
 - `MC_STORE_RS_CONTROL_PLANE_THREADS` sets the worker count of the shared control-plane RPC runtime; default `2`
 
 ## Metadata Maintenance

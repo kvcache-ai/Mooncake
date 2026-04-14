@@ -9,7 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use _store_rs::dispatcher::StoreDispatcher;
 use _store_rs::dummy_service::start_dummy_store_server;
-use _store_rs::runtime::{CompatRuntimeArgs, CompatSetupArgs};
+use _store_rs::runtime::{
+    CompatRuntimeArgs, CompatSetupArgs, CompatTimeoutCliOverrides, CompatTimeoutConfig,
+};
 use clap::{Parser, ValueEnum};
 use mooncake_store_client::{
     init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
@@ -119,8 +121,12 @@ struct Args {
     lease_ttl_ms: u64,
     #[arg(long, default_value_t = 30_000)]
     heartbeat_interval_ms: u64,
-    #[arg(long, default_value_t = 15_000)]
-    heartbeat_timeout_ms: u64,
+    #[arg(long)]
+    request_timeout_ms: Option<u64>,
+    #[arg(long)]
+    heartbeat_timeout_ms: Option<u64>,
+    #[arg(long)]
+    transfer_stall_timeout_ms: Option<u64>,
     #[arg(long)]
     metrics_addr: Option<String>,
     #[arg(long)]
@@ -157,21 +163,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     validate_args(&args)?;
     init_tracing(args.trace_filter.as_deref())?;
 
+    let timeouts = resolve_timeout_config(&args)?;
     let metrics_addr = start_metrics_if_needed(args.metrics_addr.as_deref())?;
     let shutdown = install_signal_handler()?;
     let heartbeat_interval =
         effective_heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_ms);
     let requested_initial_state = requested_initial_state(&args);
-    let runtime = build_runtime_args(&args).build()?;
+    let runtime = build_runtime_args(&args, timeouts).build()?;
 
     let stable_id = runtime.stable_id.clone();
     let epoch = runtime.epoch;
     let startup_state = runtime.initial_state;
     let segment_name = runtime.segment_name.clone();
-    let client = Arc::new(StoreDispatcher::spawn_with_heartbeat_timeout(
+    let client = Arc::new(StoreDispatcher::spawn_with_timeout_config(
         runtime.client,
         format!("mooncake-store-dispatcher-{stable_id}"),
-        Duration::from_millis(args.heartbeat_timeout_ms),
+        timeouts,
     )?);
     client.register_local_memory()?;
     let dummy_server = match args.client_server_address.as_deref() {
@@ -191,6 +198,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &segment_name,
             args.lease_ttl_ms,
             heartbeat_interval,
+            timeouts,
             metrics_addr.as_deref(),
             dummy_server.as_ref().map(|server| server.address()),
         )
@@ -305,9 +313,6 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
     if args.lease_ttl_ms == 0 {
         return Err("--lease-ttl-ms must be greater than zero".into());
     }
-    if args.heartbeat_timeout_ms == 0 {
-        return Err("--heartbeat-timeout-ms must be greater than zero".into());
-    }
     if args.epoch == 0 {
         return Err("--epoch must be greater than zero".into());
     }
@@ -328,6 +333,16 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn resolve_timeout_config(args: &Args) -> Result<CompatTimeoutConfig, Box<dyn Error>> {
+    CompatTimeoutConfig::from_env_and_overrides(CompatTimeoutCliOverrides {
+        request_timeout_ms: args.request_timeout_ms,
+        heartbeat_timeout_ms: args.heartbeat_timeout_ms,
+        transfer_stall_timeout_ms: args.transfer_stall_timeout_ms,
+        dummy_rpc_timeout_ms: None,
+    })
+    .map_err(Into::into)
+}
+
 fn parse_label(input: &str) -> Result<(String, String), String> {
     let (key, value) = input
         .split_once('=')
@@ -343,7 +358,7 @@ fn parse_hugepage_size_arg(input: &str) -> Result<usize, String> {
     parse_hugepage_size(input).map_err(|error| error.to_string())
 }
 
-fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
+fn build_runtime_args(args: &Args, timeouts: CompatTimeoutConfig) -> CompatRuntimeArgs {
     CompatRuntimeArgs {
         setup: CompatSetupArgs {
             local_hostname: args.local_hostname.clone(),
@@ -367,6 +382,7 @@ fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
             expires_at_ms: Some(now_ms().saturating_add(args.lease_ttl_ms)),
             use_hugepage: args.use_hugepage.then_some(true),
             hugepage_size_bytes: args.hugepage_size,
+            timeouts: Some(timeouts),
         },
         local_segment_name: args.local_segment_name.clone(),
         epoch: ClientEpoch(args.epoch),
@@ -401,13 +417,17 @@ fn started_message(
     segment_name: &str,
     lease_ttl_ms: u64,
     heartbeat_interval_ms: u64,
+    timeouts: CompatTimeoutConfig,
     metrics_addr: Option<&str>,
     client_server_address: Option<&str>,
 ) -> String {
     format!(
-        "mooncake-store-client started stable_id={stable_id} epoch={} initial_state={} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} metrics_addr={} client_server_address={} ",
+        "mooncake-store-client started stable_id={stable_id} epoch={} initial_state={} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} request_timeout_ms={} heartbeat_timeout_ms={} transfer_stall_timeout_ms={} metrics_addr={} client_server_address={} ",
         epoch.0,
         lifecycle_state_label(initial_state),
+        timeouts.request_timeout.as_millis(),
+        timeouts.heartbeat_timeout.as_millis(),
+        timeouts.transfer_stall_timeout.as_millis(),
         metrics_addr.unwrap_or("disabled"),
         client_server_address.unwrap_or("disabled"),
     )
@@ -607,17 +627,30 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use clap::Parser;
     use mooncake_store_client::{stable_phase_spread_ms, RouteControlMode};
     use mooncake_store_core::{ClientEpoch, ClientLifecycleState};
 
+    use _store_rs::runtime::CompatTimeoutConfig;
+
     use super::{
         build_runtime_args, drained_message, effective_heartbeat_interval,
         heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms, parse_hugepage_size_arg,
-        parse_label, requested_initial_state, should_activate_after_ready, start_metrics_if_needed,
-        started_message, startup_initial_state, stopped_message, validate_args, Args,
-        HeartbeatLoopState, InitialStateArg, RouteControlArg,
+        parse_label, requested_initial_state, resolve_timeout_config, should_activate_after_ready,
+        start_metrics_if_needed, started_message, startup_initial_state, stopped_message,
+        validate_args, Args, HeartbeatLoopState, InitialStateArg, RouteControlArg,
     };
+
+    fn sample_timeouts() -> CompatTimeoutConfig {
+        CompatTimeoutConfig {
+            request_timeout: Duration::from_millis(65_000),
+            heartbeat_timeout: Duration::from_millis(15_000),
+            transfer_stall_timeout: Duration::from_millis(10_000),
+            dummy_rpc_timeout: Duration::from_millis(65_000),
+        }
+    }
 
     fn sample_args() -> Args {
         Args {
@@ -642,7 +675,9 @@ mod tests {
             local_segment_name: None,
             lease_ttl_ms: 10_000,
             heartbeat_interval_ms: 3_000,
-            heartbeat_timeout_ms: 15_000,
+            request_timeout_ms: None,
+            heartbeat_timeout_ms: None,
+            transfer_stall_timeout_ms: None,
             metrics_addr: None,
             client_server_address: None,
             use_hugepage: false,
@@ -737,6 +772,12 @@ mod tests {
             "9000",
             "--heartbeat-interval-ms",
             "2500",
+            "--request-timeout-ms",
+            "70000",
+            "--heartbeat-timeout-ms",
+            "20000",
+            "--transfer-stall-timeout-ms",
+            "12000",
             "--metrics-addr",
             "127.0.0.1:0",
             "--client-server-address",
@@ -759,6 +800,9 @@ mod tests {
         assert_eq!(args.initial_state, InitialStateArg::Standby);
         assert_eq!(args.keyspace.as_deref(), Some("ks-a"));
         assert_eq!(args.local_segment_name.as_deref(), Some("segment-a"));
+        assert_eq!(args.request_timeout_ms, Some(70_000));
+        assert_eq!(args.heartbeat_timeout_ms, Some(20_000));
+        assert_eq!(args.transfer_stall_timeout_ms, Some(12_000));
         assert_eq!(args.metrics_addr.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(
             args.client_server_address.as_deref(),
@@ -790,7 +834,7 @@ mod tests {
         .expect("hot-upgrade args should parse");
 
         validate_args(&args).expect("hot-upgrade args should validate");
-        let runtime_args = build_runtime_args(&args);
+        let runtime_args = build_runtime_args(&args, sample_timeouts());
         assert_eq!(runtime_args.setup.stable_id.as_deref(), Some("store-a"));
         assert_eq!(runtime_args.epoch, ClientEpoch(7));
         assert_eq!(runtime_args.initial_state, ClientLifecycleState::Standby);
@@ -806,10 +850,6 @@ mod tests {
 
         let mut args = sample_args();
         args.lease_ttl_ms = 0;
-        assert!(validate_args(&args).is_err());
-
-        let mut args = sample_args();
-        args.heartbeat_timeout_ms = 0;
         assert!(validate_args(&args).is_err());
 
         let mut args = sample_args();
@@ -832,6 +872,23 @@ mod tests {
         let mut args = sample_args();
         args.route_topk = 1;
         assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn timeout_config_prefers_cli_overrides() {
+        let mut args = sample_args();
+        args.request_timeout_ms = Some(44_000);
+        args.heartbeat_timeout_ms = Some(11_000);
+        args.transfer_stall_timeout_ms = Some(9_000);
+
+        let timeouts = resolve_timeout_config(&args).expect("timeout config should resolve");
+        assert_eq!(timeouts.request_timeout, Duration::from_millis(44_000));
+        assert_eq!(timeouts.heartbeat_timeout, Duration::from_millis(11_000));
+        assert_eq!(
+            timeouts.transfer_stall_timeout,
+            Duration::from_millis(9_000)
+        );
+        assert_eq!(timeouts.dummy_rpc_timeout, Duration::from_millis(44_000));
     }
 
     #[test]
@@ -914,7 +971,7 @@ mod tests {
         args.epoch = 11;
         args.initial_state = InitialStateArg::Draining;
 
-        let runtime_args = build_runtime_args(&args);
+        let runtime_args = build_runtime_args(&args, sample_timeouts());
         assert_eq!(runtime_args.setup.local_hostname, "127.0.0.1");
         assert_eq!(runtime_args.setup.metadata_url, "redis://127.0.0.1:6379/0");
         assert_eq!(
@@ -947,12 +1004,13 @@ mod tests {
             Some("true")
         );
         assert!(runtime_args.setup.expires_at_ms.is_some());
+        assert_eq!(runtime_args.setup.timeouts, Some(sample_timeouts()));
     }
 
     #[test]
     fn active_startup_is_staged_as_standby_until_runtime_is_ready() {
         let args = sample_args();
-        let runtime_args = build_runtime_args(&args);
+        let runtime_args = build_runtime_args(&args, sample_timeouts());
         assert_eq!(requested_initial_state(&args), ClientLifecycleState::Active);
         assert_eq!(runtime_args.initial_state, ClientLifecycleState::Standby);
         assert!(should_activate_after_ready(
@@ -974,6 +1032,7 @@ mod tests {
             "segment-a",
             9_000,
             3_000,
+            sample_timeouts(),
             Some("127.0.0.1:9090"),
             None,
         );
@@ -981,6 +1040,9 @@ mod tests {
         assert!(started.contains("epoch=2"));
         assert!(started.contains("initial_state=standby"));
         assert!(started.contains("segment=segment-a"));
+        assert!(started.contains("request_timeout_ms=65000"));
+        assert!(started.contains("heartbeat_timeout_ms=15000"));
+        assert!(started.contains("transfer_stall_timeout_ms=10000"));
         assert!(started.contains("metrics_addr=127.0.0.1:9090"));
         assert!(started.contains("client_server_address=disabled"));
 

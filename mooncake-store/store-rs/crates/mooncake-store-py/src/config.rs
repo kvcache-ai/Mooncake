@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{
     EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace, RedisMetadataBackend,
@@ -11,6 +11,86 @@ use mooncake_transport::{ClassicEngineConfig, ClassicTransportProtocol, TentEngi
 use url::Url;
 
 const DEFAULT_COMPAT_LEASE_TTL_MS: u64 = 30_000;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
+const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_DUMMY_RPC_TIMEOUT: Duration = Duration::from_secs(65);
+const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
+const HEARTBEAT_TIMEOUT_ENV: &str = "MC_STORE_RS_HEARTBEAT_TIMEOUT_MS";
+const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
+const LEGACY_TRANSFER_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_TIMEOUT_MS";
+const DUMMY_RPC_TIMEOUT_ENV: &str = "MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompatTimeoutCliOverrides {
+    pub request_timeout_ms: Option<u64>,
+    pub heartbeat_timeout_ms: Option<u64>,
+    pub transfer_stall_timeout_ms: Option<u64>,
+    pub dummy_rpc_timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompatTimeoutConfig {
+    pub request_timeout: Duration,
+    pub heartbeat_timeout: Duration,
+    pub transfer_stall_timeout: Duration,
+    pub dummy_rpc_timeout: Duration,
+}
+
+impl CompatTimeoutConfig {
+    pub fn from_env() -> Self {
+        let request_timeout =
+            duration_from_env_ms(&[REQUEST_TIMEOUT_ENV]).unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        let heartbeat_timeout =
+            duration_from_env_ms(&[HEARTBEAT_TIMEOUT_ENV]).unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT);
+        let transfer_stall_timeout =
+            duration_from_env_ms(&[TRANSFER_STALL_TIMEOUT_ENV, LEGACY_TRANSFER_TIMEOUT_ENV])
+                .unwrap_or(DEFAULT_TRANSFER_STALL_TIMEOUT);
+        let dummy_rpc_timeout = duration_from_env_ms(&[DUMMY_RPC_TIMEOUT_ENV])
+            .or_else(|| duration_from_env_ms(&[REQUEST_TIMEOUT_ENV]))
+            .unwrap_or(DEFAULT_DUMMY_RPC_TIMEOUT);
+        Self {
+            request_timeout,
+            heartbeat_timeout,
+            transfer_stall_timeout,
+            dummy_rpc_timeout,
+        }
+    }
+
+    pub fn from_env_and_overrides(overrides: CompatTimeoutCliOverrides) -> Result<Self> {
+        Self::from_env().apply_overrides(overrides)
+    }
+
+    pub fn apply_overrides(mut self, overrides: CompatTimeoutCliOverrides) -> Result<Self> {
+        if let Some(timeout_ms) = overrides.request_timeout_ms {
+            self.request_timeout = parse_timeout_override("--request-timeout-ms", timeout_ms)?;
+            if overrides.dummy_rpc_timeout_ms.is_none() {
+                self.dummy_rpc_timeout = self.request_timeout;
+            }
+        }
+        if let Some(timeout_ms) = overrides.heartbeat_timeout_ms {
+            self.heartbeat_timeout = parse_timeout_override("--heartbeat-timeout-ms", timeout_ms)?;
+        }
+        if let Some(timeout_ms) = overrides.transfer_stall_timeout_ms {
+            self.transfer_stall_timeout =
+                parse_timeout_override("--transfer-stall-timeout-ms", timeout_ms)?;
+        }
+        if let Some(timeout_ms) = overrides.dummy_rpc_timeout_ms {
+            self.dummy_rpc_timeout = parse_timeout_override("--dummy-rpc-timeout-ms", timeout_ms)?;
+        }
+        Ok(self)
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn with_heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TransportBackend {
@@ -28,6 +108,7 @@ pub struct CompatBuildPlan {
     pub metadata: Arc<dyn MetadataBackend>,
     pub transport_backend: TransportBackend,
     pub transport_config: CompatTransportConfig,
+    pub timeouts: CompatTimeoutConfig,
     pub stable_id: String,
     pub tenant: String,
     pub labels: BTreeMap<String, String>,
@@ -62,32 +143,56 @@ pub struct CompatSetupArgs {
     pub expires_at_ms: Option<u64>,
     pub use_hugepage: Option<bool>,
     pub hugepage_size_bytes: Option<usize>,
+    pub timeouts: Option<CompatTimeoutConfig>,
 }
 
 impl CompatSetupArgs {
     pub fn build(self) -> Result<CompatBuildPlan> {
-        let keyspace = self.keyspace.map(MetadataKeyspace::new).unwrap_or_default();
-        let stable_id = self
-            .stable_id
-            .unwrap_or_else(|| format!("py-store-{}", now_ms()));
-        let transport_backend = resolve_transport_backend(self.transport_backend.as_deref())?;
+        let Self {
+            local_hostname,
+            metadata_url,
+            transport_metadata_url,
+            global_segment_size,
+            local_buffer_size,
+            protocol,
+            _rdma_devices: _,
+            transport_rpc_port,
+            transport_backend,
+            stable_id,
+            tenant,
+            labels,
+            routed_writes,
+            replica_count,
+            route_topk,
+            keyspace,
+            expires_at_ms,
+            use_hugepage,
+            hugepage_size_bytes,
+            timeouts,
+        } = self;
+
+        let keyspace = keyspace.map(MetadataKeyspace::new).unwrap_or_default();
+        let stable_id = stable_id.unwrap_or_else(|| format!("py-store-{}", now_ms()));
+        let transport_backend = resolve_transport_backend(transport_backend.as_deref())?;
+        let timeouts = timeouts.unwrap_or_else(CompatTimeoutConfig::from_env);
         let (metadata, transport_redis_url) =
-            build_metadata_backend(&self.metadata_url, self.transport_metadata_url, keyspace)?;
+            build_metadata_backend(&metadata_url, transport_metadata_url, keyspace)?;
         let transport_config = build_transport_config(
             transport_backend,
-            &self.local_hostname,
+            &local_hostname,
             &transport_redis_url,
-            &self.protocol,
-            self.transport_rpc_port,
+            &protocol,
+            transport_rpc_port,
+            timeouts,
         )?;
-        let mut labels = self.labels;
-        if self.route_topk < 2 {
+        let mut labels = labels;
+        if route_topk < 2 {
             return Err(StoreError::InvalidState(
                 "route_topk must be greater than or equal to 2".to_string(),
             ));
         }
         match labels.get("storage").map(String::as_str) {
-            Some("true") if self.global_segment_size == 0 => {
+            Some("true") if global_segment_size == 0 => {
                 return Err(StoreError::InvalidState(
                     "label storage=true requires storage_bytes > 0".to_string(),
                 ));
@@ -95,13 +200,13 @@ impl CompatSetupArgs {
             None => {
                 labels.insert(
                     "storage".to_string(),
-                    (self.global_segment_size != 0).to_string(),
+                    (global_segment_size != 0).to_string(),
                 );
             }
             _ => {}
         }
         labels.entry("route".to_string()).or_insert_with(|| {
-            if self.global_segment_size == 0 {
+            if global_segment_size == 0 {
                 "false".to_string()
             } else {
                 "true".to_string()
@@ -111,19 +216,18 @@ impl CompatSetupArgs {
             metadata,
             transport_backend,
             transport_config,
+            timeouts,
             stable_id,
-            tenant: self.tenant,
+            tenant,
             labels,
-            routed_writes: self.routed_writes,
-            replica_count: self.replica_count.max(1),
-            route_topk: self.route_topk,
-            storage_bytes: self.global_segment_size,
-            scratch_bytes: self.local_buffer_size,
-            expires_at_ms: self
-                .expires_at_ms
-                .unwrap_or_else(|| now_ms() + DEFAULT_COMPAT_LEASE_TTL_MS),
-            use_hugepage: self.use_hugepage,
-            hugepage_size_bytes: self.hugepage_size_bytes,
+            routed_writes,
+            replica_count: replica_count.max(1),
+            route_topk,
+            storage_bytes: global_segment_size,
+            scratch_bytes: local_buffer_size,
+            expires_at_ms: expires_at_ms.unwrap_or_else(|| now_ms() + DEFAULT_COMPAT_LEASE_TTL_MS),
+            use_hugepage,
+            hugepage_size_bytes,
         })
     }
 }
@@ -150,6 +254,7 @@ fn build_transport_config(
     transport_redis_url: &str,
     protocol: &str,
     transport_rpc_port: Option<u16>,
+    timeouts: CompatTimeoutConfig,
 ) -> Result<CompatTransportConfig> {
     match backend {
         TransportBackend::Tent => Ok(CompatTransportConfig::Tent(build_tent_config(
@@ -157,12 +262,14 @@ fn build_transport_config(
             transport_redis_url,
             protocol,
             transport_rpc_port,
+            timeouts,
         )?)),
         TransportBackend::ClassicTe => Ok(CompatTransportConfig::ClassicTe(build_classic_config(
             local_hostname,
             transport_redis_url,
             protocol,
             transport_rpc_port,
+            timeouts,
         )?)),
     }
 }
@@ -221,6 +328,7 @@ fn build_tent_config(
     transport_redis_url: &str,
     protocol: &str,
     transport_rpc_port: Option<u16>,
+    timeouts: CompatTimeoutConfig,
 ) -> Result<TentEngineConfig> {
     let (local_hostname, transport_rpc_port) =
         normalize_transport_listen_endpoint(local_hostname, transport_rpc_port)?;
@@ -261,6 +369,10 @@ fn build_tent_config(
         .set("transports/tcp/enable", tcp_enable)
         .set("transports/shm/enable", "false")
         .set("transports/rdma/enable", rdma_enable)
+        .set(
+            "transports/rdma/max_timeout_ns",
+            timeouts.transfer_stall_timeout.as_nanos().to_string(),
+        )
         .set("transports/io_uring/enable", "false")
         .redis_db_index(db_index);
     if let Some(username) = auth.username {
@@ -277,6 +389,7 @@ fn build_classic_config(
     transport_redis_url: &str,
     protocol: &str,
     transport_rpc_port: Option<u16>,
+    timeouts: CompatTimeoutConfig,
 ) -> Result<ClassicEngineConfig> {
     let (rpc_bind_host, rpc_port) =
         normalize_transport_listen_endpoint(local_hostname, transport_rpc_port)?;
@@ -302,7 +415,9 @@ fn build_classic_config(
         }
     };
     let metadata_uri = format!("redis://{}:{port}", format_redis_host(host));
-    let mut config = ClassicEngineConfig::new(metadata_uri, rpc_bind_host).protocol(protocol);
+    let mut config = ClassicEngineConfig::new(metadata_uri, rpc_bind_host)
+        .protocol(protocol)
+        .slice_timeout(timeouts.transfer_stall_timeout);
     if let Some(rpc_port) = rpc_port {
         config = config.rpc_port(rpc_port);
     }
@@ -314,6 +429,23 @@ fn build_classic_config(
         config = config.redis_password(password);
     }
     Ok(config)
+}
+
+fn duration_from_env_ms(keys: &[&str]) -> Option<Duration> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+}
+
+fn parse_timeout_override(flag: &str, timeout_ms: u64) -> Result<Duration> {
+    if timeout_ms == 0 {
+        return Err(StoreError::InvalidState(format!(
+            "{flag} must be greater than zero"
+        )));
+    }
+    Ok(Duration::from_millis(timeout_ms))
 }
 
 fn normalize_transport_listen_endpoint(
@@ -421,6 +553,15 @@ mod tests {
     use super::*;
     use crate::test_support::env_test_lock;
 
+    fn sample_timeouts() -> CompatTimeoutConfig {
+        CompatTimeoutConfig {
+            request_timeout: Duration::from_millis(65_000),
+            heartbeat_timeout: Duration::from_millis(15_000),
+            transfer_stall_timeout: Duration::from_millis(10_000),
+            dummy_rpc_timeout: Duration::from_millis(65_000),
+        }
+    }
+
     #[test]
     fn normalize_etcd_endpoint_adds_http_scheme() {
         assert_eq!(
@@ -440,6 +581,7 @@ mod tests {
             "redis://cache.local:6381/3",
             "tcp",
             Some(17111),
+            sample_timeouts(),
         )
         .expect("tent config should build");
         let debug = format!("{config:?}");
@@ -456,6 +598,7 @@ mod tests {
             "redis://user:pass@cache.local:6381/4",
             "tcp",
             None,
+            sample_timeouts(),
         )
         .expect("classic config should build");
         assert_eq!(config.metadata_uri(), "redis://cache.local:6381");
@@ -556,6 +699,7 @@ mod tests {
             expires_at_ms: Some(1),
             use_hugepage: None,
             hugepage_size_bytes: None,
+            timeouts: None,
         }
         .build()
         .expect("build plan should succeed");
@@ -589,6 +733,7 @@ mod tests {
             expires_at_ms: Some(1),
             use_hugepage: None,
             hugepage_size_bytes: None,
+            timeouts: None,
         }
         .build();
         let error = match result {
@@ -620,6 +765,7 @@ mod tests {
             expires_at_ms: Some(1),
             use_hugepage: None,
             hugepage_size_bytes: None,
+            timeouts: None,
         }
         .build();
         let error = match result {
@@ -651,6 +797,7 @@ mod tests {
             expires_at_ms: None,
             use_hugepage: Some(true),
             hugepage_size_bytes: Some(2 * 1024 * 1024),
+            timeouts: None,
         }
         .build()
         .expect("compat build plan should succeed");
@@ -701,6 +848,7 @@ mod tests {
             expires_at_ms: Some(10_000),
             use_hugepage: None,
             hugepage_size_bytes: None,
+            timeouts: None,
         }
         .build()
         .expect("classic plan should build");
@@ -737,6 +885,7 @@ mod tests {
             expires_at_ms: Some(10_000),
             use_hugepage: None,
             hugepage_size_bytes: None,
+            timeouts: None,
         }
         .build()
         .expect("rw-only plan should build");
@@ -771,6 +920,7 @@ mod tests {
             expires_at_ms: Some(10_000),
             use_hugepage: None,
             hugepage_size_bytes: None,
+            timeouts: None,
         }
         .build()
         .expect("rw-only explicit-route plan should build");
@@ -830,18 +980,61 @@ mod tests {
 
     #[test]
     fn build_tent_config_rejects_invalid_redis_inputs() {
-        let invalid_url = build_tent_config("127.0.0.1", "not-a-redis-url", "tcp", None)
-            .expect_err("bad url must fail");
+        let invalid_url = build_tent_config(
+            "127.0.0.1",
+            "not-a-redis-url",
+            "tcp",
+            None,
+            sample_timeouts(),
+        )
+        .expect_err("bad url must fail");
         assert!(matches!(invalid_url, StoreError::Metadata(_)));
 
-        let missing_host = build_tent_config("127.0.0.1", "redis:///0", "auto", None)
-            .expect_err("host is required");
+        let missing_host =
+            build_tent_config("127.0.0.1", "redis:///0", "auto", None, sample_timeouts())
+                .expect_err("host is required");
         assert!(matches!(missing_host, StoreError::Metadata(_)));
 
-        let auto = build_tent_config("127.0.0.1", "redis://cache.local", "auto", None)
-            .expect("auto config should succeed");
+        let auto = build_tent_config(
+            "127.0.0.1",
+            "redis://cache.local",
+            "auto",
+            None,
+            sample_timeouts(),
+        )
+        .expect("auto config should succeed");
         let debug = format!("{auto:?}");
         assert!(debug.contains("cache.local:6379"));
         assert!(debug.contains("transports/tcp/enable"));
+    }
+
+    #[test]
+    fn timeout_config_uses_request_timeout_for_dummy_by_default() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        std::env::set_var(REQUEST_TIMEOUT_ENV, "42000");
+        std::env::remove_var(DUMMY_RPC_TIMEOUT_ENV);
+        let timeouts = CompatTimeoutConfig::from_env();
+        assert_eq!(timeouts.request_timeout, Duration::from_millis(42_000));
+        assert_eq!(timeouts.dummy_rpc_timeout, Duration::from_millis(42_000));
+        std::env::remove_var(REQUEST_TIMEOUT_ENV);
+    }
+
+    #[test]
+    fn timeout_config_cli_overrides_update_request_and_dummy_together() {
+        let timeouts = CompatTimeoutConfig::from_env()
+            .apply_overrides(CompatTimeoutCliOverrides {
+                request_timeout_ms: Some(9_000),
+                heartbeat_timeout_ms: Some(11_000),
+                transfer_stall_timeout_ms: Some(7_000),
+                dummy_rpc_timeout_ms: None,
+            })
+            .expect("cli overrides should apply");
+        assert_eq!(timeouts.request_timeout, Duration::from_millis(9_000));
+        assert_eq!(timeouts.heartbeat_timeout, Duration::from_millis(11_000));
+        assert_eq!(
+            timeouts.transfer_stall_timeout,
+            Duration::from_millis(7_000)
+        );
+        assert_eq!(timeouts.dummy_rpc_timeout, Duration::from_millis(9_000));
     }
 }

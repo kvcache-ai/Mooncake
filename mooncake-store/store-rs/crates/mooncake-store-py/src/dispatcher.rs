@@ -16,15 +16,13 @@ use mooncake_store_core::{
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
+use crate::config::CompatTimeoutConfig;
 use crate::dummy_service::pb;
 use crate::shm::{DummyClientId, OwnedMappedRegion};
 
 type RegionKey = (u64, u64, u64);
 type RegionMap = BTreeMap<RegionKey, OwnedMappedRegion>;
 type TrackedKey = (String, String);
-const DISPATCHER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const DISPATCHER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
-const HEARTBEAT_TIMEOUT_ENV: &str = "MC_STORE_RS_HEARTBEAT_TIMEOUT_MS";
 static DISPATCHER_RUNTIME: LazyLock<Runtime> =
     LazyLock::new(|| Runtime::new().expect("dispatcher runtime should initialize"));
 
@@ -45,6 +43,7 @@ pub struct StoreDispatcher {
     state: Arc<Mutex<DispatcherState>>,
     closed: Arc<AtomicBool>,
     health_inflight: Arc<AtomicBool>,
+    request_timeout: Duration,
     health_timeout: Duration,
     runtime: String,
     heartbeat_health: Arc<Mutex<HeartbeatHealthState>>,
@@ -52,13 +51,34 @@ pub struct StoreDispatcher {
 
 impl StoreDispatcher {
     pub fn spawn(client: StoreClient, _thread_name: impl Into<String>) -> Result<Self, StoreError> {
-        Self::spawn_with_heartbeat_timeout(client, _thread_name, heartbeat_timeout_from_env())
+        Self::spawn_with_timeout_config(client, _thread_name, CompatTimeoutConfig::from_env())
     }
 
     pub fn spawn_with_heartbeat_timeout(
         client: StoreClient,
         _thread_name: impl Into<String>,
         heartbeat_timeout: Duration,
+    ) -> Result<Self, StoreError> {
+        let timeouts = CompatTimeoutConfig::from_env().with_heartbeat_timeout(heartbeat_timeout);
+        Self::spawn_with_timeout_config(client, _thread_name, timeouts)
+    }
+
+    pub fn spawn_with_timeouts(
+        client: StoreClient,
+        _thread_name: impl Into<String>,
+        request_timeout: Duration,
+        heartbeat_timeout: Duration,
+    ) -> Result<Self, StoreError> {
+        let timeouts = CompatTimeoutConfig::from_env()
+            .with_request_timeout(request_timeout)
+            .with_heartbeat_timeout(heartbeat_timeout);
+        Self::spawn_with_timeout_config(client, _thread_name, timeouts)
+    }
+
+    pub fn spawn_with_timeout_config(
+        client: StoreClient,
+        _thread_name: impl Into<String>,
+        timeouts: CompatTimeoutConfig,
     ) -> Result<Self, StoreError> {
         let runtime = client.runtime_id().to_string();
         let health = Arc::new(client.health_channel());
@@ -72,7 +92,8 @@ impl StoreDispatcher {
             })),
             closed: Arc::new(AtomicBool::new(false)),
             health_inflight: Arc::new(AtomicBool::new(false)),
-            health_timeout: heartbeat_timeout.max(Duration::from_millis(1)),
+            request_timeout: timeouts.request_timeout.max(Duration::from_millis(1)),
+            health_timeout: timeouts.heartbeat_timeout.max(Duration::from_millis(1)),
             runtime,
             heartbeat_health: Arc::new(Mutex::new(HeartbeatHealthState::default())),
         })
@@ -319,7 +340,7 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce() -> Result<T, StoreError> + Send + 'static,
     {
-        self.await_blocking_with_timeout("request execution", DISPATCHER_REQUEST_TIMEOUT, f)
+        self.await_blocking_with_timeout("request execution", self.request_timeout, f)
             .await
     }
 
@@ -695,15 +716,6 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_millis() as u64
-}
-
-fn heartbeat_timeout_from_env() -> Duration {
-    std::env::var(HEARTBEAT_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(DISPATCHER_HEARTBEAT_TIMEOUT)
 }
 
 fn track_key(state: &Arc<Mutex<DispatcherState>>, tenant: String, key: String) {

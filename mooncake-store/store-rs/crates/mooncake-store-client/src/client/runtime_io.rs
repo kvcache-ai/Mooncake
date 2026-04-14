@@ -877,6 +877,12 @@ impl StoreClient {
             .iter()
             .map(|index| lengths[*index] as u64)
             .sum::<u64>();
+        let remote_attempts = remote_indices
+            .iter()
+            .map(|index| 1 + resolved[*index].fallback_replicas.len())
+            .max()
+            .unwrap_or(1);
+        let request_deadline = self.request_deadline_for_transfer(remote_bytes, remote_attempts);
         if remote_indices.is_empty() {
             self.report_get_hits_best_effort(resolved);
             debug!(
@@ -901,6 +907,7 @@ impl StoreClient {
                         buffers,
                         &remote_indices[cursor..next],
                         &scratch,
+                        request_deadline,
                     ) {
                         Ok(()) => {
                             remote_batch_chunks += 1;
@@ -912,6 +919,7 @@ impl StoreClient {
                                     transport,
                                     &mut resolved[*index],
                                     buffer,
+                                    request_deadline,
                                     "remote_batch_get_fallback",
                                 )?;
                                 remote_direct_fallbacks += 1;
@@ -927,6 +935,7 @@ impl StoreClient {
                         transport,
                         &mut resolved[index],
                         buffer,
+                        request_deadline,
                         "remote_direct_get_fallback",
                     )?;
                     remote_direct_fallbacks += 1;
@@ -1066,6 +1075,7 @@ impl StoreClient {
         entries: &[&ResolvedObject],
         error: &StoreError,
         context: &'static str,
+        mark_runtime_suspect: bool,
     ) {
         if !matches!(
             error,
@@ -1083,14 +1093,23 @@ impl StoreClient {
                 }
             }
         }
-        for runtime in failed_runtimes {
-            self.mark_runtime_suspect(&runtime, context);
+        if mark_runtime_suspect {
+            for runtime in failed_runtimes {
+                self.mark_runtime_suspect(&runtime, context);
+            }
         }
         let _ = refresh_live_client_cache(
             self.metadata.as_ref(),
             &self.live_client_cache,
             "live_client_snapshot_remote_read_failure",
         );
+    }
+
+    fn remote_read_failure_marks_runtime_suspect(error: &StoreError) -> bool {
+        matches!(
+            error,
+            StoreError::Transport(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
+        )
     }
 
     fn plan_remote_get_chunk(
@@ -1141,19 +1160,27 @@ impl StoreClient {
         buffers: &mut [&mut [u8]],
         remote_indices: &[usize],
         scratch: &[RegionAllocation],
+        request_deadline: RequestDeadline,
     ) -> Result<()> {
         let bytes_out = remote_indices
             .iter()
             .map(|index| resolved[*index].replica.length)
             .sum::<u64>();
         let tracker = OperationTracker::new("get_remote_batch_chunk");
-        let result = (|| {
+        let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
             let requests = {
                 let mut state = self.state.lock();
                 let mut batch = Vec::with_capacity(remote_indices.len());
                 for (position, index) in remote_indices.iter().enumerate() {
                     let entry = &resolved[*index];
-                    let segment = state.open_segment(transport, &entry.replica.segment_name.0)?;
+                    let segment = state
+                        .open_segment(transport, &entry.replica.segment_name.0)
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })?;
                     batch.push(TransferRequest {
                         opcode: Opcode::Read,
                         source: scratch[position].addr,
@@ -1164,17 +1191,35 @@ impl StoreClient {
                 }
                 batch
             };
-            let batch_id = transport.allocate_batch(requests.len())?;
+            let batch_id = transport.allocate_batch(requests.len()).map_err(|error| {
+                (
+                    error.clone(),
+                    Self::remote_read_failure_marks_runtime_suspect(&error),
+                )
+            })?;
             let submit_result = transport.submit(batch_id, &requests);
             if let Err(error) = submit_result {
                 let _ = transport.free_batch(batch_id);
-                return Err(error);
+                return Err((
+                    error.clone(),
+                    Self::remote_read_failure_marks_runtime_suspect(&error),
+                ));
             }
-            let wait_result =
-                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let wait_result = wait_for_batch_completion_detailed(
+                transport,
+                batch_id,
+                self.transfer_stall_timeout,
+                request_deadline.instant(),
+            )
+            .map_err(|error| (StoreError::from(error.clone()), error.marks_runtime_suspect()));
             let free_result = transport.free_batch(batch_id);
             wait_result?;
-            free_result?;
+            free_result.map_err(|error| {
+                (
+                    error.clone(),
+                    Self::remote_read_failure_marks_runtime_suspect(&error),
+                )
+            })?;
 
             for (position, index) in remote_indices.iter().enumerate() {
                 unsafe {
@@ -1187,19 +1232,28 @@ impl StoreClient {
             }
             Ok(())
         })();
+        let result = match raw_result {
+            Ok(()) => Ok(()),
+            Err((error, mark_runtime_suspect)) => {
+                let failed = remote_indices
+                    .iter()
+                    .map(|index| &resolved[*index])
+                    .collect::<Vec<_>>();
+                self.note_remote_read_failure(
+                    &failed,
+                    &error,
+                    "remote_batch_get_failed",
+                    mark_runtime_suspect,
+                );
+                Err(error)
+            }
+        };
         debug!(
             runtime = %self.lease.runtime,
             items = remote_indices.len(),
             bytes_out,
             "executed remote batch get chunk"
         );
-        if let Err(error) = &result {
-            let failed = remote_indices
-                .iter()
-                .map(|index| &resolved[*index])
-                .collect::<Vec<_>>();
-            self.note_remote_read_failure(&failed, error, "remote_batch_get_failed");
-        }
         tracker.finish(&result, bytes_out);
         if result.is_ok() {
             registry::record_transport_bytes("read", "storage", bytes_out);
@@ -1213,22 +1267,37 @@ impl StoreClient {
         resolved: &ResolvedObject,
         buffer: &mut [u8],
         length: usize,
+        request_deadline: RequestDeadline,
     ) -> Result<()> {
         let tracker = OperationTracker::new("get_remote_direct");
-        let result = (|| {
+        let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
             let buffer_ptr = buffer.as_mut_ptr().cast::<c_void>();
             let buffer_len = buffer.len();
             let mut registered_here = false;
             {
                 let mut state = self.state.lock();
                 if !state.buffer_is_registered(buffer_ptr, length) {
-                    state.register_external_buffer(transport, buffer_ptr, buffer_len)?;
+                    state
+                        .register_external_buffer(transport, buffer_ptr, buffer_len)
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })?;
                     registered_here = true;
                 }
             }
             let request = {
                 let mut state = self.state.lock();
-                let segment = state.open_segment(transport, &resolved.replica.segment_name.0)?;
+                let segment = state
+                    .open_segment(transport, &resolved.replica.segment_name.0)
+                    .map_err(|error| {
+                        (
+                            error.clone(),
+                            Self::remote_read_failure_marks_runtime_suspect(&error),
+                        )
+                    })?;
                 TransferRequest {
                     opcode: Opcode::Read,
                     source: buffer_ptr,
@@ -1237,7 +1306,12 @@ impl StoreClient {
                     length: resolved.replica.length,
                 }
             };
-            let batch_id = transport.allocate_batch(1)?;
+            let batch_id = transport.allocate_batch(1).map_err(|error| {
+                (
+                    error.clone(),
+                    Self::remote_read_failure_marks_runtime_suspect(&error),
+                )
+            })?;
             let submit_result = transport.submit(batch_id, &[request]);
             if let Err(error) = submit_result {
                 let _ = transport.free_batch(batch_id);
@@ -1247,10 +1321,18 @@ impl StoreClient {
                         .lock()
                         .unregister_external_buffer(transport, buffer_ptr, buffer_len);
                 }
-                return Err(error);
+                return Err((
+                    error.clone(),
+                    Self::remote_read_failure_marks_runtime_suspect(&error),
+                ));
             }
-            let wait_result =
-                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let wait_result = wait_for_batch_completion_detailed(
+                transport,
+                batch_id,
+                self.transfer_stall_timeout,
+                request_deadline.instant(),
+            )
+            .map_err(|error| (StoreError::from(error.clone()), error.marks_runtime_suspect()));
             let free_result = transport.free_batch(batch_id);
             if registered_here {
                 let _ = self
@@ -1259,8 +1341,25 @@ impl StoreClient {
                     .unregister_external_buffer(transport, buffer_ptr, buffer_len);
             }
             wait_result?;
-            free_result
+            free_result.map_err(|error| {
+                (
+                    error.clone(),
+                    Self::remote_read_failure_marks_runtime_suspect(&error),
+                )
+            })
         })();
+        let result = match raw_result {
+            Ok(()) => Ok(()),
+            Err((error, mark_runtime_suspect)) => {
+                self.note_remote_read_failure(
+                    &[resolved],
+                    &error,
+                    "remote_direct_get_failed",
+                    mark_runtime_suspect,
+                );
+                Err(error)
+            }
+        };
         debug!(
             runtime = %self.lease.runtime,
             tenant = %resolved.tenant,
@@ -1268,9 +1367,6 @@ impl StoreClient {
             bytes_out = length,
             "executed remote direct get fallback"
         );
-        if let Err(error) = &result {
-            self.note_remote_read_failure(&[resolved], error, "remote_direct_get_failed");
-        }
         tracker.finish(&result, length as u64);
         if result.is_ok() {
             registry::record_transport_bytes("read", "storage", length as u64);
@@ -1283,6 +1379,7 @@ impl StoreClient {
         transport: &dyn StoreTransport,
         resolved: &ResolvedObject,
         buffer: &mut [u8],
+        request_deadline: RequestDeadline,
     ) -> Result<()> {
         let length = resolved.replica.length as usize;
         if buffer.len() < length {
@@ -1311,7 +1408,7 @@ impl StoreClient {
                 ptr::copy_nonoverlapping(source.cast::<u8>(), buffer.as_mut_ptr(), length);
             }
         } else {
-            self.execute_remote_get_direct(transport, resolved, buffer, length)?;
+            self.execute_remote_get_direct(transport, resolved, buffer, length, request_deadline)?;
         }
         validate_replica_checksum(&resolved.replica, &buffer[..length])
     }
@@ -1321,15 +1418,14 @@ impl StoreClient {
         transport: &dyn StoreTransport,
         resolved: &mut ResolvedObject,
         buffer: &mut [u8],
-        context: &'static str,
+        request_deadline: RequestDeadline,
+        _context: &'static str,
     ) -> Result<()> {
         loop {
-            match self.execute_selected_replica_direct(transport, resolved, buffer) {
+            match self.execute_selected_replica_direct(transport, resolved, buffer, request_deadline)
+            {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    if resolved.replica.owner != self.lease.runtime {
-                        self.note_remote_read_failure(&[resolved], &error, context);
-                    }
                     let readable_runtimes = self.readable_runtime_set(true)?;
                     if !self.try_advance_resolved_replica(resolved, &readable_runtimes) {
                         return Err(error);

@@ -80,6 +80,7 @@ impl StoreClient {
 
         if !remote_requests.is_empty() {
             let remote_bytes = (remote_requests.len() * value.len()) as u64;
+            let request_deadline = self.request_deadline_for_transfer(remote_bytes, 1);
             let tracker = OperationTracker::new("put_remote_batch_write")
                 .input_bytes(remote_bytes);
             let result = (|| {
@@ -104,8 +105,13 @@ impl StoreClient {
                     let _ = transport.free_batch(batch_id);
                     return Err(error);
                 }
-                let wait_result =
-                    wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+                let wait_result = wait_for_batch_completion_detailed(
+                    transport,
+                    batch_id,
+                    self.transfer_stall_timeout,
+                    request_deadline.instant(),
+                )
+                .map_err(StoreError::from);
                 let free_result = transport.free_batch(batch_id);
                 wait_result?;
                 free_result
@@ -479,6 +485,10 @@ impl StoreClient {
                     });
                 }
                 if !remote_requests.is_empty() {
+                    let request_deadline = self.request_deadline_for_transfer(
+                        remote_requests.iter().map(|request| request.length).sum(),
+                        1,
+                    );
                     let scratch = remote_scratch.ok_or_else(|| {
                         StoreError::InvalidState(
                             "remote write is missing a scratch slot".to_string(),
@@ -491,8 +501,13 @@ impl StoreClient {
                         let _ = transport.free_batch(batch_id);
                         return Err(error);
                     }
-                    let wait_result =
-                        wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+                    let wait_result = wait_for_batch_completion_detailed(
+                        transport,
+                        batch_id,
+                        self.transfer_stall_timeout,
+                        request_deadline.instant(),
+                    )
+                    .map_err(StoreError::from);
                     let free_result = transport.free_batch(batch_id);
                     wait_result?;
                     free_result?;
