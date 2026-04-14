@@ -595,6 +595,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn metrics_http_server_exposes_heartbeat_health_metrics() {
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        reset_metrics();
+        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+
+        let runtime = ClientRuntimeId::new("runtime-heartbeat-http", ClientEpoch(5)).to_string();
+        registry::record_heartbeat_health(&runtime, 4, 456_789);
+
+        let address = start_metrics_http_server("127.0.0.1:0")
+            .expect("metrics server should start on an ephemeral port");
+        let response = http_get(&address, "/metrics");
+
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains(
+            "mooncake_store_heartbeat_consecutive_failures{runtime=\"runtime-heartbeat-http:5\"} 4"
+        ));
+        assert!(response.contains(
+            "mooncake_store_heartbeat_last_success_ms{runtime=\"runtime-heartbeat-http:5\"} 456789"
+        ));
+
+        stop_metrics_http_server().expect("metrics server should stop");
+    }
+
     fn http_get(address: &str, path: &str) -> String {
         let request =
             format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
