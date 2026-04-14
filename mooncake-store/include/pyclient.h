@@ -211,8 +211,7 @@ class PyClient {
         const std::string &protocol, const std::string &rdma_devices,
         const std::string &master_server_addr,
         const std::shared_ptr<TransferEngine> &transfer_engine,
-        const std::string &ipc_socket_path,
-        bool enable_ssd_offload = false,
+        const std::string &ipc_socket_path, bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "") = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,

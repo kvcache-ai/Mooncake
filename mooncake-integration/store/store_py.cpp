@@ -1575,8 +1575,8 @@ PYBIND11_MODULE(store, m) {
                 return real_client->setup_real(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine, "",
-                    enable_ssd_offload, ssd_offload_path);
+                    master_server_addr, transfer_engine, "", enable_ssd_offload,
+                    ssd_offload_path);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -1613,7 +1613,8 @@ PYBIND11_MODULE(store, m) {
             "  master_server_addr: Master server address.\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
-            "  ssd_offload_path: SSD storage directory path (overrides env var).")
+            "  ssd_offload_path: SSD storage directory path (overrides env "
+            "var).")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

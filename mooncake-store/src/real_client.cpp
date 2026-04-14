@@ -841,8 +841,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::string ssd_offload_path =
-        get_config(config, "ssd_offload_path");
+    std::string ssd_offload_path = get_config(config, "ssd_offload_path");
 
     std::string enable_ssd_offload_str =
         get_config(config, "enable_ssd_offload", "false");
