@@ -193,7 +193,7 @@ git submodule update --init --recursive
 ### Run the local Rust e2e and benchmark
 
 ```bash
-./scripts/run-local-e2e.sh
+./scripts/e2e/run-local-e2e.sh
 ```
 
 This script will:
@@ -210,7 +210,7 @@ For deployment details and script knobs, read `docs/deployment.md`.
 Native CLI hot-upgrade validation:
 
 ```bash
-./scripts/test-client-hot-upgrade-cli.sh
+./scripts/tests/client/test-client-hot-upgrade-cli.sh
 ```
 
 This script:
@@ -224,7 +224,7 @@ This script:
 Python hot-upgrade argument and wrapper compatibility validation:
 
 ```bash
-./scripts/test-python-client-hot-upgrade-args.sh
+./scripts/tests/client/test-python-client-hot-upgrade-args.sh
 ```
 
 This script verifies both layers:
@@ -260,7 +260,7 @@ its index entries; it does not touch live owners.
 Native CLI eviction validation:
 
 ```bash
-./scripts/test-client-eviction-cli.sh
+./scripts/tests/client/test-client-eviction-cli.sh
 ```
 
 This script:
@@ -274,7 +274,7 @@ This script:
 ### Run the multi-client stress benchmark
 
 ```bash
-./scripts/run-multi-client-stress.sh
+./scripts/e2e/run-multi-client-stress.sh
 ```
 
 This script runs the Python compatibility layer in a process-per-client layout:
@@ -298,13 +298,13 @@ Treat this summary as the primary throughput signal. The per-phase `stress phase
 ### Run the Python compatibility e2e
 
 ```bash
-./scripts/run-python-compat-e2e.sh
+./scripts/e2e/run-python-compat-e2e.sh
 ```
 
 ### Run the client read/write validation
 
 ```bash
-./scripts/test-client-rw-cli.sh
+./scripts/tests/client/test-client-rw-cli.sh
 ```
 
 This standard entry point builds the standalone `mooncake-store-client` binary,
@@ -320,14 +320,14 @@ For direct operator-driven validation, the paired helper scripts remain
 available:
 
 ```bash
-python3 ./scripts/real_client_rw.py --help
-python3 ./scripts/dummy_client_rw.py --help
+python3 ./scripts/clients/real_client_rw.py --help
+python3 ./scripts/clients/dummy_client_rw.py --help
 ```
 
 Run the real-mode black-box read/write validator:
 
 ```bash
-python3 ./scripts/real_client_rw.py \
+python3 ./scripts/clients/real_client_rw.py \
   --local_host 127.0.0.1:17111 \
   --metadata_url redis://127.0.0.1:6380/0 \
   --storage-bytes $((128 * 1024 * 1024)) \
@@ -338,7 +338,7 @@ python3 ./scripts/real_client_rw.py \
 Use the same script to validate routed rw-only clients:
 
 ```bash
-python3 ./scripts/real_client_rw.py \
+python3 ./scripts/clients/real_client_rw.py \
   --local_host 127.0.0.1:17121 \
   --metadata_url redis://127.0.0.1:6380/0 \
   --storage-bytes 0 \
@@ -350,7 +350,7 @@ python3 ./scripts/real_client_rw.py \
 Run the dummy-mode black-box read/write validator against a standalone daemon:
 
 ```bash
-python3 ./scripts/dummy_client_rw.py \
+python3 ./scripts/clients/dummy_client_rw.py \
   --daemon_addr 127.0.0.1:16590 \
   --key_prefix smoke \
   --batch_size 4
@@ -359,7 +359,7 @@ python3 ./scripts/dummy_client_rw.py \
 To package the Python module and the standalone client command together:
 
 ```bash
-./scripts/build-wheel.sh
+./scripts/build/build-wheel.sh
 python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
 pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
@@ -377,8 +377,8 @@ Installing `mooncake-pro` upgrades an existing `mooncake` installation to the ma
 ### Run the HiCache compatibility checks
 
 ```bash
-./scripts/run-sglang-hicache-dummy-compat.sh
-./scripts/run-sglang-hicache-real-compat.sh
+./scripts/sglang/run-sglang-hicache-dummy-compat.sh
+./scripts/sglang/run-sglang-hicache-real-compat.sh
 ```
 
 These scripts validate:
@@ -389,7 +389,7 @@ These scripts validate:
 ### Run the true SGLang HiCache e2e
 
 ```bash
-./scripts/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
+./scripts/sglang/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
 ```
 
 This script performs a full end-to-end run with:
@@ -619,7 +619,7 @@ export PYTHONPATH="$PWD/python"
 Build a distributable wheel and package the standalone client binary:
 
 ```bash
-./scripts/build-wheel.sh
+./scripts/build/build-wheel.sh
 ```
 
 The default output layout is:
@@ -638,7 +638,7 @@ python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
 mooncake-store-client --version
 ```
 
-For local wheelhouse installs, `scripts/install-pro-wheel.sh` wraps the same flow.
+For local wheelhouse installs, `scripts/build/install-pro-wheel.sh` wraps the same flow.
 
 Packaging model:
 
@@ -765,10 +765,12 @@ crates/
 python/
   mooncake/                 Python convenience package
 scripts/
-  run-local-e2e.sh          Local Rust e2e + benchmark entrypoint
-  run-multi-client-stress.sh Python compatibility stress benchmark entrypoint
-  python_multi_client_stress.py Worker orchestration and throughput summary
-  run-python-compat-e2e.sh  Python compatibility validation
+  build/                    Wheel, coverage, and packaging helpers
+  clients/                  Real-mode and dummy-mode black-box validators
+  e2e/                      Generic local compatibility and stress runners
+  sglang/                   SGLang-specific compatibility and true e2e runners
+  tests/client/             Standalone client CLI regressions
+  tests/rolling/            Rolling-upgrade and rollback regressions
 third_party/
   Mooncake/                 Upstream Mooncake submodule
 ```

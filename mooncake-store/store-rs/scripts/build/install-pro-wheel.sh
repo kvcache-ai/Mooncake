@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 
 PYTHON_BIN=${PYTHON:-python3}
 WHEEL_DIR=${WHEEL_DIR:-"${REPO_ROOT}/dist/wheels"}
@@ -13,7 +13,7 @@ if [[ -z "${WHEEL_PATH}" ]]; then
 fi
 
 if [[ -z "${WHEEL_PATH}" || ! -f "${WHEEL_PATH}" ]]; then
-  echo "cannot find mooncake-pro wheel; run scripts/build-wheel.sh first" >&2
+  echo "cannot find mooncake-pro wheel; run scripts/build/build-wheel.sh first" >&2
   exit 1
 fi
 

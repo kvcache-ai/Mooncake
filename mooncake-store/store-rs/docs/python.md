@@ -20,7 +20,7 @@ pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 For local wheelhouse installs you can also use:
 
 ```bash
-./scripts/install-pro-wheel.sh
+./scripts/build/install-pro-wheel.sh
 ```
 
 After installation:
@@ -87,7 +87,7 @@ The package loads the native extension from the local `target` directory and pre
 Use the repository packaging script:
 
 ```bash
-./scripts/build-wheel.sh
+./scripts/build/build-wheel.sh
 ```
 
 By default the script:
@@ -102,8 +102,8 @@ By default the script:
 Common variants:
 
 ```bash
-./scripts/build-wheel.sh --interpreter python3.11
-DIST_DIR=artifacts ./scripts/build-wheel.sh
+./scripts/build/build-wheel.sh --interpreter python3.11
+DIST_DIR=artifacts ./scripts/build/build-wheel.sh
 ```
 
 Install the wheel into any compatible virtualenv:
@@ -128,7 +128,7 @@ You can build the standalone compatibility server directly:
 cargo build -p mooncake-store-py --bin mooncake-store-client --release
 ```
 
-Or use `./scripts/build-wheel.sh`, which also copies the binary to `dist/bin/`.
+Or use `./scripts/build/build-wheel.sh`, which also copies the binary to `dist/bin/`.
 
 When the client is installed from a wheel, the same binary is also embedded inside the package and exposed through the `mooncake-store-client` console script, matching the upstream Mooncake packaging style.
 
@@ -263,7 +263,7 @@ store.put("key", b"payload", config=policy)
 Use the repository-standard entry point to validate both compatibility paths in one run:
 
 ```bash
-./scripts/test-client-rw-cli.sh
+./scripts/tests/client/test-client-rw-cli.sh
 ```
 
 This script:
@@ -277,12 +277,12 @@ For path-specific manual checks, keep using the paired helper scripts below.
 
 ## Real-Mode Validation Script
 
-Use `scripts/real_client_rw.py` for black-box real-mode validation against the current store-rs compatibility stack.
+Use `scripts/clients/real_client_rw.py` for black-box real-mode validation against the current store-rs compatibility stack.
 
 Storage node:
 
 ```bash
-python3 ./scripts/real_client_rw.py \
+python3 ./scripts/clients/real_client_rw.py \
   --local_host 10.0.0.11:17111 \
   --metadata_url redis://10.0.0.10:6379/0 \
   --storage-bytes $((128 * 1024 * 1024)) \
@@ -293,7 +293,7 @@ python3 ./scripts/real_client_rw.py \
 RW-only writer:
 
 ```bash
-python3 ./scripts/real_client_rw.py \
+python3 ./scripts/clients/real_client_rw.py \
   --local_host 10.0.0.21:17121 \
   --metadata_url redis://10.0.0.10:6379/0 \
   --storage-bytes 0 \
@@ -305,7 +305,7 @@ python3 ./scripts/real_client_rw.py \
 RW-only reader:
 
 ```bash
-python3 ./scripts/real_client_rw.py \
+python3 ./scripts/clients/real_client_rw.py \
   --local_host 10.0.0.22:17122 \
   --metadata_url redis://10.0.0.10:6379/0 \
   --storage-bytes 0 \
@@ -326,12 +326,12 @@ Current script behavior:
 
 ## Dummy-Mode Validation Script
 
-Use `scripts/dummy_client_rw.py` for black-box dummy-mode validation against a standalone compatibility daemon.
+Use `scripts/clients/dummy_client_rw.py` for black-box dummy-mode validation against a standalone compatibility daemon.
 
 Single-item mode:
 
 ```bash
-python3 ./scripts/dummy_client_rw.py \
+python3 ./scripts/clients/dummy_client_rw.py \
   --daemon_addr 127.0.0.1:16590 \
   --key_prefix dummy-smoke
 ```
@@ -339,7 +339,7 @@ python3 ./scripts/dummy_client_rw.py \
 Shared-memory batch mode:
 
 ```bash
-python3 ./scripts/dummy_client_rw.py \
+python3 ./scripts/clients/dummy_client_rw.py \
   --daemon_addr 127.0.0.1:16590 \
   --key_prefix dummy-batch \
   --batch_size 8
@@ -348,7 +348,7 @@ python3 ./scripts/dummy_client_rw.py \
 Shared-memory multi-buffer mode:
 
 ```bash
-python3 ./scripts/dummy_client_rw.py \
+python3 ./scripts/clients/dummy_client_rw.py \
   --daemon_addr 127.0.0.1:16590 \
   --key_prefix dummy-multi \
   --batch_size 4 \
@@ -553,22 +553,31 @@ These values map to the Rust `ReplicationPolicy` used by `StoreClient`.
 
 ## Validation Scripts
 
+Validation entry points are now grouped by purpose:
+
+- `scripts/build/` — wheel build, wheel install, and coverage helpers
+- `scripts/clients/` — black-box real/dummy read-write validators
+- `scripts/e2e/` — generic compatibility and stress runners
+- `scripts/sglang/` — SGLang-specific compatibility and true e2e runners
+- `scripts/tests/client/` — standalone client CLI regressions
+- `scripts/tests/rolling/` — rolling-upgrade and rollback regressions
+
 Run the Python compatibility validation:
 
 ```bash
-./scripts/run-python-compat-e2e.sh
+./scripts/e2e/run-python-compat-e2e.sh
 ```
 
 Run the black-box real-mode reader / writer validator:
 
 ```bash
-python3 ./scripts/real_client_rw.py --help
+python3 ./scripts/clients/real_client_rw.py --help
 ```
 
 Run the hot-upgrade startup validation:
 
 ```bash
-./scripts/test-python-client-hot-upgrade-args.sh
+./scripts/tests/client/test-python-client-hot-upgrade-args.sh
 ```
 
 This script verifies:
@@ -579,7 +588,7 @@ This script verifies:
 Run the native CLI hot-upgrade black-box validation:
 
 ```bash
-./scripts/test-client-hot-upgrade-cli.sh
+./scripts/tests/client/test-client-hot-upgrade-cli.sh
 ```
 
 This script verifies:
@@ -591,7 +600,7 @@ This script verifies:
 Run the native CLI eviction black-box validation:
 
 ```bash
-./scripts/test-client-eviction-cli.sh
+./scripts/tests/client/test-client-eviction-cli.sh
 ```
 
 This script verifies:
@@ -605,14 +614,14 @@ This script verifies:
 Run the HiCache compatibility validations:
 
 ```bash
-./scripts/run-sglang-hicache-dummy-compat.sh
-./scripts/run-sglang-hicache-real-compat.sh
+./scripts/sglang/run-sglang-hicache-dummy-compat.sh
+./scripts/sglang/run-sglang-hicache-real-compat.sh
 ```
 
 Run the full SGLang HiCache e2e:
 
 ```bash
-./scripts/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
+./scripts/sglang/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
 ```
 
 This script verifies:

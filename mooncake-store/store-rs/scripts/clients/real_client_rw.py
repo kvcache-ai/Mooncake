@@ -13,7 +13,7 @@ Examples
 --------
 
 # storage node
-python3 scripts/real_client_rw.py \\
+python3 scripts/clients/real_client_rw.py \\
   --local_host 10.0.0.11:17111 \\
   --metadata_url redis://127.0.0.1:6379/0 \\
   --storage-bytes $((128 * 1024 * 1024)) \\
@@ -21,7 +21,7 @@ python3 scripts/real_client_rw.py \\
   --hold-seconds 600
 
 # rw-only writer
-python3 scripts/real_client_rw.py \\
+python3 scripts/clients/real_client_rw.py \\
   --local_host 10.0.0.21:17121 \\
   --metadata_url redis://127.0.0.1:6379/0 \\
   --storage-bytes 0 \\
@@ -30,7 +30,7 @@ python3 scripts/real_client_rw.py \\
   --key_prefix demo
 
 # rw-only reader
-python3 scripts/real_client_rw.py \\
+python3 scripts/clients/real_client_rw.py \\
   --local_host 10.0.0.22:17122 \\
   --metadata_url redis://127.0.0.1:6379/0 \\
   --storage-bytes 0 \\

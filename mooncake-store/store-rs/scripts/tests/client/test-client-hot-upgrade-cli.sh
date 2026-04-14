@@ -2,12 +2,12 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/test-client-hot-upgrade-cli.sh
+Usage: scripts/tests/client/test-client-hot-upgrade-cli.sh
 
 Build and directly execute the standalone mooncake-store-client binary, then
 verify hot-upgrade startup flags, SIGTERM-triggered promotion, and payload

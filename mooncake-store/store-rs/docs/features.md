@@ -304,10 +304,10 @@ Both paths are covered by repository validation scripts.
 The standard read/write entry point is:
 
 ```bash
-./scripts/test-client-rw-cli.sh
+./scripts/tests/client/test-client-rw-cli.sh
 ```
 
 Manual path-specific validators stay available as:
 
-- `scripts/real_client_rw.py`
-- `scripts/dummy_client_rw.py`
+- `scripts/clients/real_client_rw.py`
+- `scripts/clients/dummy_client_rw.py`

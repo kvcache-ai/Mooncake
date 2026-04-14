@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 UPSTREAM_DIR="${MOONCAKE_UPSTREAM_DIR:-${ROOT_DIR}/third_party/Mooncake}"
 UPSTREAM_BUILD_DIR="${MOONCAKE_UPSTREAM_BUILD_DIR:-${UPSTREAM_DIR}/build-rust}"
@@ -11,7 +12,7 @@ LOG_FILE="${MC_STORE_RS_STRESS_LOG_FILE:-${LOG_DIR}/multi-client-stress-${STAMP}
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run-multi-client-stress.sh
+Usage: scripts/e2e/run-multi-client-stress.sh
 
 Run the Python compatibility-layer multi-process stress benchmark.
 
@@ -73,7 +74,7 @@ mkdir -p "${LOG_DIR}"
 
 cd "${ROOT_DIR}"
 cargo build --release -p mooncake-store-py
-python3 "${ROOT_DIR}/scripts/python_multi_client_stress.py" | tee "${LOG_FILE}"
+python3 "${ROOT_DIR}/scripts/e2e/python_multi_client_stress.py" | tee "${LOG_FILE}"
 
 echo
 echo "stress log: ${LOG_FILE}"
