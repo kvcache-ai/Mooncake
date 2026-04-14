@@ -125,7 +125,9 @@ The `/metrics` surface is now split by metric family instead of one flat operati
 - dummy and real HiCache-compatible execution paths
 - wheel packaging with bundled native runtime libraries
 - wheel-installed `mooncake-store-client` console command
+- wheel-installed `mooncake-store-admin` maintenance command
 - standalone `mooncake-store-client` binary artifact in `dist/bin/`
+- standalone `mooncake-store-admin` binary artifact in `dist/bin/`
 - hugepage-aware allocator options
 - `ReplicateConfig` request policy mapping
 - batch APIs, route query, metrics helpers, lifecycle helpers
@@ -229,6 +231,29 @@ This script verifies both layers:
 
 - PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
 - Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
+
+### Clean stale Redis segment metadata
+
+Client leases in Redis expire automatically, but segment registration keys do not.
+If a storage client is hard-killed, Redis can keep stale `segments/...` entries for
+that dead owner until an operator sweeps them.
+
+Use the explicit admin command when you want to remove segment metadata that belongs
+to owners with no live lease:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  cleanup-stale-segments
+```
+
+Optional inputs:
+
+- `--keyspace <prefix>` to target a non-default metadata keyspace
+- `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` for Redis ACL authentication
+
+The sweep is intentionally explicit. It removes only dead-owner segment metadata and
+its index entries; it does not touch live owners.
 
 ### Run the eviction validation
 

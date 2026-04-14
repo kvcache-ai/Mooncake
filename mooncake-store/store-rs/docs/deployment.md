@@ -429,6 +429,34 @@ Redis metadata supports two authentication forms:
 
 Credentials embedded in `redis://username:password@host:port/db` also work and take precedence over the environment variables. Prefer environment variables for cloud Redis passwords or any password containing URL-reserved characters.
 
+### Clean stale Redis segment registrations
+
+Redis client leases expire automatically. Segment registration keys do not.
+
+That means a hard-killed storage client can leave stale `segments/...` metadata and
+segment index entries behind even after its lease has disappeared. Store-RS keeps
+this cleanup as an explicit operator action instead of a background guess, so a
+temporary lease blip does not accidentally delete live metadata.
+
+Run the admin sweep when you want to remove dead-owner segment metadata:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  cleanup-stale-segments
+```
+
+Useful options:
+
+- `--keyspace <prefix>` to clean a non-default metadata namespace
+- `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` for Redis ACL authentication
+
+The command removes:
+
+- stale segment hash keys owned by clients with no live lease
+- stale entries from the global segment index
+- stale entries from the per-owner segment index
+
 ### Transport metadata
 
 The transport layer is selected by the compatibility runtime and then configured through the matching backend config.
