@@ -332,6 +332,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | dedicated dispatcher timeout for heartbeat publish |
 | `MC_STORE_RS_TRACE` | Python wrapper setup fallback, e2e, and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |
+| `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |
 | `MC_STORE_RS_METRICS_ADDR` | Python wrapper setup fallback, e2e, and applications | bind address for the in-process metrics server |
 | `MC_STORE_RS_REDIS_URL` | Rust e2e | metadata Redis URL |
 | `MC_STORE_RS_REDIS_PORT` | local scripts and e2e | local Redis port |
