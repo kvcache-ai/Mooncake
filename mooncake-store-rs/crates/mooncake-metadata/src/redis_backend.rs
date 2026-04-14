@@ -207,6 +207,8 @@ const REDIS_CONNECT_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS";
 const REDIS_IO_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_IO_TIMEOUT_MS";
 const DEFAULT_REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_REDIS_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const READONLY_METADATA_RETRY_ATTEMPTS: usize = 3;
+const READONLY_METADATA_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug)]
 pub struct RedisMetadataConfig {
@@ -272,6 +274,26 @@ impl RedisMetadataBackend {
             .set_write_timeout(Some(redis_io_timeout()))
             .map_err(|error| metadata_error("redis set_write_timeout", error))?;
         Ok(connection)
+    }
+
+    fn query_readonly<T, F>(&self, operation: &str, mut query: F) -> Result<T>
+    where
+        F: FnMut(&mut redis::Connection) -> std::result::Result<T, redis::RedisError>,
+    {
+        for attempt in 0..READONLY_METADATA_RETRY_ATTEMPTS {
+            let mut connection = self.connection()?;
+            match query(&mut connection) {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if attempt + 1 < READONLY_METADATA_RETRY_ATTEMPTS
+                        && should_retry_readonly_redis_error(&error) =>
+                {
+                    std::thread::sleep(READONLY_METADATA_RETRY_DELAY);
+                }
+                Err(error) => return Err(metadata_error(operation, error)),
+            }
+        }
+        unreachable!("readonly metadata query either returns or exhausts retries");
     }
 
     fn load_segment_state(
@@ -697,32 +719,48 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
-        let mut connection = self.connection()?;
         let index = self.keyspace.object_index();
-        let mut keys: Vec<String> = connection
-            .smembers(&index)
-            .map_err(|error| metadata_error("redis smembers object index", error))?;
-        if keys.is_empty() {
-            keys = redis::cmd("KEYS")
-                .arg(self.keyspace.object_pattern())
-                .query(&mut connection)
-                .map_err(|error| metadata_error("redis keys objects", error))?;
-        }
+        let (entries, backfill_index) =
+            self.query_readonly("redis list object routes", |connection| {
+                let mut keys: Vec<String> = connection.smembers(&index)?;
+                let mut backfill_index = false;
+                if keys.is_empty() {
+                    keys = redis::cmd("KEYS")
+                        .arg(self.keyspace.object_pattern())
+                        .query(connection)?;
+                    backfill_index = !keys.is_empty();
+                }
+
+                let mut entries = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let payload: Option<String> = redis::cmd("HGET")
+                        .arg(key.as_str())
+                        .arg("payload")
+                        .query(connection)?;
+                    entries.push((key, payload));
+                }
+                Ok((entries, backfill_index))
+            })?;
+
         let mut stale = Vec::new();
-        let mut routes = Vec::with_capacity(keys.len());
-        for key in keys {
-            let payload: Option<String> = redis::cmd("HGET")
-                .arg(key.as_str())
-                .arg("payload")
-                .query(&mut connection)
-                .map_err(|error| metadata_error("redis hget route payload", error))?;
+        let mut live_keys = Vec::new();
+        let mut routes = Vec::with_capacity(entries.len());
+        for (key, payload) in entries {
             if let Some(payload) = payload {
+                live_keys.push(key);
                 routes.push(serde_json::from_str(&payload).map_err(json_error)?);
             } else {
                 stale.push(key);
             }
         }
+        if backfill_index && !live_keys.is_empty() {
+            let mut connection = self.connection()?;
+            connection
+                .sadd::<_, _, ()>(&index, live_keys)
+                .map_err(|error| metadata_error("redis sadd legacy object index", error))?;
+        }
         if !stale.is_empty() {
+            let mut connection = self.connection()?;
             connection
                 .srem::<_, _, ()>(&index, stale)
                 .map_err(|error| metadata_error("redis srem stale object index", error))?;
@@ -832,6 +870,13 @@ fn metadata_error(operation: &str, error: redis::RedisError) -> StoreError {
     StoreError::Metadata(format!("{operation}: {error}"))
 }
 
+fn should_retry_readonly_redis_error(error: &redis::RedisError) -> bool {
+    let detail = error.to_string().to_ascii_lowercase();
+    error.is_timeout()
+        || error.is_connection_dropped()
+        || (error.is_io_error() && detail.contains("interrupted"))
+}
+
 fn json_error(error: serde_json::Error) -> StoreError {
     StoreError::Metadata(format!("json serialization: {error}"))
 }
@@ -856,9 +901,9 @@ mod tests {
 
     use super::{
         redacted_route_namespace_source, redis_connect_timeout, redis_connection_info,
-        redis_io_timeout, MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig,
-        DEFAULT_REDIS_CONNECT_TIMEOUT, DEFAULT_REDIS_IO_TIMEOUT, REDIS_CONNECT_TIMEOUT_ENV,
-        REDIS_IO_TIMEOUT_ENV,
+        redis_io_timeout, should_retry_readonly_redis_error, MetadataKeyspace,
+        RedisMetadataBackend, RedisMetadataConfig, DEFAULT_REDIS_CONNECT_TIMEOUT,
+        DEFAULT_REDIS_IO_TIMEOUT, REDIS_CONNECT_TIMEOUT_ENV, REDIS_IO_TIMEOUT_ENV,
     };
 
     struct RedisTestServer {
@@ -1173,6 +1218,70 @@ mod tests {
             .smembers(&index_key)
             .expect("client index read after prune should succeed");
         assert!(indexed.is_empty());
+    }
+
+    #[test]
+    fn redis_backend_backfills_and_prunes_object_index() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-object-index");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+
+        let route = sample_route(3);
+        backend
+            .compare_and_swap_object_route(&route.key, None, Some(&route))
+            .expect("route create should succeed");
+
+        let client = redis::Client::open(server.url()).expect("redis client should open");
+        let mut connection = client
+            .get_connection()
+            .expect("redis connection should succeed");
+        connection
+            .del::<_, ()>(keyspace.object_index())
+            .expect("object index delete should succeed");
+
+        let listed = backend
+            .list_object_routes()
+            .expect("legacy object listing should succeed");
+        assert_eq!(listed, vec![route.clone()]);
+
+        let indexed: Vec<String> = connection
+            .smembers(keyspace.object_index())
+            .expect("object index read should succeed");
+        assert_eq!(indexed, vec![keyspace.object(&route.key)]);
+
+        connection
+            .del::<_, ()>(keyspace.object(&route.key))
+            .expect("object route delete should succeed");
+
+        let listed = backend
+            .list_object_routes()
+            .expect("stale object listing should succeed");
+        assert!(listed.is_empty());
+
+        let indexed: Vec<String> = connection
+            .smembers(keyspace.object_index())
+            .expect("object index read after prune should succeed");
+        assert!(indexed.is_empty());
+    }
+
+    #[test]
+    fn readonly_metadata_retry_classifier_accepts_transient_io() {
+        let interrupted =
+            redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        let timed_out = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let dropped = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        let refused =
+            redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+
+        assert!(should_retry_readonly_redis_error(&interrupted));
+        assert!(should_retry_readonly_redis_error(&timed_out));
+        assert!(should_retry_readonly_redis_error(&dropped));
+        assert!(!should_retry_readonly_redis_error(&refused));
     }
 
     #[test]
