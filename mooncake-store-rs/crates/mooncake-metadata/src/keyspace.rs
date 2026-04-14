@@ -1,5 +1,5 @@
 use mooncake_store_core::{
-    ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName,
+    ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName, TenantPolicyScope,
 };
 use std::borrow::Cow;
 
@@ -89,6 +89,34 @@ impl MetadataKeyspace {
         }
     }
 
+    pub fn tenant_policy(&self, scope: &TenantPolicyScope) -> String {
+        let mut key = format!(
+            "{}/system/tenant-policy/tenants/{}",
+            self.prefix,
+            encode_key_component(&scope.tenant)
+        );
+        if let Some(domain) = scope.domain.as_deref() {
+            key.push_str("/domains/");
+            key.push_str(&encode_key_component(domain));
+        }
+        if let Some(object_set) = scope.object_set.as_deref() {
+            key.push_str("/object-sets/");
+            key.push_str(&encode_key_component(object_set));
+        }
+        key
+    }
+
+    pub fn tenant_policy_prefix(&self, tenant: Option<&str>) -> String {
+        match tenant {
+            Some(tenant) => format!(
+                "{}/system/tenant-policy/tenants/{}/",
+                self.prefix,
+                encode_key_component(tenant)
+            ),
+            None => format!("{}/system/tenant-policy/tenants/", self.prefix),
+        }
+    }
+
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
@@ -107,6 +135,36 @@ pub fn parse_route_policy_domain(
     Some(RoutePolicyDomain::Tenant(
         decode_key_component(encoded).into_owned(),
     ))
+}
+
+pub fn parse_tenant_policy_scope(
+    keyspace: &MetadataKeyspace,
+    key: &str,
+) -> Option<TenantPolicyScope> {
+    let prefix = format!("{}/system/tenant-policy/tenants/", keyspace.prefix());
+    let rest = key.strip_prefix(&prefix)?;
+    let mut parts = rest.split('/');
+    let tenant = decode_key_component(parts.next()?).into_owned();
+    let mut domain = None;
+    let mut object_set = None;
+    while let Some(part) = parts.next() {
+        match part {
+            "domains" => {
+                domain = Some(decode_key_component(parts.next()?).into_owned());
+            }
+            "object-sets" => {
+                object_set = Some(decode_key_component(parts.next()?).into_owned());
+            }
+            _ => return None,
+        }
+    }
+    let scope = TenantPolicyScope {
+        tenant,
+        domain,
+        object_set,
+    };
+    scope.validate().ok()?;
+    Some(scope)
 }
 
 fn encode_key_component(value: &str) -> String {

@@ -172,6 +172,277 @@ impl RoutePolicy {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct TenantPolicyScope {
+    pub tenant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_set: Option<String>,
+}
+
+impl TenantPolicyScope {
+    pub fn new(
+        tenant: impl Into<String>,
+        domain: Option<impl Into<String>>,
+        object_set: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            tenant: tenant.into(),
+            domain: domain.map(Into::into),
+            object_set: object_set.map(Into::into),
+        }
+    }
+
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.tenant.is_empty() {
+            return Err(crate::StoreError::InvalidState(
+                "tenant policy scope tenant must not be empty".to_string(),
+            ));
+        }
+        if self.object_set.is_some() && self.domain.is_none() {
+            return Err(crate::StoreError::InvalidState(
+                "tenant policy scope object_set requires domain".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn matches_namespace(&self, scope: &crate::NamespaceScope) -> bool {
+        if self.tenant != scope.tenant {
+            return false;
+        }
+        if self.domain.as_deref().is_some_and(|domain| domain != scope.domain) {
+            return false;
+        }
+        if self
+            .object_set
+            .as_deref()
+            .is_some_and(|object_set| object_set != scope.object_set)
+        {
+            return false;
+        }
+        true
+    }
+
+    pub fn specificity(&self) -> usize {
+        1 + usize::from(self.domain.is_some()) + usize::from(self.object_set.is_some())
+    }
+
+    pub fn ancestors(scope: &crate::NamespaceScope) -> [Self; 3] {
+        [
+            Self::new(scope.tenant.clone(), None::<String>, None::<String>),
+            Self::new(scope.tenant.clone(), Some(scope.domain.clone()), None::<String>),
+            Self::new(
+                scope.tenant.clone(),
+                Some(scope.domain.clone()),
+                Some(scope.object_set.clone()),
+            ),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantRoutePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_topk: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_control: Option<RouteControlMode>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_objects: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantExecutionFairnessPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_remote_batch_items_per_tenant: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantBandwidthShapingPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_remote_batch_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_remote_batch_burst_items: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_bytes_per_batch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantPlacementPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_replica_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_local: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_alloc_in_same_node: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_storage_owners: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_segments: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantPolicySpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<TenantRoutePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<TenantQuotaPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fairness: Option<TenantExecutionFairnessPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shaping: Option<TenantBandwidthShapingPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<TenantPlacementPolicy>,
+}
+
+impl TenantPolicySpec {
+    pub fn merged_with(&self, overlay: &Self) -> Self {
+        Self {
+            routing: Some(merge_routing_policy(self.routing.as_ref(), overlay.routing.as_ref()))
+                .filter(|policy| {
+                    policy.route_topk.is_some() || policy.route_control.is_some()
+                }),
+            quota: Some(merge_quota_policy(self.quota.as_ref(), overlay.quota.as_ref()))
+                .filter(|policy| policy.max_bytes.is_some() || policy.max_objects.is_some()),
+            fairness: Some(merge_fairness_policy(
+                self.fairness.as_ref(),
+                overlay.fairness.as_ref(),
+            ))
+            .filter(|policy| policy.max_remote_batch_items_per_tenant.is_some()),
+            shaping: Some(merge_shaping_policy(self.shaping.as_ref(), overlay.shaping.as_ref()))
+                .filter(|policy| {
+                    policy.max_remote_batch_bytes.is_some()
+                        || policy.max_remote_batch_burst_items.is_some()
+                        || policy.max_inflight_bytes_per_batch.is_some()
+                }),
+            placement: Some(merge_placement_policy(
+                self.placement.as_ref(),
+                overlay.placement.as_ref(),
+            ))
+            .filter(|policy| {
+                policy.default_replica_count.is_some()
+                    || policy.prefer_local.is_some()
+                    || policy.prefer_alloc_in_same_node.is_some()
+                    || policy.preferred_storage_owners.is_some()
+                    || policy.preferred_segments.is_some()
+            }),
+        }
+    }
+
+    pub fn resolve_for_scope<'a>(
+        policies: impl IntoIterator<Item = &'a TenantPolicy>,
+        scope: &crate::NamespaceScope,
+    ) -> Self {
+        let mut resolved = Self::default();
+        let mut matching = policies
+            .into_iter()
+            .filter(|policy| policy.scope.matches_namespace(scope))
+            .collect::<Vec<_>>();
+        matching.sort_by(|left, right| left.scope.specificity().cmp(&right.scope.specificity()));
+        for policy in matching {
+            resolved = resolved.merged_with(&policy.spec);
+        }
+        resolved
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantPolicy {
+    pub scope: TenantPolicyScope,
+    pub spec: TenantPolicySpec,
+    pub version: u64,
+    pub updated_at_ms: u64,
+    pub updated_by: String,
+}
+
+impl TenantPolicy {
+    pub fn validate(&self) -> crate::Result<()> {
+        self.scope.validate()
+    }
+}
+
+fn merge_routing_policy(
+    base: Option<&TenantRoutePolicy>,
+    overlay: Option<&TenantRoutePolicy>,
+) -> TenantRoutePolicy {
+    TenantRoutePolicy {
+        route_topk: overlay.and_then(|policy| policy.route_topk).or(base.and_then(|policy| policy.route_topk)),
+        route_control: overlay
+            .and_then(|policy| policy.route_control)
+            .or(base.and_then(|policy| policy.route_control)),
+    }
+}
+
+fn merge_quota_policy(
+    base: Option<&TenantQuotaPolicy>,
+    overlay: Option<&TenantQuotaPolicy>,
+) -> TenantQuotaPolicy {
+    TenantQuotaPolicy {
+        max_bytes: overlay.and_then(|policy| policy.max_bytes).or(base.and_then(|policy| policy.max_bytes)),
+        max_objects: overlay
+            .and_then(|policy| policy.max_objects)
+            .or(base.and_then(|policy| policy.max_objects)),
+    }
+}
+
+fn merge_fairness_policy(
+    base: Option<&TenantExecutionFairnessPolicy>,
+    overlay: Option<&TenantExecutionFairnessPolicy>,
+) -> TenantExecutionFairnessPolicy {
+    TenantExecutionFairnessPolicy {
+        max_remote_batch_items_per_tenant: overlay
+            .and_then(|policy| policy.max_remote_batch_items_per_tenant)
+            .or(base.and_then(|policy| policy.max_remote_batch_items_per_tenant)),
+    }
+}
+
+fn merge_shaping_policy(
+    base: Option<&TenantBandwidthShapingPolicy>,
+    overlay: Option<&TenantBandwidthShapingPolicy>,
+) -> TenantBandwidthShapingPolicy {
+    TenantBandwidthShapingPolicy {
+        max_remote_batch_bytes: overlay
+            .and_then(|policy| policy.max_remote_batch_bytes)
+            .or(base.and_then(|policy| policy.max_remote_batch_bytes)),
+        max_remote_batch_burst_items: overlay
+            .and_then(|policy| policy.max_remote_batch_burst_items)
+            .or(base.and_then(|policy| policy.max_remote_batch_burst_items)),
+        max_inflight_bytes_per_batch: overlay
+            .and_then(|policy| policy.max_inflight_bytes_per_batch)
+            .or(base.and_then(|policy| policy.max_inflight_bytes_per_batch)),
+    }
+}
+
+fn merge_placement_policy(
+    base: Option<&TenantPlacementPolicy>,
+    overlay: Option<&TenantPlacementPolicy>,
+) -> TenantPlacementPolicy {
+    TenantPlacementPolicy {
+        default_replica_count: overlay
+            .and_then(|policy| policy.default_replica_count)
+            .or(base.and_then(|policy| policy.default_replica_count)),
+        prefer_local: overlay
+            .and_then(|policy| policy.prefer_local)
+            .or(base.and_then(|policy| policy.prefer_local)),
+        prefer_alloc_in_same_node: overlay
+            .and_then(|policy| policy.prefer_alloc_in_same_node)
+            .or(base.and_then(|policy| policy.prefer_alloc_in_same_node)),
+        preferred_storage_owners: overlay
+            .and_then(|policy| policy.preferred_storage_owners.clone())
+            .or(base.and_then(|policy| policy.preferred_storage_owners.clone())),
+        preferred_segments: overlay
+            .and_then(|policy| policy.preferred_segments.clone())
+            .or(base.and_then(|policy| policy.preferred_segments.clone())),
+    }
+}
+
 fn default_segment_alignment_bytes() -> u64 {
     1
 }
@@ -199,7 +470,10 @@ mod tests {
     #[test]
     fn object_key_can_be_derived_from_namespace_scope() {
         let scope = NamespaceScope::new("tenant-a", "domain-a", "set-a");
-        assert_eq!(ObjectKey::from_scope(&scope, "logical-a").0, "tenant-a::logical-a");
+        assert_eq!(
+            ObjectKey::from_scope(&scope, "logical-a").0,
+            "tenant-a::logical-a"
+        );
         assert_eq!(
             ObjectKey::from_logical_id(&scoped_logical_object_id("tenant-a", "logical-a")),
             scoped_object_key("tenant-a", "logical-a")

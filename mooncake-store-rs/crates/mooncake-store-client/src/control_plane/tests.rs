@@ -24,9 +24,9 @@ use crate::control_plane::pb;
 use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute,
-    ReplicaRoute, ReplicaTier, RouteCasRequest, RouteState, RouteVersion, SegmentName,
-    SegmentReservation, StoreError,
+    ClientStableId, CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
+    ReplicaTier, RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation,
+    StoreError,
 };
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};

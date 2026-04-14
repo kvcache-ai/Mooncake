@@ -309,6 +309,18 @@ impl StoreClientBuilder {
             stable_id: self.stable_id,
             epoch: self.epoch,
         };
+        let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
+        let effective_tenant_policy =
+            resolve_effective_tenant_policy(self.metadata.as_ref(), &default_scope)?;
+        let effective_route_policy = route_policy_from_tenant_spec(&effective_tenant_policy);
+        let effective_route_control = effective_route_policy
+            .as_ref()
+            .map(|policy| policy.route_control)
+            .unwrap_or(self.route_control);
+        let effective_route_topk = effective_route_policy
+            .as_ref()
+            .map(|policy| policy.route_topk as usize)
+            .unwrap_or(self.route_topk);
         let state = Mutex::new(StoreState::default());
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
         let lifecycle_state = Arc::new(AtomicU8::new(encode_lifecycle_state(
@@ -335,16 +347,16 @@ impl StoreClientBuilder {
             self.metadata.as_ref(),
             &provisional_lease,
             &self.default_tenant,
-            self.route_control,
-            self.route_topk,
+            effective_route_control,
+            effective_route_topk,
         )?;
         let local_authority = Arc::new(LocalAuthorityAdapter {
             lifecycle_state: lifecycle_state.clone(),
             route_write_gate: route_write_gate.clone(),
         });
         let route_directory = build_route_directory(
-            self.route_control,
-            self.route_topk,
+            effective_route_control,
+            effective_route_topk,
             self.metadata.clone(),
             &provisional_lease,
             control_client.clone(),
@@ -434,9 +446,15 @@ impl StoreClientBuilder {
             route_write_gate,
             startup_activation_pending: AtomicBool::new(startup_activation_pending),
             heartbeat_repair_pending: AtomicUsize::new(0),
-            namespace_quota: self.namespace_quota,
-            execution_fairness: self.execution_fairness,
-            bandwidth_shaping: self.bandwidth_shaping,
+            route_control: effective_route_control,
+            route_topk: effective_route_topk,
+            namespace_quota: resolved_namespace_quota(&effective_tenant_policy)
+                .or(self.namespace_quota),
+            execution_fairness: resolved_execution_fairness(&effective_tenant_policy)
+                .or(self.execution_fairness),
+            bandwidth_shaping: resolved_bandwidth_shaping(&effective_tenant_policy)
+                .or(self.bandwidth_shaping),
+            placement_policy: resolved_placement_policy(&effective_tenant_policy),
             state,
         })
     }
@@ -461,6 +479,24 @@ fn bootstrap_route_policy(
     bootstrap_default_route_policy(metadata, &local)?;
     let effective = resolve_effective_route_policy(metadata, default_tenant)?;
     validate_route_policy(&local, &effective)
+}
+
+fn resolve_effective_tenant_policy(
+    metadata: &dyn MetadataBackend,
+    scope: &NamespaceScope,
+) -> Result<TenantPolicySpec> {
+    let policies = metadata.list_tenant_policies()?;
+    Ok(TenantPolicySpec::resolve_for_scope(policies.iter(), scope))
+}
+
+fn route_policy_from_tenant_spec(spec: &TenantPolicySpec) -> Option<RoutePolicy> {
+    let routing = spec.routing.as_ref()?;
+    Some(RoutePolicy {
+        route_topk: routing.route_topk?,
+        route_control: routing.route_control?,
+        created_by: ClientRuntimeId::new("tenant-policy", ClientEpoch(0)),
+        created_at_ms: 0,
+    })
 }
 
 fn bootstrap_default_route_policy(metadata: &dyn MetadataBackend, local: &RoutePolicy) -> Result<()> {
@@ -488,6 +524,11 @@ fn resolve_effective_route_policy(
     metadata: &dyn MetadataBackend,
     default_tenant: &str,
 ) -> Result<RoutePolicy> {
+    let scope = NamespaceScope::with_defaults(Some(default_tenant), None, None);
+    let tenant_spec = resolve_effective_tenant_policy(metadata, &scope)?;
+    if let Some(policy) = route_policy_from_tenant_spec(&tenant_spec) {
+        return Ok(policy);
+    }
     if let Some(tenant_policy) = metadata.get_route_policy(&RoutePolicyDomain::Tenant(
         default_tenant.to_string(),
     ))? {
@@ -509,6 +550,33 @@ fn validate_route_policy(local: &RoutePolicy, existing: &RoutePolicy) -> Result<
         existing.route_control,
         existing.route_topk,
     )))
+}
+
+fn resolved_namespace_quota(spec: &TenantPolicySpec) -> Option<NamespaceQuota> {
+    spec.quota.as_ref().map(|quota| NamespaceQuota {
+        max_bytes: quota.max_bytes,
+        max_objects: quota.max_objects,
+    })
+}
+
+fn resolved_execution_fairness(spec: &TenantPolicySpec) -> Option<ExecutionFairness> {
+    spec.fairness
+        .as_ref()
+        .map(|fairness| ExecutionFairness {
+            max_remote_batch_items_per_tenant: fairness.max_remote_batch_items_per_tenant,
+        })
+}
+
+fn resolved_bandwidth_shaping(spec: &TenantPolicySpec) -> Option<BandwidthShaping> {
+    spec.shaping.as_ref().map(|shaping| BandwidthShaping {
+        max_remote_batch_bytes: shaping.max_remote_batch_bytes,
+        max_remote_batch_burst_items: shaping.max_remote_batch_burst_items,
+        max_inflight_bytes_per_batch: shaping.max_inflight_bytes_per_batch,
+    })
+}
+
+fn resolved_placement_policy(spec: &TenantPolicySpec) -> Option<TenantPlacementPolicy> {
+    spec.placement.clone()
 }
 
 fn startup_prewarm_max_delay_from_env() -> Duration {

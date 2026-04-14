@@ -314,6 +314,13 @@ impl StoreClient {
     }
 
     fn default_replica_count(&self) -> usize {
+        if let Some(replica_count) = self
+            .placement_policy
+            .as_ref()
+            .and_then(|policy| policy.default_replica_count)
+        {
+            return replica_count.max(1);
+        }
         match &self.write_mode {
             WriteMode::LocalOnly => 1,
             WriteMode::Routed { replica_count, .. } => *replica_count,
@@ -630,7 +637,29 @@ impl StoreClient {
         &self,
         policy: Option<&ReplicationPolicy>,
     ) -> Result<ResolvedReplicationPolicy> {
-        let policy = policy.cloned().unwrap_or_default();
+        let mut policy = policy.cloned().unwrap_or_default();
+        if let Some(placement) = self.placement_policy.as_ref() {
+            if policy.preferred_storage_owners.is_empty() {
+                if let Some(owners) = placement.preferred_storage_owners.as_ref() {
+                    policy.preferred_storage_owners = owners.clone();
+                }
+            }
+            if policy.preferred_segments.is_empty() {
+                if let Some(segments) = placement.preferred_segments.as_ref() {
+                    policy.preferred_segments = segments
+                        .iter()
+                        .cloned()
+                        .map(SegmentName::new)
+                        .collect();
+                }
+            }
+            if let Some(prefer_local) = placement.prefer_local {
+                policy.prefer_local = prefer_local;
+            }
+            if let Some(prefer_same_node) = placement.prefer_alloc_in_same_node {
+                policy.prefer_alloc_in_same_node = prefer_same_node;
+            }
+        }
         let replica_count = policy
             .replica_count
             .unwrap_or_else(|| self.default_replica_count());

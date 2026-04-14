@@ -16,13 +16,15 @@ pub use identity::{
     DEFAULT_TENANT,
 };
 pub use identity_codec::{
-    apply_route_identity, parse_legacy_scoped_key, route_logical_object_id,
-    route_reuse_identity, scoped_logical_object_id, scoped_object_key,
+    apply_route_identity, parse_legacy_scoped_key, route_logical_object_id, route_reuse_identity,
+    scoped_logical_object_id, scoped_object_key,
 };
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,
     RouteControlMode, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, TenantBandwidthShapingPolicy,
+    TenantExecutionFairnessPolicy, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
+    TenantPolicySpec, TenantQuotaPolicy, TenantRoutePolicy,
 };
 pub use traits::{MetadataBackend, PlacementStrategy, RouteDirectory};

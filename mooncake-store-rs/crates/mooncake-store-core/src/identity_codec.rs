@@ -1,7 +1,5 @@
 use crate::error::{Result, StoreError};
-use crate::identity::{
-    LogicalObjectId, NamespaceScope, ReuseIdentity, DEFAULT_QOS_TIER,
-};
+use crate::identity::{LogicalObjectId, NamespaceScope, ReuseIdentity, DEFAULT_QOS_TIER};
 use crate::route::{ObjectKey, ObjectRoute};
 
 pub fn scoped_logical_object_id(tenant: &str, logical_key: &str) -> LogicalObjectId {
@@ -49,14 +47,8 @@ pub fn route_reuse_identity(route: &ObjectRoute) -> Result<ReuseIdentity> {
     Ok(ReuseIdentity::new(
         tenant,
         domain,
-        route
-            .sharing_scope
-            .clone()
-            .unwrap_or(object_set),
-        route
-            .canonical_key
-            .clone()
-            .unwrap_or(canonical_key),
+        route.sharing_scope.clone().unwrap_or(object_set),
+        route.canonical_key.clone().unwrap_or(canonical_key),
     ))
 }
 
@@ -128,14 +120,18 @@ mod tests {
         apply_route_identity(&mut route, &scoped_logical_object_id("tenant-b", "key-b"));
         assert_eq!(route.key.0, "tenant-b::key-b");
         assert_eq!(route.logical_key.as_deref(), Some("key-b"));
-        assert_eq!(route.canonical_key.as_deref(), Some("tenant-b/default/default/key-b"));
+        assert_eq!(
+            route.canonical_key.as_deref(),
+            Some("tenant-b/default/default/key-b")
+        );
         assert_eq!(route.sharing_scope.as_deref(), Some("tenant-b"));
         assert_eq!(route.qos_tier.as_deref(), Some("default"));
     }
 
     #[test]
     fn parse_legacy_scoped_key_rejects_unscoped_values() {
-        let error = parse_legacy_scoped_key(&ObjectKey::new("plain-key")).expect_err("key should fail");
+        let error =
+            parse_legacy_scoped_key(&ObjectKey::new("plain-key")).expect_err("key should fail");
         assert!(matches!(error, StoreError::InvalidState(_)));
     }
 

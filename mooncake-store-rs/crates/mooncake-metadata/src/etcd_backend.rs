@@ -5,9 +5,10 @@ use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
     SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
+    TenantPolicy, TenantPolicyScope,
 };
 
-use crate::keyspace::parse_route_policy_domain;
+use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 
@@ -517,6 +518,162 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
+    fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>> {
+        let key = self.config.keyspace.tenant_policy(scope);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key, None)
+                .await
+                .map_err(etcd_error("etcd get tenant policy"))?;
+            response
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice(kv.value()).map_err(json_error))
+                .transpose()
+        })
+    }
+
+    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
+        let prefix = self.config.keyspace.tenant_policy_prefix(None);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(prefix, Some(GetOptions::new().with_prefix()))
+                .await
+                .map_err(etcd_error("etcd list tenant policies"))?;
+            let mut policies = response
+                .kvs()
+                .iter()
+                .filter_map(|kv| {
+                    let key = std::str::from_utf8(kv.key()).ok()?;
+                    parse_tenant_policy_scope(&self.config.keyspace, key)?;
+                    let policy: TenantPolicy = serde_json::from_slice(kv.value()).ok()?;
+                    Some(policy)
+                })
+                .collect::<Vec<_>>();
+            policies.sort_by(|left, right| left.scope.cmp(&right.scope));
+            Ok(policies)
+        })
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> Result<TenantPolicy> {
+        policy.validate()?;
+        let key = self.config.keyspace.tenant_policy(&policy.scope);
+        let payload = serde_json::to_string(policy).map_err(json_error)?;
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let response = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant policy"))?;
+                let current = response
+                    .kvs()
+                    .first()
+                    .map(|kv| serde_json::from_slice::<TenantPolicy>(kv.value()).map_err(json_error))
+                    .transpose()?;
+                match (expected_version, current.as_ref()) {
+                    (None, None) => {}
+                    (Some(expected), Some(current)) if current.version == expected => {}
+                    (None, Some(_)) => {
+                        return Err(StoreError::Conflict(format!(
+                            "tenant policy already exists for {}",
+                            policy.scope.tenant
+                        )))
+                    }
+                    (Some(expected), Some(current)) => {
+                        return Err(StoreError::Conflict(format!(
+                            "tenant policy version mismatch for {}: expected={} actual={}",
+                            policy.scope.tenant, expected, current.version
+                        )))
+                    }
+                    (Some(expected), None) => {
+                        return Err(StoreError::Conflict(format!(
+                            "tenant policy missing for {} at expected version {}",
+                            policy.scope.tenant, expected
+                        )))
+                    }
+                }
+                let txn = if let Some(kv) = response.kvs().first() {
+                    Txn::new()
+                        .when([Compare::mod_revision(
+                            key.clone(),
+                            CompareOp::Equal,
+                            kv.mod_revision(),
+                        )])
+                        .and_then([TxnOp::put(key.clone(), payload.clone(), None)])
+                } else {
+                    Txn::new()
+                        .when([Compare::version(key.clone(), CompareOp::Equal, 0)])
+                        .and_then([TxnOp::put(key.clone(), payload.clone(), None)])
+                };
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd put tenant policy"))?;
+                if txn_response.succeeded() {
+                    return Ok(policy.clone());
+                }
+            }
+        })
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> Result<bool> {
+        let key = self.config.keyspace.tenant_policy(scope);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let response = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant policy"))?;
+                let current = response
+                    .kvs()
+                    .first()
+                    .map(|kv| serde_json::from_slice::<TenantPolicy>(kv.value()).map_err(json_error))
+                    .transpose()?;
+                let Some(current) = current else {
+                    return Ok(false);
+                };
+                if let Some(expected_version) = expected_version {
+                    if current.version != expected_version {
+                        return Err(StoreError::Conflict(format!(
+                            "tenant policy version mismatch for {}: expected={} actual={}",
+                            scope.tenant, expected_version, current.version
+                        )));
+                    }
+                }
+                let kv = response
+                    .kvs()
+                    .first()
+                    .expect("tenant policy current kv should exist");
+                let txn = Txn::new()
+                    .when([Compare::mod_revision(
+                        key.clone(),
+                        CompareOp::Equal,
+                        kv.mod_revision(),
+                    )])
+                    .and_then([TxnOp::delete(key.clone(), None)]);
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd delete tenant policy"))?;
+                if txn_response.succeeded() {
+                    return Ok(true);
+                }
+            }
+        })
+    }
+
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
         let key = self.config.keyspace.handoff(&handoff.stable_id);
         let payload = serde_json::to_string(handoff).map_err(json_error)?;
@@ -575,7 +732,8 @@ mod tests {
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion,
-        SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+        SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError, TenantPolicy,
+        TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
     };
 
     use super::{EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace};
@@ -866,6 +1024,72 @@ mod tests {
                 .get_handoff(&handoff.stable_id)
                 .expect("handoff get should succeed"),
             Some(handoff)
+        );
+    }
+
+    #[test]
+    fn etcd_backend_tenant_policy_supports_versioned_put_list_and_delete() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-tenant-policy")),
+        )
+        .expect("etcd backend should initialize");
+        let scope = TenantPolicyScope::new("tenant/a", Some("domain-1"), None::<String>);
+        let policy = TenantPolicy {
+            scope: scope.clone(),
+            spec: TenantPolicySpec {
+                quota: Some(TenantQuotaPolicy {
+                    max_bytes: Some(128),
+                    max_objects: Some(8),
+                }),
+                ..TenantPolicySpec::default()
+            },
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "admin".to_string(),
+        };
+
+        let stored = backend
+            .put_tenant_policy(&policy, None)
+            .expect("tenant policy insert should succeed");
+        assert_eq!(stored, policy);
+        assert_eq!(
+            backend
+                .get_tenant_policy(&scope)
+                .expect("tenant policy read should succeed"),
+            Some(policy.clone())
+        );
+
+        let mut updated = policy.clone();
+        updated.version = 2;
+        updated.updated_at_ms = 20;
+        updated.updated_by = "admin-2".to_string();
+        updated.spec.quota.as_mut().unwrap().max_objects = Some(16);
+        let error = backend
+            .put_tenant_policy(&updated, Some(3))
+            .expect_err("mismatched version should fail");
+        assert!(matches!(error, StoreError::Conflict(_)));
+
+        backend
+            .put_tenant_policy(&updated, Some(1))
+            .expect("tenant policy update should succeed");
+        assert_eq!(
+            backend
+                .list_tenant_policies()
+                .expect("tenant policy listing should succeed"),
+            vec![updated.clone()]
+        );
+        assert!(backend
+            .delete_tenant_policy(&scope, Some(2))
+            .expect("tenant policy delete should succeed"));
+        assert_eq!(
+            backend
+                .get_tenant_policy(&scope)
+                .expect("tenant policy read after delete should succeed"),
+            None
         );
     }
 }

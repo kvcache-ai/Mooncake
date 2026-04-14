@@ -639,6 +639,8 @@ struct ReplicaWriteTarget {
 }
 
 struct PreparedObjectWrite<'a> {
+    object_id: LogicalObjectId,
+    qos_tier: Option<&'a str>,
     scoped_key: ObjectKey,
     value: &'a [u8],
     targets: Vec<ReplicaWriteTarget>,

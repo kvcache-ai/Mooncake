@@ -6,7 +6,7 @@ use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    SegmentReservation,
+    SegmentReservation, TenantPolicy, TenantPolicyScope,
 };
 
 pub trait MetadataBackend: Send + Sync {
@@ -101,6 +101,22 @@ pub trait MetadataBackend: Send + Sync {
     fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> Result<bool>;
 
     fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>>;
+
+    fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>>;
+
+    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>>;
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> Result<TenantPolicy>;
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> Result<bool>;
 
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()>;
 

@@ -365,9 +365,15 @@ fn tent_base_config(redis_port: u16, rdma_enable: bool) -> TentEngineConfig {
         .set("rpc_server_hostname", "127.0.0.1")
         .set("rpc_server_port", "0")
         .set("log_level", "warning")
-        .set("transports/tcp/enable", if rdma_enable { "false" } else { "true" })
+        .set(
+            "transports/tcp/enable",
+            if rdma_enable { "false" } else { "true" },
+        )
         .set("transports/shm/enable", "false")
-        .set("transports/rdma/enable", if rdma_enable { "true" } else { "false" })
+        .set(
+            "transports/rdma/enable",
+            if rdma_enable { "true" } else { "false" },
+        )
         .set("transports/io_uring/enable", "false");
     if rdma_enable {
         let rdma_devices = env::var("MC_STORE_RS_RDMA_DEVICES").unwrap_or_default();
@@ -1276,18 +1282,18 @@ fn verify_rdma_bandwidth_isolation(
         "rdma-high-router",
         ClientEpoch(1),
         ClientLifecycleState::Active,
-        build_tent_bundle(
-            redis_port,
-            "rdma-high-router-segment",
-            true,
-        )?,
+        build_tent_bundle(redis_port, "rdma-high-router-segment", true)?,
         LocalMemoryConfig::new()
             .storage_bytes(value_size * 8)
             .scratch_bytes(SCRATCH_BYTES)
             .location("cpu:0")
             .tags(vec!["dram".to_string(), "rdma-high-router".to_string()]),
         "tenant-high",
-        &[("pool", "pool-a"), ("role", "rdma-high"), ("storage", "false")],
+        &[
+            ("pool", "pool-a"),
+            ("role", "rdma-high"),
+            ("storage", "false"),
+        ],
         planner.clone(),
         1,
         Some(BandwidthShaping::new().max_inflight_bytes_per_batch((value_size * 8) as u64)),
@@ -1297,18 +1303,18 @@ fn verify_rdma_bandwidth_isolation(
         "rdma-low-router",
         ClientEpoch(1),
         ClientLifecycleState::Active,
-        build_tent_bundle(
-            redis_port,
-            "rdma-low-router-segment",
-            true,
-        )?,
+        build_tent_bundle(redis_port, "rdma-low-router-segment", true)?,
         LocalMemoryConfig::new()
             .storage_bytes(value_size * 8)
             .scratch_bytes(SCRATCH_BYTES)
             .location("cpu:0")
             .tags(vec!["dram".to_string(), "rdma-low-router".to_string()]),
         "tenant-low",
-        &[("pool", "pool-a"), ("role", "rdma-low"), ("storage", "false")],
+        &[
+            ("pool", "pool-a"),
+            ("role", "rdma-low"),
+            ("storage", "false"),
+        ],
         planner,
         1,
         Some(BandwidthShaping::new().max_inflight_bytes_per_batch(value_size as u64)),
