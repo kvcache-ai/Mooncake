@@ -276,6 +276,29 @@ Treat this summary as the primary throughput signal. The per-phase `stress phase
 ./scripts/run-python-compat-e2e.sh
 ```
 
+### Run the client read/write validation
+
+```bash
+./scripts/test-client-rw-cli.sh
+```
+
+This standard entry point builds the standalone `mooncake-store-client` binary,
+starts storage daemons against a temporary Redis metadata backend, and verifies:
+
+- dummy single-item read/write
+- dummy shared-memory batch read/write
+- dummy multi-buffer shared-memory read/write
+- real routed write on one client and read on another client
+- both single-item and batched real-mode paths
+
+For direct operator-driven validation, the paired helper scripts remain
+available:
+
+```bash
+python3 ./scripts/real_client_rw.py --help
+python3 ./scripts/dummy_client_rw.py --help
+```
+
 Run the real-mode black-box read/write validator:
 
 ```bash
@@ -297,6 +320,15 @@ python3 ./scripts/real_client_rw.py \
   --routed-writes \
   --mode write \
   --key_prefix smoke
+```
+
+Run the dummy-mode black-box read/write validator against a standalone daemon:
+
+```bash
+python3 ./scripts/dummy_client_rw.py \
+  --daemon_addr 127.0.0.1:16590 \
+  --key_prefix smoke \
+  --batch_size 4
 ```
 
 To package the Python module and the standalone client command together:

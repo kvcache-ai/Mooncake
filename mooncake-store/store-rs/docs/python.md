@@ -236,6 +236,23 @@ policy = ReplicateConfig(
 store.put("key", b"payload", config=policy)
 ```
 
+## Standard Read/Write Validation
+
+Use the repository-standard entry point to validate both compatibility paths in one run:
+
+```bash
+./scripts/test-client-rw-cli.sh
+```
+
+This script:
+
+- builds the standalone `mooncake-store-client` binary
+- starts two storage daemons against a temporary Redis metadata backend
+- validates dummy single-item, shm batch, and shm multi-buffer read/write
+- validates real routed write/read across separate real clients
+
+For path-specific manual checks, keep using the paired helper scripts below.
+
 ## Real-Mode Validation Script
 
 Use `scripts/real_client_rw.py` for black-box real-mode validation against the current store-rs compatibility stack.
@@ -281,8 +298,48 @@ Current script behavior:
 - accepts `host:port` in `--local_host` and normalizes that port into the real-mode backend config
 - supports `idle`, `write`, `read`, and `both`
 - supports batch put/get validation through `--batch_size`
+- supports `--route-control`, `--route-topk`, and `--transport-backend`
 - treats `--master_addr` as a deprecated compatibility alias and ignores it
 - exits with a regular error code on validation failure
+
+## Dummy-Mode Validation Script
+
+Use `scripts/dummy_client_rw.py` for black-box dummy-mode validation against a standalone compatibility daemon.
+
+Single-item mode:
+
+```bash
+python3 ./scripts/dummy_client_rw.py \
+  --daemon_addr 127.0.0.1:16590 \
+  --key_prefix dummy-smoke
+```
+
+Shared-memory batch mode:
+
+```bash
+python3 ./scripts/dummy_client_rw.py \
+  --daemon_addr 127.0.0.1:16590 \
+  --key_prefix dummy-batch \
+  --batch_size 8
+```
+
+Shared-memory multi-buffer mode:
+
+```bash
+python3 ./scripts/dummy_client_rw.py \
+  --daemon_addr 127.0.0.1:16590 \
+  --key_prefix dummy-multi \
+  --batch_size 4 \
+  --batch_api multi_buffer
+```
+
+Current script behavior:
+
+- waits for `health_check()` before issuing traffic
+- uses high-level `put` / `get` in single-item mode
+- uses registered-buffer shm APIs in batched mode
+- can validate raw multi-buffer shm get/put with `--batch_api multi_buffer`
+- uses `remove_all()` for cleanup because dummy mode does not expose per-key delete parity
 
 ## Basic Dummy-Mode Example
 
