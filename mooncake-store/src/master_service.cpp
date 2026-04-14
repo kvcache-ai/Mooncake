@@ -839,8 +839,7 @@ auto MasterService::GetReplicaListByRegexInScope(
                         << " matched by regex, but has no complete replicas.";
                     continue;
                 }
-                results.emplace(metadata.legacy_raw_key,
-                                std::move(replica_list));
+                results.emplace(metadata.logical_key, std::move(replica_list));
                 metadata.GrantLease(default_kv_lease_ttl_,
                                     default_kv_soft_pin_ttl_);
             }
@@ -848,26 +847,26 @@ auto MasterService::GetReplicaListByRegexInScope(
         }
 
         for (const auto& [object_id, metadata] : shard->metadata) {
-            if (std::regex_search(metadata.legacy_raw_key, pattern)) {
-                std::vector<Replica::Descriptor> replica_list;
-                metadata.VisitReplicas(
-                    &Replica::fn_is_completed,
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
-                    });
-
-                if (replica_list.empty()) {
-                    LOG(WARNING)
-                        << "key=" << metadata.logical_key
-                        << " matched by regex, but has no complete replicas.";
-                    continue;
-                }
-
-                results.emplace(metadata.legacy_raw_key,
-                                std::move(replica_list));
-                metadata.GrantLease(default_kv_lease_ttl_,
-                                    default_kv_soft_pin_ttl_);
+            if (!std::regex_search(metadata.logical_key, pattern)) {
+                continue;
             }
+            std::vector<Replica::Descriptor> replica_list;
+            metadata.VisitReplicas(
+                &Replica::fn_is_completed,
+                [&replica_list](const Replica& replica) {
+                    replica_list.emplace_back(replica.get_descriptor());
+                });
+
+            if (replica_list.empty()) {
+                LOG(WARNING)
+                    << "key=" << metadata.logical_key
+                    << " matched by regex, but has no complete replicas.";
+                continue;
+            }
+
+            results.emplace(metadata.logical_key, std::move(replica_list));
+            metadata.GrantLease(default_kv_lease_ttl_,
+                                default_kv_soft_pin_ttl_);
         }
     }
 
@@ -935,15 +934,15 @@ std::vector<std::string> MasterService::ResolvePreferredSegments(
     }
 
     std::unordered_map<std::string, size_t> segment_hits;
-    auto accumulate_segment_hits = [&](const auto& shard) {
-        auto scoped_keys = FindScopedKeys(*shard.operator->(), config.tenant_id,
-                                          config.domain_id);
+    auto accumulate_segment_hits = [&](const MetadataShard& shard) {
+        auto scoped_keys =
+            FindScopedKeys(shard, config.tenant_id, config.domain_id);
         if (scoped_keys == nullptr) {
             return;
         }
         for (const auto& object_id : *scoped_keys) {
-            auto metadata_it = shard->metadata.find(object_id);
-            if (metadata_it == shard->metadata.end()) {
+            auto metadata_it = shard.metadata.find(object_id);
+            if (metadata_it == shard.metadata.end()) {
                 continue;
             }
             const auto& metadata = metadata_it->second;
@@ -957,13 +956,13 @@ std::vector<std::string> MasterService::ResolvePreferredSegments(
         }
     };
 
-    accumulate_segment_hits(current_shard);
+    accumulate_segment_hits(*current_shard.operator->());
     for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
         if (shard_index == current_shard_index) {
             continue;
         }
         MetadataShardAccessorRO shard(this, shard_index);
-        accumulate_segment_hits(shard);
+        accumulate_segment_hits(*shard.operator->());
     }
 
     std::vector<std::pair<std::string, size_t>> ranked_segments(
@@ -1133,7 +1132,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_offload_) {
         auto& shard = accessor.GetShard();
-        const auto object_id = shard->raw_key_to_id.at(key);
+        const auto& object_id = accessor.GetId();
         metadata.VisitReplicas(
             &Replica::fn_is_completed,
             [this, &key, &shard, &object_id](Replica& replica) {
@@ -1648,7 +1647,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
-    const auto object_id = shard->raw_key_to_id.at(key);
+    const auto& object_id = accessor.GetId();
     shard->replication_tasks.emplace(
         std::piecewise_construct, std::forward_as_tuple(object_id),
         std::forward_as_tuple(client_id, std::chrono::system_clock::now(),
@@ -1864,7 +1863,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
-    const auto object_id = shard->raw_key_to_id.at(key);
+    const auto& object_id = accessor.GetId();
     shard->replication_tasks.emplace(
         std::piecewise_construct, std::forward_as_tuple(object_id),
         std::forward_as_tuple(client_id, std::chrono::system_clock::now(),
@@ -2094,29 +2093,29 @@ auto MasterService::RemoveByRegexInScope(const std::string& regex_pattern,
             for (const auto& object_id : candidate_ids) {
                 auto it = shard->metadata.find(object_id);
                 if (it == shard->metadata.end() ||
-                    !std::regex_search(it->second.legacy_raw_key, pattern)) {
+                    !std::regex_search(it->second.logical_key, pattern)) {
                     continue;
                 }
                 if (!force && !it->second.IsLeaseExpired()) {
-                    VLOG(1) << "key=" << it->second.legacy_raw_key
+                    VLOG(1) << "key=" << it->second.logical_key
                             << " matched by regex, but has lease. Skipping "
                             << "removal.";
                     continue;
                 }
                 if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
-                    LOG(WARNING) << "key=" << it->second.legacy_raw_key
+                    LOG(WARNING) << "key=" << it->second.logical_key
                                  << " matched by regex, but not all replicas "
                                     "are complete. Skipping removal.";
                     continue;
                 }
                 if (metadata_shards_[i].replication_tasks.contains(it->first)) {
                     LOG(WARNING)
-                        << "key=" << it->second.legacy_raw_key
+                        << "key=" << it->second.logical_key
                         << ", matched by regex, but has replication task. "
                            "Skipping removal.";
                     continue;
                 }
-                VLOG(1) << "key=" << it->second.legacy_raw_key
+                VLOG(1) << "key=" << it->second.logical_key
                         << " matched by regex. Removing.";
                 ReleaseLiveBytes(it->second);
                 UnindexMetadata(*shard.operator->(), it->first, it->second);
@@ -2127,45 +2126,45 @@ auto MasterService::RemoveByRegexInScope(const std::string& regex_pattern,
         }
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
-            if (std::regex_search(it->second.legacy_raw_key, pattern)) {
-                if (!force && !it->second.IsLeaseExpired()) {
-                    VLOG(1) << "key=" << it->second.legacy_raw_key
-                            << " matched by regex, but has lease. Skipping "
-                            << "removal.";
-                    ++it;
-                    continue;
-                }
-                /**
-                 * The reason the force operation here does not bypass the
-                 * replica check is that put operations (which could also be
-                 * copy or move) and remove operations might be happening
-                 * concurrently, making it extremely dangerous to perform a
-                 * direct removal at this point.
-                 */
-                if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
-                    LOG(WARNING) << "key=" << it->second.legacy_raw_key
-                                 << " matched by regex, but not all replicas "
-                                    "are complete. Skipping removal.";
-                    ++it;
-                    continue;
-                }
-                if (metadata_shards_[i].replication_tasks.contains(it->first)) {
-                    LOG(WARNING) << "key=" << it->second.legacy_raw_key
-                                 << ", matched by regex, but has replication "
-                                    "task. Skipping removal.";
-                    ++it;
-                    continue;
-                }
-
-                VLOG(1) << "key=" << it->second.legacy_raw_key
-                        << " matched by regex. Removing.";
-                ReleaseLiveBytes(it->second);
-                UnindexMetadata(*shard.operator->(), it->first, it->second);
-                it = shard->metadata.erase(it);
-                removed_count++;
-            } else {
+            if (!std::regex_search(it->second.logical_key, pattern)) {
                 ++it;
+                continue;
             }
+            if (!force && !it->second.IsLeaseExpired()) {
+                VLOG(1) << "key=" << it->second.logical_key
+                        << " matched by regex, but has lease. Skipping "
+                        << "removal.";
+                ++it;
+                continue;
+            }
+            /**
+             * The reason the force operation here does not bypass the
+             * replica check is that put operations (which could also be
+             * copy or move) and remove operations might be happening
+             * concurrently, making it extremely dangerous to perform a
+             * direct removal at this point.
+             */
+            if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
+                LOG(WARNING) << "key=" << it->second.logical_key
+                             << " matched by regex, but not all replicas "
+                                "are complete. Skipping removal.";
+                ++it;
+                continue;
+            }
+            if (metadata_shards_[i].replication_tasks.contains(it->first)) {
+                LOG(WARNING) << "key=" << it->second.logical_key
+                             << ", matched by regex, but has replication "
+                                "task. Skipping removal.";
+                ++it;
+                continue;
+            }
+
+            VLOG(1) << "key=" << it->second.logical_key
+                    << " matched by regex. Removing.";
+            ReleaseLiveBytes(it->second);
+            UnindexMetadata(*shard.operator->(), it->first, it->second);
+            it = shard->metadata.erase(it);
+            removed_count++;
         }
     }
 
@@ -2429,7 +2428,7 @@ auto MasterService::NotifyOffloadSuccess(
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& shard = accessor.GetShard();
-                const auto object_id = shard->raw_key_to_id.at(key);
+                const auto& object_id = accessor.GetId();
                 auto task_it = shard->offloading_tasks.find(object_id);
                 if (task_it != shard->offloading_tasks.end()) {
                     auto source =

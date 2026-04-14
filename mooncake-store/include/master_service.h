@@ -1124,11 +1124,14 @@ class MasterService {
             return replication_task_it_->second;
         }
 
+        const LogicalObjectId& GetId() const NO_THREAD_SAFETY_ANALYSIS {
+            return it_->first;
+        }
+
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
             service_->UnindexMetadata(*shard_guard_.operator->(), it_->first,
                                       it_->second);
-            shard_guard_->raw_key_to_id.erase(key_);
             shard_guard_->metadata.erase(it_);
             alias_it_ = shard_guard_->raw_key_to_id.end();
             it_ = shard_guard_->metadata.end();
@@ -1260,6 +1263,10 @@ class MasterService {
         // Get metadata (only call when Exists() is true)
         const ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
             return it_->second;
+        }
+
+        const LogicalObjectId& GetId() const NO_THREAD_SAFETY_ANALYSIS {
+            return it_->first;
         }
 
         MetadataShardAccessorRO& GetShard() NO_THREAD_SAFETY_ANALYSIS {
