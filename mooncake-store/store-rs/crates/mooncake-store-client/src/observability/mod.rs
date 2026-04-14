@@ -3,15 +3,18 @@ mod process;
 pub(crate) mod registry;
 
 use is_terminal::IsTerminal;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{Result, StoreError};
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub use registry::{MetricsSnapshot, OperationMetricSnapshot};
@@ -23,6 +26,7 @@ static METRICS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_millis(250);
+const TRACE_FILE_ENV: &str = "MC_STORE_RS_TRACE_FILE";
 
 struct MetricsHttpServer {
     address: String,
@@ -95,6 +99,38 @@ pub struct InflightGuard {
     scope: &'static str,
 }
 
+#[derive(Clone)]
+struct TraceFileMakeWriter {
+    file: Arc<Mutex<File>>,
+}
+
+struct TraceFileWriter {
+    file: Arc<Mutex<File>>,
+}
+
+impl<'a> MakeWriter<'a> for TraceFileMakeWriter {
+    type Writer = TraceFileWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TraceFileWriter {
+            file: self.file.clone(),
+        }
+    }
+}
+
+impl Write for TraceFileWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.file
+            .lock()
+            .expect("trace file lock poisoned")
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.lock().expect("trace file lock poisoned").flush()
+    }
+}
+
 impl InflightGuard {
     pub fn enter(operation: &'static str, scope: &'static str) -> Self {
         registry::increment_inflight(operation, scope);
@@ -120,16 +156,33 @@ pub fn init_tracing(filter: Option<&str>) -> Result<()> {
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
     };
 
-    let use_ansi = std::io::stdout().is_terminal();
+    let trace_file = trace_file_from_env(TRACE_FILE_ENV)?;
+    let use_ansi = trace_file.is_none() && std::io::stdout().is_terminal();
 
-    let subscriber = fmt()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_ansi(use_ansi)
-        .with_span_events(FmtSpan::CLOSE);
+    let init_result = match trace_file {
+        Some(trace_file) => {
+            let writer = TraceFileMakeWriter {
+                file: Arc::new(Mutex::new(open_trace_file(&trace_file)?)),
+            };
+            fmt()
+                .with_env_filter(env_filter)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_ansi(false)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_writer(writer)
+                .try_init()
+        }
+        None => fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_ansi(use_ansi)
+            .with_span_events(FmtSpan::CLOSE)
+            .try_init(),
+    };
 
-    match subscriber.try_init() {
+    match init_result {
         Ok(()) => {
             let _ = TRACING_STATE.set(());
             Ok(())
@@ -153,13 +206,49 @@ pub fn init_tracing_from_env(toggle_env: &str, filter_env: &str) -> Result<bool>
     let enabled = std::env::var(toggle_env)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false);
-    if !enabled {
+    let has_trace_file = trace_file_from_env(TRACE_FILE_ENV)?.is_some();
+    if !enabled && !has_trace_file {
         return Ok(false);
     }
 
     let filter = std::env::var(filter_env).ok();
     init_tracing(filter.as_deref())?;
     Ok(true)
+}
+
+fn trace_file_from_env(name: &str) -> Result<Option<PathBuf>> {
+    let Some(path) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+fn open_trace_file(path: &Path) -> Result<File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            StoreError::InvalidState(format!(
+                "failed to create trace log directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            StoreError::InvalidState(format!(
+                "failed to open trace log file {}: {error}",
+                path.display()
+            ))
+        })
 }
 
 pub fn start_metrics_http_server(bind_addr: &str) -> Result<String> {
@@ -468,6 +557,39 @@ mod tests {
         std::env::remove_var(toggle_env);
 
         init_tracing(Some("[")).expect("repeated tracing init should short-circuit cleanly");
+    }
+
+    #[test]
+    fn trace_file_helpers_ignore_blank_and_open_append_file() {
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let path_env = "MOONCAKE_TEST_TRACE_FILE";
+        let temp_dir =
+            std::env::temp_dir().join(format!("mooncake-store-trace-{}", std::process::id()));
+        let trace_path = temp_dir.join("nested").join("real-client.log");
+
+        with_env_var(path_env, None, || {
+            assert_eq!(
+                trace_file_from_env(path_env).expect("missing trace file env should parse"),
+                None
+            );
+        });
+
+        with_env_var(path_env, Some(""), || {
+            assert_eq!(
+                trace_file_from_env(path_env).expect("blank trace file env should parse"),
+                None
+            );
+        });
+
+        let mut file = open_trace_file(&trace_path).expect("trace file should open");
+        writeln!(file, "first line").expect("trace file write should succeed");
+        drop(file);
+
+        let contents = std::fs::read_to_string(&trace_path).expect("trace file should be readable");
+        assert!(contents.contains("first line"));
+
+        let _ = std::fs::remove_file(&trace_path);
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]

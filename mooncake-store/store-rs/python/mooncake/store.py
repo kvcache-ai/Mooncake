@@ -795,7 +795,9 @@ def _start_metrics_server_from_env() -> str | None:
     return _native.start_metrics_server(str(bind_addr).strip())
 
 def _init_tracing_from_env() -> bool:
-    if not _env_truthy(os.environ.get("MC_STORE_RS_TRACE")):
+    if not _env_truthy(os.environ.get("MC_STORE_RS_TRACE")) and not _has_value(
+        os.environ.get("MC_STORE_RS_TRACE_FILE")
+    ):
         return False
     trace_filter = _coerce_optional_str(os.environ.get("MC_STORE_RS_TRACE_FILTER"))
     _native.init_tracing(trace_filter)

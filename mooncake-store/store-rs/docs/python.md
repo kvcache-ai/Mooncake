@@ -473,7 +473,9 @@ The real backend keeps batch read behavior compatible with upstream Mooncake whi
 - `stop_metrics_server()`
 - `metrics_server_address()`
 
-Python real clients also auto-initialize Rust tracing before `setup(...)` when `MC_STORE_RS_TRACE=1`; use `MC_STORE_RS_TRACE_FILTER` to pass a `tracing_subscriber` filter.
+Python real clients also auto-initialize Rust tracing before `setup(...)` when `MC_STORE_RS_TRACE=1` or `MC_STORE_RS_TRACE_FILE` is set; use `MC_STORE_RS_TRACE_FILTER` to pass a `tracing_subscriber` filter.
+
+When `MC_STORE_RS_TRACE_FILE=/path/to/real-client.log` is set, Rust tracing appends to that file instead of writing to the process stdout/stderr stream. This is the recommended way to keep SGLang real-client logs separate from SGLang server logs.
 
 ## Metadata URLs
 

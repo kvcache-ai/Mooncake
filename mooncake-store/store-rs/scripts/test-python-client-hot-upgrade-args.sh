@@ -370,6 +370,20 @@ finally:
     os.environ.pop("MC_STORE_RS_TRACE_FILTER", None)
     trace_state["filters"].clear()
 
+os.environ["MC_STORE_RS_TRACE_FILE"] = "/tmp/mooncake-real-client.log"
+try:
+    store.setup(
+        "127.0.0.1",
+        "redis://127.0.0.1:6379/0",
+        1024,
+        512,
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert trace_state["filters"] == [None]
+finally:
+    os.environ.pop("MC_STORE_RS_TRACE_FILE", None)
+    trace_state["filters"].clear()
+
 try:
     store.setup(
         "127.0.0.1:17111",

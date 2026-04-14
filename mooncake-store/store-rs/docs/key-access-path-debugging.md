@@ -47,6 +47,7 @@ Python package, use environment variables:
 ```bash
 export MC_STORE_RS_TRACE=1
 export MC_STORE_RS_TRACE_FILTER='info,mooncake_store_client::client=debug,mooncake_store_client::route_directory=debug,mooncake_store_client::control_plane=debug,hyper=warn,h2=warn,tower=warn,tonic=warn'
+export MC_STORE_RS_TRACE_FILE=/tmp/mooncake-real-client-debug.log
 export MC_STORE_RS_METRICS_ADDR='0.0.0.0:19101'
 
 python -m sglang.launch_server ...
@@ -54,6 +55,7 @@ python -m sglang.launch_server ...
 
 `MC_STORE_RS_TRACE=1` initializes Rust tracing before `setup(...)`.
 `MC_STORE_RS_TRACE_FILTER` is passed directly to `tracing_subscriber`.
+`MC_STORE_RS_TRACE_FILE` appends the Rust real-client trace to a dedicated file.
 `MC_STORE_RS_METRICS_ADDR` starts the in-process `/metrics` endpoint after
 real-client setup.
 
