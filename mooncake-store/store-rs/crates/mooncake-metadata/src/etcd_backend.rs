@@ -7,6 +7,7 @@ use mooncake_store_core::{
     SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
 };
 
+use crate::keyspace::parse_route_policy_domain;
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 
@@ -465,6 +466,54 @@ impl MetadataBackend for EtcdMetadataBackend {
                 .await
                 .map_err(etcd_error("etcd put route policy if absent"))?;
             Ok(response.succeeded())
+        })
+    }
+
+    fn put_route_policy(&self, domain: &RoutePolicyDomain, policy: &RoutePolicy) -> Result<()> {
+        let key = self.config.keyspace.route_policy(domain);
+        let payload = serde_json::to_string(policy).map_err(json_error)?;
+        self.block_on(async {
+            let mut client = self.client().await?;
+            client
+                .put(key, payload, None)
+                .await
+                .map_err(etcd_error("etcd put route policy"))?;
+            Ok(())
+        })
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> Result<bool> {
+        let key = self.config.keyspace.route_policy(domain);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .delete(key, None)
+                .await
+                .map_err(etcd_error("etcd delete route policy"))?;
+            Ok(response.deleted() != 0)
+        })
+    }
+
+    fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        let prefix = format!("{}/system/route-policy/", self.config.keyspace.prefix());
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(prefix.clone(), Some(GetOptions::new().with_prefix()))
+                .await
+                .map_err(etcd_error("etcd list route policies"))?;
+            let mut policies = response
+                .kvs()
+                .iter()
+                .filter_map(|kv| {
+                    let key = std::str::from_utf8(kv.key()).ok()?;
+                    let domain = parse_route_policy_domain(&self.config.keyspace, key)?;
+                    let policy = serde_json::from_slice(kv.value()).ok()?;
+                    Some((domain, policy))
+                })
+                .collect::<Vec<_>>();
+            policies.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok(policies)
         })
     }
 

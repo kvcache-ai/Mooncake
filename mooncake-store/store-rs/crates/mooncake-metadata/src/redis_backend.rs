@@ -8,6 +8,7 @@ use mooncake_store_core::{
 };
 use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
 
+use crate::keyspace::parse_route_policy_domain;
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 
@@ -996,6 +997,47 @@ impl MetadataBackend for RedisMetadataBackend {
         })
     }
 
+    fn put_route_policy(&self, domain: &RoutePolicyDomain, policy: &RoutePolicy) -> Result<()> {
+        let mut connection = self.connection()?;
+        let key = self.keyspace.route_policy(domain);
+        let payload = serde_json::to_string(policy).map_err(json_error)?;
+        connection
+            .set::<_, _, ()>(key, payload)
+            .map_err(|error| metadata_error("redis set route policy", error))
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let key = self.keyspace.route_policy(domain);
+        let removed: usize = connection
+            .del(key)
+            .map_err(|error| metadata_error("redis del route policy", error))?;
+        Ok(removed != 0)
+    }
+
+    fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        let mut connection = self.connection()?;
+        let prefix = format!("{}/system/route-policy/", self.keyspace.prefix());
+        let keys: Vec<String> = connection
+            .keys(format!("{}*", prefix))
+            .map_err(|error| metadata_error("redis keys route policy", error))?;
+        let mut policies = Vec::new();
+        for key in keys {
+            let payload: Option<String> = connection
+                .get(&key)
+                .map_err(|error| metadata_error("redis get route policy", error))?;
+            let Some(payload) = payload else {
+                continue;
+            };
+            let Some(domain) = parse_route_policy_domain(&self.keyspace, &key) else {
+                continue;
+            };
+            policies.push((domain, serde_json::from_str(&payload).map_err(json_error)?));
+        }
+        policies.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(policies)
+    }
+
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
         let key = self.keyspace.handoff(&handoff.stable_id);
         let payload = serde_json::to_string(handoff).map_err(json_error)?;
@@ -1090,8 +1132,9 @@ mod tests {
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
-        ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion,
-        SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+        ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy,
+        RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
+        SegmentName, StoreError,
     };
     use redis::Commands;
 
@@ -1444,6 +1487,11 @@ mod tests {
             return;
         };
         let keyspace = MetadataKeyspace::new("test/redis-object-index");
+    fn redis_backend_route_policy_supports_overwrite_list_and_delete() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-route-policy");
         let backend = RedisMetadataBackend::new(
             RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
         )
@@ -1500,6 +1548,46 @@ mod tests {
         assert!(should_retry_readonly_redis_error(&timed_out));
         assert!(should_retry_readonly_redis_error(&dropped));
         assert!(!should_retry_readonly_redis_error(&refused));
+        let creator = ClientRuntimeId::new("route-owner", ClientEpoch(7));
+        let default_policy = RoutePolicy {
+            route_topk: 2,
+            route_control: RouteControlMode::EmbeddedWrh,
+            created_by: creator.clone(),
+            created_at_ms: 11,
+        };
+        let tenant_domain = RoutePolicyDomain::Tenant("tenant/a".to_string());
+        let tenant_policy = RoutePolicy {
+            route_topk: 4,
+            route_control: RouteControlMode::MetadataOnly,
+            created_by: creator,
+            created_at_ms: 22,
+        };
+
+        assert!(backend
+            .put_route_policy_if_absent(&RoutePolicyDomain::Default, &default_policy)
+            .expect("default route policy bootstrap should succeed"));
+        backend
+            .put_route_policy(&tenant_domain, &tenant_policy)
+            .expect("tenant route policy overwrite should succeed");
+        let listed = backend
+            .list_route_policies()
+            .expect("route policy listing should succeed");
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|(domain, policy)| {
+            *domain == RoutePolicyDomain::Default && *policy == default_policy
+        }));
+        assert!(listed
+            .iter()
+            .any(|(domain, policy)| *domain == tenant_domain && *policy == tenant_policy));
+        assert!(backend
+            .delete_route_policy(&tenant_domain)
+            .expect("tenant route policy delete should succeed"));
+        assert_eq!(
+            backend
+                .get_route_policy(&tenant_domain)
+                .expect("tenant route policy read should succeed"),
+            None,
+        );
     }
 
     #[test]

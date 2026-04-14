@@ -285,7 +285,7 @@ fn build_transport_config(
     }
 }
 
-fn build_metadata_backend(
+pub fn build_metadata_backend(
     metadata_url: &str,
     transport_metadata_url: Option<String>,
     keyspace: MetadataKeyspace,
