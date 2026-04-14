@@ -72,8 +72,15 @@ impl PlacementPlanner {
         object: &ObjectRef<'_>,
     ) -> Result<Vec<ClientRuntimeId>> {
         let tenant = object.tenant.unwrap_or(observer.default_tenant());
+        let domain = object.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN);
+        let object_set = object
+            .object_set
+            .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET);
+        let qos_tier = object
+            .qos_tier
+            .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER);
         let candidates = self.candidates_for_client(observer, 1)?;
-        Ok(self.rank_candidates(tenant, object.key, &candidates))
+        Ok(self.rank_candidates(object, tenant, domain, object_set, qos_tier, &candidates))
     }
 
     pub fn rank_many(
@@ -107,7 +114,10 @@ impl PlacementPlanner {
         let mut plans = Vec::with_capacity(objects.len());
         for object in objects {
             let tenant = object.tenant.unwrap_or(default_tenant).to_string();
-            let domain = object.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN).to_string();
+            let domain = object
+                .domain
+                .unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)
+                .to_string();
             let object_set = object
                 .object_set
                 .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET)
@@ -116,7 +126,14 @@ impl PlacementPlanner {
                 .qos_tier
                 .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
                 .to_string();
-            let scored = self.rank_candidates(object, &tenant, &domain, &object_set, &qos_tier, &candidates);
+            let scored = self.rank_candidates(
+                object,
+                &tenant,
+                &domain,
+                &object_set,
+                &qos_tier,
+                &candidates,
+            );
             plans.push(PlacementChoice {
                 tenant,
                 domain,
@@ -137,8 +154,12 @@ impl PlacementPlanner {
     ) -> Result<Vec<ClientRuntimeId>> {
         let tenant = object.tenant.unwrap_or(default_tenant);
         let domain = object.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN);
-        let object_set = object.object_set.unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET);
-        let qos_tier = object.qos_tier.unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER);
+        let object_set = object
+            .object_set
+            .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET);
+        let qos_tier = object
+            .qos_tier
+            .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER);
         let candidates = self.candidates(observer)?;
         Ok(self.rank_candidates(object, tenant, domain, object_set, qos_tier, &candidates))
     }
@@ -153,7 +174,10 @@ impl PlacementPlanner {
         let mut plans = Vec::with_capacity(objects.len());
         for object in objects {
             let tenant = object.tenant.unwrap_or(default_tenant).to_string();
-            let domain = object.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN).to_string();
+            let domain = object
+                .domain
+                .unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)
+                .to_string();
             let object_set = object
                 .object_set
                 .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET)
@@ -162,7 +186,14 @@ impl PlacementPlanner {
                 .qos_tier
                 .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
                 .to_string();
-            let owners = self.rank_candidates(object, &tenant, &domain, &object_set, &qos_tier, &candidates);
+            let owners = self.rank_candidates(
+                object,
+                &tenant,
+                &domain,
+                &object_set,
+                &qos_tier,
+                &candidates,
+            );
             plans.push(PlacementChoice {
                 tenant,
                 domain,
@@ -231,8 +262,15 @@ impl PlacementPlanner {
             .iter()
             .map(|candidate| {
                 (
-                    rendezvous_score(tenant, domain, object_set, qos_tier, object.key, &candidate.runtime)
-                        .saturating_add(locality_bonus(candidate, object)),
+                    rendezvous_score(
+                        tenant,
+                        domain,
+                        object_set,
+                        qos_tier,
+                        object.key,
+                        &candidate.runtime,
+                    )
+                    .saturating_add(locality_bonus(candidate, object)),
                     candidate.runtime.clone(),
                 )
             })
@@ -257,9 +295,25 @@ impl PlacementPlanner {
         let mut plans = Vec::with_capacity(objects.len());
         for object in objects {
             let tenant = object.tenant.unwrap_or(default_tenant).to_string();
-            let scored = self.rank_candidates(&tenant, object.key, candidates);
+            let domain = object
+                .domain
+                .unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)
+                .to_string();
+            let object_set = object
+                .object_set
+                .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET)
+                .to_string();
+            let qos_tier = object
+                .qos_tier
+                .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
+                .to_string();
+            let scored =
+                self.rank_candidates(object, &tenant, &domain, &object_set, &qos_tier, candidates);
             plans.push(PlacementChoice {
                 tenant,
+                domain,
+                object_set,
+                qos_tier,
                 key: object.key.to_string(),
                 owners: scored.into_iter().take(replica_count).collect(),
             });
@@ -276,9 +330,25 @@ impl PlacementPlanner {
         let mut plans = Vec::with_capacity(objects.len());
         for object in objects {
             let tenant = object.tenant.unwrap_or(default_tenant).to_string();
-            let owners = self.rank_candidates(&tenant, object.key, candidates);
+            let domain = object
+                .domain
+                .unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)
+                .to_string();
+            let object_set = object
+                .object_set
+                .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET)
+                .to_string();
+            let qos_tier = object
+                .qos_tier
+                .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
+                .to_string();
+            let owners =
+                self.rank_candidates(object, &tenant, &domain, &object_set, &qos_tier, candidates);
             plans.push(PlacementChoice {
                 tenant,
+                domain,
+                object_set,
+                qos_tier,
                 key: object.key.to_string(),
                 owners,
             });
@@ -524,7 +594,14 @@ mod tests {
     #[test]
     fn planner_prefers_matching_namespace_labels() {
         let metadata = Arc::new(InMemoryMetadataBackend::new());
-        publish_client(metadata.as_ref(), "writer", 1, ClientLifecycleState::Active, "pool-a", "false");
+        publish_client(
+            metadata.as_ref(),
+            "writer",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "false",
+        );
         publish_labeled_client(
             metadata.as_ref(),
             "storage-a",
@@ -605,16 +682,26 @@ mod tests {
             segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
             labels: Default::default(),
         };
-        endpoints.labels.insert("pool".to_string(), pool.to_string());
-        endpoints.labels.insert("storage".to_string(), storage.to_string());
+        endpoints
+            .labels
+            .insert("pool".to_string(), pool.to_string());
+        endpoints
+            .labels
+            .insert("storage".to_string(), storage.to_string());
         if let Some(domain) = domain {
-            endpoints.labels.insert("domain".to_string(), domain.to_string());
+            endpoints
+                .labels
+                .insert("domain".to_string(), domain.to_string());
         }
         if let Some(object_set) = object_set {
-            endpoints.labels.insert("object_set".to_string(), object_set.to_string());
+            endpoints
+                .labels
+                .insert("object_set".to_string(), object_set.to_string());
         }
         if let Some(qos_tier) = qos_tier {
-            endpoints.labels.insert("qos_tier".to_string(), qos_tier.to_string());
+            endpoints
+                .labels
+                .insert("qos_tier".to_string(), qos_tier.to_string());
         }
         metadata
             .upsert_client_lease(&ClientLease {

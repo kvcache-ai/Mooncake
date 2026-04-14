@@ -363,6 +363,11 @@ impl StorageOwnerState {
             }
             Some(ObjectRoute {
                 key: route.key.clone(),
+                namespace: route.namespace.clone(),
+                logical_key: route.logical_key.clone(),
+                canonical_key: route.canonical_key.clone(),
+                sharing_scope: route.sharing_scope.clone(),
+                qos_tier: route.qos_tier.clone(),
                 version: route.version.next(),
                 state: route.state,
                 compatibility: route.compatibility.clone(),
