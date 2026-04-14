@@ -280,6 +280,13 @@ For cross-host or cross-container real-mode deployments, set a reachable `local_
 
 The compatibility client defaults `lease_ttl_ms` to `30000`. Keep the heartbeat interval comfortably below that TTL so dead peers converge quickly without triggering avoidable churn.
 
+Heartbeat refresh now uses a dedicated publish timeout instead of the generic
+dispatcher request timeout. Standalone clients also retry failed heartbeat
+publishes instead of exiting on the first timeout. Use
+`heartbeat_timeout_ms` / `--heartbeat-timeout-ms` or
+`MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` when cloud metadata links need a longer
+budget than the default request path.
+
 ## Read-side Membership and Failure Semantics
 
 The client keeps membership refresh out of the steady-state request path.
@@ -322,6 +329,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRANSPORT_RPC_PORT` | Python wrapper setup fallback | fixed real data-plane transport port |
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |
 | `MC_STORE_RS_EXPIRES_AT_MS` | Python wrapper setup fallback | absolute lease expiry timestamp in milliseconds |
+| `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | dedicated dispatcher timeout for heartbeat publish |
 | `MC_STORE_RS_TRACE` | Python wrapper setup fallback, e2e, and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |
 | `MC_STORE_RS_METRICS_ADDR` | Python wrapper setup fallback, e2e, and applications | bind address for the in-process metrics server |
@@ -329,6 +337,8 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_REDIS_PORT` | local scripts and e2e | local Redis port |
 | `MC_REDIS_USERNAME` | Redis metadata backends and transport Redis plugins | optional Redis ACL username |
 | `MC_REDIS_PASSWORD` | Redis metadata backends and transport Redis plugins | optional Redis password; enables auth when set |
+| `MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS` | Redis metadata backend | connection timeout for sync Redis metadata calls |
+| `MC_STORE_RS_REDIS_IO_TIMEOUT_MS` | Redis metadata backend | read/write timeout for sync Redis metadata calls |
 | `MC_STORE_RS_VALUE_SIZE` | Rust e2e | payload size for validation and benchmark loops |
 | `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |

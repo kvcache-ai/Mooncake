@@ -125,17 +125,7 @@ impl StoreClient {
 
 impl MooncakeCompatibilityFacade for StoreClient {
     fn heartbeat(&mut self, expires_at_ms: u64) -> Result<()> {
-        let _span = info_span!(
-            "store.heartbeat",
-            runtime = %self.lease.runtime,
-            expires_at_ms
-        )
-        .entered();
-        let tracker = OperationTracker::new("heartbeat");
-        self.lease.expires_at_ms = expires_at_ms;
-        let result = self.metadata.upsert_client_lease(&self.lease);
-        tracker.finish(&result, 0);
-        result
+        self.prepare_heartbeat(expires_at_ms).publish()
     }
 
     fn enter_standby(&mut self) -> Result<()> {
@@ -1057,6 +1047,16 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let result = Ok(sizes);
         tracker.finish(&result, bytes_out);
         result
+    }
+}
+
+impl StoreClient {
+    pub fn prepare_heartbeat(&mut self, expires_at_ms: u64) -> HeartbeatLease {
+        self.lease.expires_at_ms = expires_at_ms;
+        HeartbeatLease {
+            metadata: self.metadata.clone(),
+            lease: self.lease.clone(),
+        }
     }
 }
 

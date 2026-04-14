@@ -23,6 +23,8 @@ type RegionKey = (u64, u64, u64);
 type RegionMap = BTreeMap<RegionKey, OwnedMappedRegion>;
 type TrackedKey = (String, String);
 const DISPATCHER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPATCHER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const HEARTBEAT_TIMEOUT_ENV: &str = "MC_STORE_RS_HEARTBEAT_TIMEOUT_MS";
 static DISPATCHER_RUNTIME: LazyLock<Runtime> =
     LazyLock::new(|| Runtime::new().expect("dispatcher runtime should initialize"));
 
@@ -35,10 +37,20 @@ pub struct StoreDispatcher {
     regions: Arc<Mutex<RegionMap>>,
     state: Arc<Mutex<DispatcherState>>,
     closed: Arc<AtomicBool>,
+    heartbeat_inflight: Arc<AtomicBool>,
+    heartbeat_timeout: Duration,
 }
 
 impl StoreDispatcher {
     pub fn spawn(client: StoreClient, _thread_name: impl Into<String>) -> Result<Self, StoreError> {
+        Self::spawn_with_heartbeat_timeout(client, _thread_name, heartbeat_timeout_from_env())
+    }
+
+    pub fn spawn_with_heartbeat_timeout(
+        client: StoreClient,
+        _thread_name: impl Into<String>,
+        heartbeat_timeout: Duration,
+    ) -> Result<Self, StoreError> {
         Ok(Self {
             client: Arc::new(RwLock::new(client)),
             regions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -46,6 +58,8 @@ impl StoreDispatcher {
                 tracked_keys: BTreeSet::new(),
             })),
             closed: Arc::new(AtomicBool::new(false)),
+            heartbeat_inflight: Arc::new(AtomicBool::new(false)),
+            heartbeat_timeout: heartbeat_timeout.max(Duration::from_millis(1)),
         })
     }
 
@@ -54,7 +68,28 @@ impl StoreDispatcher {
     }
 
     pub fn heartbeat(&self, expires_at_ms: u64) -> Result<(), StoreError> {
-        self.run_mut(move |client| client.heartbeat(expires_at_ms))
+        self.ensure_open()?;
+        if self.heartbeat_inflight.swap(true, Ordering::SeqCst) {
+            return Err(StoreError::Transport(
+                "store dispatcher heartbeat publish is still in flight".to_string(),
+            ));
+        }
+        let heartbeat = match self.prepare_heartbeat(expires_at_ms) {
+            Ok(heartbeat) => heartbeat,
+            Err(error) => {
+                self.heartbeat_inflight.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let inflight = self.heartbeat_inflight.clone();
+        DISPATCHER_RUNTIME.block_on(self.await_blocking_with_timeout(
+            "heartbeat publish",
+            self.heartbeat_timeout,
+            move || {
+                let _guard = InflightGuard(inflight);
+                heartbeat.publish()
+            },
+        ))
     }
 
     pub fn activate(&self) -> Result<(), StoreError> {
@@ -160,7 +195,7 @@ impl StoreDispatcher {
                 return Err(dispatcher_stopped());
             }
             let Some(client) = client.try_read_for(DISPATCHER_REQUEST_TIMEOUT) else {
-                return Err(dispatcher_timeout("read lock"));
+                return Err(dispatcher_timeout("read lock", DISPATCHER_REQUEST_TIMEOUT));
             };
             f(&client)
         })
@@ -180,7 +215,7 @@ impl StoreDispatcher {
                 return Err(dispatcher_stopped());
             }
             let Some(mut client) = client.try_write_for(DISPATCHER_REQUEST_TIMEOUT) else {
-                return Err(dispatcher_timeout("write lock"));
+                return Err(dispatcher_timeout("write lock", DISPATCHER_REQUEST_TIMEOUT));
             };
             f(&mut client)
         })
@@ -288,13 +323,26 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce() -> Result<T, StoreError> + Send + 'static,
     {
-        match tokio::time::timeout(DISPATCHER_REQUEST_TIMEOUT, tokio::task::spawn_blocking(f)).await
-        {
+        self.await_blocking_with_timeout("request execution", DISPATCHER_REQUEST_TIMEOUT, f)
+            .await
+    }
+
+    async fn await_blocking_with_timeout<T, F>(
+        &self,
+        context: &'static str,
+        timeout: Duration,
+        f: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, StoreError> + Send + 'static,
+    {
+        match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => Err(StoreError::Transport(format!(
                 "store dispatcher worker failed: {error}"
             ))),
-            Err(_) => Err(dispatcher_timeout("request execution")),
+            Err(_) => Err(dispatcher_timeout(context, timeout)),
         }
     }
 
@@ -303,6 +351,27 @@ impl StoreDispatcher {
             return Err(dispatcher_stopped());
         }
         Ok(())
+    }
+
+    fn prepare_heartbeat(
+        &self,
+        expires_at_ms: u64,
+    ) -> Result<mooncake_store_client::HeartbeatLease, StoreError> {
+        let Some(mut client) = self.client.try_write_for(DISPATCHER_REQUEST_TIMEOUT) else {
+            return Err(dispatcher_timeout(
+                "heartbeat prepare write lock",
+                DISPATCHER_REQUEST_TIMEOUT,
+            ));
+        };
+        Ok(client.prepare_heartbeat(expires_at_ms))
+    }
+}
+
+struct InflightGuard(Arc<AtomicBool>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -579,11 +648,20 @@ fn dispatcher_stopped() -> StoreError {
     StoreError::Transport("store dispatcher stopped".to_string())
 }
 
-fn dispatcher_timeout(context: &'static str) -> StoreError {
+fn dispatcher_timeout(context: &'static str, timeout: Duration) -> StoreError {
     StoreError::Transport(format!(
         "store dispatcher {context} timed out after {}ms",
-        DISPATCHER_REQUEST_TIMEOUT.as_millis(),
+        timeout.as_millis(),
     ))
+}
+
+fn heartbeat_timeout_from_env() -> Duration {
+    std::env::var(HEARTBEAT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DISPATCHER_HEARTBEAT_TIMEOUT)
 }
 
 fn track_key(state: &Arc<Mutex<DispatcherState>>, tenant: String, key: String) {

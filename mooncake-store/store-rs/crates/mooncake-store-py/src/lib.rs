@@ -1569,9 +1569,10 @@ mod tests {
         LocalMemoryConfig, StoreClient, StoreClientBuilder, StoreTransport,
     };
     use mooncake_store_core::{
-        ClientEpoch, ClientLifecycleState, ClientRuntimeId, CompatibilityDescriptor, ObjectKey,
-        ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentAnnouncement,
-        SegmentLifecycleState, SegmentName, StoreError,
+        CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
+        CompatibilityDescriptor, HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute,
+        ReplicaRoute, ReplicaTier, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
+        SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
     };
     use mooncake_transport::{
         Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
@@ -1875,7 +1876,10 @@ mod tests {
     }
 
     fn build_client(name: &str) -> StoreClient {
-        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        build_client_with_metadata(name, Arc::new(InMemoryMetadataBackend::new()))
+    }
+
+    fn build_client_with_metadata(name: &str, metadata: Arc<dyn MetadataBackend>) -> StoreClient {
         let transport = Arc::new(TestTransport::new(&format!("{name}-segment")));
         StoreClientBuilder::new(metadata, name)
             .epoch(ClientEpoch(1))
@@ -1891,6 +1895,156 @@ mod tests {
             )
             .build(60_000)
             .expect("test store client should build")
+    }
+
+    struct BlockingLeaseMetadata {
+        inner: InMemoryMetadataBackend,
+        block_enabled: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl BlockingLeaseMetadata {
+        fn new(
+            block_enabled: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+            entered: std::sync::mpsc::Sender<()>,
+        ) -> Self {
+            Self {
+                inner: InMemoryMetadataBackend::new(),
+                block_enabled,
+                release,
+                entered: std::sync::Mutex::new(Some(entered)),
+            }
+        }
+    }
+
+    impl MetadataBackend for BlockingLeaseMetadata {
+        fn route_namespace(&self) -> String {
+            self.inner.route_namespace()
+        }
+
+        fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+            if self.block_enabled.load(Ordering::SeqCst) {
+                if let Some(sender) = self.entered.lock().expect("mutex poisoned").take() {
+                    let _ = sender.send(());
+                }
+                while !self.release.load(Ordering::SeqCst) {
+                    sleep(Duration::from_millis(10));
+                }
+            }
+            self.inner.upsert_client_lease(lease)
+        }
+
+        fn update_client_state(
+            &self,
+            runtime: &ClientRuntimeId,
+            next: ClientLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_client_state(runtime, next)
+        }
+
+        fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+            self.inner.list_live_clients()
+        }
+
+        fn publish_segment(
+            &self,
+            segment: &SegmentAnnouncement,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.publish_segment(segment)
+        }
+
+        fn unpublish_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.unpublish_segment(owner, segment)
+        }
+
+        fn list_segments(
+            &self,
+            owner: Option<&ClientRuntimeId>,
+        ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+            self.inner.list_segments(owner)
+        }
+
+        fn update_segment_state(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            next: SegmentLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_segment_state(owner, segment, next)
+        }
+
+        fn reserve_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            length_bytes: u64,
+        ) -> mooncake_store_core::Result<SegmentReservation> {
+            self.inner.reserve_segment(owner, segment, length_bytes)
+        }
+
+        fn release_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            offset_bytes: u64,
+            length_bytes: u64,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner
+                .release_segment(owner, segment, offset_bytes, length_bytes)
+        }
+
+        fn get_object_route(
+            &self,
+            key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+            self.inner.get_object_route(key)
+        }
+
+        fn list_object_routes(&self) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+            self.inner.list_object_routes()
+        }
+
+        fn compare_and_swap_object_route(
+            &self,
+            key: &ObjectKey,
+            expected: Option<RouteVersion>,
+            next: Option<&ObjectRoute>,
+        ) -> mooncake_store_core::Result<CasResult> {
+            self.inner
+                .compare_and_swap_object_route(key, expected, next)
+        }
+
+        fn get_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+        ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+            self.inner.get_route_policy(domain)
+        }
+
+        fn put_route_policy_if_absent(
+            &self,
+            domain: &RoutePolicyDomain,
+            policy: &RoutePolicy,
+        ) -> mooncake_store_core::Result<bool> {
+            self.inner.put_route_policy_if_absent(domain, policy)
+        }
+
+        fn put_handoff(&self, handoff: &HandoffPlan) -> mooncake_store_core::Result<()> {
+            self.inner.put_handoff(handoff)
+        }
+
+        fn get_handoff(
+            &self,
+            stable_id: &ClientStableId,
+        ) -> mooncake_store_core::Result<Option<HandoffPlan>> {
+            self.inner.get_handoff(stable_id)
+        }
     }
 
     fn build_real_store(name: &str) -> PyMooncakeDistributedStore {
@@ -2905,5 +3059,74 @@ mod tests {
             .join()
             .expect("dispatcher shared worker should join")
             .expect("first shared request should finish after release");
+    }
+
+    #[test]
+    fn dispatcher_heartbeat_timeout_does_not_block_shared_requests() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let block_enabled = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(BlockingLeaseMetadata::new(
+            block_enabled.clone(),
+            release.clone(),
+            entered_tx,
+        ));
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn_with_heartbeat_timeout(
+                build_client_with_metadata("dispatcher-heartbeat", metadata),
+                "dispatcher-heartbeat".to_string(),
+                Duration::from_millis(200),
+            )
+            .expect("dispatcher should spawn"),
+        );
+        block_enabled.store(true, Ordering::SeqCst);
+
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-heartbeat-timeout".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || dispatcher.heartbeat(60_000)
+            })
+            .expect("heartbeat timeout worker should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("heartbeat publish should enter metadata");
+
+        let started = std::time::Instant::now();
+        let shared = dispatcher
+            .run(|_client| Ok::<_, StoreError>(11usize))
+            .expect("shared request should proceed while heartbeat publish is stuck");
+        assert_eq!(shared, 11);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shared request should not wait for stuck heartbeat publish"
+        );
+
+        let error = worker
+            .join()
+            .expect("heartbeat timeout worker should join")
+            .expect_err("stuck heartbeat should time out");
+        assert!(
+            matches!(error, StoreError::Transport(ref message) if message.contains("heartbeat publish timed out")),
+            "unexpected error: {error}"
+        );
+
+        let inflight = dispatcher
+            .heartbeat(60_000)
+            .expect_err("second heartbeat should see the first publish still in flight");
+        assert!(
+            matches!(inflight, StoreError::Transport(ref message) if message.contains("still in flight")),
+            "unexpected in-flight error: {inflight}"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..50 {
+            if dispatcher.heartbeat(60_000).is_ok() {
+                return;
+            }
+            sleep(Duration::from_millis(20));
+        }
+        panic!("heartbeat should recover after the blocked publish is released");
     }
 }

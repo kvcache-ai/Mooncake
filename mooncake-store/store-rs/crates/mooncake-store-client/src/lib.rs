@@ -7,8 +7,9 @@ mod route_directory;
 mod transport;
 
 pub use client::{
-    GetRequest, MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest,
-    ObjectRef, PutFromRequest, PutRequest, ReplicationPolicy, StoreClient, StoreClientBuilder,
+    GetRequest, HeartbeatLease, MooncakeCompatibilityFacade, MultiBufferGetRequest,
+    MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest, ReplicationPolicy, StoreClient,
+    StoreClientBuilder,
 };
 pub use memory::LocalMemoryConfig;
 pub use mooncake_store_core::RouteControlMode;

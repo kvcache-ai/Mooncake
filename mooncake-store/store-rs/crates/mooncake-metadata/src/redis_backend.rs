@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
@@ -203,6 +203,11 @@ redis.call('HSET', key,
 return {1, used}
 "#;
 
+const REDIS_CONNECT_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS";
+const REDIS_IO_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_IO_TIMEOUT_MS";
+const DEFAULT_REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_REDIS_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Clone, Debug)]
 pub struct RedisMetadataConfig {
     pub url: String,
@@ -246,9 +251,17 @@ impl RedisMetadataBackend {
     }
 
     fn connection(&self) -> Result<redis::Connection> {
-        self.client
-            .get_connection()
-            .map_err(|error| metadata_error("redis get_connection", error))
+        let connection = self
+            .client
+            .get_connection_with_timeout(redis_connect_timeout())
+            .map_err(|error| metadata_error("redis get_connection", error))?;
+        connection
+            .set_read_timeout(Some(redis_io_timeout()))
+            .map_err(|error| metadata_error("redis set_read_timeout", error))?;
+        connection
+            .set_write_timeout(Some(redis_io_timeout()))
+            .map_err(|error| metadata_error("redis set_write_timeout", error))?;
+        Ok(connection)
     }
 
     fn load_segment_state(
@@ -346,6 +359,23 @@ fn redacted_route_namespace_source(url: &str) -> String {
         }
         None => url.to_string(),
     }
+}
+
+fn redis_connect_timeout() -> Duration {
+    duration_from_env_ms(REDIS_CONNECT_TIMEOUT_ENV, DEFAULT_REDIS_CONNECT_TIMEOUT)
+}
+
+fn redis_io_timeout() -> Duration {
+    duration_from_env_ms(REDIS_IO_TIMEOUT_ENV, DEFAULT_REDIS_IO_TIMEOUT)
+}
+
+fn duration_from_env_ms(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(default)
 }
 
 impl MetadataBackend for RedisMetadataBackend {
@@ -743,8 +773,10 @@ mod tests {
     use redis::Commands;
 
     use super::{
-        redacted_route_namespace_source, redis_connection_info, MetadataKeyspace,
-        RedisMetadataBackend, RedisMetadataConfig,
+        redacted_route_namespace_source, redis_connect_timeout, redis_connection_info,
+        redis_io_timeout, MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig,
+        DEFAULT_REDIS_CONNECT_TIMEOUT, DEFAULT_REDIS_IO_TIMEOUT, REDIS_CONNECT_TIMEOUT_ENV,
+        REDIS_IO_TIMEOUT_ENV,
     };
 
     struct RedisTestServer {
@@ -1091,6 +1123,21 @@ mod tests {
 
         std::env::remove_var("MC_REDIS_USERNAME");
         std::env::remove_var("MC_REDIS_PASSWORD");
+    }
+
+    #[test]
+    fn redis_timeout_helpers_honor_env_overrides() {
+        let _guard = env_lock();
+        std::env::set_var(REDIS_CONNECT_TIMEOUT_ENV, "7000");
+        std::env::set_var(REDIS_IO_TIMEOUT_ENV, "11000");
+
+        assert_eq!(redis_connect_timeout(), Duration::from_secs(7));
+        assert_eq!(redis_io_timeout(), Duration::from_secs(11));
+
+        std::env::remove_var(REDIS_CONNECT_TIMEOUT_ENV);
+        std::env::remove_var(REDIS_IO_TIMEOUT_ENV);
+        assert_eq!(redis_connect_timeout(), DEFAULT_REDIS_CONNECT_TIMEOUT);
+        assert_eq!(redis_io_timeout(), DEFAULT_REDIS_IO_TIMEOUT);
     }
 
     #[test]
