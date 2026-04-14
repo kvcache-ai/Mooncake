@@ -124,11 +124,11 @@ Use `MetadataOnly` for bring-up and debugging. Use `EmbeddedWrh` for normal depl
 Startup bootstrap is metadata-authoritative:
 
 - every client starts with a local route policy: `route_control + route_topk`
-- if the metadata keyspace has no route policy yet, the first successful client writes it with create-if-absent semantics
-- later clients must match the stored policy or startup fails immediately
-- the current bootstrap scope is the metadata keyspace, so request-level tenants share the same route-authority policy inside one deployment
+- if the metadata keyspace has no default route policy yet, the first successful client writes it with create-if-absent semantics
+- startup then resolves the effective policy for the client's default tenant: tenant override first, otherwise the default cluster policy
+- later clients must match that effective policy or startup fails immediately
 
-For tenant-isolated deployments that need different route-authority policy, use a different `MetadataKeyspace`.
+Use `mooncake-store-admin policy set --tenant <tenant> --route-topk <n> --route-control <mode>` when one tenant in a shared metadata keyspace needs a different route-authority policy.
 
 ## Routed Placement
 

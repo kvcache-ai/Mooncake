@@ -148,7 +148,7 @@ After installation, both interfaces are available:
 - `python -c "import mooncake"` loads the native extension
 - `python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"` shows the active Pro runtime
 - `mooncake-store-client --help` runs the packaged standalone client command
-- `mooncake-store-admin --help` runs the packaged metadata maintenance command
+- `mooncake-store-admin --help` runs the packaged metadata maintenance and route-policy management command
 - if your environment still exposes the upstream compatibility alias, `mooncake_master --version` prints the same packaged Pro version banner
 
 ## Standalone Client Binary
@@ -163,7 +163,7 @@ Or use `./scripts/build/build-wheel.sh`, which also copies the binary to `dist/b
 
 When the client is installed from a wheel, the same binary is also embedded inside the package and exposed through the `mooncake-store-client` console script, matching the upstream Mooncake packaging style.
 
-The same wheel also exposes `mooncake-store-admin` for explicit metadata maintenance.
+The same wheel also exposes `mooncake-store-admin` for explicit metadata maintenance and tenant route-policy management.
 
 Start a storage client:
 
@@ -234,11 +234,28 @@ mooncake-store-admin \
   cleanup-stale-segments
 ```
 
+Manage tenant route policy or clean up stale segment registrations with the packaged admin binary:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  policy set \
+  --tenant tenant-a \
+  --route-topk 3 \
+  --route-control embedded-wrh
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  policy get \
+  --tenant tenant-a
+```
+
 Notes:
 
 - client leases expire automatically; segment registration keys do not
 - the cleanup is explicit by design, so temporary lease misses do not trigger automatic deletion
-- `--keyspace <prefix>` scopes the sweep to one metadata namespace
+- tenant route policy is stored in metadata and applied at runtime bootstrap for clients whose default tenant matches the override
+- `--keyspace <prefix>` scopes both policy operations and stale-segment cleanup to one metadata namespace
 - `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` also apply here
 
 ## Basic Real-Mode Example
