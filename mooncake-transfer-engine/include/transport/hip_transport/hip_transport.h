@@ -94,6 +94,14 @@ class HipTransport : public Transport {
     // Stream and event pools for async operations
     StreamPool stream_pool_;
     EventPool event_pool_;
+
+#ifdef USE_HYGON
+    // Copy kernels for Hygon HCU fabric memory
+    bool module_loaded_ = false;
+    std::unordered_map<int, hipModule_t> device_copy_modules_;
+    std::unordered_map<int, hipFunction_t> device_copy_funcs_;
+    void loadCopyModule();
+#endif
 };
 
 }  // namespace mooncake

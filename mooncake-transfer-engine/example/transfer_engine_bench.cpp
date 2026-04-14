@@ -47,7 +47,7 @@
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
 #include <cassert>
 
-#if defined(USE_MNNVL) || defined(USE_UBSHMEM)
+#if defined(USE_MNNVL) || defined(USE_UBSHMEM) || defined(USE_HIP)
 #include "gpu_vendor/mnnvl.h"
 #endif
 
@@ -107,6 +107,7 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
+DEFINE_bool(verify, false, "Verify data correctness after transfer");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
@@ -139,13 +140,21 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #endif
-        if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
+        if (FLAGS_protocol == "nvlink") {
 #ifdef USE_MNNVL
             d_buf = allocateFabricMemory(size);
             LOG(INFO) << "Using MNNVL fabric memory allocation";
 #else
             LOG(ERROR)
-                << "--protocol=nvlink or --protocol=hip requires USE_MNNVL=ON";
+                << "--protocol=nvlink requires USE_MNNVL=ON";
+            return nullptr;
+#endif
+        } else if (FLAGS_protocol == "hip") {
+#ifdef USE_HIP
+            d_buf = allocateFabricMemory(size);
+            LOG(INFO) << "Using HIP fabric memory allocation";
+#else
+            LOG(ERROR) << "--protocol=hip requires USE_HIP=ON";
             return nullptr;
 #endif
         } else if (FLAGS_protocol == "nvlink_intra") {
@@ -196,13 +205,20 @@ static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
-    if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
+    if (FLAGS_protocol == "nvlink") {
 #ifdef USE_MNNVL
         if (FLAGS_use_vram) {
             freeFabricMemory(addr);
             return;
         }
 #endif  // USE_MNNVL
+    } else if (FLAGS_protocol == "hip") {
+#ifdef USE_HIP
+        if (FLAGS_use_vram) {
+            freeFabricMemory(addr);
+            return;
+        }
+#endif
     } else if (FLAGS_protocol == "nvlink_intra") {
 #ifdef USE_INTRA_NVLINK
         if (FLAGS_use_vram) {
@@ -434,6 +450,10 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
         s = engine->freeBatchID(batch_id);
         LOG_ASSERT(s.ok());
         batch_count++;
+        if (FLAGS_verify) {
+            // For verification, only run one batch to check data correctness
+            break;
+        }
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
     total_batch_count.fetch_add(batch_count);
@@ -537,6 +557,17 @@ int initiator() {
 
     auto addr = allocateBuffers();
     for (int i = 0; i < buffer_num; ++i) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
+        if (FLAGS_use_vram) {
+            checkCudaError(cudaMemset(addr[i], 0xAA, FLAGS_buffer_size),
+                           "Failed to initialize device memory");
+             // Ensure memory initialization is done from CPU standpoint
+            checkCudaError(cudaStreamSynchronize(0), "Failed to synchronize");
+        } else {
+            memset(addr[i], 0xAA, FLAGS_buffer_size);
+        }
+#endif
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              getLocationName(i));
         LOG_ASSERT(!rc);
@@ -552,9 +583,12 @@ int initiator() {
     for (int i = 0; i < FLAGS_threads; ++i)
         workers[i] = std::thread(initiatorWorker, engine.get(), segment_id, i,
                                  addr[i % buffer_num]);
-
-    sleep(FLAGS_duration);
-    running = false;
+    if (FLAGS_verify) {
+        LOG(INFO) << "Verification mode: only run one batch for correctness check";
+    } else {
+        sleep(FLAGS_duration);
+        running = false;
+    }
 
     for (int i = 0; i < FLAGS_threads; ++i) workers[i].join();
 
@@ -569,7 +603,49 @@ int initiator() {
               << calculateRate(
                      batch_count * FLAGS_batch_size * FLAGS_block_size,
                      duration);
+    if (FLAGS_verify && FLAGS_operation == "read") {
+        uint64_t require_size =
+            FLAGS_block_size * FLAGS_batch_size * FLAGS_threads;
+        if (require_size > FLAGS_buffer_size) {
+            LOG(ERROR) << "Buffer size " << FLAGS_buffer_size
+                       << " is smaller than required size " << require_size
+                       << " for verification. Please increase buffer_size.";
+            exit(EXIT_FAILURE);
+        }
 
+        std::vector<uint8_t> actual(require_size);
+        for (int i = 0; i < buffer_num; ++i) {
+            LOG(INFO) << "Verifying data for buffer " << i;
+            std::vector<uint8_t> expected(require_size, 0xAA);
+
+            for (int b = 0; b < FLAGS_batch_size; ++b) {
+                for (int t = 0; t < FLAGS_threads; ++t) {
+                    if (t % buffer_num == i) {
+                        uint64_t offset = FLAGS_block_size * (b * FLAGS_threads + t);
+                        memset(expected.data() + offset, 0xCC, FLAGS_block_size);
+                    }
+                }
+            }
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
+            if (FLAGS_use_vram) {
+                checkCudaError(cudaMemcpy(actual.data(), (uint8_t *)addr[i],
+                                           require_size, cudaMemcpyDeviceToHost),
+                               "Failed to copy data for verification");
+            } else {
+                memcpy(actual.data(), (uint8_t *)addr[i], require_size);
+            }
+#else
+            memcpy(actual.data(), (uint8_t *)addr[i], require_size);
+#endif
+            if (memcmp(actual.data(), expected.data(), require_size) != 0) {
+                LOG(ERROR) << "Data verification failed for buffer " << i;
+                exit(EXIT_FAILURE);
+            } else {
+                LOG(INFO) << "Buffer " << i << " data verification passed.";
+            }
+        }
+    }
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
     }
@@ -607,13 +683,68 @@ int target() {
 
     auto addr = allocateBuffers();
     for (int i = 0; i < buffer_num; ++i) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
+        if (FLAGS_use_vram) {
+            checkCudaError(cudaMemset(addr[i], 0xCC, FLAGS_buffer_size),
+                           "Failed to initialize device memory");
+             // Ensure memory initialization is done from CPU standpoint
+            checkCudaError(cudaStreamSynchronize(0), "Failed to synchronize");
+        } else {
+            memset(addr[i], 0xCC, FLAGS_buffer_size);
+        }
+#endif
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              getLocationName(i));
         LOG_ASSERT(!rc);
     }
 
+    if (FLAGS_verify) {
+        LOG(INFO) << "Target verification mode: initiator should run with '--operation=write'";
+    }
     while (target_running) sleep(1);
 
+    if (FLAGS_verify) {
+        uint64_t require_size =
+        FLAGS_block_size * FLAGS_batch_size * FLAGS_threads;
+        if (require_size > FLAGS_buffer_size) {
+            LOG(ERROR) << "Buffer size " << FLAGS_buffer_size
+                       << " is smaller than required size " << require_size
+                       << " for verification. Please increase buffer_size.";
+            exit(EXIT_FAILURE);
+        }
+
+        std::vector<uint8_t> actual(require_size);
+        for (int i = 0; i < buffer_num; ++i) {
+            LOG(INFO) << "Verifying data for buffer " << i;
+            std::vector<uint8_t> expected(require_size, 0xCC);
+
+            for (int b = 0; b < FLAGS_batch_size; ++b) {
+                for (int t = 0; t < FLAGS_threads; ++t) {
+                    if (t % buffer_num == i) {
+                        uint64_t offset = FLAGS_block_size * (b * FLAGS_threads + t);
+                        memset(expected.data() + offset, 0xAA, FLAGS_block_size);
+                    }
+                }
+            }
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || defined(USE_UBSHMEM)
+            if (FLAGS_use_vram) {
+                checkCudaError(cudaMemcpy(actual.data(), addr[i], require_size, cudaMemcpyDeviceToHost),
+                               "Failed to copy data for verification");
+            } else {
+                memcpy(actual.data(), addr[i], require_size);
+            }
+#else
+            memcpy(actual.data(), addr[i], require_size);
+#endif
+            if (memcmp(actual.data(), expected.data(), require_size) != 0) {
+                LOG(ERROR) << "Data verification failed for buffer " << i;
+                exit(EXIT_FAILURE);
+            } else {
+                LOG(INFO) << "Buffer " << i << " data verification passed.";
+            }
+        }
+    }
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
     }

@@ -52,6 +52,51 @@ MemoryBackendType ProbeAllocatorBackend(int device_id) {
     return MemoryBackendType::use_cudamalloc;
 }
 
+#ifdef USE_HYGON
+
+struct DeviceGuard {
+    int old_device;
+    DeviceGuard(int new_device) {
+        cudaGetDevice(&old_device);
+        cudaSetDevice(new_device);
+    }
+    ~DeviceGuard() { cudaSetDevice(old_device); }
+};
+
+constexpr int kAlignment = 2ULL * 1024 * 1024;  // 2MB
+
+void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
+    (void)stream;
+    if (size <= 0) {
+        return nullptr;
+    }
+    DeviceGuard guard(device);
+
+    void *ptr = nullptr;
+    size = (size + kAlignment - 1) & ~(kAlignment - 1);
+    CUresult result = cudaMalloc(&ptr, size);
+    if (result != CUDA_SUCCESS) {
+        std::cerr << "cudaMalloc failed: " << result << "\n";
+        return nullptr;
+    }
+    return ptr;
+}
+
+void FreeFabricMemory(void *ptr, ssize_t ssize, int device,
+                      cudaStream_t stream) {
+    (void)ssize;
+    (void)stream;
+    if (ptr) {
+        DeviceGuard guard(device);
+        CUresult result = cudaFree(ptr);
+        if (result != CUDA_SUCCESS) {
+            std::cerr << "cudaFree failed: " << result << "\n";
+        }
+    }
+}
+
+#else
+
 void *AllocateFabricMemory(ssize_t size, int device, cudaStream_t stream) {
     (void)stream;
     size_t granularity = 0;
@@ -154,6 +199,8 @@ void FreeFabricMemory(void *ptr, ssize_t ssize, int device,
     }
     cuMemRelease(handle);
 }
+
+#endif  // USE_HYGON
 
 }  // namespace
 

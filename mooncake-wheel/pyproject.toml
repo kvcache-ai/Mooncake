@@ -60,4 +60,5 @@ where = ["."]
 include = ["mooncake*"]
 
 [tool.setuptools.package-data]
-mooncake = ["*.so", "mooncake_master", "mooncake_client", "transfer_engine_bench"]
+# *.co: Hygon HCU mc_copy_kernel (packaged only when present; built with -DUSE_HYGON=ON)
+mooncake = ["*.so", "*.co", "mooncake_master", "mooncake_client", "transfer_engine_bench"]

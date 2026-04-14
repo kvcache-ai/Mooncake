@@ -194,6 +194,7 @@ endif()
 
 if(USE_MNNVL)
   if(NOT USE_HIP
+     AND NOT USE_HYGON
      AND NOT USE_MUSA
      AND NOT USE_MACA)
     set(USE_CUDA ON)
@@ -311,6 +312,10 @@ if(USE_MUSA)
 endif()
 
 if(USE_HYGON)
+  # Enable shared HIP IPC/stream paths,
+  # Hygon fabric/RPC remains gated by USE_HYGON in hip_transport.
+  set(USE_HIP ON)
+
   if(NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
     if(DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
       set(DTK_ROOT

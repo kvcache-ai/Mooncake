@@ -89,7 +89,6 @@ endif()
 
 if(USE_HYGON)
   target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
-  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
 endif()
 
 if(USE_COREX)

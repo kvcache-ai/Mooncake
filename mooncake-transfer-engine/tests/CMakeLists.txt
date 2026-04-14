@@ -117,7 +117,7 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 
-if(USE_MNNVL)
+if(USE_MNNVL OR USE_HIP)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)

@@ -4,7 +4,7 @@
 #include "cuda_alike.h"
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
-    defined(USE_HYGON) || defined(USE_COREX)
+    defined(USE_COREX) || (defined(USE_HYGON) && !defined(USE_HIP))
 
 namespace mooncake {
 namespace device {
