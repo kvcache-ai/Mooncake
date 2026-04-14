@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 MODE="${1:-all}"
 TRANSPORT_BACKEND="${MC_STORE_RS_TRANSPORT_BACKEND:-classic-te}"
@@ -12,13 +12,13 @@ PROTOCOL="${MC_STORE_RS_TEST_PROTOCOL:-tcp}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/test-client-rw-cli.sh [all|real|dummy]
+Usage: scripts/tests/client/test-client-rw-cli.sh [all|real|dummy]
 
 Build and execute the standalone mooncake-store-client binary, then verify both
 repository-standard read/write validators:
 
-- `scripts/dummy_client_rw.py` against the daemon dummy API
-- `scripts/real_client_rw.py` against the real routed store runtime
+- `scripts/clients/dummy_client_rw.py` against the daemon dummy API
+- `scripts/clients/real_client_rw.py` against the real routed store runtime
 
 Environment:
   MC_STORE_RS_REDIS_PORT      Redis port for the temporary metadata backend
@@ -277,7 +277,7 @@ sleep 1
 
 if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   echo "==> validating dummy single-item path"
-  python3 ./scripts/dummy_client_rw.py \
+  python3 ./scripts/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
     --key_prefix "dummy-single-${RUN_ID}" \
@@ -288,7 +288,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
     --delete
 
   echo "==> validating dummy shm batch path"
-  python3 ./scripts/dummy_client_rw.py \
+  python3 ./scripts/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
     --key_prefix "dummy-batch-${RUN_ID}" \
@@ -300,7 +300,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
     --delete
 
   echo "==> validating dummy multi-buffer shm path"
-  python3 ./scripts/dummy_client_rw.py \
+  python3 ./scripts/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
     --key_prefix "dummy-multi-${RUN_ID}" \
@@ -314,7 +314,7 @@ fi
 
 if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
   echo "==> validating real routed single-item path"
-  python3 ./scripts/real_client_rw.py \
+  python3 ./scripts/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
     --storage-bytes 0 \
@@ -332,7 +332,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
     --replica_num 2 \
     --key_prefix "real-single-${RUN_ID}"
 
-  python3 ./scripts/real_client_rw.py \
+  python3 ./scripts/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
     --storage-bytes 0 \
@@ -351,7 +351,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
     --key_prefix "real-single-${RUN_ID}"
 
   echo "==> validating real routed batch path"
-  python3 ./scripts/real_client_rw.py \
+  python3 ./scripts/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
     --storage-bytes 0 \
@@ -369,7 +369,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
     --replica_num 2 \
     --key_prefix "real-batch-${RUN_ID}"
 
-  python3 ./scripts/real_client_rw.py \
+  python3 ./scripts/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
     --storage-bytes 0 \

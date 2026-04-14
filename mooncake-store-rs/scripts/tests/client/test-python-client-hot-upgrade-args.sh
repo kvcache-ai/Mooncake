@@ -2,11 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 
 usage() {
   cat <<'EOF'
-Usage: scripts/test-python-client-hot-upgrade-args.sh
+Usage: scripts/tests/client/test-python-client-hot-upgrade-args.sh
 
 Verify Python hot-upgrade startup argument handling for both the native PyO3
 binding and the pure-Python wrapper compatibility path.

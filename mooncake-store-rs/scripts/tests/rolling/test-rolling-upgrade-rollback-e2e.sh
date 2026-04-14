@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# test-rolling-upgrade-rollback-wrh-e2e.sh
+# test-rolling-upgrade-rollback-e2e.sh
 #
-# End-to-end rolling upgrade ROLLBACK verification for Mooncake Store using
-# embedded-wrh route control mode.
-#
-# This is the embedded-wrh variant of test-rolling-upgrade-rollback-e2e.sh.
-# The key differences from the metadata-only version:
-#   - Route data is stored in client process memory (WRH authority)
-#   - Clients use --label route=true to act as route authorities
-#   - Driver Python code uses route_control="embedded_wrh"
+# End-to-end rolling upgrade ROLLBACK verification for Mooncake Store.
 #
 # This script simulates a scenario where a rolling upgrade is partially
 # applied and then rolled back:
 #   1. Builds the current code as V1 and backs up the binary
-#   2. Patches the source to create a V2
+#   2. Patches the source to create a V2 (bumps store_api_minor_version,
+#      adds a version tag to the startup log, adds a proto field)
 #   3. Builds V2
 #   4. Starts two V1 clients, writes test data (Phase 1)
 #   5. Rolling-upgrades client-a (V1 -> V2), verifies data (Phase 2)
@@ -23,7 +17,7 @@
 #   8. Restores the source to its original state
 #
 # Usage:
-#   ./scripts/test-rolling-upgrade-rollback-wrh-e2e.sh
+#   ./scripts/tests/rolling/test-rolling-upgrade-rollback-e2e.sh
 #
 # Environment:
 #   MC_STORE_RS_REDIS_PORT  Redis port (default: 6380)
@@ -31,7 +25,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -130,7 +124,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
 RUN_ID=$(date +%s%N)
-KEYSPACE="mc/store-rs/rollback-wrh-e2e/${RUN_ID}"
+KEYSPACE="mc/store-rs/rollback-e2e/${RUN_ID}"
 TEMP_DIR=$(mktemp -d)
 PIDS=()
 REDIS_STARTED=0
@@ -188,7 +182,7 @@ fi
 cd "${REPO_ROOT}"
 
 echo "============================================"
-echo "  Rolling Upgrade ROLLBACK E2E Test (embedded-wrh)"
+echo "  Rolling Upgrade ROLLBACK E2E Test"
 echo "  RUN_ID: ${RUN_ID}"
 echo "============================================"
 echo ""
@@ -229,13 +223,13 @@ BASE_ARGS=(
   --storage-bytes 1048576
   --scratch-bytes 1048576
   --protocol tcp
-  --route-control embedded-wrh
+  --route-control metadata-only
   --keyspace "${KEYSPACE}"
   --lease-ttl-ms 4000
   --heartbeat-interval-ms 500
   --label pool=pool-a
   --label storage=true
-  --label route=true
+  --label route=false
   --drain-on-exit
 )
 
@@ -273,7 +267,7 @@ assert store.setup(
     stable_id="driver-write-1",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
-    route_control="embedded_wrh",
+    route_control="metadata_only",
 ) == 0
 
 policy_a = ReplicateConfig(replica_num=1, preferred_storage_owners=["client-a:1"], prefer_local=False)
@@ -330,7 +324,7 @@ assert store.setup(
     stable_id="driver-verify-2",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
-    route_control="embedded_wrh",
+    route_control="metadata_only",
 ) == 0
 
 for _ in range(100):
@@ -356,12 +350,6 @@ store.close()
 PY
 
 echo "  [OK] PHASE 2 complete: mixed-version cluster verified"
-
-# In embedded-wrh mode, other clients need time to refresh their live client
-# cache and discover client-a V2's new control plane address. Wait for a few
-# seconds to allow the membership sync background thread to pick up the change.
-echo "  Waiting for membership cache refresh..."
-sleep 3
 
 # ===== PHASE 3: Rollback client-a (V2 -> V1) ==============================
 
@@ -410,7 +398,7 @@ assert store.setup(
     stable_id="driver-verify-rollback",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
-    route_control="embedded_wrh",
+    route_control="metadata_only",
 ) == 0
 
 # Wait for route to converge: test-key-1 and test-key-3 should be on client-a:3
@@ -472,5 +460,5 @@ sleep 2
 
 echo ""
 echo "============================================"
-echo "  Rolling Upgrade ROLLBACK E2E Test (embedded-wrh) PASSED ✅"
+echo "  Rolling Upgrade ROLLBACK E2E Test PASSED ✅"
 echo "============================================"

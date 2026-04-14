@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 UPSTREAM_DIR="${MOONCAKE_UPSTREAM_DIR:-${ROOT_DIR}/third_party/Mooncake}"
 UPSTREAM_BUILD_DIR="${MOONCAKE_UPSTREAM_BUILD_DIR:-${UPSTREAM_DIR}/build-rust}"

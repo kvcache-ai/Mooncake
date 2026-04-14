@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# test-rolling-upgrade-e2e.sh
+# test-rolling-upgrade-rollback-wrh-e2e.sh
 #
-# End-to-end rolling upgrade verification for Mooncake Store.
+# End-to-end rolling upgrade ROLLBACK verification for Mooncake Store using
+# embedded-wrh route control mode.
 #
-# This script:
+# This is the embedded-wrh variant of test-rolling-upgrade-rollback-e2e.sh.
+# The key differences from the metadata-only version:
+#   - Route data is stored in client process memory (WRH authority)
+#   - Clients use --label route=true to act as route authorities
+#   - Driver Python code uses route_control="embedded_wrh"
+#
+# This script simulates a scenario where a rolling upgrade is partially
+# applied and then rolled back:
 #   1. Builds the current code as V1 and backs up the binary
-#   2. Patches the source to create a V2 (bumps store_api_minor_version,
-#      adds a version tag to the startup log, adds a proto field)
+#   2. Patches the source to create a V2
 #   3. Builds V2
-#   4. Starts two V1 clients, writes test data
-#   5. Rolling-upgrades client-a (V1 -> V2), verifies data preservation
-#   6. Rolling-upgrades client-b (V1 -> V2), verifies full cluster
-#   7. Restores the source to its original state
+#   4. Starts two V1 clients, writes test data (Phase 1)
+#   5. Rolling-upgrades client-a (V1 -> V2), verifies data (Phase 2)
+#   6. Rolls back client-a (V2 -> V1) using V1 binary with epoch=3 (Phase 3)
+#   7. Verifies all data intact and cluster is fully V1 again (Phase 4)
+#   8. Restores the source to its original state
 #
 # Usage:
-#   ./scripts/test-rolling-upgrade-e2e.sh
+#   ./scripts/tests/rolling/test-rolling-upgrade-rollback-wrh-e2e.sh
 #
 # Environment:
 #   MC_STORE_RS_REDIS_PORT  Redis port (default: 6380)
@@ -23,7 +31,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -122,7 +130,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
 RUN_ID=$(date +%s%N)
-KEYSPACE="mc/store-rs/rolling-upgrade-e2e/${RUN_ID}"
+KEYSPACE="mc/store-rs/rollback-wrh-e2e/${RUN_ID}"
 TEMP_DIR=$(mktemp -d)
 PIDS=()
 REDIS_STARTED=0
@@ -180,7 +188,7 @@ fi
 cd "${REPO_ROOT}"
 
 echo "============================================"
-echo "  Rolling Upgrade E2E Test"
+echo "  Rolling Upgrade ROLLBACK E2E Test (embedded-wrh)"
 echo "  RUN_ID: ${RUN_ID}"
 echo "============================================"
 echo ""
@@ -221,13 +229,13 @@ BASE_ARGS=(
   --storage-bytes 1048576
   --scratch-bytes 1048576
   --protocol tcp
-  --route-control metadata-only
+  --route-control embedded-wrh
   --keyspace "${KEYSPACE}"
   --lease-ttl-ms 4000
   --heartbeat-interval-ms 500
   --label pool=pool-a
   --label storage=true
-  --label route=false
+  --label route=true
   --drain-on-exit
 )
 
@@ -240,15 +248,15 @@ echo "=== PHASE 1: Start two V1 clients and verify read/write ==="
   --stable-id client-a --epoch 1 --initial-state active \
   --local-segment-name "seg-a-v1-${RUN_ID}" \
   >"${TEMP_DIR}/client-a-v1.log" 2>&1 &
-CLIENT_A_PID=$!
-PIDS+=("${CLIENT_A_PID}")
+CLIENT_A_V1_PID=$!
+PIDS+=("${CLIENT_A_V1_PID}")
 
 "${BIN_V1}" "${BASE_ARGS[@]}" \
   --stable-id client-b --epoch 1 --initial-state active \
   --local-segment-name "seg-b-v1-${RUN_ID}" \
   >"${TEMP_DIR}/client-b-v1.log" 2>&1 &
-CLIENT_B_PID=$!
-PIDS+=("${CLIENT_B_PID}")
+CLIENT_B_V1_PID=$!
+PIDS+=("${CLIENT_B_V1_PID}")
 
 wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-client started stable_id=client-a epoch=1"
 wait_for_log "${TEMP_DIR}/client-b-v1.log" "mooncake-store-client started stable_id=client-b epoch=1"
@@ -265,7 +273,7 @@ assert store.setup(
     stable_id="driver-write-1",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
-    route_control="metadata_only",
+    route_control="embedded_wrh",
 ) == 0
 
 policy_a = ReplicateConfig(replica_num=1, preferred_storage_owners=["client-a:1"], prefer_local=False)
@@ -282,7 +290,7 @@ PY
 
 echo "  [OK] PHASE 1 complete"
 
-# ===== PHASE 2: Rolling upgrade client-a ==================================
+# ===== PHASE 2: Rolling upgrade client-a (V1 -> V2) =======================
 
 echo ""
 echo "=== PHASE 2: Rolling upgrade client-a (V1 -> V2) ==="
@@ -304,11 +312,11 @@ else
 fi
 
 echo "  Sending SIGTERM to client-a V1 predecessor..."
-kill -TERM "${CLIENT_A_PID}"
+kill -TERM "${CLIENT_A_V1_PID}"
 wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-client handoff stable_id=client-a" 30
 wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-client upgraded stable_id=client-a" 30
 wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-client promoted stable_id=client-a" 30
-wait_for_exit "${CLIENT_A_PID}" "client-a-v1" 30
+wait_for_exit "${CLIENT_A_V1_PID}" "client-a-v1" 30
 echo "  [OK] client-a V1 exited, V2 promoted"
 
 REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" python3 - <<'PY'
@@ -322,7 +330,7 @@ assert store.setup(
     stable_id="driver-verify-2",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
-    route_control="metadata_only",
+    route_control="embedded_wrh",
 ) == 0
 
 for _ in range(100):
@@ -342,34 +350,54 @@ print("  [OK] test-key-2 still readable from client-b V1")
 policy = ReplicateConfig(replica_num=1, preferred_storage_owners=["client-a:2"], prefer_local=False)
 assert store.put("test-key-3", b"value-from-v2-client-a", config=policy) == 0
 assert store.get("test-key-3") == b"value-from-v2-client-a"
-print("  [OK] New write on V2 client-a successful")
+print("  [OK] New write test-key-3 on V2 client-a successful")
 
 store.close()
 PY
 
 echo "  [OK] PHASE 2 complete: mixed-version cluster verified"
 
-# ===== PHASE 3: Rolling upgrade client-b ==================================
+# In embedded-wrh mode, other clients need time to refresh their live client
+# cache and discover client-a V2's new control plane address. Wait for a few
+# seconds to allow the membership sync background thread to pick up the change.
+echo "  Waiting for membership cache refresh..."
+sleep 3
+
+# ===== PHASE 3: Rollback client-a (V2 -> V1) ==============================
 
 echo ""
-echo "=== PHASE 3: Rolling upgrade client-b (V1 -> V2) ==="
+echo "=== PHASE 3: Rollback client-a (V2 -> V1) using V1 binary ==="
+echo "  Starting client-a V1 rollback with epoch=3 (standby)..."
 
-"${BIN_V2}" "${BASE_ARGS[@]}" \
-  --stable-id client-b --epoch 2 --initial-state standby \
-  --local-segment-name "seg-b-v2-${RUN_ID}" \
-  >"${TEMP_DIR}/client-b-v2.log" 2>&1 &
-CLIENT_B_V2_PID=$!
-PIDS+=("${CLIENT_B_V2_PID}")
-wait_for_log "${TEMP_DIR}/client-b-v2.log" "mooncake-store-client started" 20
-echo "  [OK] client-b V2 successor started (standby)"
+"${BIN_V1}" "${BASE_ARGS[@]}" \
+  --stable-id client-a --epoch 3 --initial-state standby \
+  --local-segment-name "seg-a-rollback-${RUN_ID}" \
+  >"${TEMP_DIR}/client-a-rollback.log" 2>&1 &
+CLIENT_A_ROLLBACK_PID=$!
+PIDS+=("${CLIENT_A_ROLLBACK_PID}")
+wait_for_log "${TEMP_DIR}/client-a-rollback.log" "mooncake-store-client started stable_id=client-a epoch=3" 20
+echo "  [OK] client-a V1 rollback successor started (standby, epoch=3)"
 
-echo "  Sending SIGTERM to client-b V1 predecessor..."
-kill -TERM "${CLIENT_B_PID}"
-wait_for_log "${TEMP_DIR}/client-b-v1.log" "mooncake-store-client handoff stable_id=client-b" 30
-wait_for_log "${TEMP_DIR}/client-b-v1.log" "mooncake-store-client upgraded stable_id=client-b" 30
-wait_for_log "${TEMP_DIR}/client-b-v2.log" "mooncake-store-client promoted stable_id=client-b" 30
-wait_for_exit "${CLIENT_B_PID}" "client-b-v1" 30
-echo "  [OK] client-b V1 exited, V2 promoted"
+# Verify the rollback instance does NOT have the [v2] tag
+if grep -q '\[v2\]' "${TEMP_DIR}/client-a-rollback.log"; then
+  echo "  [FAIL] Rollback instance should NOT have [v2] tag" >&2
+  exit 1
+else
+  echo "  [OK] Rollback instance confirmed as V1 (no [v2] tag)"
+fi
+
+echo "  Sending SIGTERM to client-a V2 predecessor..."
+kill -TERM "${CLIENT_A_V2_PID}"
+wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-client handoff stable_id=client-a" 30
+wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-client upgraded stable_id=client-a" 30
+wait_for_log "${TEMP_DIR}/client-a-rollback.log" "mooncake-store-client promoted stable_id=client-a" 30
+wait_for_exit "${CLIENT_A_V2_PID}" "client-a-v2" 30
+echo "  [OK] client-a V2 exited, V1 rollback instance promoted (epoch=3)"
+
+# ===== PHASE 4: Verify all data intact after rollback =====================
+
+echo ""
+echo "=== PHASE 4: Verify all data intact after rollback ==="
 
 REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" python3 - <<'PY'
 import os, time
@@ -379,44 +407,70 @@ store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1", os.environ["REDIS_URL"],
     4*1024*1024, 1*1024*1024, "tcp", "", "",
-    stable_id="driver-verify-3",
+    stable_id="driver-verify-rollback",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
-    route_control="metadata_only",
+    route_control="embedded_wrh",
 ) == 0
 
+# Wait for route to converge: test-key-1 and test-key-3 should be on client-a:3
 for _ in range(100):
-    route = store.query_route("test-key-2")
-    if route and [r["owner"] for r in route["replicas"]] == ["client-b:2"]:
+    route = store.query_route("test-key-1")
+    if route and [r["owner"] for r in route["replicas"]] == ["client-a:3"]:
         break
     time.sleep(0.1)
 else:
-    raise AssertionError("route did not converge to client-b:2")
+    raise AssertionError("route for test-key-1 did not converge to client-a:3")
 
-assert store.get("test-key-1") == b"value-from-v1-client-a"
-print("  [OK] test-key-1 preserved (V1 client-a -> V2 client-a)")
+# Verify test-key-1: originally written to client-a V1, migrated V1->V2->V1
+data = store.get("test-key-1")
+assert data == b"value-from-v1-client-a", f"test-key-1 mismatch: {data}"
+print("  [OK] test-key-1 preserved after rollback (V1 -> V2 -> V1, owner: client-a:3)")
 
-assert store.get("test-key-2") == b"value-from-v1-client-b"
-print("  [OK] test-key-2 preserved (V1 client-b -> V2 client-b)")
+# Verify test-key-2: always on client-b V1, should be unaffected
+data = store.get("test-key-2")
+assert data == b"value-from-v1-client-b", f"test-key-2 mismatch: {data}"
+print("  [OK] test-key-2 still intact on client-b V1")
 
-assert store.get("test-key-3") == b"value-from-v2-client-a"
-print("  [OK] test-key-3 preserved (written during mixed-version phase)")
+# Verify test-key-3: written during V2 phase, migrated V2->V1
+for _ in range(100):
+    route = store.query_route("test-key-3")
+    if route and [r["owner"] for r in route["replicas"]] == ["client-a:3"]:
+        break
+    time.sleep(0.1)
+else:
+    raise AssertionError("route for test-key-3 did not converge to client-a:3")
 
-policy = ReplicateConfig(replica_num=1, preferred_storage_owners=["client-b:2"], prefer_local=False)
-assert store.put("test-key-4", b"value-from-v2-client-b", config=policy) == 0
-assert store.get("test-key-4") == b"value-from-v2-client-b"
-print("  [OK] test-key-4 new write on fully-upgraded cluster")
+data = store.get("test-key-3")
+assert data == b"value-from-v2-client-a", f"test-key-3 mismatch: {data}"
+print("  [OK] test-key-3 preserved after rollback (written by V2, now on V1)")
 
+# Write new data on the rolled-back V1 instance to confirm it is fully functional
+policy = ReplicateConfig(replica_num=1, preferred_storage_owners=["client-a:3"], prefer_local=False)
+assert store.put("test-key-4", b"value-after-rollback", config=policy) == 0
+assert store.get("test-key-4") == b"value-after-rollback"
+print("  [OK] test-key-4 new write on rolled-back V1 client-a successful")
+
+# Cross-node read: verify client-b can still serve data
+policy_b = ReplicateConfig(replica_num=1, preferred_storage_owners=["client-b:1"], prefer_local=False)
+assert store.put("test-key-5", b"value-post-rollback-client-b", config=policy_b) == 0
+assert store.get("test-key-5") == b"value-post-rollback-client-b"
+print("  [OK] test-key-5 cross-node write/read verified after rollback")
+
+print("")
+print("  === All 5 keys verified: rollback is fully successful ===")
 store.close()
 PY
 
+echo "  [OK] PHASE 4 complete: all data intact, cluster fully V1"
+
 # ── teardown ───────────────────────────────────────────────────────────────
 
-kill -TERM "${CLIENT_A_V2_PID}" 2>/dev/null || true
-kill -TERM "${CLIENT_B_V2_PID}" 2>/dev/null || true
+kill -TERM "${CLIENT_A_ROLLBACK_PID}" 2>/dev/null || true
+kill -TERM "${CLIENT_B_V1_PID}" 2>/dev/null || true
 sleep 2
 
 echo ""
 echo "============================================"
-echo "  Rolling Upgrade E2E Test PASSED ✅"
+echo "  Rolling Upgrade ROLLBACK E2E Test (embedded-wrh) PASSED ✅"
 echo "============================================"

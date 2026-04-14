@@ -27,7 +27,7 @@ The repository expects the upstream sources at `third_party/Mooncake`.
 Run the full Rust end-to-end suite and the built-in batch benchmark:
 
 ```bash
-./scripts/run-local-e2e.sh
+./scripts/e2e/run-local-e2e.sh
 ```
 
 What the script does:
@@ -52,7 +52,7 @@ Supported script inputs:
 Run the Python compatibility validation:
 
 ```bash
-./scripts/run-python-compat-e2e.sh
+./scripts/e2e/run-python-compat-e2e.sh
 ```
 
 What the script does:
@@ -67,7 +67,7 @@ What the script does:
 Run the real-mode black-box validator:
 
 ```bash
-python3 ./scripts/real_client_rw.py --help
+python3 ./scripts/clients/real_client_rw.py --help
 ```
 
 What the script does:
@@ -89,7 +89,7 @@ Recommended split-deployment pattern:
 Native CLI hot-upgrade validation:
 
 ```bash
-./scripts/test-client-hot-upgrade-cli.sh
+./scripts/tests/client/test-client-hot-upgrade-cli.sh
 ```
 
 What the script does:
@@ -103,7 +103,7 @@ What the script does:
 Python hot-upgrade argument and wrapper compatibility validation:
 
 ```bash
-./scripts/test-python-client-hot-upgrade-args.sh
+./scripts/tests/client/test-python-client-hot-upgrade-args.sh
 ```
 
 What the script verifies:
@@ -116,7 +116,7 @@ What the script verifies:
 Native CLI eviction validation:
 
 ```bash
-./scripts/test-client-eviction-cli.sh
+./scripts/tests/client/test-client-eviction-cli.sh
 ```
 
 What the script does:
@@ -137,8 +137,8 @@ For production dashboards, pair the in-process exporter with infrastructure expo
 Run the compatibility checks for both Python execution modes:
 
 ```bash
-./scripts/run-sglang-hicache-dummy-compat.sh
-./scripts/run-sglang-hicache-real-compat.sh
+./scripts/sglang/run-sglang-hicache-dummy-compat.sh
+./scripts/sglang/run-sglang-hicache-real-compat.sh
 ```
 
 What they validate:
@@ -158,7 +158,7 @@ Deployment note:
 Run the full HiCache end-to-end validation:
 
 ```bash
-./scripts/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
+./scripts/sglang/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
 ```
 
 What the script does:
@@ -281,7 +281,7 @@ The runner intentionally does not scan local model caches. A missing model path 
 Run the process-per-client stress benchmark:
 
 ```bash
-./scripts/run-multi-client-stress.sh
+./scripts/e2e/run-multi-client-stress.sh
 ```
 
 What the script does:
@@ -325,7 +325,7 @@ Important stress-benchmark inputs:
 Build the Python wheel and stage the standalone client binary:
 
 ```bash
-./scripts/build-wheel.sh
+./scripts/build/build-wheel.sh
 ```
 
 Default outputs:
@@ -345,7 +345,7 @@ pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 Or use the repository helper:
 
 ```bash
-./scripts/install-pro-wheel.sh
+./scripts/build/install-pro-wheel.sh
 ```
 
 Operational meaning:

@@ -13,18 +13,18 @@ Examples
 --------
 
 # single-item read/write
-python3 scripts/dummy_client_rw.py \\
+python3 scripts/clients/dummy_client_rw.py \\
   --daemon_addr 127.0.0.1:16590 \\
   --key_prefix dummy-smoke
 
 # shm batch path
-python3 scripts/dummy_client_rw.py \\
+python3 scripts/clients/dummy_client_rw.py \\
   --daemon_addr 127.0.0.1:16590 \\
   --key_prefix dummy-batch \\
   --batch_size 8
 
 # multi-buffer shm path
-python3 scripts/dummy_client_rw.py \\
+python3 scripts/clients/dummy_client_rw.py \\
   --daemon_addr 127.0.0.1:16590 \\
   --key_prefix dummy-multi \\
   --batch_size 4 \\

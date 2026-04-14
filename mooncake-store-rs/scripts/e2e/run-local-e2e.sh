@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 BENCH_ITERS="${MC_STORE_RS_BENCH_ITERS:-512}"
 VALUE_SIZE="${MC_STORE_RS_VALUE_SIZE:-4096}"

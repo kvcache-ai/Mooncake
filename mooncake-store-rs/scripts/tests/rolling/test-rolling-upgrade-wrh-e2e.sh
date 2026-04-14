@@ -22,7 +22,7 @@
 #   7. Restores the source to its original state
 #
 # Usage:
-#   ./scripts/test-rolling-upgrade-wrh-e2e.sh
+#   ./scripts/tests/rolling/test-rolling-upgrade-wrh-e2e.sh
 #
 # Environment:
 #   MC_STORE_RS_REDIS_PORT  Redis port (default: 6380)
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 
 # ── helpers ────────────────────────────────────────────────────────────────

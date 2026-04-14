@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 
 PYTHON_BIN=${PYTHON:-python3}
 VENV_DIR=${WHEEL_VENV:-"${REPO_ROOT}/.venv-wheel"}
@@ -15,7 +15,7 @@ BUILD_JOBS=${BUILD_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || getconf 
 
 usage() {
   cat <<'EOF'
-Usage: scripts/build-wheel.sh [maturin build args...]
+Usage: scripts/build/build-wheel.sh [maturin build args...]
 
 Environment:
   PYTHON                     Python interpreter used to create the build venv
@@ -26,9 +26,9 @@ Environment:
   BUILD_JOBS                 Parallel jobs for CMake builds
 
 Examples:
-  ./scripts/build-wheel.sh
-  ./scripts/build-wheel.sh --interpreter python3.11
-  DIST_DIR=artifacts ./scripts/build-wheel.sh --compatibility manylinux_2_28
+  ./scripts/build/build-wheel.sh
+  ./scripts/build/build-wheel.sh --interpreter python3.11
+  DIST_DIR=artifacts ./scripts/build/build-wheel.sh --compatibility manylinux_2_28
 EOF
 }
 

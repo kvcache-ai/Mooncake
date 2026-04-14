@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 
 COVERAGE_DIR=${COVERAGE_DIR:-"${REPO_ROOT}/target/coverage"}
 UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}
@@ -12,7 +12,7 @@ HTML_DIR="${COVERAGE_DIR}/html"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/generate-coverage.sh
+Usage: scripts/build/generate-coverage.sh
 
 Generate workspace unit-test coverage reports.
 
