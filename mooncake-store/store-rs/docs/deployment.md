@@ -475,9 +475,24 @@ mooncake-store-admin \
   cleanup-stale-segments
 ```
 
+You can also manage tenant route policy through the same binary:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  policy list
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  policy set \
+  --tenant tenant-a \
+  --route-topk 3 \
+  --route-control embedded-wrh
+```
+
 Useful options:
 
-- `--keyspace <prefix>` to clean a non-default metadata namespace
+- `--keyspace <prefix>` to target a non-default metadata namespace for either policy management or stale cleanup
 - `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` for Redis ACL authentication
 
 The command removes:

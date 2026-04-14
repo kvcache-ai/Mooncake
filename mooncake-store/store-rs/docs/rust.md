@@ -246,7 +246,7 @@ Use these methods when debugging placement or route state:
 
 The default route control mode is `EmbeddedWrh`. Use `route_control(RouteControlMode::MetadataOnly)` if you want metadata-backed route control for bring-up or debugging.
 
-Use `route_topk(...)` when you want a different WRH route-authority fanout. The runtime defaults to `2`, rejects values below `2`, and validates the setting against the route policy already stored in the active metadata keyspace.
+Use `route_topk(...)` when you want a different WRH route-authority fanout. The runtime defaults to `2`, rejects values below `2`, and validates the setting against the effective route policy already stored in the active metadata keyspace: tenant override for the builder's default tenant first, otherwise the default cluster policy.
 
 ## Observability
 
