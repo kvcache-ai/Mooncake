@@ -95,9 +95,9 @@ By default the script:
 - creates or reuses `.venv-wheel`
 - installs `maturin`
 - installs `build` for the Pro metapackage
-- embeds the standalone `mooncake-store-client` binary into the runtime wheel package
+- embeds the standalone `mooncake-store-client` and `mooncake-store-admin` binaries into the runtime wheel package
 - builds both wheels into `dist/wheels/`
-- copies the standalone `mooncake-store-client` artifact into `dist/bin/`
+- copies the standalone `mooncake-store-client` and `mooncake-store-admin` artifacts into `dist/bin/`
 
 Common variants:
 
@@ -117,6 +117,7 @@ After installation, both interfaces are available:
 - `python -c "import mooncake"` loads the native extension
 - `python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"` shows the active Pro runtime
 - `mooncake-store-client --help` runs the packaged standalone client command
+- `mooncake-store-admin --help` runs the packaged metadata maintenance command
 - if your environment still exposes the upstream compatibility alias, `mooncake_master --version` prints the same packaged Pro version banner
 
 ## Standalone Client Binary
@@ -130,6 +131,8 @@ cargo build -p mooncake-store-py --bin mooncake-store-client --release
 Or use `./scripts/build-wheel.sh`, which also copies the binary to `dist/bin/`.
 
 When the client is installed from a wheel, the same binary is also embedded inside the package and exposed through the `mooncake-store-client` console script, matching the upstream Mooncake packaging style.
+
+The same wheel also exposes `mooncake-store-admin` for explicit metadata maintenance.
 
 Start a storage client:
 
@@ -181,6 +184,24 @@ Heartbeat behavior:
 - failed heartbeat publishes are retried on a short backoff
 - `--heartbeat-timeout-ms` controls the dedicated heartbeat publish timeout
 - `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` provides the same override for Python or environment-driven launches
+
+## Metadata Maintenance
+
+Use the packaged admin binary when Redis still contains stale segment registrations
+from dead storage owners:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  cleanup-stale-segments
+```
+
+Notes:
+
+- client leases expire automatically; segment registration keys do not
+- the cleanup is explicit by design, so temporary lease misses do not trigger automatic deletion
+- `--keyspace <prefix>` scopes the sweep to one metadata namespace
+- `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` also apply here
 
 ## Basic Real-Mode Example
 

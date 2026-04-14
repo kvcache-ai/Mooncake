@@ -109,7 +109,7 @@ export MOONCAKE_UPSTREAM_BUILD_DIR="${UPSTREAM_BUILD_DIR}"
 
 cargo build \
   --manifest-path "${REPO_ROOT}/crates/mooncake-store-py/Cargo.toml" \
-  --bin mooncake-store-client \
+  --bins \
   --release
 
 "${VENV_DIR}/bin/maturin" build \
@@ -122,6 +122,9 @@ cargo build \
 install -m 0755 \
   "${REPO_ROOT}/target/release/mooncake-store-client" \
   "${BIN_DIR}/mooncake-store-client"
+install -m 0755 \
+  "${REPO_ROOT}/target/release/mooncake-store-admin" \
+  "${BIN_DIR}/mooncake-store-admin"
 
 LATEST_WHEEL=$(ls -1t "${WHEEL_DIR}"/*.whl 2>/dev/null | head -n 1 || true)
 if [[ -z "${LATEST_WHEEL}" ]]; then
@@ -133,7 +136,8 @@ fi
   "${LATEST_WHEEL}" \
   "${REPO_ROOT}" \
   "${UPSTREAM_BUILD_DIR}" \
-  "${REPO_ROOT}/target/release/mooncake-store-client"
+  "${REPO_ROOT}/target/release/mooncake-store-client" \
+  "${REPO_ROOT}/target/release/mooncake-store-admin"
 import base64
 import csv
 import hashlib
@@ -148,10 +152,12 @@ wheel_path = pathlib.Path(sys.argv[1])
 repo_root = pathlib.Path(sys.argv[2])
 upstream_build_dir = pathlib.Path(sys.argv[3])
 store_client_path = pathlib.Path(sys.argv[4])
+store_admin_path = pathlib.Path(sys.argv[5])
 upstream_py_dir = repo_root / "third_party" / "Mooncake" / "mooncake-wheel" / "mooncake"
 
 binary_assets = {
     "mooncake-store-client": store_client_path,
+    "mooncake-store-admin": store_admin_path,
     "mooncake_master": upstream_build_dir / "mooncake-store" / "src" / "mooncake_master",
     "mooncake_client": upstream_build_dir / "mooncake-store" / "src" / "mooncake_client",
     "transfer_engine_bench": upstream_build_dir
@@ -268,4 +274,5 @@ cat <<EOF
 wheel:  ${LATEST_WHEEL}
 meta:   ${LATEST_META_WHEEL}
 client: ${BIN_DIR}/mooncake-store-client
+admin:  ${BIN_DIR}/mooncake-store-admin
 EOF

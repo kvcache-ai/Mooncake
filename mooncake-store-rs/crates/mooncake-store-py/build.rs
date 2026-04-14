@@ -30,6 +30,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cargo:rustc-link-arg-bin=mooncake-store-client=-Wl,-rpath,{}",
         tent_dir.display()
     );
+    println!(
+        "cargo:rustc-link-arg-bin=mooncake-store-admin=-Wl,-rpath,{}",
+        classic_dir.display()
+    );
+    println!(
+        "cargo:rustc-link-arg-bin=mooncake-store-admin=-Wl,-rpath,{}",
+        tent_dir.display()
+    );
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", classic_dir.display());
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", tent_dir.display());
     println!("cargo:rerun-if-env-changed=PYTHON");

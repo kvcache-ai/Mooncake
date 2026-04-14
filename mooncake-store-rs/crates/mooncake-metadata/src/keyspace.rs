@@ -53,6 +53,10 @@ impl MetadataKeyspace {
         }
     }
 
+    pub fn segment_index_for_owner_key(&self, owner_storage_key: &str) -> String {
+        format!("{}/indexes/segments/{}", self.prefix, owner_storage_key)
+    }
+
     pub fn object(&self, key: &ObjectKey) -> String {
         format!("{}/objects/{}", self.prefix, key.0)
     }
