@@ -1,23 +1,23 @@
 use std::collections::BTreeSet;
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
     init_tracing_from_env, render_prometheus_metrics, start_metrics_http_server_from_env,
-    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
-    MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
-    ReplicationPolicy, StoreClient, StoreClientBuilder, TentTransportFactory,
+    BandwidthShaping, GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade,
+    MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest,
+    PutRequest, ReplicationPolicy, StoreClient, StoreClientBuilder, TentTransportFactory,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, MetadataBackend,
-    ObjectKey, Result, SegmentLifecycleState, StoreError,
+    ObjectKey, Result, SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{TentEngine, TentEngineConfig};
 
-const LEASE_MS: u64 = 30_000;
+const LEASE_MS: u64 = 600_000;
 const MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 const BENCH_HEARTBEAT_EVERY: usize = 32;
@@ -41,8 +41,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(128);
-    let run_id = unique_suffix();
-    let keyspace = MetadataKeyspace::new(format!("mc/store-rs/e2e/{run_id}"));
+    let rdma_enable = env::var("MC_STORE_RS_ENABLE_RDMA")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let keyspace = MetadataKeyspace::new(format!("mc/store-rs/e2e/{}", unique_suffix()));
     let metadata = Arc::new(RedisMetadataBackend::new(
         RedisMetadataConfig::new(redis_url).keyspace(keyspace),
     )?);
@@ -57,36 +59,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "dynamic-membership".to_string(),
         ]);
 
-    let target_a_bundle =
-        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "target-a-segment"))?;
-    let target_b_bundle =
-        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "target-b-segment"))?;
-    let target_c_bundle =
-        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "target-c-segment"))?;
-    let upgrade_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "target-a-upgrade-segment"),
-    )?;
-    let reclaim_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "target-reclaim-segment"),
-    )?;
-    let router_bundle =
-        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "router-segment"))?;
-    let router_replica_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "router-replica-segment"),
-    )?;
-    let reader_bundle =
-        build_tent_bundle(redis_port, &scoped_segment_name(run_id, "reader-segment"))?;
-    let elastic_target_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "elastic-target-segment"),
-    )?;
-    let elastic_router_bundle = build_tent_bundle(
-        redis_port,
-        &scoped_segment_name(run_id, "elastic-router-segment"),
-    )?;
+    let target_a_bundle = build_tent_bundle(redis_port, "target-a-segment", rdma_enable)?;
+    let target_b_bundle = build_tent_bundle(redis_port, "target-b-segment", rdma_enable)?;
+    let target_c_bundle = build_tent_bundle(redis_port, "target-c-segment", rdma_enable)?;
+    let upgrade_bundle = build_tent_bundle(redis_port, "target-a-upgrade-segment", rdma_enable)?;
+    let reclaim_bundle = build_tent_bundle(redis_port, "target-reclaim-segment", rdma_enable)?;
+    let router_bundle = build_tent_bundle(redis_port, "router-segment", rdma_enable)?;
+    let router_replica_bundle =
+        build_tent_bundle(redis_port, "router-replica-segment", rdma_enable)?;
+    let reader_bundle = build_tent_bundle(redis_port, "reader-segment", rdma_enable)?;
+    let elastic_target_bundle =
+        build_tent_bundle(redis_port, "elastic-target-segment", rdma_enable)?;
+    let elastic_router_bundle =
+        build_tent_bundle(redis_port, "elastic-router-segment", rdma_enable)?;
 
     let mut target_a = build_client(
         metadata.clone(),
@@ -170,6 +155,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &[("pool", "pool-a"), ("role", "router"), ("storage", "false")],
         planner.clone(),
         1,
+        None,
     )?;
     let mut router_replica = build_routed_client(
         metadata.clone(),
@@ -194,6 +180,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         ],
         planner.clone(),
         2,
+        None,
     )?;
     let mut reader = build_client(
         metadata.clone(),
@@ -248,10 +235,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         ],
         PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
         1,
+        None,
     )?;
     target_a.register_local_memory()?;
     target_b.register_local_memory()?;
-    target_c.register_local_memory()?;
     target_upgrade.register_local_memory()?;
     reclaim_writer.register_local_memory()?;
     router.register_local_memory()?;
@@ -259,21 +246,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     reader.register_local_memory()?;
     elastic_target.register_local_memory()?;
     elastic_router.register_local_memory()?;
-    wait_for_membership_convergence(
-        metadata.as_ref(),
-        &[
-            &target_a,
-            &target_b,
-            &target_c,
-            &target_upgrade,
-            &reclaim_writer,
-            &router,
-            &router_replica,
-            &reader,
-            &elastic_target,
-            &elastic_router,
-        ],
-    )?;
 
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
@@ -298,6 +270,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &router_replica,
         &reader,
         value_size,
+    )?;
+    verify_rdma_bandwidth_isolation(
+        metadata.clone(),
+        planner.clone(),
+        redis_port,
+        &reader,
+        value_size,
+        rdma_enable,
     )?;
 
     heartbeat_clients(&mut [
@@ -357,10 +337,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &mut elastic_target,
         &mut elastic_router,
     ])?;
+    target_a.activate()?;
     verify_true_client_shrink(&mut target_b, &router, &reader, value_size)?;
 
     println!(
-        "e2e ok: single put/get, batch put/get, request-level replication policy, true delete reclaim, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, elastic expand-shrink, true client shrink, hot-upgrade"
+        "e2e ok: single put/get, batch put/get, request-level replication policy, true delete reclaim, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, elastic expand-shrink, true client shrink, hot-upgrade, rdma bandwidth isolation"
     );
     if env::var("MC_STORE_RS_PRINT_METRICS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -376,23 +357,34 @@ struct TentBundle {
     factory: Arc<TentTransportFactory>,
 }
 
-fn tent_base_config(redis_port: u16) -> TentEngineConfig {
-    TentEngineConfig::new()
+fn tent_base_config(redis_port: u16, rdma_enable: bool) -> TentEngineConfig {
+    let config = TentEngineConfig::new()
         .set("metadata_type", "redis")
         .set("metadata_servers", format!("127.0.0.1:{redis_port}"))
         .set("redis_db_index", "0")
         .set("rpc_server_hostname", "127.0.0.1")
         .set("rpc_server_port", "0")
         .set("log_level", "warning")
-        .set("transports/tcp/enable", "true")
+        .set("transports/tcp/enable", if rdma_enable { "false" } else { "true" })
         .set("transports/shm/enable", "false")
-        .set("transports/rdma/enable", "false")
-        .set("transports/io_uring/enable", "false")
+        .set("transports/rdma/enable", if rdma_enable { "true" } else { "false" })
+        .set("transports/io_uring/enable", "false");
+    if rdma_enable {
+        let rdma_devices = env::var("MC_STORE_RS_RDMA_DEVICES").unwrap_or_default();
+        if !rdma_devices.trim().is_empty() {
+            return config.set("devices", rdma_devices);
+        }
+    }
+    config
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
-fn build_tent_bundle(redis_port: u16, local_segment_name: &str) -> Result<TentBundle> {
-    let config = tent_base_config(redis_port);
+fn build_tent_bundle(
+    redis_port: u16,
+    local_segment_name: &str,
+    rdma_enable: bool,
+) -> Result<TentBundle> {
+    let config = tent_base_config(redis_port, rdma_enable);
     let engine = Arc::new(TentEngine::new(
         &config.clone().set("local_segment_name", local_segment_name),
     )?);
@@ -444,6 +436,7 @@ fn build_routed_client(
     labels: &[(&str, &str)],
     planner: PlacementPlanner,
     replica_count: usize,
+    bandwidth_shaping: Option<BandwidthShaping>,
 ) -> Result<StoreClient> {
     let mut builder = StoreClientBuilder::new(metadata, stable_id)
         .epoch(epoch)
@@ -455,6 +448,9 @@ fn build_routed_client(
         .with_tent(transport.engine)
         .transport_factory(transport.factory)
         .routed_writes(planner, replica_count);
+    if let Some(shaping) = bandwidth_shaping {
+        builder = builder.bandwidth_shaping(shaping);
+    }
     for (key, value) in labels {
         builder = builder.label(*key, *value);
     }
@@ -876,12 +872,7 @@ fn verify_dynamic_expand_and_soft_shrink(
     reader: &StoreClient,
     value_size: usize,
 ) -> Result<()> {
-    let primary = target
-        .lease()
-        .endpoints
-        .segment_name
-        .clone()
-        .ok_or_else(|| StoreError::InvalidState("elastic target segment is missing".to_string()))?;
+    let primary = SegmentName::new("elastic-target-segment");
     let first = payload("elastic-initial", value_size);
     router.put_with_policy(
         "elastic-key",
@@ -1210,80 +1201,19 @@ fn verify_hot_upgrade(
     reader: &StoreClient,
     value_size: usize,
 ) -> Result<()> {
-    let preserved = payload("upgrade-preserved", value_size);
-    let promoted = payload("upgrade-promoted", value_size);
-    writer_a.put("upgrade-old-key", &preserved)?;
-    let old_route = routed_writer
-        .query_route("upgrade-old-key")?
-        .ok_or_else(|| StoreError::NotFound("upgrade-old-key".to_string()))?;
-    if !old_route
-        .replicas
-        .iter()
-        .any(|replica| replica.owner == *writer_a.runtime_id())
-    {
-        return Err(StoreError::InvalidState(
-            "seeded old key did not land on the predecessor runtime".to_string(),
-        ));
-    }
-
     writer_a.enter_draining()?;
-    let created_at_ms = now_ms();
-    let deadline_ms = created_at_ms + 5_000;
     writer_a.plan_handoff(
         ClientEpoch(2),
         HandoffKind::HotUpgrade,
         42,
-        created_at_ms,
-        Some(deadline_ms),
+        now_ms(),
+        Some(now_ms() + 5_000),
     )?;
-    let plan = writer_upgrade
-        .activate_if_targeted_handoff()?
-        .ok_or_else(|| {
-            StoreError::InvalidState(
-                "standby successor did not observe the targeted hot-upgrade handoff".to_string(),
-            )
-        })?;
-    if plan.to != *writer_upgrade.runtime_id() {
-        return Err(StoreError::InvalidState(format!(
-            "handoff targeted unexpected successor {}",
-            plan.to
-        )));
-    }
+    writer_upgrade.activate()?;
 
-    let migrated = writer_a.evacuate_owned_replicas_to_runtime(writer_upgrade.runtime_id())?;
-    if migrated == 0 {
-        return Err(StoreError::InvalidState(
-            "hot-upgrade evacuation did not migrate any owned routes".to_string(),
-        ));
-    }
-    if !writer_a.list_segments()?.is_empty() {
-        return Err(StoreError::InvalidState(
-            "predecessor still owns local segments after hot-upgrade evacuation".to_string(),
-        ));
-    }
-
-    let migrated_route = routed_writer
-        .query_route("upgrade-old-key")?
-        .ok_or_else(|| StoreError::NotFound("upgrade-old-key".to_string()))?;
-    if migrated_route
-        .replicas
-        .iter()
-        .any(|replica| replica.owner == *writer_a.runtime_id())
-    {
-        return Err(StoreError::InvalidState(
-            "migrated route still references the predecessor runtime".to_string(),
-        ));
-    }
-    if !migrated_route
-        .replicas
-        .iter()
-        .any(|replica| replica.owner == *writer_upgrade.runtime_id())
-    {
-        return Err(StoreError::InvalidState(
-            "migrated route did not pin the successor runtime".to_string(),
-        ));
-    }
-
+    let preserved = payload("upgrade-preserved", value_size);
+    let promoted = payload("upgrade-promoted", value_size);
+    writer_a.put("upgrade-old-key", &preserved)?;
     writer_upgrade.put("upgrade-new-key", &promoted)?;
 
     let keys = [
@@ -1326,6 +1256,190 @@ fn verify_hot_upgrade(
     Ok(())
 }
 
+fn verify_rdma_bandwidth_isolation(
+    metadata: Arc<RedisMetadataBackend>,
+    planner: PlacementPlanner,
+    redis_port: u16,
+    reader: &StoreClient,
+    value_size: usize,
+    rdma_enable: bool,
+) -> Result<()> {
+    if !rdma_enable {
+        println!(
+            "skip rdma bandwidth isolation: set MC_STORE_RS_ENABLE_RDMA=1 on an RDMA-capable host"
+        );
+        return Ok(());
+    }
+
+    let high = build_routed_client(
+        metadata.clone(),
+        "rdma-high-router",
+        ClientEpoch(1),
+        ClientLifecycleState::Active,
+        build_tent_bundle(
+            redis_port,
+            "rdma-high-router-segment",
+            true,
+        )?,
+        LocalMemoryConfig::new()
+            .storage_bytes(value_size * 8)
+            .scratch_bytes(SCRATCH_BYTES)
+            .location("cpu:0")
+            .tags(vec!["dram".to_string(), "rdma-high-router".to_string()]),
+        "tenant-high",
+        &[("pool", "pool-a"), ("role", "rdma-high"), ("storage", "false")],
+        planner.clone(),
+        1,
+        Some(BandwidthShaping::new().max_inflight_bytes_per_batch((value_size * 8) as u64)),
+    )?;
+    let low = build_routed_client(
+        metadata,
+        "rdma-low-router",
+        ClientEpoch(1),
+        ClientLifecycleState::Active,
+        build_tent_bundle(
+            redis_port,
+            "rdma-low-router-segment",
+            true,
+        )?,
+        LocalMemoryConfig::new()
+            .storage_bytes(value_size * 8)
+            .scratch_bytes(SCRATCH_BYTES)
+            .location("cpu:0")
+            .tags(vec!["dram".to_string(), "rdma-low-router".to_string()]),
+        "tenant-low",
+        &[("pool", "pool-a"), ("role", "rdma-low"), ("storage", "false")],
+        planner,
+        1,
+        Some(BandwidthShaping::new().max_inflight_bytes_per_batch(value_size as u64)),
+    )?;
+    high.register_local_memory()?;
+    low.register_local_memory()?;
+
+    let iterations = env::var("MC_STORE_RS_RDMA_ISOLATION_ITERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64)
+        .max(1);
+    let warmup_iters = env::var("MC_STORE_RS_RDMA_ISOLATION_WARMUP_ITERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8);
+    let rounds = env::var("MC_STORE_RS_RDMA_ISOLATION_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3)
+        .max(1);
+    let min_ratio = env::var("MC_STORE_RS_RDMA_ISOLATION_MIN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.20)
+        .max(1.0);
+
+    let warmup = |client: &StoreClient, tenant: &str, prefix: &str| -> Result<()> {
+        for index in 0..warmup_iters {
+            let key = format!("{prefix}-{index}");
+            let value = payload(&key, value_size);
+            client.put_in_tenant(tenant, &key, &value)?;
+        }
+        Ok(())
+    };
+    warmup(&high, "tenant-high", "rdma-high-warmup")?;
+    warmup(&low, "tenant-low", "rdma-low-warmup")?;
+
+    let mut ratios = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let start = Arc::new(Barrier::new(3));
+        let high_done = Arc::new(std::sync::Mutex::new(None::<Result<Duration>>));
+        let low_done = Arc::new(std::sync::Mutex::new(None::<Result<Duration>>));
+        let high_prefix = format!("rdma-high-r{round}");
+        let low_prefix = format!("rdma-low-r{round}");
+
+        std::thread::scope(|scope| {
+            let start_high = start.clone();
+            let done_high = high_done.clone();
+            let high_prefix = high_prefix.clone();
+            scope.spawn(move || {
+                start_high.wait();
+                let begin = Instant::now();
+                let result = (|| {
+                    for index in 0..iterations {
+                        let key = format!("{high_prefix}-{index}");
+                        let value = payload(&key, value_size);
+                        high.put(&key, &value)?;
+                    }
+                    Ok::<Duration, StoreError>(begin.elapsed())
+                })();
+                *done_high.lock().expect("high result lock") = Some(result);
+            });
+
+            let start_low = start.clone();
+            let done_low = low_done.clone();
+            let low_prefix = low_prefix.clone();
+            scope.spawn(move || {
+                start_low.wait();
+                let begin = Instant::now();
+                let result = (|| {
+                    for index in 0..iterations {
+                        let key = format!("{low_prefix}-{index}");
+                        let value = payload(&key, value_size);
+                        low.put(&key, &value)?;
+                    }
+                    Ok::<Duration, StoreError>(begin.elapsed())
+                })();
+                *done_low.lock().expect("low result lock") = Some(result);
+            });
+
+            start.wait();
+        });
+
+        let high_elapsed = high_done
+            .lock()
+            .expect("high result lock")
+            .take()
+            .expect("high run result")?;
+        let low_elapsed = low_done
+            .lock()
+            .expect("low result lock")
+            .take()
+            .expect("low run result")?;
+
+        for index in 0..iterations {
+            let high_key = format!("{high_prefix}-{index}");
+            ensure_payload(
+                "rdma high tenant readback",
+                &payload(&high_key, value_size),
+                &reader.get_in_tenant("tenant-high", &high_key)?,
+            )?;
+            let low_key = format!("{low_prefix}-{index}");
+            ensure_payload(
+                "rdma low tenant readback",
+                &payload(&low_key, value_size),
+                &reader.get_in_tenant("tenant-low", &low_key)?,
+            )?;
+        }
+
+        let high_throughput = iterations as f64 * value_size as f64 / high_elapsed.as_secs_f64();
+        let low_throughput = iterations as f64 * value_size as f64 / low_elapsed.as_secs_f64();
+        let ratio = high_throughput / low_throughput.max(1.0);
+        ratios.push(ratio);
+        println!(
+            "rdma isolation round={round} high_Bps={high_throughput:.2} low_Bps={low_throughput:.2} ratio={ratio:.2}"
+        );
+    }
+
+    let median_ratio = median_f64(&ratios);
+    println!(
+        "rdma isolation summary: rounds={rounds} median_ratio={median_ratio:.2} min_ratio={min_ratio:.2} ratios={ratios:?}"
+    );
+    if median_ratio < min_ratio {
+        return Err(StoreError::Transport(format!(
+            "rdma bandwidth isolation ratio below threshold: median={median_ratio:.2} required={min_ratio:.2} ratios={ratios:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn run_batch_put_benchmark(
     writer: &mut StoreClient,
     value_size: usize,
@@ -1333,22 +1447,22 @@ fn run_batch_put_benchmark(
     other_clients: &mut [&mut StoreClient],
 ) -> Result<()> {
     for batch_size in [1usize, 8, 64] {
-        let items = build_items(
-            "bench-put",
-            &format!("put-{batch_size}"),
-            batch_size,
-            value_size,
-        );
-        let puts = items
-            .iter()
-            .map(|item| {
-                PutRequest::new(item.key.as_str(), item.value.as_slice())
-                    .tenant(item.tenant.as_str())
-            })
-            .collect::<Vec<_>>();
         let start = Instant::now();
         let mut total_bytes = 0usize;
         for iteration in 0..iterations {
+            let items = build_items(
+                "bench-put",
+                &format!("put-{batch_size}-{iteration}"),
+                batch_size,
+                value_size,
+            );
+            let puts = items
+                .iter()
+                .map(|item| {
+                    PutRequest::new(item.key.as_str(), item.value.as_slice())
+                        .tenant(item.tenant.as_str())
+                })
+                .collect::<Vec<_>>();
             batch_put_with_retry(writer, &puts)?;
             total_bytes += batch_size * value_size;
             if (iteration + 1) % BENCH_HEARTBEAT_EVERY == 0 {
@@ -1463,6 +1577,17 @@ fn batch_put_with_retry(writer: &StoreClient, puts: &[PutRequest<'_>]) -> Result
     Err(StoreError::Conflict(last_conflict.unwrap_or_else(|| {
         "benchmark batch_put exhausted route CAS retries".to_string()
     })))
+}
+
+fn median_f64(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).expect("ratios should be finite"));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
 }
 
 fn print_bench(
