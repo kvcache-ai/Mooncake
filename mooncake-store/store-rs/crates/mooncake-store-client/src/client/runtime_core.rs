@@ -1,4 +1,35 @@
 impl StoreClient {
+    pub fn lifecycle_state(&self) -> ClientLifecycleState {
+        decode_lifecycle_state(self.lifecycle_state.load(Ordering::SeqCst))
+    }
+
+    fn set_lifecycle_state(&self, next_state: ClientLifecycleState) {
+        self.lifecycle_state
+            .store(encode_lifecycle_state(next_state), Ordering::SeqCst);
+    }
+
+    fn complete_startup_activation_after_local_memory_registration(&self) -> Result<()> {
+        if self.lifecycle_state() != ClientLifecycleState::Standby {
+            return Ok(());
+        }
+        if self
+            .startup_activation_pending
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .metadata
+            .update_client_state(&self.lease.runtime, ClientLifecycleState::Active)
+        {
+            self.startup_activation_pending.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        self.set_lifecycle_state(ClientLifecycleState::Active);
+        Ok(())
+    }
+
     pub fn runtime_id(&self) -> &ClientRuntimeId {
         &self.lease.runtime
     }
@@ -47,7 +78,7 @@ impl StoreClient {
     }
 
     pub fn activate_if_targeted_handoff(&mut self) -> Result<Option<HandoffPlan>> {
-        let Some(handoff) = self.targeted_handoff_plan_for_state(self.lease.state)? else {
+        let Some(handoff) = self.targeted_handoff_plan_for_state(self.lifecycle_state())? else {
             return Ok(None);
         };
         self.activate()?;
@@ -66,7 +97,7 @@ impl StoreClient {
         &mut self,
         successor: &ClientRuntimeId,
     ) -> Result<usize> {
-        if self.lease.state != ClientLifecycleState::Draining {
+        if self.lifecycle_state() != ClientLifecycleState::Draining {
             self.enter_draining()?;
         }
         self.evacuate_owned_replicas_to_runtime_when_draining(successor)
@@ -159,7 +190,7 @@ impl StoreClient {
         let tracker = OperationTracker::new("evacuate_owned_replicas_via");
         let result = (|| {
             self.ensure_local_memory()?;
-            if self.lease.state != ClientLifecycleState::Draining {
+            if self.lifecycle_state() != ClientLifecycleState::Draining {
                 self.enter_draining()?;
             }
             let segments = {
@@ -209,8 +240,10 @@ impl StoreClient {
         result
     }
 
-    pub fn lease(&self) -> &ClientLease {
-        &self.lease
+    pub fn lease(&self) -> ClientLease {
+        let mut lease = self.lease.clone();
+        lease.state = self.lifecycle_state();
+        lease
     }
 
     pub fn default_tenant(&self) -> &str {
@@ -241,6 +274,7 @@ impl StoreClient {
         let mut builder = StoreClientBuilder::new(self.metadata.clone(), helper_stable_id)
             .epoch(self.lease.runtime.epoch)
             .state(ClientLifecycleState::Active)
+            .activate_on_local_memory_registration()
             .tenant(self.default_tenant.clone())
             .compatibility(self.lease.compatibility.clone())
             .local_memory(self.local_memory.clone())

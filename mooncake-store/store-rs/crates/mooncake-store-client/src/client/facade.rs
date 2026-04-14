@@ -407,7 +407,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let tracker = OperationTracker::new("evacuate_owned_replicas");
         let result = (|| {
             self.ensure_local_memory()?;
-            if self.lease.state != ClientLifecycleState::Draining {
+            if self.lifecycle_state() != ClientLifecycleState::Draining {
                 self.enter_draining()?;
             }
             self.evacuate_owned_replicas_when_draining()
@@ -453,7 +453,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let _span =
             info_span!("store.register_local_memory", runtime = %self.lease.runtime).entered();
         let tracker = OperationTracker::new("register_local_memory");
-        let result = self.ensure_local_memory();
+        let result = (|| {
+            self.ensure_local_memory()?;
+            self.complete_startup_activation_after_local_memory_registration()
+        })();
         tracker.finish(&result, 0);
         result
     }
@@ -1053,6 +1056,7 @@ impl StoreClient {
         operation: &'static str,
     ) -> HealthUpdate {
         self.lease.state = next_state;
+        self.set_lifecycle_state(next_state);
         HealthUpdate::state_transition(self.metadata.clone(), self.lease.clone(), operation)
     }
 }

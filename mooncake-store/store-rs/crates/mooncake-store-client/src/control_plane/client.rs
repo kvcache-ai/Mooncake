@@ -901,6 +901,28 @@ impl ControlPlaneClient {
         self.channels.lock().clear();
     }
 
+    pub(crate) fn probe_reachability(&self, lease: &ClientLease) -> ControlPlaneReachability {
+        let address = match control_address(lease) {
+            Ok(address) => address,
+            Err(error) => return ControlPlaneReachability::Unknown(error),
+        };
+
+        let uri = normalize_control_uri(&address);
+        let endpoint = match Endpoint::from_shared(uri.clone()) {
+            Ok(endpoint) => endpoint.connect_timeout(CONNECT_TIMEOUT).tcp_nodelay(true),
+            Err(error) => {
+                return ControlPlaneReachability::Unknown(StoreError::Transport(format!(
+                    "invalid control plane uri {uri}: {error}"
+                )));
+            }
+        };
+
+        match self.with_runtime(|runtime| runtime.block_on(endpoint.connect())) {
+            Ok(_) => ControlPlaneReachability::Reachable,
+            Err(_) => ControlPlaneReachability::Unreachable,
+        }
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn active_stream_sessions(&self) -> usize {

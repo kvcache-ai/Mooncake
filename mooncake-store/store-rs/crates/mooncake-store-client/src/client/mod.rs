@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::slice;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU8, Ordering},
+    Arc, OnceLock,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
@@ -67,6 +70,8 @@ pub struct StoreClient {
     write_mode: WriteMode,
     route_control: RouteControlMode,
     route_topk: usize,
+    lifecycle_state: AtomicU8,
+    startup_activation_pending: AtomicBool,
     state: Mutex<StoreState>,
 }
 
@@ -87,6 +92,27 @@ pub struct HealthUpdate {
 }
 
 pub type HeartbeatLease = HealthUpdate;
+
+fn encode_lifecycle_state(state: ClientLifecycleState) -> u8 {
+    match state {
+        ClientLifecycleState::Standby => 0,
+        ClientLifecycleState::Active => 1,
+        ClientLifecycleState::Draining => 2,
+        ClientLifecycleState::Sealed => 3,
+        ClientLifecycleState::Offline => 4,
+    }
+}
+
+fn decode_lifecycle_state(encoded: u8) -> ClientLifecycleState {
+    match encoded {
+        0 => ClientLifecycleState::Standby,
+        1 => ClientLifecycleState::Active,
+        2 => ClientLifecycleState::Draining,
+        3 => ClientLifecycleState::Sealed,
+        4 => ClientLifecycleState::Offline,
+        _ => ClientLifecycleState::Offline,
+    }
+}
 
 impl HealthChannel {
     pub fn new(metadata: Arc<dyn MetadataBackend>, lease: ClientLease) -> Self {
@@ -114,6 +140,10 @@ impl HealthChannel {
 
     pub fn snapshot_lease(&self) -> ClientLease {
         self.lease.lock().clone()
+    }
+
+    pub fn sync_state(&self, next_state: ClientLifecycleState) {
+        self.lease.lock().state = next_state;
     }
 }
 

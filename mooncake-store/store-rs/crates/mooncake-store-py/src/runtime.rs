@@ -58,6 +58,7 @@ impl CompatRuntimeArgs {
         let mut builder = StoreClientBuilder::new(plan.metadata, stable_id.clone())
             .epoch(self.epoch)
             .state(self.initial_state)
+            .activate_on_local_memory_registration()
             .compatibility(CompatibilityDescriptor::default())
             .tenant(plan.tenant)
             .local_memory(local_memory)

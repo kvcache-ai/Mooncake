@@ -364,6 +364,7 @@ fn build_client(
     let mut builder = StoreClientBuilder::new(metadata, stable_id)
         .epoch(epoch)
         .state(state)
+        .activate_on_local_memory_registration()
         .tenant(tenant)
         .compatibility(CompatibilityDescriptor::default())
         .local_memory(memory)
@@ -391,6 +392,7 @@ fn build_routed_client(
     let mut builder = StoreClientBuilder::new(metadata, stable_id)
         .epoch(epoch)
         .state(state)
+        .activate_on_local_memory_registration()
         .tenant(tenant)
         .compatibility(CompatibilityDescriptor::default())
         .local_memory(memory)
@@ -407,13 +409,15 @@ fn wait_for_runtime_visibility(
     metadata: &dyn MetadataBackend,
     client: &StoreClient,
     runtime: &mooncake_store_core::ClientRuntimeId,
+    expected_state: ClientLifecycleState,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         match client.runtime_state(runtime) {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(state)) if state == expected_state => return Ok(()),
             Ok(None) | Err(StoreError::NotFound(_)) => {}
             Err(error) => return Err(error),
+            Ok(Some(_)) => {}
         }
         sleep(Duration::from_millis(20));
     }
@@ -436,14 +440,14 @@ fn wait_for_membership_convergence(
 ) -> Result<()> {
     let runtimes = clients
         .iter()
-        .map(|client| client.runtime_id().clone())
+        .map(|client| (client.runtime_id().clone(), client.lease().state))
         .collect::<Vec<_>>();
     for client in clients {
-        for runtime in &runtimes {
+        for (runtime, expected_state) in &runtimes {
             if runtime == client.runtime_id() {
                 continue;
             }
-            wait_for_runtime_visibility(metadata, client, runtime)?;
+            wait_for_runtime_visibility(metadata, client, runtime, *expected_state)?;
         }
     }
     Ok(())

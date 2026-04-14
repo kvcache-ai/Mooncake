@@ -161,11 +161,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let shutdown = install_signal_handler()?;
     let heartbeat_interval =
         effective_heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_ms);
+    let requested_initial_state = requested_initial_state(&args);
     let runtime = build_runtime_args(&args).build()?;
 
     let stable_id = runtime.stable_id.clone();
     let epoch = runtime.epoch;
-    let initial_state = runtime.initial_state;
+    let startup_state = runtime.initial_state;
     let segment_name = runtime.segment_name.clone();
     let client = Arc::new(StoreDispatcher::spawn_with_heartbeat_timeout(
         runtime.client,
@@ -177,13 +178,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(address) => Some(start_dummy_store_server(client.clone(), address)?),
         None => None,
     };
+    if should_activate_after_ready(requested_initial_state, startup_state) {
+        client.activate()?;
+    }
 
     eprintln!(
         "{}",
         started_message(
             &stable_id,
             epoch,
-            initial_state,
+            requested_initial_state,
             &segment_name,
             args.lease_ttl_ms,
             heartbeat_interval,
@@ -200,7 +204,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ));
     while !shutdown.requested() {
         let now = now_ms();
-        if should_follow_handoff(initial_state, epoch) {
+        if should_follow_handoff(requested_initial_state, epoch) {
             if let Some(plan) = client.activate_if_targeted_handoff()? {
                 eprintln!(
                     "{}",
@@ -366,9 +370,27 @@ fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
         },
         local_segment_name: args.local_segment_name.clone(),
         epoch: ClientEpoch(args.epoch),
-        initial_state: args.initial_state.into(),
+        initial_state: startup_initial_state(requested_initial_state(args)),
         route_control: args.route_control.into(),
     }
+}
+
+fn requested_initial_state(args: &Args) -> ClientLifecycleState {
+    args.initial_state.into()
+}
+
+fn startup_initial_state(requested: ClientLifecycleState) -> ClientLifecycleState {
+    match requested {
+        ClientLifecycleState::Active => ClientLifecycleState::Standby,
+        other => other,
+    }
+}
+
+fn should_activate_after_ready(
+    requested: ClientLifecycleState,
+    startup: ClientLifecycleState,
+) -> bool {
+    requested == ClientLifecycleState::Active && startup == ClientLifecycleState::Standby
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -592,8 +614,9 @@ mod tests {
     use super::{
         build_runtime_args, drained_message, effective_heartbeat_interval,
         heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms, parse_hugepage_size_arg,
-        parse_label, start_metrics_if_needed, started_message, stopped_message, validate_args,
-        Args, HeartbeatLoopState, InitialStateArg, RouteControlArg,
+        parse_label, requested_initial_state, should_activate_after_ready, start_metrics_if_needed,
+        started_message, startup_initial_state, stopped_message, validate_args, Args,
+        HeartbeatLoopState, InitialStateArg, RouteControlArg,
     };
 
     fn sample_args() -> Args {
@@ -924,6 +947,22 @@ mod tests {
             Some("true")
         );
         assert!(runtime_args.setup.expires_at_ms.is_some());
+    }
+
+    #[test]
+    fn active_startup_is_staged_as_standby_until_runtime_is_ready() {
+        let args = sample_args();
+        let runtime_args = build_runtime_args(&args);
+        assert_eq!(requested_initial_state(&args), ClientLifecycleState::Active);
+        assert_eq!(runtime_args.initial_state, ClientLifecycleState::Standby);
+        assert!(should_activate_after_ready(
+            ClientLifecycleState::Active,
+            runtime_args.initial_state
+        ));
+        assert_eq!(
+            startup_initial_state(ClientLifecycleState::Draining),
+            ClientLifecycleState::Draining
+        );
     }
 
     #[test]
