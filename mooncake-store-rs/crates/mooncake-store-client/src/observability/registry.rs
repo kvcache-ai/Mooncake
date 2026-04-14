@@ -24,6 +24,9 @@ pub(crate) const OBJECT_ROUTES: &str = "mooncake_store_object_routes";
 pub(crate) const REPLICA_DISTRIBUTION: &str = "mooncake_store_replica_distribution";
 pub(crate) const RUNTIME_STATUS: &str = "mooncake_store_runtime_status";
 pub(crate) const RUNTIME_LEASE_EXPIRES_AT_MS: &str = "mooncake_store_runtime_lease_expires_at_ms";
+pub(crate) const HEARTBEAT_CONSECUTIVE_FAILURES: &str =
+    "mooncake_store_heartbeat_consecutive_failures";
+pub(crate) const HEARTBEAT_LAST_SUCCESS_MS: &str = "mooncake_store_heartbeat_last_success_ms";
 pub(crate) const MEMBERSHIP_REFRESH_TOTAL: &str = "mooncake_store_membership_refresh_total";
 pub(crate) const MEMBERSHIP_REFRESH_DURATION: &str =
     "mooncake_store_membership_refresh_duration_seconds";
@@ -61,6 +64,8 @@ pub struct MetricsSnapshot {
     pub replica_distribution: Vec<GaugeSample<ReplicaDistributionKey>>,
     pub runtime_status: Vec<GaugeSample<RuntimeStatusKey>>,
     pub runtime_lease_expires_at_ms: Vec<GaugeSample<RuntimeKey>>,
+    pub heartbeat_consecutive_failures: Vec<GaugeSample<RuntimeKey>>,
+    pub heartbeat_last_success_ms: Vec<GaugeSample<RuntimeKey>>,
     pub membership_refresh: Vec<CounterSample<ResultKey>>,
     pub membership_refresh_duration: Vec<HistogramSample<ResultKey>>,
     pub route_cas: Vec<CounterSample<ResultKey>>,
@@ -228,6 +233,10 @@ impl<K: Ord + Clone> GaugeFamily<K> {
         *gauge = (*gauge + delta).max(0.0);
     }
 
+    fn set(&mut self, key: K, value: f64) {
+        self.inner.insert(key, value.max(0.0));
+    }
+
     fn snapshot(&self) -> Vec<GaugeSample<K>> {
         self.inner
             .iter()
@@ -319,6 +328,8 @@ struct MetricsRegistry {
     segments: BTreeMap<(String, String), SegmentSample>,
     routes: BTreeMap<String, ObjectRoute>,
     runtime_leases: BTreeMap<String, RuntimeLeaseMetric>,
+    heartbeat_consecutive_failures: GaugeFamily<RuntimeKey>,
+    heartbeat_last_success_ms: GaugeFamily<RuntimeKey>,
     membership_refresh: CounterFamily<ResultKey>,
     membership_refresh_duration: HistogramFamily<ResultKey>,
     route_cas: CounterFamily<ResultKey>,
@@ -404,6 +415,8 @@ impl MetricsRegistry {
             replica_distribution: self.replica_distribution_snapshot(),
             runtime_status: self.runtime_status_snapshot(),
             runtime_lease_expires_at_ms: self.runtime_lease_snapshot(),
+            heartbeat_consecutive_failures: self.heartbeat_consecutive_failures.snapshot(),
+            heartbeat_last_success_ms: self.heartbeat_last_success_ms.snapshot(),
             membership_refresh: self.membership_refresh.snapshot(),
             membership_refresh_duration: self.membership_refresh_duration.snapshot(),
             route_cas: self.route_cas.snapshot(),
@@ -613,6 +626,23 @@ pub(crate) fn record_runtime_leases(leases: &[ClientLease]) {
             )
         })
         .collect();
+}
+
+pub(crate) fn record_heartbeat_health(
+    runtime: &str,
+    consecutive_failures: u64,
+    last_success_ms: u64,
+) {
+    let mut registry = metrics_registry().lock().expect("metrics lock poisoned");
+    let key = RuntimeKey {
+        runtime: runtime.to_string(),
+    };
+    registry
+        .heartbeat_consecutive_failures
+        .set(key.clone(), consecutive_failures as f64);
+    registry
+        .heartbeat_last_success_ms
+        .set(key, last_success_ms as f64);
 }
 
 pub(crate) fn record_segment(announcement: &SegmentAnnouncement) {

@@ -68,23 +68,73 @@ pub struct StoreClient {
     state: Mutex<StoreState>,
 }
 
-pub struct HeartbeatLease {
-    metadata: Arc<dyn MetadataBackend>,
-    lease: ClientLease,
+enum HealthUpdateKind {
+    Heartbeat,
+    StateTransition { operation: &'static str },
 }
 
-impl HeartbeatLease {
+pub struct HealthUpdate {
+    metadata: Arc<dyn MetadataBackend>,
+    lease: ClientLease,
+    kind: HealthUpdateKind,
+}
+
+pub type HeartbeatLease = HealthUpdate;
+
+impl HealthUpdate {
+    fn heartbeat(metadata: Arc<dyn MetadataBackend>, lease: ClientLease) -> Self {
+        Self {
+            metadata,
+            lease,
+            kind: HealthUpdateKind::Heartbeat,
+        }
+    }
+
+    fn state_transition(
+        metadata: Arc<dyn MetadataBackend>,
+        lease: ClientLease,
+        operation: &'static str,
+    ) -> Self {
+        Self {
+            metadata,
+            lease,
+            kind: HealthUpdateKind::StateTransition { operation },
+        }
+    }
+
     pub fn publish(self) -> Result<()> {
-        let _span = info_span!(
-            "store.heartbeat",
-            runtime = %self.lease.runtime,
-            expires_at_ms = self.lease.expires_at_ms
-        )
-        .entered();
-        let tracker = OperationTracker::new("heartbeat");
-        let result = self.metadata.upsert_client_lease(&self.lease);
-        tracker.finish(&result, 0);
-        result
+        let Self {
+            metadata,
+            lease,
+            kind,
+        } = self;
+        match kind {
+            HealthUpdateKind::Heartbeat => {
+                let _span = info_span!(
+                    "store.heartbeat",
+                    runtime = %lease.runtime,
+                    expires_at_ms = lease.expires_at_ms
+                )
+                .entered();
+                let tracker = OperationTracker::new("heartbeat");
+                let result = metadata.upsert_client_lease(&lease);
+                tracker.finish(&result, 0);
+                result
+            }
+            HealthUpdateKind::StateTransition { operation } => {
+                let _span = info_span!(
+                    "store.health_state_update",
+                    runtime = %lease.runtime,
+                    operation,
+                    state = ?lease.state
+                )
+                .entered();
+                let tracker = OperationTracker::new(operation);
+                let result = metadata.update_client_state(&lease.runtime, lease.state);
+                tracker.finish(&result, 0);
+                result
+            }
+        }
     }
 }
 
