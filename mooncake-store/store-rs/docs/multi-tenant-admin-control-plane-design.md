@@ -98,6 +98,16 @@ Relevant code:
 
 ---
 
+## Status Update
+
+The core design in this document is now substantially implemented:
+
+- unified tenant policy is stored in metadata
+- `mooncake-store-admin` is the preferred tenant policy entrypoint
+- Store-RS runtime consumes and enforces tenant-scoped routing/quota/fairness/shaping/placement defaults
+
+The remaining follow-up work is compatibility cleanup: legacy runtime-local builder / Python / CLI / env knobs are still accepted as compatibility fallbacks, but should no longer be presented as the preferred policy authoring surface.
+
 ## Problem Statement
 
 Today, multi-tenant control-plane behavior is partly implemented, but operators lack a first-class management surface for:

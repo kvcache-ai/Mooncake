@@ -14,6 +14,7 @@ import queue
 import sys
 import threading
 from dataclasses import dataclass, field
+import warnings
 
 from ._runtime import package_dir, preload_native_libraries
 
@@ -320,6 +321,7 @@ class MooncakeDistributedStore:
             args[0] = local_hostname
             if transport_rpc_port is not None and "transport_rpc_port" not in kwargs:
                 kwargs["transport_rpc_port"] = transport_rpc_port
+        _warn_setup_policy_fallback(kwargs, source="MooncakeDistributedStore.setup")
         _init_tracing_from_env()
         result = self._invoke("setup", *args, **kwargs)
         _start_metrics_server_from_env()
@@ -584,6 +586,7 @@ class MooncakeDistributedStore:
         return grouped
     def _setup_from_config_dict(self, config: Mapping[str, object]):
         config = _apply_setup_env_defaults(dict(config))
+        _warn_setup_policy_fallback(config, source="MooncakeDistributedStore.setup config")
         if "local_hostname" not in config:
             raise TypeError("setup config requires `local_hostname`")
         metadata_url = config.get("metadata_server", config.get("metadata_url"))
@@ -732,6 +735,22 @@ def _coerce_mapping(value) -> dict[str, str] | None:
     if not isinstance(value, Mapping):
         raise TypeError("labels must be a mapping")
     return {str(key): str(item) for key, item in value.items()}
+
+def _warn_setup_policy_fallback(config: Mapping[str, object], *, source: str) -> None:
+    policy_keys = []
+    if _has_value(config.get("route_topk")):
+        policy_keys.append("route_topk")
+    if _has_value(config.get("route_control")):
+        policy_keys.append("route_control")
+    if not policy_keys:
+        return
+    joined = ", ".join(policy_keys)
+    warnings.warn(
+        f"{source} provided {joined}; admin-managed tenant policy in metadata is the preferred configuration surface and these values are treated as compatibility fallbacks",
+        UserWarning,
+        stacklevel=3,
+    )
+
 
 _SETUP_ENV_DEFAULTS = {
     "stable_id": ("MC_STORE_RS_STABLE_ID", _coerce_optional_str),

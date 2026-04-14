@@ -103,15 +103,15 @@ struct Args {
     epoch: u64,
     #[arg(long, value_enum, default_value_t = InitialStateArg::Active)]
     initial_state: InitialStateArg,
-    #[arg(long, default_value = "default")]
+    #[arg(long, default_value = "default", help = "Default tenant scope for startup policy lookup and request defaults")]
     tenant: String,
-    #[arg(long = "label", value_parser = parse_label)]
+    #[arg(long = "label", value_parser = parse_label, help = "Runtime identity and placement labels; use admin-managed tenant policy for tenant-scoped routing/resource policy")]
     labels: Vec<(String, String)>,
     #[arg(long, default_value_t = false)]
     routed_writes: bool,
     #[arg(long, default_value_t = 1)]
     replica_count: usize,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, help = "Compatibility fallback WRH route-authority fanout; prefer admin-managed tenant policy in metadata")]
     route_topk: usize,
     #[arg(long)]
     keyspace: Option<String>,
@@ -137,7 +137,7 @@ struct Args {
     hugepage_size: Option<usize>,
     #[arg(long)]
     trace_filter: Option<String>,
-    #[arg(long, value_enum, default_value_t = RouteControlArg::EmbeddedWrh)]
+    #[arg(long, value_enum, default_value_t = RouteControlArg::EmbeddedWrh, help = "Compatibility fallback route-control mode; prefer admin-managed tenant policy in metadata")]
     route_control: RouteControlArg,
     #[arg(long, default_value_t = false)]
     drain_on_exit: bool,
@@ -162,6 +162,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     validate_args(&args)?;
     init_tracing(args.trace_filter.as_deref())?;
+    emit_compat_warnings(&args);
 
     let timeouts = resolve_timeout_config(&args)?;
     let metrics_addr = start_metrics_if_needed(args.metrics_addr.as_deref())?;
@@ -307,6 +308,19 @@ fn graceful_shutdown(
         successor.runtime.epoch,
         migrated,
     ))
+}
+
+fn emit_compat_warnings(args: &Args) {
+    if args.route_topk != 2 {
+        eprintln!(
+            "[WARN] --route-topk is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata"
+        );
+    }
+    if args.route_control != RouteControlArg::EmbeddedWrh {
+        eprintln!(
+            "[WARN] --route-control is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata"
+        );
+    }
 }
 
 fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
@@ -636,7 +650,7 @@ mod tests {
     use _store_rs::runtime::CompatTimeoutConfig;
 
     use super::{
-        build_runtime_args, drained_message, effective_heartbeat_interval,
+        build_runtime_args, drained_message, effective_heartbeat_interval, emit_compat_warnings,
         heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms, parse_hugepage_size_arg,
         parse_label, requested_initial_state, resolve_timeout_config, should_activate_after_ready,
         start_metrics_if_needed, started_message, startup_initial_state, stopped_message,
@@ -842,6 +856,19 @@ mod tests {
             runtime_args.local_segment_name.as_deref(),
             Some("store-a-next")
         );
+    }
+
+    #[test]
+    fn emit_compat_warnings_only_triggers_for_non_default_route_flags() {
+        emit_compat_warnings(&sample_args());
+
+        let mut args = sample_args();
+        args.route_topk = 4;
+        emit_compat_warnings(&args);
+
+        let mut args = sample_args();
+        args.route_control = RouteControlArg::MetadataOnly;
+        emit_compat_warnings(&args);
     }
 
     #[test]

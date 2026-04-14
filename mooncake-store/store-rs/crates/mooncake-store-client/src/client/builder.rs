@@ -181,6 +181,10 @@ impl StoreClientBuilder {
         self
     }
 
+    /// Sets the default tenant scope for request builders and startup policy resolution.
+    ///
+    /// This remains the normal way to choose which tenant's policy is resolved at bootstrap.
+    /// It is not itself a tenant-policy authoring surface.
     pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
         self.default_tenant = tenant.into();
         self
@@ -214,11 +218,21 @@ impl StoreClientBuilder {
         self
     }
 
+    /// Sets a compatibility fallback route-control mode for startup.
+    ///
+    /// Admin-managed tenant policy in metadata is the preferred authoring surface for
+    /// tenant-scoped routing. When a tenant policy provides routing settings, those values
+    /// take precedence over this builder-local fallback.
     pub fn route_control(mut self, route_control: RouteControlMode) -> Self {
         self.route_control = route_control;
         self
     }
 
+    /// Sets a compatibility fallback WRH route-authority fanout for startup.
+    ///
+    /// Admin-managed tenant policy in metadata is the preferred authoring surface for
+    /// tenant-scoped routing. When a tenant policy provides `route_topk`, that value takes
+    /// precedence over this builder-local fallback.
     pub fn route_topk(mut self, route_topk: usize) -> Self {
         self.route_topk = route_topk;
         self
@@ -249,16 +263,19 @@ impl StoreClientBuilder {
         self
     }
 
+    /// Sets a compatibility fallback quota used when no admin-managed tenant policy provides one.
     pub fn namespace_quota(mut self, namespace_quota: NamespaceQuota) -> Self {
         self.namespace_quota = Some(namespace_quota);
         self
     }
 
+    /// Sets a compatibility fallback fairness policy used when no admin-managed tenant policy provides one.
     pub fn execution_fairness(mut self, execution_fairness: ExecutionFairness) -> Self {
         self.execution_fairness = Some(execution_fairness);
         self
     }
 
+    /// Sets a compatibility fallback bandwidth-shaping policy used when no admin-managed tenant policy provides one.
     pub fn bandwidth_shaping(mut self, bandwidth_shaping: BandwidthShaping) -> Self {
         self.bandwidth_shaping = Some(bandwidth_shaping);
         self

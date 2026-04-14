@@ -85,6 +85,8 @@ fn main() -> Result<()> {
 
 `rpc_server_port` is the TENT TCP data-plane port. Leaving it at `0` lets TENT choose a random local port, which is fine for single-host demos. For cross-host or cross-container deployments, set a fixed port and make sure peers can reach `rpc_server_hostname:rpc_server_port`.
 
+`tenant(...)` remains the normal way to select the default scope used for startup policy lookup and request builders. `route_topk(...)`, `route_control(...)`, `namespace_quota(...)`, `execution_fairness(...)`, and `bandwidth_shaping(...)` are compatibility fallbacks; admin-managed tenant policy in metadata is the preferred authoring surface when those settings are tenant-scoped.
+
 ## Transport Backends
 
 The Rust transport layer exposes two explicit choices:

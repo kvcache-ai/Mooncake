@@ -104,6 +104,10 @@ pub enum CompatTransportConfig {
     ClassicTe(ClassicEngineConfig),
 }
 
+/// Compatibility-layer build output for Python and standalone client entrypoints.
+///
+/// Tenant-scoped policy should be authored through admin-managed metadata. Fields such as
+/// `route_topk` remain here as compatibility fallbacks so existing integrations continue to work.
 pub struct CompatBuildPlan {
     pub metadata: Arc<dyn MetadataBackend>,
     pub transport_backend: TransportBackend,
@@ -124,6 +128,10 @@ pub struct CompatBuildPlan {
 }
 
 #[derive(Clone, Debug)]
+/// Compatibility setup inputs accepted by the Python wrapper and standalone client.
+///
+/// Admin-managed tenant policy in metadata is the preferred authoring surface for tenant-scoped
+/// routing and resource policy. These inputs are kept as bootstrap/fallback knobs.
 pub struct CompatSetupArgs {
     pub local_hostname: String,
     pub metadata_url: String,

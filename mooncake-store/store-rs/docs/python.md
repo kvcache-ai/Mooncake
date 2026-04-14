@@ -49,6 +49,8 @@ The Python compatibility layer supports two execution styles.
 
 Use `setup(...)` when Python should talk to the native distributed store runtime directly.
 
+For tenant-scoped routing and resource policy, prefer `mooncake-store-admin policy ...` and durable metadata. Python `setup(...)` route knobs are kept as compatibility/bootstrap fallbacks.
+
 This mode:
 
 - constructs a Rust `StoreClient`
@@ -163,7 +165,7 @@ Or use `./scripts/build/build-wheel.sh`, which also copies the binary to `dist/b
 
 When the client is installed from a wheel, the same binary is also embedded inside the package and exposed through the `mooncake-store-client` console script, matching the upstream Mooncake packaging style.
 
-The same wheel also exposes `mooncake-store-admin` for explicit metadata maintenance and tenant route-policy management.
+The same wheel also exposes `mooncake-store-admin` for explicit metadata maintenance and admin-managed tenant policy operations.
 
 Start a storage client:
 
@@ -186,11 +188,11 @@ Useful flags:
 - `--transport-backend tent|classic-te` to choose the real data-plane backend
 - `--transport-rpc-port <port>` to pin the real data-plane TCP port used by real clients
 - `--routed-writes` and `--replica-count` to enable routed writer mode
-- `--route-topk <n>` to control WRH route-authority fanout; it must be `>= 2` and match the policy already stored in the metadata keyspace
-- `--route-control metadata-only|embedded-wrh` to select the route authority mode
-- `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
+<<<<<<< HEAD
+- `--route-topk <n>` as a compatibility fallback for WRH route-authority fanout; it must be `>= 2`, should match any policy already stored in metadata, and admin-managed tenant policy is preferred
+- `--route-control metadata-only|embedded-wrh` as a compatibility fallback for route authority mode; prefer admin-managed tenant policy in metadata
+- `--heartbeat-interval-ms`, `--heartbeat-timeout-ms`, and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
 - `--request-timeout-ms` to set the outer request deadline for routed operations and dispatcher calls
-- `--heartbeat-timeout-ms` to set the dedicated heartbeat / state-publish timeout
 - `--transfer-stall-timeout-ms` to set the inner transport stall detector for TENT / classic TE
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
 - `--client-server-address host:port` to expose the standalone compatibility server for dummy clients only
@@ -234,7 +236,7 @@ mooncake-store-admin \
   cleanup-stale-segments
 ```
 
-Manage tenant route policy or clean up stale segment registrations with the packaged admin binary:
+Manage tenant policy or clean up stale segment registrations with the packaged admin binary:
 
 ```bash
 mooncake-store-admin \
@@ -254,7 +256,8 @@ Notes:
 
 - client leases expire automatically; segment registration keys do not
 - the cleanup is explicit by design, so temporary lease misses do not trigger automatic deletion
-- tenant route policy is stored in metadata and applied at runtime bootstrap for clients whose default tenant matches the override
+- tenant-scoped routing, quota, fairness, shaping, and placement defaults should be authored through admin-managed metadata policy
+- Python `setup(...)`, standalone client flags, and related env vars remain compatibility/bootstrap fallbacks when metadata does not provide the relevant section
 - `--keyspace <prefix>` scopes both policy operations and stale-segment cleanup to one metadata namespace
 - `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` also apply here
 
