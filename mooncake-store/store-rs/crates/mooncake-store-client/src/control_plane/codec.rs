@@ -195,8 +195,16 @@ pub(super) fn try_replica_route(replica: pb::ReplicaRoute) -> Result<ReplicaRout
 pub(super) fn pb_object_route(route: &ObjectRoute) -> pb::ObjectRoute {
     pb::ObjectRoute {
         key: route.key.0.clone(),
-        tenant: route.namespace.as_ref().map(|scope| scope.tenant.clone()).unwrap_or_default(),
-        domain: route.namespace.as_ref().map(|scope| scope.domain.clone()).unwrap_or_default(),
+        tenant: route
+            .namespace
+            .as_ref()
+            .map(|scope| scope.tenant.clone())
+            .unwrap_or_default(),
+        domain: route
+            .namespace
+            .as_ref()
+            .map(|scope| scope.domain.clone())
+            .unwrap_or_default(),
         object_set: route
             .namespace
             .as_ref()
@@ -221,15 +229,16 @@ pub(super) fn try_object_route(route: pb::ObjectRoute) -> Result<ObjectRoute> {
         .ok_or_else(|| {
             StoreError::Transport("control plane object route is missing compatibility".to_string())
         })?;
-    let namespace = if route.tenant.is_empty() && route.domain.is_empty() && route.object_set.is_empty() {
-        None
-    } else {
-        Some(mooncake_store_core::NamespaceScope::with_defaults(
-            Some(route.tenant.as_str()).filter(|value| !value.is_empty()),
-            Some(route.domain.as_str()).filter(|value| !value.is_empty()),
-            Some(route.object_set.as_str()).filter(|value| !value.is_empty()),
-        ))
-    };
+    let namespace =
+        if route.tenant.is_empty() && route.domain.is_empty() && route.object_set.is_empty() {
+            None
+        } else {
+            Some(mooncake_store_core::NamespaceScope::with_defaults(
+                Some(route.tenant.as_str()).filter(|value| !value.is_empty()),
+                Some(route.domain.as_str()).filter(|value| !value.is_empty()),
+                Some(route.object_set.as_str()).filter(|value| !value.is_empty()),
+            ))
+        };
     let logical_key = (!route.logical_key.is_empty()).then_some(route.logical_key.clone());
     let canonical_key = (!route.canonical_key.is_empty()).then_some(route.canonical_key.clone());
     let sharing_scope = (!route.sharing_scope.is_empty()).then_some(route.sharing_scope.clone());

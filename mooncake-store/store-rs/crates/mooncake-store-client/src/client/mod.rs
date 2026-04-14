@@ -13,9 +13,9 @@ use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
     MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result,
-    RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain,
-    RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    StoreError,
+    RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+    TenantPlacementPolicy, TenantPolicySpec,
 };
 use mooncake_transport::{
     Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
@@ -95,6 +95,7 @@ pub struct StoreClient {
     namespace_quota: Option<NamespaceQuota>,
     execution_fairness: Option<ExecutionFairness>,
     bandwidth_shaping: Option<BandwidthShaping>,
+    placement_policy: Option<TenantPlacementPolicy>,
     state: Mutex<StoreState>,
 }
 

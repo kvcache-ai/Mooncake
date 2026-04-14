@@ -12,7 +12,9 @@ use mooncake_store_core::{
     ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
     NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    StoreError,
+    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
+    TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaPolicy, TenantRoutePolicy,
 };
 use mooncake_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferBatchHints, TransferPacingMode,
@@ -603,6 +605,33 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         self.inner.list_route_policies()
     }
 
+    fn get_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+        self.inner.get_tenant_policy(scope)
+    }
+
+    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies()
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<TenantPolicy> {
+        self.inner.put_tenant_policy(policy, expected_version)
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_tenant_policy(scope, expected_version)
+    }
+
     fn put_handoff(
         &self,
         handoff: &mooncake_store_core::HandoffPlan,
@@ -743,6 +772,33 @@ impl MetadataBackend for CountingMetadataBackend {
         &self,
     ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
         self.inner.list_route_policies()
+    }
+
+    fn get_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+        self.inner.get_tenant_policy(scope)
+    }
+
+    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies()
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<TenantPolicy> {
+        self.inner.put_tenant_policy(policy, expected_version)
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_tenant_policy(scope, expected_version)
     }
 
     fn put_handoff(
@@ -3918,7 +3974,20 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
         suspect_runtime_cache.lock().contains(&dead_runtime),
         "first reader should mark the dead replica runtime as suspect in the shared cache"
     );
-
+    assert!(
+        reader_a
+            .suspect_runtime_cache
+            .lock()
+            .contains(store_a.runtime_id()),
+        "first reader should quarantine the failed storage runtime"
+    );
+    assert!(
+        reader_b
+            .suspect_runtime_cache
+            .lock()
+            .contains(store_a.runtime_id()),
+        "second reader should observe the shared quarantine entry"
+    );
     assert_eq!(
         reader_b
             .get("shared-suspect-key")
@@ -7016,21 +7085,27 @@ fn bootstrap_route_policy_uses_tenant_override_when_present() {
         created_by: writer.runtime.clone(),
         created_at_ms: 10,
     };
-    let tenant_policy = RoutePolicy {
-        route_topk: 4,
-        route_control: RouteControlMode::MetadataOnly,
-        created_by: writer.runtime.clone(),
-        created_at_ms: 20,
-    };
     metadata
         .put_route_policy(&RoutePolicyDomain::Default, &default_policy)
         .expect("default route policy should be stored");
     metadata
-        .put_route_policy(
-            &RoutePolicyDomain::Tenant("tenant-a".to_string()),
-            &tenant_policy,
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(4),
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 20,
+                updated_by: "admin".to_string(),
+            },
+            None,
         )
-        .expect("tenant route policy should be stored");
+        .expect("tenant policy should be stored");
 
     bootstrap_route_policy(
         metadata.as_ref(),
@@ -7043,7 +7118,8 @@ fn bootstrap_route_policy_uses_tenant_override_when_present() {
 
     let effective = resolve_effective_route_policy(metadata.as_ref(), "tenant-a")
         .expect("effective route policy should resolve");
-    assert_eq!(effective, tenant_policy);
+    assert_eq!(effective.route_topk, 4);
+    assert_eq!(effective.route_control, RouteControlMode::MetadataOnly);
 }
 
 #[test]
@@ -7075,10 +7151,31 @@ fn bootstrap_route_policy_falls_back_to_default_when_tenant_override_missing() {
 #[test]
 fn namespace_quota_rejects_over_limit_writes() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(5),
+                        max_objects: Some(1),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant quota policy should store");
     let transport = Arc::new(TestTransport::new("quota-segment"));
     let client = StoreClientBuilder::new(metadata, "quota-client")
         .tenant("tenant-a")
-        .namespace_quota(NamespaceQuota::new().max_bytes(5).max_objects(1))
         .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
@@ -7098,6 +7195,78 @@ fn namespace_quota_rejects_over_limit_writes() {
         .put("other", b"1")
         .expect_err("second object should exceed object quota");
     assert!(matches!(objects_error, StoreError::Allocator(_)));
+}
+
+#[test]
+fn runtime_uses_metadata_authored_fairness_shaping_and_placement_defaults() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("runtime-policy-client-segment"));
+    let owner_a = publish_storage_node(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "owner-a",
+        "seg-a",
+        "pool-a",
+    );
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    fairness: Some(TenantExecutionFairnessPolicy {
+                        max_remote_batch_items_per_tenant: Some(3),
+                    }),
+                    shaping: Some(TenantBandwidthShapingPolicy {
+                        max_remote_batch_bytes: Some(64),
+                        max_remote_batch_burst_items: Some(5),
+                        max_inflight_bytes_per_batch: Some(17),
+                    }),
+                    placement: Some(TenantPlacementPolicy {
+                        default_replica_count: Some(2),
+                        prefer_local: Some(false),
+                        prefer_alloc_in_same_node: Some(true),
+                        preferred_storage_owners: Some(vec!["owner-a".to_string()]),
+                        preferred_segments: Some(vec!["seg-a".to_string()]),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant runtime policy should store");
+    let client = StoreClientBuilder::new(metadata, "runtime-policy-client")
+        .tenant("tenant-a")
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("runtime policy client should build");
+
+    wait_for_runtime_visibility(&client, &owner_a);
+
+    assert_eq!(client.fairness_max_remote_batch_items_per_tenant(), Some(3));
+    assert_eq!(client.shaping_max_remote_batch_bytes(), Some(64));
+    assert_eq!(client.shaping_max_inflight_bytes_per_batch(), Some(17));
+    assert_eq!(client.default_replica_count(), 2);
+
+    let resolved = client
+        .resolve_replication_policy(None)
+        .expect("default replication policy should resolve");
+    assert_eq!(resolved.replica_count, 2);
+    assert!(resolved.preferred_segments.contains(&SegmentName::new("seg-a")));
+    assert_eq!(resolved.preferred_storage_runtimes, vec![owner_a]);
+    assert!(resolved.prefer_local);
 }
 
 #[test]

@@ -5,10 +5,11 @@ use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
     SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
+    TenantPolicy, TenantPolicyScope,
 };
 use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
 
-use crate::keyspace::parse_route_policy_domain;
+use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 
@@ -203,6 +204,33 @@ redis.call('HSET', key,
     'alignment_bytes', tostring(announcement["alignment_bytes"] or 1),
     'capacity_bytes', tostring(announcement["capacity_bytes"]))
 return {1, used}
+"#;
+
+const CAS_TENANT_POLICY_SCRIPT: &str = r#"
+local key = KEYS[1]
+local expected = ARGV[1]
+local payload = ARGV[2]
+
+local current_payload = redis.call('GET', key)
+if not current_payload then
+    if expected ~= '__none__' then
+        return {0, ''}
+    end
+else
+    local current = cjson.decode(current_payload)
+    local current_version = tostring(current['version'])
+    if expected == '__none__' or current_version ~= expected then
+        return {0, current_payload}
+    end
+end
+
+if payload == '__delete__' then
+    redis.call('DEL', key)
+    return {1, ''}
+end
+
+redis.call('SET', key, payload)
+return {1, payload}
 "#;
 
 const REDIS_CONNECT_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS";
@@ -1038,6 +1066,129 @@ impl MetadataBackend for RedisMetadataBackend {
         Ok(policies)
     }
 
+    fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>> {
+        let mut connection = self.connection()?;
+        let key = self.keyspace.tenant_policy(scope);
+        let payload: Option<String> = connection
+            .get(&key)
+            .map_err(|error| metadata_error("redis get tenant policy", error))?;
+        payload
+            .map(|payload| serde_json::from_str(&payload).map_err(json_error))
+            .transpose()
+    }
+
+    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
+        let mut connection = self.connection()?;
+        let prefix = self.keyspace.tenant_policy_prefix(None);
+        let keys: Vec<String> = connection
+            .keys(format!("{}*", prefix))
+            .map_err(|error| metadata_error("redis keys tenant policy", error))?;
+        let mut policies: Vec<TenantPolicy> = Vec::new();
+        for key in keys {
+            let payload: Option<String> = connection
+                .get(&key)
+                .map_err(|error| metadata_error("redis get tenant policy", error))?;
+            let Some(payload) = payload else {
+                continue;
+            };
+            let Some(_scope) = parse_tenant_policy_scope(&self.keyspace, &key) else {
+                continue;
+            };
+            policies.push(serde_json::from_str(&payload).map_err(json_error)?);
+        }
+        policies.sort_by(|left, right| left.scope.cmp(&right.scope));
+        Ok(policies)
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> Result<TenantPolicy> {
+        policy.validate()?;
+        let mut connection = self.connection()?;
+        let key = self.keyspace.tenant_policy(&policy.scope);
+        let payload = serde_json::to_string(policy).map_err(json_error)?;
+        let result = Script::new(CAS_TENANT_POLICY_SCRIPT)
+            .key(&key)
+            .arg(
+                expected_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
+            .arg(payload)
+            .invoke::<(i32, String)>(&mut connection)
+            .map_err(|error| metadata_error("redis cas tenant policy", error))?;
+        if result.0 == 1 {
+            return Ok(policy.clone());
+        }
+        let current = if result.1.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str::<TenantPolicy>(&result.1).map_err(json_error)?)
+        };
+        match (expected_version, current.as_ref()) {
+            (None, Some(_)) => Err(StoreError::Conflict(format!(
+                "tenant policy already exists for {}",
+                policy.scope.tenant
+            ))),
+            (Some(expected), Some(current)) => Err(StoreError::Conflict(format!(
+                "tenant policy version mismatch for {}: expected={} actual={}",
+                policy.scope.tenant, expected, current.version
+            ))),
+            (Some(expected), None) => Err(StoreError::Conflict(format!(
+                "tenant policy missing for {} at expected version {}",
+                policy.scope.tenant, expected
+            ))),
+            (None, None) => Err(StoreError::Conflict(format!(
+                "tenant policy write rejected for {}",
+                policy.scope.tenant
+            ))),
+        }
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let key = self.keyspace.tenant_policy(scope);
+        let result = Script::new(CAS_TENANT_POLICY_SCRIPT)
+            .key(&key)
+            .arg(
+                expected_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
+            .arg("__delete__")
+            .invoke::<(i32, String)>(&mut connection)
+            .map_err(|error| metadata_error("redis delete tenant policy", error))?;
+        if result.0 == 1 {
+            return Ok(!result.1.is_empty());
+        }
+        let current = if result.1.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str::<TenantPolicy>(&result.1).map_err(json_error)?)
+        };
+        match (expected_version, current.as_ref()) {
+            (None, None) => Ok(false),
+            (Some(expected), Some(current)) => Err(StoreError::Conflict(format!(
+                "tenant policy version mismatch for {}: expected={} actual={}",
+                scope.tenant, expected, current.version
+            ))),
+            (Some(expected), None) => Err(StoreError::Conflict(format!(
+                "tenant policy missing for {} at expected version {}",
+                scope.tenant, expected
+            ))),
+            (None, Some(_)) => Err(StoreError::Conflict(format!(
+                "tenant policy delete rejected for {}",
+                scope.tenant
+            ))),
+        }
+    }
+
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
         let key = self.keyspace.handoff(&handoff.stable_id);
         let payload = serde_json::to_string(handoff).map_err(json_error)?;
@@ -1134,7 +1285,8 @@ mod tests {
         ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy,
         RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-        SegmentName, StoreError,
+        SegmentName, StoreError, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+        TenantQuotaPolicy,
     };
     use redis::Commands;
 
@@ -1701,6 +1853,72 @@ mod tests {
             .smembers(keyspace.segment_index(Some(&dead_runtime)))
             .expect("dead owner index should load");
         assert!(dead_owner_index.is_empty());
+    }
+
+    #[test]
+    fn redis_backend_tenant_policy_supports_versioned_put_list_and_delete() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-tenant-policy")),
+        )
+        .expect("redis backend should initialize");
+        let scope = TenantPolicyScope::new("tenant/a", Some("domain-1"), None::<String>);
+        let policy = TenantPolicy {
+            scope: scope.clone(),
+            spec: TenantPolicySpec {
+                quota: Some(TenantQuotaPolicy {
+                    max_bytes: Some(128),
+                    max_objects: Some(8),
+                }),
+                ..TenantPolicySpec::default()
+            },
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "admin".to_string(),
+        };
+
+        let stored = backend
+            .put_tenant_policy(&policy, None)
+            .expect("tenant policy insert should succeed");
+        assert_eq!(stored, policy);
+        assert_eq!(
+            backend
+                .get_tenant_policy(&scope)
+                .expect("tenant policy read should succeed"),
+            Some(policy.clone())
+        );
+
+        let mut updated = policy.clone();
+        updated.version = 2;
+        updated.updated_at_ms = 20;
+        updated.updated_by = "admin-2".to_string();
+        updated.spec.quota.as_mut().unwrap().max_objects = Some(16);
+        let error = backend
+            .put_tenant_policy(&updated, Some(3))
+            .expect_err("mismatched version should fail");
+        assert!(matches!(error, StoreError::Conflict(_)));
+
+        backend
+            .put_tenant_policy(&updated, Some(1))
+            .expect("tenant policy update should succeed");
+        assert_eq!(
+            backend
+                .list_tenant_policies()
+                .expect("tenant policy listing should succeed"),
+            vec![updated.clone()]
+        );
+        assert!(backend
+            .delete_tenant_policy(&scope, Some(2))
+            .expect("tenant policy delete should succeed"));
+        assert_eq!(
+            backend
+                .get_tenant_policy(&scope)
+                .expect("tenant policy read after delete should succeed"),
+            None
+        );
     }
 
     #[test]

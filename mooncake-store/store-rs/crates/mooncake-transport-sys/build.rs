@@ -78,7 +78,8 @@ fn detect_python() -> PythonConfig {
         let mut parts = version.split('.');
         let major = parts.next().and_then(|part| part.parse::<u32>().ok());
         let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
-        if !matches!((major, minor), (Some(major), Some(minor)) if major > 3 || (major == 3 && minor >= 7)) {
+        if !matches!((major, minor), (Some(major), Some(minor)) if major > 3 || (major == 3 && minor >= 7))
+        {
             continue;
         }
 
@@ -105,7 +106,11 @@ if include_dir and libdir and ldlibrary:
     print(libdir)
     print(ldlibrary)
 "#;
-    let output = Command::new(candidate).arg("-c").arg(script).output().ok()?;
+    let output = Command::new(candidate)
+        .arg("-c")
+        .arg(script)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -184,9 +189,7 @@ fn ensure_yalantinglibs_prefix(upstream_dir: &Path, build_dir: &Path) -> PathBuf
         "build bundled yalantinglibs",
     );
     run(
-        Command::new("cmake")
-            .arg("--install")
-            .arg(&ylt_build_dir),
+        Command::new("cmake").arg("--install").arg(&ylt_build_dir),
         "install bundled yalantinglibs",
     );
 
@@ -225,20 +228,61 @@ fn ensure_upstream_native_artifacts(
             ))
             .arg(format!(
                 "-Dyalantinglibs_DIR={}",
-                yalantinglibs_prefix.join("lib/cmake/yalantinglibs").display()
+                yalantinglibs_prefix
+                    .join("lib/cmake/yalantinglibs")
+                    .display()
             ))
-            .arg(format!("-DPYTHON_EXECUTABLE={}", python.executable.display()))
-            .arg(format!("-DPython_EXECUTABLE={}", python.executable.display()))
-            .arg(format!("-DPython3_EXECUTABLE={}", python.executable.display()))
-            .arg(format!("-DPython3_INCLUDE_DIR={}", python.include_dir.display()))
-            .arg(format!("-DPython3_INCLUDE_DIRS={}", python.include_dir.display()))
-            .arg(format!("-DPython3_LIBRARY={}", python.library_dir.join(format!("lib{}.so", python.library_name)).display()))
-            .arg(format!("-DPython3_LIBRARIES={}", python.library_dir.join(format!("lib{}.so", python.library_name)).display()))
-            .arg(format!("-DPython3_LIBRARY_DIRS={}", python.library_dir.display()))
-            .arg(format!("-DPython3_RUNTIME_LIBRARY_DIRS={}", python.library_dir.display()))
+            .arg(format!(
+                "-DPYTHON_EXECUTABLE={}",
+                python.executable.display()
+            ))
+            .arg(format!(
+                "-DPython_EXECUTABLE={}",
+                python.executable.display()
+            ))
+            .arg(format!(
+                "-DPython3_EXECUTABLE={}",
+                python.executable.display()
+            ))
+            .arg(format!(
+                "-DPython3_INCLUDE_DIR={}",
+                python.include_dir.display()
+            ))
+            .arg(format!(
+                "-DPython3_INCLUDE_DIRS={}",
+                python.include_dir.display()
+            ))
+            .arg(format!(
+                "-DPython3_LIBRARY={}",
+                python
+                    .library_dir
+                    .join(format!("lib{}.so", python.library_name))
+                    .display()
+            ))
+            .arg(format!(
+                "-DPython3_LIBRARIES={}",
+                python
+                    .library_dir
+                    .join(format!("lib{}.so", python.library_name))
+                    .display()
+            ))
+            .arg(format!(
+                "-DPython3_LIBRARY_DIRS={}",
+                python.library_dir.display()
+            ))
+            .arg(format!(
+                "-DPython3_RUNTIME_LIBRARY_DIRS={}",
+                python.library_dir.display()
+            ))
             .arg(format!("-DPython3_LIBNAME={}", python.library_name))
-            .arg(format!("-DJSONCPP_INCLUDE_DIR={}", jsoncpp.include_dir.display()))
-            .arg(format!("-DJSONCPP_LIBRARY={}", jsoncpp.library_path.display()))
+            .arg(format!(
+                "-DJSONCPP_INCLUDE_DIR={}",
+                jsoncpp.include_dir.display()
+            ))
+            .arg(format!(
+                "-DJSONCPP_LIBRARY={}",
+                jsoncpp.library_path.display()
+            ))
             .arg("-DWITH_TE=ON")
             .arg("-DWITH_STORE=OFF")
             .arg("-DWITH_STORE_RUST=OFF")

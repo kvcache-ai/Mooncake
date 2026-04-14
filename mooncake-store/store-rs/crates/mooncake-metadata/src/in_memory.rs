@@ -4,6 +4,7 @@ use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
     SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
+    TenantPolicy, TenantPolicyScope,
 };
 use parking_lot::RwLock;
 
@@ -15,6 +16,7 @@ struct InMemoryState {
     handoffs: BTreeMap<String, HandoffPlan>,
     objects: BTreeMap<String, ObjectRoute>,
     route_policies: BTreeMap<RoutePolicyDomain, RoutePolicy>,
+    tenant_policies: BTreeMap<TenantPolicyScope, TenantPolicy>,
     segments: BTreeMap<String, StoredSegmentState>,
 }
 
@@ -226,6 +228,77 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .collect())
     }
 
+    fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>> {
+        Ok(self.state.read().tenant_policies.get(scope).cloned())
+    }
+
+    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
+        Ok(self
+            .state
+            .read()
+            .tenant_policies
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> Result<TenantPolicy> {
+        policy.validate()?;
+        let mut state = self.state.write();
+        let current = state.tenant_policies.get(&policy.scope).cloned();
+        match (expected_version, current.as_ref()) {
+            (None, None) => {}
+            (Some(expected), Some(current)) if current.version == expected => {}
+            (None, Some(_)) => {
+                return Err(StoreError::Conflict(format!(
+                    "tenant policy already exists for {}",
+                    policy.scope.tenant
+                )))
+            }
+            (Some(expected), Some(current)) => {
+                return Err(StoreError::Conflict(format!(
+                    "tenant policy version mismatch for {}: expected={} actual={}",
+                    policy.scope.tenant, expected, current.version
+                )))
+            }
+            (Some(expected), None) => {
+                return Err(StoreError::Conflict(format!(
+                    "tenant policy missing for {} at expected version {}",
+                    policy.scope.tenant, expected
+                )))
+            }
+        }
+        state
+            .tenant_policies
+            .insert(policy.scope.clone(), policy.clone());
+        Ok(policy.clone())
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> Result<bool> {
+        let mut state = self.state.write();
+        let Some(current) = state.tenant_policies.get(scope) else {
+            return Ok(false);
+        };
+        if let Some(expected_version) = expected_version {
+            if current.version != expected_version {
+                return Err(StoreError::Conflict(format!(
+                    "tenant policy version mismatch for {}: expected={} actual={}",
+                    scope.tenant, expected_version, current.version
+                )));
+            }
+        }
+        state.tenant_policies.remove(scope);
+        Ok(true)
+    }
+
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
         self.state
             .write()
@@ -244,7 +317,8 @@ mod tests {
     use mooncake_store_core::{
         ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
         CompatibilityDescriptor, MetadataBackend, RouteControlMode, RoutePolicy, RoutePolicyDomain,
-        SegmentAnnouncement, SegmentLifecycleState, SegmentName,
+        SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError, TenantPolicy,
+        TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
     };
 
     use super::InMemoryMetadataBackend;
@@ -424,6 +498,63 @@ mod tests {
                 .get_route_policy(&RoutePolicyDomain::Tenant("tenant-a".to_string()))
                 .expect("tenant route policy read should succeed"),
             None,
+        );
+    }
+
+    #[test]
+    fn tenant_policy_put_requires_matching_version() {
+        let metadata = InMemoryMetadataBackend::new();
+        let scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+        let policy = TenantPolicy {
+            scope: scope.clone(),
+            spec: TenantPolicySpec {
+                quota: Some(TenantQuotaPolicy {
+                    max_bytes: Some(128),
+                    max_objects: Some(8),
+                }),
+                ..TenantPolicySpec::default()
+            },
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "admin".to_string(),
+        };
+        metadata
+            .put_tenant_policy(&policy, None)
+            .expect("first tenant policy insert should succeed");
+        assert_eq!(
+            metadata
+                .get_tenant_policy(&scope)
+                .expect("tenant policy read should succeed"),
+            Some(policy.clone())
+        );
+
+        let mut updated = policy.clone();
+        updated.version = 2;
+        updated.updated_at_ms = 20;
+        updated.updated_by = "admin-2".to_string();
+        updated.spec.quota.as_mut().unwrap().max_objects = Some(16);
+        let error = metadata
+            .put_tenant_policy(&updated, Some(3))
+            .expect_err("mismatched version should fail");
+        assert!(matches!(error, StoreError::Conflict(_)));
+
+        metadata
+            .put_tenant_policy(&updated, Some(1))
+            .expect("matching version should succeed");
+        assert_eq!(
+            metadata
+                .list_tenant_policies()
+                .expect("tenant policy listing should succeed"),
+            vec![updated.clone()]
+        );
+        assert!(metadata
+            .delete_tenant_policy(&scope, Some(2))
+            .expect("delete should succeed"));
+        assert_eq!(
+            metadata
+                .get_tenant_policy(&scope)
+                .expect("tenant policy read after delete should succeed"),
+            None
         );
     }
 }

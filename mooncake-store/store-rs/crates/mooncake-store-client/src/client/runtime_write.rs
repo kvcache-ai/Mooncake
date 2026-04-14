@@ -190,6 +190,8 @@ impl StoreClient {
         }
 
         struct PendingBatchReservation<'a> {
+            object_id: LogicalObjectId,
+            qos_tier: Option<&'a str>,
             scoped_key: ObjectKey,
             value: &'a [u8],
             candidates: Vec<ReplicaPlacementCandidate>,
@@ -298,7 +300,17 @@ impl StoreClient {
                         tenant, request.key
                     )));
                 }
+                let object_id = LogicalObjectId::new(
+                    NamespaceScope::with_defaults(
+                        Some(tenant),
+                        request.domain,
+                        request.object_set,
+                    ),
+                    request.key,
+                );
                 pending.push(PendingBatchReservation {
+                    object_id,
+                    qos_tier: request.qos_tier,
                     scoped_key: self.scoped_key(tenant, request.key),
                     value: request.value,
                     candidates,
@@ -398,6 +410,8 @@ impl StoreClient {
             let mut prepared = Vec::with_capacity(pending.len());
             for entry in pending {
                 prepared.push(PreparedObjectWrite {
+                    object_id: entry.object_id,
+                    qos_tier: entry.qos_tier,
                     scoped_key: entry.scoped_key,
                     value: entry.value,
                     targets: entry.targets,
@@ -573,29 +587,30 @@ impl StoreClient {
                     .as_ref()
                     .map(|route| route.version.next())
                     .unwrap_or(RouteVersion(1));
-                let (tenant, logical_key) = entry.scoped_key.0.split_once("::").ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "route key {} is missing tenant scope",
-                        entry.scoped_key.0
-                    ))
-                })?;
-                let namespace = mooncake_store_core::NamespaceScope::with_defaults(Some(tenant), None, None);
+                let mut route = ObjectRoute {
+                    key: entry.scoped_key.clone(),
+                    namespace: None,
+                    logical_key: None,
+                    canonical_key: None,
+                    sharing_scope: None,
+                    qos_tier: None,
+                    version: next_version,
+                    state: RouteState::Active,
+                    compatibility: self.lease.compatibility.clone(),
+                    replicas,
+                };
+                mooncake_store_core::apply_route_identity(&mut route, &entry.object_id);
+                route.qos_tier = Some(
+                    entry
+                        .qos_tier
+                        .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
+                        .to_string(),
+                );
                 routes.push(PendingRoutePublish {
                     key: entry.scoped_key.clone(),
                     expected_version,
                     previous: current,
-                    route: ObjectRoute {
-                        key: entry.scoped_key.clone(),
-                        namespace: Some(namespace.clone()),
-                        logical_key: Some(logical_key.to_string()),
-                        canonical_key: Some(format!("{}/{}", namespace.canonical_prefix(), logical_key)),
-                        sharing_scope: Some(tenant.to_string()),
-                        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
-                        version: next_version,
-                        state: RouteState::Active,
-                        compatibility: self.lease.compatibility.clone(),
-                        replicas,
-                    },
+                    route,
                 });
             }
             Ok(routes)
