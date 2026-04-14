@@ -2047,7 +2047,7 @@ fn routed_read_skips_inactive_primary_replica_and_prunes_stale_route() {
 }
 
 #[test]
-fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() {
+fn routed_read_fails_over_within_same_request_after_primary_transport_failure() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("transport-failed-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("transport-failed-b-segment"));
@@ -2149,18 +2149,10 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
         state.segments_by_handle.remove(&handle);
     }
 
-    let error = reader
-        .get("transport-failed-key")
-        .expect_err("first reader get should fail on dead primary transport");
-    assert!(matches!(
-        error,
-        StoreError::NotFound(_) | StoreError::Transport(_) | StoreError::InvalidState(_)
-    ));
-
     assert_eq!(
         reader
             .get("transport-failed-key")
-            .expect("retry should skip suspect primary and use live secondary"),
+            .expect("reader get should fail over to live secondary in the same request"),
         b"transport-failed-payload"
     );
 
@@ -2171,6 +2163,118 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
     assert_eq!(repaired.replicas.len(), 1);
     assert_eq!(repaired.replicas[0].owner, *store_b.runtime_id());
     assert_eq!(repaired.replicas[0].priority, 0);
+}
+
+#[test]
+fn batch_get_fails_over_within_same_request_after_primary_transport_failure() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("batch-transport-failed-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("batch-transport-failed-b-segment"));
+    let writer_transport =
+        Arc::new(store_a_transport.peer("batch-transport-failed-writer-segment"));
+    let reader_transport =
+        Arc::new(store_a_transport.peer("batch-transport-failed-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "batch-transport-failed-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "batch-transport-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "batch-transport-failed-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "batch-transport-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "batch-transport-failed-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "batch-transport-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "batch-transport-failed-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "batch-transport-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    for (key, payload) in [
+        ("batch-transport-failed-key-a", b"batch-transport-payload-a".as_slice()),
+        ("batch-transport-failed-key-b", b"batch-transport-payload-b".as_slice()),
+    ] {
+        writer
+            .put_with_policy(
+                key,
+                payload,
+                &ReplicationPolicy::new()
+                    .replica_count(2)
+                    .prefer_local(false)
+                    .preferred_storage_owners([
+                        store_a.runtime_id().storage_key(),
+                        store_b.runtime_id().storage_key(),
+                    ]),
+            )
+            .expect("replicated put should succeed");
+    }
+
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("batch-transport-failed-a-segment")
+            .expect("primary segment handle should exist");
+        state.segments_by_handle.remove(&handle);
+    }
+
+    let values = reader
+        .batch_get(&[
+            ObjectRef::new("batch-transport-failed-key-a"),
+            ObjectRef::new("batch-transport-failed-key-b"),
+        ])
+        .expect("batch_get should fail over to surviving replicas");
+    assert_eq!(
+        values,
+        vec![
+            b"batch-transport-payload-a".to_vec(),
+            b"batch-transport-payload-b".to_vec()
+        ]
+    );
 }
 
 #[test]
@@ -2266,19 +2370,18 @@ fn route_lookup_many_stays_ok_when_live_replica_survives_and_snapshot_converges(
         state.segments_by_handle.remove(&handle);
     }
 
-    let first = reader.get("route-lookup-live-key");
-    assert!(matches!(
-        first,
-        Err(StoreError::NotFound(_))
-            | Err(StoreError::Transport(_))
-            | Err(StoreError::InvalidState(_))
-    ));
+    assert_eq!(
+        reader
+            .get("route-lookup-live-key")
+            .expect("first read should fail over to the surviving replica"),
+        b"route-lookup-live-payload"
+    );
 
     for _ in 0..3 {
         assert_eq!(
             reader
                 .get("route-lookup-live-key")
-                .expect("subsequent reads should use the surviving replica"),
+                .expect("subsequent reads should keep using the surviving replica"),
             b"route-lookup-live-payload"
         );
     }

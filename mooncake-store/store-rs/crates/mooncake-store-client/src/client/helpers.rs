@@ -1,7 +1,9 @@
 struct ResolvedObject {
     tenant: String,
     key: String,
+    route: ObjectRoute,
     replica: ReplicaRoute,
+    fallback_replicas: VecDeque<ReplicaRoute>,
 }
 
 fn copy_into_region(allocation: RegionAllocation, value: &[u8]) {

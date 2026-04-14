@@ -638,6 +638,73 @@ impl StoreClient {
         }
     }
 
+    fn has_same_replica(left: &ReplicaRoute, right: &ReplicaRoute) -> bool {
+        left.owner == right.owner
+            && left.segment_name == right.segment_name
+            && left.segment_offset == right.segment_offset
+            && left.length == right.length
+    }
+
+    fn fallback_replicas_for_route(
+        &self,
+        route: &ObjectRoute,
+        selected: &ReplicaRoute,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) -> VecDeque<ReplicaRoute> {
+        route.replicas
+            .iter()
+            .filter(|replica| !Self::has_same_replica(replica, selected))
+            .filter(|replica| {
+                replica.owner == self.lease.runtime || readable_runtimes.contains(&replica.owner)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn try_advance_resolved_replica(
+        &self,
+        entry: &mut ResolvedObject,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) -> bool {
+        while let Some(candidate) = entry.fallback_replicas.pop_front() {
+            if candidate.owner != self.lease.runtime
+                && !readable_runtimes.contains(&candidate.owner)
+            {
+                continue;
+            }
+            if candidate.length != entry.replica.length {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    tenant = %entry.tenant,
+                    key = %entry.key,
+                    current_length = entry.replica.length,
+                    candidate_length = candidate.length,
+                    "skipping fallback replica with mismatched length"
+                );
+                continue;
+            }
+            entry.replica = candidate;
+            return true;
+        }
+        false
+    }
+
+    fn maybe_prune_route_after_failover(
+        &self,
+        entry: &ResolvedObject,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) {
+        if entry
+            .route
+            .replicas
+            .iter()
+            .min_by_key(|candidate| candidate.priority)
+            .is_some_and(|primary| primary.owner != entry.replica.owner)
+        {
+            self.prune_unreadable_replicas_best_effort(&entry.route, readable_runtimes);
+        }
+    }
+
     fn resolve_objects(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<ResolvedObject>> {
         let tracker = OperationTracker::new("route_lookup_many");
         let result = (|| {
@@ -695,10 +762,14 @@ impl StoreClient {
                 {
                     self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
                 }
+                let fallback_replicas =
+                    self.fallback_replicas_for_route(&route, &replica, &readable_for_route);
                 resolved.push(ResolvedObject {
                     tenant: tenant.to_string(),
                     key: object.key.to_string(),
+                    route,
                     replica,
+                    fallback_replicas,
                 });
             }
             Ok(resolved)
@@ -724,7 +795,7 @@ impl StoreClient {
 
     fn execute_batch_get_into(
         &self,
-        resolved: &[ResolvedObject],
+        resolved: &mut [ResolvedObject],
         buffers: &mut [&mut [u8]],
     ) -> Result<Vec<usize>> {
         self.ensure_local_memory()?;
@@ -824,23 +895,39 @@ impl StoreClient {
         while cursor < remote_indices.len() {
             match self.plan_remote_get_chunk(&remote_indices, &lengths, cursor)? {
                 Some((next, scratch)) => {
-                    self.execute_remote_batch_get_chunk(
+                    match self.execute_remote_batch_get_chunk(
                         transport,
                         resolved,
                         buffers,
                         &remote_indices[cursor..next],
                         &scratch,
-                    )?;
-                    remote_batch_chunks += 1;
+                    ) {
+                        Ok(()) => {
+                            remote_batch_chunks += 1;
+                        }
+                        Err(_) => {
+                            for index in &remote_indices[cursor..next] {
+                                let buffer = &mut *buffers[*index];
+                                self.read_single_object_with_failover(
+                                    transport,
+                                    &mut resolved[*index],
+                                    buffer,
+                                    "remote_batch_get_fallback",
+                                )?;
+                                remote_direct_fallbacks += 1;
+                            }
+                        }
+                    }
                     cursor = next;
                 }
                 None => {
                     let index = remote_indices[cursor];
-                    self.execute_remote_get_direct(
+                    let buffer = &mut *buffers[index];
+                    self.read_single_object_with_failover(
                         transport,
-                        &resolved[index],
-                        buffers[index],
-                        lengths[index],
+                        &mut resolved[index],
+                        buffer,
+                        "remote_direct_get_fallback",
                     )?;
                     remote_direct_fallbacks += 1;
                     cursor += 1;
@@ -1189,5 +1276,75 @@ impl StoreClient {
             registry::record_transport_bytes("read", "storage", length as u64);
         }
         result
+    }
+
+    fn execute_selected_replica_direct(
+        &self,
+        transport: &dyn StoreTransport,
+        resolved: &ResolvedObject,
+        buffer: &mut [u8],
+    ) -> Result<()> {
+        let length = resolved.replica.length as usize;
+        if buffer.len() < length {
+            return Err(StoreError::Allocator(format!(
+                "buffer too small for tenant={} key={}: need {length}, have {}",
+                resolved.tenant,
+                resolved.key,
+                buffer.len()
+            )));
+        }
+        let local = {
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            resolved.replica.owner == self.lease.runtime
+                && memory.has_storage_segment(&resolved.replica.segment_name)
+        };
+        if local {
+            let source = {
+                let state = self.state.lock();
+                state.memory_ref()?.storage_address(
+                    &resolved.replica.segment_name,
+                    resolved.replica.segment_offset as usize,
+                )?
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(source.cast::<u8>(), buffer.as_mut_ptr(), length);
+            }
+        } else {
+            self.execute_remote_get_direct(transport, resolved, buffer, length)?;
+        }
+        validate_replica_checksum(&resolved.replica, &buffer[..length])
+    }
+
+    fn read_single_object_with_failover(
+        &self,
+        transport: &dyn StoreTransport,
+        resolved: &mut ResolvedObject,
+        buffer: &mut [u8],
+        context: &'static str,
+    ) -> Result<()> {
+        loop {
+            match self.execute_selected_replica_direct(transport, resolved, buffer) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if resolved.replica.owner != self.lease.runtime {
+                        self.note_remote_read_failure(&[resolved], &error, context);
+                    }
+                    let readable_runtimes = self.readable_runtime_set(true)?;
+                    if !self.try_advance_resolved_replica(resolved, &readable_runtimes) {
+                        return Err(error);
+                    }
+                    self.maybe_prune_route_after_failover(resolved, &readable_runtimes);
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        tenant = %resolved.tenant,
+                        key = %resolved.key,
+                        storage_owner = %resolved.replica.owner,
+                        segment = %resolved.replica.segment_name.0,
+                        "retrying get with fallback replica"
+                    );
+                }
+            }
+        }
     }
 }
