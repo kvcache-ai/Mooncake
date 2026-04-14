@@ -234,6 +234,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         eprintln!("{shutdown_summary}");
     }
+    if let Err(error) = client.enter_offline() {
+        eprintln!(
+            "mooncake-store-client offline publish failed stable_id={stable_id} error={error}"
+        );
+    }
     drop(dummy_server);
     client.shutdown();
     if metrics_addr.is_some() {

@@ -18,8 +18,11 @@ impl StoreClient {
             .max_by_key(|lease| lease.runtime.epoch))
     }
 
-    pub fn activate_if_targeted_handoff(&mut self) -> Result<Option<HandoffPlan>> {
-        if self.lease.state != ClientLifecycleState::Standby {
+    pub fn targeted_handoff_plan_for_state(
+        &self,
+        current_state: ClientLifecycleState,
+    ) -> Result<Option<HandoffPlan>> {
+        if current_state != ClientLifecycleState::Standby {
             return Ok(None);
         }
         let Some(handoff) = self.metadata.get_handoff(&self.lease.runtime.stable_id)? else {
@@ -40,6 +43,13 @@ impl StoreClient {
         {
             return Ok(None);
         }
+        Ok(Some(handoff))
+    }
+
+    pub fn activate_if_targeted_handoff(&mut self) -> Result<Option<HandoffPlan>> {
+        let Some(handoff) = self.targeted_handoff_plan_for_state(self.lease.state)? else {
+            return Ok(None);
+        };
         self.activate()?;
         Ok(Some(handoff))
     }
@@ -54,6 +64,16 @@ impl StoreClient {
 
     pub fn evacuate_owned_replicas_to_runtime(
         &mut self,
+        successor: &ClientRuntimeId,
+    ) -> Result<usize> {
+        if self.lease.state != ClientLifecycleState::Draining {
+            self.enter_draining()?;
+        }
+        self.evacuate_owned_replicas_to_runtime_when_draining(successor)
+    }
+
+    pub fn evacuate_owned_replicas_to_runtime_when_draining(
+        &self,
         successor: &ClientRuntimeId,
     ) -> Result<usize> {
         if !self.has_active_compatible_runtime(successor, false)?
@@ -74,9 +94,6 @@ impl StoreClient {
         let tracker = OperationTracker::new("evacuate_owned_replicas_to_runtime");
         let result = (|| {
             self.ensure_local_memory()?;
-            if self.lease.state != ClientLifecycleState::Draining {
-                self.enter_draining()?;
-            }
             let segments = {
                 let state = self.state.lock();
                 state.memory_ref()?.storage_segments()

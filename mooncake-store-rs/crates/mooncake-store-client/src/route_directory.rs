@@ -1672,6 +1672,63 @@ mod tests {
     }
 
     #[test]
+    fn embedded_directory_excludes_rw_only_clients_from_authority_candidates() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-rw-only", 1, false, Some("scope-a"));
+        let storage_a = lease("authority-storage-a", 2, true, Some("scope-a"));
+        let storage_b = lease("authority-storage-b", 3, true, Some("scope-a"));
+        let rw_only_writer = lease("rw-only-writer", 4, false, Some("scope-a"));
+        for lease in [
+            observer.clone(),
+            storage_a.clone(),
+            storage_b.clone(),
+            rw_only_writer.clone(),
+        ] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_rw_only_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(ControlPlaneClient::new().expect("control client should build")),
+            live_client_cache,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::SuspectRuntimeCache::default(),
+            )),
+        );
+
+        let candidates = directory
+            .authority_candidates(&observer)
+            .expect("authority candidates should load");
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|lease| lease.runtime != rw_only_writer.runtime));
+
+        let selected = directory.select_authorities_from_candidates(
+            &candidates,
+            &ObjectKey::new("tenant-a::rw-only-authority-key"),
+        );
+        assert_eq!(selected.authorities.len(), 2);
+        assert!(selected
+            .authorities
+            .iter()
+            .all(|lease| lease.runtime != rw_only_writer.runtime));
+    }
+
+    #[test]
     fn embedded_directory_quarantines_dead_authority_without_globally_demoting_it() {
         let metadata = Arc::new(InMemoryMetadataBackend::new());
         let observer = lease("observer-suspect", 1, false, Some("scope-a"));

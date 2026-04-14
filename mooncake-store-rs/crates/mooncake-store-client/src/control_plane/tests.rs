@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::runtime::Builder as RuntimeBuilder;
@@ -16,7 +18,7 @@ use super::{
     try_compatibility, try_object_route, try_replica_route, try_replica_tier, try_route_state,
     try_runtime_id, try_segment_reservation, AllocatorService, AuthorityService,
     ControlPlaneClient, ControlPlaneHandle, ControlStreamSession, EvictionService,
-    GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp,
+    GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp, CONTROL_PLANE_THREADS_ENV,
 };
 use crate::control_plane::pb;
 use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
@@ -387,6 +389,236 @@ impl Drop for ClosingStreamHandle {
     }
 }
 
+struct DelayedUnaryService {
+    inner: GrpcControlPlaneService,
+    batch_get_delay: Duration,
+}
+
+#[tonic::async_trait]
+impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryService {
+    type ControlStreamStream = ReceiverStream<std::result::Result<pb::ControlStreamReply, Status>>;
+
+    async fn get_route(
+        &self,
+        request: Request<pb::GetRouteRequest>,
+    ) -> std::result::Result<Response<pb::GetRouteReply>, Status> {
+        self.inner.get_route(request).await
+    }
+
+    async fn batch_get_routes(
+        &self,
+        request: Request<pb::BatchGetRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchGetRoutesReply>, Status> {
+        tokio::time::sleep(self.batch_get_delay).await;
+        self.inner.batch_get_routes(request).await
+    }
+
+    async fn compare_and_swap_route(
+        &self,
+        request: Request<pb::CompareAndSwapRouteRequest>,
+    ) -> std::result::Result<Response<pb::CompareAndSwapRouteReply>, Status> {
+        self.inner.compare_and_swap_route(request).await
+    }
+
+    async fn list_routes_by_replica_owner(
+        &self,
+        request: Request<pb::ListRoutesByReplicaOwnerRequest>,
+    ) -> std::result::Result<Response<pb::ListRoutesByReplicaOwnerReply>, Status> {
+        self.inner.list_routes_by_replica_owner(request).await
+    }
+
+    async fn batch_compare_and_swap_routes(
+        &self,
+        request: Request<pb::BatchCompareAndSwapRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchCompareAndSwapRoutesReply>, Status> {
+        self.inner.batch_compare_and_swap_routes(request).await
+    }
+
+    async fn replace_route(
+        &self,
+        request: Request<pb::ReplaceRouteRequest>,
+    ) -> std::result::Result<Response<pb::ReplaceRouteReply>, Status> {
+        self.inner.replace_route(request).await
+    }
+
+    async fn batch_replace_routes(
+        &self,
+        request: Request<pb::BatchReplaceRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchReplaceRoutesReply>, Status> {
+        self.inner.batch_replace_routes(request).await
+    }
+
+    async fn reserve_any(
+        &self,
+        request: Request<pb::ReserveAnyRequest>,
+    ) -> std::result::Result<Response<pb::ReserveAnyReply>, Status> {
+        self.inner.reserve_any(request).await
+    }
+
+    async fn batch_reserve_any(
+        &self,
+        request: Request<pb::BatchReserveAnyRequest>,
+    ) -> std::result::Result<Response<pb::BatchReserveAnyReply>, Status> {
+        self.inner.batch_reserve_any(request).await
+    }
+
+    async fn reserve_specific(
+        &self,
+        request: Request<pb::ReserveSpecificRequest>,
+    ) -> std::result::Result<Response<pb::ReserveSpecificReply>, Status> {
+        self.inner.reserve_specific(request).await
+    }
+
+    async fn batch_reserve_specific(
+        &self,
+        request: Request<pb::BatchReserveSpecificRequest>,
+    ) -> std::result::Result<Response<pb::BatchReserveSpecificReply>, Status> {
+        self.inner.batch_reserve_specific(request).await
+    }
+
+    async fn release(
+        &self,
+        request: Request<pb::ReleaseRequest>,
+    ) -> std::result::Result<Response<pb::ReleaseReply>, Status> {
+        self.inner.release(request).await
+    }
+
+    async fn batch_release(
+        &self,
+        request: Request<pb::BatchReleaseRequest>,
+    ) -> std::result::Result<Response<pb::BatchReleaseReply>, Status> {
+        self.inner.batch_release(request).await
+    }
+
+    async fn batch_report_route_hits(
+        &self,
+        request: Request<pb::BatchReportRouteHitsRequest>,
+    ) -> std::result::Result<Response<pb::BatchReportRouteHitsReply>, Status> {
+        self.inner.batch_report_route_hits(request).await
+    }
+
+    async fn batch_track_replica_routes(
+        &self,
+        request: Request<pb::BatchTrackReplicaRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchTrackReplicaRoutesReply>, Status> {
+        self.inner.batch_track_replica_routes(request).await
+    }
+
+    async fn control_stream(
+        &self,
+        _request: Request<tonic::Streaming<pb::ControlStreamRequest>>,
+    ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
+        Err(Status::unavailable("stream disabled"))
+    }
+}
+
+struct DelayedUnaryHandle {
+    address: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DelayedUnaryHandle {
+    fn spawn(
+        authority: Arc<dyn AuthorityService>,
+        allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
+        batch_get_delay: Duration,
+    ) -> mooncake_store_core::Result<Self> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
+            StoreError::Transport(format!("delayed unary bind failed: {error}"))
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            StoreError::Transport(format!("delayed unary listener setup failed: {error}"))
+        })?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| {
+                StoreError::Transport(format!("delayed unary local addr failed: {error}"))
+            })?
+            .to_string();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let thread = thread::Builder::new()
+            .name(format!("delayed-unary-{address}"))
+            .spawn(move || {
+                let runtime = RuntimeBuilder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime should start");
+                let service = DelayedUnaryService {
+                    inner: GrpcControlPlaneService::new(authority, allocator, eviction),
+                    batch_get_delay,
+                };
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("listener conversion should succeed");
+                    Server::builder()
+                        .tcp_nodelay(true)
+                        .add_service(
+                            pb::control_plane_service_server::ControlPlaneServiceServer::new(
+                                service,
+                            ),
+                        )
+                        .serve_with_incoming_shutdown(
+                            TcpListenerStream::new(listener),
+                            async move {
+                                let _ = shutdown_rx.await;
+                            },
+                        )
+                        .await
+                        .expect("delayed unary server should run");
+                });
+            })
+            .map_err(|error| {
+                StoreError::Transport(format!("delayed unary spawn failed: {error}"))
+            })?;
+        Ok(Self {
+            address,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for DelayedUnaryHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn env_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _guard = env_test_lock().lock();
+    let previous = std::env::var(key).ok();
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    let result = f();
+    match previous {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    result
+}
+
 fn sample_owner() -> ClientRuntimeId {
     ClientRuntimeId::new("writer", ClientEpoch(7))
 }
@@ -603,6 +835,88 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
     assert_eq!(client.active_stream_sessions(), 0);
     drop(client);
     handle.shutdown();
+}
+
+#[test]
+fn control_plane_client_does_not_serialize_concurrent_unary_rpcs_on_runtime_lock() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("alpha", 1, &owner));
+
+    let mut handle = DelayedUnaryHandle::spawn(
+        authority.clone(),
+        allocator,
+        eviction,
+        Duration::from_millis(500),
+    )
+    .expect("delayed unary control plane should start");
+    let lease = sample_lease(handle.address());
+    let authority_id = ClientStableId::new("authority");
+    let client = Arc::new(ControlPlaneClient::new().expect("control plane client should start"));
+
+    let slow_client = client.clone();
+    let slow_lease = lease.clone();
+    let slow_authority = authority_id.clone();
+    let slow = thread::spawn(move || {
+        slow_client
+            .batch_get_routes(
+                &slow_lease,
+                "ns-a",
+                &slow_authority,
+                &[ObjectKey::new("alpha")],
+            )
+            .expect("slow batch get should succeed")
+    });
+
+    thread::sleep(Duration::from_millis(100));
+
+    let fast_client = client.clone();
+    let fast_lease = lease.clone();
+    let fast_authority = authority_id.clone();
+    let started = Instant::now();
+    let fast = thread::spawn(move || {
+        fast_client
+            .list_routes_by_replica_owner(&fast_lease, "ns-a", &fast_authority, &owner)
+            .expect("fast list should succeed")
+    });
+
+    let fast_result = fast.join().expect("fast request thread should join");
+    let fast_elapsed = started.elapsed();
+    let slow_result = slow.join().expect("slow request thread should join");
+
+    assert_eq!(fast_result.len(), 1);
+    assert_eq!(slow_result.len(), 1);
+    assert!(
+        fast_elapsed < Duration::from_millis(350),
+        "fast unary rpc should not wait behind another caller's runtime lock: {fast_elapsed:?}"
+    );
+
+    handle.shutdown();
+}
+
+#[test]
+fn control_plane_client_runtime_threads_are_configurable_via_env() {
+    with_env_var(CONTROL_PLANE_THREADS_ENV, Some("1"), || {
+        let client = ControlPlaneClient::new().expect("control plane client should start");
+        drop(client);
+    });
+
+    with_env_var(CONTROL_PLANE_THREADS_ENV, Some("8"), || {
+        let client = ControlPlaneClient::new().expect("control plane client should start");
+        drop(client);
+    });
+
+    with_env_var(CONTROL_PLANE_THREADS_ENV, Some("0"), || {
+        let client = ControlPlaneClient::new().expect("invalid env should fall back to default");
+        drop(client);
+    });
+
+    with_env_var(CONTROL_PLANE_THREADS_ENV, Some("bad"), || {
+        let client = ControlPlaneClient::new().expect("invalid env should fall back to default");
+        drop(client);
+    });
 }
 
 #[test]

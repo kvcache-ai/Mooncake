@@ -6,14 +6,14 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
-    record_heartbeat_health, HealthUpdate, MooncakeCompatibilityFacade, MultiBufferGetRequest,
-    MultiBufferPutRequest, ObjectRef, ReplicationPolicy, StoreClient,
+    record_heartbeat_health, HealthChannel, HealthUpdate, MooncakeCompatibilityFacade,
+    MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, ReplicationPolicy, StoreClient,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
     StoreError,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
 use crate::dummy_service::pb;
@@ -39,7 +39,8 @@ struct HeartbeatHealthState {
 }
 
 pub struct StoreDispatcher {
-    client: Arc<RwLock<StoreClient>>,
+    client: Arc<StoreClient>,
+    health: Arc<HealthChannel>,
     regions: Arc<Mutex<RegionMap>>,
     state: Arc<Mutex<DispatcherState>>,
     closed: Arc<AtomicBool>,
@@ -60,9 +61,11 @@ impl StoreDispatcher {
         heartbeat_timeout: Duration,
     ) -> Result<Self, StoreError> {
         let runtime = client.runtime_id().to_string();
+        let health = Arc::new(client.health_channel());
         record_heartbeat_health(&runtime, 0, 0);
         Ok(Self {
-            client: Arc::new(RwLock::new(client)),
+            client: Arc::new(client),
+            health,
             regions: Arc::new(Mutex::new(BTreeMap::new())),
             state: Arc::new(Mutex::new(DispatcherState {
                 tracked_keys: BTreeSet::new(),
@@ -80,13 +83,7 @@ impl StoreDispatcher {
     }
 
     pub fn heartbeat(&self, expires_at_ms: u64) -> Result<(), StoreError> {
-        let heartbeat = match self.prepare_heartbeat(expires_at_ms) {
-            Ok(heartbeat) => heartbeat,
-            Err(error) => {
-                self.record_heartbeat_failure();
-                return Err(error);
-            }
-        };
+        let heartbeat = self.prepare_heartbeat(expires_at_ms);
         let result = self.run_health_update("heartbeat publish", heartbeat);
         if result.is_ok() {
             self.record_heartbeat_success();
@@ -97,17 +94,22 @@ impl StoreDispatcher {
     }
 
     pub fn activate(&self) -> Result<(), StoreError> {
-        let update = self.prepare_state_update(ClientLifecycleState::Active, "activate")?;
+        let update = self.prepare_state_update(ClientLifecycleState::Active, "activate");
         self.run_health_update("state update publish", update)
     }
 
     pub fn enter_standby(&self) -> Result<(), StoreError> {
-        let update = self.prepare_state_update(ClientLifecycleState::Standby, "enter_standby")?;
+        let update = self.prepare_state_update(ClientLifecycleState::Standby, "enter_standby");
         self.run_health_update("state update publish", update)
     }
 
     pub fn enter_draining(&self) -> Result<(), StoreError> {
-        let update = self.prepare_state_update(ClientLifecycleState::Draining, "enter_draining")?;
+        let update = self.prepare_state_update(ClientLifecycleState::Draining, "enter_draining");
+        self.run_health_update("state update publish", update)
+    }
+
+    pub fn enter_offline(&self) -> Result<(), StoreError> {
+        let update = self.prepare_state_update(ClientLifecycleState::Offline, "enter_offline");
         self.run_health_update("state update publish", update)
     }
 
@@ -119,7 +121,7 @@ impl StoreDispatcher {
         created_at_ms: u64,
         deadline_ms: Option<u64>,
     ) -> Result<HandoffPlan, StoreError> {
-        self.run_mut(move |client| {
+        self.run(move |client| {
             client.plan_handoff(
                 successor_epoch,
                 kind,
@@ -131,7 +133,14 @@ impl StoreDispatcher {
     }
 
     pub fn activate_if_targeted_handoff(&self) -> Result<Option<HandoffPlan>, StoreError> {
-        self.run_mut(|client| client.activate_if_targeted_handoff())
+        let current_state = self.health.snapshot_lease().state;
+        let Some(plan) =
+            self.run(move |client| client.targeted_handoff_plan_for_state(current_state))?
+        else {
+            return Ok(None);
+        };
+        self.activate()?;
+        Ok(Some(plan))
     }
 
     pub fn find_hot_upgrade_successor(&self) -> Result<Option<ClientLease>, StoreError> {
@@ -146,14 +155,20 @@ impl StoreDispatcher {
     }
 
     pub fn evacuate_owned_replicas(&self) -> Result<usize, StoreError> {
-        self.run_mut(|client| client.evacuate_owned_replicas())
+        if self.health.snapshot_lease().state != ClientLifecycleState::Draining {
+            self.enter_draining()?;
+        }
+        self.run(|client| client.evacuate_owned_replicas_when_draining())
     }
 
     pub fn evacuate_owned_replicas_to_runtime(
         &self,
         runtime: ClientRuntimeId,
     ) -> Result<usize, StoreError> {
-        self.run_mut(move |client| client.evacuate_owned_replicas_to_runtime(&runtime))
+        if self.health.snapshot_lease().state != ClientLifecycleState::Draining {
+            self.enter_draining()?;
+        }
+        self.run(move |client| client.evacuate_owned_replicas_to_runtime_when_draining(&runtime))
     }
 
     pub fn register_buffer(&self, base_ptr: usize, len: usize) -> Result<(), StoreError> {
@@ -181,14 +196,6 @@ impl StoreDispatcher {
         DISPATCHER_RUNTIME.block_on(self.run_async(f))
     }
 
-    pub(crate) fn run_mut<T, F>(&self, f: F) -> Result<T, StoreError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut StoreClient) -> Result<T, StoreError> + Send + 'static,
-    {
-        DISPATCHER_RUNTIME.block_on(self.run_async_mut(f))
-    }
-
     pub(crate) async fn run_async<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
@@ -201,30 +208,7 @@ impl StoreDispatcher {
             if closed.load(Ordering::SeqCst) {
                 return Err(dispatcher_stopped());
             }
-            let Some(client) = client.try_read_for(DISPATCHER_REQUEST_TIMEOUT) else {
-                return Err(dispatcher_timeout("read lock", DISPATCHER_REQUEST_TIMEOUT));
-            };
-            f(&client)
-        })
-        .await
-    }
-
-    pub(crate) async fn run_async_mut<T, F>(&self, f: F) -> Result<T, StoreError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut StoreClient) -> Result<T, StoreError> + Send + 'static,
-    {
-        self.ensure_open()?;
-        let closed = self.closed.clone();
-        let client = self.client.clone();
-        self.await_blocking(move || {
-            if closed.load(Ordering::SeqCst) {
-                return Err(dispatcher_stopped());
-            }
-            let Some(mut client) = client.try_write_for(DISPATCHER_REQUEST_TIMEOUT) else {
-                return Err(dispatcher_timeout("write lock", DISPATCHER_REQUEST_TIMEOUT));
-            };
-            f(&mut client)
+            f(client.as_ref())
         })
         .await
     }
@@ -360,31 +344,16 @@ impl StoreDispatcher {
         Ok(())
     }
 
-    fn prepare_heartbeat(
-        &self,
-        expires_at_ms: u64,
-    ) -> Result<mooncake_store_client::HeartbeatLease, StoreError> {
-        let Some(mut client) = self.client.try_write_for(DISPATCHER_REQUEST_TIMEOUT) else {
-            return Err(dispatcher_timeout(
-                "heartbeat prepare write lock",
-                DISPATCHER_REQUEST_TIMEOUT,
-            ));
-        };
-        Ok(client.prepare_heartbeat(expires_at_ms))
+    fn prepare_heartbeat(&self, expires_at_ms: u64) -> mooncake_store_client::HeartbeatLease {
+        self.health.prepare_heartbeat(expires_at_ms)
     }
 
     fn prepare_state_update(
         &self,
         next_state: ClientLifecycleState,
         operation: &'static str,
-    ) -> Result<HealthUpdate, StoreError> {
-        let Some(mut client) = self.client.try_write_for(DISPATCHER_REQUEST_TIMEOUT) else {
-            return Err(dispatcher_timeout(
-                "state update prepare write lock",
-                DISPATCHER_REQUEST_TIMEOUT,
-            ));
-        };
-        Ok(client.prepare_state_update(next_state, operation))
+    ) -> HealthUpdate {
+        self.health.prepare_state_update(next_state, operation)
     }
 
     fn run_health_update(

@@ -3,22 +3,25 @@ use super::*;
 
 impl ControlPlaneClient {
     pub(crate) fn new() -> Result<Self> {
-        let runtime = RuntimeBuilder::new_current_thread()
+        let worker_threads = control_plane_runtime_threads_from_env();
+        let runtime = RuntimeBuilder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("mooncake-control-client")
             .enable_all()
             .build()
             .map_err(|error| {
                 StoreError::Transport(format!("control plane runtime init failed: {error}"))
             })?;
         Ok(Self {
-            runtime: Mutex::new(Some(runtime)),
+            runtime: Some(runtime),
             channels: Mutex::new(BTreeMap::new()),
             streams: Mutex::new(BTreeMap::new()),
         })
     }
 
     fn with_runtime<T>(&self, f: impl FnOnce(&Runtime) -> T) -> T {
-        let runtime = self.runtime.lock();
-        let runtime = runtime
+        let runtime = self
+            .runtime
             .as_ref()
             .expect("control plane runtime should remain available while client is alive");
         f(runtime)
@@ -905,9 +908,33 @@ impl ControlPlaneClient {
     }
 }
 
+fn control_plane_runtime_threads_from_env() -> usize {
+    const DEFAULT_CONTROL_PLANE_THREADS: usize = 2;
+
+    let Some(raw) = std::env::var(CONTROL_PLANE_THREADS_ENV).ok() else {
+        return DEFAULT_CONTROL_PLANE_THREADS;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_CONTROL_PLANE_THREADS;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(threads) if threads > 0 => threads,
+        _ => {
+            warn!(
+                env = CONTROL_PLANE_THREADS_ENV,
+                value = trimmed,
+                default = DEFAULT_CONTROL_PLANE_THREADS,
+                "invalid control-plane runtime thread count; falling back to default"
+            );
+            DEFAULT_CONTROL_PLANE_THREADS
+        }
+    }
+}
+
 impl Drop for ControlPlaneClient {
     fn drop(&mut self) {
-        if let Some(runtime) = self.runtime.get_mut().take() {
+        if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
     }

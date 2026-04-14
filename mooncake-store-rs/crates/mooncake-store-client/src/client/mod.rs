@@ -75,6 +75,11 @@ enum HealthUpdateKind {
     StateTransition { operation: &'static str },
 }
 
+pub struct HealthChannel {
+    metadata: Arc<dyn MetadataBackend>,
+    lease: Mutex<ClientLease>,
+}
+
 pub struct HealthUpdate {
     metadata: Arc<dyn MetadataBackend>,
     lease: ClientLease,
@@ -82,6 +87,35 @@ pub struct HealthUpdate {
 }
 
 pub type HeartbeatLease = HealthUpdate;
+
+impl HealthChannel {
+    pub fn new(metadata: Arc<dyn MetadataBackend>, lease: ClientLease) -> Self {
+        Self {
+            metadata,
+            lease: Mutex::new(lease),
+        }
+    }
+
+    pub fn prepare_heartbeat(&self, expires_at_ms: u64) -> HeartbeatLease {
+        let mut lease = self.lease.lock();
+        lease.expires_at_ms = expires_at_ms;
+        HealthUpdate::heartbeat(self.metadata.clone(), lease.clone())
+    }
+
+    pub fn prepare_state_update(
+        &self,
+        next_state: ClientLifecycleState,
+        operation: &'static str,
+    ) -> HealthUpdate {
+        let mut lease = self.lease.lock();
+        lease.state = next_state;
+        HealthUpdate::state_transition(self.metadata.clone(), lease.clone(), operation)
+    }
+
+    pub fn snapshot_lease(&self) -> ClientLease {
+        self.lease.lock().clone()
+    }
+}
 
 impl HealthUpdate {
     fn heartbeat(metadata: Arc<dyn MetadataBackend>, lease: ClientLease) -> Self {

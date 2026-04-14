@@ -22,6 +22,7 @@ use crate::observability::OperationTracker;
 
 const CONTROL_ADDR_LABEL: &str = "control_addr";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_PLANE_THREADS_ENV: &str = "MC_STORE_RS_CONTROL_PLANE_THREADS";
 
 pub(crate) trait AuthorityService: Send + Sync {
     fn get_route(
@@ -179,7 +180,7 @@ pub(crate) struct ReleaseOp {
 }
 
 pub(crate) struct ControlPlaneClient {
-    runtime: Mutex<Option<Runtime>>,
+    runtime: Option<Runtime>,
     channels: Mutex<BTreeMap<String, Channel>>,
     streams: Mutex<BTreeMap<String, Arc<ControlStreamSession>>>,
 }
