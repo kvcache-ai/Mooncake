@@ -1016,6 +1016,7 @@ impl StoreClient {
         next_state: ClientLifecycleState,
         operation: &'static str,
     ) -> HealthUpdate {
+        let _route_write_guard = self.route_write_gate.lock();
         self.lease.state = next_state;
         self.set_lifecycle_state(next_state);
         HealthUpdate::state_transition(self.metadata.clone(), self.lease.clone(), operation)

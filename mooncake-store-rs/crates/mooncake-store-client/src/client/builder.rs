@@ -290,6 +290,10 @@ impl StoreClientBuilder {
         };
         let state = Mutex::new(StoreState::default());
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
+        let lifecycle_state = Arc::new(AtomicU8::new(encode_lifecycle_state(
+            published_initial_state,
+        )));
+        let route_write_gate = Arc::new(Mutex::new(()));
         let route_namespace = self.metadata.route_namespace();
         let live_client_cache = shared_live_client_cache(&route_namespace);
         let suspect_runtime_cache = shared_suspect_runtime_cache(&route_namespace);
@@ -331,12 +335,16 @@ impl StoreClientBuilder {
             runtime: runtime.clone(),
             allocator: allocator.clone(),
             storage_owner: storage_owner.clone(),
+            lifecycle_state: lifecycle_state.clone(),
             transfer_stall_timeout: self.transfer_stall_timeout,
             request_timeout_override: self.request_timeout_override,
         });
         let control_plane = ControlPlaneHandle::spawn(
             &control_bind_host(&endpoints.rpc_address),
-            Arc::new(LocalAuthorityAdapter),
+            Arc::new(LocalAuthorityAdapter {
+                lifecycle_state: lifecycle_state.clone(),
+                route_write_gate: route_write_gate.clone(),
+            }),
             storage_adapter.clone(),
             storage_adapter,
         )?;
@@ -394,7 +402,8 @@ impl StoreClientBuilder {
             route_topk: self.route_topk,
             transfer_stall_timeout: self.transfer_stall_timeout,
             request_timeout_override: self.request_timeout_override,
-            lifecycle_state: AtomicU8::new(encode_lifecycle_state(published_initial_state)),
+            lifecycle_state,
+            route_write_gate,
             startup_activation_pending: AtomicBool::new(startup_activation_pending),
             state,
         })

@@ -480,6 +480,7 @@ impl StoreClient {
         require_local_memory: bool,
     ) -> Result<mooncake_store_core::SegmentReservation> {
         if *owner == self.lease.runtime {
+            lifecycle_accepts_writes(&self.lifecycle_state, "local storage allocator")?;
             if require_local_memory {
                 let state = self.state.lock();
                 if let Some(segment_name) = segment_name {
@@ -616,6 +617,9 @@ impl StoreClient {
     }
 
     fn can_prefer_local_storage_for_write_mode(&self) -> bool {
+        if self.lifecycle_state() != ClientLifecycleState::Active {
+            return false;
+        }
         if !self.has_active_local_storage() {
             return false;
         }

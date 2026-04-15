@@ -32,8 +32,7 @@ use crate::placement::PlacementPlanner;
 use crate::route_directory::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,
     authority_list_routes, authority_list_routes_by_replica_owner, authority_replace,
-    authority_replace_many,
-    build_route_directory,
+    authority_replace_many, build_route_directory,
 };
 use crate::transport::{wait_for_batch_completion_detailed, StoreTransport, StoreTransportFactory};
 
@@ -53,6 +52,9 @@ const STABLE_PHASE_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
 const LEGACY_TRANSFER_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_TIMEOUT_MS";
 const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
+
+type SharedLifecycleState = Arc<AtomicU8>;
+type SharedRouteWriteGate = Arc<Mutex<()>>;
 
 include!("types.rs");
 include!("builder.rs");
@@ -83,7 +85,8 @@ pub struct StoreClient {
     route_topk: usize,
     transfer_stall_timeout: Duration,
     request_timeout_override: Option<Duration>,
-    lifecycle_state: AtomicU8,
+    lifecycle_state: SharedLifecycleState,
+    route_write_gate: SharedRouteWriteGate,
     startup_activation_pending: AtomicBool,
     state: Mutex<StoreState>,
 }

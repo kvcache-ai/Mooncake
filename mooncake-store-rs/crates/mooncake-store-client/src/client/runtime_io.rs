@@ -202,7 +202,7 @@ impl StoreClient {
                     .get("route")
                     .is_some_and(|value| value == "true")
             })
-            .filter(|lease| lease.state != ClientLifecycleState::Standby)
+            .filter(|lease| lease.state == ClientLifecycleState::Active)
             .collect())
     }
 
