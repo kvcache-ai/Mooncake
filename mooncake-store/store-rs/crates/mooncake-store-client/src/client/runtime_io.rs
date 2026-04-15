@@ -536,10 +536,7 @@ impl StoreClient {
         let stale = self
             .allocator
             .lock()
-            .allocations()
-            .into_iter()
-            .filter(|allocation| !live_allocations.contains(allocation))
-            .collect::<Vec<_>>();
+            .stale_allocations(live_allocations, now_ms());
         if stale.is_empty() {
             return Ok(0);
         }

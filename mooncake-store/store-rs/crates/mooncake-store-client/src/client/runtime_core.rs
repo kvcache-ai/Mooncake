@@ -3,6 +3,24 @@ impl StoreClient {
         decode_lifecycle_state(self.lifecycle_state.load(Ordering::SeqCst))
     }
 
+    fn pending_publish_deadline_ms(&self, length_bytes: u64) -> u64 {
+        pending_publish_deadline_ms(
+            length_bytes,
+            self.transfer_stall_timeout,
+            self.request_timeout_override,
+        )
+    }
+
+    fn mark_local_pending_reservation(
+        &self,
+        reservation: &mooncake_store_core::SegmentReservation,
+    ) {
+        let deadline_ms = self.pending_publish_deadline_ms(reservation.length_bytes);
+        self.allocator
+            .lock()
+            .mark_pending_reservation(reservation, deadline_ms);
+    }
+
     fn set_lifecycle_state(&self, next_state: ClientLifecycleState) {
         self.lifecycle_state
             .store(encode_lifecycle_state(next_state), Ordering::SeqCst);
@@ -599,13 +617,15 @@ impl StoreClient {
                 .get("storage")
                 .is_some_and(|value| value == "true");
             if !allow_local_eviction {
-                return match segment_name {
+                let reservation = match segment_name {
                     Some(segment_name) => self
                         .allocator
                         .lock()
                         .reserve_specific(owner, segment_name, length_bytes),
                     None => self.allocator.lock().reserve_any(owner, length_bytes),
-                };
+                }?;
+                self.mark_local_pending_reservation(&reservation);
+                return Ok(reservation);
             }
             let mut last_error = None;
             for _ in 0..=32usize {
@@ -617,7 +637,10 @@ impl StoreClient {
                     None => self.allocator.lock().reserve_any(owner, length_bytes),
                 };
                 match reservation {
-                    Ok(reservation) => return Ok(reservation),
+                    Ok(reservation) => {
+                        self.mark_local_pending_reservation(&reservation);
+                        return Ok(reservation);
+                    }
                     Err(StoreError::Allocator(message)) => {
                         last_error = Some(message);
                     }

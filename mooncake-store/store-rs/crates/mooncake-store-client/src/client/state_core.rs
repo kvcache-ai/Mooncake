@@ -210,6 +210,7 @@ struct ClockEntry {
 #[derive(Default)]
 struct LocalAllocatorState {
     segments: BTreeMap<SegmentName, SegmentAllocator>,
+    pending_allocations: BTreeMap<AllocationSpan, u64>,
 }
 
 impl LocalAllocatorState {
@@ -278,6 +279,8 @@ impl LocalAllocatorState {
         if let Some(segment) = self.segments.remove(segment_name) {
             registry::record_segment_removed(&segment.announcement);
         }
+        self.pending_allocations
+            .retain(|allocation, _| allocation.segment_name != *segment_name);
     }
 
     fn reserve_any(
@@ -342,8 +345,72 @@ impl LocalAllocatorState {
             .get_mut(segment_name)
             .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
         segment.release(owner, segment_name, offset_bytes, length_bytes)?;
+        self.pending_allocations.remove(&AllocationSpan {
+            segment_name: segment_name.clone(),
+            offset_bytes,
+            length_bytes,
+        });
         registry::record_segment(&segment.announcement);
         Ok(())
+    }
+
+    fn mark_pending_allocation(
+        &mut self,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+        deadline_ms: u64,
+    ) {
+        self.pending_allocations.insert(
+            AllocationSpan {
+                segment_name: segment_name.clone(),
+                offset_bytes,
+                length_bytes,
+            },
+            deadline_ms,
+        );
+    }
+
+    fn mark_pending_reservation(
+        &mut self,
+        reservation: &mooncake_store_core::SegmentReservation,
+        deadline_ms: u64,
+    ) {
+        self.mark_pending_allocation(
+            &reservation.segment_name,
+            reservation.offset_bytes,
+            reservation.length_bytes,
+            deadline_ms,
+        );
+    }
+
+    fn clear_pending_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        for replica in route.replicas.iter().filter(|replica| replica.owner == *runtime) {
+            self.pending_allocations.remove(&AllocationSpan {
+                segment_name: replica.segment_name.clone(),
+                offset_bytes: replica.segment_offset,
+                length_bytes: replica.length,
+            });
+        }
+    }
+
+    fn pending_allocations(&mut self, now_ms: u64) -> BTreeSet<AllocationSpan> {
+        self.pending_allocations
+            .retain(|_, deadline_ms| *deadline_ms > now_ms);
+        self.pending_allocations.keys().cloned().collect()
+    }
+
+    fn stale_allocations(
+        &mut self,
+        live_allocations: &BTreeSet<AllocationSpan>,
+        now_ms: u64,
+    ) -> Vec<AllocationSpan> {
+        let pending = self.pending_allocations(now_ms);
+        self.allocations()
+            .into_iter()
+            .filter(|allocation| !live_allocations.contains(allocation))
+            .filter(|allocation| !pending.contains(allocation))
+            .collect()
     }
 }
 

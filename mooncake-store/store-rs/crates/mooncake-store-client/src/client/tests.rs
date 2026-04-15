@@ -22,10 +22,10 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, flatten_slices, now_ms, record_success_metric,
-    scatter_into_buffers, shared_suspect_runtime_cache, startup_prewarm_delay, LiveClientCache,
-    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
-    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
-    SuspectRuntimeCache,
+    scatter_into_buffers, shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan,
+    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
+    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
+    StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -5372,6 +5372,8 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         runtime: client.runtime_id().clone(),
         allocator: client.allocator.clone(),
         storage_owner: client.storage_owner.clone(),
+        transfer_stall_timeout: Duration::from_secs(1),
+        request_timeout_override: None,
     };
     let primary = client.segment_name().expect("primary segment should exist");
     let single_reservation = local_allocator
@@ -6211,12 +6213,47 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         Err(StoreError::Allocator(_))
     ));
 
+    let pending_deadline = now_ms().saturating_add(1_000);
+    allocator.mark_pending_allocation(
+        &primary.segment_name,
+        reused.offset_bytes,
+        reused.length_bytes,
+        pending_deadline,
+    );
+    assert!(allocator
+        .pending_allocations(now_ms())
+        .contains(&AllocationSpan {
+            segment_name: primary.segment_name.clone(),
+            offset_bytes: reused.offset_bytes,
+            length_bytes: reused.length_bytes,
+        }));
+    let pending_route = mooncake_store_core::ObjectRoute {
+        key: ObjectKey::new("default::allocator-pending"),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: owner.clone(),
+            segment_name: primary.segment_name.clone(),
+            offset: 0,
+            segment_offset: reused.offset_bytes,
+            length: reused.length_bytes,
+            checksum: None,
+            tier: mooncake_store_core::ReplicaTier::Dram,
+            priority: 0,
+        }],
+    };
+    allocator.clear_pending_route(&pending_route, &owner);
+    assert!(allocator.pending_allocations(now_ms()).is_empty());
+
     let shared_allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
     shared_allocator.lock().upsert(&primary);
     let adapter = LocalAllocatorAdapter {
         runtime: owner.clone(),
         allocator: shared_allocator.clone(),
         storage_owner: test_storage_owner_state(&owner, shared_allocator.clone()),
+        transfer_stall_timeout: Duration::from_secs(1),
+        request_timeout_override: None,
     };
     let wrong_owner = ClientRuntimeId::new("other", ClientEpoch(9));
     assert!(matches!(
@@ -6307,4 +6344,124 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     });
     assert_eq!(state.take_due_reclaims(10).len(), 1);
     assert_eq!(state.pending_reclaims.len(), 1);
+}
+
+#[test]
+fn drain_stale_release_waits_for_pending_publish_deadline() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("pending-deadline-store"));
+    let client = StoreClientBuilder::new(metadata, "pending-deadline-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .request_timeout(Duration::from_millis(25))
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("memory registration should succeed");
+
+    let reservation = client
+        .reserve_segment_allocation(client.runtime_id(), None, 32, true)
+        .expect("reservation should succeed");
+    let primary = client.segment_name().expect("primary segment should exist");
+    client
+        .drain_segment_internal(&primary, true)
+        .expect("segment drain should succeed");
+    assert_eq!(
+        client
+            .release_stale_local_allocations(&BTreeSet::new())
+            .expect("fresh pending reservation should not be released"),
+        0
+    );
+
+    sleep(Duration::from_millis(400));
+    assert_eq!(
+        client
+            .release_stale_local_allocations(&BTreeSet::new())
+            .expect("expired pending reservation should be released"),
+        1
+    );
+    assert!(
+        client
+            .allocator
+            .lock()
+            .pending_allocations(now_ms())
+            .is_empty(),
+        "expired pending reservation should no longer block drain"
+    );
+    assert_eq!(reservation.length_bytes, 32);
+}
+
+#[test]
+fn local_allocator_pending_window_respects_publish_and_timeout() {
+    let owner = ClientRuntimeId::new("pending-owner", ClientEpoch(11));
+    let primary = SegmentAnnouncement {
+        owner: owner.clone(),
+        segment_name: SegmentName::new("pending-primary"),
+        capacity_bytes: 128,
+        used_bytes: 0,
+        state: SegmentLifecycleState::Active,
+        alignment_bytes: 16,
+        tags: vec!["dram".to_string()],
+    };
+    let mut allocator = LocalAllocatorState::default();
+    allocator.upsert(&primary);
+
+    let published = allocator
+        .reserve_any(&owner, 17)
+        .expect("reservation should succeed");
+    allocator.mark_pending_reservation(&published, now_ms().saturating_add(200));
+    assert!(
+        allocator
+            .stale_allocations(&BTreeSet::new(), now_ms())
+            .is_empty(),
+        "fresh pending allocation should not be stale"
+    );
+    let route = mooncake_store_core::ObjectRoute {
+        key: ObjectKey::new("default::pending-route"),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: owner.clone(),
+            segment_name: published.segment_name.clone(),
+            offset: 0,
+            segment_offset: published.offset_bytes,
+            length: published.length_bytes,
+            checksum: None,
+            tier: mooncake_store_core::ReplicaTier::Dram,
+            priority: 0,
+        }],
+    };
+    allocator.clear_pending_route(&route, &owner);
+    assert!(
+        allocator.pending_allocations(now_ms()).is_empty(),
+        "published route should clear the pending allocation window"
+    );
+
+    let orphaned = allocator
+        .reserve_any(&owner, 17)
+        .expect("second reservation should succeed");
+    allocator.mark_pending_reservation(&orphaned, now_ms().saturating_add(50));
+    assert!(
+        !allocator
+            .stale_allocations(&BTreeSet::new(), now_ms())
+            .contains(&AllocationSpan {
+                segment_name: orphaned.segment_name.clone(),
+                offset_bytes: orphaned.offset_bytes,
+                length_bytes: orphaned.length_bytes,
+            }),
+        "fresh orphan should still be protected by the pending window"
+    );
+    sleep(Duration::from_millis(80));
+    assert!(allocator
+        .stale_allocations(&BTreeSet::new(), now_ms())
+        .contains(&AllocationSpan {
+            segment_name: orphaned.segment_name,
+            offset_bytes: orphaned.offset_bytes,
+            length_bytes: orphaned.length_bytes,
+        }));
 }
