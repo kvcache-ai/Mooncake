@@ -202,15 +202,19 @@ if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
 
-target_compile_options(mooncake_master PRIVATE -Os)
-target_link_options(mooncake_master PRIVATE -Os -s)
-
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
 target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
                                               asio_shared)
-target_compile_options(mooncake_client PRIVATE -Os)
-target_link_options(mooncake_client PRIVATE -Os -s)
+
+# Optimize binary sizes only in Release mode
+string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
+if (CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
+  target_compile_options(mooncake_master PRIVATE -Os)
+  target_link_options(mooncake_master PRIVATE -Os -s)
+  target_compile_options(mooncake_client PRIVATE -Os)
+  target_link_options(mooncake_client PRIVATE -Os -s)
+endif()
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
