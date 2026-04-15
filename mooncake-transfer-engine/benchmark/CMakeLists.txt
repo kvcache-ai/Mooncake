@@ -15,5 +15,6 @@ if(USE_CUDA)
 endif()
 
 # Set RPATH for finding libasio.so at runtime
-set_target_properties(tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-                                         INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-asio")
+set_target_properties(
+  tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+                     INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-asio")
