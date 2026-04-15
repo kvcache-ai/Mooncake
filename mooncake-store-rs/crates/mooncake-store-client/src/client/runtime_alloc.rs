@@ -395,6 +395,7 @@ impl StoreClient {
         match mode {
             ReclaimMode::Scheduled => self.schedule_route_reclaim(route),
             ReclaimMode::Immediate => self.release_route_allocations(route),
+            ReclaimMode::Deferred => Ok(()),
         }
     }
 

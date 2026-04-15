@@ -34,7 +34,7 @@ use crate::{
     },
     memory::RegionAllocation,
     metrics_test_lock, render_prometheus_metrics, reset_metrics,
-    route_directory::build_route_directory,
+    route_directory::{authority_replace, build_route_directory},
     snapshot_metrics,
     transport::{StoreTransport, StoreTransportFactory},
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
@@ -6517,6 +6517,122 @@ fn stale_route_transport_failure_refreshes_to_republished_route() {
     assert_eq!(buffer, b"route-b");
     assert_eq!(resolved.route.version, route_v2.version);
     assert_eq!(resolved.replica.owner, *store_b.runtime_id());
+}
+
+#[test]
+fn draining_route_authority_mirrors_local_routes_before_restart() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("authority-drain-store-segment"));
+    let authority_transport = Arc::new(store_transport.peer("authority-drain-victim-segment"));
+    let writer_transport = Arc::new(store_transport.peer("authority-drain-writer-segment"));
+    let reader_transport = Arc::new(store_transport.peer("authority-drain-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store = StoreClientBuilder::new(metadata.clone(), "authority-drain-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "authority-drain-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let mut authority = StoreClientBuilder::new(metadata.clone(), "authority-drain-victim")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "authority-drain-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(authority_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("authority build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "authority-drain-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route_scope", "authority-drain-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "authority-drain-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route_scope", "authority-drain-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    authority
+        .register_local_memory()
+        .expect("authority memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store, &authority, &writer, &reader]);
+
+    let key = "authority-drain-key";
+    let value = b"authority-drain-value";
+    let route = writer
+        .put_with_policy(
+            key,
+            value,
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store.runtime_id().storage_key()]),
+        )
+        .expect("seed route should write to store");
+    assert_eq!(route.replicas[0].owner, *store.runtime_id());
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new(format!("default::{key}"));
+    authority_replace(
+        &namespace,
+        &store.runtime_id().stable_id,
+        &scoped_key,
+        None,
+    )
+    .expect("test should remove store mirror");
+    authority_replace(
+        &namespace,
+        &authority.runtime_id().stable_id,
+        &scoped_key,
+        Some(&route),
+    )
+    .expect("test should leave route only on draining authority");
+
+    let migrated = authority
+        .evacuate_owned_replicas()
+        .expect("authority drain should mirror local routes");
+    assert_eq!(migrated, 0);
+    authority_replace(
+        &namespace,
+        &authority.runtime_id().stable_id,
+        &scoped_key,
+        None,
+    )
+    .expect("test should simulate authority process restart");
+
+    assert_eq!(
+        reader
+            .get(key)
+            .expect("reader should find route after authority restart"),
+        value
+    );
 }
 
 #[test]

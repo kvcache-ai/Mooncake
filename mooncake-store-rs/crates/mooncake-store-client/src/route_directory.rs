@@ -1031,6 +1031,27 @@ pub(crate) fn authority_list_routes_by_replica_owner(
         .collect())
 }
 
+pub(crate) fn authority_list_routes(
+    namespace: &str,
+    authority: &ClientStableId,
+) -> Result<Vec<ObjectRoute>> {
+    let mesh = route_mesh(namespace);
+    let guard = mesh.lock();
+    if !guard.is_local(authority) {
+        return Err(StoreError::NotFound(format!(
+            "route authority {} is not attached locally",
+            authority
+        )));
+    }
+    Ok(guard
+        .routes_by_authority
+        .get(&authority.0)
+        .into_iter()
+        .flat_map(|routes| routes.values())
+        .cloned()
+        .collect())
+}
+
 pub(crate) fn authority_compare_and_swap(
     namespace: &str,
     authority: &ClientStableId,
