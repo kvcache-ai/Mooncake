@@ -212,7 +212,11 @@ impl TenantPolicyScope {
         if self.tenant != scope.tenant {
             return false;
         }
-        if self.domain.as_deref().is_some_and(|domain| domain != scope.domain) {
+        if self
+            .domain
+            .as_deref()
+            .is_some_and(|domain| domain != scope.domain)
+        {
             return false;
         }
         if self
@@ -232,7 +236,11 @@ impl TenantPolicyScope {
     pub fn ancestors(scope: &crate::NamespaceScope) -> [Self; 3] {
         [
             Self::new(scope.tenant.clone(), None::<String>, None::<String>),
-            Self::new(scope.tenant.clone(), Some(scope.domain.clone()), None::<String>),
+            Self::new(
+                scope.tenant.clone(),
+                Some(scope.domain.clone()),
+                None::<String>,
+            ),
             Self::new(
                 scope.tenant.clone(),
                 Some(scope.domain.clone()),
@@ -305,23 +313,30 @@ pub struct TenantPolicySpec {
 impl TenantPolicySpec {
     pub fn merged_with(&self, overlay: &Self) -> Self {
         Self {
-            routing: Some(merge_routing_policy(self.routing.as_ref(), overlay.routing.as_ref()))
-                .filter(|policy| {
-                    policy.route_topk.is_some() || policy.route_control.is_some()
-                }),
-            quota: Some(merge_quota_policy(self.quota.as_ref(), overlay.quota.as_ref()))
-                .filter(|policy| policy.max_bytes.is_some() || policy.max_objects.is_some()),
+            routing: Some(merge_routing_policy(
+                self.routing.as_ref(),
+                overlay.routing.as_ref(),
+            ))
+            .filter(|policy| policy.route_topk.is_some() || policy.route_control.is_some()),
+            quota: Some(merge_quota_policy(
+                self.quota.as_ref(),
+                overlay.quota.as_ref(),
+            ))
+            .filter(|policy| policy.max_bytes.is_some() || policy.max_objects.is_some()),
             fairness: Some(merge_fairness_policy(
                 self.fairness.as_ref(),
                 overlay.fairness.as_ref(),
             ))
             .filter(|policy| policy.max_remote_batch_items_per_tenant.is_some()),
-            shaping: Some(merge_shaping_policy(self.shaping.as_ref(), overlay.shaping.as_ref()))
-                .filter(|policy| {
-                    policy.max_remote_batch_bytes.is_some()
-                        || policy.max_remote_batch_burst_items.is_some()
-                        || policy.max_inflight_bytes_per_batch.is_some()
-                }),
+            shaping: Some(merge_shaping_policy(
+                self.shaping.as_ref(),
+                overlay.shaping.as_ref(),
+            ))
+            .filter(|policy| {
+                policy.max_remote_batch_bytes.is_some()
+                    || policy.max_remote_batch_burst_items.is_some()
+                    || policy.max_inflight_bytes_per_batch.is_some()
+            }),
             placement: Some(merge_placement_policy(
                 self.placement.as_ref(),
                 overlay.placement.as_ref(),
@@ -373,7 +388,9 @@ fn merge_routing_policy(
     overlay: Option<&TenantRoutePolicy>,
 ) -> TenantRoutePolicy {
     TenantRoutePolicy {
-        route_topk: overlay.and_then(|policy| policy.route_topk).or(base.and_then(|policy| policy.route_topk)),
+        route_topk: overlay
+            .and_then(|policy| policy.route_topk)
+            .or(base.and_then(|policy| policy.route_topk)),
         route_control: overlay
             .and_then(|policy| policy.route_control)
             .or(base.and_then(|policy| policy.route_control)),
@@ -385,7 +402,9 @@ fn merge_quota_policy(
     overlay: Option<&TenantQuotaPolicy>,
 ) -> TenantQuotaPolicy {
     TenantQuotaPolicy {
-        max_bytes: overlay.and_then(|policy| policy.max_bytes).or(base.and_then(|policy| policy.max_bytes)),
+        max_bytes: overlay
+            .and_then(|policy| policy.max_bytes)
+            .or(base.and_then(|policy| policy.max_bytes)),
         max_objects: overlay
             .and_then(|policy| policy.max_objects)
             .or(base.and_then(|policy| policy.max_objects)),

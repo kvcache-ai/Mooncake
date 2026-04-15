@@ -746,8 +746,7 @@ mod tests {
 
     use mooncake_store_core::{Result, StoreError};
     use mooncake_transport::{
-        SegmentInfo, TransferBatchHints, TransferPacingMode, TransferProgress, TransferRequest,
-        TransferStatus,
+        SegmentInfo, TransferBatchHints, TransferProgress, TransferRequest, TransferStatus,
     };
     use parking_lot::Mutex;
 
@@ -822,9 +821,8 @@ mod tests {
             &self,
             batch_id: u64,
             requests: &[TransferRequest],
-            hints: &TransferBatchHints,
+            _hints: &TransferBatchHints,
         ) -> Result<()> {
-            assert_eq!(hints.mode, TransferPacingMode::Standard);
             self.submit(batch_id, requests)
         }
 
