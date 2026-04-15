@@ -317,10 +317,14 @@ impl StoreClient {
                 &payload,
                 Some(&policy),
                 Some(&confirmed),
-                ReclaimMode::Immediate,
+                ReclaimMode::Deferred,
             ) {
                 Ok(next) => {
-                    writer.sync_route_to_live_authorities(&next)?;
+                    writer.sync_route_to_live_authorities_excluding(
+                        &next,
+                        Some(&self.lease.runtime.stable_id),
+                    )?;
+                    writer.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
                     registry::record_rebalance_route("migrate", "ok");
                     registry::record_rebalance_bytes(
                         "migrate",
@@ -403,10 +407,14 @@ impl StoreClient {
                 &payload,
                 Some(&policy),
                 Some(&confirmed),
-                ReclaimMode::Immediate,
+                ReclaimMode::Deferred,
             ) {
                 Ok(next) => {
-                    writer.sync_route_to_live_authorities(&next)?;
+                    writer.sync_route_to_live_authorities_excluding(
+                        &next,
+                        Some(&self.lease.runtime.stable_id),
+                    )?;
+                    writer.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
                     registry::record_rebalance_route("migrate", "ok");
                     registry::record_rebalance_bytes(
                         "migrate",
@@ -490,27 +498,137 @@ impl StoreClient {
         })?
     }
 
-    fn sync_route_to_live_authorities(&self, route: &ObjectRoute) -> Result<()> {
+    fn get_route_from_authority(
+        &self,
+        authority: &ClientLease,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectRoute>> {
+        let namespace = self.metadata.route_namespace();
+        if authority.runtime.stable_id == self.lease.runtime.stable_id {
+            return authority_get(&namespace, &authority.runtime.stable_id, key);
+        }
+        let mut results = self.control_client.batch_get_routes(
+            authority,
+            &namespace,
+            &authority.runtime.stable_id,
+            std::slice::from_ref(key),
+        )?;
+        results.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane route get reply is missing batch item".to_string(),
+            )
+        })?
+    }
+
+    fn ensure_authority_route_not_stale(
+        &self,
+        authority: &ClientLease,
+        route: &ObjectRoute,
+    ) -> Result<()> {
+        if self
+            .get_route_from_authority(authority, &route.key)?
+            .is_some_and(|current| current.version >= route.version)
+        {
+            return Ok(());
+        }
+        self.replace_route_on_authority(authority, route)
+    }
+
+    fn sync_route_to_live_authorities_excluding(
+        &self,
+        route: &ObjectRoute,
+        excluded: Option<&ClientStableId>,
+    ) -> Result<usize> {
+        if self.route_control == RouteControlMode::MetadataOnly {
+            return Ok(0);
+        }
+        let mut protected = 0usize;
+        let mut last_error = None;
         for authority in self.route_scan_authorities()? {
+            let is_excluded =
+                excluded.is_some_and(|stable_id| authority.runtime.stable_id == *stable_id);
             match self.replace_route_on_authority(&authority, route) {
-                Ok(()) => {}
-                Err(error) if authority.runtime != self.lease.runtime => {
-                    self.mark_runtime_suspect(
-                        &authority.runtime,
-                        "route_sync_authority_replace_failed",
-                    );
+                Ok(()) => {
+                    if !is_excluded {
+                        protected = protected.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    if authority.runtime != self.lease.runtime {
+                        self.mark_runtime_suspect(
+                            &authority.runtime,
+                            "route_sync_authority_replace_failed",
+                        );
+                    }
                     warn!(
                         runtime = %self.lease.runtime,
                         authority = %authority.runtime,
                         key = %route.key.0,
                         error = %error,
-                        "route authority sync failed during migration; continuing with already-published authority route"
+                        "route authority sync failed during migration"
                     );
+                    if !is_excluded {
+                        last_error = Some(error);
+                    }
                 }
-                Err(error) => return Err(error),
             }
         }
-        Ok(())
+        if excluded.is_some() && protected == 0 {
+            return Err(last_error.unwrap_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "route {} has no live authority outside the draining runtime",
+                    route.key.0
+                ))
+            }));
+        }
+        Ok(protected)
+    }
+
+    fn sync_local_authority_routes_to_live_authorities(&self) -> Result<usize> {
+        if self.route_control == RouteControlMode::MetadataOnly {
+            return Ok(0);
+        }
+        let routes = authority_list_routes(
+            &self.metadata.route_namespace(),
+            &self.lease.runtime.stable_id,
+        )?;
+        let mut synced = 0usize;
+        for route in routes {
+            let mut protected = 0usize;
+            let mut last_error = None;
+            for authority in self.route_scan_authorities()? {
+                if authority.runtime.stable_id == self.lease.runtime.stable_id {
+                    continue;
+                }
+                match self.ensure_authority_route_not_stale(&authority, &route) {
+                    Ok(()) => protected = protected.saturating_add(1),
+                    Err(error) => {
+                        self.mark_runtime_suspect(
+                            &authority.runtime,
+                            "route_authority_shutdown_sync_failed",
+                        );
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            authority = %authority.runtime,
+                            key = %route.key.0,
+                            error = %error,
+                            "route authority shutdown sync failed"
+                        );
+                        last_error = Some(error);
+                    }
+                }
+            }
+            if protected == 0 {
+                return Err(last_error.unwrap_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "local authority route {} has no live mirror",
+                        route.key.0
+                    ))
+                }));
+            }
+            synced = synced.saturating_add(1);
+        }
+        Ok(synced)
     }
 
     fn release_stale_local_allocations(
@@ -619,6 +737,7 @@ impl StoreClient {
 
             let remaining = self.remaining_live_segments()?;
             if remaining.is_empty() {
+                let _ = self.sync_local_authority_routes_to_live_authorities()?;
                 return Ok(migrated);
             }
 

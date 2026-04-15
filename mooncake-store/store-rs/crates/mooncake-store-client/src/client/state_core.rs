@@ -723,4 +723,5 @@ struct AllocationSpan {
 enum ReclaimMode {
     Scheduled,
     Immediate,
+    Deferred,
 }
