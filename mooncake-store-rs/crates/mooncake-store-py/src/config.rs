@@ -10,7 +10,7 @@ use mooncake_store_core::{MetadataBackend, Result, StoreError};
 use mooncake_transport::{ClassicEngineConfig, ClassicTransportProtocol, TentEngineConfig};
 use url::Url;
 
-const DEFAULT_COMPAT_LEASE_TTL_MS: u64 = 30_000;
+pub const DEFAULT_COMPAT_LEASE_TTL_MS: u64 = 30_000;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -118,6 +118,7 @@ pub struct CompatBuildPlan {
     pub storage_bytes: usize,
     pub scratch_bytes: usize,
     pub expires_at_ms: u64,
+    pub lease_ttl_ms: u64,
     pub use_hugepage: Option<bool>,
     pub hugepage_size_bytes: Option<usize>,
 }
@@ -212,6 +213,15 @@ impl CompatSetupArgs {
                 "true".to_string()
             }
         });
+        let now_ms = now_ms();
+        let (expires_at_ms, lease_ttl_ms) = match expires_at_ms {
+            Some(expires_at_ms) => (expires_at_ms, expires_at_ms.saturating_sub(now_ms).max(1)),
+            None => (
+                now_ms.saturating_add(DEFAULT_COMPAT_LEASE_TTL_MS),
+                DEFAULT_COMPAT_LEASE_TTL_MS,
+            ),
+        };
+
         Ok(CompatBuildPlan {
             metadata,
             transport_backend,
@@ -225,7 +235,8 @@ impl CompatSetupArgs {
             route_topk,
             storage_bytes: global_segment_size,
             scratch_bytes: local_buffer_size,
-            expires_at_ms: expires_at_ms.unwrap_or_else(|| now_ms() + DEFAULT_COMPAT_LEASE_TTL_MS),
+            expires_at_ms,
+            lease_ttl_ms,
             use_hugepage,
             hugepage_size_bytes,
         })
@@ -623,8 +634,8 @@ mod tests {
         let _guard = env_test_lock().lock().expect("test lock poisoned");
         std::env::set_var("MC_REDIS_USERNAME", "env-user");
         std::env::set_var("MC_REDIS_PASSWORD", "env-pass");
-        let auth = resolve_redis_auth("redis://cache.local:6381/3")
-            .expect("redis auth should resolve");
+        let auth =
+            resolve_redis_auth("redis://cache.local:6381/3").expect("redis auth should resolve");
         assert_eq!(auth.username.as_deref(), Some("env-user"));
         assert_eq!(auth.password.as_deref(), Some("env-pass"));
         std::env::remove_var("MC_REDIS_USERNAME");

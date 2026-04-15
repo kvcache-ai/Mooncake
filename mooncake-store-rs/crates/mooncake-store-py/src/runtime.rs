@@ -18,6 +18,7 @@ pub struct CompatRuntime {
     pub initial_state: ClientLifecycleState,
     pub segment_name: String,
     pub expires_at_ms: u64,
+    pub lease_ttl_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +37,7 @@ impl CompatRuntimeArgs {
         let planner_metadata = plan.routed_writes.then(|| plan.metadata.clone());
         let stable_id = plan.stable_id.clone();
         let expires_at_ms = plan.expires_at_ms;
+        let lease_ttl_ms = plan.lease_ttl_ms;
         let segment_name = self
             .local_segment_name
             .unwrap_or_else(|| default_segment_name(&stable_id));
@@ -89,6 +91,7 @@ impl CompatRuntimeArgs {
             initial_state: self.initial_state,
             segment_name,
             expires_at_ms,
+            lease_ttl_ms,
         })
     }
 }

@@ -3,11 +3,13 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
-    record_heartbeat_health, HealthChannel, HealthUpdate, MooncakeCompatibilityFacade,
-    MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, ReplicationPolicy, StoreClient,
+    record_heartbeat_health, stable_phase_spread_ms, HealthChannel, HealthUpdate,
+    MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
+    ReplicationPolicy, StoreClient,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
@@ -15,6 +17,7 @@ use mooncake_store_core::{
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
+use tracing::{info, warn};
 
 use crate::config::CompatTimeoutConfig;
 use crate::dummy_service::pb;
@@ -25,6 +28,7 @@ type RegionMap = BTreeMap<RegionKey, OwnedMappedRegion>;
 type TrackedKey = (String, String);
 static DISPATCHER_RUNTIME: LazyLock<Runtime> =
     LazyLock::new(|| Runtime::new().expect("dispatcher runtime should initialize"));
+const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 
 pub(crate) struct DispatcherState {
     tracked_keys: BTreeSet<TrackedKey>,
@@ -36,6 +40,21 @@ struct HeartbeatHealthState {
     last_success_ms: u64,
 }
 
+struct HeartbeatLoopHandle {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct HealthPublisher {
+    health: Arc<HealthChannel>,
+    closed: Arc<AtomicBool>,
+    health_inflight: Arc<AtomicBool>,
+    health_timeout: Duration,
+    runtime: String,
+    heartbeat_health: Arc<Mutex<HeartbeatHealthState>>,
+}
+
 pub struct StoreDispatcher {
     client: Arc<StoreClient>,
     health: Arc<HealthChannel>,
@@ -43,6 +62,7 @@ pub struct StoreDispatcher {
     state: Arc<Mutex<DispatcherState>>,
     closed: Arc<AtomicBool>,
     health_inflight: Arc<AtomicBool>,
+    heartbeat_loop: Arc<Mutex<Option<HeartbeatLoopHandle>>>,
     request_timeout: Duration,
     health_timeout: Duration,
     runtime: String,
@@ -92,11 +112,59 @@ impl StoreDispatcher {
             })),
             closed: Arc::new(AtomicBool::new(false)),
             health_inflight: Arc::new(AtomicBool::new(false)),
+            heartbeat_loop: Arc::new(Mutex::new(None)),
             request_timeout: timeouts.request_timeout.max(Duration::from_millis(1)),
             health_timeout: timeouts.heartbeat_timeout.max(Duration::from_millis(1)),
             runtime,
             heartbeat_health: Arc::new(Mutex::new(HeartbeatHealthState::default())),
         })
+    }
+
+    pub fn start_heartbeat_loop(
+        &self,
+        lease_ttl_ms: u64,
+        requested_interval_ms: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let mut loop_guard = self.heartbeat_loop.lock();
+        if loop_guard.is_some() {
+            return Ok(());
+        }
+
+        let lease_ttl_ms = lease_ttl_ms.max(1);
+        let interval_ms = effective_heartbeat_interval(
+            requested_interval_ms.unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_MS),
+            lease_ttl_ms,
+        );
+        let initial_delay_ms = initial_heartbeat_delay_ms(&self.runtime, interval_ms);
+        let stop = Arc::new(AtomicBool::new(false));
+        let publisher = self.health_publisher();
+        let thread_stop = stop.clone();
+        let thread_name = format!("{}-heartbeat", self.runtime.replace(':', "-"));
+        let thread = thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                run_heartbeat_loop(
+                    publisher,
+                    thread_stop,
+                    lease_ttl_ms,
+                    interval_ms,
+                    initial_delay_ms,
+                );
+            })
+            .map_err(|error| {
+                StoreError::Transport(format!("store dispatcher heartbeat thread failed: {error}"))
+            })?;
+
+        *loop_guard = Some(HeartbeatLoopHandle { stop, thread });
+        Ok(())
+    }
+
+    pub fn stop_heartbeat_loop(&self) {
+        let Some(handle) = self.heartbeat_loop.lock().take() else {
+            return;
+        };
+        handle.stop.store(true, Ordering::SeqCst);
+        let _ = handle.thread.join();
     }
 
     pub fn register_local_memory(&self) -> Result<(), StoreError> {
@@ -109,14 +177,7 @@ impl StoreDispatcher {
     }
 
     pub fn heartbeat(&self, expires_at_ms: u64) -> Result<(), StoreError> {
-        let heartbeat = self.prepare_heartbeat(expires_at_ms);
-        let result = self.run_health_update("heartbeat publish", heartbeat);
-        if result.is_ok() {
-            self.record_heartbeat_success();
-        } else {
-            self.record_heartbeat_failure();
-        }
-        result
+        self.health_publisher().heartbeat(expires_at_ms)
     }
 
     pub fn activate(&self) -> Result<(), StoreError> {
@@ -332,6 +393,7 @@ impl StoreDispatcher {
     }
 
     pub fn shutdown(&self) {
+        self.stop_heartbeat_loop();
         self.closed.store(true, Ordering::SeqCst);
     }
 
@@ -370,10 +432,6 @@ impl StoreDispatcher {
         Ok(())
     }
 
-    fn prepare_heartbeat(&self, expires_at_ms: u64) -> mooncake_store_client::HeartbeatLease {
-        self.health.prepare_heartbeat(expires_at_ms)
-    }
-
     fn prepare_state_update(
         &self,
         next_state: ClientLifecycleState,
@@ -387,21 +445,43 @@ impl StoreDispatcher {
         context: &'static str,
         update: HealthUpdate,
     ) -> Result<(), StoreError> {
-        self.ensure_open()?;
-        if self.health_inflight.swap(true, Ordering::SeqCst) {
-            return Err(StoreError::Transport(format!(
-                "store dispatcher {context} is still in flight"
-            )));
-        }
-        let inflight = self.health_inflight.clone();
-        DISPATCHER_RUNTIME.block_on(self.await_blocking_with_timeout(
-            context,
+        run_health_update(
+            self.closed.as_ref(),
+            self.health_inflight.clone(),
             self.health_timeout,
-            move || {
-                let _guard = InflightGuard(inflight);
-                update.publish()
-            },
-        ))
+            context,
+            update,
+        )
+    }
+
+    fn health_publisher(&self) -> HealthPublisher {
+        HealthPublisher {
+            health: self.health.clone(),
+            closed: self.closed.clone(),
+            health_inflight: self.health_inflight.clone(),
+            health_timeout: self.health_timeout,
+            runtime: self.runtime.clone(),
+            heartbeat_health: self.heartbeat_health.clone(),
+        }
+    }
+}
+
+impl HealthPublisher {
+    fn heartbeat(&self, expires_at_ms: u64) -> Result<(), StoreError> {
+        let heartbeat = self.health.prepare_heartbeat(expires_at_ms);
+        let result = run_health_update(
+            self.closed.as_ref(),
+            self.health_inflight.clone(),
+            self.health_timeout,
+            "heartbeat publish",
+            heartbeat,
+        );
+        if result.is_ok() {
+            self.record_heartbeat_success();
+        } else {
+            self.record_heartbeat_failure();
+        }
+        result
     }
 
     fn record_heartbeat_success(&self) {
@@ -421,6 +501,40 @@ impl StoreDispatcher {
             heartbeat.last_success_ms,
         );
     }
+}
+
+fn run_health_update(
+    closed: &AtomicBool,
+    inflight: Arc<AtomicBool>,
+    timeout: Duration,
+    context: &'static str,
+    update: HealthUpdate,
+) -> Result<(), StoreError> {
+    if closed.load(Ordering::SeqCst) {
+        return Err(dispatcher_stopped());
+    }
+    if inflight.swap(true, Ordering::SeqCst) {
+        return Err(StoreError::Transport(format!(
+            "store dispatcher {context} is still in flight"
+        )));
+    }
+    DISPATCHER_RUNTIME.block_on(async move {
+        match tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                let _guard = InflightGuard(inflight);
+                update.publish()
+            }),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(StoreError::Transport(format!(
+                "store dispatcher worker failed: {error}"
+            ))),
+            Err(_) => Err(dispatcher_timeout(context, timeout)),
+        }
+    })
 }
 
 struct InflightGuard(Arc<AtomicBool>);
@@ -709,6 +823,58 @@ fn dispatcher_timeout(context: &'static str, timeout: Duration) -> StoreError {
         "store dispatcher {context} timed out after {}ms",
         timeout.as_millis(),
     ))
+}
+
+fn effective_heartbeat_interval(requested_ms: u64, lease_ttl_ms: u64) -> u64 {
+    let interval_ms = if requested_ms == 0 || requested_ms >= lease_ttl_ms {
+        (lease_ttl_ms / 3).max(1_000)
+    } else {
+        requested_ms
+    };
+    interval_ms.min(lease_ttl_ms.saturating_sub(1).max(1))
+}
+
+fn initial_heartbeat_delay_ms(runtime: &str, heartbeat_interval_ms: u64) -> u64 {
+    stable_phase_spread_ms(runtime, heartbeat_interval_ms, "heartbeat")
+}
+
+fn heartbeat_retry_delay_ms(heartbeat_interval_ms: u64) -> u64 {
+    heartbeat_interval_ms.clamp(500, 1_000)
+}
+
+fn run_heartbeat_loop(
+    publisher: HealthPublisher,
+    stop: Arc<AtomicBool>,
+    lease_ttl_ms: u64,
+    heartbeat_interval_ms: u64,
+    initial_delay_ms: u64,
+) {
+    let runtime = publisher.runtime.clone();
+    let mut next_heartbeat = current_time_ms().saturating_add(initial_delay_ms);
+    while !stop.load(Ordering::SeqCst) && !publisher.closed.load(Ordering::SeqCst) {
+        let now_ms = current_time_ms();
+        if now_ms >= next_heartbeat {
+            match publisher.heartbeat(now_ms.saturating_add(lease_ttl_ms)) {
+                Ok(()) => {
+                    next_heartbeat = now_ms.saturating_add(heartbeat_interval_ms);
+                }
+                Err(error) => {
+                    let retry_after_ms = heartbeat_retry_delay_ms(heartbeat_interval_ms);
+                    warn!(
+                        runtime,
+                        retry_after_ms,
+                        error = %error,
+                        "store dispatcher heartbeat failed"
+                    );
+                    next_heartbeat = now_ms.saturating_add(retry_after_ms);
+                }
+            }
+            continue;
+        }
+        let sleep_ms = next_heartbeat.saturating_sub(now_ms).clamp(1, 100);
+        thread::sleep(Duration::from_millis(sleep_ms));
+    }
+    info!(runtime, "store dispatcher heartbeat loop stopped");
 }
 
 fn current_time_ms() -> u64 {
