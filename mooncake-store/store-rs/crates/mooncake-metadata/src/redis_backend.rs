@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
@@ -216,6 +217,55 @@ pub struct RedisMetadataConfig {
     pub keyspace: MetadataKeyspace,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedRedisAuth {
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl ResolvedRedisAuth {
+    fn from_connection_info(info: &RedisConnectionInfo) -> Self {
+        Self {
+            username: info.username.clone(),
+            password: info.password.clone(),
+        }
+    }
+
+    fn with_env_fallback(mut self) -> Self {
+        if self.username.is_some() || self.password.is_some() {
+            return self;
+        }
+
+        let password = std::env::var("MC_REDIS_PASSWORD")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let Some(password) = password else {
+            return self;
+        };
+
+        self.password = Some(password);
+        self.username = std::env::var("MC_REDIS_USERNAME")
+            .ok()
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    fn apply_to_connection_info(&self, info: &mut RedisConnectionInfo) {
+        info.username = self.username.clone();
+        info.password = self.password.clone();
+    }
+
+    fn password_only_fallback(&self) -> Option<Self> {
+        if self.username.is_none() || self.password.is_none() {
+            return None;
+        }
+        Some(Self {
+            username: None,
+            password: self.password.clone(),
+        })
+    }
+}
+
 impl RedisMetadataConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
@@ -232,6 +282,8 @@ impl RedisMetadataConfig {
 
 pub struct RedisMetadataBackend {
     client: redis::Client,
+    legacy_auth_client: Option<redis::Client>,
+    prefer_legacy_auth: AtomicBool,
     keyspace: MetadataKeyspace,
     route_namespace: String,
 }
@@ -248,25 +300,36 @@ pub struct RedisMetadataCleanupReport {
 
 impl RedisMetadataBackend {
     pub fn new(config: RedisMetadataConfig) -> Result<Self> {
+        let connection_info = redis_connection_info(&config.url)?;
+        let legacy_auth_connection_info = legacy_auth_connection_info(&connection_info);
         let route_namespace = format!(
             "redis://{}#{}",
             redacted_route_namespace_source(&config.url),
             config.keyspace.prefix()
         );
-        let client = redis::Client::open(redis_connection_info(&config.url)?)
+        let client = redis::Client::open(connection_info)
             .map_err(|error| metadata_error("redis client open", error))?;
+        let legacy_auth_client = legacy_auth_connection_info
+            .map(redis::Client::open)
+            .transpose()
+            .map_err(|error| metadata_error("redis client open legacy auth", error))?;
         Ok(Self {
             client,
+            legacy_auth_client,
+            prefer_legacy_auth: AtomicBool::new(false),
             keyspace: config.keyspace,
             route_namespace,
         })
     }
 
-    fn connection(&self) -> Result<redis::Connection> {
-        let connection = self
-            .client
+    fn connection_with_client(
+        &self,
+        client: &redis::Client,
+        operation: &'static str,
+    ) -> Result<redis::Connection> {
+        let connection = client
             .get_connection_with_timeout(redis_connect_timeout())
-            .map_err(|error| metadata_error("redis get_connection", error))?;
+            .map_err(|error| metadata_error(operation, error))?;
         connection
             .set_read_timeout(Some(redis_io_timeout()))
             .map_err(|error| metadata_error("redis set_read_timeout", error))?;
@@ -274,6 +337,30 @@ impl RedisMetadataBackend {
             .set_write_timeout(Some(redis_io_timeout()))
             .map_err(|error| metadata_error("redis set_write_timeout", error))?;
         Ok(connection)
+    }
+
+    fn connection(&self) -> Result<redis::Connection> {
+        if self.prefer_legacy_auth.load(Ordering::Relaxed) {
+            if let Some(client) = &self.legacy_auth_client {
+                return self.connection_with_client(client, "redis get_connection legacy auth");
+            }
+        }
+
+        match self.connection_with_client(&self.client, "redis get_connection") {
+            Ok(connection) => Ok(connection),
+            Err(error) => {
+                if !matches_redis_legacy_auth_mismatch(&error) {
+                    return Err(error);
+                }
+                let Some(client) = &self.legacy_auth_client else {
+                    return Err(error);
+                };
+                let connection =
+                    self.connection_with_client(client, "redis get_connection legacy auth")?;
+                self.prefer_legacy_auth.store(true, Ordering::Relaxed);
+                Ok(connection)
+            }
+        }
     }
 
     fn query_readonly<T, F>(&self, operation: &str, mut query: F) -> Result<T>
@@ -432,26 +519,23 @@ fn redis_connection_info(url: &str) -> Result<ConnectionInfo> {
         .to_string()
         .into_connection_info()
         .map_err(|error| metadata_error("redis connection info", error))?;
-    apply_redis_auth_env(&mut info.redis);
+    resolve_redis_auth(url)?.apply_to_connection_info(&mut info.redis);
     Ok(info)
 }
 
-fn apply_redis_auth_env(info: &mut RedisConnectionInfo) {
-    if info.username.is_some() || info.password.is_some() {
-        return;
-    }
+fn legacy_auth_connection_info(info: &ConnectionInfo) -> Option<ConnectionInfo> {
+    let legacy_auth = ResolvedRedisAuth::from_connection_info(&info.redis).password_only_fallback()?;
+    let mut legacy = info.clone();
+    legacy_auth.apply_to_connection_info(&mut legacy.redis);
+    Some(legacy)
+}
 
-    let password = std::env::var("MC_REDIS_PASSWORD")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let Some(password) = password else {
-        return;
-    };
-
-    info.password = Some(password);
-    info.username = std::env::var("MC_REDIS_USERNAME")
-        .ok()
-        .filter(|value| !value.is_empty());
+pub fn resolve_redis_auth(url: &str) -> Result<ResolvedRedisAuth> {
+    let info = url
+        .to_string()
+        .into_connection_info()
+        .map_err(|error| metadata_error("redis auth resolution", error))?;
+    Ok(ResolvedRedisAuth::from_connection_info(&info.redis).with_env_fallback())
 }
 
 fn redacted_route_namespace_source(url: &str) -> String {
@@ -885,6 +969,20 @@ fn metadata_error(operation: &str, error: redis::RedisError) -> StoreError {
     StoreError::Metadata(format!("{operation}: {error}"))
 }
 
+fn matches_redis_legacy_auth_mismatch(error: &StoreError) -> bool {
+    let StoreError::Metadata(message) = error else {
+        return false;
+    };
+    is_legacy_redis_auth_arity_error(message)
+}
+
+pub fn is_legacy_redis_auth_arity_error(message: &str) -> bool {
+    let detail = message.to_ascii_lowercase();
+    detail.contains("wrong number of arguments for 'auth' command")
+        || detail.contains("wrong number of arguments for `auth` command")
+        || detail.contains("wrong number of arguments for auth command")
+}
+
 fn should_retry_readonly_redis_error(error: &redis::RedisError) -> bool {
     let detail = error.to_string().to_ascii_lowercase();
     error.is_timeout()
@@ -915,6 +1013,7 @@ mod tests {
     use redis::Commands;
 
     use super::{
+        is_legacy_redis_auth_arity_error, legacy_auth_connection_info,
         redacted_route_namespace_source, redis_connect_timeout, redis_connection_info,
         redis_io_timeout, should_retry_readonly_redis_error, MetadataKeyspace,
         RedisMetadataBackend, RedisMetadataConfig, DEFAULT_REDIS_CONNECT_TIMEOUT,
@@ -1393,6 +1492,30 @@ mod tests {
 
         std::env::remove_var("MC_REDIS_USERNAME");
         std::env::remove_var("MC_REDIS_PASSWORD");
+    }
+
+    #[test]
+    fn legacy_auth_connection_info_strips_username_when_password_exists() {
+        let info = redis_connection_info("redis://url-user:url-pass@127.0.0.1:6379/3")
+            .expect("redis connection info should parse");
+        let legacy =
+            legacy_auth_connection_info(&info).expect("legacy auth info should be derived");
+        assert_eq!(legacy.redis.username, None);
+        assert_eq!(legacy.redis.password.as_deref(), Some("url-pass"));
+        assert_eq!(legacy.redis.db, 3);
+    }
+
+    #[test]
+    fn legacy_auth_message_matcher_accepts_auth_arity_errors() {
+        assert!(is_legacy_redis_auth_arity_error(
+            "redis get_connection: An error was signalled by the server - ERR wrong number of arguments for 'auth' command"
+        ));
+        assert!(is_legacy_redis_auth_arity_error(
+            "redis get_connection: ERR wrong number of arguments for `auth` command"
+        ));
+        assert!(!is_legacy_redis_auth_arity_error(
+            "redis get_connection: WRONGPASS invalid username-password pair"
+        ));
     }
 
     #[test]

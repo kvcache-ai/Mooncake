@@ -239,6 +239,8 @@ redis://username:password@redis.example.com:6379/0
 
 If both forms are present, credentials in the URL take precedence. Prefer environment variables when passwords contain reserved URL characters such as `@`, `/`, `:` or `#`; URL-embedded credentials must be percent-encoded. Route namespaces redact URL credentials before they are used for routing metadata identity.
 
+For Redis 5 password-only deployments, the metadata backend also tolerates connections where a username was supplied by configuration but the server accepts only legacy `AUTH <password>`; the client retries with password-only auth after the server rejects the username form.
+
 ## Python Compatibility Configuration
 
 `MooncakeDistributedStore.setup(...)` accepts the core store knobs plus Python-specific convenience parameters.
