@@ -272,6 +272,17 @@ def run_initiator(args):
         )
     print(f"  Remote buffer at 0x{remote_addr:x}")
 
+    # Connection warmup: a small transfer to establish the EFA connection
+    # (openSegment, endpoint creation, etc.) so it doesn't skew the first
+    # prefix size's measurements.
+    print("Warming up connection...")
+    warmup_size = min(transfer_sizes[0], recv_bytes)
+    for _ in range(3):
+        engine.transfer_sync_read(
+            args.target_server_name, recv_addr, remote_addr, warmup_size
+        )
+    print("  Connection ready.")
+
     # Run benchmarks
     print(f"\n{'='*72}")
     print(
