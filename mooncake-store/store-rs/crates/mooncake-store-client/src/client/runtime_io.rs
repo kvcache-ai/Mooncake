@@ -206,53 +206,9 @@ impl StoreClient {
             .collect())
     }
 
-    fn insert_latest_route(routes: &mut BTreeMap<String, ObjectRoute>, route: ObjectRoute) {
-        match routes.get(&route.key.0) {
-            Some(current) if current.version >= route.version => {}
-            _ => {
-                routes.insert(route.key.0.clone(), route);
-            }
-        }
-    }
-
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
-        let namespace = self.metadata.route_namespace();
-        let mut routes = BTreeMap::new();
-        for route in self.metadata.list_object_routes()? {
-            Self::insert_latest_route(&mut routes, route);
-        }
-        for authority in self.route_scan_authorities()? {
-            let scanned = if authority.runtime.stable_id == self.lease.runtime.stable_id {
-                authority_list_routes_by_replica_owner(
-                    &namespace,
-                    &authority.runtime.stable_id,
-                    owner,
-                )
-            } else {
-                self.control_client.list_routes_by_replica_owner(
-                    &authority,
-                    &namespace,
-                    &authority.runtime.stable_id,
-                    owner,
-                )
-            };
-            match scanned {
-                Ok(found) => {
-                    for route in found {
-                        Self::insert_latest_route(&mut routes, route);
-                    }
-                }
-                Err(error) => {
-                    debug!(
-                        authority = %authority.runtime,
-                        owner = %owner,
-                        error = %error,
-                        "route-owner scan failed during shrink"
-                    );
-                }
-            }
-        }
-        Ok(routes.into_values().collect())
+        self.route_directory
+            .list_routes_by_replica_owner(&self.lease, owner)
     }
 
     fn split_scoped_route_key<'a>(&self, route: &'a ObjectRoute) -> Result<(&'a str, &'a str)> {
@@ -548,7 +504,7 @@ impl StoreClient {
                         authority = %authority.runtime,
                         key = %route.key.0,
                         error = %error,
-                        "route authority sync failed during migration; continuing with metadata-visible route"
+                        "route authority sync failed during migration; continuing with already-published authority route"
                     );
                 }
                 Err(error) => return Err(error),

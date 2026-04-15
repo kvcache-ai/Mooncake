@@ -103,7 +103,7 @@ impl StoreClient {
                     .batch_reserve_any(&group.lease, &storage_runtime, &lengths)
                 {
                     Ok(results) => {
-                        for ((index, length_bytes), result) in group
+                        for ((index, _length_bytes), result) in group
                             .any_indices
                             .iter()
                             .copied()
@@ -112,30 +112,13 @@ impl StoreClient {
                         {
                             let reservation = match result {
                                 Ok(reservation) => reservation,
-                                Err(error) if should_fallback_to_metadata_allocator(&error) => {
-                                    debug!(
-                                        storage_runtime = %storage_runtime,
-                                        error = %error,
-                                        length_bytes,
-                                        "allocator batch reserve rpc failed; falling back to metadata allocator"
-                                    );
-                                    match self.reserve_segment_allocation_via_metadata(
-                                        &storage_runtime,
-                                        None,
-                                        length_bytes,
-                                    ) {
-                                        Ok(reservation) => reservation,
-                                        Err(error) => {
-                                            resolved[index] = Some(Err(error));
-                                            continue;
-                                        }
-                                    }
-                                }
                                 Err(error) => {
-                                    self.mark_runtime_suspect(
-                                        &storage_runtime,
-                                        "allocator_batch_reserve_any_failed",
-                                    );
+                                    if should_mark_runtime_suspect_after_allocator_error(&error) {
+                                        self.mark_runtime_suspect(
+                                            &storage_runtime,
+                                            "allocator_batch_reserve_any_failed",
+                                        );
+                                    }
                                     resolved[index] = Some(Err(error.clone()));
                                     continue;
                                 }
@@ -149,39 +132,13 @@ impl StoreClient {
                             )));
                         }
                     }
-                    Err(error) if should_fallback_to_metadata_allocator(&error) => {
-                        debug!(
-                            storage_runtime = %storage_runtime,
-                            error = %error,
-                            items = group.any_indices.len(),
-                            "allocator batch reserve rpc failed; falling back to metadata allocator"
-                        );
-                        for index in &group.any_indices {
-                            let reservation = match self.reserve_segment_allocation_via_metadata(
-                                &storage_runtime,
-                                None,
-                                requests[*index].length_bytes,
-                            ) {
-                                Ok(reservation) => reservation,
-                                Err(error) => {
-                                    resolved[*index] = Some(Err(error));
-                                    continue;
-                                }
-                            };
-                            resolved[*index] = Some(Ok((
-                                ReplicaWriteTarget {
-                                    storage_runtime: storage_runtime.clone(),
-                                    segment_name: reservation.segment_name.clone(),
-                                },
-                                reservation,
-                            )));
-                        }
-                    }
                     Err(error) => {
-                        self.mark_runtime_suspect(
-                            &storage_runtime,
-                            "allocator_batch_reserve_any_failed",
-                        );
+                        if should_mark_runtime_suspect_after_allocator_error(&error) {
+                            self.mark_runtime_suspect(
+                                &storage_runtime,
+                                "allocator_batch_reserve_any_failed",
+                            );
+                        }
                         for index in group.any_indices {
                             resolved[index] = Some(Err(error.clone()));
                         }
@@ -206,7 +163,7 @@ impl StoreClient {
                     .batch_reserve_specific(&group.lease, &storage_runtime, &ops)
                 {
                     Ok(results) => {
-                        for ((index, request), result) in group
+                        for ((index, _request), result) in group
                             .specific_indices
                             .iter()
                             .copied()
@@ -215,31 +172,13 @@ impl StoreClient {
                         {
                             let reservation = match result {
                                 Ok(reservation) => reservation,
-                                Err(error) if should_fallback_to_metadata_allocator(&error) => {
-                                    debug!(
-                                        storage_runtime = %storage_runtime,
-                                        segment = %request.segment_name.0,
-                                        error = %error,
-                                        length_bytes = request.length_bytes,
-                                        "allocator batch reserve_specific rpc failed; falling back to metadata allocator"
-                                    );
-                                    match self.reserve_segment_allocation_via_metadata(
-                                        &storage_runtime,
-                                        Some(&request.segment_name),
-                                        request.length_bytes,
-                                    ) {
-                                        Ok(reservation) => reservation,
-                                        Err(error) => {
-                                            resolved[index] = Some(Err(error));
-                                            continue;
-                                        }
-                                    }
-                                }
                                 Err(error) => {
-                                    self.mark_runtime_suspect(
-                                        &storage_runtime,
-                                        "allocator_batch_reserve_specific_failed",
-                                    );
+                                    if should_mark_runtime_suspect_after_allocator_error(&error) {
+                                        self.mark_runtime_suspect(
+                                            &storage_runtime,
+                                            "allocator_batch_reserve_specific_failed",
+                                        );
+                                    }
                                     resolved[index] = Some(Err(error.clone()));
                                     continue;
                                 }
@@ -253,40 +192,13 @@ impl StoreClient {
                             )));
                         }
                     }
-                    Err(error) if should_fallback_to_metadata_allocator(&error) => {
-                        debug!(
-                            storage_runtime = %storage_runtime,
-                            error = %error,
-                            items = group.specific_indices.len(),
-                            "allocator batch reserve_specific rpc failed; falling back to metadata allocator"
-                        );
-                        for (index, request) in group.specific_indices.iter().copied().zip(ops.iter())
-                        {
-                            let reservation = match self.reserve_segment_allocation_via_metadata(
-                                &storage_runtime,
-                                Some(&request.segment_name),
-                                request.length_bytes,
-                            ) {
-                                Ok(reservation) => reservation,
-                                Err(error) => {
-                                    resolved[index] = Some(Err(error));
-                                    continue;
-                                }
-                            };
-                            resolved[index] = Some(Ok((
-                                ReplicaWriteTarget {
-                                    storage_runtime: storage_runtime.clone(),
-                                    segment_name: reservation.segment_name.clone(),
-                                },
-                                reservation,
-                            )));
-                        }
-                    }
                     Err(error) => {
-                        self.mark_runtime_suspect(
-                            &storage_runtime,
-                            "allocator_batch_reserve_specific_failed",
-                        );
+                        if should_mark_runtime_suspect_after_allocator_error(&error) {
+                            self.mark_runtime_suspect(
+                                &storage_runtime,
+                                "allocator_batch_reserve_specific_failed",
+                            );
+                        }
                         for index in group.specific_indices {
                             resolved[index] = Some(Err(error.clone()));
                         }
@@ -364,38 +276,38 @@ impl StoreClient {
                 Ok(results) => {
                     for (index, result) in indices.iter().copied().zip(results.into_iter()) {
                         if let Err(error) = result {
+                            if should_mark_runtime_suspect_after_allocator_error(&error) {
+                                self.mark_runtime_suspect(
+                                    &storage_runtime,
+                                    "allocator_batch_release_failed",
+                                );
+                            }
                             debug!(
                                 storage_runtime = %storage_runtime,
                                 segment = %requests[index].segment_name.0,
                                 offset_bytes = requests[index].offset_bytes,
                                 length_bytes = requests[index].length_bytes,
                                 error = %error,
-                                "allocator batch release rpc failed; falling back to metadata allocator"
+                                "allocator batch release rpc failed"
                             );
-                            self.metadata.release_segment(
-                                &storage_runtime,
-                                &requests[index].segment_name,
-                                requests[index].offset_bytes,
-                                requests[index].length_bytes,
-                            )?;
+                            return Err(error);
                         }
                     }
                 }
                 Err(error) => {
+                    if should_mark_runtime_suspect_after_allocator_error(&error) {
+                        self.mark_runtime_suspect(
+                            &storage_runtime,
+                            "allocator_batch_release_failed",
+                        );
+                    }
                     debug!(
                         storage_runtime = %storage_runtime,
                         error = %error,
                         items = indices.len(),
-                        "allocator batch release rpc failed; falling back to metadata allocator"
+                        "allocator batch release rpc failed"
                     );
-                    for index in indices {
-                        self.metadata.release_segment(
-                            &storage_runtime,
-                            &requests[index].segment_name,
-                            requests[index].offset_bytes,
-                            requests[index].length_bytes,
-                        )?;
-                    }
+                    return Err(error);
                 }
             }
         }

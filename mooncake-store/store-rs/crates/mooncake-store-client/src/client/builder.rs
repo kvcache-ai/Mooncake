@@ -324,7 +324,6 @@ impl StoreClientBuilder {
         let storage_owner = Arc::new(StorageOwnerState::new(
             runtime.clone(),
             provisional_lease.clone(),
-            self.metadata.clone(),
             route_directory.clone(),
             allocator.clone(),
         ));

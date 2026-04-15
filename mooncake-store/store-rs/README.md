@@ -6,7 +6,7 @@ A Rust-native Mooncake Store implementation that keeps the Mooncake store progra
 
 `mooncake-store-rs` is a complete store implementation built in Rust.
 
-It keeps the familiar Mooncake-style store API, but organizes the system around client-owned routing and peer-to-peer control-plane communication. Object data is transferred through Mooncake TE/TENT, while leases, segment state, and durable metadata stay in Redis or etcd.
+It keeps the familiar Mooncake-style store API, but organizes the system around client-owned routing and peer-to-peer control-plane communication. Object data is transferred through Mooncake TE/TENT, while leases, segment state, route policy, handoff plans, and other durable coordination state stay in Redis or etcd.
 
 The result is a store that is easier to embed into Rust systems, easier to test locally, and easier to expose to Python without adding another store implementation.
 
@@ -59,7 +59,7 @@ The implementation is easier to understand when grouped by capability instead of
 - configurable WRH authority fanout through `route_topk` with primary-plus-mirrors selection
 - optional `MetadataOnly` route mode
 - route read, replace, and compare-and-swap through the control plane
-- metadata fallback when route authorities are unavailable
+- authority reads with mirrored top-k repair inside the route-authority set
 - prewarmed membership snapshots with background lease refresh instead of request-path membership refresh
 - read fail-fast on suspect or offline owners while keeping draining owners readable during handoff
 - suspect owners stay quarantined until a fresh lease heartbeat or control-plane endpoint change proves recovery
@@ -89,7 +89,7 @@ The implementation is easier to understand when grouped by capability instead of
 - delete reclaim
 - configurable reclaim grace window
 - elastic segment expansion and retirement
-- metadata allocator fallback only for unsupported control-plane endpoints; transport failures quarantine the owner and move to the next soft candidate
+- remote allocator reserve/release through peer control-plane RPC; capacity errors stay owner-local, while transport/protocol failures quarantine the owner and let placement move on
 
 ### Lifecycle and Membership
 
@@ -170,7 +170,7 @@ The runtime separates two owner roles:
 - storage owners reclaim in the background above the high watermark and stop at the low watermark
 - readers report replica hits to storage owners in batch
 - writers push published remote routes to storage owners in batch
-- metadata remains a durable fallback, not the default hot path
+- metadata carries durable coordination state such as leases, segment state, route policy, handoff plans, and `MetadataOnly` routes
 
 For the runtime view, read `docs/architecture.md`.
 

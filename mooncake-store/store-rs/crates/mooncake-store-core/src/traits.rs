@@ -114,6 +114,16 @@ pub trait RouteDirectory: Send + Sync {
             })
             .collect())
     }
+
+    fn list_routes_by_replica_owner(
+        &self,
+        _observer: &ClientLease,
+        _owner: &ClientRuntimeId,
+    ) -> Result<Vec<ObjectRoute>> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not support list_routes_by_replica_owner".to_string(),
+        ))
+    }
 }
 
 pub trait PlacementStrategy: Send + Sync {

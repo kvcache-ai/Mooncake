@@ -7,7 +7,7 @@ This document describes the runtime architecture implemented in `mooncake-store-
 - Keep the public store programming model close to Mooncake
 - Reuse Mooncake TE/TENT for the data path
 - Avoid a dedicated master on the route hot path
-- Keep metadata backends responsible for leases, segments, and durable route persistence
+- Keep metadata backends responsible for leases, segments, route policy, handoff, and `MetadataOnly` route persistence
 - Make lifecycle changes, reclaim, and routing explicit in the client
 
 ## Component Model
@@ -18,7 +18,7 @@ This document describes the runtime architecture implemented in `mooncake-store-
 | `RouteDirectory` | Route lookup and route CAS | Yes |
 | `ControlPlaneClient` | Peer-to-peer route and allocator RPC | Yes |
 | `StorageOwnerState` | Local replica tracking, CLOCK eviction, route-aware reclaim | Yes on storage nodes |
-| `MetadataBackend` | Leases, segments, fallback route persistence | No for default route lookups |
+| `MetadataBackend` | Leases, segments, route policy, handoff, and `MetadataOnly` route persistence | No for default `EmbeddedWrh` route lookups |
 | `TentEngine` / `TentTransportFactory` | Data transfer and remote segment access | Yes |
 | `LocalAllocatorState` | Local segment reservation and release | Yes for local storage |
 
@@ -58,9 +58,9 @@ In the default route mode, the client chooses route authorities with embedded we
 - the highest-ranked authority is the CAS primary
 - the remaining `route_topk - 1` authorities are mirrored authorities
 - route reads and route CAS go to authorities over the control plane
-- metadata remains the fallback path when authorities are unavailable
+- if the mirrored set does not resolve a key, lower-ranked authorities in the same WRH ordering can still be queried
 
-This keeps object route lookups off the metadata hot path while preserving a durable fallback.
+This keeps object route lookups on the authority mesh and off the metadata hot path in normal `EmbeddedWrh` deployments.
 
 Route authority policy is bootstrap-validated through metadata:
 
@@ -77,7 +77,7 @@ This keeps route-authority fanout deterministic across the cluster instead of le
 
 | Route Mode | Route Read Path | Route Write Path | Best For |
 |------------|-----------------|------------------|----------|
-| `EmbeddedWrh` | Authority RPC first, metadata fallback | Authority CAS with mirrored top-k publication | Normal deployments |
+| `EmbeddedWrh` | Authority RPC across ranked WRH authorities | Authority CAS with mirrored top-k publication | Normal deployments |
 | `MetadataOnly` | Metadata backend | Metadata backend | Simpler debugging and bring-up |
 
 ## Membership Snapshot Model
@@ -196,7 +196,7 @@ Allocation is split by storage ownership.
 
 - local allocations use `LocalAllocatorState`
 - remote allocations use control-plane RPC to the owning client
-- metadata allocation remains the fallback only when the remote client does not expose allocator RPC; transport failures instead quarantine that owner and let placement move on
+- remote allocator capacity errors remain owner-local results; transport or protocol failures quarantine that owner and let placement move on
 
 Local memory supports two backing strategies:
 

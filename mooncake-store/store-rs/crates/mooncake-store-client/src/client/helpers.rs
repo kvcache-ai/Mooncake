@@ -78,8 +78,8 @@ fn compatibility_matches(left: &ClientLease, right: &ClientLease) -> bool {
     left.compatibility.is_compatible_with(&right.compatibility)
 }
 
-fn should_fallback_to_metadata_allocator(error: &StoreError) -> bool {
-    matches!(error, StoreError::Unsupported(_))
+fn should_mark_runtime_suspect_after_allocator_error(error: &StoreError) -> bool {
+    matches!(error, StoreError::Transport(_) | StoreError::Unsupported(_))
 }
 
 fn control_bind_host(rpc_address: &str) -> String {

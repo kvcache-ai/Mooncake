@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex};
+use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,8 @@ use super::{
 };
 use crate::{
     control_plane::{
-        control_address_label, AllocatorService, AuthorityService, ControlPlaneClient, ReleaseOp,
+        control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
+        ControlPlaneHandle, ReleaseOp,
     },
     memory::RegionAllocation,
     metrics_test_lock, render_prometheus_metrics, reset_metrics,
@@ -81,6 +82,75 @@ struct CountingMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     list_live_clients_calls: AtomicUsize,
     get_object_route_calls: AtomicUsize,
+}
+
+struct StaticAllocatorAdapter {
+    runtime: ClientRuntimeId,
+    allocator: Arc<Mutex<LocalAllocatorState>>,
+}
+
+impl AllocatorService for StaticAllocatorAdapter {
+    fn reserve_any(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+        if *owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "allocator rpc targeted runtime {} on {}",
+                owner, self.runtime
+            )));
+        }
+        self.allocator.lock().reserve_any(owner, length_bytes)
+    }
+
+    fn reserve_specific(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+        if *owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "allocator rpc targeted runtime {} on {}",
+                owner, self.runtime
+            )));
+        }
+        self.allocator
+            .lock()
+            .reserve_specific(owner, segment_name, length_bytes)
+    }
+
+    fn release(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<()> {
+        if *owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "allocator rpc targeted runtime {} on {}",
+                owner, self.runtime
+            )));
+        }
+        self.allocator
+            .lock()
+            .release(owner, segment_name, offset_bytes, length_bytes)
+    }
+}
+
+#[derive(Default)]
+struct NoopEvictionService;
+
+impl crate::control_plane::EvictionService for NoopEvictionService {
+    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> mooncake_store_core::Result<usize> {
+        Ok(keys.len())
+    }
+
+    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> mooncake_store_core::Result<usize> {
+        Ok(routes.len())
+    }
 }
 
 struct BlockingCasMetadataBackend {
@@ -998,15 +1068,14 @@ fn test_storage_owner_state(
     Arc::new(StorageOwnerState::new(
         runtime.clone(),
         lease,
-        metadata,
         route_directory,
         allocator,
     ))
 }
 
 fn publish_storage_node(
-    metadata: &InMemoryMetadataBackend,
-    transport: &TestTransport,
+    metadata: &Arc<InMemoryMetadataBackend>,
+    transport: &Arc<TestTransport>,
     stable_id: &str,
     segment_name: &str,
     pool: &str,
@@ -1015,48 +1084,42 @@ fn publish_storage_node(
 }
 
 fn publish_storage_node_with_capacity(
-    metadata: &InMemoryMetadataBackend,
-    transport: &TestTransport,
+    metadata: &Arc<InMemoryMetadataBackend>,
+    transport: &Arc<TestTransport>,
     stable_id: &str,
     segment_name: &str,
     pool: &str,
     capacity_bytes: u64,
     alignment_bytes: u64,
 ) -> ClientRuntimeId {
-    transport.add_external_segment(segment_name, capacity_bytes as usize);
-    let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(1));
-    let mut endpoints = ClientEndpointSet {
-        rpc_address: "127.0.0.1:0".to_string(),
-        segment_name: Some(SegmentName::new(segment_name)),
-        labels: Default::default(),
-    };
-    endpoints
-        .labels
-        .insert("pool".to_string(), pool.to_string());
-    endpoints
-        .labels
-        .insert("storage".to_string(), "true".to_string());
-    metadata
-        .upsert_client_lease(&ClientLease {
-            runtime: runtime.clone(),
-            state: ClientLifecycleState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            endpoints,
-            expires_at_ms: test_future_expiry_ms(),
-        })
-        .expect("storage lease should upsert");
-    metadata
-        .publish_segment(&SegmentAnnouncement {
-            owner: runtime.clone(),
-            segment_name: SegmentName::new(segment_name),
-            capacity_bytes,
-            used_bytes: 0,
-            state: SegmentLifecycleState::Active,
-            alignment_bytes,
-            tags: vec!["dram".to_string()],
-        })
-        .expect("storage segment should publish");
+    let storage_transport = Arc::new(transport.peer(segment_name));
+    let storage = Arc::new(
+        StoreClientBuilder::new(metadata.clone(), stable_id)
+            .state(ClientLifecycleState::Active)
+            .label("pool", pool)
+            .label("storage", "true")
+            .segment_name(segment_name)
+            .live_client_sync_interval(fast_live_client_sync_interval())
+            .transport(storage_transport)
+            .local_memory(storage_config_with_layout(
+                capacity_bytes as usize,
+                4096,
+                alignment_bytes as usize,
+            ))
+            .build(test_future_expiry_ms())
+            .expect("storage client build should succeed"),
+    );
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    let runtime = storage.runtime_id().clone();
+    test_storage_nodes().lock().push(storage);
     runtime
+}
+
+fn test_storage_nodes() -> &'static Mutex<Vec<Arc<StoreClient>>> {
+    static STORAGE_NODES: OnceLock<Mutex<Vec<Arc<StoreClient>>>> = OnceLock::new();
+    STORAGE_NODES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn wait_for_runtime_visibility(client: &StoreClient, runtime: &ClientRuntimeId) {
@@ -1308,8 +1371,8 @@ fn observability_metrics_render_remote_datapaths() {
     let writer_transport = Arc::new(TestTransport::new("metrics-remote-writer-segment"));
     let reader_transport = Arc::new(writer_transport.peer("metrics-remote-reader-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        writer_transport.as_ref(),
+        &metadata,
+        &writer_transport,
         "metrics-storage-remote",
         "metrics-seg-remote",
         "pool-a",
@@ -1401,8 +1464,8 @@ fn observability_metrics_render_fast_batch_put_stages() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("metrics-fast-batch-segment"));
     publish_storage_node(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "metrics-fast-storage",
         "metrics-fast-storage-seg",
         "pool-a",
@@ -1442,8 +1505,8 @@ fn observability_metrics_render_fast_batch_put_stages_for_shared_policy() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("metrics-fast-shared-policy-segment"));
     publish_storage_node(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "metrics-fast-shared-policy-storage",
         "metrics-fast-shared-policy-storage-seg",
         "pool-a",
@@ -1683,6 +1746,7 @@ fn rw_only_client_can_expand_into_primary_segment() {
     let transport = Arc::new(TestTransport::new("rw-expand-segment"));
     let client = StoreClientBuilder::new(metadata, "rw-expand")
         .state(ClientLifecycleState::Active)
+        .label("route", "true")
         .transport(transport.clone())
         .transport_factory(transport.factory())
         .local_memory(rw_only_config())
@@ -2014,8 +2078,8 @@ fn background_live_client_sync_refreshes_snapshot_without_request_refresh() {
 
     let after_build = metadata.list_live_clients_calls();
     let storage_runtime = publish_storage_node(
-        metadata.inner.as_ref(),
-        writer_transport.as_ref(),
+        &metadata.inner,
+        &writer_transport,
         "storage-background-sync",
         "storage-background-sync-seg",
         "pool-a",
@@ -2116,15 +2180,15 @@ fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("router-segment"));
     let owner_a = publish_storage_node(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-a",
         "seg-a",
         "pool-a",
     );
     let owner_b = publish_storage_node(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-b",
         "seg-b",
         "pool-a",
@@ -3409,7 +3473,7 @@ fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
 }
 
 #[test]
-fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
+fn embedded_wrh_query_route_ignores_metadata_after_authority_miss() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("repair-meta-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("repair-meta-b-segment"));
@@ -3527,34 +3591,37 @@ fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
         .expect("store-c memory should register");
     wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
 
-    let repaired_route = reader
-        .query_route("route-repair-metadata")
-        .expect("metadata repair route query should succeed")
-        .expect("metadata repair route should exist");
-    assert_eq!(repaired_route, seed_route);
-    assert_eq!(
+    assert!(
+        reader
+            .query_route("route-repair-metadata")
+            .expect("metadata route lookup should still succeed")
+            .is_none(),
+        "embedded WRH must ignore metadata-only routes after authority miss"
+    );
+    assert!(
         crate::route_directory::authority_get(
             &namespace,
             &store_b.runtime_id().stable_id,
             &scoped_key,
         )
-        .expect("store-b repaired route should be readable"),
-        Some(seed_route.clone())
+        .expect("store-b route query should succeed")
+        .is_none()
     );
-    assert_eq!(
+    assert!(
         crate::route_directory::authority_get(
             &namespace,
             &store_c.runtime_id().stable_id,
             &scoped_key,
         )
-        .expect("store-c repaired route should be readable"),
-        Some(seed_route.clone())
+        .expect("store-c route query should succeed")
+        .is_none()
     );
-    assert_eq!(
-        reader
-            .get("route-repair-metadata")
-            .expect("reader get should succeed after metadata repair"),
-        b"route-repair-metadata-payload"
+    assert!(
+        matches!(
+            reader.get("route-repair-metadata"),
+            Err(StoreError::NotFound(_))
+        ),
+        "embedded WRH get should fail closed when only metadata still has the route"
     );
 }
 
@@ -3982,8 +4049,8 @@ fn batch_get_chunks_remote_reads_when_scratch_window_is_small() {
     let writer_transport = Arc::new(TestTransport::new("writer-batch-chunk-segment"));
     let reader_transport = Arc::new(writer_transport.peer("reader-batch-chunk-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        writer_transport.as_ref(),
+        &metadata,
+        &writer_transport,
         "storage-batch-chunk",
         "seg-batch-chunk",
         "pool-a",
@@ -4041,8 +4108,8 @@ fn batch_get_into_falls_back_to_direct_when_value_exceeds_scratch() {
     let writer_transport = Arc::new(TestTransport::new("writer-batch-direct-segment"));
     let reader_transport = Arc::new(writer_transport.peer("reader-batch-direct-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        writer_transport.as_ref(),
+        &metadata,
+        &writer_transport,
         "storage-batch-direct",
         "seg-batch-direct",
         "pool-a",
@@ -4218,15 +4285,15 @@ fn replication_policy_prefers_local_before_remote_replica() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-segment"));
     let owner_a = publish_storage_node(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-a",
         "seg-a",
         "pool-a",
     );
     let owner_b = publish_storage_node(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-b",
         "seg-b",
         "pool-a",
@@ -4268,8 +4335,8 @@ fn default_put_spills_to_remote_after_local_capacity_is_exhausted() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-spill-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-spill",
         "seg-spill",
         "pool-a",
@@ -4532,15 +4599,65 @@ fn background_watermark_eviction_reclaims_without_front_path_pressure() {
 fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-prefer-segment"));
-    let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
-        "storage-prefer",
-        "seg-prefer",
-        "pool-a",
-        8,
-        1,
+    let remote_transport = Arc::new(transport.peer("seg-prefer"));
+    remote_transport.add_external_segment("seg-prefer", 8);
+    let remote_owner = ClientRuntimeId::new("storage-prefer", ClientEpoch(1));
+    let remote_allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
+    remote_allocator.lock().upsert(&SegmentAnnouncement {
+        owner: remote_owner.clone(),
+        segment_name: SegmentName::new("seg-prefer"),
+        capacity_bytes: 8,
+        used_bytes: 0,
+        state: SegmentLifecycleState::Active,
+        alignment_bytes: 1,
+        tags: vec!["dram".to_string()],
+    });
+    let remote_control = ControlPlaneHandle::spawn(
+        "127.0.0.1",
+        Arc::new(LocalAuthorityAdapter),
+        Arc::new(StaticAllocatorAdapter {
+            runtime: remote_owner.clone(),
+            allocator: remote_allocator,
+        }),
+        Arc::new(NoopEvictionService),
+    )
+    .expect("static storage control plane should spawn");
+    let mut endpoints = ClientEndpointSet {
+        rpc_address: "127.0.0.1:0".to_string(),
+        segment_name: Some(SegmentName::new("seg-prefer")),
+        labels: Default::default(),
+    };
+    endpoints.labels.insert("pool".to_string(), "pool-a".to_string());
+    endpoints
+        .labels
+        .insert("storage".to_string(), "false".to_string());
+    endpoints
+        .labels
+        .insert("route".to_string(), "false".to_string());
+    endpoints.labels.insert(
+        control_address_label().to_string(),
+        remote_control.address().to_string(),
     );
+    metadata
+        .upsert_client_lease(&ClientLease {
+            runtime: remote_owner.clone(),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints,
+            expires_at_ms: test_future_expiry_ms(),
+        })
+        .expect("static storage lease should upsert");
+    metadata
+        .publish_segment(&SegmentAnnouncement {
+            owner: remote_owner.clone(),
+            segment_name: SegmentName::new("seg-prefer"),
+            capacity_bytes: 8,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 1,
+            tags: vec!["dram".to_string()],
+        })
+        .expect("static storage segment should publish");
     let client = StoreClientBuilder::new(metadata, "writer-prefer")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
@@ -4574,6 +4691,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
             .expect("fallback get should succeed"),
         b"ijklmnop"
     );
+    drop(remote_control);
 }
 
 #[test]
@@ -4581,8 +4699,8 @@ fn routed_batch_put_prefers_local_before_spilling_remote() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("router-local-first-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-batch",
         "seg-batch",
         "pool-a",
@@ -4629,8 +4747,8 @@ fn routed_batch_put_ignores_local_segments_when_storage_role_is_disabled() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("router-local-disabled-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-batch-disabled",
         "seg-batch-disabled",
         "pool-a",
@@ -4677,8 +4795,8 @@ fn request_replication_policy_honors_preferred_segment() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-segment"));
     let owner_b = publish_storage_node(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-b",
         "seg-b",
         "pool-a",
