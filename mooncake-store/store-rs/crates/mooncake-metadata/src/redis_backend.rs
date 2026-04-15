@@ -206,8 +206,10 @@ return {1, used}
 
 const REDIS_CONNECT_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS";
 const REDIS_IO_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_IO_TIMEOUT_MS";
+const REDIS_AUTH_PROBE_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_AUTH_PROBE_TIMEOUT_MS";
 const DEFAULT_REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_REDIS_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_REDIS_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const READONLY_METADATA_RETRY_ATTEMPTS: usize = 3;
 const READONLY_METADATA_RETRY_DELAY: Duration = Duration::from_millis(25);
 
@@ -247,6 +249,16 @@ impl ResolvedRedisAuth {
         self.username = std::env::var("MC_REDIS_USERNAME")
             .ok()
             .filter(|value| !value.is_empty());
+        self
+    }
+
+    fn normalize_for_endpoint(self, url: &str) -> Self {
+        let Some(legacy_auth) = self.password_only_fallback() else {
+            return self;
+        };
+        if redis_accepts_auth(url, &legacy_auth) {
+            return legacy_auth;
+        }
         self
     }
 
@@ -524,7 +536,8 @@ fn redis_connection_info(url: &str) -> Result<ConnectionInfo> {
 }
 
 fn legacy_auth_connection_info(info: &ConnectionInfo) -> Option<ConnectionInfo> {
-    let legacy_auth = ResolvedRedisAuth::from_connection_info(&info.redis).password_only_fallback()?;
+    let legacy_auth =
+        ResolvedRedisAuth::from_connection_info(&info.redis).password_only_fallback()?;
     let mut legacy = info.clone();
     legacy_auth.apply_to_connection_info(&mut legacy.redis);
     Some(legacy)
@@ -535,7 +548,22 @@ pub fn resolve_redis_auth(url: &str) -> Result<ResolvedRedisAuth> {
         .to_string()
         .into_connection_info()
         .map_err(|error| metadata_error("redis auth resolution", error))?;
-    Ok(ResolvedRedisAuth::from_connection_info(&info.redis).with_env_fallback())
+    Ok(ResolvedRedisAuth::from_connection_info(&info.redis)
+        .with_env_fallback()
+        .normalize_for_endpoint(url))
+}
+
+fn redis_accepts_auth(url: &str, auth: &ResolvedRedisAuth) -> bool {
+    let Ok(mut info) = url.to_string().into_connection_info() else {
+        return false;
+    };
+    auth.apply_to_connection_info(&mut info.redis);
+    let Ok(client) = redis::Client::open(info) else {
+        return false;
+    };
+    client
+        .get_connection_with_timeout(redis_auth_probe_timeout())
+        .is_ok()
 }
 
 fn redacted_route_namespace_source(url: &str) -> String {
@@ -555,6 +583,13 @@ fn redis_connect_timeout() -> Duration {
 
 fn redis_io_timeout() -> Duration {
     duration_from_env_ms(REDIS_IO_TIMEOUT_ENV, DEFAULT_REDIS_IO_TIMEOUT)
+}
+
+fn redis_auth_probe_timeout() -> Duration {
+    duration_from_env_ms(
+        REDIS_AUTH_PROBE_TIMEOUT_ENV,
+        DEFAULT_REDIS_AUTH_PROBE_TIMEOUT,
+    )
 }
 
 fn duration_from_env_ms(name: &str, default: Duration) -> Duration {
@@ -1014,10 +1049,12 @@ mod tests {
 
     use super::{
         is_legacy_redis_auth_arity_error, legacy_auth_connection_info,
-        redacted_route_namespace_source, redis_connect_timeout, redis_connection_info,
-        redis_io_timeout, should_retry_readonly_redis_error, MetadataKeyspace,
-        RedisMetadataBackend, RedisMetadataConfig, DEFAULT_REDIS_CONNECT_TIMEOUT,
-        DEFAULT_REDIS_IO_TIMEOUT, REDIS_CONNECT_TIMEOUT_ENV, REDIS_IO_TIMEOUT_ENV,
+        redacted_route_namespace_source, redis_auth_probe_timeout, redis_connect_timeout,
+        redis_connection_info, redis_io_timeout, resolve_redis_auth,
+        should_retry_readonly_redis_error, MetadataKeyspace, RedisMetadataBackend,
+        RedisMetadataConfig, DEFAULT_REDIS_AUTH_PROBE_TIMEOUT, DEFAULT_REDIS_CONNECT_TIMEOUT,
+        DEFAULT_REDIS_IO_TIMEOUT, REDIS_AUTH_PROBE_TIMEOUT_ENV, REDIS_CONNECT_TIMEOUT_ENV,
+        REDIS_IO_TIMEOUT_ENV,
     };
 
     struct RedisTestServer {
@@ -1028,13 +1065,18 @@ mod tests {
 
     impl RedisTestServer {
         fn start() -> Option<Self> {
+            Self::start_with_password(None)
+        }
+
+        fn start_with_password(password: Option<&str>) -> Option<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").ok()?;
             let port = listener.local_addr().ok()?.port();
             drop(listener);
 
             let dir = std::env::temp_dir().join(format!("mooncake-store-rs-redis-{port}"));
             let _ = std::fs::create_dir_all(&dir);
-            let child = Command::new("redis-server")
+            let mut command = Command::new("redis-server");
+            command
                 .arg("--save")
                 .arg("")
                 .arg("--appendonly")
@@ -1046,11 +1088,16 @@ mod tests {
                 .arg("--dir")
                 .arg(&dir)
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
+                .stderr(Stdio::null());
+            if let Some(password) = password {
+                command.arg("--requirepass").arg(password);
+            }
+            let child = command.spawn().ok()?;
 
-            let url = format!("redis://127.0.0.1:{port}/0");
+            let url = match password {
+                Some(password) => format!("redis://:{password}@127.0.0.1:{port}/0"),
+                None => format!("redis://127.0.0.1:{port}/0"),
+            };
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline {
                 if redis::Client::open(url.as_str())
@@ -1506,6 +1553,25 @@ mod tests {
     }
 
     #[test]
+    fn redis_auth_normalization_strips_username_when_password_auth_works() {
+        let _guard = env_lock();
+        let Some(server) = RedisTestServer::start_with_password(Some("legacy-pass")) else {
+            return;
+        };
+        let url = server
+            .url()
+            .replacen("redis://:", "redis://legacy-user:", 1);
+
+        let auth = resolve_redis_auth(&url).expect("redis auth should resolve");
+        assert_eq!(auth.username, None);
+        assert_eq!(auth.password.as_deref(), Some("legacy-pass"));
+
+        let info = redis_connection_info(&url).expect("redis connection info should parse");
+        assert_eq!(info.redis.username, None);
+        assert_eq!(info.redis.password.as_deref(), Some("legacy-pass"));
+    }
+
+    #[test]
     fn legacy_auth_message_matcher_accepts_auth_arity_errors() {
         assert!(is_legacy_redis_auth_arity_error(
             "redis get_connection: An error was signalled by the server - ERR wrong number of arguments for 'auth' command"
@@ -1523,14 +1589,18 @@ mod tests {
         let _guard = env_lock();
         std::env::set_var(REDIS_CONNECT_TIMEOUT_ENV, "7000");
         std::env::set_var(REDIS_IO_TIMEOUT_ENV, "11000");
+        std::env::set_var(REDIS_AUTH_PROBE_TIMEOUT_ENV, "900");
 
         assert_eq!(redis_connect_timeout(), Duration::from_secs(7));
         assert_eq!(redis_io_timeout(), Duration::from_secs(11));
+        assert_eq!(redis_auth_probe_timeout(), Duration::from_millis(900));
 
         std::env::remove_var(REDIS_CONNECT_TIMEOUT_ENV);
         std::env::remove_var(REDIS_IO_TIMEOUT_ENV);
+        std::env::remove_var(REDIS_AUTH_PROBE_TIMEOUT_ENV);
         assert_eq!(redis_connect_timeout(), DEFAULT_REDIS_CONNECT_TIMEOUT);
         assert_eq!(redis_io_timeout(), DEFAULT_REDIS_IO_TIMEOUT);
+        assert_eq!(redis_auth_probe_timeout(), DEFAULT_REDIS_AUTH_PROBE_TIMEOUT);
     }
 
     #[test]
