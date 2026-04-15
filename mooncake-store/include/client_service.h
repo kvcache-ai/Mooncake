@@ -24,6 +24,7 @@
 #include "master_metric_manager.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
+#include "pinned_buffer_pool.h"
 
 namespace mooncake {
 
@@ -660,6 +661,9 @@ class Client {
     const std::string protocol_;
 
     // Client persistent thread pool for async operations
+    // Pinned host memory pool for GPU D2H staging (must outlive
+    // write_thread_pool_)
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
 
