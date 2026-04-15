@@ -496,6 +496,9 @@ impl EmbeddedWrhRouteDirectory {
         resolved: &mut [Option<ObjectRoute>],
     ) -> Result<()> {
         for (index, key) in keys.iter().enumerate() {
+            if resolved[index].is_some() {
+                continue;
+            }
             match self.metadata.get_object_route(key) {
                 Ok(Some(route)) => {
                     debug!(
