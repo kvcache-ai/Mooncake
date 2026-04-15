@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <iostream>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -63,7 +64,7 @@ struct RdmaSlice {
     int source_dev_id = -1;
     int target_dev_id = -1;
 
-    RdmaEndPoint* ep_weak_ptr = nullptr;
+    std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
     TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
     int retry_count = 0;

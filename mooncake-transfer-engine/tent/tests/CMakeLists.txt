@@ -43,3 +43,7 @@ target_link_libraries(tent_failover_test PRIVATE tent gtest gtest_main)
 target_include_directories(tent_failover_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_failover_test COMMAND tent_failover_test)
+
+add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
+target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main)
+add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
