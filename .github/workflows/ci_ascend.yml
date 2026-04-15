@@ -28,21 +28,35 @@ jobs:
         - /etc/hccn.conf:/etc/hccn.conf
 
     steps:
-    - name: Configure GitHub fetch fallback
+    - name: Configure GitHub fetch defaults
       shell: bash
-      env:
-        ASCEND_GITHUB_MIRROR_URLS: ${{ vars.ASCEND_GITHUB_MIRROR_URLS }}
       run: |
-        set -euo pipefail
-
         git config --global protocol.version 2
         git config --global http.version HTTP/1.1
         git config --global http.lowSpeedLimit 1024
         git config --global http.lowSpeedTime 30
 
+    - name: Checkout code
+      id: checkout_code
+      continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Retry checkout via GitHub mirror
+      if: steps.checkout_code.outcome == 'failure'
+      shell: bash
+      env:
+        ASCEND_GITHUB_MIRROR_URLS: ${{ vars.ASCEND_GITHUB_MIRROR_URLS }}
+        CHECKOUT_REF: ${{ inputs.checkout_ref || github.sha }}
+      run: |
+        set -euo pipefail
+
         if [ -z "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
-          echo "ASCEND_GITHUB_MIRROR_URLS is not set, using direct GitHub"
-          exit 0
+          echo "Checkout from GitHub failed and ASCEND_GITHUB_MIRROR_URLS is not set"
+          exit 1
         fi
 
         normalize_base() {
@@ -58,39 +72,39 @@ jobs:
         candidates=()
         while IFS= read -r raw; do
           base="$(normalize_base "$raw" || true)"
-          [ -n "$base" ] && candidates+=("$base")
+          [ -n "$base" ] || continue
+          [ "$base" = "https://github.com/" ] && continue
+          candidates+=("$base")
         done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
-        candidates+=("https://github.com/")
+
+        if [ ${#candidates[@]} -eq 0 ]; then
+          echo "Checkout from GitHub failed and no valid mirror candidates were configured"
+          exit 1
+        fi
+
+        workdir="${GITHUB_WORKSPACE}"
+        git config --global --add safe.directory "$workdir"
 
         for base in "${candidates[@]}"; do
-          if [ "$base" = "https://github.com/" ]; then
-            test_url="https://github.com/${GITHUB_REPOSITORY}.git"
-          else
-            test_url="${base}https://github.com/${GITHUB_REPOSITORY}.git"
-          fi
+          mirror_url="${base}https://github.com/${GITHUB_REPOSITORY}.git"
+          echo "Retrying checkout with ${mirror_url}"
 
-          echo "Probing ${test_url}"
-          if git ls-remote --exit-code "$test_url" HEAD >/dev/null 2>&1; then
-            if [ "$base" = "https://github.com/" ]; then
-              echo "Using direct GitHub"
-            else
-              git config --global url."${base}https://github.com/".insteadOf https://github.com/
-              echo "Using GitHub mirror prefix: ${base}"
-            fi
+          find "$workdir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          git init "$workdir"
+          git -C "$workdir" remote add origin "$mirror_url"
+
+          if git -C "$workdir" fetch --depth=1 origin "$CHECKOUT_REF" && \
+             git -C "$workdir" checkout --force --detach FETCH_HEAD; then
+            echo "Mirror checkout succeeded via ${base}"
             exit 0
           fi
 
-          echo "Probe failed for ${base}, trying next candidate"
+          echo "Mirror checkout failed via ${base}"
+          rm -rf "$workdir/.git"
         done
 
-        echo "No reachable GitHub mirror found, using direct GitHub"
-
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ inputs.checkout_ref || github.sha }}
-        fetch-depth: 1
-        persist-credentials: false
+        echo "Direct GitHub checkout failed and all mirror retries failed"
+        exit 1
 
     - name: Configure CMake
       shell: bash
