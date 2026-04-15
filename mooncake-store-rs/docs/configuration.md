@@ -99,7 +99,7 @@ Notes:
 
 | Mode | Default | Behavior |
 |------|---------|----------|
-| `RouteControlMode::EmbeddedWrh` | yes | client-side route authority selection with metadata fallback and a prewarmed background-refreshed membership snapshot |
+| `RouteControlMode::EmbeddedWrh` | yes | client-side route authority selection with mirrored top-k publication, ranked authority reads, and a prewarmed background-refreshed membership snapshot |
 | `RouteControlMode::MetadataOnly` | no | route reads and writes go directly to metadata |
 
 Use `MetadataOnly` for bring-up and debugging. Use `EmbeddedWrh` for normal deployments.

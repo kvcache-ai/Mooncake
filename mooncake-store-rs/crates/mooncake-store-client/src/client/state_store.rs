@@ -179,14 +179,12 @@ impl StorageOwnerState {
     fn new(
         runtime: ClientRuntimeId,
         observer: ClientLease,
-        metadata: Arc<dyn MetadataBackend>,
         route_directory: Arc<dyn RouteDirectory>,
         allocator: Arc<Mutex<LocalAllocatorState>>,
     ) -> Self {
         Self {
             runtime,
             observer,
-            metadata,
             route_directory,
             allocator,
             clock: Mutex::new(StorageClockState::default()),
@@ -425,23 +423,10 @@ impl StorageOwnerState {
     }
 
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
-        let mut routes = BTreeMap::new();
-        for route in self.metadata.list_object_routes()? {
-            if route.replicas.iter().any(|replica| replica.owner == *owner) {
-                Self::insert_latest_route(&mut routes, route);
-            }
-        }
-        Ok(routes.into_values().collect())
+        self.route_directory
+            .list_routes_by_replica_owner(&self.observer, owner)
     }
 
-    fn insert_latest_route(routes: &mut BTreeMap<String, ObjectRoute>, route: ObjectRoute) {
-        match routes.get(&route.key.0) {
-            Some(current) if current.version >= route.version => {}
-            _ => {
-                routes.insert(route.key.0.clone(), route);
-            }
-        }
-    }
 }
 
 impl StorageClockState {

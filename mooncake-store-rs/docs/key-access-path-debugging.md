@@ -68,7 +68,7 @@ KEY='YOUR_KEY'
 TENANT='default'
 
 grep -E \
-  "key=\"${KEY}\"|key=${KEY}|${TENANT}::${KEY}|route authority returned object route|metadata returned object route|resolved object routes|writing reserved replicas|batch get completed|remote direct|get fallback|route .*failed|marked route authority" \
+  "key=\"${KEY}\"|key=${KEY}|${TENANT}::${KEY}|route authority returned object route|resolved object routes|writing reserved replicas|batch get completed|remote direct|get fallback|route .*failed|marked route authority" \
   sglang.log
 ```
 
@@ -261,7 +261,7 @@ Failure paths do log the route authority. Example:
 ```text
 control stream batch_get_routes failed; falling back to unary batch rpc authority=py-store-xxx items=1 error=...
 marked route authority as suspect after request failure runtime=py-store-xxx:1 context="route_batch_read_transport_failed"
-mirrored authority route batch read failed; trying other authorities or metadata runtime=py-store-xxx:1 ...
+authority route batch read failed; trying mirrored authorities runtime=py-store-xxx:1 ...
 ```
 
 These logs tell you which route authority was tried and why the request fell
@@ -283,12 +283,6 @@ Important fields:
   primary/mirror path.
 - `route_version` and `replica_count` describe the route returned by that
   authority.
-
-If metadata repair or fallback returns the route, you may also see:
-
-```text
-metadata returned object route namespace=... key=default::YOUR_KEY source=metadata route_version=1 replica_count=1
-```
 
 ## Metrics for Correlation
 

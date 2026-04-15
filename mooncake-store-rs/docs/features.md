@@ -60,7 +60,7 @@ What it provides:
 - primary and secondary route authorities
 - authority reads and compare-and-swap through the control plane
 - replica removal through route-owner compare-and-swap
-- metadata fallback when authority RPC is unavailable
+- mirrored-authority publication plus ranked authority reads for repair and convergence
 
 ### Metadata-only routing
 
@@ -116,17 +116,13 @@ Remote storage owners apply the same reserve loop as local storage owners:
 - if the failure is capacity-related, trigger storage-owner eviction and retry
 - return an allocator error when capacity still cannot be recovered
 
-### Metadata fallback
+### Remote allocator semantics
 
-Allocator fallback is intentionally narrow.
+Allocator ownership stays with the storage owner.
 
-The client falls back to metadata-backed allocation only when allocator RPC fails with:
-
-- unsupported control-plane endpoints
-
-Transport failures quarantine the remote storage owner and let routed placement skip to the next soft candidate instead of reviving the failed owner through metadata allocation.
-
-Allocator failures returned by a live remote storage owner are treated as real capacity errors and are not silently downgraded to metadata allocation.
+- reserve and release go through allocator RPC on the owning client
+- capacity failures returned by a live storage owner remain capacity failures
+- transport or protocol failures quarantine the remote storage owner and let routed placement skip to the next soft candidate
 
 ## Storage-Owner Eviction
 

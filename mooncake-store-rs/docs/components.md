@@ -7,7 +7,7 @@ This document explains the repository by module and by runtime role.
 | Layer | Main Crates | Responsibility |
 |------|-------------|----------------|
 | Store model | `mooncake-store-core` | Shared types, traits, lifecycle, and route model |
-| Metadata | `mooncake-metadata` | Persistent leases, segments, and route fallback state |
+| Metadata | `mooncake-metadata` | Persistent leases, segments, route policy, handoff, and `MetadataOnly` route state |
 | Runtime | `mooncake-store-client` | User-facing API and all runtime decisions |
 | Transport binding | `mooncake-transport-sys`, `mooncake-transport` | Native TE/TENT linkage and Rust wrappers |
 | Compatibility | `mooncake-store-py` | Python binding and compatibility API |
@@ -54,7 +54,8 @@ Main responsibilities:
 - live client lease storage
 - segment announcement storage
 - segment lifecycle updates
-- route persistence for fallback and metadata-only mode
+- route policy and handoff storage
+- route storage for `MetadataOnly` mode
 
 ## Client Runtime
 

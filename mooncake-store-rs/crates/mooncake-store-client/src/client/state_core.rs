@@ -178,7 +178,6 @@ struct StoreState {
 struct StorageOwnerState {
     runtime: ClientRuntimeId,
     observer: ClientLease,
-    metadata: Arc<dyn MetadataBackend>,
     route_directory: Arc<dyn RouteDirectory>,
     allocator: Arc<Mutex<LocalAllocatorState>>,
     clock: Mutex<StorageClockState>,

@@ -472,49 +472,6 @@ impl StoreClient {
             }))
     }
 
-    fn reserve_segment_allocation_via_metadata(
-        &self,
-        owner: &ClientRuntimeId,
-        segment_name: Option<&SegmentName>,
-        length_bytes: u64,
-    ) -> Result<mooncake_store_core::SegmentReservation> {
-        match segment_name {
-            Some(segment_name) => self
-                .metadata
-                .reserve_segment(owner, segment_name, length_bytes),
-            None => {
-                let mut segments = self.metadata.list_segments(Some(owner))?;
-                segments.retain(|segment| segment.state == SegmentLifecycleState::Active);
-                segments.sort_by(|left, right| {
-                    let left_remaining = left.capacity_bytes.saturating_sub(left.used_bytes);
-                    let right_remaining = right.capacity_bytes.saturating_sub(right.used_bytes);
-                    right_remaining
-                        .cmp(&left_remaining)
-                        .then_with(|| left.segment_name.cmp(&right.segment_name))
-                });
-                let mut last_capacity_error = None;
-                for segment in segments {
-                    match self
-                        .metadata
-                        .reserve_segment(owner, &segment.segment_name, length_bytes)
-                    {
-                        Ok(reservation) => return Ok(reservation),
-                        Err(StoreError::Allocator(message)) => {
-                            last_capacity_error = Some(StoreError::Allocator(message));
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(last_capacity_error.unwrap_or_else(|| {
-                    StoreError::Allocator(format!(
-                        "no writable active segment available for {}",
-                        owner
-                    ))
-                }))
-            }
-        }
-    }
-
     fn reserve_segment_allocation(
         &self,
         owner: &ClientRuntimeId,
@@ -593,17 +550,10 @@ impl StoreClient {
         };
         match rpc_result {
             Ok(reservation) => Ok(reservation),
-            Err(error) if should_fallback_to_metadata_allocator(&error) => {
-                debug!(
-                    owner = %owner,
-                    segment = segment_name.map(|segment| segment.0.as_str()).unwrap_or("*"),
-                    error = %error,
-                    "allocator rpc failed; falling back to metadata allocator"
-                );
-                self.reserve_segment_allocation_via_metadata(owner, segment_name, length_bytes)
-            }
             Err(error) => {
-                self.mark_runtime_suspect(owner, "allocator_rpc_failed");
+                if should_mark_runtime_suspect_after_allocator_error(&error) {
+                    self.mark_runtime_suspect(owner, "allocator_rpc_failed");
+                }
                 Err(error)
             }
         }

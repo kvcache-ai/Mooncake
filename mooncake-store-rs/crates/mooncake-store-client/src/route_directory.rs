@@ -72,6 +72,19 @@ impl RouteDirectory for MetadataRouteDirectory {
         }
         result
     }
+
+    fn list_routes_by_replica_owner(
+        &self,
+        _observer: &ClientLease,
+        owner: &ClientRuntimeId,
+    ) -> Result<Vec<ObjectRoute>> {
+        Ok(self
+            .metadata
+            .list_object_routes()?
+            .into_iter()
+            .filter(|route| route.replicas.iter().any(|replica| replica.owner == *owner))
+            .collect())
+    }
 }
 
 struct EmbeddedWrhRouteDirectory {
@@ -357,6 +370,26 @@ impl EmbeddedWrhRouteDirectory {
             .is_local(&authority.runtime.stable_id)
     }
 
+    fn list_routes_by_replica_owner_from_authority(
+        &self,
+        authority: &ClientLease,
+        owner: &ClientRuntimeId,
+    ) -> Result<Vec<ObjectRoute>> {
+        if self.authority_is_local(authority) {
+            return authority_list_routes_by_replica_owner(
+                &self.namespace,
+                &authority.runtime.stable_id,
+                owner,
+            );
+        }
+        self.control_plane.list_routes_by_replica_owner(
+            authority,
+            &self.namespace,
+            &authority.runtime.stable_id,
+            owner,
+        )
+    }
+
     fn read_ranked_authorities(
         &self,
         keys: &[ObjectKey],
@@ -490,33 +523,34 @@ impl EmbeddedWrhRouteDirectory {
         }
     }
 
-    fn merge_metadata_routes(
-        &self,
-        keys: &[ObjectKey],
-        resolved: &mut [Option<ObjectRoute>],
-    ) -> Result<()> {
-        for (index, key) in keys.iter().enumerate() {
-            if resolved[index].is_some() {
-                continue;
+    fn merge_route_listing(
+        routes: &mut BTreeMap<String, ObjectRoute>,
+        candidate: ObjectRoute,
+        authority: &str,
+    ) {
+        match routes.get(&candidate.key.0) {
+            None => {
+                routes.insert(candidate.key.0.clone(), candidate);
             }
-            match self.metadata.get_object_route(key) {
-                Ok(Some(route)) => {
-                    debug!(
-                        namespace = %self.namespace,
-                        key = %key.0,
-                        source = "metadata",
-                        route_version = route.version.0,
-                        replica_count = route.replicas.len(),
-                        "metadata returned object route"
-                    );
-                    Self::merge_fresher_route(&mut resolved[index], route, "metadata", key);
+            Some(current) if candidate.version > current.version => {
+                routes.insert(candidate.key.0.clone(), candidate);
+            }
+            Some(current) if candidate.version == current.version && *current != candidate => {
+                let choose_candidate =
+                    canonical_route_key(&candidate) < canonical_route_key(current);
+                if choose_candidate {
+                    routes.insert(candidate.key.0.clone(), candidate.clone());
                 }
-                Ok(None) => {}
-                Err(StoreError::Unsupported(_)) => {}
-                Err(error) => return Err(error),
+                warn!(
+                    key = %candidate.key.0,
+                    authority,
+                    version = candidate.version.0,
+                    canonical = if choose_candidate { "candidate" } else { "existing" },
+                    "route authorities disagree on the same route version; choosing canonical route"
+                );
             }
+            Some(_) => {}
         }
-        Ok(())
     }
 
     fn set_repair_observation(
@@ -677,9 +711,9 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 &mut resolved,
                 Some(repairs.as_mut_slice()),
                 if rank == 0 {
-                    "authority route batch read failed; trying mirrored authorities or metadata"
+                    "authority route batch read failed; trying mirrored authorities"
                 } else {
-                    "mirrored authority route batch read failed; trying other authorities or metadata"
+                    "mirrored authority route batch read failed; trying other authorities"
                 },
             )?;
         }
@@ -691,12 +725,10 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             rank,
             &mut resolved,
             None,
-            "fallback authority route batch read failed; trying other authorities or metadata",
+            "fallback authority route batch read failed; trying other authorities",
         )? {
             rank = rank.saturating_add(1);
         }
-
-        self.merge_metadata_routes(keys, &mut resolved)?;
 
         self.backfill_missing_authorities(keys, &selections, &resolved, &repairs);
         Ok(resolved)
@@ -737,89 +769,112 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         let mut resolved = std::iter::repeat_with(|| None)
             .take(requests.len())
             .collect::<Vec<_>>();
-        let mut primary_groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
-        for (index, selection) in selections.iter().enumerate() {
-            let Some(primary) = selection.authorities.first().cloned() else {
-                continue;
-            };
-            primary_groups
-                .entry(primary.runtime.stable_id.0.clone())
-                .or_insert_with(|| (primary, Vec::new()))
-                .1
-                .push(index);
-        }
+        let mut resolved_authorities = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<Option<ClientLease>>>();
+        let mut last_errors = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<Option<StoreError>>>();
 
-        for (_, (authority, indices)) in primary_groups {
-            let batch_requests = indices
-                .iter()
-                .map(|index| requests[*index].clone())
-                .collect::<Vec<_>>();
-            if self.authority_is_local(&authority) {
-                match self.cas_local_batch(&authority.runtime.stable_id, &batch_requests) {
+        for rank in 0..self.route_topk {
+            let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
+            for (index, selection) in selections.iter().enumerate() {
+                if resolved[index].is_some() {
+                    continue;
+                }
+                let Some(authority) = selection.authorities.get(rank).cloned() else {
+                    continue;
+                };
+                groups
+                    .entry(authority.runtime.stable_id.0.clone())
+                    .or_insert_with(|| (authority, Vec::new()))
+                    .1
+                    .push(index);
+            }
+
+            for (_, (authority, indices)) in groups {
+                let batch_requests = indices
+                    .iter()
+                    .map(|index| requests[*index].clone())
+                    .collect::<Vec<_>>();
+                if self.authority_is_local(&authority) {
+                    match self.cas_local_batch(&authority.runtime.stable_id, &batch_requests) {
+                        Ok(results) => {
+                            for (index, result) in indices.into_iter().zip(results.into_iter()) {
+                                resolved[index] = Some(Ok(result));
+                                resolved_authorities[index] = Some(authority.clone());
+                            }
+                        }
+                        Err(error) => {
+                            self.maybe_mark_authority_suspect(
+                                &authority,
+                                &error,
+                                "route_batch_cas_local_failed",
+                            );
+                            warn!(
+                                runtime = %authority.runtime,
+                                error = %error,
+                                items = batch_requests.len(),
+                                "authority route batch cas failed; trying next mirrored authority"
+                            );
+                            for index in indices {
+                                last_errors[index] = Some(error.clone());
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                match self.control_plane.batch_compare_and_swap_routes(
+                    &authority,
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    &batch_requests,
+                ) {
                     Ok(results) => {
-                        for (index, result) in indices.into_iter().zip(results.into_iter()) {
-                            resolved[index] = Some(Ok(result));
+                        for ((index, request), result) in indices
+                            .into_iter()
+                            .zip(batch_requests.into_iter())
+                            .zip(results.into_iter())
+                        {
+                            match result {
+                                Ok(result) => {
+                                    resolved[index] = Some(Ok(result));
+                                    resolved_authorities[index] = Some(authority.clone());
+                                }
+                                Err(error) => {
+                                    self.maybe_mark_authority_suspect(
+                                        &authority,
+                                        &error,
+                                        "route_batch_cas_failed",
+                                    );
+                                    warn!(
+                                        runtime = %authority.runtime,
+                                        key = %request.key.0,
+                                        error = %error,
+                                        "authority route cas failed; trying next mirrored authority"
+                                    );
+                                    last_errors[index] = Some(error);
+                                }
+                            }
                         }
                     }
                     Err(error) => {
                         self.maybe_mark_authority_suspect(
                             &authority,
                             &error,
-                            "route_batch_cas_local_failed",
+                            "route_batch_cas_transport_failed",
                         );
                         warn!(
                             runtime = %authority.runtime,
                             error = %error,
                             items = batch_requests.len(),
-                            "authority route batch cas failed; falling back to metadata"
+                            "authority route batch cas failed; trying next mirrored authority"
                         );
-                    }
-                }
-                continue;
-            }
-
-            match self.control_plane.batch_compare_and_swap_routes(
-                &authority,
-                &self.namespace,
-                &authority.runtime.stable_id,
-                &batch_requests,
-            ) {
-                Ok(results) => {
-                    for ((index, request), result) in indices
-                        .into_iter()
-                        .zip(batch_requests.into_iter())
-                        .zip(results.into_iter())
-                    {
-                        match result {
-                            Ok(result) => resolved[index] = Some(Ok(result)),
-                            Err(error) => {
-                                self.maybe_mark_authority_suspect(
-                                    &authority,
-                                    &error,
-                                    "route_batch_cas_failed",
-                                );
-                                warn!(
-                                    runtime = %authority.runtime,
-                                    key = %request.key.0,
-                                    error = %error,
-                                    "authority route cas failed; falling back to metadata"
-                                );
-                            }
+                        for index in indices {
+                            last_errors[index] = Some(error.clone());
                         }
                     }
-                }
-                Err(error) => {
-                    self.maybe_mark_authority_suspect(
-                        &authority,
-                        &error,
-                        "route_batch_cas_transport_failed",
-                    );
-                    warn!(
-                        runtime = %authority.runtime,
-                        error = %error,
-                        items = batch_requests.len(),
-                        "authority route batch cas failed; falling back to metadata"
-                    );
                 }
             }
         }
@@ -829,16 +884,17 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         for (index, request) in requests.iter().enumerate() {
             let result = match resolved[index].take() {
                 Some(result) => result,
-                None => self.metadata.compare_and_swap_object_route(
-                    &request.key,
-                    request.expected,
-                    request.next.as_ref(),
-                ),
+                None => Err(last_errors[index].take().unwrap_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "no reachable mirrored route authority for {}",
+                        request.key.0
+                    ))
+                })),
             };
             if result.as_ref().ok().is_some_and(|cas| cas.applied) {
-                if let Some(primary) = selections[index].authorities.first() {
-                    for secondary in selections[index].authorities.iter().skip(1) {
-                        if secondary.runtime.stable_id == primary.runtime.stable_id {
+                if let Some(served) = resolved_authorities[index].as_ref() {
+                    for secondary in &selections[index].authorities {
+                        if secondary.runtime.stable_id == served.runtime.stable_id {
                             continue;
                         }
                         mirrors
@@ -863,6 +919,52 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             self.mirror_secondary_batch(&secondary, &requests);
         }
         Ok(results)
+    }
+
+    fn list_routes_by_replica_owner(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+    ) -> Result<Vec<ObjectRoute>> {
+        let mut routes = BTreeMap::<String, ObjectRoute>::new();
+        let mut attempted = 0usize;
+        let mut successful_queries = 0usize;
+        let mut last_error = None;
+        for authority in self.authority_candidates(observer)? {
+            attempted = attempted.saturating_add(1);
+            match self.list_routes_by_replica_owner_from_authority(&authority, owner) {
+                Ok(found) => {
+                    successful_queries = successful_queries.saturating_add(1);
+                    for route in found {
+                        Self::merge_route_listing(
+                            &mut routes,
+                            route,
+                            &authority.runtime.to_string(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_list_by_replica_owner_failed",
+                    );
+                    warn!(
+                        authority = %authority.runtime,
+                        owner = %owner,
+                        error = %error,
+                        "route-owner listing failed on authority"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        if successful_queries == 0 && attempted > 0 {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+        Ok(routes.into_values().collect())
     }
 }
 
@@ -1765,7 +1867,7 @@ mod tests {
         )
         .expect("route directory test should prewarm membership");
         let directory = EmbeddedWrhRouteDirectory::new(
-            1,
+            2,
             metadata.clone(),
             &observer,
             control,
@@ -1794,12 +1896,19 @@ mod tests {
         };
         let results = directory
             .compare_and_swap_object_routes(&observer, std::slice::from_ref(&request))
-            .expect("first cas should succeed via fallback after quarantining dead authority");
+            .expect("first cas should succeed via mirrored authority after quarantining dead authority");
         assert!(
             results[0]
                 .as_ref()
                 .expect("cas reply should decode")
                 .applied
+        );
+        assert!(
+            metadata
+                .get_object_route(&key)
+                .expect("metadata query should succeed")
+                .is_none(),
+            "embedded WRH CAS must not spill route state into metadata"
         );
 
         let filtered = directory
@@ -1938,6 +2047,75 @@ mod tests {
         route_mesh(&namespace)
             .lock()
             .unregister_local(&live_authority.runtime.stable_id);
+    }
+
+    #[test]
+    fn embedded_directory_lists_owner_routes_from_authorities_only() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-owner-scan", 1, false, Some("scope-a"));
+        let authority_a = lease("authority-owner-a", 1, true, Some("scope-a"));
+        let authority_b = lease("authority-owner-b", 2, true, Some("scope-a"));
+        for lease in [observer.clone(), authority_a.clone(), authority_b.clone()] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_owner_scan_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &observer,
+            control,
+            live_client_cache,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::SuspectRuntimeCache::default(),
+            )),
+        );
+        let namespace = metadata.route_namespace();
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&authority_a.runtime.stable_id);
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&authority_b.runtime.stable_id);
+
+        let key = ObjectKey::new("tenant-a::owner-only-route");
+        let authority_route = route_for(&key.0, &authority_a.runtime);
+        let mut metadata_route = authority_route.clone();
+        metadata_route.version = RouteVersion(7);
+        metadata_route.replicas[0].segment_name = SegmentName::new("seg-metadata");
+        authority_replace(
+            &namespace,
+            &authority_a.runtime.stable_id,
+            &key,
+            Some(&authority_route),
+        )
+        .expect("authority route insert should succeed");
+        metadata
+            .compare_and_swap_object_route(&key, None, Some(&metadata_route))
+            .expect("metadata route insert should succeed");
+
+        let listed = directory
+            .list_routes_by_replica_owner(&observer, &authority_a.runtime)
+            .expect("owner route scan should succeed");
+        assert_eq!(listed, vec![authority_route.clone()]);
+
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&authority_a.runtime.stable_id);
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&authority_b.runtime.stable_id);
     }
 
     #[test]
