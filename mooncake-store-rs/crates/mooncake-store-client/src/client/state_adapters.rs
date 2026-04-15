@@ -110,7 +110,11 @@ impl LocalAllocatorAdapter {
     ) -> Result<mooncake_store_core::SegmentReservation> {
         let mut last_error = None;
         for _ in 0..=32usize {
-            match self.allocator.lock().reserve_any(owner, length_bytes) {
+            let reservation = {
+                let mut allocator = self.allocator.lock();
+                allocator.reserve_any(owner, length_bytes)
+            };
+            match reservation {
                 Ok(reservation) => {
                     let deadline_ms = self.pending_publish_deadline_ms(reservation.length_bytes);
                     self.allocator
@@ -140,11 +144,11 @@ impl LocalAllocatorAdapter {
     ) -> Result<mooncake_store_core::SegmentReservation> {
         let mut last_error = None;
         for _ in 0..=32usize {
-            match self
-                .allocator
-                .lock()
-                .reserve_specific(owner, segment_name, length_bytes)
-            {
+            let reservation = {
+                let mut allocator = self.allocator.lock();
+                allocator.reserve_specific(owner, segment_name, length_bytes)
+            };
+            match reservation {
                 Ok(reservation) => {
                     let deadline_ms = self.pending_publish_deadline_ms(reservation.length_bytes);
                     self.allocator

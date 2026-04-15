@@ -400,6 +400,12 @@ impl LocalAllocatorState {
         self.pending_allocations.keys().cloned().collect()
     }
 
+    fn next_pending_deadline_ms(&mut self, now_ms: u64) -> Option<u64> {
+        self.pending_allocations
+            .retain(|_, deadline_ms| *deadline_ms > now_ms);
+        self.pending_allocations.values().min().copied()
+    }
+
     fn stale_allocations(
         &mut self,
         live_allocations: &BTreeSet<AllocationSpan>,

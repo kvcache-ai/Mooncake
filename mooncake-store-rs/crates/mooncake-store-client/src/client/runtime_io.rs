@@ -9,82 +9,110 @@ impl StoreClient {
         reclaim_mode: ReclaimMode,
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
-        self.flush_due_reclaims()?;
         let scoped_key = self.scoped_key(tenant, key);
         let policy = self.resolve_replication_policy(policy)?;
-        let reserve_tracker =
-            OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
-        let reserve_result = self.reserve_replica_targets(tenant, key, value.len(), &policy);
-        reserve_tracker.finish(&reserve_result, 0);
-        let (targets, reservations) = reserve_result?;
-        let write_tracker =
-            OperationTracker::new("put_stage_write").input_bytes(value.len() as u64);
-        let write_result = self.write_reserved_replicas(&targets, &reservations, value);
-        write_tracker.finish(&write_result, value.len() as u64);
-        let offsets = match write_result {
-            Ok(offsets) => offsets,
-            Err(error) => {
+        let max_write_attempts = if policy.with_soft_pin {
+            DEFAULT_PUT_WRITE_RETRY_LIMIT
+        } else {
+            1
+        };
+        let mut attempt = 0usize;
+        loop {
+            attempt = attempt.saturating_add(1);
+            self.flush_due_reclaims()?;
+            let reserve_tracker =
+                OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
+            let reserve_result = self.reserve_replica_targets(tenant, key, value.len(), &policy);
+            reserve_tracker.finish(&reserve_result, 0);
+            let (targets, reservations) = reserve_result?;
+            let write_tracker =
+                OperationTracker::new("put_stage_write").input_bytes(value.len() as u64);
+            let write_result = self.write_reserved_replicas(&targets, &reservations, value);
+            write_tracker.finish(&write_result, value.len() as u64);
+            let offsets = match write_result {
+                Ok(offsets) => offsets,
+                Err(error) => {
+                    let _ = self.release_reserved_allocations(&targets, &reservations);
+                    self.note_remote_write_failure(
+                        &targets,
+                        &error,
+                        "remote_write_failed",
+                    );
+                    if attempt < max_write_attempts
+                        && self.should_retry_put_after_write_failure(&error, &policy)
+                    {
+                        debug!(
+                            runtime = %self.lease.runtime,
+                            tenant,
+                            key,
+                            attempt,
+                            max_write_attempts,
+                            error = %error,
+                            "retrying put after transient replica write failure"
+                        );
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let expected_version = current.map(|route| route.version);
+            let next_version = current
+                .map(|route| route.version.next())
+                .unwrap_or(RouteVersion(1));
+            let checksum = payload_checksum(value);
+            let route = ObjectRoute {
+                key: scoped_key.clone(),
+                version: next_version,
+                state: RouteState::Active,
+                compatibility: self.lease.compatibility.clone(),
+                replicas: targets
+                    .iter()
+                    .zip(offsets.iter())
+                    .enumerate()
+                    .map(|(priority, (target, offset))| ReplicaRoute {
+                        owner: target.storage_runtime.clone(),
+                        segment_name: target.segment_name.clone(),
+                        offset: *offset,
+                        segment_offset: reservations[priority].offset_bytes,
+                        length: value.len() as u64,
+                        checksum: Some(checksum),
+                        tier: ReplicaTier::Dram,
+                        priority: priority as u16,
+                    })
+                    .collect(),
+            };
+            let cas_tracker = OperationTracker::new("put_stage_route_cas");
+            let publish_started = Instant::now();
+            let cas_result = self.route_directory.compare_and_swap_object_route(
+                &self.lease,
+                &route.key,
+                expected_version,
+                Some(&route),
+            );
+            registry::record_replication_publish(
+                match &cas_result {
+                    Ok(cas) if cas.applied => "ok",
+                    Ok(_) => "conflict",
+                    Err(StoreError::Conflict(_)) => "conflict",
+                    Err(_) => "error",
+                },
+                publish_started.elapsed(),
+            );
+            cas_tracker.finish(&cas_result, 0);
+            let cas = cas_result?;
+            if !cas.applied {
                 let _ = self.release_reserved_allocations(&targets, &reservations);
-                return Err(error);
+                return Err(StoreError::Conflict(format!(
+                    "route update lost race for tenant={tenant} key={key}"
+                )));
             }
-        };
-        let expected_version = current.map(|route| route.version);
-        let next_version = current
-            .map(|route| route.version.next())
-            .unwrap_or(RouteVersion(1));
-        let checksum = payload_checksum(value);
-        let route = ObjectRoute {
-            key: scoped_key,
-            version: next_version,
-            state: RouteState::Active,
-            compatibility: self.lease.compatibility.clone(),
-            replicas: targets
-                .iter()
-                .zip(offsets.iter())
-                .enumerate()
-                .map(|(priority, (target, offset))| ReplicaRoute {
-                    owner: target.storage_runtime.clone(),
-                    segment_name: target.segment_name.clone(),
-                    offset: *offset,
-                    segment_offset: reservations[priority].offset_bytes,
-                    length: value.len() as u64,
-                    checksum: Some(checksum),
-                    tier: ReplicaTier::Dram,
-                    priority: priority as u16,
-                })
-                .collect(),
-        };
-        let cas_tracker = OperationTracker::new("put_stage_route_cas");
-        let publish_started = Instant::now();
-        let cas_result = self.route_directory.compare_and_swap_object_route(
-            &self.lease,
-            &route.key,
-            expected_version,
-            Some(&route),
-        );
-        registry::record_replication_publish(
-            match &cas_result {
-                Ok(cas) if cas.applied => "ok",
-                Ok(_) => "conflict",
-                Err(StoreError::Conflict(_)) => "conflict",
-                Err(_) => "error",
-            },
-            publish_started.elapsed(),
-        );
-        cas_tracker.finish(&cas_result, 0);
-        let cas = cas_result?;
-        if !cas.applied {
-            let _ = self.release_reserved_allocations(&targets, &reservations);
-            return Err(StoreError::Conflict(format!(
-                "route update lost race for tenant={tenant} key={key}"
-            )));
+            self.storage_owner.track_route(&route);
+            self.track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
+            if let Some(previous) = current {
+                self.reclaim_route(previous, reclaim_mode)?;
+            }
+            return Ok(route);
         }
-        self.storage_owner.track_route(&route);
-        self.track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
-        if let Some(previous) = current {
-            self.reclaim_route(previous, reclaim_mode)?;
-        }
-        Ok(route)
     }
 
     fn put_scoped_with_policy(
@@ -565,6 +593,91 @@ impl StoreClient {
         Ok(())
     }
 
+    fn format_remaining_live_segments(segments: &[SegmentAnnouncement]) -> String {
+        segments
+            .iter()
+            .map(|segment| format!("{}:{}", segment.segment_name.0, segment.used_bytes))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn remaining_live_segments(&self) -> Result<Vec<SegmentAnnouncement>> {
+        Ok(self
+            .list_segments()?
+            .into_iter()
+            .filter(|segment| segment.used_bytes != 0)
+            .collect::<Vec<_>>())
+    }
+
+    fn next_pending_publish_deadline_ms(&self) -> Option<u64> {
+        self.allocator.lock().next_pending_deadline_ms(now_ms())
+    }
+
+    fn wait_for_pending_publish_or_retry(&self) {
+        let now = now_ms();
+        let delay_ms = self
+            .next_pending_publish_deadline_ms()
+            .map(|deadline_ms| deadline_ms.saturating_sub(now).min(25))
+            .unwrap_or(10);
+        if delay_ms != 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+
+    fn evacuate_draining_routes_until_stable<F>(
+        &self,
+        remaining_error_prefix: &str,
+        mut migrate_route: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&ObjectRoute) -> Result<bool>,
+    {
+        self.ensure_local_memory()?;
+        let segments = {
+            let state = self.state.lock();
+            state.memory_ref()?.storage_segments()
+        };
+        for segment in segments
+            .iter()
+            .filter(|segment| segment.state == SegmentLifecycleState::Active)
+        {
+            self.drain_segment_internal(&segment.segment_name, true)?;
+        }
+        self.flush_all_reclaims()?;
+
+        let mut migrated = 0usize;
+        loop {
+            let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
+            let had_routes = !routes.is_empty();
+            for route in routes {
+                if migrate_route(&route)? {
+                    migrated = migrated.saturating_add(1);
+                }
+            }
+
+            self.flush_all_reclaims()?;
+            let live_allocations = self.current_owned_allocations()?;
+            let _ = self.release_stale_local_allocations(&live_allocations)?;
+            self.flush_all_reclaims()?;
+            self.retire_empty_draining_segments()?;
+
+            let remaining = self.remaining_live_segments()?;
+            if remaining.is_empty() {
+                return Ok(migrated);
+            }
+
+            if had_routes || self.next_pending_publish_deadline_ms().is_some() {
+                self.wait_for_pending_publish_or_retry();
+                continue;
+            }
+
+            return Err(StoreError::InvalidState(format!(
+                "{remaining_error_prefix}: {}",
+                Self::format_remaining_live_segments(&remaining)
+            )));
+        }
+    }
+
     fn select_readable_replica(
         &self,
         route: &ObjectRoute,
@@ -642,6 +755,50 @@ impl StoreClient {
             && left.length == right.length
     }
 
+    fn should_retry_put_after_write_failure(
+        &self,
+        error: &StoreError,
+        policy: &ResolvedReplicationPolicy,
+    ) -> bool {
+        policy.with_soft_pin
+            && matches!(
+                error,
+                StoreError::Transport(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
+            )
+    }
+
+    fn note_remote_write_failure(
+        &self,
+        targets: &[ReplicaWriteTarget],
+        error: &StoreError,
+        context: &'static str,
+    ) {
+        if !matches!(
+            error,
+            StoreError::Transport(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
+        ) {
+            return;
+        }
+        let mut failed_runtimes = BTreeSet::new();
+        {
+            let mut state = self.state.lock();
+            for target in targets {
+                state.invalidate_remote_segment(&target.segment_name.0);
+                if target.storage_runtime != self.lease.runtime {
+                    failed_runtimes.insert(target.storage_runtime.clone());
+                }
+            }
+        }
+        for runtime in failed_runtimes {
+            self.mark_runtime_suspect(&runtime, context);
+        }
+        let _ = refresh_live_client_cache(
+            self.metadata.as_ref(),
+            &self.live_client_cache,
+            "live_client_snapshot_remote_write_failure",
+        );
+    }
+
     fn fallback_replicas_for_route(
         &self,
         route: &ObjectRoute,
@@ -700,6 +857,61 @@ impl StoreClient {
         {
             self.prune_unreadable_replicas_best_effort(&entry.route, readable_runtimes);
         }
+    }
+
+    fn should_refresh_route_after_read_error(error: &StoreError) -> bool {
+        match error {
+            StoreError::Transport(_) | StoreError::NotFound(_) => true,
+            StoreError::InvalidState(message) => message.contains("checksum mismatch"),
+            _ => false,
+        }
+    }
+
+    fn refresh_resolved_route_after_read_failure(
+        &self,
+        entry: &mut ResolvedObject,
+    ) -> Result<bool> {
+        let _ = refresh_live_client_cache(
+            self.metadata.as_ref(),
+            &self.live_client_cache,
+            "live_client_snapshot_read_route_refresh",
+        );
+        let readable_runtimes = self.readable_runtime_set(true)?;
+        let Some(route) = self.query_route_in_tenant(&entry.tenant, &entry.key)? else {
+            return Ok(false);
+        };
+        if route.state != RouteState::Active {
+            return Ok(false);
+        }
+        let Some(replica) = self.select_readable_replica(&route, &readable_runtimes) else {
+            return Ok(false);
+        };
+        let changed =
+            route != entry.route || !Self::has_same_replica(&replica, &entry.replica);
+        if !changed {
+            return Ok(false);
+        }
+        let fallback_replicas =
+            self.fallback_replicas_for_route(&route, &replica, &readable_runtimes);
+        entry.route = route;
+        entry.replica = replica;
+        entry.fallback_replicas = fallback_replicas;
+        self.maybe_prune_route_after_failover(entry, &readable_runtimes);
+        Ok(true)
+    }
+
+    fn wait_for_route_refresh_retry(&self, request_deadline: RequestDeadline) -> bool {
+        if request_deadline.has_expired() {
+            return false;
+        }
+        let delay = request_deadline
+            .remaining()
+            .min(DEFAULT_ROUTE_REFRESH_RETRY_DELAY);
+        if delay.is_zero() {
+            return false;
+        }
+        sleep(delay);
+        true
     }
 
     fn resolve_objects(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<ResolvedObject>> {
@@ -1150,6 +1362,41 @@ impl StoreClient {
         Ok(best)
     }
 
+    fn segment_info_contains_target(info: &SegmentInfo, target_offset: u64, length: u64) -> bool {
+        info.buffers.iter().any(|buffer| {
+            let Some(buffer_end) = buffer.base.checked_add(buffer.length) else {
+                return false;
+            };
+            let Some(target_end) = target_offset.checked_add(length) else {
+                return false;
+            };
+            target_offset >= buffer.base && target_end <= buffer_end
+        })
+    }
+
+    fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
+        if Self::segment_info_contains_target(info, replica.offset, replica.length) {
+            return Ok(replica.offset);
+        }
+        let buffer = info.buffers.first().ok_or_else(|| {
+            StoreError::Transport(format!(
+                "segment {} exposes no buffers",
+                replica.segment_name.0
+            ))
+        })?;
+        let target_offset = buffer
+            .base
+            .checked_add(replica.segment_offset)
+            .ok_or_else(|| StoreError::Transport("remote target offset overflow".to_string()))?;
+        if Self::segment_info_contains_target(info, target_offset, replica.length) {
+            return Ok(target_offset);
+        }
+        Err(StoreError::Transport(format!(
+            "replica offset {} is outside segment {}",
+            replica.offset, replica.segment_name.0
+        )))
+    }
+
     fn execute_remote_batch_get_chunk(
         &self,
         transport: &dyn StoreTransport,
@@ -1170,8 +1417,15 @@ impl StoreClient {
                 let mut batch = Vec::with_capacity(remote_indices.len());
                 for (position, index) in remote_indices.iter().enumerate() {
                     let entry = &resolved[*index];
-                    let segment = state
-                        .open_segment(transport, &entry.replica.segment_name.0)
+                    let (segment, info) = state
+                        .open_segment_with_info(transport, &entry.replica.segment_name.0)
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })?;
+                    let target_offset = Self::remote_replica_target_offset(&info, &entry.replica)
                         .map_err(|error| {
                             (
                                 error.clone(),
@@ -1182,7 +1436,7 @@ impl StoreClient {
                         opcode: Opcode::Read,
                         source: scratch[position].addr,
                         target_id: segment,
-                        target_offset: entry.replica.offset,
+                        target_offset,
                         length: entry.replica.length,
                     });
                 }
@@ -1287,19 +1541,28 @@ impl StoreClient {
             }
             let request = {
                 let mut state = self.state.lock();
-                let segment = state
-                    .open_segment(transport, &resolved.replica.segment_name.0)
+                let (segment, info) = state
+                    .open_segment_with_info(transport, &resolved.replica.segment_name.0)
                     .map_err(|error| {
                         (
                             error.clone(),
                             Self::remote_read_failure_marks_runtime_suspect(&error),
                         )
                     })?;
+                let target_offset =
+                    Self::remote_replica_target_offset(&info, &resolved.replica).map_err(
+                        |error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        },
+                    )?;
                 TransferRequest {
                     opcode: Opcode::Read,
                     source: buffer_ptr,
                     target_id: segment,
-                    target_offset: resolved.replica.offset,
+                    target_offset,
                     length: resolved.replica.length,
                 }
             };
@@ -1425,6 +1688,30 @@ impl StoreClient {
                 Err(error) => {
                     let readable_runtimes = self.readable_runtime_set(true)?;
                     if !self.try_advance_resolved_replica(resolved, &readable_runtimes) {
+                        if Self::should_refresh_route_after_read_error(&error) {
+                            if self.refresh_resolved_route_after_read_failure(resolved)? {
+                                debug!(
+                                    runtime = %self.lease.runtime,
+                                    tenant = %resolved.tenant,
+                                    key = %resolved.key,
+                                    route_version = resolved.route.version.0,
+                                    storage_owner = %resolved.replica.owner,
+                                    segment = %resolved.replica.segment_name.0,
+                                    "retrying get after route refresh"
+                                );
+                                continue;
+                            }
+                            if self.wait_for_route_refresh_retry(request_deadline) {
+                                debug!(
+                                    runtime = %self.lease.runtime,
+                                    tenant = %resolved.tenant,
+                                    key = %resolved.key,
+                                    error = %error,
+                                    "waiting for route refresh after transient read failure"
+                                );
+                                continue;
+                            }
+                        }
                         return Err(error);
                     }
                     self.maybe_prune_route_after_failover(resolved, &readable_runtimes);

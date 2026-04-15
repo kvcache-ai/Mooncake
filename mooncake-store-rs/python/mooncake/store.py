@@ -33,21 +33,36 @@ def _load_native():
         for suffix in suffixes:
             patterns.extend([f"_store_rs{suffix}", f"lib_store_rs{suffix}"])
 
-        for profile in ("release", "debug"):
+        candidates: list[pathlib.Path] = []
+        seen: set[pathlib.Path] = set()
+        for profile in ("debug", "release"):
             for profile_dir in (target_root / profile, target_root / profile / "deps"):
                 for pattern in patterns:
-                    candidate = profile_dir / pattern
-                    if not candidate.exists():
-                        continue
-                    spec = importlib.util.spec_from_file_location(
-                        "mooncake._store_rs", candidate
-                    )
-                    if spec is None or spec.loader is None:
-                        continue
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules["mooncake._store_rs"] = module
-                    spec.loader.exec_module(module)
-                    return module
+                    for candidate in profile_dir.glob(pattern):
+                        resolved = candidate.resolve()
+                        if resolved in seen or not resolved.exists():
+                            continue
+                        seen.add(resolved)
+                        candidates.append(resolved)
+
+        candidates.sort(
+            key=lambda candidate: (
+                candidate.stat().st_mtime_ns,
+                1 if f"{pathlib.Path('target') / 'debug'}" in str(candidate) else 0,
+            ),
+            reverse=True,
+        )
+
+        for candidate in candidates:
+            spec = importlib.util.spec_from_file_location(
+                "mooncake._store_rs", candidate
+            )
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["mooncake._store_rs"] = module
+            spec.loader.exec_module(module)
+            return module
 
         raise ImportError(
             "cannot find native mooncake store module; run `cargo build -p mooncake-store-py` first"

@@ -2,16 +2,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey, ReplicaRoute,
-    RouteCasRequest, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, StoreError,
+    ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey, ObjectRoute,
+    ReplicaRoute, RouteCasRequest, RoutePolicy, RoutePolicyDomain, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
@@ -58,6 +58,7 @@ struct TestTransportState {
     segments_by_handle: BTreeMap<u64, TestSegment>,
     live_batches: BTreeSet<u64>,
     registered_memory: BTreeMap<usize, usize>,
+    fail_next_submit_segments: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +82,19 @@ struct CountingMetadataBackend {
     list_live_clients_calls: AtomicUsize,
 }
 
+struct BlockingCasMetadataBackend {
+    inner: Arc<InMemoryMetadataBackend>,
+    block_key: ObjectKey,
+    gate: Arc<(StdMutex<BlockingCasGateState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct BlockingCasGateState {
+    entered: bool,
+    released: bool,
+    blocked_once: bool,
+}
+
 impl CountingMetadataBackend {
     fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
         Self {
@@ -91,6 +105,47 @@ impl CountingMetadataBackend {
 
     fn list_live_clients_calls(&self) -> usize {
         self.list_live_clients_calls.load(Ordering::Relaxed)
+    }
+}
+
+impl BlockingCasMetadataBackend {
+    fn new(inner: Arc<InMemoryMetadataBackend>, block_key: &str) -> Self {
+        Self {
+            inner,
+            block_key: ObjectKey::new(block_key),
+            gate: Arc::new((
+                StdMutex::new(BlockingCasGateState::default()),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let (lock, condvar) = &*self.gate;
+        let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
+        while !state.entered {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let wait_for = deadline.saturating_duration_since(now);
+            let (next, result) = condvar
+                .wait_timeout(state, wait_for)
+                .expect("blocking CAS gate wait should succeed");
+            state = next;
+            if result.timed_out() && !state.entered {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release_blocked_cas(&self) {
+        let (lock, condvar) = &*self.gate;
+        let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
+        state.released = true;
+        condvar.notify_all();
     }
 }
 
@@ -345,6 +400,142 @@ impl MetadataBackend for CountingMetadataBackend {
     }
 }
 
+impl MetadataBackend for BlockingCasMetadataBackend {
+    fn route_namespace(&self) -> String {
+        self.inner.route_namespace()
+    }
+
+    fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+        self.inner.upsert_client_lease(lease)
+    }
+
+    fn update_client_state(
+        &self,
+        runtime: &ClientRuntimeId,
+        next: ClientLifecycleState,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.update_client_state(runtime, next)
+    }
+
+    fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+        self.inner.list_live_clients()
+    }
+
+    fn publish_segment(&self, segment: &SegmentAnnouncement) -> mooncake_store_core::Result<()> {
+        self.inner.publish_segment(segment)
+    }
+
+    fn unpublish_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.unpublish_segment(owner, segment)
+    }
+
+    fn list_segments(
+        &self,
+        owner: Option<&ClientRuntimeId>,
+    ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+        self.inner.list_segments(owner)
+    }
+
+    fn update_segment_state(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.update_segment_state(owner, segment, next)
+    }
+
+    fn reserve_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+        self.inner.reserve_segment(owner, segment, length_bytes)
+    }
+
+    fn release_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner
+            .release_segment(owner, segment, offset_bytes, length_bytes)
+    }
+
+    fn get_object_route(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
+        self.inner.get_object_route(key)
+    }
+
+    fn list_object_routes(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ObjectRoute>> {
+        self.inner.list_object_routes()
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        key: &ObjectKey,
+        expected: Option<mooncake_store_core::RouteVersion>,
+        next: Option<&mooncake_store_core::ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        if *key == self.block_key {
+            let (lock, condvar) = &*self.gate;
+            let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
+            if !state.blocked_once {
+                state.entered = true;
+                condvar.notify_all();
+                while !state.released {
+                    state = condvar
+                        .wait(state)
+                        .expect("blocking CAS gate wait should succeed");
+                }
+                state.blocked_once = true;
+            }
+        }
+        self.inner
+            .compare_and_swap_object_route(key, expected, next)
+    }
+
+    fn get_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+    ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+        self.inner.get_route_policy(domain)
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.put_route_policy_if_absent(domain, policy)
+    }
+
+    fn put_handoff(
+        &self,
+        handoff: &mooncake_store_core::HandoffPlan,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_handoff(handoff)
+    }
+
+    fn get_handoff(
+        &self,
+        stable_id: &mooncake_store_core::ClientStableId,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
+        self.inner.get_handoff(stable_id)
+    }
+}
+
 impl TestTransport {
     fn new(local_segment: &str) -> Self {
         Self {
@@ -357,6 +548,7 @@ impl TestTransport {
                 segments_by_handle: BTreeMap::new(),
                 live_batches: BTreeSet::new(),
                 registered_memory: BTreeMap::new(),
+                fail_next_submit_segments: BTreeSet::new(),
             })),
         }
     }
@@ -385,6 +577,36 @@ impl TestTransport {
         let handle = state.segments_by_name.get(segment_name)?;
         let segment = state.segments_by_handle.get(handle)?;
         Some((segment.base as u64, segment.len as u64))
+    }
+
+    fn restart_external_segment(&self, segment_name: &str) -> u64 {
+        let mut state = self.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove(segment_name)
+            .expect("segment should exist before restart");
+        let segment = state
+            .segments_by_handle
+            .remove(&handle)
+            .expect("segment handle should exist before restart");
+        let snapshot = state
+            .allocations
+            .remove(&segment.base)
+            .map(|buffer| buffer.into_vec())
+            .unwrap_or_else(|| vec![0u8; segment.len]);
+        let base = allocate_boxed_region(&mut state, segment.len);
+        if let Some(buffer) = state.allocations.get_mut(&base) {
+            let copy_len = snapshot.len().min(buffer.len());
+            buffer[..copy_len].copy_from_slice(&snapshot[..copy_len]);
+        }
+        register_segment(&mut state, segment_name.to_string(), base, segment.len)
+    }
+
+    fn fail_next_submit_for_segment(&self, segment_name: &str) {
+        self.state
+            .lock()
+            .fail_next_submit_segments
+            .insert(segment_name.to_string());
     }
 }
 
@@ -556,9 +778,27 @@ impl StoreTransport for TestTransport {
         batch_id: u64,
         requests: &[TransferRequest],
     ) -> mooncake_store_core::Result<()> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
         if !state.live_batches.contains(&batch_id) {
             return Err(StoreError::NotFound(format!("batch {batch_id} not found")));
+        }
+        let mut failed_segment = None;
+        for request in requests {
+            let segment_name = state
+                .segments_by_name
+                .iter()
+                .find_map(|(name, handle)| (*handle == request.target_id).then_some(name.clone()));
+            if let Some(segment_name) = segment_name {
+                if state.fail_next_submit_segments.remove(&segment_name) {
+                    failed_segment = Some(segment_name);
+                    break;
+                }
+            }
+        }
+        if let Some(segment_name) = failed_segment {
+            return Err(StoreError::Transport(format!(
+                "injected submit failure for segment {segment_name}"
+            )));
         }
         for request in requests {
             let segment = state
@@ -696,6 +936,29 @@ fn rw_only_config() -> LocalMemoryConfig {
 
 fn fast_live_client_sync_interval() -> Duration {
     Duration::from_millis(25)
+}
+
+fn resolved_object_for_route(
+    reader: &StoreClient,
+    tenant: &str,
+    key: &str,
+    route: ObjectRoute,
+) -> ResolvedObject {
+    let readable_runtimes = reader
+        .readable_runtime_set(true)
+        .expect("readable runtime refresh should succeed");
+    let replica = reader
+        .select_readable_replica(&route, &readable_runtimes)
+        .expect("route should expose a readable replica");
+    let fallback_replicas =
+        reader.fallback_replicas_for_route(&route, &replica, &readable_runtimes);
+    ResolvedObject {
+        tenant: tenant.to_string(),
+        key: key.to_string(),
+        route,
+        replica,
+        fallback_replicas,
+    }
 }
 
 fn test_future_expiry_ms() -> u64 {
@@ -2862,6 +3125,108 @@ fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
             .get("put-failed-key")
             .expect("writer get should succeed"),
         b"put-failed-payload"
+    );
+}
+
+#[test]
+fn routed_put_retries_after_mid_transfer_failure_and_uses_surviving_peer() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("put-retry-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("put-retry-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("put-retry-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("put-retry-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "put-retry-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "put-retry-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "put-retry-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "put-retry-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    let store_a_segment = store_a
+        .segment_name()
+        .expect("store-a segment should exist");
+    store_a_transport.fail_next_submit_for_segment(&store_a_segment.0);
+
+    let route = writer
+        .put_with_policy(
+            "put-retry-key",
+            b"put-retry-payload",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .with_soft_pin(true)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("put should retry after the first target fails mid-transfer");
+
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(route.replicas[0].owner, *store_b.runtime_id());
+    assert!(
+        writer
+            .suspect_runtime_cache
+            .lock()
+            .contains(store_a.runtime_id()),
+        "failed write target should be quarantined before retrying placement"
+    );
+    assert_eq!(
+        reader
+            .get("put-retry-key")
+            .expect("reader should see retried write"),
+        b"put-retry-payload"
     );
 }
 
@@ -5861,6 +6226,476 @@ fn true_client_shrink_ignores_unreachable_route_authority() {
             expected[&key]
         );
     }
+}
+
+#[test]
+fn remote_get_recomputes_segment_base_after_restart() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("restart-read-store-segment"));
+    let reader_transport = Arc::new(store_transport.peer("restart-read-reader-segment"));
+
+    let store = StoreClientBuilder::new(metadata.clone(), "restart-read-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "restart-read-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store, &reader]);
+
+    let key = "restart-read-key";
+    let value = b"restart-read-value";
+    store.put(key, value).expect("seed put should succeed");
+    assert_eq!(
+        reader.get(key).expect("initial reader get should succeed"),
+        value
+    );
+
+    let segment = store.segment_name().expect("store segment should exist");
+    store_transport.restart_external_segment(&segment.0);
+
+    assert_eq!(
+        reader
+            .get(key)
+            .expect("reader get after restart should succeed"),
+        value
+    );
+}
+
+#[test]
+fn remote_put_refreshes_cached_segment_handle_after_restart() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("restart-write-store-segment"));
+    let router_transport = Arc::new(store_transport.peer("restart-write-router-segment"));
+    let reader_transport = Arc::new(store_transport.peer("restart-write-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store = StoreClientBuilder::new(metadata.clone(), "restart-write-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "restart-write-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "restart-write-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store, &router, &reader]);
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(1)
+        .prefer_local(false)
+        .preferred_storage_owners([store.runtime_id().storage_key()]);
+
+    router
+        .put_with_policy("restart-write-key-1", b"warmup", &policy)
+        .expect("warmup put should succeed");
+    assert_eq!(
+        reader
+            .get("restart-write-key-1")
+            .expect("warmup reader get should succeed"),
+        b"warmup"
+    );
+
+    let segment = store.segment_name().expect("store segment should exist");
+    store_transport.restart_external_segment(&segment.0);
+
+    router
+        .put_with_policy("restart-write-key-2", b"after-restart", &policy)
+        .expect("put after restart should succeed");
+
+    assert_eq!(
+        reader
+            .get("restart-write-key-1")
+            .expect("reader should still see preserved warmup data"),
+        b"warmup"
+    );
+    assert_eq!(
+        reader
+            .get("restart-write-key-2")
+            .expect("reader should see post-restart data"),
+        b"after-restart"
+    );
+}
+
+#[test]
+fn stale_route_checksum_mismatch_refreshes_to_latest_route() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("overwrite-refresh-store-segment"));
+    let reader_transport = Arc::new(store_transport.peer("overwrite-refresh-reader-segment"));
+
+    let store = StoreClientBuilder::new(metadata.clone(), "overwrite-refresh-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "overwrite-refresh-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store, &reader]);
+
+    let key = "overwrite-refresh-key";
+    let route_v1 = store
+        .put(key, b"aaaaaaaa")
+        .expect("first overwrite put should succeed");
+    let _route_v2 = store
+        .put(key, b"bbbbbbbb")
+        .expect("second overwrite put should succeed");
+    let route_v3 = store
+        .put(key, b"cccccccc")
+        .expect("third overwrite put should succeed");
+    assert_eq!(
+        route_v3.replicas[0].segment_offset, route_v1.replicas[0].segment_offset,
+        "third overwrite should reuse the reclaimed v1 slot"
+    );
+
+    let transport = reader.transport().expect("reader transport should exist");
+    let mut resolved = resolved_object_for_route(&reader, "default", key, route_v1.clone());
+    let mut buffer = vec![0u8; route_v1.replicas[0].length as usize];
+    let request_deadline = reader.request_deadline_for_transfer(buffer.len() as u64, 1);
+    reader
+        .read_single_object_with_failover(
+            transport,
+            &mut resolved,
+            &mut buffer,
+            request_deadline,
+            "overwrite_refresh",
+        )
+        .expect("stale checksum should refresh to the latest route");
+
+    assert_eq!(buffer, b"cccccccc");
+    assert_eq!(resolved.route.version, route_v3.version);
+    assert_eq!(
+        resolved.replica.segment_name,
+        route_v3.replicas[0].segment_name
+    );
+    assert_eq!(
+        resolved.replica.segment_offset,
+        route_v3.replicas[0].segment_offset
+    );
+}
+
+#[test]
+fn stale_route_transport_failure_refreshes_to_republished_route() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("refresh-route-store-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("refresh-route-store-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("refresh-route-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("refresh-route-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "refresh-route-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "refresh-route-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "refresh-route-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "refresh-route-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    let route_v1 = writer
+        .put_with_policy(
+            "refresh-route-key",
+            b"route-a",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_a.runtime_id().storage_key()]),
+        )
+        .expect("initial route should land on store-a");
+    assert_eq!(route_v1.replicas[0].owner, *store_a.runtime_id());
+
+    let route_v2 = writer
+        .put_with_policy(
+            "refresh-route-key",
+            b"route-b",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_b.runtime_id().storage_key()]),
+        )
+        .expect("overwrite route should land on store-b");
+    assert_eq!(route_v2.replicas[0].owner, *store_b.runtime_id());
+
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("refresh-route-store-a-segment")
+            .expect("store-a segment handle should exist");
+        state
+            .segments_by_handle
+            .remove(&handle)
+            .expect("store-a segment body should exist");
+    }
+
+    let transport = reader.transport().expect("reader transport should exist");
+    let mut resolved =
+        resolved_object_for_route(&reader, "default", "refresh-route-key", route_v1.clone());
+    let mut buffer = vec![0u8; route_v1.replicas[0].length as usize];
+    let request_deadline = reader.request_deadline_for_transfer(buffer.len() as u64, 1);
+    reader
+        .read_single_object_with_failover(
+            transport,
+            &mut resolved,
+            &mut buffer,
+            request_deadline,
+            "route_refresh_after_transport_failure",
+        )
+        .expect("stale transport failure should refresh to the republished route");
+
+    assert_eq!(buffer, b"route-b");
+    assert_eq!(resolved.route.version, route_v2.version);
+    assert_eq!(resolved.replica.owner, *store_b.runtime_id());
+}
+
+#[test]
+fn true_client_shrink_waits_for_inflight_route_publish() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let blocking = Arc::new(BlockingCasMetadataBackend::new(
+        inner,
+        "default::shrink-inflight-key",
+    ));
+    let metadata: Arc<dyn MetadataBackend> = blocking.clone();
+    let store_a_transport = Arc::new(TestTransport::new("shrink-inflight-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("shrink-inflight-b-segment"));
+    let router_transport = Arc::new(store_a_transport.peer("shrink-inflight-router-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("shrink-inflight-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "shrink-inflight-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "shrink-inflight-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "shrink-inflight-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "shrink-inflight-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &router, &reader]);
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(1)
+        .prefer_local(false)
+        .preferred_storage_owners([store_a.runtime_id().storage_key()]);
+    let store_a_runtime = store_a.runtime_id().clone();
+    let key = "shrink-inflight-key";
+    let value = b"shrink-inflight-value".to_vec();
+    let writer_value = value.clone();
+    let writer = std::thread::spawn(move || router.put_with_policy(key, &writer_value, &policy));
+
+    assert!(
+        blocking.wait_until_blocked(Duration::from_secs(1)),
+        "writer should reach the blocked route publish point"
+    );
+
+    let release_blocker = blocking.clone();
+    let releaser = std::thread::spawn(move || {
+        sleep(Duration::from_millis(100));
+        release_blocker.release_blocked_cas();
+    });
+
+    let started = Instant::now();
+    let migrated = {
+        let mut shrink_store = store_a;
+        shrink_store
+            .evacuate_owned_replicas()
+            .expect("shrink should converge after the pending publish is released")
+    };
+    writer
+        .join()
+        .expect("writer thread should join")
+        .expect("writer put should succeed");
+    releaser.join().expect("release thread should join");
+    assert!(
+        started.elapsed() >= Duration::from_millis(80),
+        "shrink should wait for the in-flight publish instead of returning immediately"
+    );
+    assert_eq!(migrated, 1);
+
+    assert_eq!(
+        reader
+            .get(key)
+            .expect("reader get after shrink should succeed"),
+        value
+    );
+    let route = reader
+        .query_route(key)
+        .expect("route query should succeed after shrink")
+        .expect("route should still exist after shrink");
+    assert!(
+        route
+            .replicas
+            .iter()
+            .all(|replica| replica.owner != store_a_runtime),
+        "route should migrate away from the drained runtime"
+    );
 }
 
 #[test]
