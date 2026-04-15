@@ -185,7 +185,7 @@ Status MultiTransport::submitTransfer(
             task.batch_id = batch_id;
             const auto& request = entries[entry.request_idx];
 #ifdef USE_ASCEND_HETEROGENEOUS
-            task.request = const_cast<Transport::TransferRequest *>(&request);
+            task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
             task.request = &request;
 #endif
@@ -269,7 +269,7 @@ Status MultiTransport::submitTransfer(
         task.batch_id = batch_id;
         const auto& first_req = entries[resolved[ltask.start].request_idx];
 #ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest *>(&first_req);
+        task.request = const_cast<Transport::TransferRequest*>(&first_req);
 #else
         task.request = &first_req;
 #endif
