@@ -36,6 +36,7 @@ impl StoreBackend {
     fn close(&self) {
         match self {
             Self::Real(dispatcher) => {
+                dispatcher.stop_heartbeat_loop();
                 let _ = dispatcher.enter_offline();
                 dispatcher.shutdown();
             }
@@ -159,6 +160,9 @@ impl PyMooncakeDistributedStore {
         .map_err(store_error_to_py)?;
         dispatcher
             .register_local_memory()
+            .map_err(store_error_to_py)?;
+        dispatcher
+            .start_heartbeat_loop(runtime.lease_ttl_ms, None)
             .map_err(store_error_to_py)?;
         self.replace_backend(StoreBackend::Real(dispatcher));
         Ok(0)
@@ -1570,7 +1574,8 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
-        snapshot_metrics, LocalMemoryConfig, StoreClient, StoreClientBuilder, StoreTransport,
+        snapshot_metrics, LocalMemoryConfig, RouteControlMode, StoreClient, StoreClientBuilder,
+        StoreTransport,
     };
     use mooncake_store_core::{
         CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
@@ -1889,6 +1894,7 @@ mod tests {
             .epoch(ClientEpoch(1))
             .state(ClientLifecycleState::Active)
             .compatibility(CompatibilityDescriptor::default())
+            .route_control(RouteControlMode::MetadataOnly)
             .transport(transport)
             .local_memory(
                 LocalMemoryConfig::new()
@@ -2068,6 +2074,30 @@ mod tests {
         let mut store = PyMooncakeDistributedStore::new();
         store.replace_backend(StoreBackend::Real(dispatcher));
         store
+    }
+
+    fn lease_expires_at_ms(metadata: &InMemoryMetadataBackend, runtime: &ClientRuntimeId) -> u64 {
+        metadata
+            .list_live_clients()
+            .expect("leases should list")
+            .into_iter()
+            .find(|lease| lease.runtime == *runtime)
+            .expect("target lease should exist")
+            .expires_at_ms
+    }
+
+    fn wait_until_lease_after(
+        metadata: &InMemoryMetadataBackend,
+        runtime: &ClientRuntimeId,
+        previous_expires_at_ms: u64,
+    ) -> bool {
+        for _ in 0..80 {
+            if lease_expires_at_ms(metadata, runtime) > previous_expires_at_ms {
+                return true;
+            }
+            sleep(Duration::from_millis(25));
+        }
+        false
     }
 
     fn bind_addr() -> String {
@@ -3179,6 +3209,63 @@ mod tests {
         backend.close();
 
         let runtime = ClientRuntimeId::new("dispatcher-close-offline", ClientEpoch(1));
+        let state = metadata
+            .list_live_clients()
+            .expect("leases should list")
+            .into_iter()
+            .find(|lease| lease.runtime == runtime)
+            .map(|lease| lease.state);
+        assert_eq!(state, Some(ClientLifecycleState::Offline));
+    }
+
+    #[test]
+    fn dispatcher_auto_heartbeat_extends_lease_until_stopped() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let dispatcher = StoreDispatcher::spawn(
+            build_client_with_metadata("dispatcher-auto-heartbeat", metadata.clone()),
+            "dispatcher-auto-heartbeat".to_string(),
+        )
+        .expect("dispatcher should spawn");
+        let runtime = ClientRuntimeId::new("dispatcher-auto-heartbeat", ClientEpoch(1));
+        let initial_expires_at = lease_expires_at_ms(&metadata, &runtime);
+
+        dispatcher
+            .start_heartbeat_loop(90_000, Some(25))
+            .expect("heartbeat loop should start");
+        let refreshed = wait_until_lease_after(&metadata, &runtime, initial_expires_at);
+        dispatcher.stop_heartbeat_loop();
+
+        assert!(
+            refreshed,
+            "background heartbeat should refresh the lease expiry"
+        );
+        let stopped_expires_at = lease_expires_at_ms(&metadata, &runtime);
+        sleep(Duration::from_millis(100));
+        assert_eq!(
+            lease_expires_at_ms(&metadata, &runtime),
+            stopped_expires_at,
+            "stopped heartbeat loop must not keep mutating the lease"
+        );
+        dispatcher.shutdown();
+    }
+
+    #[test]
+    fn real_store_close_stops_auto_heartbeat_before_offline() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let dispatcher = StoreDispatcher::spawn(
+            build_client_with_metadata("dispatcher-auto-heartbeat-close", metadata.clone()),
+            "dispatcher-auto-heartbeat-close".to_string(),
+        )
+        .expect("dispatcher should spawn");
+        dispatcher
+            .start_heartbeat_loop(90_000, Some(25))
+            .expect("heartbeat loop should start");
+        let backend = StoreBackend::Real(dispatcher);
+
+        backend.close();
+        sleep(Duration::from_millis(100));
+
+        let runtime = ClientRuntimeId::new("dispatcher-auto-heartbeat-close", ClientEpoch(1));
         let state = metadata
             .list_live_clients()
             .expect("leases should list")
