@@ -9,7 +9,7 @@ endif()
 
 file(GLOB TEBENCH_SOURCES "*.cpp")
 add_executable(tebench ${TEBENCH_SOURCES})
-target_link_libraries(tebench PUBLIC transfer_engine tent)
+target_link_libraries(tebench PUBLIC transfer_engine tent_link_group)
 if(USE_CUDA)
   target_link_libraries(tebench PUBLIC CUDA::cudart)
 endif()

@@ -96,6 +96,31 @@ target_link_libraries(
         tent_interface
 )
 
+add_library(tent_link_group INTERFACE)
+target_link_libraries(tent_link_group INTERFACE "-Wl,--start-group" tent)
+foreach(tgt
+            metastore_redis
+            metastore_http
+            metastore_etcd
+            tent_platform_all
+            platform_cuda
+            platform_ascend
+            tent_xport_gds
+            tent_xport_uring
+            tent_xport_bufio
+            tent_xport_mnnvl
+            tent_xport_nvlink
+            tent_xport_rdma
+            tent_xport_shm
+            tent_xport_tcp
+            tent_xport_ascend_direct
+            tent_metrics)
+    if (TARGET ${tgt})
+        target_link_libraries(tent_link_group INTERFACE ${tgt})
+    endif()
+endforeach()
+target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
+
 install(TARGETS tent_shared
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
