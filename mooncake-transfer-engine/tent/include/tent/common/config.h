@@ -132,7 +132,7 @@ class Config {
         {
             std::string lower = value;
             std::transform(lower.begin(), lower.end(), lower.begin(),
-                           ::tolower);
+                           [](unsigned char c) { return std::tolower(c); });
             if (lower == "true") {
                 set(key, true);
                 return;

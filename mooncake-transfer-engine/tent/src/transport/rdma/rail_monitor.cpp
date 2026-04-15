@@ -226,7 +226,10 @@ Status RailMonitor::loadDefault() {
                 best_nic = cand;
             }
         }
-        if (best_nic < 0) continue;
+        if (best_nic < 0) {
+            direct_rails_[local_nic] = -1;
+            continue;
+        }
         remote_load[best_nic]++;
         direct_rails_[local_nic] = best_nic;
     }
