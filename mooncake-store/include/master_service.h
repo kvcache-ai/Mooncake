@@ -1168,6 +1168,14 @@ class MasterService {
 
     const bool enable_offload_;
 
+    // Offload-on-evict: defer disk offload to eviction time (env:
+    // MOONCAKE_OFFLOAD_ON_EVICT)
+    bool offload_on_evict_{false};
+    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
+    // exceeded (env: MOONCAKE_OFFLOAD_FORCE_EVICT, only effective when
+    // offload_on_evict_=true)
+    bool offload_force_evict_{false};
+
     const std::string ha_backend_type_;
 
     const std::string ha_backend_connstring_;

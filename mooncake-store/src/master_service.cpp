@@ -159,6 +159,23 @@ MasterService::MasterService(const MasterServiceConfig& config)
             "put_start_discard_timeout_sec");
     }
 
+    // Offload-on-evict: defer LOCAL_DISK offload to eviction time
+    {
+        const char* env = std::getenv("MOONCAKE_OFFLOAD_ON_EVICT");
+        offload_on_evict_ = enable_offload_ && env && std::string(env) == "1";
+        if (offload_on_evict_) {
+            LOG(INFO) << "Offload-on-evict mode enabled: DRAM offload to "
+                         "LOCAL_DISK will occur at eviction time instead of "
+                         "PutEnd";
+            const char* force_env = std::getenv("MOONCAKE_OFFLOAD_FORCE_EVICT");
+            offload_force_evict_ = force_env && std::string(force_env) == "1";
+            if (offload_force_evict_) {
+                LOG(INFO) << "Force-evict enabled: objects exceeding offload "
+                             "cap will be evicted without disk offload";
+            }
+        }
+    }
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -910,7 +927,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    if (enable_offload_) {
+    if (enable_offload_ && !offload_on_evict_) {
         auto& shard = accessor.GetShard();
         metadata.VisitReplicas(
             &Replica::fn_is_completed, [this, &key, &shard](Replica& replica) {
@@ -3491,6 +3508,66 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
+    // --- Offload-on-evict support ---
+    long offload_queued_this_cycle = 0;
+    long offload_deferred_count = 0;
+    const long offload_cap =
+        offload_on_evict_ ? static_cast<long>(offloading_queue_limit_ * 0.5)
+                          : 0;
+
+    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
+        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    };
+
+    // Returns freed bytes. Returns 0 if offload-queued (no memory freed yet).
+    auto try_evict_or_offload =
+        [&](const std::string& key, ObjectMetadata& metadata,
+            MetadataShardAccessorRW& shard) -> uint64_t {
+        if (!offload_on_evict_) {
+            // Original behavior
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
+        if (has_local_disk_replica(metadata)) {
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // Force-evict cap: if force_evict enabled and cap reached, force delete
+        if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
+            LOG(WARNING) << "[EVICT] Offload cap reached, force-evicting key="
+                         << key << " without disk offload";
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // Queue for offload: push to offloading queue + inc_refcnt
+        bool queued = false;
+        metadata.VisitReplicas(
+            [](const Replica& r) {
+                return r.is_memory_replica() && r.is_completed() &&
+                       r.get_refcnt() == 0;
+            },
+            [this, &key, &shard, &queued](Replica& replica) {
+                auto result = PushOffloadingQueue(key, replica);
+                if (result) {
+                    replica.inc_refcnt();
+                    shard->offloading_tasks.emplace(
+                        key, OffloadingTask{replica.id(),
+                                            std::chrono::system_clock::now()});
+                    queued = true;
+                }
+            });
+
+        if (queued) {
+            offload_queued_this_cycle++;
+            offload_deferred_count++;
+            return 0;  // No memory freed yet
+        }
+
+        // PushOffloadingQueue failed — force-evict as fallback
+        return metadata.size * evict_replicas(metadata);
+    };
+
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % kNumShards;
@@ -3563,16 +3640,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 if (it->second.lease_timeout <= target_timeout) {
-                    // Evict this object
-                    total_freed_size +=
-                        it->second.size *
-                        evict_replicas(it->second);  // Erase memory replicas
+                    // Evict this object (or defer for offload)
+                    uint64_t freed =
+                        try_evict_or_offload(it->first, it->second, shard);
+                    total_freed_size += freed;
                     if (it->second.IsValid() == false) {
                         it = shard->metadata.erase(it);
                     } else {
                         ++it;
                     }
-                    shard_evicted_count++;
+                    if (freed > 0) {
+                        shard_evicted_count++;
+                    }
                 } else {
                     // second pass candidates
                     no_pin_objects.push_back(it->second.lease_timeout);
@@ -3624,17 +3703,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
                         can_evict_replicas(it->second)) {
-                        // Evict this object
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
+                        // Evict this object (or defer for offload)
+                        uint64_t freed =
+                            try_evict_or_offload(it->first, it->second, shard);
+                        total_freed_size += freed;
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
-                        evicted_count++;
+                        if (freed > 0) {
+                            evicted_count++;
+                        }
                         target_evict_num--;
                     } else {
                         ++it;
@@ -3674,16 +3754,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // and lease timeout less than or equal to target.
                     if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
+                        // Evict this object (or defer for offload)
+                        uint64_t freed =
+                            try_evict_or_offload(it->first, it->second, shard);
+                        total_freed_size += freed;
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
-                        evicted_count++;
+                        if (freed > 0) {
+                            evicted_count++;
+                        }
                         target_evict_num--;
                     } else {
                         ++it;
@@ -3704,7 +3786,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    if (evicted_count > 0 || released_discarded_cnt > 0) {
+    if (evicted_count > 0 || released_discarded_cnt > 0 ||
+        offload_deferred_count > 0) {
+        // Offload-deferred counts as partial success: work was done (objects
+        // queued for disk offload), so suppress re-triggering until the next
+        // watermark breach or explicit need_eviction_ signal.
         need_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
@@ -3716,7 +3802,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_eviction_fail();
     }
     VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+            << ", offload_deferred=" << offload_deferred_count
             << ", total_freed_size=" << total_freed_size;
+    if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
+        LOG(WARNING) << "[EVICT] No memory freed this cycle; "
+                     << offload_deferred_count
+                     << " objects deferred for disk offload. "
+                        "Consider lowering eviction_high_watermark_ratio.";
+    }
 }
 
 void MasterService::ClientMonitorFunc() {
