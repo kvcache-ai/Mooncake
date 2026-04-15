@@ -1263,8 +1263,7 @@ impl StoreClient {
     fn shaping_max_remote_batch_burst_items(&self) -> Option<usize> {
         self.bandwidth_shaping
             .as_ref()
-            .and_then(|shaping| shaping.max_remote_batch_bytes)
-            .map(|bytes| bytes as usize)
+            .and_then(|shaping| shaping.max_remote_batch_burst_items)
     }
 
     fn shaping_max_remote_batch_bytes(&self) -> Option<usize> {

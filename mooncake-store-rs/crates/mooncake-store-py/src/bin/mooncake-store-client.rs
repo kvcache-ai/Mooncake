@@ -103,7 +103,11 @@ struct Args {
     epoch: u64,
     #[arg(long, value_enum, default_value_t = InitialStateArg::Active)]
     initial_state: InitialStateArg,
-    #[arg(long, default_value = "default", help = "Default tenant scope for startup policy lookup and request defaults")]
+    #[arg(
+        long,
+        default_value = "default",
+        help = "Default tenant scope for startup policy lookup and request defaults"
+    )]
     tenant: String,
     #[arg(long = "label", value_parser = parse_label, help = "Runtime identity and placement labels; use admin-managed tenant policy for tenant-scoped routing/resource policy")]
     labels: Vec<(String, String)>,
@@ -111,7 +115,11 @@ struct Args {
     routed_writes: bool,
     #[arg(long, default_value_t = 1)]
     replica_count: usize,
-    #[arg(long, default_value_t = 2, help = "Compatibility fallback WRH route-authority fanout; prefer admin-managed tenant policy in metadata")]
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Compatibility fallback WRH route-authority fanout; prefer admin-managed tenant policy in metadata"
+    )]
     route_topk: usize,
     #[arg(long)]
     keyspace: Option<String>,
@@ -310,16 +318,24 @@ fn graceful_shutdown(
     ))
 }
 
-fn emit_compat_warnings(args: &Args) {
+fn compat_warnings(args: &Args) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
     if args.route_topk != 2 {
-        eprintln!(
-            "[WARN] --route-topk is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata"
+        warnings.push(
+            "[WARN] --route-topk is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata",
         );
     }
     if args.route_control != RouteControlArg::EmbeddedWrh {
-        eprintln!(
-            "[WARN] --route-control is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata"
+        warnings.push(
+            "[WARN] --route-control is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata",
         );
+    }
+    warnings
+}
+
+fn emit_compat_warnings(args: &Args) {
+    for warning in compat_warnings(args) {
+        eprintln!("{warning}");
     }
 }
 
@@ -655,6 +671,10 @@ mod tests {
         parse_label, requested_initial_state, resolve_timeout_config, should_activate_after_ready,
         start_metrics_if_needed, started_message, startup_initial_state, stopped_message,
         validate_args, Args, HeartbeatLoopState, InitialStateArg, RouteControlArg,
+        build_runtime_args, compat_warnings, drained_message, effective_heartbeat_interval,
+        emit_compat_warnings, heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms,
+        parse_hugepage_size_arg, parse_label, start_metrics_if_needed, started_message,
+        stopped_message, validate_args, Args, HeartbeatLoopState, InitialStateArg, RouteControlArg,
     };
 
     fn sample_timeouts() -> CompatTimeoutConfig {
@@ -859,15 +879,31 @@ mod tests {
     }
 
     #[test]
-    fn emit_compat_warnings_only_triggers_for_non_default_route_flags() {
-        emit_compat_warnings(&sample_args());
+    fn compat_warnings_only_trigger_for_non_default_route_flags() {
+        assert!(compat_warnings(&sample_args()).is_empty());
 
         let mut args = sample_args();
         args.route_topk = 4;
-        emit_compat_warnings(&args);
+        assert_eq!(
+            compat_warnings(&args),
+            vec![
+                "[WARN] --route-topk is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata"
+            ]
+        );
 
         let mut args = sample_args();
         args.route_control = RouteControlArg::MetadataOnly;
+        assert_eq!(
+            compat_warnings(&args),
+            vec![
+                "[WARN] --route-control is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata"
+            ]
+        );
+
+        let mut args = sample_args();
+        args.route_topk = 4;
+        args.route_control = RouteControlArg::MetadataOnly;
+        assert_eq!(compat_warnings(&args).len(), 2);
         emit_compat_warnings(&args);
     }
 

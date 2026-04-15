@@ -6,10 +6,10 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{init_tracing, RouteControlMode};
 use mooncake_store_core::{
-    ClientEpoch, ClientRuntimeId, MetadataBackend, NamespaceScope, RoutePolicy,
-    RoutePolicyDomain, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
-    TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
-    TenantRoutePolicy, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
+    ClientEpoch, ClientRuntimeId, MetadataBackend, NamespaceScope, RoutePolicy, RoutePolicyDomain,
+    TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantPlacementPolicy,
+    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy, TenantRoutePolicy,
+    DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
 };
 use url::Url;
 
@@ -418,7 +418,9 @@ fn merge_tenant_policy(
     TenantPolicy {
         scope,
         spec,
-        version: current.map(|policy| policy.version.saturating_add(1)).unwrap_or(1),
+        version: current
+            .map(|policy| policy.version.saturating_add(1))
+            .unwrap_or(1),
         updated_at_ms: now_ms(),
         updated_by: updated_by.to_string(),
     }
@@ -692,12 +694,7 @@ mod tests {
             ..TenantPolicySpec::default()
         };
 
-        let merged = merge_tenant_policy(
-            Some(&current),
-            current.scope.clone(),
-            patch,
-            "new-admin",
-        );
+        let merged = merge_tenant_policy(Some(&current), current.scope.clone(), patch, "new-admin");
         assert_eq!(merged.version, 8);
         assert_eq!(merged.updated_by, "new-admin");
         assert_eq!(

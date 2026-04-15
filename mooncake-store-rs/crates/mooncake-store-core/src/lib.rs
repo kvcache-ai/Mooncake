@@ -23,8 +23,8 @@ pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,
     RouteControlMode, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, TenantBandwidthShapingPolicy,
-    TenantExecutionFairnessPolicy, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
-    TenantPolicySpec, TenantQuotaPolicy, TenantRoutePolicy,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantPlacementPolicy,
+    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy, TenantRoutePolicy,
 };
 pub use traits::{MetadataBackend, PlacementStrategy, RouteDirectory};

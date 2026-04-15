@@ -80,13 +80,17 @@ impl MetadataKeyspace {
 
     pub fn route_policy(&self, domain: &RoutePolicyDomain) -> String {
         match domain {
-            RoutePolicyDomain::Default => format!("{}/system/route-policy/default", self.prefix),
+            RoutePolicyDomain::Default => format!("{}default", self.route_policy_prefix()),
             RoutePolicyDomain::Tenant(tenant) => format!(
-                "{}/system/route-policy/tenants/{}",
-                self.prefix,
+                "{}tenants/{}",
+                self.route_policy_prefix(),
                 encode_key_component(tenant)
             ),
         }
+    }
+
+    pub fn route_policy_prefix(&self) -> String {
+        format!("{}/system/route-policy/", self.prefix)
     }
 
     pub fn tenant_policy(&self, scope: &TenantPolicyScope) -> String {
@@ -130,10 +134,10 @@ pub fn parse_route_policy_domain(
     if key == default {
         return Some(RoutePolicyDomain::Default);
     }
-    let tenant_prefix = format!("{}/system/route-policy/tenants/", keyspace.prefix());
+    let tenant_prefix = format!("{}tenants/", keyspace.route_policy_prefix());
     let encoded = key.strip_prefix(&tenant_prefix)?;
     Some(RoutePolicyDomain::Tenant(
-        decode_key_component(encoded).into_owned(),
+        decode_key_component_checked(encoded)?.into_owned(),
     ))
 }
 
@@ -144,16 +148,16 @@ pub fn parse_tenant_policy_scope(
     let prefix = format!("{}/system/tenant-policy/tenants/", keyspace.prefix());
     let rest = key.strip_prefix(&prefix)?;
     let mut parts = rest.split('/');
-    let tenant = decode_key_component(parts.next()?).into_owned();
+    let tenant = decode_key_component_checked(parts.next()?)?.into_owned();
     let mut domain = None;
     let mut object_set = None;
     while let Some(part) = parts.next() {
         match part {
             "domains" => {
-                domain = Some(decode_key_component(parts.next()?).into_owned());
+                domain = Some(decode_key_component_checked(parts.next()?)?.into_owned());
             }
             "object-sets" => {
-                object_set = Some(decode_key_component(parts.next()?).into_owned());
+                object_set = Some(decode_key_component_checked(parts.next()?)?.into_owned());
             }
             _ => return None,
         }
@@ -183,26 +187,26 @@ fn encode_key_component(value: &str) -> String {
     encoded
 }
 
-fn decode_key_component(value: &str) -> Cow<'_, str> {
+fn decode_key_component_checked(value: &str) -> Option<Cow<'_, str>> {
     if !value.contains('%') {
-        return Cow::Borrowed(value);
+        return Some(Cow::Borrowed(value));
     }
-    let mut decoded = String::with_capacity(value.len());
     let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
             let hex = &value[index + 1..index + 3];
             if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                decoded.push(byte as char);
+                decoded.push(byte);
                 index += 3;
                 continue;
             }
         }
-        decoded.push(bytes[index] as char);
+        decoded.push(bytes[index]);
         index += 1;
     }
-    Cow::Owned(decoded)
+    String::from_utf8(decoded).ok().map(Cow::Owned)
 }
 
 impl Default for MetadataKeyspace {
@@ -217,7 +221,7 @@ mod tests {
         ClientEpoch, ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName,
     };
 
-    use super::{parse_route_policy_domain, MetadataKeyspace};
+    use super::{parse_route_policy_domain, parse_tenant_policy_scope, MetadataKeyspace};
 
     #[test]
     fn keyspace_builds_scoped_keys_and_patterns() {
@@ -283,5 +287,38 @@ mod tests {
             parse_route_policy_domain(&keyspace, &tenant_key),
             Some(RoutePolicyDomain::Tenant("tenant/a".to_string()))
         );
+    }
+
+    #[test]
+    fn keyspace_prefix_helpers_cover_route_and_tenant_policy_namespaces() {
+        let keyspace = MetadataKeyspace::new("tenant-a");
+        assert_eq!(
+            keyspace.route_policy_prefix(),
+            "tenant-a/system/route-policy/"
+        );
+        assert_eq!(
+            keyspace.tenant_policy_prefix(Some("tenant/a")),
+            "tenant-a/system/tenant-policy/tenants/tenant%2Fa/"
+        );
+    }
+
+    #[test]
+    fn tenant_policy_scope_parser_round_trips_encoded_components() {
+        let keyspace = MetadataKeyspace::new("tenant-a");
+        let scope = mooncake_store_core::TenantPolicyScope::new(
+            "tenant/a",
+            Some("domain/b"),
+            Some("object-set/c"),
+        );
+        let key = keyspace.tenant_policy(&scope);
+
+        assert_eq!(parse_tenant_policy_scope(&keyspace, &key), Some(scope));
+    }
+
+    #[test]
+    fn tenant_policy_scope_parser_rejects_invalid_utf8_percent_sequences() {
+        let keyspace = MetadataKeyspace::new("tenant-a");
+        let key = "tenant-a/system/tenant-policy/tenants/%FF";
+        assert_eq!(parse_tenant_policy_scope(&keyspace, key), None);
     }
 }

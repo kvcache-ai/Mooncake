@@ -302,6 +302,9 @@ impl<'a> PutFromRequest<'a> {
 #[derive(Debug)]
 pub struct GetRequest<'a> {
     pub tenant: Option<&'a str>,
+    pub domain: Option<&'a str>,
+    pub object_set: Option<&'a str>,
+    pub qos_tier: Option<&'a str>,
     pub key: &'a str,
     pub buffer: &'a mut [u8],
 }
@@ -357,6 +360,9 @@ impl<'a> MultiBufferPutRequest<'a> {
 
 pub struct MultiBufferGetRequest<'a> {
     pub tenant: Option<&'a str>,
+    pub domain: Option<&'a str>,
+    pub object_set: Option<&'a str>,
+    pub qos_tier: Option<&'a str>,
     pub key: &'a str,
     pub buffers: &'a mut [&'a mut [u8]],
 }
@@ -365,6 +371,9 @@ impl<'a> MultiBufferGetRequest<'a> {
     pub fn new(key: &'a str, buffers: &'a mut [&'a mut [u8]]) -> Self {
         Self {
             tenant: None,
+            domain: None,
+            object_set: None,
+            qos_tier: None,
             key,
             buffers,
         }
@@ -374,12 +383,30 @@ impl<'a> MultiBufferGetRequest<'a> {
         self.tenant = Some(tenant);
         self
     }
+
+    pub fn domain(mut self, domain: &'a str) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+
+    pub fn object_set(mut self, object_set: &'a str) -> Self {
+        self.object_set = Some(object_set);
+        self
+    }
+
+    pub fn qos_tier(mut self, qos_tier: &'a str) -> Self {
+        self.qos_tier = Some(qos_tier);
+        self
+    }
 }
 
 impl<'a> GetRequest<'a> {
     pub fn new(key: &'a str, buffer: &'a mut [u8]) -> Self {
         Self {
             tenant: None,
+            domain: None,
+            object_set: None,
+            qos_tier: None,
             key,
             buffer,
         }
@@ -387,6 +414,21 @@ impl<'a> GetRequest<'a> {
 
     pub fn tenant(mut self, tenant: &'a str) -> Self {
         self.tenant = Some(tenant);
+        self
+    }
+
+    pub fn domain(mut self, domain: &'a str) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+
+    pub fn object_set(mut self, object_set: &'a str) -> Self {
+        self.object_set = Some(object_set);
+        self
+    }
+
+    pub fn qos_tier(mut self, qos_tier: &'a str) -> Self {
+        self.qos_tier = Some(qos_tier);
         self
     }
 }

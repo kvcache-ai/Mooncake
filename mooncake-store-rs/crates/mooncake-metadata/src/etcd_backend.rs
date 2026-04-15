@@ -496,7 +496,7 @@ impl MetadataBackend for EtcdMetadataBackend {
     }
 
     fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
-        let prefix = format!("{}/system/route-policy/", self.config.keyspace.prefix());
+        let prefix = self.config.keyspace.route_policy_prefix();
         self.block_on(async {
             let mut client = self.client().await?;
             let response = client
@@ -575,7 +575,9 @@ impl MetadataBackend for EtcdMetadataBackend {
                 let current = response
                     .kvs()
                     .first()
-                    .map(|kv| serde_json::from_slice::<TenantPolicy>(kv.value()).map_err(json_error))
+                    .map(|kv| {
+                        serde_json::from_slice::<TenantPolicy>(kv.value()).map_err(json_error)
+                    })
                     .transpose()?;
                 match (expected_version, current.as_ref()) {
                     (None, None) => {}
@@ -639,7 +641,9 @@ impl MetadataBackend for EtcdMetadataBackend {
                 let current = response
                     .kvs()
                     .first()
-                    .map(|kv| serde_json::from_slice::<TenantPolicy>(kv.value()).map_err(json_error))
+                    .map(|kv| {
+                        serde_json::from_slice::<TenantPolicy>(kv.value()).map_err(json_error)
+                    })
                     .transpose()?;
                 let Some(current) = current else {
                     return Ok(false);

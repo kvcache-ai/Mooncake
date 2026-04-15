@@ -17,6 +17,12 @@ pub fn parse_legacy_scoped_key(key: &ObjectKey) -> Result<LogicalObjectId> {
     let (tenant, logical_key) = key.0.split_once("::").ok_or_else(|| {
         StoreError::InvalidState(format!("route key {} is missing tenant scope", key.0))
     })?;
+    if tenant.is_empty() || logical_key.is_empty() {
+        return Err(StoreError::InvalidState(format!(
+            "route key {} must include non-empty tenant and logical key",
+            key.0
+        )));
+    }
     Ok(scoped_logical_object_id(tenant, logical_key))
 }
 
@@ -133,6 +139,17 @@ mod tests {
         let error =
             parse_legacy_scoped_key(&ObjectKey::new("plain-key")).expect_err("key should fail");
         assert!(matches!(error, StoreError::InvalidState(_)));
+    }
+
+    #[test]
+    fn parse_legacy_scoped_key_rejects_empty_components() {
+        let missing_tenant =
+            parse_legacy_scoped_key(&ObjectKey::new("::key")).expect_err("tenant should fail");
+        assert!(matches!(missing_tenant, StoreError::InvalidState(_)));
+
+        let missing_logical_key = parse_legacy_scoped_key(&ObjectKey::new("tenant::"))
+            .expect_err("logical key should fail");
+        assert!(matches!(missing_logical_key, StoreError::InvalidState(_)));
     }
 
     #[test]

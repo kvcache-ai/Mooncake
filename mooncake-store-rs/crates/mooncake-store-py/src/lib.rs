@@ -1538,12 +1538,15 @@ mod tests {
     use mooncake_store_client::{
         snapshot_metrics, LocalMemoryConfig, MooncakeCompatibilityFacade, RouteControlMode,
         StoreClient, StoreClientBuilder, StoreTransport,
+        snapshot_metrics, LocalMemoryConfig, PlacementPlanner, StoreClient, StoreClientBuilder,
+        StoreTransport,
     };
     use mooncake_store_core::{
         CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
         CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute,
         ReplicaRoute, ReplicaTier, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
         SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
+        TenantPolicy, TenantPolicyScope,
     };
     use mooncake_transport::{
         Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
@@ -1601,6 +1604,7 @@ mod tests {
                 })),
             }
         }
+
     }
 
     impl StoreTransport for TestTransport {
@@ -1861,9 +1865,21 @@ mod tests {
         state: ClientLifecycleState,
     ) -> StoreClient {
         let transport = Arc::new(TestTransport::new(&format!("{name}-segment")));
+        build_client_with_metadata_and_transport(name, metadata, transport)
+    }
+
+    fn build_client_with_metadata_and_transport(
+        name: &str,
+        metadata: Arc<dyn MetadataBackend>,
+        transport: Arc<TestTransport>,
+    ) -> StoreClient {
+        let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
         StoreClientBuilder::new(metadata, name)
             .epoch(ClientEpoch(1))
             .state(state)
+            .state(ClientLifecycleState::Active)
+            .label("storage", "true")
+            .live_client_sync_interval(Duration::from_millis(25))
             .compatibility(CompatibilityDescriptor::default())
             .route_control(RouteControlMode::MetadataOnly)
             .transport(transport)
@@ -1875,6 +1891,7 @@ mod tests {
                     .alignment(1)
                     .reclaim_grace_ms(0),
             )
+            .routed_writes(planner, 1)
             .build(60_000)
             .expect("test store client should build")
     }
@@ -2068,6 +2085,33 @@ mod tests {
             &self,
         ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
             self.inner.list_route_policies()
+        }
+
+        fn get_tenant_policy(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+            self.inner.get_tenant_policy(scope)
+        }
+
+        fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+            self.inner.list_tenant_policies()
+        }
+
+        fn put_tenant_policy(
+            &self,
+            policy: &TenantPolicy,
+            expected_version: Option<u64>,
+        ) -> mooncake_store_core::Result<TenantPolicy> {
+            self.inner.put_tenant_policy(policy, expected_version)
+        }
+
+        fn delete_tenant_policy(
+            &self,
+            scope: &TenantPolicyScope,
+            expected_version: Option<u64>,
+        ) -> mooncake_store_core::Result<bool> {
+            self.inner.delete_tenant_policy(scope, expected_version)
         }
 
         fn put_handoff(&self, handoff: &HandoffPlan) -> mooncake_store_core::Result<()> {
@@ -2682,7 +2726,16 @@ mod tests {
     #[test]
     fn real_store_supports_core_python_compat_api() {
         init_python();
-        let mut store = build_real_store("py-real");
+        let mut store = PyMooncakeDistributedStore::new();
+        store.replace_backend(StoreBackend::Real(
+            StoreDispatcher::spawn(build_client("py-real"), "dispatcher-py-real")
+                .expect("dispatcher should spawn"),
+        ));
+        store
+            .real_dispatcher()
+            .expect("real dispatcher should be installed")
+            .register_local_memory()
+            .expect("local memory should register");
         assert_eq!(
             store
                 .health_check()
@@ -3003,6 +3056,15 @@ mod tests {
 
         store.enter_draining().expect("draining should succeed");
         let _ = store.evacuate_owned_replicas();
+        match store.evacuate_owned_replicas() {
+            Ok(_) => {}
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("not enough writable placement targets"),
+                    "unexpected shrink result: {error:?}"
+                );
+            }
+        }
 
         store.close();
         assert!(store.get_hostname().is_err());

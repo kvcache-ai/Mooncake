@@ -7,6 +7,7 @@ use mooncake_store_core::{
     SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
     TenantPolicy, TenantPolicyScope,
 };
+use redis::cmd;
 use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
 
 use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
@@ -218,15 +219,16 @@ if not current_payload then
     end
 else
     local current = cjson.decode(current_payload)
-    local current_version = tostring(current['version'])
-    if expected == '__none__' or current_version ~= expected then
+    local current_version = tonumber(current['version'])
+    local expected_version = tonumber(expected)
+    if expected == '__none__' or current_version ~= expected_version then
         return {0, current_payload}
     end
 end
 
 if payload == '__delete__' then
     redis.call('DEL', key)
-    return {1, ''}
+    return {1, current_payload or ''}
 end
 
 redis.call('SET', key, payload)
@@ -521,10 +523,7 @@ impl RedisMetadataBackend {
             .smembers(&global_index)
             .map_err(|error| metadata_error("redis smembers segment index", error))?;
         if keys.is_empty() {
-            keys = redis::cmd("KEYS")
-                .arg(self.keyspace.segment_pattern(None))
-                .query(&mut connection)
-                .map_err(|error| metadata_error("redis keys segments", error))?;
+            keys = scan_keys(&mut connection, &self.keyspace.segment_pattern(None))?;
         }
 
         let mut report = RedisMetadataCleanupReport {
@@ -657,6 +656,25 @@ fn duration_from_env_ms(name: &str, default: Duration) -> Duration {
         .unwrap_or(default)
 }
 
+fn scan_keys(connection: &mut redis::Connection, pattern: &str) -> Result<Vec<String>> {
+    let mut cursor = 0u64;
+    let mut keys = Vec::new();
+    loop {
+        let (next, batch): (u64, Vec<String>) = cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .query(connection)
+            .map_err(|error| metadata_error("redis scan keys", error))?;
+        keys.extend(batch);
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    Ok(keys)
+}
+
 impl MetadataBackend for RedisMetadataBackend {
     fn route_namespace(&self) -> String {
         self.route_namespace.clone()
@@ -716,6 +734,16 @@ impl MetadataBackend for RedisMetadataBackend {
             connection
                 .sadd::<_, _, ()>(&index, keys.clone())
                 .map_err(|error| metadata_error("redis sadd legacy client index", error))?;
+        let mut keys: Vec<String> = connection
+            .smembers(&index)
+            .map_err(|error| metadata_error("redis smembers client index", error))?;
+        if keys.is_empty() {
+            keys = scan_keys(&mut connection, &self.keyspace.client_pattern())?;
+            if !keys.is_empty() {
+                connection
+                    .sadd::<_, _, ()>(&index, keys.clone())
+                    .map_err(|error| metadata_error("redis sadd legacy client index", error))?;
+            }
         }
         let entries = self.query_readonly("redis fetch client leases", |connection| {
             let mut entries = Vec::with_capacity(keys.len());
@@ -801,6 +829,12 @@ impl MetadataBackend for RedisMetadataBackend {
             }
             Ok(entries)
         })?;
+        let mut keys: Vec<String> = connection
+            .smembers(&index)
+            .map_err(|error| metadata_error("redis smembers segment index", error))?;
+        if keys.is_empty() {
+            keys = scan_keys(&mut connection, &self.keyspace.segment_pattern(owner))?;
+        }
         let mut stale = Vec::new();
         let mut segments = Vec::with_capacity(entries.len());
         for (key, payload) in entries {
@@ -932,6 +966,12 @@ impl MetadataBackend for RedisMetadataBackend {
                 Ok((entries, backfill_index))
             })?;
 
+        let mut keys: Vec<String> = connection
+            .smembers(&index)
+            .map_err(|error| metadata_error("redis smembers object index", error))?;
+        if keys.is_empty() {
+            keys = scan_keys(&mut connection, &self.keyspace.object_pattern())?;
+        }
         let mut stale = Vec::new();
         let mut live_keys = Vec::new();
         let mut routes = Vec::with_capacity(entries.len());
@@ -1045,10 +1085,8 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
         let mut connection = self.connection()?;
-        let prefix = format!("{}/system/route-policy/", self.keyspace.prefix());
-        let keys: Vec<String> = connection
-            .keys(format!("{}*", prefix))
-            .map_err(|error| metadata_error("redis keys route policy", error))?;
+        let prefix = self.keyspace.route_policy_prefix();
+        let keys = scan_keys(&mut connection, &format!("{}*", prefix))?;
         let mut policies = Vec::new();
         for key in keys {
             let payload: Option<String> = connection
@@ -1080,9 +1118,7 @@ impl MetadataBackend for RedisMetadataBackend {
     fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
         let mut connection = self.connection()?;
         let prefix = self.keyspace.tenant_policy_prefix(None);
-        let keys: Vec<String> = connection
-            .keys(format!("{}*", prefix))
-            .map_err(|error| metadata_error("redis keys tenant policy", error))?;
+        let keys = scan_keys(&mut connection, &format!("{}*", prefix))?;
         let mut policies: Vec<TenantPolicy> = Vec::new();
         for key in keys {
             let payload: Option<String> = connection
@@ -1165,7 +1201,7 @@ impl MetadataBackend for RedisMetadataBackend {
             .invoke::<(i32, String)>(&mut connection)
             .map_err(|error| metadata_error("redis delete tenant policy", error))?;
         if result.0 == 1 {
-            return Ok(!result.1.is_empty());
+            return Ok(true);
         }
         let current = if result.1.is_empty() {
             None
