@@ -1159,6 +1159,10 @@ fn wait_for_membership_convergence(clients: &[&StoreClient]) {
     }
 }
 
+fn tc_replica2_payload(key: &str) -> Vec<u8> {
+    format!("tc-replica2-payload::{key}").into_bytes()
+}
+
 #[test]
 fn hot_upgrade_handoff_is_published_after_draining() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
@@ -2909,6 +2913,310 @@ fn route_lookup_many_records_miss_after_killed_single_replica_is_quarantined() {
                 && snapshot.status == "error")),
         "route lookup miss should not be counted as an error"
     );
+}
+
+#[test]
+fn tc05_style_replica2_kill_hash_prefix_changes_victim_coverage() {
+    const NUM_KEYS: usize = 30;
+
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("tc05-hash-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("tc05-hash-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("tc05-hash-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("tc05-hash-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("tc05-hash-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "tc05-hash-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "tc05-hash-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "tc05-hash-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "tc05-hash-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "tc05-hash-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "tc05-hash-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-c build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "tc05-hash-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "tc05-hash-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 2)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "tc05-hash-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "tc05-hash-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
+
+    let victim = store_a.runtime_id().clone();
+    let ownership_pattern = |prefix: &str| -> Vec<(String, bool)> {
+        let mut result = Vec::with_capacity(NUM_KEYS);
+        for index in 0..NUM_KEYS {
+            let key = format!("{prefix}-{index}");
+            let payload = tc_replica2_payload(&key);
+            let route = writer
+                .put_with_policy(
+                    &key,
+                    &payload,
+                    &ReplicationPolicy::new()
+                        .replica_count(2)
+                        .prefer_local(false),
+                )
+                .expect("replica=2 put should succeed");
+            let victim_owned = route.replicas.iter().any(|replica| replica.owner == victim);
+            result.push((key, victim_owned));
+        }
+        result
+    };
+
+    let tcp_pattern = ownership_pattern("tc-replica2-tcp");
+    let rdma_pattern = ownership_pattern("tc-replica2-rdma");
+    let tcp_victim_owned = tcp_pattern
+        .iter()
+        .filter(|(_, victim_owned)| *victim_owned)
+        .count();
+    let rdma_victim_owned = rdma_pattern
+        .iter()
+        .filter(|(_, victim_owned)| *victim_owned)
+        .count();
+
+    assert!(
+        tcp_victim_owned > 0 && tcp_victim_owned < NUM_KEYS,
+        "TC-05 style free placement should leave some keys on victim and some keys away from victim",
+    );
+    assert!(
+        rdma_victim_owned > 0 && rdma_victim_owned < NUM_KEYS,
+        "TC-10 style key prefix should also only cover victim on a subset of keys",
+    );
+    assert_ne!(
+        tcp_pattern
+            .iter()
+            .map(|(_, victim_owned)| *victim_owned)
+            .collect::<Vec<_>>(),
+        rdma_pattern
+            .iter()
+            .map(|(_, victim_owned)| *victim_owned)
+            .collect::<Vec<_>>(),
+        "changing only the key prefix should perturb which keys place a replica on the killed node",
+    );
+
+    let tcp_key_without_victim = tcp_pattern
+        .iter()
+        .find_map(|(key, victim_owned)| (!*victim_owned).then_some(key.clone()))
+        .expect("tc-replica2-tcp should include a key that never touched victim");
+    let tcp_key_with_victim = tcp_pattern
+        .iter()
+        .find_map(|(key, victim_owned)| (*victim_owned).then_some(key.clone()))
+        .expect("tc-replica2-tcp should include a key that used victim");
+
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("tc05-hash-a-segment")
+            .expect("victim segment handle should exist");
+        state
+            .segments_by_handle
+            .remove(&handle)
+            .expect("victim segment body should exist");
+    }
+
+    assert_eq!(
+        reader
+            .get(&tcp_key_without_victim)
+            .expect("key that never used victim should still read"),
+        tc_replica2_payload(&tcp_key_without_victim),
+    );
+    assert_eq!(
+        reader
+            .get(&tcp_key_with_victim)
+            .expect("key that lost victim should fail over to its surviving replica"),
+        tc_replica2_payload(&tcp_key_with_victim),
+    );
+}
+
+#[test]
+fn tc05_style_replica2_kill_survives_when_every_key_loses_victim_replica() {
+    const NUM_KEYS: usize = 30;
+
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("tc05-forced-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("tc05-forced-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("tc05-forced-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("tc05-forced-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("tc05-forced-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "tc05-forced-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "tc05-forced-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "tc05-forced-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "tc05-forced-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "tc05-forced-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "tc05-forced-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-c build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "tc05-forced-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "tc05-forced-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 2)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "tc05-forced-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "tc05-forced-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
+
+    let victim = store_a.runtime_id().clone();
+    let survivor = store_b.runtime_id().clone();
+
+    for index in 0..NUM_KEYS {
+        let key = format!("tc-replica2-forced-{index}");
+        let payload = tc_replica2_payload(&key);
+        let route = writer
+            .put_with_policy(
+                &key,
+                &payload,
+                &ReplicationPolicy::new()
+                    .replica_count(2)
+                    .prefer_local(false)
+                    .preferred_storage_owners([victim.storage_key(), survivor.storage_key()]),
+            )
+            .expect("forced victim+survivor put should succeed");
+        let owners = route
+            .replicas
+            .iter()
+            .map(|replica| replica.owner.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            owners,
+            BTreeSet::from([victim.clone(), survivor.clone()]),
+            "each TC-05 key must actually lose one replica on the victim after kill",
+        );
+    }
+
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("tc05-forced-a-segment")
+            .expect("victim segment handle should exist");
+        state
+            .segments_by_handle
+            .remove(&handle)
+            .expect("victim segment body should exist");
+    }
+
+    for index in 0..NUM_KEYS {
+        let key = format!("tc-replica2-forced-{index}");
+        assert_eq!(
+            reader
+                .get(&key)
+                .expect("reader should fail over to the surviving forced replica"),
+            tc_replica2_payload(&key),
+        );
+    }
 }
 
 #[test]
