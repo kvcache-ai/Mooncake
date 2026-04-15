@@ -250,8 +250,7 @@ std::string getMachineID() {
     if (!machine_id.empty()) return machine_id;
 
     std::string content = "undefined_machine_";
-    for (int i = 0; i < 16; ++i)
-        content += 'a' + SimpleRandom::Get().next(26);
+    for (int i = 0; i < 16; ++i) content += 'a' + SimpleRandom::Get().next(26);
     LOG(WARNING) << "TENT getMachineID source=fallback value=" << content;
     return content;
 }
