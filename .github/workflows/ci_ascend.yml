@@ -15,8 +15,8 @@ jobs:
 
     container:
       image: localhost:5000/mooncake-hixl-ci:v5
-      options: --privileged --user 0:0 --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3 
-                    --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7 
+      options: --privileged --user 0:0 --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+                    --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
                     --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc --ulimit nproc=65535:65535
       env:
         GITHUB_ACTIONS: "true"
@@ -28,6 +28,63 @@ jobs:
         - /etc/hccn.conf:/etc/hccn.conf
 
     steps:
+    - name: Configure GitHub fetch fallback
+      shell: bash
+      env:
+        ASCEND_GITHUB_MIRROR_URLS: ${{ vars.ASCEND_GITHUB_MIRROR_URLS }}
+      run: |
+        set -euo pipefail
+
+        git config --global protocol.version 2
+        git config --global http.version HTTP/1.1
+        git config --global http.lowSpeedLimit 1024
+        git config --global http.lowSpeedTime 30
+
+        if [ -z "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
+          echo "ASCEND_GITHUB_MIRROR_URLS is not set, using direct GitHub"
+          exit 0
+        fi
+
+        normalize_base() {
+          local base="$1"
+          base="${base#${base%%[![:space:]]*}}"
+          base="${base%${base##*[![:space:]]}}"
+          [ -n "$base" ] || return 1
+          [ "$base" = "https://github.com" ] && base="https://github.com/"
+          [ "$base" != "https://github.com/" ] && base="${base%/}/"
+          printf '%s\n' "$base"
+        }
+
+        candidates=()
+        while IFS= read -r raw; do
+          base="$(normalize_base "$raw" || true)"
+          [ -n "$base" ] && candidates+=("$base")
+        done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
+        candidates+=("https://github.com/")
+
+        for base in "${candidates[@]}"; do
+          if [ "$base" = "https://github.com/" ]; then
+            test_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          else
+            test_url="${base}https://github.com/${GITHUB_REPOSITORY}.git"
+          fi
+
+          echo "Probing ${test_url}"
+          if git ls-remote --exit-code "$test_url" HEAD >/dev/null 2>&1; then
+            if [ "$base" = "https://github.com/" ]; then
+              echo "Using direct GitHub"
+            else
+              git config --global url."${base}https://github.com/".insteadOf https://github.com/
+              echo "Using GitHub mirror prefix: ${base}"
+            fi
+            exit 0
+          fi
+
+          echo "Probe failed for ${base}, trying next candidate"
+        done
+
+        echo "No reachable GitHub mirror found, using direct GitHub"
+
     - name: Checkout code
       uses: actions/checkout@v4
       with:
@@ -120,7 +177,7 @@ jobs:
           # Check if master is running
           if ! kill -0 $MASTER_PID 2>/dev/null; then
               echo "Error: Mooncake Master failed to start"
-              cat /tmp/mooncake_master.log 
+              cat /tmp/mooncake_master.log
               exit 1
           fi
 
@@ -244,7 +301,7 @@ jobs:
 
           echo ""
           echo "All Hixl Mooncake Store tests completed successfully!"
-          
+
 
     - name: Test Summary
       if: always()
