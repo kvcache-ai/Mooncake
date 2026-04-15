@@ -2,8 +2,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
-    ClassicTeTransportFactory, LocalMemoryConfig, PlacementPlanner, RouteControlMode, StoreClient,
-    StoreClientBuilder, StoreTransportFactory, TentTransportFactory,
+    http_transport_label, ClassicTeTransportFactory, HttpStoreTransportFactory,
+    HttpTransportServerHandle, LocalMemoryConfig, MooncakeCompatibilityFacade,
+    PlacementPlanner, RouteControlMode, StoreClient, StoreClientBuilder, StoreTransportFactory,
+    TentTransportFactory,
 };
 use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
 
@@ -19,6 +21,7 @@ pub struct CompatRuntime {
     pub segment_name: String,
     pub expires_at_ms: u64,
     pub lease_ttl_ms: u64,
+    _http_transport_server: Option<HttpTransportServerHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,11 +45,22 @@ impl CompatRuntimeArgs {
             .local_segment_name
             .unwrap_or_else(|| default_segment_name(&stable_id));
         let transport_config = plan.transport_config.clone();
+        let http_transport_server = match transport_config {
+            CompatTransportConfig::Http => Some(HttpTransportServerHandle::start("127.0.0.1:0")?),
+            _ => None,
+        };
         let factory: Arc<dyn StoreTransportFactory> = match transport_config {
             CompatTransportConfig::Tent(config) => Arc::new(TentTransportFactory::new(config)),
             CompatTransportConfig::ClassicTe(config) => {
                 Arc::new(ClassicTeTransportFactory::new(config))
             }
+            CompatTransportConfig::Http => Arc::new(HttpStoreTransportFactory::new(
+                plan.metadata.clone(),
+                http_transport_server
+                    .as_ref()
+                    .map(|server| server.address().to_string())
+                    .unwrap_or_default(),
+            )),
         };
         let transport = factory.create(&segment_name)?;
         let mut local_memory = LocalMemoryConfig::new()
@@ -61,7 +75,7 @@ impl CompatRuntimeArgs {
             local_memory = local_memory.hugepage_size_bytes(hugepage_size_bytes);
         }
 
-        let mut builder = StoreClientBuilder::new(plan.metadata, stable_id.clone())
+        let mut builder = StoreClientBuilder::new(plan.metadata.clone(), stable_id.clone())
             .epoch(self.epoch)
             .state(self.initial_state)
             .activate_on_local_memory_registration()
@@ -78,6 +92,9 @@ impl CompatRuntimeArgs {
         for (key, value) in plan.labels {
             builder = builder.label(key, value);
         }
+        if let Some(server) = http_transport_server.as_ref() {
+            builder = builder.label(http_transport_label(), server.address());
+        }
         if let Some(metadata) = planner_metadata {
             builder = builder.routed_writes(
                 PlacementPlanner::new(metadata).require_label("storage", "true"),
@@ -85,14 +102,21 @@ impl CompatRuntimeArgs {
             );
         }
 
+        let client = builder.build(expires_at_ms)?;
+        if let Some(server) = http_transport_server.as_ref() {
+            client.register_local_memory()?;
+            server.publish_segment(&segment_name, client.local_memory_base_addr()?, plan.storage_bytes);
+        }
+
         Ok(CompatRuntime {
-            client: builder.build(expires_at_ms)?,
+            client,
             stable_id,
             epoch: self.epoch,
             initial_state: self.initial_state,
             segment_name,
             expires_at_ms,
             lease_ttl_ms,
+            _http_transport_server: http_transport_server,
         })
     }
 }
@@ -348,6 +372,59 @@ mod tests {
         assert_eq!(route.replicas[0].owner.stable_id.0, writer.stable_id);
         assert!(writer.segment_name.contains("runtime-writer-segment"));
         assert!(reader.expires_at_ms >= now_ms());
+    }
+
+    #[test]
+    fn runtime_builds_http_transport_clients_and_moves_remote_bytes() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let metadata_url = format!("{}/{}", server.url().trim_end_matches("/0"), 0);
+
+        let mut writer = sample_args("http", &metadata_url);
+        writer.setup.transport_backend = Some("http".to_string());
+        writer.setup.stable_id = Some("runtime-http-writer".to_string());
+        writer.setup.keyspace = Some("runtime/http".to_string());
+        writer.local_segment_name = Some("runtime-http-writer-segment".to_string());
+        writer.route_control = RouteControlMode::MetadataOnly;
+
+        let mut reader = sample_args("http", &metadata_url);
+        reader.setup.transport_backend = Some("http".to_string());
+        reader.setup.stable_id = Some("runtime-http-reader".to_string());
+        reader.setup.keyspace = Some("runtime/http".to_string());
+        reader.local_segment_name = Some("runtime-http-reader-segment".to_string());
+        reader.route_control = RouteControlMode::MetadataOnly;
+
+        let writer = writer.build().expect("writer http runtime should build");
+        let reader = reader.build().expect("reader http runtime should build");
+
+        writer
+            .client
+            .put("alpha", b"hello-http")
+            .expect("writer put should succeed over http transport");
+        writer
+            .client
+            .batch_put(&[
+                PutRequest::new("beta", b"beta"),
+                PutRequest::new("gamma", b"gamma"),
+            ])
+            .expect("writer batch put should succeed over http transport");
+
+        assert_eq!(
+            reader
+                .client
+                .get("alpha")
+                .expect("reader get should succeed over http transport"),
+            b"hello-http"
+        );
+        assert_eq!(
+            reader
+                .client
+                .batch_get(&[ObjectRef::new("beta"), ObjectRef::new("gamma")])
+                .expect("reader batch get should succeed over http transport"),
+            vec![b"beta".to_vec(), b"gamma".to_vec()]
+        );
     }
 
     #[test]

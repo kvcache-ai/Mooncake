@@ -5602,6 +5602,69 @@ fn routed_put_emits_transport_pacing_hints() {
 }
 
 #[test]
+fn routed_batch_put_emits_transport_pacing_hints() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-batch-put-pacing-segment"));
+    let remote_owner = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-batch-put-pacing",
+        "seg-batch-put-pacing",
+        "pool-a",
+        1024,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "writer-batch-put-pacing")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .bandwidth_shaping(BandwidthShaping::new().max_inflight_bytes_per_batch(11))
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    writer
+        .batch_put(&[
+            PutRequest::new("paced-a", b"aaaa")
+                .tenant("tenant-a")
+                .replication(
+                    ReplicationPolicy::new()
+                        .prefer_local(false)
+                        .preferred_storage_owner(remote_owner.storage_key()),
+                ),
+            PutRequest::new("paced-b", b"bbbb")
+                .tenant("tenant-b")
+                .replication(
+                    ReplicationPolicy::new()
+                        .prefer_local(false)
+                        .preferred_storage_owner(remote_owner.storage_key()),
+                ),
+        ])
+        .expect("batch routed put should succeed");
+
+    let hints = transport.submitted_batch_hints();
+    assert!(
+        hints.iter().any(|hint| {
+            hint.0.as_deref() == Some("tenant:tenant-a")
+                && hint.1 == TransferPacingMode::ThroughputOptimized
+                && hint.2 == Some(11)
+        }),
+        "hints: {hints:?}"
+    );
+    assert!(
+        hints.iter().any(|hint| {
+            hint.0.as_deref() == Some("tenant:tenant-b")
+                && hint.1 == TransferPacingMode::ThroughputOptimized
+                && hint.2 == Some(11)
+        }),
+        "hints: {hints:?}"
+    );
+}
+
+#[test]
 fn routed_put_shaping_caps_remote_batch_bytes() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-put-shaping-segment"));

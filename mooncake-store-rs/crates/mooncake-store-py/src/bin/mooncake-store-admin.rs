@@ -1,17 +1,17 @@
 use std::error::Error;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
-use _store_rs::config::build_metadata_backend;
+use _store_rs::admin::{
+    format_policy_scope, format_route_policy_domain, redact_redis_url, route_policy_domain,
+    AdminService, PolicyPatchInput,
+};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
 use mooncake_store_client::{init_tracing, RouteControlMode};
 use mooncake_store_core::{
-    ClientEpoch, ClientRuntimeId, MetadataBackend, NamespaceScope, RoutePolicy, RoutePolicyDomain,
-    TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantPlacementPolicy,
-    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy, TenantRoutePolicy,
-    DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
+    MetadataBackend, RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaPolicy,
+    TenantRoutePolicy,
 };
-use url::Url;
 
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-admin")]
@@ -131,29 +131,51 @@ impl From<RouteControlArg> for RouteControlMode {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    init_tracing(args.trace_filter.as_deref())?;
-
-    match &args.command {
-        Command::CleanupStaleSegments => cleanup_stale_segments(&args),
-        Command::Policy { command } => run_policy_command(&args, command),
+impl From<&PolicyValueArgs> for PolicyPatchInput {
+    fn from(values: &PolicyValueArgs) -> Self {
+        Self {
+            route_topk: values.route_topk,
+            route_control: values.route_control.map(Into::into),
+            max_bytes: values.max_bytes,
+            max_objects: values.max_objects,
+            max_remote_batch_items_per_tenant: values.max_remote_batch_items_per_tenant,
+            max_remote_batch_bytes: values.max_remote_batch_bytes,
+            max_remote_batch_burst_items: values.max_remote_batch_burst_items,
+            max_inflight_bytes_per_batch: values.max_inflight_bytes_per_batch,
+            default_replica_count: values.default_replica_count,
+            prefer_local: values.prefer_local,
+            prefer_alloc_in_same_node: values.prefer_alloc_in_same_node,
+            preferred_storage_owners: values.preferred_storage_owners.clone(),
+            preferred_segments: values.preferred_segments.clone(),
+        }
     }
 }
 
-fn run_policy_command(args: &Args, command: &PolicyCommand) -> Result<(), Box<dyn Error>> {
-    let backend = metadata_backend(args)?;
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    init_tracing(args.trace_filter.as_deref())?;
+    let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
+
+    match &args.command {
+        Command::CleanupStaleSegments => cleanup_stale_segments(&service),
+        Command::Policy { command } => run_policy_command(&service, &args, command),
+    }
+}
+
+fn run_policy_command(
+    service: &AdminService,
+    args: &Args,
+    command: &PolicyCommand,
+) -> Result<(), Box<dyn Error>> {
     match command {
-        PolicyCommand::Get { scope, effective } => {
-            get_policy(backend.as_ref(), args, scope, *effective)
-        }
+        PolicyCommand::Get { scope, effective } => get_policy(service, args, scope, *effective),
         PolicyCommand::Set {
             scope,
             values,
             expected_version,
             updated_by,
         } => set_policy(
-            backend.as_ref(),
+            service,
             args,
             scope,
             values,
@@ -163,36 +185,13 @@ fn run_policy_command(args: &Args, command: &PolicyCommand) -> Result<(), Box<dy
         PolicyCommand::Delete {
             scope,
             expected_version,
-        } => delete_policy(backend.as_ref(), args, scope, *expected_version),
-        PolicyCommand::List { tenant } => list_policies(backend.as_ref(), args, tenant.as_deref()),
-    }
-}
-
-fn metadata_backend(args: &Args) -> Result<std::sync::Arc<dyn MetadataBackend>, Box<dyn Error>> {
-    let keyspace = args
-        .keyspace
-        .clone()
-        .map(MetadataKeyspace::new)
-        .unwrap_or_default();
-    let (backend, _) = build_metadata_backend(&args.metadata_url, None, keyspace)?;
-    Ok(backend)
-}
-
-fn route_policy_domain(tenant: Option<&str>) -> RoutePolicyDomain {
-    tenant
-        .map(|tenant| RoutePolicyDomain::Tenant(tenant.to_string()))
-        .unwrap_or(RoutePolicyDomain::Default)
-}
-
-fn format_route_policy_domain(domain: &RoutePolicyDomain) -> String {
-    match domain {
-        RoutePolicyDomain::Default => "default".to_string(),
-        RoutePolicyDomain::Tenant(tenant) => format!("tenant:{tenant}"),
+        } => delete_policy(service, args, scope, *expected_version),
+        PolicyCommand::List { tenant } => list_policies(service, args, tenant.as_deref()),
     }
 }
 
 fn get_policy(
-    backend: &dyn MetadataBackend,
+    service: &AdminService,
     args: &Args,
     scope: &OptionalPolicyScopeArgs,
     effective: bool,
@@ -201,112 +200,87 @@ fn get_policy(
         if scope.domain.is_some() || scope.object_set.is_some() || effective {
             return Err("--domain/--object-set/--effective require --tenant".into());
         }
-        return get_legacy_route_policy(backend, args, None);
+        return get_legacy_route_policy(service, args, None);
     }
 
     let tenant = scope.tenant.as_deref().expect("checked above");
-    let policy_scope = tenant_policy_scope(tenant, scope.domain.as_deref(), scope.object_set.as_deref())?;
+    let response = service.get_tenant_policy(
+        tenant,
+        scope.domain.as_deref(),
+        scope.object_set.as_deref(),
+        effective,
+    )?;
     println!("tenant policy:");
     println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
     println!("  keyspace: {}", current_keyspace(args).prefix());
-    println!("  scope: {}", format_policy_scope(&policy_scope));
-
-    if effective {
-        let policies = backend.list_tenant_policies()?;
-        let namespace = NamespaceScope::with_defaults(
-            Some(tenant),
-            scope.domain.as_deref(),
-            scope.object_set.as_deref(),
-        );
-        let matching = policies
-            .iter()
-            .filter(|policy| policy.scope.matches_namespace(&namespace))
-            .collect::<Vec<_>>();
-        if matching.is_empty() {
-            println!("  status: not found");
-            return Ok(());
+    println!("  scope: {}", format_policy_scope(&response.scope));
+    println!("  effective: {}", response.effective);
+    if response.effective {
+        match response.effective_spec.as_ref() {
+            Some(spec) => print_policy_spec(spec, 2),
+            None => println!("  status: not found"),
         }
-        let resolved = TenantPolicySpec::resolve_for_scope(matching, &namespace);
-        println!("  effective: true");
-        print_policy_spec(&resolved, 2);
-        return Ok(());
-    }
-
-    println!("  effective: false");
-    match backend.get_tenant_policy(&policy_scope)? {
-        Some(policy) => print_tenant_policy(&policy),
-        None => println!("  status: not found"),
+    } else {
+        match response.policy.as_ref() {
+            Some(policy) => print_tenant_policy(policy),
+            None => println!("  status: not found"),
+        }
     }
     Ok(())
 }
 
 fn set_policy(
-    backend: &dyn MetadataBackend,
+    service: &AdminService,
     args: &Args,
     scope: &PolicyScopeArgs,
     values: &PolicyValueArgs,
     expected_version: Option<u64>,
     updated_by: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let scope = tenant_policy_scope(
+    let stored = service.set_tenant_policy(
         &scope.tenant,
         scope.domain.as_deref(),
         scope.object_set.as_deref(),
+        values.into(),
+        expected_version,
+        updated_by,
     )?;
-    let patch = tenant_policy_patch(values)?;
-    if policy_patch_is_empty(&patch) {
-        return Err("at least one policy flag must be provided".into());
-    }
-
-    let current = backend.get_tenant_policy(&scope)?;
-    let policy = merge_tenant_policy(current.as_ref(), scope.clone(), patch, updated_by);
-    let expected = expected_version.or_else(|| current.as_ref().map(|policy| policy.version));
-    let stored = backend.put_tenant_policy(&policy, expected)?;
-    sync_legacy_route_policy(backend, &stored)?;
 
     println!("tenant policy updated:");
     println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
     println!("  keyspace: {}", current_keyspace(args).prefix());
-    println!("  scope: {}", format_policy_scope(&scope));
+    println!("  scope: {}", format_policy_scope(&stored.scope));
     print_tenant_policy(&stored);
     Ok(())
 }
 
 fn delete_policy(
-    backend: &dyn MetadataBackend,
+    service: &AdminService,
     args: &Args,
     scope: &PolicyScopeArgs,
     expected_version: Option<u64>,
 ) -> Result<(), Box<dyn Error>> {
-    let scope = tenant_policy_scope(
+    let removed = service.delete_tenant_policy(
         &scope.tenant,
         scope.domain.as_deref(),
         scope.object_set.as_deref(),
+        expected_version,
     )?;
-    let removed = backend.delete_tenant_policy(&scope, expected_version)?;
-    if removed && is_root_tenant_scope(&scope) {
-        backend.delete_route_policy(&RoutePolicyDomain::Tenant(scope.tenant.clone()))?;
-    }
 
     println!("tenant policy delete:");
     println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
     println!("  keyspace: {}", current_keyspace(args).prefix());
-    println!("  scope: {}", format_policy_scope(&scope));
-    println!("  removed: {}", removed);
+    println!("  scope: {}", format_policy_scope(&removed.scope));
+    println!("  removed: {}", removed.removed);
     Ok(())
 }
 
 fn list_policies(
-    backend: &dyn MetadataBackend,
+    service: &AdminService,
     args: &Args,
     tenant: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut policies = backend.list_tenant_policies()?;
-    if let Some(tenant) = tenant {
-        policies.retain(|policy| policy.scope.tenant == tenant);
-    }
-    policies.sort_by(|left, right| left.scope.cmp(&right.scope));
-
+    let policies = service.list_tenant_policies(tenant)?;
     println!("tenant policies:");
     println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
     println!("  keyspace: {}", current_keyspace(args).prefix());
@@ -322,153 +296,23 @@ fn list_policies(
 }
 
 fn get_legacy_route_policy(
-    backend: &dyn MetadataBackend,
+    service: &AdminService,
     args: &Args,
     tenant: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    let domain = route_policy_domain(tenant);
-    let policy = backend.get_route_policy(&domain)?;
+    let response = service.get_route_policy(tenant)?;
     println!("route policy:");
     println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
     println!("  keyspace: {}", current_keyspace(args).prefix());
-    println!("  domain: {}", format_route_policy_domain(&domain));
-    match policy {
-        Some(policy) => print_route_policy(&policy, 2),
+    println!(
+        "  domain: {}",
+        format_route_policy_domain(&route_policy_domain(tenant))
+    );
+    match response.policy.as_ref() {
+        Some(policy) => print_route_policy(policy, 2),
         None => println!("  status: not found"),
     }
     Ok(())
-}
-
-fn tenant_policy_scope(
-    tenant: &str,
-    domain: Option<&str>,
-    object_set: Option<&str>,
-) -> Result<TenantPolicyScope, Box<dyn Error>> {
-    let scope = TenantPolicyScope::new(tenant, domain, object_set);
-    scope.validate()?;
-    Ok(scope)
-}
-
-fn tenant_policy_patch(values: &PolicyValueArgs) -> Result<TenantPolicySpec, Box<dyn Error>> {
-    if let Some(route_topk) = values.route_topk {
-        if route_topk < 2 {
-            return Err("route_topk must be greater than or equal to 2".into());
-        }
-    }
-
-    Ok(TenantPolicySpec {
-        routing: Some(TenantRoutePolicy {
-            route_topk: values.route_topk,
-            route_control: values.route_control.map(Into::into),
-        })
-        .filter(|policy| policy.route_topk.is_some() || policy.route_control.is_some()),
-        quota: Some(TenantQuotaPolicy {
-            max_bytes: values.max_bytes,
-            max_objects: values.max_objects,
-        })
-        .filter(|policy| policy.max_bytes.is_some() || policy.max_objects.is_some()),
-        fairness: Some(TenantExecutionFairnessPolicy {
-            max_remote_batch_items_per_tenant: values.max_remote_batch_items_per_tenant,
-        })
-        .filter(|policy| policy.max_remote_batch_items_per_tenant.is_some()),
-        shaping: Some(TenantBandwidthShapingPolicy {
-            max_remote_batch_bytes: values.max_remote_batch_bytes,
-            max_remote_batch_burst_items: values.max_remote_batch_burst_items,
-            max_inflight_bytes_per_batch: values.max_inflight_bytes_per_batch,
-        })
-        .filter(|policy| {
-            policy.max_remote_batch_bytes.is_some()
-                || policy.max_remote_batch_burst_items.is_some()
-                || policy.max_inflight_bytes_per_batch.is_some()
-        }),
-        placement: Some(TenantPlacementPolicy {
-            default_replica_count: values.default_replica_count,
-            prefer_local: values.prefer_local,
-            prefer_alloc_in_same_node: values.prefer_alloc_in_same_node,
-            preferred_storage_owners: values.preferred_storage_owners.clone(),
-            preferred_segments: values.preferred_segments.clone(),
-        })
-        .filter(|policy| {
-            policy.default_replica_count.is_some()
-                || policy.prefer_local.is_some()
-                || policy.prefer_alloc_in_same_node.is_some()
-                || policy.preferred_storage_owners.is_some()
-                || policy.preferred_segments.is_some()
-        }),
-    })
-}
-
-fn policy_patch_is_empty(spec: &TenantPolicySpec) -> bool {
-    spec.routing.is_none()
-        && spec.quota.is_none()
-        && spec.fairness.is_none()
-        && spec.shaping.is_none()
-        && spec.placement.is_none()
-}
-
-fn merge_tenant_policy(
-    current: Option<&TenantPolicy>,
-    scope: TenantPolicyScope,
-    patch: TenantPolicySpec,
-    updated_by: &str,
-) -> TenantPolicy {
-    let spec = current
-        .map(|policy| policy.spec.merged_with(&patch))
-        .unwrap_or(patch);
-    TenantPolicy {
-        scope,
-        spec,
-        version: current
-            .map(|policy| policy.version.saturating_add(1))
-            .unwrap_or(1),
-        updated_at_ms: now_ms(),
-        updated_by: updated_by.to_string(),
-    }
-}
-
-fn sync_legacy_route_policy(
-    backend: &dyn MetadataBackend,
-    policy: &TenantPolicy,
-) -> Result<(), Box<dyn Error>> {
-    if !is_root_tenant_scope(&policy.scope) {
-        return Ok(());
-    }
-    let domain = RoutePolicyDomain::Tenant(policy.scope.tenant.clone());
-    if let Some(routing) = policy.spec.routing.as_ref() {
-        if let Some(route_policy) = route_policy_from_tenant_policy(policy, routing) {
-            backend.put_route_policy(&domain, &route_policy)?;
-            return Ok(());
-        }
-    }
-    backend.delete_route_policy(&domain)?;
-    Ok(())
-}
-
-fn route_policy_from_tenant_policy(
-    policy: &TenantPolicy,
-    routing: &TenantRoutePolicy,
-) -> Option<RoutePolicy> {
-    Some(RoutePolicy {
-        route_topk: routing.route_topk?,
-        route_control: routing.route_control?,
-        created_by: ClientRuntimeId::new(policy.updated_by.clone(), ClientEpoch(0)),
-        created_at_ms: policy.updated_at_ms,
-    })
-}
-
-fn is_root_tenant_scope(scope: &TenantPolicyScope) -> bool {
-    scope.domain.is_none() && scope.object_set.is_none()
-}
-
-fn format_policy_scope(scope: &TenantPolicyScope) -> String {
-    let mut formatted = format!("tenant={}", scope.tenant);
-    if let Some(domain) = scope.domain.as_deref() {
-        formatted.push_str(&format!(", domain={domain}"));
-    }
-    if let Some(object_set) = scope.object_set.as_deref() {
-        formatted.push_str(&format!(", object_set={object_set}"));
-    }
-    formatted
 }
 
 fn print_tenant_policy(policy: &TenantPolicy) {
@@ -551,25 +395,13 @@ fn current_keyspace(args: &Args) -> MetadataKeyspace {
         .unwrap_or_default()
 }
 
-fn cleanup_stale_segments(args: &Args) -> Result<(), Box<dyn Error>> {
-    if !args.metadata_url.starts_with("redis://") {
-        return Err("cleanup-stale-segments currently supports redis:// metadata only".into());
-    }
-
-    let keyspace = current_keyspace(args);
-    let backend = RedisMetadataBackend::new(
-        RedisMetadataConfig::new(args.metadata_url.clone()).keyspace(keyspace.clone()),
-    )?;
-    let report = backend.cleanup_stale_segments()?;
-
+fn cleanup_stale_segments(service: &AdminService) -> Result<(), Box<dyn Error>> {
+    let report = service.cleanup_stale_segments()?;
     println!("cleanup stale segments:");
-    println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
-    println!("  keyspace: {}", keyspace.prefix());
+    println!("  metadata_url: {}", service.redacted_metadata_url());
+    println!("  keyspace: {}", service.keyspace().prefix());
     println!("  live_clients: {}", report.live_clients);
-    println!(
-        "  inspected_segment_keys: {}",
-        report.inspected_segment_keys
-    );
+    println!("  inspected_segment_keys: {}", report.inspected_segment_keys);
     println!("  removed_segment_keys: {}", report.removed_segment_keys);
     println!(
         "  removed_segment_index_entries: {}",
@@ -586,29 +418,8 @@ fn cleanup_stale_segments(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn redact_redis_url(url: &str) -> String {
-    match Url::parse(url) {
-        Ok(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.to_string()
-        }
-        Err(_) => url.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use mooncake_metadata::InMemoryMetadataBackend;
-    use mooncake_store_core::{MetadataBackend, TenantQuotaPolicy};
-
     use super::*;
     use clap::Parser;
 
@@ -668,81 +479,75 @@ mod tests {
     }
 
     #[test]
-    fn merge_tenant_policy_preserves_unset_sections() {
-        let current = TenantPolicy {
-            scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
-            spec: TenantPolicySpec {
-                routing: Some(TenantRoutePolicy {
-                    route_topk: Some(4),
-                    route_control: Some(RouteControlMode::EmbeddedWrh),
-                }),
-                quota: Some(TenantQuotaPolicy {
-                    max_bytes: Some(64),
-                    max_objects: Some(8),
-                }),
-                ..TenantPolicySpec::default()
-            },
-            version: 7,
-            updated_at_ms: 1,
-            updated_by: "old-admin".to_string(),
+    fn policy_value_args_convert_to_patch_input() {
+        let values = PolicyValueArgs {
+            route_topk: Some(3),
+            route_control: Some(RouteControlArg::MetadataOnly),
+            max_bytes: Some(9),
+            ..PolicyValueArgs::default()
         };
-        let patch = TenantPolicySpec {
-            quota: Some(TenantQuotaPolicy {
-                max_bytes: Some(128),
-                max_objects: None,
-            }),
-            ..TenantPolicySpec::default()
-        };
+        let patch: PolicyPatchInput = (&values).into();
+        assert_eq!(patch.route_topk, Some(3));
+        assert_eq!(patch.route_control, Some(RouteControlMode::MetadataOnly));
+        assert_eq!(patch.max_bytes, Some(9));
+    }
 
-        let merged = merge_tenant_policy(Some(&current), current.scope.clone(), patch, "new-admin");
-        assert_eq!(merged.version, 8);
-        assert_eq!(merged.updated_by, "new-admin");
+    #[test]
+    fn redact_redis_url_strips_credentials() {
         assert_eq!(
-            merged.spec.routing,
-            Some(TenantRoutePolicy {
-                route_topk: Some(4),
-                route_control: Some(RouteControlMode::EmbeddedWrh),
-            })
-        );
-        assert_eq!(
-            merged.spec.quota,
-            Some(TenantQuotaPolicy {
-                max_bytes: Some(128),
-                max_objects: Some(8),
-            })
+            redact_redis_url("redis://user:pass@127.0.0.1:6379/0"),
+            "redis://127.0.0.1:6379/0"
         );
     }
 
     #[test]
-    fn sync_legacy_route_policy_mirrors_root_tenant_routing() {
-        let backend = InMemoryMetadataBackend::new();
-        let policy = TenantPolicy {
-            scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
-            spec: TenantPolicySpec {
-                routing: Some(TenantRoutePolicy {
+    fn admin_service_round_trips_policy_and_route_mirror() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        let service = AdminService::new(backend.clone(), "memory://test", MetadataKeyspace::default());
+        let stored = service
+            .set_tenant_policy(
+                "tenant-a",
+                None,
+                None,
+                PolicyPatchInput {
                     route_topk: Some(5),
                     route_control: Some(RouteControlMode::MetadataOnly),
-                }),
-                ..TenantPolicySpec::default()
-            },
-            version: 1,
-            updated_at_ms: 42,
-            updated_by: "admin".to_string(),
-        };
-
-        sync_legacy_route_policy(&backend, &policy).expect("legacy sync should succeed");
-        let mirrored = backend
-            .get_route_policy(&RoutePolicyDomain::Tenant("tenant-a".to_string()))
-            .expect("mirrored route policy read should succeed")
-            .expect("mirrored route policy should exist");
-        assert_eq!(mirrored.route_topk, 5);
-        assert_eq!(mirrored.route_control, RouteControlMode::MetadataOnly);
+                    max_bytes: Some(64),
+                    ..PolicyPatchInput::default()
+                },
+                None,
+                "admin",
+            )
+            .expect("policy write should succeed");
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.spec.quota, Some(TenantQuotaPolicy {
+            max_bytes: Some(64),
+            max_objects: None,
+        }));
+        let mirrored = service
+            .get_route_policy(Some("tenant-a"))
+            .expect("route policy read should succeed");
+        assert_eq!(mirrored.policy.expect("mirrored route policy").route_topk, 5);
+        let effective = service
+            .get_tenant_policy("tenant-a", None, None, true)
+            .expect("effective policy read should succeed");
+        assert!(effective.found);
+        assert_eq!(
+            effective.effective_spec.expect("effective spec").routing,
+            Some(TenantRoutePolicy {
+                route_topk: Some(5),
+                route_control: Some(RouteControlMode::MetadataOnly),
+            })
+        );
     }
 
     #[test]
-    fn effective_scope_uses_default_domain_and_object_set() {
-        let namespace = NamespaceScope::with_defaults(Some("tenant-a"), None, None);
-        assert_eq!(namespace.domain, DEFAULT_DOMAIN);
-        assert_eq!(namespace.object_set, DEFAULT_OBJECT_SET);
+    fn cleanup_stale_segments_rejects_non_redis_metadata() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        let service = AdminService::new(backend, "memory://test", MetadataKeyspace::default());
+        let error = service
+            .cleanup_stale_segments()
+            .expect_err("non-redis cleanup should fail");
+        assert!(matches!(error, mooncake_store_core::StoreError::Unsupported(_)));
     }
 }

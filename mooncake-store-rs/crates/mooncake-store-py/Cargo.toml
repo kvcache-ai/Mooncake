@@ -19,6 +19,8 @@ mooncake-transport = { path = "../mooncake-transport" }
 parking_lot.workspace = true
 pyo3.workspace = true
 prost = "0.13"
+serde.workspace = true
+serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.12", features = ["transport"] }
 tracing.workspace = true

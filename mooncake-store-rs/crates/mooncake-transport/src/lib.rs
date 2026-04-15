@@ -4,6 +4,8 @@ mod tent;
 
 use std::ffi::c_void;
 
+use serde::{Deserialize, Serialize};
+
 pub use classic::{ClassicEngineConfig, ClassicTransferEngine, ClassicTransportProtocol};
 pub use tent::{SegmentBuffer, SegmentInfo, SegmentKind, TentEngine, TentEngineConfig};
 
@@ -13,13 +15,13 @@ pub enum TransportEngineKind {
     Tent,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Opcode {
     Read,
     Write,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TransferStatus {
     Waiting,
     Pending,
@@ -30,7 +32,7 @@ pub enum TransferStatus {
     Failed,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct TransferProgress {
     pub status: TransferStatus,
     pub transferred_bytes: u64,
@@ -45,7 +47,7 @@ pub struct TransferRequest {
     pub length: u64,
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TransferPacingMode {
     LatencySensitive,
     #[default]
@@ -53,7 +55,7 @@ pub enum TransferPacingMode {
     ThroughputOptimized,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransferBatchHints {
     pub pacing_group: Option<String>,
     pub mode: TransferPacingMode,

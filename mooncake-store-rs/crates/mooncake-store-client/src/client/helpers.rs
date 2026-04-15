@@ -106,3 +106,12 @@ fn now_ms() -> u64 {
         .expect("time should advance")
         .as_millis() as u64
 }
+
+impl StoreClient {
+    pub fn local_memory_base_addr(&self) -> Result<*mut c_void> {
+        self.ensure_local_memory()?;
+        let segment = self.segment_name()?;
+        let state = self.state.lock();
+        state.memory_ref()?.storage_address(&segment, 0)
+    }
+}
