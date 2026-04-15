@@ -897,6 +897,35 @@ fn control_plane_client_does_not_serialize_concurrent_unary_rpcs_on_runtime_lock
 }
 
 #[test]
+fn control_plane_client_times_out_slow_unary_rpc() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("alpha", 1, &owner));
+
+    let mut handle =
+        DelayedUnaryHandle::spawn(authority, allocator, eviction, Duration::from_millis(500))
+            .expect("delayed unary control plane should start");
+    let lease = sample_lease(handle.address());
+    let authority_id = ClientStableId::new("authority");
+    let client = ControlPlaneClient::with_request_timeout(Duration::from_millis(100))
+        .expect("control plane client should start");
+
+    let started = Instant::now();
+    let error = client
+        .batch_get_routes(&lease, "ns-a", &authority_id, &[ObjectKey::new("alpha")])
+        .expect_err("slow unary rpc should time out");
+    assert!(matches!(error, StoreError::Transport(_)));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "control plane timeout should fail fast"
+    );
+
+    handle.shutdown();
+}
+
+#[test]
 fn control_plane_client_runtime_threads_are_configurable_via_env() {
     with_env_var(CONTROL_PLANE_THREADS_ENV, Some("1"), || {
         let client = ControlPlaneClient::new().expect("control plane client should start");

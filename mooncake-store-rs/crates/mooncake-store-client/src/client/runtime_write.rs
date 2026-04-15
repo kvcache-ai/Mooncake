@@ -46,6 +46,7 @@ impl StoreClient {
                 continue;
             }
 
+            self.ensure_remote_runtime_reachable(&target.storage_runtime, &target.segment_name.0)?;
             let (handle, info) = {
                 let mut state = self.state.lock();
                 state.open_segment_with_info(transport, &target.segment_name.0)?
@@ -463,6 +464,10 @@ impl StoreClient {
                         }
                         addr as u64
                     } else {
+                        self.ensure_remote_runtime_reachable(
+                            &target.storage_runtime,
+                            &target.segment_name.0,
+                        )?;
                         let (handle, info) = {
                             let mut state = self.state.lock();
                             state.open_segment_with_info(transport, &target.segment_name.0)?

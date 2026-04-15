@@ -995,6 +995,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
 }
 
 impl StoreClient {
+    pub fn sync_lifecycle_state(&self, next_state: ClientLifecycleState) {
+        let _route_write_guard = self.route_write_gate.lock();
+        self.set_lifecycle_state(next_state);
+    }
+
     pub fn health_channel(&self) -> HealthChannel {
         HealthChannel::new(self.metadata.clone(), self.lease.clone())
     }
