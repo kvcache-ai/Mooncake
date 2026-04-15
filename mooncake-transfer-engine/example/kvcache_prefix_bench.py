@@ -297,14 +297,23 @@ def run_initiator(args):
             print(f"  SKIP {tokens} tokens: transfer {transfer_size} > recv buffer")
             continue
 
-        # Warmup
-        for _ in range(args.warmup):
-            ret = engine.transfer_sync_read(
-                args.target_server_name, recv_addr, remote_addr, transfer_size
-            )
-            if ret != 0:
-                print(f"  WARNING: warmup transfer failed: {ret}")
-                break
+        # Warmup: use the same offset pattern as the benchmark to pre-warm
+        # remote memory pages and DMA paths at each offset.
+        pool_bytes = int(args.pool_size_gb * 1024 * 1024 * 1024)
+        max_offset = pool_bytes - transfer_size
+        for w in range(args.warmup):
+            for i in range(args.iterations):
+                if max_offset > 0:
+                    offset = ((i * transfer_size) % max_offset) & ~0xFFF
+                else:
+                    offset = 0
+                ret = engine.transfer_sync_read(
+                    args.target_server_name, recv_addr,
+                    remote_addr + offset, transfer_size
+                )
+                if ret != 0:
+                    print(f"  WARNING: warmup transfer failed: {ret}")
+                    break
 
         # Benchmark
         latencies = []
@@ -312,8 +321,6 @@ def run_initiator(args):
         for i in range(args.iterations):
             # Use different offset within remote pool for each iteration
             # to simulate accessing different prefix locations
-            pool_bytes = int(args.pool_size_gb * 1024 * 1024 * 1024)
-            max_offset = pool_bytes - transfer_size
             if max_offset > 0:
                 # Align to 4KB boundary
                 offset = ((i * transfer_size) % max_offset) & ~0xFFF
@@ -345,7 +352,7 @@ def run_initiator(args):
         avg_ms = statistics.mean(latencies)
         p50_ms = latencies[len(latencies) // 2]
         p99_ms = latencies[int(len(latencies) * 0.99)]
-        throughput_gbs = (transfer_size / 1e9) / (avg_ms / 1000)
+        throughput_gbs = (transfer_size / 1e9) / (p50_ms / 1000)
 
         print(
             f"  {tokens:>6} {transfer_size/1e6:>8.1f}MB "
