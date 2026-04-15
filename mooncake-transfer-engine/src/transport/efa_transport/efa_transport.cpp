@@ -17,11 +17,13 @@
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <fstream>
 #include <future>
 #include <set>
 #include <thread>
@@ -36,6 +38,58 @@
 #include "transport/efa_transport/efa_endpoint.h"
 
 namespace mooncake {
+
+// Default PTE (page table entry) limit per EFA NIC.  EFA hardware supports
+// roughly 24 million PTEs per NIC, but we use 22M as a conservative default.
+// With 4KB pages: 22M × 4KB ≈ 88GB per NIC.
+// With 2MB hugepages: 22M × 2MB ≈ 44TB per NIC (effectively unlimited).
+// Override via MC_EFA_MAX_PTE_ENTRIES environment variable.
+static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
+
+// Detect the kernel page size backing the memory at `addr` by reading
+// /proc/self/smaps.  Falls back to sysconf(_SC_PAGESIZE) on any failure.
+static size_t detectBufferPageSize(void* addr) {
+    size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps.is_open()) return fallback;
+
+    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    std::string line;
+    bool in_range = false;
+
+    while (std::getline(smaps, line)) {
+        // VMA header: "start-end perms offset dev inode [pathname]"
+        if (!line.empty() && std::isxdigit(line[0])) {
+            unsigned long start = 0, end = 0;
+            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
+                in_range = (target >= start && target < end);
+            }
+        } else if (in_range &&
+                   line.compare(0, 15, "KernelPageSize:") == 0) {
+            unsigned long kb = 0;
+            if (sscanf(line.c_str(), "KernelPageSize: %lu kB", &kb) == 1 &&
+                kb > 0) {
+                return kb * 1024;
+            }
+        }
+    }
+    return fallback;
+}
+
+static size_t getMaxPteEntries() {
+    static size_t cached = []() {
+        const char* env = std::getenv("MC_EFA_MAX_PTE_ENTRIES");
+        if (env) {
+            size_t val = std::stoull(env);
+            if (val > 0) {
+                LOG(INFO) << "MC_EFA_MAX_PTE_ENTRIES override: " << val;
+                return val;
+            }
+        }
+        return kDefaultMaxPteEntries;
+    }();
+    return cached;
+}
 
 EfaTransport::EfaTransport() {
     LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
@@ -210,12 +264,21 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     int access_rights = kBaseAccessRights;
     size_t max_mr = (size_t)globalConfig().max_mr_size;
 
-    // Use half of max_mr_size as chunk limit.  This provides substantial
-    // headroom below the per-NIC hardware limit and distributes the buffer
-    // across more NICs, improving transfer parallelism.  The previous
-    // approach (max_mr_size - 1GB) was too close to the hardware limit and
-    // caused sporadic fi_mr_reg failures under parallel registration.
-    size_t chunk_limit = (max_mr > 0) ? max_mr / 2 : max_mr;
+    // Compute chunk limit based on EFA PTE (page table entry) constraints.
+    // Each EFA NIC has a hardware limit on PTE entries (~24M).  The effective
+    // per-NIC MR size limit depends on the backing page size:
+    //   4KB pages  → 22M × 4KB  ≈ 88GB  (smaller than device max_mr_size)
+    //   2MB hugepg → 22M × 2MB  ≈ 44TB  (device max_mr_size is the limit)
+    // We detect the actual page size of the buffer and compute accordingly,
+    // so hugepage-backed memory avoids unnecessary splitting.
+    size_t page_size = detectBufferPageSize(addr);
+    size_t pte_limit = getMaxPteEntries() * page_size;
+    size_t chunk_limit = (max_mr > 0) ? std::min(max_mr, pte_limit) : 0;
+    LOG(INFO) << "Auto-split params: page_size=" << page_size
+              << ", max_pte_entries=" << getMaxPteEntries()
+              << ", pte_limit=" << pte_limit
+              << ", max_mr_size=" << max_mr
+              << ", chunk_limit=" << chunk_limit;
 
     // Determine chunk boundaries
     std::vector<std::pair<void*, size_t>> chunks;
