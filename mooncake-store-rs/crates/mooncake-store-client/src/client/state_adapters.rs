@@ -90,9 +90,19 @@ struct LocalAllocatorAdapter {
     runtime: ClientRuntimeId,
     allocator: Arc<Mutex<LocalAllocatorState>>,
     storage_owner: Arc<StorageOwnerState>,
+    transfer_stall_timeout: Duration,
+    request_timeout_override: Option<Duration>,
 }
 
 impl LocalAllocatorAdapter {
+    fn pending_publish_deadline_ms(&self, length_bytes: u64) -> u64 {
+        pending_publish_deadline_ms(
+            length_bytes,
+            self.transfer_stall_timeout,
+            self.request_timeout_override,
+        )
+    }
+
     fn reserve_any_with_eviction(
         &self,
         owner: &ClientRuntimeId,
@@ -101,7 +111,13 @@ impl LocalAllocatorAdapter {
         let mut last_error = None;
         for _ in 0..=32usize {
             match self.allocator.lock().reserve_any(owner, length_bytes) {
-                Ok(reservation) => return Ok(reservation),
+                Ok(reservation) => {
+                    let deadline_ms = self.pending_publish_deadline_ms(reservation.length_bytes);
+                    self.allocator
+                        .lock()
+                        .mark_pending_reservation(&reservation, deadline_ms);
+                    return Ok(reservation);
+                }
                 Err(StoreError::Allocator(message)) => {
                     last_error = Some(message);
                 }
@@ -129,7 +145,13 @@ impl LocalAllocatorAdapter {
                 .lock()
                 .reserve_specific(owner, segment_name, length_bytes)
             {
-                Ok(reservation) => return Ok(reservation),
+                Ok(reservation) => {
+                    let deadline_ms = self.pending_publish_deadline_ms(reservation.length_bytes);
+                    self.allocator
+                        .lock()
+                        .mark_pending_reservation(&reservation, deadline_ms);
+                    return Ok(reservation);
+                }
                 Err(StoreError::Allocator(message)) => {
                     last_error = Some(message);
                 }

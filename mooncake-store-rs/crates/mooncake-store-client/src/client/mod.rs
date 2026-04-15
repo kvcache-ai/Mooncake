@@ -182,6 +182,28 @@ fn estimate_request_timeout(
     )
 }
 
+fn pending_publish_grace_timeout(
+    bytes: u64,
+    transfer_stall_timeout: Duration,
+    request_timeout_override: Option<Duration>,
+) -> Duration {
+    request_timeout_override
+        .unwrap_or_else(|| estimate_request_timeout(bytes, 1, transfer_stall_timeout))
+        .saturating_add(DEFAULT_REQUEST_FAILOVER_SLACK)
+}
+
+fn pending_publish_deadline_ms(
+    bytes: u64,
+    transfer_stall_timeout: Duration,
+    request_timeout_override: Option<Duration>,
+) -> u64 {
+    let grace_ms =
+        pending_publish_grace_timeout(bytes, transfer_stall_timeout, request_timeout_override)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+    now_ms().saturating_add(grace_ms)
+}
+
 impl StoreClient {
     fn request_deadline_for_transfer(&self, bytes: u64, attempts: usize) -> RequestDeadline {
         let timeout = self.request_timeout_override.unwrap_or_else(|| {

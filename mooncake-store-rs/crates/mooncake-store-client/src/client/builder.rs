@@ -332,6 +332,8 @@ impl StoreClientBuilder {
             runtime: runtime.clone(),
             allocator: allocator.clone(),
             storage_owner: storage_owner.clone(),
+            transfer_stall_timeout: self.transfer_stall_timeout,
+            request_timeout_override: self.request_timeout_override,
         });
         let control_plane = ControlPlaneHandle::spawn(
             &control_bind_host(&endpoints.rpc_address),

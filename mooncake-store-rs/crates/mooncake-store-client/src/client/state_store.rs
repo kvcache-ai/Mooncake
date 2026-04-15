@@ -164,6 +164,12 @@ impl StorageOwnerState {
     }
 
     fn track_routes(&self, routes: &[ObjectRoute]) -> usize {
+        {
+            let mut allocator = self.allocator.lock();
+            for route in routes {
+                allocator.clear_pending_route(route, &self.runtime);
+            }
+        }
         let mut clock = self.clock.lock();
         for route in routes {
             clock.sync_route(route, &self.runtime);
@@ -172,6 +178,9 @@ impl StorageOwnerState {
     }
 
     fn track_route(&self, route: &ObjectRoute) {
+        self.allocator
+            .lock()
+            .clear_pending_route(route, &self.runtime);
         self.clock.lock().track_route(route, &self.runtime);
     }
 
@@ -180,6 +189,9 @@ impl StorageOwnerState {
     }
 
     fn sync_route(&self, route: &ObjectRoute) {
+        self.allocator
+            .lock()
+            .clear_pending_route(route, &self.runtime);
         self.clock.lock().sync_route(route, &self.runtime);
     }
 
