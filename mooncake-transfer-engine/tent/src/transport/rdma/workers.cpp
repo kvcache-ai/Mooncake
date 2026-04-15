@@ -300,6 +300,7 @@ void Workers::asyncPollCq() {
             if (!ep) {
                 updateSliceStatus(slice, TIMEOUT);
                 slice_to_remove.push_back(slice);
+                worker.inflight_slices.fetch_sub(1);
                 continue;
             }
             auto num_slices = ep->acknowledge(slice, TIMEOUT);
