@@ -496,7 +496,7 @@ Status EfaTransport::submitTransferTask(
                 LOG(ERROR) << "No active EFA device for striping transfer of "
                            << request.length << " bytes";
                 for (auto& entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
+                    for (auto s : entry.second) s->markFailed();
                 return Status::AddressNotRegistered(
                     "No active EFA device found for striping");
             }
@@ -558,7 +558,7 @@ Status EfaTransport::submitTransferTask(
                 }
 
                 slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
+                __sync_fetch_and_add(&task.total_bytes, slice->length);
                 __sync_fetch_and_add(&task.slice_count, 1);
             }
         } else if (request_buffer_id >= 0 && request_device_id >= 0) {
@@ -594,7 +594,7 @@ Status EfaTransport::submitTransferTask(
                 local_segment_desc->buffers[request_buffer_id]
                     .lkey[request_device_id];
             slices_to_post[context].push_back(slice);
-            task.total_bytes += slice->length;
+            __sync_fetch_and_add(&task.total_bytes, slice->length);
             __sync_fetch_and_add(&task.slice_count, 1);
         } else {
             // FALLBACK: device not found via initial selectDevice.
@@ -621,7 +621,7 @@ Status EfaTransport::submitTransferTask(
                               "device(s): "
                            << request.source;
                 for (auto& entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
+                    for (auto s : entry.second) s->markFailed();
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active EFA "
                     "device(s): " +
@@ -651,7 +651,7 @@ Status EfaTransport::submitTransferTask(
             slice->rdma.source_lkey =
                 local_segment_desc->buffers[buffer_id].lkey[device_id];
             slices_to_post[context].push_back(slice);
-            task.total_bytes += slice->length;
+            __sync_fetch_and_add(&task.total_bytes, slice->length);
             __sync_fetch_and_add(&task.slice_count, 1);
         }
     }

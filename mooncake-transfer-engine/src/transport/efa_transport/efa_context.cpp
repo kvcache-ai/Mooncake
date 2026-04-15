@@ -27,6 +27,7 @@
 #include <sstream>
 
 #include "config.h"
+#include "cuda_alike.h"
 #include "transport/efa_transport/efa_endpoint.h"
 #include "transport/efa_transport/efa_transport.h"
 #include "transport/transport.h"
@@ -319,30 +320,73 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
                                              int access,
                                              EfaMemoryRegionMeta& mrMeta) {
     if (length > (size_t)globalConfig().max_mr_size) {
-        PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
-                      << "shrink it to " << globalConfig().max_mr_size;
-        length = (size_t)globalConfig().max_mr_size;
+        LOG(ERROR) << "Buffer length " << length
+                   << " exceeds device max_mr_size "
+                   << globalConfig().max_mr_size
+                   << ". Use EfaTransport::registerLocalMemory() which "
+                      "auto-splits large buffers.";
+        return ERR_CONTEXT;
     }
 
     mrMeta.addr = addr;
     mrMeta.length = length;
 
-    // Convert access flags to libfabric flags
-    uint64_t fi_access = 0;
-    if (access & FI_READ) fi_access |= FI_READ;
-    if (access & FI_WRITE) fi_access |= FI_WRITE;
-    if (access & FI_REMOTE_READ) fi_access |= FI_REMOTE_READ;
-    if (access & FI_REMOTE_WRITE) fi_access |= FI_REMOTE_WRITE;
-
     // For EFA, we need local read/write and remote read/write
-    fi_access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    uint64_t fi_access =
+        FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
 
-    int ret = fi_mr_reg(domain_, addr, length, fi_access, 0, 0, 0, &mrMeta.mr,
-                        nullptr);
-    if (ret) {
-        LOG(ERROR) << "fi_mr_reg failed for " << addr << ": "
-                   << fi_strerror(-ret);
-        return ERR_CONTEXT;
+    // Detect memory type and use fi_mr_regattr() for GPU memory.
+    // The EFA provider's fi_mr_reg() hardcodes iface=FI_HMEM_SYSTEM,
+    // so GPU memory must go through fi_mr_regattr() with explicit
+    // iface/device fields (per libfabric spec and EFA provider impl).
+    enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
+    int device_ordinal = 0;
+
+#if defined(USE_CUDA)
+    cudaPointerAttributes attributes;
+    cudaError_t cuda_ret = cudaPointerGetAttributes(&attributes, addr);
+    if (cuda_ret == cudaSuccess &&
+        attributes.type == cudaMemoryTypeDevice) {
+        iface = FI_HMEM_CUDA;
+        device_ordinal = attributes.device;
+    }
+#elif defined(USE_HIP)
+    hipPointerAttribute_t attributes;
+    hipError_t hip_ret = hipPointerGetAttributes(&attributes, addr);
+    if (hip_ret == hipSuccess &&
+        attributes.type == hipMemoryTypeDevice) {
+        iface = FI_HMEM_ROCR;
+        device_ordinal = attributes.device;
+    }
+#endif
+
+    int ret;
+    if (iface != FI_HMEM_SYSTEM) {
+        // GPU memory: use fi_mr_regattr with explicit iface and device
+        struct iovec iov = {.iov_base = addr, .iov_len = length};
+        struct fi_mr_attr attr = {};
+        attr.mr_iov = &iov;
+        attr.iov_count = 1;
+        attr.access = fi_access;
+        attr.iface = iface;
+        attr.device.cuda = device_ordinal;
+
+        ret = fi_mr_regattr(domain_, &attr, 0, &mrMeta.mr);
+        if (ret) {
+            LOG(ERROR) << "fi_mr_regattr failed for GPU memory " << addr
+                       << " (device " << device_ordinal
+                       << "): " << fi_strerror(-ret);
+            return ERR_CONTEXT;
+        }
+    } else {
+        // CPU memory: fi_mr_reg is sufficient
+        ret = fi_mr_reg(domain_, addr, length, fi_access, 0, 0, 0,
+                        &mrMeta.mr, nullptr);
+        if (ret) {
+            LOG(ERROR) << "fi_mr_reg failed for " << addr << ": "
+                       << fi_strerror(-ret);
+            return ERR_CONTEXT;
+        }
     }
 
     mrMeta.key = fi_mr_key(mrMeta.mr);

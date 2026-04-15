@@ -158,6 +158,7 @@ class EfaContext {
 
     // Round-robin CQ assignment for new endpoints (mirrors RDMA transport)
     std::shared_ptr<EfaCq> nextCq() {
+        if (cq_list_.empty()) return nullptr;
         int index = (next_cq_index_++) % cq_list_.size();
         return cq_list_[index];
     }
