@@ -6,6 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, OnceLock,
 };
+use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
@@ -15,7 +16,7 @@ use mooncake_store_core::{
     RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement,
     SegmentLifecycleState, SegmentName, StoreError,
 };
-use mooncake_transport::{Opcode, TentEngine, TransferRequest};
+use mooncake_transport::{Opcode, SegmentInfo, TentEngine, TransferRequest};
 use parking_lot::Mutex;
 use tracing::{debug, info, info_span, warn};
 
@@ -44,6 +45,8 @@ const DEFAULT_REQUEST_TIMEOUT_BASE: Duration = Duration::from_secs(1);
 const DEFAULT_REQUEST_TIMEOUT_CAP: Duration = Duration::from_secs(60);
 const DEFAULT_REQUEST_FAILOVER_SLACK: Duration = Duration::from_millis(250);
 const DEFAULT_REQUEST_THROUGHPUT_FLOOR_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
+const DEFAULT_ROUTE_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
+const DEFAULT_PUT_WRITE_RETRY_LIMIT: usize = 4;
 const STABLE_PHASE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const STABLE_PHASE_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
@@ -137,6 +140,14 @@ impl RequestDeadline {
 
     fn instant(self) -> Instant {
         self.deadline
+    }
+
+    fn has_expired(self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    fn remaining(self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
     }
 }
 

@@ -46,11 +46,10 @@ impl StoreClient {
                 continue;
             }
 
-            let handle = {
+            let (handle, info) = {
                 let mut state = self.state.lock();
-                state.open_segment(transport, &target.segment_name.0)?
+                state.open_segment_with_info(transport, &target.segment_name.0)?
             };
-            let info = transport.get_segment_info(handle)?;
             let buffer = info.buffers.first().ok_or_else(|| {
                 StoreError::Transport(format!(
                     "segment {} exposes no buffers",
@@ -186,6 +185,14 @@ impl StoreClient {
             for segment in &resolved_policy.preferred_segments {
                 match self.lookup_preferred_segment(segment) {
                     Ok(preferred) => {
+                        if self.runtime_is_suspect(&preferred.owner) {
+                            debug!(
+                                segment = %preferred.segment_name.0,
+                                storage_runtime = %preferred.owner,
+                                "batch put is skipping suspect preferred segment owner"
+                            );
+                            continue;
+                        }
                         if !shared_seen.insert(preferred.owner.clone()) {
                             continue;
                         }
@@ -208,6 +215,13 @@ impl StoreClient {
                 }
             }
             for storage_runtime in &resolved_policy.preferred_storage_runtimes {
+                if self.runtime_is_suspect(storage_runtime) {
+                    debug!(
+                        storage_runtime = %storage_runtime,
+                        "batch put is skipping suspect preferred storage owner"
+                    );
+                    continue;
+                }
                 if !shared_seen.insert(storage_runtime.clone()) {
                     continue;
                 }
@@ -232,6 +246,14 @@ impl StoreClient {
                 let mut candidates = shared_candidates.clone();
                 let mut seen = shared_seen.clone();
                 for owner in &plan.owners {
+                    if self.runtime_is_suspect(owner) {
+                        debug!(
+                            key = %self.scoped_key(tenant, request.key).0,
+                            storage_runtime = %owner,
+                            "batch put is skipping suspect ranked storage owner"
+                        );
+                        continue;
+                    }
                     if seen.insert(owner.clone()) {
                         candidates.push(ReplicaPlacementCandidate {
                             target: ReplicaPlacementTarget::StorageRuntime(owner.clone()),
@@ -441,11 +463,10 @@ impl StoreClient {
                         }
                         addr as u64
                     } else {
-                        let handle = {
+                        let (handle, info) = {
                             let mut state = self.state.lock();
-                            state.open_segment(transport, &target.segment_name.0)?
+                            state.open_segment_with_info(transport, &target.segment_name.0)?
                         };
-                        let info = transport.get_segment_info(handle)?;
                         let buffer = info.buffers.first().ok_or_else(|| {
                             StoreError::Transport(format!(
                                 "segment {} exposes no buffers",

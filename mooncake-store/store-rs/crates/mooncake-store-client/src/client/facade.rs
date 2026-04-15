@@ -1000,49 +1000,10 @@ impl StoreClient {
     }
 
     pub fn evacuate_owned_replicas_when_draining(&self) -> Result<usize> {
-        self.ensure_local_memory()?;
-        let segments = {
-            let state = self.state.lock();
-            state.memory_ref()?.storage_segments()
-        };
-        for segment in segments
-            .iter()
-            .filter(|segment| segment.state == SegmentLifecycleState::Active)
-        {
-            self.drain_segment_internal(&segment.segment_name, true)?;
-        }
-        self.flush_all_reclaims()?;
-
-        let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
-        let mut migrated = 0usize;
-        for route in routes {
-            if self.migrate_owned_route(&route)? {
-                migrated = migrated.saturating_add(1);
-            }
-        }
-
-        self.flush_all_reclaims()?;
-        let live_allocations = self.current_owned_allocations()?;
-        let _ = self.release_stale_local_allocations(&live_allocations)?;
-        self.flush_all_reclaims()?;
-        self.retire_empty_draining_segments()?;
-
-        let remaining = self
-            .list_segments()?
-            .into_iter()
-            .filter(|segment| segment.used_bytes != 0)
-            .collect::<Vec<_>>();
-        if !remaining.is_empty() {
-            return Err(StoreError::InvalidState(format!(
-                "client shrink still has live bytes on local segments: {}",
-                remaining
-                    .iter()
-                    .map(|segment| format!("{}:{}", segment.segment_name.0, segment.used_bytes))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-        Ok(migrated)
+        self.evacuate_draining_routes_until_stable(
+            "client shrink still has live bytes on local segments",
+            |route| self.migrate_owned_route(route),
+        )
     }
 
     pub fn prepare_heartbeat(&mut self, expires_at_ms: u64) -> HeartbeatLease {

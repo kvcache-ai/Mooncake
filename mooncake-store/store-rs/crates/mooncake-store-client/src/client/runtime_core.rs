@@ -141,59 +141,18 @@ impl StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("evacuate_owned_replicas_to_runtime");
-        let result = (|| {
-            self.ensure_local_memory()?;
-            let segments = {
-                let state = self.state.lock();
-                state.memory_ref()?.storage_segments()
-            };
-            for segment in segments
-                .iter()
-                .filter(|segment| segment.state == SegmentLifecycleState::Active)
-            {
-                self.drain_segment_internal(&segment.segment_name, true)?;
-            }
-            self.flush_all_reclaims()?;
-
-            let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
-            let helper_writer = self.build_hot_upgrade_helper_writer()?;
-            let mut migrated = 0usize;
-            for route in routes {
-                let migrated_route = match helper_writer.as_ref() {
-                    Some(writer) => {
-                        self.migrate_owned_route_to_runtime_via_writer(writer, successor, &route)?
-                    }
-                    None => self.migrate_owned_route_to_runtime(successor, &route)?,
-                };
-                if migrated_route {
-                    migrated = migrated.saturating_add(1);
-                }
-            }
-            drop(helper_writer);
-
-            self.flush_all_reclaims()?;
-            let live_allocations = self.current_owned_allocations()?;
-            let _ = self.release_stale_local_allocations(&live_allocations)?;
-            self.flush_all_reclaims()?;
-            self.retire_empty_draining_segments()?;
-
-            let remaining = self
-                .list_segments()?
-                .into_iter()
-                .filter(|segment| segment.used_bytes != 0)
-                .collect::<Vec<_>>();
-            if !remaining.is_empty() {
-                return Err(StoreError::InvalidState(format!(
-                    "hot-upgrade evacuation still has live bytes on local segments: {}",
-                    remaining
-                        .iter()
-                        .map(|segment| format!("{}:{}", segment.segment_name.0, segment.used_bytes))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
-            Ok(migrated)
-        })();
+        let helper_writer = self.build_hot_upgrade_helper_writer()?;
+        let result = self.evacuate_draining_routes_until_stable(
+            "hot-upgrade evacuation still has live bytes on local segments",
+            |route| match helper_writer.as_ref() {
+                Some(writer) => self.migrate_owned_route_to_runtime_via_writer(
+                    writer,
+                    successor,
+                    route,
+                ),
+                None => self.migrate_owned_route_to_runtime(successor, route),
+            },
+        );
         tracker.finish(&result, 0);
         result
     }
@@ -207,52 +166,13 @@ impl StoreClient {
         .entered();
         let tracker = OperationTracker::new("evacuate_owned_replicas_via");
         let result = (|| {
-            self.ensure_local_memory()?;
             if self.lifecycle_state() != ClientLifecycleState::Draining {
                 self.enter_draining()?;
             }
-            let segments = {
-                let state = self.state.lock();
-                state.memory_ref()?.storage_segments()
-            };
-            for segment in segments
-                .iter()
-                .filter(|segment| segment.state == SegmentLifecycleState::Active)
-            {
-                self.drain_segment_internal(&segment.segment_name, true)?;
-            }
-            self.flush_all_reclaims()?;
-
-            let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
-            let mut migrated = 0usize;
-            for route in routes {
-                if self.migrate_owned_route_via_writer(writer, &route)? {
-                    migrated = migrated.saturating_add(1);
-                }
-            }
-
-            self.flush_all_reclaims()?;
-            let live_allocations = self.current_owned_allocations()?;
-            let _ = self.release_stale_local_allocations(&live_allocations)?;
-            self.flush_all_reclaims()?;
-            self.retire_empty_draining_segments()?;
-
-            let remaining = self
-                .list_segments()?
-                .into_iter()
-                .filter(|segment| segment.used_bytes != 0)
-                .collect::<Vec<_>>();
-            if !remaining.is_empty() {
-                return Err(StoreError::InvalidState(format!(
-                    "client shrink still has live bytes on local segments: {}",
-                    remaining
-                        .iter()
-                        .map(|segment| format!("{}:{}", segment.segment_name.0, segment.used_bytes))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
-            Ok(migrated)
+            self.evacuate_draining_routes_until_stable(
+                "client shrink still has live bytes on local segments",
+                |route| self.migrate_owned_route_via_writer(writer, route),
+            )
         })();
         tracker.finish(&result, 0);
         result
@@ -433,6 +353,10 @@ impl StoreClient {
             quarantine_ms = DEFAULT_SUSPECT_RUNTIME_TTL.as_millis() as u64,
             "marked runtime as suspect after remote failure"
         );
+    }
+
+    fn runtime_is_suspect(&self, runtime: &ClientRuntimeId) -> bool {
+        self.suspect_runtime_cache.lock().contains(runtime)
     }
 
     fn readable_runtime_set(&self, force_refresh: bool) -> Result<BTreeSet<ClientRuntimeId>> {
@@ -809,6 +733,16 @@ impl StoreClient {
         for segment in &policy.preferred_segments {
             match self.lookup_preferred_segment(segment) {
                 Ok(preferred) => {
+                    if self.runtime_is_suspect(&preferred.owner) {
+                        debug!(
+                            tenant,
+                            key,
+                            storage_runtime = %preferred.owner,
+                            segment = %preferred.segment_name.0,
+                            "skipping suspect preferred segment owner"
+                        );
+                        continue;
+                    }
                     let candidate = ReplicaPlacementCandidate {
                         target: ReplicaPlacementTarget::Segment {
                             storage_runtime: preferred.owner,
@@ -855,6 +789,15 @@ impl StoreClient {
         }
 
         for storage_runtime in &policy.preferred_storage_runtimes {
+            if self.runtime_is_suspect(storage_runtime) {
+                debug!(
+                    tenant,
+                    key,
+                    storage_runtime = %storage_runtime,
+                    "skipping suspect preferred storage owner"
+                );
+                continue;
+            }
             let candidate = ReplicaPlacementCandidate {
                 target: ReplicaPlacementTarget::StorageRuntime(storage_runtime.clone()),
                 soft: true,

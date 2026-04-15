@@ -40,6 +40,41 @@ impl StoreState {
         self.remote_segments.remove(segment_name);
     }
 
+    fn reopen_segment(
+        &mut self,
+        transport: &dyn StoreTransport,
+        segment_name: &str,
+    ) -> Result<u64> {
+        if let Some(handle) = self.remote_segments.remove(segment_name) {
+            let _ = transport.close_segment(handle);
+        }
+        self.open_segment(transport, segment_name)
+    }
+
+    fn open_segment_with_info(
+        &mut self,
+        transport: &dyn StoreTransport,
+        segment_name: &str,
+    ) -> Result<(u64, SegmentInfo)> {
+        let mut refreshed = false;
+        loop {
+            let handle = if refreshed {
+                self.reopen_segment(transport, segment_name)?
+            } else {
+                self.open_segment(transport, segment_name)?
+            };
+            match transport.get_segment_info(handle) {
+                Ok(info) => return Ok((handle, info)),
+                Err(error) if !refreshed && remote_segment_cache_refreshable(&error) => {
+                    self.remote_segments.remove(segment_name);
+                    let _ = transport.close_segment(handle);
+                    refreshed = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn register_external_buffer(
         &mut self,
         transport: &dyn StoreTransport,
@@ -534,4 +569,11 @@ fn watermark_bytes(capacity_bytes: u64, percent: u8) -> u64 {
     capacity_bytes
         .saturating_mul(percent as u64)
         .div_ceil(100)
+}
+
+fn remote_segment_cache_refreshable(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Transport(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
+    )
 }
