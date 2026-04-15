@@ -87,19 +87,19 @@ impl std::fmt::Debug for TentEngineConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentInfo {
     pub kind: SegmentKind,
     pub buffers: Vec<SegmentBuffer>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SegmentKind {
     Memory,
     File,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentBuffer {
     pub base: u64,
     pub length: u64,

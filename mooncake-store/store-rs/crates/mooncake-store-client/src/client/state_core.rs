@@ -639,12 +639,19 @@ struct ReplicaWriteTarget {
 }
 
 struct PreparedObjectWrite<'a> {
+    tenant: &'a str,
     object_id: LogicalObjectId,
     qos_tier: Option<&'a str>,
     scoped_key: ObjectKey,
     value: &'a [u8],
     targets: Vec<ReplicaWriteTarget>,
     reservations: Vec<mooncake_store_core::SegmentReservation>,
+}
+
+impl PreparedObjectWrite<'_> {
+    fn value_tenant(&self) -> &str {
+        self.tenant
+    }
 }
 
 #[derive(Clone, Debug)]

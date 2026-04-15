@@ -96,12 +96,14 @@ impl CompatTimeoutConfig {
 pub enum TransportBackend {
     Tent,
     ClassicTe,
+    Http,
 }
 
 #[derive(Clone, Debug)]
 pub enum CompatTransportConfig {
     Tent(TentEngineConfig),
     ClassicTe(ClassicEngineConfig),
+    Http,
 }
 
 /// Compatibility-layer build output for Python and standalone client entrypoints.
@@ -261,6 +263,7 @@ fn resolve_transport_backend(explicit: Option<&str>) -> Result<TransportBackend>
     match value.to_ascii_lowercase().as_str() {
         "tent" => Ok(TransportBackend::Tent),
         "classic" | "classic_te" | "classic-te" | "te" => Ok(TransportBackend::ClassicTe),
+        "http" => Ok(TransportBackend::Http),
         other => Err(StoreError::Unsupported(format!(
             "unsupported transport backend: {other}"
         ))),
@@ -290,6 +293,12 @@ fn build_transport_config(
             transport_rpc_port,
             timeouts,
         )?)),
+        TransportBackend::Http => match protocol.to_ascii_lowercase().as_str() {
+            "http" | "tcp" | "" | "auto" => Ok(CompatTransportConfig::Http),
+            other => Err(StoreError::Unsupported(format!(
+                "unsupported transport protocol for http backend: {other}"
+            ))),
+        },
     }
 }
 
@@ -809,7 +818,7 @@ mod tests {
                 assert!(debug.contains("17112"));
                 assert!(debug.contains("transports/rdma/enable"));
             }
-            CompatTransportConfig::ClassicTe(_) => {}
+            CompatTransportConfig::ClassicTe(_) | CompatTransportConfig::Http => {}
         }
     }
 
@@ -847,6 +856,7 @@ mod tests {
                 assert_eq!(config.transport_protocol(), ClassicTransportProtocol::Tcp);
             }
             CompatTransportConfig::Tent(_) => panic!("classic backend should build classic config"),
+            CompatTransportConfig::Http => panic!("classic backend should not build http config"),
         }
     }
 

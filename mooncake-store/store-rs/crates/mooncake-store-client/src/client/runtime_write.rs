@@ -190,6 +190,7 @@ impl StoreClient {
         }
 
         struct PendingBatchReservation<'a> {
+            tenant: &'a str,
             object_id: LogicalObjectId,
             qos_tier: Option<&'a str>,
             scoped_key: ObjectKey,
@@ -309,6 +310,7 @@ impl StoreClient {
                     request.key,
                 );
                 pending.push(PendingBatchReservation {
+                    tenant,
                     object_id,
                     qos_tier: request.qos_tier,
                     scoped_key: self.scoped_key(tenant, request.key),
@@ -410,6 +412,7 @@ impl StoreClient {
             let mut prepared = Vec::with_capacity(pending.len());
             for entry in pending {
                 prepared.push(PreparedObjectWrite {
+                    tenant: entry.tenant,
                     object_id: entry.object_id,
                     qos_tier: entry.qos_tier,
                     scoped_key: entry.scoped_key,
@@ -560,7 +563,15 @@ impl StoreClient {
                     })?;
                     copy_into_region(scratch, entry.value);
                     let batch_id = transport.allocate_batch(remote_requests.len())?;
-                    let submit_result = transport.submit(batch_id, &remote_requests);
+                    let tenant = entry.value_tenant();
+                    let remote_bytes = remote_requests.iter().map(|request| request.length).sum();
+                    let hints = self.remote_batch_hints(
+                        tenant,
+                        remote_bytes,
+                        TransferPacingMode::ThroughputOptimized,
+                    );
+                    let submit_result =
+                        transport.submit_with_hints(batch_id, &remote_requests, &hints);
                     if let Err(error) = submit_result {
                         let _ = transport.free_batch(batch_id);
                         return Err(error);
@@ -575,11 +586,7 @@ impl StoreClient {
                     let free_result = transport.free_batch(batch_id);
                     wait_result?;
                     free_result?;
-                    registry::record_transport_bytes(
-                        "write",
-                        "storage",
-                        remote_requests.iter().map(|request| request.length).sum(),
-                    );
+                    registry::record_transport_bytes("write", "storage", remote_bytes);
                 }
 
                 let expected_version = current.as_ref().map(|route| route.version);

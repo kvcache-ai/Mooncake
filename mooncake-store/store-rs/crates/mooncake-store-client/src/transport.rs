@@ -1,16 +1,21 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::slice;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use mooncake_store_core::{Result, StoreError};
+use mooncake_store_core::{MetadataBackend, Result, StoreError};
 use mooncake_transport::{
-    ClassicEngineConfig, ClassicTransferEngine, SegmentBuffer, SegmentInfo, SegmentKind,
+    ClassicEngineConfig, ClassicTransferEngine, Opcode, SegmentBuffer, SegmentInfo, SegmentKind,
     TentEngine, TentEngineConfig, TransferBatchHints, TransferProgress, TransferRequest,
     TransferStatus,
 };
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BatchWaitFailureKind {
@@ -177,6 +182,27 @@ where
     Ok(())
 }
 
+const HTTP_TRANSPORT_PATH_OPEN_SEGMENT: &str = "/v1/transport/open-segment";
+const HTTP_TRANSPORT_PATH_SUBMIT_BATCH: &str = "/v1/transport/submit-batch";
+const HTTP_TRANSPORT_PATH_BATCH_STATUS: &str = "/v1/transport/batch-status";
+const HTTP_TRANSPORT_LABEL: &str = "transport_http_address";
+const HTTP_TRANSPORT_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+pub struct HttpStoreTransportFactory {
+    metadata: Arc<dyn MetadataBackend>,
+    local_runtime_rpc_address: String,
+}
+
+impl HttpStoreTransportFactory {
+    pub fn new(metadata: Arc<dyn MetadataBackend>, local_runtime_rpc_address: impl Into<String>) -> Self {
+        Self {
+            metadata,
+            local_runtime_rpc_address: local_runtime_rpc_address.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TentTransportFactory {
     config: TentEngineConfig,
@@ -192,6 +218,16 @@ impl StoreTransportFactory for TentTransportFactory {
     fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>> {
         Ok(Arc::new(TentEngine::new(
             &self.config.clone().set("local_segment_name", segment_name),
+        )?))
+    }
+}
+
+impl StoreTransportFactory for HttpStoreTransportFactory {
+    fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>> {
+        Ok(Arc::new(HttpStoreTransport::new(
+            self.metadata.clone(),
+            segment_name,
+            &self.local_runtime_rpc_address,
         )?))
     }
 }
@@ -309,6 +345,87 @@ enum ClassicAllocationOwner {
 }
 
 #[derive(Clone, Debug)]
+struct HttpAllocationRecord {
+    owned: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HttpSegmentHandle {
+    remote_runtime_rpc: String,
+    remote_segment_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct HttpBatchRecord {
+    remote_runtime_rpc: String,
+}
+
+pub struct HttpStoreTransport {
+    metadata: Arc<dyn MetadataBackend>,
+    segment_name: String,
+    local_runtime_rpc_address: String,
+    allocations: Mutex<BTreeMap<usize, HttpAllocationRecord>>,
+    next_handle: Mutex<u64>,
+    next_batch: Mutex<u64>,
+    segment_handles: Mutex<BTreeMap<u64, HttpSegmentHandle>>,
+    batches: Mutex<BTreeMap<u64, HttpBatchRecord>>,
+}
+
+impl HttpStoreTransport {
+    fn new(
+        metadata: Arc<dyn MetadataBackend>,
+        segment_name: &str,
+        local_runtime_rpc_address: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            metadata,
+            segment_name: segment_name.to_string(),
+            local_runtime_rpc_address: local_runtime_rpc_address.to_string(),
+            allocations: Mutex::new(BTreeMap::new()),
+            next_handle: Mutex::new(1),
+            next_batch: Mutex::new(1),
+            segment_handles: Mutex::new(BTreeMap::new()),
+            batches: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn next_segment_handle(&self) -> u64 {
+        let mut next = self.next_handle.lock();
+        let handle = *next;
+        *next = next.saturating_add(1);
+        handle
+    }
+
+    fn next_batch_id(&self) -> u64 {
+        let mut next = self.next_batch.lock();
+        let batch_id = *next;
+        *next = next.saturating_add(1);
+        batch_id
+    }
+
+    fn resolve_remote_runtime_rpc(&self, segment_name: &str) -> Result<String> {
+        let segments = self.metadata.list_segments(None)?;
+        let owner = segments
+            .into_iter()
+            .find(|segment| segment.segment_name.0 == segment_name)
+            .map(|segment| segment.owner)
+            .ok_or_else(|| StoreError::NotFound(format!("segment {segment_name} not found")))?;
+        let lease = self
+            .metadata
+            .list_live_clients()?
+            .into_iter()
+            .find(|lease| lease.runtime == owner)
+            .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", owner)))?;
+        lease.endpoints.labels.get(HTTP_TRANSPORT_LABEL).cloned().ok_or_else(|| {
+            StoreError::NotFound(format!(
+                "runtime {} does not expose {}",
+                lease.runtime, HTTP_TRANSPORT_LABEL
+            ))
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ClassicAllocationRecord {
     location: String,
     size: usize,
@@ -392,6 +509,259 @@ impl ClassicTeTransport {
         let previous = std::mem::replace(&mut *engine, replacement);
         drop(previous);
         engine.republish_local_metadata()
+    }
+}
+
+impl StoreTransport for HttpStoreTransport {
+    fn segment_name(&self) -> Result<String> {
+        Ok(self.segment_name.clone())
+    }
+
+    fn rpc_server_address(&self) -> Result<(String, u16)> {
+        parse_rpc_server_address(&self.local_runtime_rpc_address)
+    }
+
+    fn open_segment(&self, segment_name: &str) -> Result<u64> {
+        let remote_runtime_rpc = self.resolve_remote_runtime_rpc(segment_name)?;
+        let request = HttpOpenSegmentRequest {
+            segment_name: segment_name.to_string(),
+        };
+        let _: HttpJsonResponse<HttpOpenSegmentResponse> = http_json_request(
+            &remote_runtime_rpc,
+            "POST",
+            HTTP_TRANSPORT_PATH_OPEN_SEGMENT,
+            Some(&request),
+            &[],
+        )?;
+        let handle = self.next_segment_handle();
+        self.segment_handles.lock().insert(
+            handle,
+            HttpSegmentHandle {
+                remote_runtime_rpc,
+                remote_segment_name: segment_name.to_string(),
+            },
+        );
+        Ok(handle)
+    }
+
+    fn close_segment(&self, handle: u64) -> Result<()> {
+        self.segment_handles
+            .lock()
+            .remove(&handle)
+            .map(|_| ())
+            .ok_or_else(|| StoreError::NotFound(format!("segment handle {handle} not found")))
+    }
+
+    fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo> {
+        let segment = self
+            .segment_handles
+            .lock()
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("segment handle {handle} not found")))?;
+        let path = format!("{}/{}", HTTP_TRANSPORT_PATH_OPEN_SEGMENT, segment.remote_segment_name);
+        let response: HttpJsonResponse<HttpOpenSegmentResponse> = http_json_request(
+            &segment.remote_runtime_rpc,
+            "GET",
+            &path,
+            None::<&HttpEmptyBody>,
+            &[],
+        )?;
+        Ok(response.json.segment)
+    }
+
+    fn adopt_local_memory(&self, addr: *mut c_void, _size: usize, _location: &str) -> Result<()> {
+        self.allocations
+            .lock()
+            .entry(addr as usize)
+            .or_insert_with(|| HttpAllocationRecord { owned: false });
+        Ok(())
+    }
+
+    fn allocate_memory(&self, size: usize, _location: &str) -> Result<*mut c_void> {
+        let alignment = default_classic_alignment();
+        let mut addr = std::ptr::null_mut();
+        let rc = unsafe { libc::posix_memalign(&mut addr, alignment, size.max(1)) };
+        if rc != 0 {
+            return Err(StoreError::Allocator(format!(
+                "http transport posix_memalign failed with rc={rc} size={size} alignment={alignment}"
+            )));
+        }
+        self.allocations
+            .lock()
+            .insert(addr as usize, HttpAllocationRecord { owned: true });
+        Ok(addr)
+    }
+
+    fn free_memory(&self, addr: *mut c_void) -> Result<()> {
+        let record = self
+            .allocations
+            .lock()
+            .remove(&(addr as usize))
+            .ok_or_else(|| StoreError::Allocator(format!("http transport does not own allocation {:p}", addr)))?;
+        if record.owned {
+            unsafe { libc::free(addr) };
+        }
+        Ok(())
+    }
+
+    fn register_memory(&self, _addr: *mut c_void, _size: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn unregister_memory(&self, _addr: *mut c_void, _size: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
+        if batch_size == 0 {
+            return Err(StoreError::Transport("batch_size must be greater than zero".to_string()));
+        }
+        Ok(self.next_batch_id())
+    }
+
+    fn free_batch(&self, batch_id: u64) -> Result<()> {
+        self.batches.lock().remove(&batch_id);
+        Ok(())
+    }
+
+    fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()> {
+        self.submit_with_hints(batch_id, requests, &TransferBatchHints::default())
+    }
+
+    fn submit_with_hints(
+        &self,
+        batch_id: u64,
+        requests: &[TransferRequest],
+        hints: &TransferBatchHints,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let handles = self.segment_handles.lock();
+        let first = handles
+            .get(&requests[0].target_id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("segment handle {} not found", requests[0].target_id)))?;
+        for request in requests.iter().skip(1) {
+            let current = handles
+                .get(&request.target_id)
+                .ok_or_else(|| StoreError::NotFound(format!("segment handle {} not found", request.target_id)))?;
+            if current.remote_runtime_rpc != first.remote_runtime_rpc {
+                return Err(StoreError::Unsupported(
+                    "http transport batches must target a single runtime".to_string(),
+                ));
+            }
+        }
+        drop(handles);
+
+        let mut body = Vec::new();
+        let items = requests
+            .iter()
+            .map(|request| {
+                let segment = self
+                    .segment_handles
+                    .lock()
+                    .get(&request.target_id)
+                    .cloned()
+                    .ok_or_else(|| StoreError::NotFound(format!("segment handle {} not found", request.target_id)))?;
+                let body_offset = body.len() as u64;
+                let bytes = unsafe {
+                    slice::from_raw_parts(request.source.cast::<u8>(), request.length as usize)
+                };
+                body.extend_from_slice(bytes);
+                Ok(HttpTransferItem {
+                    opcode: request.opcode,
+                    segment_name: segment.remote_segment_name,
+                    target_offset: request.target_offset,
+                    length: request.length,
+                    body_offset,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let request = HttpSubmitBatchRequest {
+            batch_id,
+            hints: hints.clone(),
+            items,
+        };
+        let response: HttpJsonResponse<HttpSubmitBatchWireResponse> = http_json_request(
+            &first.remote_runtime_rpc,
+            "POST",
+            HTTP_TRANSPORT_PATH_SUBMIT_BATCH,
+            Some(&request),
+            &body,
+        )?;
+        let expected_read_body_length = usize::try_from(response.json.read_body_length)
+            .map_err(|_| StoreError::Transport("http read response length does not fit usize".to_string()))?;
+        if expected_read_body_length != response.raw_body.len() {
+            return Err(StoreError::Transport(
+                "http transport read response length header does not match payload".to_string(),
+            ));
+        }
+        let mut read_cursor = 0usize;
+        for request in requests {
+            if request.opcode != Opcode::Read {
+                continue;
+            }
+            let len = usize::try_from(request.length)
+                .map_err(|_| StoreError::Transport("request length does not fit usize".to_string()))?;
+            let end = read_cursor
+                .checked_add(len)
+                .ok_or_else(|| StoreError::Transport("http read response overflow".to_string()))?;
+            if end > response.raw_body.len() {
+                return Err(StoreError::Transport(
+                    "http transport read response shorter than expected".to_string(),
+                ));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    response.raw_body[read_cursor..end].as_ptr(),
+                    request.source.cast::<u8>(),
+                    len,
+                );
+            }
+            read_cursor = end;
+        }
+        if read_cursor != response.raw_body.len() {
+            return Err(StoreError::Transport(
+                "http transport read response contains unexpected trailing bytes".to_string(),
+            ));
+        }
+        self.batches.lock().insert(
+            batch_id,
+            HttpBatchRecord {
+                remote_runtime_rpc: first.remote_runtime_rpc.clone(),
+            },
+        );
+        if response.json.progress.status == TransferStatus::Completed {
+            return Ok(());
+        }
+        Err(StoreError::Transport(format!(
+            "http transport batch {batch_id} returned status {:?}",
+            response.json.progress.status
+        )))
+    }
+
+    fn task_status(&self, batch_id: u64, _task_id: usize) -> Result<TransferProgress> {
+        self.overall_status(batch_id)
+    }
+
+    fn overall_status(&self, batch_id: u64) -> Result<TransferProgress> {
+        let batch = self
+            .batches
+            .lock()
+            .get(&batch_id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("batch {batch_id} not found")))?;
+        let path = format!("{}/{}", HTTP_TRANSPORT_PATH_BATCH_STATUS, batch_id);
+        let response: HttpJsonResponse<HttpBatchStatusResponse> = http_json_request(
+            &batch.remote_runtime_rpc,
+            "GET",
+            &path,
+            None::<&HttpEmptyBody>,
+            &[],
+        )?;
+        Ok(response.json.progress)
     }
 }
 
@@ -548,6 +918,565 @@ impl StoreTransport for ClassicTeTransport {
     fn overall_status(&self, batch_id: u64) -> Result<TransferProgress> {
         self.engine.read().batch_status(batch_id)
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct HttpEmptyBody;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HttpOpenSegmentRequest {
+    segment_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HttpOpenSegmentResponse {
+    segment: SegmentInfo,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HttpTransferItem {
+    opcode: Opcode,
+    segment_name: String,
+    target_offset: u64,
+    length: u64,
+    body_offset: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HttpSubmitBatchRequest {
+    batch_id: u64,
+    hints: TransferBatchHints,
+    items: Vec<HttpTransferItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HttpBatchStatusResponse {
+    progress: TransferProgress,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HttpSubmitBatchWireResponse {
+    progress: TransferProgress,
+    read_body_length: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HttpJsonResponse<R> {
+    json: R,
+    raw_body: Vec<u8>,
+}
+
+fn http_json_request<T: Serialize, R: for<'de> Deserialize<'de>>(
+    address: &str,
+    method: &str,
+    path: &str,
+    body: Option<&T>,
+    raw_body: &[u8],
+) -> Result<HttpJsonResponse<R>> {
+    let json = match body {
+        Some(body) => serde_json::to_vec(body)
+            .map_err(|error| StoreError::Transport(format!("http transport failed to encode json: {error}")))?,
+        None => Vec::new(),
+    };
+    let header = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Mooncake-Body-Length: {}\r\nConnection: close\r\n\r\n",
+        json.len(),
+        raw_body.len()
+    );
+    let mut stream = TcpStream::connect(address).map_err(|error| {
+        StoreError::Transport(format!("http transport failed to connect {address}: {error}"))
+    })?;
+    stream
+        .set_read_timeout(Some(HTTP_TRANSPORT_READ_TIMEOUT))
+        .map_err(|error| StoreError::Transport(format!("http transport failed to set timeout: {error}")))?;
+    stream.write_all(header.as_bytes()).map_err(|error| {
+        StoreError::Transport(format!("http transport failed to write request header: {error}"))
+    })?;
+    if !json.is_empty() {
+        stream.write_all(&json).map_err(|error| {
+            StoreError::Transport(format!("http transport failed to write request body: {error}"))
+        })?;
+    }
+    if !raw_body.is_empty() {
+        stream.write_all(raw_body).map_err(|error| {
+            StoreError::Transport(format!("http transport failed to write payload body: {error}"))
+        })?;
+    }
+    stream.flush().map_err(|error| {
+        StoreError::Transport(format!("http transport failed to flush request: {error}"))
+    })?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|error| {
+        StoreError::Transport(format!("http transport failed to read response: {error}"))
+    })?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| StoreError::Transport("http transport response missing header terminator".to_string()))?;
+    let header_text = String::from_utf8_lossy(&response[..header_end]);
+    let status_line = header_text.lines().next().unwrap_or_default().to_string();
+    if !status_line.contains(" 200 ") {
+        return Err(StoreError::Transport(format!(
+            "http transport request failed: {status_line}"
+        )));
+    }
+    let body = &response[header_end + 4..];
+    let json_length = parse_http_header_usize(&response[..header_end], "content-length");
+    let raw_length = parse_http_header_usize(&response[..header_end], "x-mooncake-body-length");
+    if body.len() < json_length.saturating_add(raw_length) {
+        return Err(StoreError::Transport(
+            "http transport response body shorter than declared lengths".to_string(),
+        ));
+    }
+    let json = serde_json::from_slice(&body[..json_length]).map_err(|error| {
+        StoreError::Transport(format!("http transport failed to decode response json: {error}"))
+    })?;
+    Ok(HttpJsonResponse {
+        json,
+        raw_body: body[json_length..json_length + raw_length].to_vec(),
+    })
+}
+
+pub fn http_transport_label() -> &'static str {
+    HTTP_TRANSPORT_LABEL
+}
+
+pub struct HttpTransportServerHandle {
+    address: String,
+    shutdown: Sender<()>,
+    thread: Option<JoinHandle<()>>,
+    state: Arc<HttpTransportServerState>,
+}
+
+struct HttpTransportServerState {
+    segments: Mutex<BTreeMap<String, HttpServerSegment>>,
+    batches: Mutex<BTreeMap<u64, TransferProgress>>,
+    inflight_by_group: Mutex<BTreeMap<String, u64>>,
+}
+
+struct HttpServerSegment {
+    base_addr: usize,
+    length: usize,
+}
+
+impl HttpTransportServerHandle {
+    pub fn start(bind_addr: &str) -> Result<Self> {
+        let listener = TcpListener::bind(bind_addr).map_err(|error| {
+            StoreError::Transport(format!("http transport server failed to bind {bind_addr}: {error}"))
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            StoreError::Transport(format!(
+                "http transport server failed to enable nonblocking mode: {error}"
+            ))
+        })?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "http transport server failed to read local address: {error}"
+                ))
+            })?
+            .to_string();
+        let state = Arc::new(HttpTransportServerState {
+            segments: Mutex::new(BTreeMap::new()),
+            batches: Mutex::new(BTreeMap::new()),
+            inflight_by_group: Mutex::new(BTreeMap::new()),
+        });
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let thread_state = state.clone();
+        let thread = thread::Builder::new()
+            .name(format!("mooncake-http-transport-{address}"))
+            .spawn(move || run_http_transport_server(listener, shutdown_rx, thread_state))
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "http transport server failed to spawn worker thread: {error}"
+                ))
+            })?;
+        Ok(Self {
+            address,
+            shutdown,
+            thread: Some(thread),
+            state,
+        })
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn publish_segment(&self, segment_name: &str, base_addr: *mut c_void, length: usize) {
+        self.state.segments.lock().insert(
+            segment_name.to_string(),
+            HttpServerSegment {
+                base_addr: base_addr as usize,
+                length,
+            },
+        );
+    }
+
+    pub fn shutdown(&mut self) -> Result<()> {
+        let _ = self.shutdown.send(());
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| StoreError::InvalidState("http transport server panicked".to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HttpTransportServerHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn run_http_transport_server(
+    listener: TcpListener,
+    shutdown_rx: Receiver<()>,
+    state: Arc<HttpTransportServerState>,
+) {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => handle_http_transport_connection(stream, &state),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if shutdown_rx.recv_timeout(Duration::from_millis(50)).is_ok() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn handle_http_transport_connection(mut stream: TcpStream, state: &Arc<HttpTransportServerState>) {
+    if stream
+        .set_read_timeout(Some(HTTP_TRANSPORT_READ_TIMEOUT))
+        .is_err()
+    {
+        return;
+    }
+    let request = match read_http_transport_request(&mut stream) {
+        Ok(request) => request,
+        Err(_) => return,
+    };
+    let response = route_http_transport_request(state, request);
+    let _ = stream.write_all(&response);
+    let _ = stream.flush();
+}
+
+#[derive(Debug)]
+struct HttpTransportRequest {
+    method: String,
+    path: String,
+    json_body: Vec<u8>,
+    raw_body: Vec<u8>,
+}
+
+fn route_http_transport_request(
+    state: &Arc<HttpTransportServerState>,
+    request: HttpTransportRequest,
+) -> Vec<u8> {
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/healthz") | ("GET", "/livez") => http_transport_text_response("200 OK", "ok\n"),
+        ("POST", HTTP_TRANSPORT_PATH_OPEN_SEGMENT) => {
+            let payload = match serde_json::from_slice::<HttpOpenSegmentRequest>(&request.json_body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return http_transport_error_response(
+                        "400 Bad Request",
+                        &format!("invalid JSON body: {error}"),
+                    )
+                }
+            };
+            let segments = state.segments.lock();
+            let Some(segment) = segments.get(&payload.segment_name) else {
+                return http_transport_error_response("404 Not Found", "segment not found");
+            };
+            http_transport_json_response(
+                "200 OK",
+                &HttpOpenSegmentResponse {
+                    segment: SegmentInfo {
+                        kind: SegmentKind::Memory,
+                        buffers: vec![SegmentBuffer {
+                            base: segment.base_addr as u64,
+                            length: segment.length as u64,
+                            location: "cpu:0".to_string(),
+                        }],
+                    },
+                },
+            )
+        }
+        ("GET", path) if path.starts_with(&(HTTP_TRANSPORT_PATH_OPEN_SEGMENT.to_string() + "/")) => {
+            let segment_name = path.trim_start_matches(&(HTTP_TRANSPORT_PATH_OPEN_SEGMENT.to_string() + "/"));
+            let segments = state.segments.lock();
+            let Some(segment) = segments.get(segment_name) else {
+                return http_transport_error_response("404 Not Found", "segment not found");
+            };
+            http_transport_json_response(
+                "200 OK",
+                &HttpOpenSegmentResponse {
+                    segment: SegmentInfo {
+                        kind: SegmentKind::Memory,
+                        buffers: vec![SegmentBuffer {
+                            base: segment.base_addr as u64,
+                            length: segment.length as u64,
+                            location: "cpu:0".to_string(),
+                        }],
+                    },
+                },
+            )
+        }
+        ("POST", HTTP_TRANSPORT_PATH_SUBMIT_BATCH) => {
+            let payload = match serde_json::from_slice::<HttpSubmitBatchRequest>(&request.json_body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return http_transport_error_response(
+                        "400 Bad Request",
+                        &format!("invalid JSON body: {error}"),
+                    )
+                }
+            };
+            let total_bytes = payload.items.iter().map(|item| item.length).sum::<u64>();
+            if let Some(limit) = payload.hints.max_inflight_bytes {
+                if total_bytes > limit {
+                    return http_transport_error_response(
+                        "400 Bad Request",
+                        &format!("batch exceeds max_inflight_bytes limit: bytes={total_bytes} limit={limit}"),
+                    );
+                }
+            }
+            if let Some(group) = payload.hints.pacing_group.as_ref() {
+                let mut inflight = state.inflight_by_group.lock();
+                let current = inflight.get(group).copied().unwrap_or_default();
+                if let Some(limit) = payload.hints.max_inflight_bytes {
+                    if current.saturating_add(total_bytes) > limit {
+                        return http_transport_error_response(
+                            "429 Too Many Requests",
+                            &format!("inflight bytes exceed limit for group {group}"),
+                        );
+                    }
+                }
+                inflight.insert(group.clone(), current.saturating_add(total_bytes));
+            }
+            let result = apply_http_batch(state, &payload, &request.raw_body);
+            if let Some(group) = payload.hints.pacing_group.as_ref() {
+                let mut inflight = state.inflight_by_group.lock();
+                let current = inflight.get(group).copied().unwrap_or_default();
+                let next = current.saturating_sub(total_bytes);
+                if next == 0 {
+                    inflight.remove(group);
+                } else {
+                    inflight.insert(group.clone(), next);
+                }
+            }
+            match result {
+                Ok((progress, read_body)) => {
+                    state.batches.lock().insert(payload.batch_id, progress);
+                    http_transport_json_response_with_raw(
+                        "200 OK",
+                        &HttpSubmitBatchWireResponse {
+                            progress,
+                            read_body_length: read_body.len() as u64,
+                        },
+                        &read_body,
+                    )
+                }
+                Err(error) => http_transport_error_response("400 Bad Request", &error.to_string()),
+            }
+        }
+        ("GET", path) if path.starts_with(&(HTTP_TRANSPORT_PATH_BATCH_STATUS.to_string() + "/")) => {
+            let batch_id = match path
+                .trim_start_matches(&(HTTP_TRANSPORT_PATH_BATCH_STATUS.to_string() + "/"))
+                .parse::<u64>()
+            {
+                Ok(batch_id) => batch_id,
+                Err(error) => {
+                    return http_transport_error_response(
+                        "400 Bad Request",
+                        &format!("invalid batch id: {error}"),
+                    )
+                }
+            };
+            let Some(progress) = state.batches.lock().get(&batch_id).copied() else {
+                return http_transport_error_response("404 Not Found", "batch not found");
+            };
+            http_transport_json_response("200 OK", &HttpBatchStatusResponse { progress })
+        }
+        _ => http_transport_error_response("404 Not Found", "not found"),
+    }
+}
+
+fn apply_http_batch(
+    state: &Arc<HttpTransportServerState>,
+    payload: &HttpSubmitBatchRequest,
+    raw_body: &[u8],
+) -> Result<(TransferProgress, Vec<u8>)> {
+    let segments = state.segments.lock();
+    let mut transferred = 0u64;
+    let mut read_body = Vec::new();
+    for item in &payload.items {
+        let segment = segments.get(&item.segment_name).ok_or_else(|| {
+            StoreError::NotFound(format!("segment {} not found", item.segment_name))
+        })?;
+        let len = usize::try_from(item.length)
+            .map_err(|_| StoreError::Transport("item length does not fit usize".to_string()))?;
+        let target_offset = usize::try_from(item.target_offset)
+            .map_err(|_| StoreError::Transport("target offset does not fit usize".to_string()))?;
+        let target_end = target_offset
+            .checked_add(len)
+            .ok_or_else(|| StoreError::Transport("target range overflow".to_string()))?;
+        if target_end > segment.length {
+            return Err(StoreError::Transport(format!(
+                "segment {} transfer exceeds bounds",
+                item.segment_name
+            )));
+        }
+        match item.opcode {
+            Opcode::Write => {
+                let start = usize::try_from(item.body_offset)
+                    .map_err(|_| StoreError::Transport("body offset does not fit usize".to_string()))?;
+                let end = start
+                    .checked_add(len)
+                    .ok_or_else(|| StoreError::Transport("body slice overflow".to_string()))?;
+                if end > raw_body.len() {
+                    return Err(StoreError::Transport(
+                        "raw body is shorter than declared item payload".to_string(),
+                    ));
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw_body[start..end].as_ptr(),
+                        (segment.base_addr as *mut u8).add(target_offset),
+                        len,
+                    );
+                }
+            }
+            Opcode::Read => unsafe {
+                let source = slice::from_raw_parts((segment.base_addr as *const u8).add(target_offset), len);
+                read_body.extend_from_slice(source);
+            },
+        }
+        transferred = transferred.saturating_add(item.length);
+    }
+    Ok((
+        TransferProgress {
+            status: TransferStatus::Completed,
+            transferred_bytes: transferred,
+        },
+        read_body,
+    ))
+}
+
+fn read_http_transport_request(stream: &mut TcpStream) -> std::io::Result<HttpTransportRequest> {
+    let mut request = Vec::with_capacity(4096);
+    let mut buffer = [0_u8; 1024];
+    let mut header_end = None;
+    let mut json_length = 0usize;
+    let mut raw_length = 0usize;
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if header_end.is_none() {
+            header_end = request.windows(4).position(|window| window == b"\r\n\r\n");
+            if let Some(index) = header_end {
+                json_length = parse_http_header_usize(&request[..index + 4], "content-length");
+                raw_length = parse_http_header_usize(&request[..index + 4], "x-mooncake-body-length");
+                let body_len = request.len().saturating_sub(index + 4);
+                if body_len >= json_length.saturating_add(raw_length) {
+                    break;
+                }
+            }
+        } else if let Some(index) = header_end {
+            let body_len = request.len().saturating_sub(index + 4);
+            if body_len >= json_length.saturating_add(raw_length) {
+                break;
+            }
+        }
+        if request.len() >= 8 * 1024 * 1024 {
+            break;
+        }
+    }
+    let header_end = header_end.unwrap_or(request.len());
+    let header_bytes = &request[..header_end];
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let first_line = header_text.lines().next().unwrap_or_default();
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    let body_start = usize::min(request.len(), header_end.saturating_add(4));
+    let json_end = usize::min(request.len(), body_start.saturating_add(json_length));
+    let raw_end = usize::min(request.len(), json_end.saturating_add(raw_length));
+    Ok(HttpTransportRequest {
+        method,
+        path,
+        json_body: request[body_start..json_end].to_vec(),
+        raw_body: request[json_end..raw_end].to_vec(),
+    })
+}
+
+fn parse_http_header_usize(headers: &[u8], key: &str) -> usize {
+    let text = String::from_utf8_lossy(headers);
+    text.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(key)
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
+fn http_transport_text_response(status: &str, body: &str) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nX-Mooncake-Body-Length: 0\r\nConnection: close\r\n\r\n",
+        body.len(),
+    )
+    .into_bytes();
+    response.extend_from_slice(body.as_bytes());
+    response
+}
+
+fn http_transport_json_response<T: Serialize>(status: &str, body: &T) -> Vec<u8> {
+    http_transport_json_response_with_raw(status, body, &[])
+}
+
+fn http_transport_json_response_with_raw<T: Serialize>(status: &str, body: &T, raw_body: &[u8]) -> Vec<u8> {
+    match serde_json::to_vec(body) {
+        Ok(encoded) => {
+            let mut response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Mooncake-Body-Length: {}\r\nConnection: close\r\n\r\n",
+                encoded.len(),
+                raw_body.len(),
+            )
+            .into_bytes();
+            response.extend_from_slice(&encoded);
+            response.extend_from_slice(raw_body);
+            response
+        }
+        Err(error) => http_transport_error_response(
+            "500 Internal Server Error",
+            &format!("failed to serialize response: {error}"),
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HttpTransportErrorResponse {
+    error: String,
+}
+
+fn http_transport_error_response(status: &str, message: &str) -> Vec<u8> {
+    http_transport_json_response(
+        status,
+        &HttpTransportErrorResponse {
+            error: message.to_string(),
+        },
+    )
 }
 
 fn default_classic_alignment() -> usize {
@@ -744,16 +1673,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use mooncake_store_core::{Result, StoreError};
+    use mooncake_store_core::{ClientLease, Result, StoreError};
     use mooncake_transport::{
-        SegmentInfo, TransferBatchHints, TransferProgress, TransferRequest, TransferStatus,
+        Opcode, SegmentInfo, TransferBatchHints, TransferPacingMode, TransferProgress,
+        TransferRequest, TransferStatus,
     };
     use parking_lot::Mutex;
 
     use super::{
         classic_buffer_location, parse_rpc_server_address, registration_chunks,
         wait_for_batch_completion, wait_for_batch_completion_detailed, BatchWaitFailureKind,
-        ClassicAllocationOwner, ClassicAllocationRecord, StoreTransport,
+        ClassicAllocationOwner, ClassicAllocationRecord, HttpStoreTransport,
+        HttpTransportServerHandle, StoreTransport,
     };
 
     struct ScriptedTransport {
@@ -1080,5 +2011,269 @@ mod tests {
         assert_eq!(classic_buffer_location(&allocations, 0x1080, 0x80), "cpu:1");
         assert_eq!(classic_buffer_location(&allocations, 0x1080, 0x81), "*");
         assert_eq!(classic_buffer_location(&allocations, 0x2000, 0x10), "*");
+    }
+
+    #[derive(Clone)]
+    struct TestMetadataBackend {
+        leases: Vec<ClientLease>,
+        segments: Vec<mooncake_store_core::SegmentAnnouncement>,
+    }
+
+    impl mooncake_store_core::MetadataBackend for TestMetadataBackend {
+        fn route_namespace(&self) -> String {
+            "test".to_string()
+        }
+
+        fn upsert_client_lease(&self, _lease: &ClientLease) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn update_client_state(
+            &self,
+            _runtime: &mooncake_store_core::ClientRuntimeId,
+            _next: mooncake_store_core::ClientLifecycleState,
+        ) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
+            Ok(self.leases.clone())
+        }
+
+        fn publish_segment(&self, _segment: &mooncake_store_core::SegmentAnnouncement) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn unpublish_segment(
+            &self,
+            _owner: &mooncake_store_core::ClientRuntimeId,
+            _segment: &mooncake_store_core::SegmentName,
+        ) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn list_segments(
+            &self,
+            _owner: Option<&mooncake_store_core::ClientRuntimeId>,
+        ) -> Result<Vec<mooncake_store_core::SegmentAnnouncement>> {
+            Ok(self.segments.clone())
+        }
+
+        fn update_segment_state(
+            &self,
+            _owner: &mooncake_store_core::ClientRuntimeId,
+            _segment: &mooncake_store_core::SegmentName,
+            _next: mooncake_store_core::SegmentLifecycleState,
+        ) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn reserve_segment(
+            &self,
+            _owner: &mooncake_store_core::ClientRuntimeId,
+            _segment: &mooncake_store_core::SegmentName,
+            _length_bytes: u64,
+        ) -> Result<mooncake_store_core::SegmentReservation> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn release_segment(
+            &self,
+            _owner: &mooncake_store_core::ClientRuntimeId,
+            _segment: &mooncake_store_core::SegmentName,
+            _offset_bytes: u64,
+            _length_bytes: u64,
+        ) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn get_object_route(
+            &self,
+            _key: &mooncake_store_core::ObjectKey,
+        ) -> Result<Option<mooncake_store_core::ObjectRoute>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn list_object_routes(&self) -> Result<Vec<mooncake_store_core::ObjectRoute>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn compare_and_swap_object_route(
+            &self,
+            _key: &mooncake_store_core::ObjectKey,
+            _expected: Option<mooncake_store_core::RouteVersion>,
+            _next: Option<&mooncake_store_core::ObjectRoute>,
+        ) -> Result<mooncake_store_core::CasResult> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn get_route_policy(
+            &self,
+            _domain: &mooncake_store_core::RoutePolicyDomain,
+        ) -> Result<Option<mooncake_store_core::RoutePolicy>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn put_route_policy_if_absent(
+            &self,
+            _domain: &mooncake_store_core::RoutePolicyDomain,
+            _policy: &mooncake_store_core::RoutePolicy,
+        ) -> Result<bool> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn put_route_policy(
+            &self,
+            _domain: &mooncake_store_core::RoutePolicyDomain,
+            _policy: &mooncake_store_core::RoutePolicy,
+        ) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn delete_route_policy(
+            &self,
+            _domain: &mooncake_store_core::RoutePolicyDomain,
+        ) -> Result<bool> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn list_route_policies(
+            &self,
+        ) -> Result<Vec<(mooncake_store_core::RoutePolicyDomain, mooncake_store_core::RoutePolicy)>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn get_tenant_policy(
+            &self,
+            _scope: &mooncake_store_core::TenantPolicyScope,
+        ) -> Result<Option<mooncake_store_core::TenantPolicy>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn list_tenant_policies(&self) -> Result<Vec<mooncake_store_core::TenantPolicy>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn put_tenant_policy(
+            &self,
+            _policy: &mooncake_store_core::TenantPolicy,
+            _expected_version: Option<u64>,
+        ) -> Result<mooncake_store_core::TenantPolicy> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn delete_tenant_policy(
+            &self,
+            _scope: &mooncake_store_core::TenantPolicyScope,
+            _expected_version: Option<u64>,
+        ) -> Result<bool> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn put_handoff(&self, _handoff: &mooncake_store_core::HandoffPlan) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn get_handoff(
+            &self,
+            _stable_id: &mooncake_store_core::ClientStableId,
+        ) -> Result<Option<mooncake_store_core::HandoffPlan>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+    }
+
+    #[test]
+    fn http_transport_moves_write_and_read_payloads_over_http() {
+        let mut remote_segment = vec![0u8; 64];
+        let server = HttpTransportServerHandle::start("127.0.0.1:0")
+            .expect("http transport server should start");
+        server.publish_segment(
+            "remote-segment",
+            remote_segment.as_mut_ptr().cast::<c_void>(),
+            remote_segment.len(),
+        );
+
+        let runtime = mooncake_store_core::ClientRuntimeId::new(
+            "remote-runtime",
+            mooncake_store_core::ClientEpoch(1),
+        );
+        let mut endpoints = mooncake_store_core::ClientEndpointSet::default();
+        endpoints.labels.insert(
+            super::http_transport_label().to_string(),
+            server.address().to_string(),
+        );
+        let metadata = Arc::new(TestMetadataBackend {
+            leases: vec![ClientLease {
+                runtime: runtime.clone(),
+                state: mooncake_store_core::ClientLifecycleState::Active,
+                compatibility: mooncake_store_core::CompatibilityDescriptor::default(),
+                endpoints,
+                expires_at_ms: u64::MAX,
+            }],
+            segments: vec![mooncake_store_core::SegmentAnnouncement {
+                owner: runtime,
+                segment_name: mooncake_store_core::SegmentName::new("remote-segment"),
+                capacity_bytes: remote_segment.len() as u64,
+                used_bytes: 0,
+                state: mooncake_store_core::SegmentLifecycleState::Active,
+                alignment_bytes: 1,
+                tags: Vec::new(),
+            }],
+        });
+
+        let transport = HttpStoreTransport::new(
+            metadata,
+            "local-segment",
+            "127.0.0.1:17000",
+        )
+        .expect("http transport should build");
+        let handle = transport
+            .open_segment("remote-segment")
+            .expect("open_segment should resolve remote runtime");
+
+        let write_batch = transport.allocate_batch(1).expect("write batch should allocate");
+        let write_payload = b"hello-http-read";
+        let write_request = TransferRequest {
+            opcode: Opcode::Write,
+            source: write_payload.as_ptr().cast::<c_void>() as *mut c_void,
+            target_id: handle,
+            target_offset: 5,
+            length: write_payload.len() as u64,
+        };
+        transport
+            .submit_with_hints(
+                write_batch,
+                &[write_request],
+                &TransferBatchHints {
+                    pacing_group: Some("tenant/default".to_string()),
+                    mode: TransferPacingMode::LatencySensitive,
+                    max_inflight_bytes: Some(1024),
+                },
+            )
+            .expect("http write should succeed");
+        assert_eq!(&remote_segment[5..5 + write_payload.len()], write_payload);
+
+        let read_batch = transport.allocate_batch(1).expect("read batch should allocate");
+        let mut read_buffer = vec![0u8; write_payload.len()];
+        let read_request = TransferRequest {
+            opcode: Opcode::Read,
+            source: read_buffer.as_mut_ptr().cast::<c_void>(),
+            target_id: handle,
+            target_offset: 5,
+            length: write_payload.len() as u64,
+        };
+        remote_segment[5..5 + write_payload.len()].copy_from_slice(write_payload);
+        transport
+            .submit_with_hints(
+                read_batch,
+                &[read_request],
+                &TransferBatchHints {
+                    pacing_group: Some("tenant/default".to_string()),
+                    mode: TransferPacingMode::ThroughputOptimized,
+                    max_inflight_bytes: Some(1024),
+                },
+            )
+            .expect("http read should succeed");
+        assert_eq!(read_buffer, write_payload);
     }
 }
