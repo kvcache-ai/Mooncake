@@ -155,7 +155,7 @@ impl RequestDeadline {
     }
 }
 
-fn duration_from_env_ms(keys: &[&str]) -> Option<Duration> {
+pub(crate) fn duration_from_env_ms(keys: &[&str]) -> Option<Duration> {
     keys.iter()
         .find_map(|key| std::env::var(key).ok())
         .and_then(|value| value.parse::<u64>().ok())

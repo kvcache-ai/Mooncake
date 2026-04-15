@@ -3,6 +3,10 @@ use super::*;
 
 impl ControlPlaneClient {
     pub(crate) fn new() -> Result<Self> {
+        Self::with_request_timeout(control_request_timeout_from_env())
+    }
+
+    pub(crate) fn with_request_timeout(request_timeout: Duration) -> Result<Self> {
         let worker_threads = control_plane_runtime_threads_from_env();
         let runtime = RuntimeBuilder::new_multi_thread()
             .worker_threads(worker_threads)
@@ -16,6 +20,7 @@ impl ControlPlaneClient {
             runtime: Some(runtime),
             channels: Mutex::new(BTreeMap::new()),
             streams: Mutex::new(BTreeMap::new()),
+            request_timeout: request_timeout.max(Duration::from_millis(1)),
         })
     }
 
@@ -770,25 +775,30 @@ impl ControlPlaneClient {
         }
 
         let channel = self.channel_for(lease)?;
+        let request_timeout = self.request_timeout;
         let session = self.with_runtime(|runtime| {
             runtime.block_on(async move {
-                let (sender, receiver) = mpsc::channel(128);
-                let outbound = ReceiverStream::new(receiver);
-                let mut client =
-                    pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
-                let inbound = client
-                    .control_stream(Request::new(outbound))
-                    .await
-                    .map(Response::into_inner)
-                    .map_err(status_to_store_error)?;
-                let session = Arc::new(ControlStreamSession {
-                    sender,
-                    pending: Arc::new(Mutex::new(BTreeMap::new())),
-                    next_request_id: AtomicU64::new(1),
-                    closed: AtomicBool::new(false),
-                });
-                spawn_stream_reader(session.clone(), inbound);
-                Ok::<_, StoreError>(session)
+                tokio::time::timeout(request_timeout, async move {
+                    let (sender, receiver) = mpsc::channel(128);
+                    let outbound = ReceiverStream::new(receiver);
+                    let mut client =
+                        pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
+                    let inbound = client
+                        .control_stream(Request::new(outbound))
+                        .await
+                        .map(Response::into_inner)
+                        .map_err(status_to_store_error)?;
+                    let session = Arc::new(ControlStreamSession {
+                        sender,
+                        pending: Arc::new(Mutex::new(BTreeMap::new())),
+                        next_request_id: AtomicU64::new(1),
+                        closed: AtomicBool::new(false),
+                    });
+                    spawn_stream_reader(session.clone(), inbound);
+                    Ok::<_, StoreError>(session)
+                })
+                .await
+                .map_err(|_| control_timeout_error("control stream open", request_timeout))?
             })
         })?;
         self.streams
@@ -834,11 +844,30 @@ impl ControlPlaneClient {
                 last_error = Some(error);
                 continue;
             }
-            let reply = self
-                .with_runtime(|runtime| runtime.block_on(rx))
-                .map_err(|_| {
+            let request_timeout = self.request_timeout;
+            let reply = self.with_runtime(|runtime| {
+                runtime.block_on(async move { tokio::time::timeout(request_timeout, rx).await })
+            });
+            let reply = match reply {
+                Ok(reply) => reply.map_err(|_| {
                     StoreError::Transport("control stream response channel closed".to_string())
-                })?;
+                })?,
+                Err(_) => {
+                    session.pending.lock().remove(&request_id);
+                    session.closed.store(true, Ordering::Relaxed);
+                    self.invalidate_stream_session(&address);
+                    let error = control_timeout_error("control stream request", request_timeout);
+                    debug!(
+                        address,
+                        request_id,
+                        attempt,
+                        error = %error,
+                        "control stream request timed out; invalidating session"
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             match reply {
                 Ok(reply) => return Ok(reply),
                 Err(error) => {
@@ -890,10 +919,16 @@ impl ControlPlaneClient {
         Fut: std::future::Future<Output = std::result::Result<Response<T>, Status>>,
     {
         let client = pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
+        let request_timeout = self.request_timeout;
         self.with_runtime(|runtime| {
-            runtime.block_on(async move { f(client).await.map(Response::into_inner) })
+            runtime.block_on(async move {
+                tokio::time::timeout(request_timeout, f(client))
+                    .await
+                    .map_err(|_| control_timeout_error("control unary rpc", request_timeout))?
+                    .map(Response::into_inner)
+                    .map_err(status_to_store_error)
+            })
         })
-        .map_err(status_to_store_error)
     }
 
     pub(crate) fn clear_channels(&self) {
@@ -952,6 +987,18 @@ fn control_plane_runtime_threads_from_env() -> usize {
             DEFAULT_CONTROL_PLANE_THREADS
         }
     }
+}
+
+fn control_request_timeout_from_env() -> Duration {
+    crate::client::duration_from_env_ms(&[CONTROL_REQUEST_TIMEOUT_ENV])
+        .unwrap_or(DEFAULT_CONTROL_REQUEST_TIMEOUT)
+}
+
+fn control_timeout_error(context: &'static str, timeout: Duration) -> StoreError {
+    StoreError::Transport(format!(
+        "{context} timed out after {}ms",
+        timeout.as_millis()
+    ))
 }
 
 impl Drop for ControlPlaneClient {

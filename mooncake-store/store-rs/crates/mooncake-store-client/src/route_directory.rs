@@ -401,6 +401,9 @@ impl EmbeddedWrhRouteDirectory {
     ) -> Result<bool> {
         let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
         for (index, authorities) in ranked_authorities.iter().enumerate() {
+            if resolved[index].is_some() {
+                continue;
+            }
             let Some(authority) = authorities.get(rank).cloned() else {
                 continue;
             };
@@ -1852,6 +1855,174 @@ mod tests {
             .authorities
             .iter()
             .all(|lease| lease.runtime != rw_only_writer.runtime));
+    }
+
+    #[test]
+    fn embedded_directory_does_not_probe_fallback_authorities_after_topk_hit() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-topk-hit", 1, false, Some("scope-a"));
+        let authority_a = lease("authority-topk-a", 8, true, Some("scope-a"));
+        let authority_b = lease("authority-topk-b", 7, true, Some("scope-a"));
+        let unreachable = lease("authority-topk-dead", 1, true, Some("scope-a"));
+        for lease in [
+            observer.clone(),
+            authority_a.clone(),
+            authority_b.clone(),
+            unreachable.clone(),
+        ] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        let suspect_runtime_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::SuspectRuntimeCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_topk_hit_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &observer,
+            Arc::new(ControlPlaneClient::new().expect("control client should build")),
+            live_client_cache,
+            suspect_runtime_cache.clone(),
+        );
+        let namespace = metadata.route_namespace();
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&authority_a.runtime.stable_id);
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&authority_b.runtime.stable_id);
+
+        let candidates = vec![
+            authority_a.clone(),
+            authority_b.clone(),
+            unreachable.clone(),
+        ];
+        let key = (0..4096u32)
+            .map(|index| ObjectKey::new(format!("tenant-a::topk-hit-key-{index}")))
+            .find(|candidate_key| {
+                let ranked =
+                    directory.ranked_authorities_from_candidates(&candidates, candidate_key);
+                ranked.len() >= 3
+                    && ranked[2].runtime == unreachable.runtime
+                    && ranked[..2]
+                        .iter()
+                        .any(|lease| lease.runtime == authority_a.runtime)
+                    && ranked[..2]
+                        .iter()
+                        .any(|lease| lease.runtime == authority_b.runtime)
+            })
+            .expect("test key should rank the unreachable authority outside topk");
+        let route = route_for(&key.0, &authority_a.runtime);
+        for authority in [&authority_a, &authority_b] {
+            authority_replace(&namespace, &authority.runtime.stable_id, &key, Some(&route))
+                .expect("topk authority route should seed");
+        }
+
+        let routes = directory
+            .get_object_routes(&observer, std::slice::from_ref(&key))
+            .expect("topk route read should not contact fallback authorities");
+        assert_eq!(routes, vec![Some(route)]);
+        assert!(
+            !suspect_runtime_cache.lock().contains(&unreachable.runtime),
+            "resolved topk reads must not quarantine untouched fallback authorities"
+        );
+
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&authority_a.runtime.stable_id);
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&authority_b.runtime.stable_id);
+    }
+
+    #[test]
+    fn embedded_directory_stops_after_first_topk_hit() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-first-hit", 1, false, Some("scope-a"));
+        let live_authority = lease("authority-first-hit-live", 8, true, Some("scope-a"));
+        let mut dead_mirror = lease("authority-first-hit-dead", 7, true, Some("scope-a"));
+        dead_mirror.endpoints.labels.insert(
+            crate::control_plane::control_address_label().to_string(),
+            "127.0.0.1:1".to_string(),
+        );
+        for lease in [
+            observer.clone(),
+            live_authority.clone(),
+            dead_mirror.clone(),
+        ] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        let suspect_runtime_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::SuspectRuntimeCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_first_hit_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &observer,
+            Arc::new(ControlPlaneClient::new().expect("control client should build")),
+            live_client_cache,
+            suspect_runtime_cache.clone(),
+        );
+        let namespace = metadata.route_namespace();
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&live_authority.runtime.stable_id);
+
+        let candidates = vec![live_authority.clone(), dead_mirror.clone()];
+        let key = (0..4096u32)
+            .map(|index| ObjectKey::new(format!("tenant-a::first-hit-key-{index}")))
+            .find(|candidate_key| {
+                let ranked =
+                    directory.ranked_authorities_from_candidates(&candidates, candidate_key);
+                ranked.len() >= 2
+                    && ranked[0].runtime == live_authority.runtime
+                    && ranked[1].runtime == dead_mirror.runtime
+            })
+            .expect("test key should rank the live authority before the dead mirror");
+        let route = route_for(&key.0, &live_authority.runtime);
+        authority_replace(
+            &namespace,
+            &live_authority.runtime.stable_id,
+            &key,
+            Some(&route),
+        )
+        .expect("live authority route should seed");
+
+        let routes = directory
+            .get_object_routes(&observer, std::slice::from_ref(&key))
+            .expect("first topk route hit should not probe dead mirrors");
+        assert_eq!(routes, vec![Some(route)]);
+        assert!(
+            !suspect_runtime_cache.lock().contains(&dead_mirror.runtime),
+            "resolved topk reads must not quarantine untouched mirrors"
+        );
+
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&live_authority.runtime.stable_id);
     }
 
     #[test]

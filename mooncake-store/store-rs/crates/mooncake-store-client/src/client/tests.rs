@@ -22,10 +22,11 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, encode_lifecycle_state, flatten_slices, now_ms,
-    record_success_metric, scatter_into_buffers, shared_suspect_runtime_cache,
-    startup_prewarm_delay, AllocationSpan, LiveClientCache, LocalAllocatorAdapter,
-    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget, ResolvedObject,
-    SegmentAllocator, StorageOwnerState, StoreState, SuspectRuntimeCache,
+    record_success_metric, refresh_live_client_cache, scatter_into_buffers,
+    shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan, LiveClientCache,
+    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
+    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
+    SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -2545,6 +2546,128 @@ fn routed_read_fails_over_within_same_request_after_primary_transport_failure() 
     assert_eq!(repaired.replicas.len(), 1);
     assert_eq!(repaired.replicas[0].owner, *store_b.runtime_id());
     assert_eq!(repaired.replicas[0].priority, 0);
+}
+
+#[test]
+fn routed_read_probes_cached_remote_segment_before_reuse() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("cached-probe-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("cached-probe-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("cached-probe-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("cached-probe-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "cached-probe-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "cached-probe-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "cached-probe-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 2)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "cached-probe-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    writer
+        .put_with_policy(
+            "cached-probe-key",
+            b"cached-probe-payload",
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("replicated put should succeed");
+
+    assert_eq!(
+        reader
+            .get("cached-probe-key")
+            .expect("first read should cache the primary remote segment"),
+        b"cached-probe-payload"
+    );
+
+    let mut stale_lease = store_a.lease().clone();
+    stale_lease.endpoints.labels.insert(
+        control_address_label().to_string(),
+        "127.0.0.1:1".to_string(),
+    );
+    metadata
+        .upsert_client_lease(&stale_lease)
+        .expect("stale lease update should succeed");
+    refresh_live_client_cache(
+        metadata.as_ref(),
+        &reader.live_client_cache,
+        "cached_probe_reader_refresh",
+    )
+    .expect("reader cache refresh should succeed");
+
+    assert_eq!(
+        reader
+            .get("cached-probe-key")
+            .expect("second read should probe cached primary and fail over"),
+        b"cached-probe-payload"
+    );
+    assert!(
+        reader
+            .suspect_runtime_cache
+            .lock()
+            .contains(store_a.runtime_id()),
+        "dead primary must be quarantined even when its segment handle is cached"
+    );
+    let repaired = reader
+        .query_route("cached-probe-key")
+        .expect("repaired route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired.replicas.len(), 1);
+    assert_eq!(repaired.replicas[0].owner, *store_b.runtime_id());
 }
 
 #[test]

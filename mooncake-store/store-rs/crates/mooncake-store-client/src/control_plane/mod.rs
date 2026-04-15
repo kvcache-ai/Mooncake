@@ -22,6 +22,8 @@ use crate::observability::OperationTracker;
 
 const CONTROL_ADDR_LABEL: &str = "control_addr";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_CONTROL_REQUEST_TIMEOUT_MS";
 const CONTROL_PLANE_THREADS_ENV: &str = "MC_STORE_RS_CONTROL_PLANE_THREADS";
 
 pub(crate) trait AuthorityService: Send + Sync {
@@ -183,6 +185,7 @@ pub(crate) struct ControlPlaneClient {
     runtime: Option<Runtime>,
     channels: Mutex<BTreeMap<String, Channel>>,
     streams: Mutex<BTreeMap<String, Arc<ControlStreamSession>>>,
+    request_timeout: Duration,
 }
 
 #[derive(Debug)]

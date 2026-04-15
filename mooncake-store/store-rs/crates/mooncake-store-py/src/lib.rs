@@ -1574,8 +1574,8 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
-        snapshot_metrics, LocalMemoryConfig, RouteControlMode, StoreClient, StoreClientBuilder,
-        StoreTransport,
+        snapshot_metrics, LocalMemoryConfig, MooncakeCompatibilityFacade, RouteControlMode,
+        StoreClient, StoreClientBuilder, StoreTransport,
     };
     use mooncake_store_core::{
         CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
@@ -1889,10 +1889,18 @@ mod tests {
     }
 
     fn build_client_with_metadata(name: &str, metadata: Arc<dyn MetadataBackend>) -> StoreClient {
+        build_client_with_metadata_and_state(name, metadata, ClientLifecycleState::Active)
+    }
+
+    fn build_client_with_metadata_and_state(
+        name: &str,
+        metadata: Arc<dyn MetadataBackend>,
+        state: ClientLifecycleState,
+    ) -> StoreClient {
         let transport = Arc::new(TestTransport::new(&format!("{name}-segment")));
         StoreClientBuilder::new(metadata, name)
             .epoch(ClientEpoch(1))
-            .state(ClientLifecycleState::Active)
+            .state(state)
             .compatibility(CompatibilityDescriptor::default())
             .route_control(RouteControlMode::MetadataOnly)
             .transport(transport)
@@ -3194,6 +3202,48 @@ mod tests {
             .join()
             .expect("dispatcher state read-holder should join")
             .expect("read-holder should finish after release");
+    }
+
+    #[test]
+    fn dispatcher_state_update_changes_inner_lifecycle() {
+        let dispatcher = StoreDispatcher::spawn(
+            build_client_with_metadata_and_state(
+                "dispatcher-standby-activate",
+                Arc::new(InMemoryMetadataBackend::new()),
+                ClientLifecycleState::Standby,
+            ),
+            "dispatcher-standby-activate".to_string(),
+        )
+        .expect("dispatcher should spawn");
+        dispatcher
+            .register_local_memory()
+            .expect("local memory should register");
+
+        assert_eq!(
+            dispatcher
+                .run(|client| Ok::<_, StoreError>(client.lifecycle_state()))
+                .expect("lifecycle read should succeed"),
+            ClientLifecycleState::Standby
+        );
+        dispatcher.activate().expect("activate should succeed");
+        assert_eq!(
+            dispatcher
+                .run(|client| Ok::<_, StoreError>(client.lifecycle_state()))
+                .expect("lifecycle read should succeed"),
+            ClientLifecycleState::Active
+        );
+        dispatcher
+            .run(|client| client.put("activated-write", b"ok"))
+            .expect("activated storage should accept writes");
+        dispatcher
+            .enter_draining()
+            .expect("draining should succeed");
+        assert_eq!(
+            dispatcher
+                .run(|client| Ok::<_, StoreError>(client.lifecycle_state()))
+                .expect("lifecycle read should succeed"),
+            ClientLifecycleState::Draining
+        );
     }
 
     #[test]

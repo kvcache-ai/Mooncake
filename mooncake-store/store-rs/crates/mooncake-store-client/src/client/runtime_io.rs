@@ -1472,6 +1472,32 @@ impl StoreClient {
         )))
     }
 
+    fn ensure_remote_runtime_reachable(
+        &self,
+        runtime: &ClientRuntimeId,
+        target: &str,
+    ) -> Result<()> {
+        if *runtime == self.lease.runtime {
+            return Ok(());
+        }
+
+        let lease = self.lookup_runtime_lease(runtime)?;
+        match self.control_client.probe_reachability(&lease) {
+            crate::control_plane::ControlPlaneReachability::Reachable => Ok(()),
+            crate::control_plane::ControlPlaneReachability::Unreachable => {
+                self.mark_runtime_suspect(runtime, "remote_runtime_control_unreachable");
+                Err(StoreError::Transport(format!(
+                    "remote runtime {runtime} is unreachable before opening {target}"
+                )))
+            }
+            crate::control_plane::ControlPlaneReachability::Unknown(error) => Err(error),
+        }
+    }
+
+    fn ensure_remote_replica_reachable(&self, replica: &ReplicaRoute) -> Result<()> {
+        self.ensure_remote_runtime_reachable(&replica.owner, &replica.segment_name.0)
+    }
+
     fn execute_remote_batch_get_chunk(
         &self,
         transport: &dyn StoreTransport,
@@ -1490,8 +1516,17 @@ impl StoreClient {
             let requests = {
                 let mut state = self.state.lock();
                 let mut batch = Vec::with_capacity(remote_indices.len());
+                let mut checked_runtimes = BTreeSet::new();
                 for (position, index) in remote_indices.iter().enumerate() {
                     let entry = &resolved[*index];
+                    if entry.replica.owner != self.lease.runtime
+                        && checked_runtimes.insert(entry.replica.owner.clone())
+                    {
+                        drop(state);
+                        self.ensure_remote_replica_reachable(&entry.replica)
+                            .map_err(|error| (error, false))?;
+                        state = self.state.lock();
+                    }
                     let (segment, info) = state
                         .open_segment_with_info(transport, &entry.replica.segment_name.0)
                         .map_err(|error| {
@@ -1743,6 +1778,7 @@ impl StoreClient {
                 ptr::copy_nonoverlapping(source.cast::<u8>(), buffer.as_mut_ptr(), length);
             }
         } else {
+            self.ensure_remote_replica_reachable(&resolved.replica)?;
             self.execute_remote_get_direct(transport, resolved, buffer, length, request_deadline)?;
         }
         validate_replica_checksum(&resolved.replica, &buffer[..length])

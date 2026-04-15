@@ -437,6 +437,7 @@ impl StoreDispatcher {
         next_state: ClientLifecycleState,
         operation: &'static str,
     ) -> HealthUpdate {
+        self.client.sync_lifecycle_state(next_state);
         self.health.prepare_state_update(next_state, operation)
     }
 
