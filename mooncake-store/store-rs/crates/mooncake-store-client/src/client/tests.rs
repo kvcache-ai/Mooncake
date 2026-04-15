@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -21,11 +21,11 @@ use parking_lot::Mutex;
 
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
-    control_bind_host, copy_into_region, flatten_slices, now_ms, record_success_metric,
-    scatter_into_buffers, shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan,
-    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
-    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
-    StoreState, SuspectRuntimeCache,
+    control_bind_host, copy_into_region, encode_lifecycle_state, flatten_slices, now_ms,
+    record_success_metric, scatter_into_buffers, shared_suspect_runtime_cache,
+    startup_prewarm_delay, AllocationSpan, LiveClientCache, LocalAllocatorAdapter,
+    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget, ResolvedObject,
+    SegmentAllocator, StorageOwnerState, StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -34,7 +34,7 @@ use crate::{
     },
     memory::RegionAllocation,
     metrics_test_lock, render_prometheus_metrics, reset_metrics,
-    route_directory::{authority_replace, build_route_directory},
+    route_directory::{authority_get, authority_replace, build_route_directory},
     snapshot_metrics,
     transport::{StoreTransport, StoreTransportFactory},
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
@@ -45,6 +45,14 @@ use crate::{
 struct TestTransport {
     local_segment: String,
     state: Arc<Mutex<TestTransportState>>,
+}
+
+fn test_lifecycle_state(state: ClientLifecycleState) -> Arc<AtomicU8> {
+    Arc::new(AtomicU8::new(encode_lifecycle_state(state)))
+}
+
+fn test_route_write_gate() -> Arc<Mutex<()>> {
+    Arc::new(Mutex::new(()))
 }
 
 struct TestTransportFactory {
@@ -2179,20 +2187,8 @@ fn singleton_control_plane_paths_use_stream_sessions() {
 fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("router-segment"));
-    let owner_a = publish_storage_node(
-        &metadata,
-        &transport,
-        "storage-a",
-        "seg-a",
-        "pool-a",
-    );
-    let owner_b = publish_storage_node(
-        &metadata,
-        &transport,
-        "storage-b",
-        "seg-b",
-        "pool-a",
-    );
+    let owner_a = publish_storage_node(&metadata, &transport, "storage-a", "seg-a", "pool-a");
+    let owner_b = publish_storage_node(&metadata, &transport, "storage-b", "seg-b", "pool-a");
     let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
     let client = StoreClientBuilder::new(metadata.clone(), "router")
         .state(ClientLifecycleState::Active)
@@ -3598,24 +3594,20 @@ fn embedded_wrh_query_route_ignores_metadata_after_authority_miss() {
             .is_none(),
         "embedded WRH must ignore metadata-only routes after authority miss"
     );
-    assert!(
-        crate::route_directory::authority_get(
-            &namespace,
-            &store_b.runtime_id().stable_id,
-            &scoped_key,
-        )
-        .expect("store-b route query should succeed")
-        .is_none()
-    );
-    assert!(
-        crate::route_directory::authority_get(
-            &namespace,
-            &store_c.runtime_id().stable_id,
-            &scoped_key,
-        )
-        .expect("store-c route query should succeed")
-        .is_none()
-    );
+    assert!(crate::route_directory::authority_get(
+        &namespace,
+        &store_b.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("store-b route query should succeed")
+    .is_none());
+    assert!(crate::route_directory::authority_get(
+        &namespace,
+        &store_c.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("store-c route query should succeed")
+    .is_none());
     assert!(
         matches!(
             reader.get("route-repair-metadata"),
@@ -4284,20 +4276,8 @@ fn remove_defers_reclaim_until_grace_deadline() {
 fn replication_policy_prefers_local_before_remote_replica() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-segment"));
-    let owner_a = publish_storage_node(
-        &metadata,
-        &transport,
-        "storage-a",
-        "seg-a",
-        "pool-a",
-    );
-    let owner_b = publish_storage_node(
-        &metadata,
-        &transport,
-        "storage-b",
-        "seg-b",
-        "pool-a",
-    );
+    let owner_a = publish_storage_node(&metadata, &transport, "storage-a", "seg-a", "pool-a");
+    let owner_b = publish_storage_node(&metadata, &transport, "storage-b", "seg-b", "pool-a");
     let client = StoreClientBuilder::new(metadata.clone(), "writer")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
@@ -4614,7 +4594,10 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
     });
     let remote_control = ControlPlaneHandle::spawn(
         "127.0.0.1",
-        Arc::new(LocalAuthorityAdapter),
+        Arc::new(LocalAuthorityAdapter {
+            lifecycle_state: test_lifecycle_state(ClientLifecycleState::Active),
+            route_write_gate: test_route_write_gate(),
+        }),
         Arc::new(StaticAllocatorAdapter {
             runtime: remote_owner.clone(),
             allocator: remote_allocator,
@@ -4627,7 +4610,9 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         segment_name: Some(SegmentName::new("seg-prefer")),
         labels: Default::default(),
     };
-    endpoints.labels.insert("pool".to_string(), "pool-a".to_string());
+    endpoints
+        .labels
+        .insert("pool".to_string(), "pool-a".to_string());
     endpoints
         .labels
         .insert("storage".to_string(), "false".to_string());
@@ -4794,13 +4779,7 @@ fn routed_batch_put_ignores_local_segments_when_storage_role_is_disabled() {
 fn request_replication_policy_honors_preferred_segment() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-segment"));
-    let owner_b = publish_storage_node(
-        &metadata,
-        &transport,
-        "storage-b",
-        "seg-b",
-        "pool-a",
-    );
+    let owner_b = publish_storage_node(&metadata, &transport, "storage-b", "seg-b", "pool-a");
     let client = StoreClientBuilder::new(metadata, "writer")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
@@ -5544,7 +5523,7 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
 fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("adapter-segment"));
-    let client = StoreClientBuilder::new(metadata.clone(), "adapter-client")
+    let mut client = StoreClientBuilder::new(metadata.clone(), "adapter-client")
         .tenant("tenant-a")
         .state(ClientLifecycleState::Active)
         .transport(transport)
@@ -5563,7 +5542,10 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
     let authority = client.runtime_id().stable_id.clone();
     let scoped_key = client.scoped_key("tenant-z", "alpha");
 
-    let local_authority = LocalAuthorityAdapter;
+    let local_authority = LocalAuthorityAdapter {
+        lifecycle_state: test_lifecycle_state(ClientLifecycleState::Active),
+        route_write_gate: test_route_write_gate(),
+    };
     assert_eq!(
         local_authority
             .get_route(&namespace, &authority, &scoped_key)
@@ -5690,6 +5672,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         runtime: client.runtime_id().clone(),
         allocator: client.allocator.clone(),
         storage_owner: client.storage_owner.clone(),
+        lifecycle_state: test_lifecycle_state(ClientLifecycleState::Active),
         transfer_stall_timeout: Duration::from_secs(1),
         request_timeout_override: None,
     };
@@ -5718,6 +5701,57 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         local_allocator.release(&wrong_owner, &primary, 0, 8),
         Err(StoreError::InvalidState(_))
     ));
+
+    let draining_authority = LocalAuthorityAdapter {
+        lifecycle_state: test_lifecycle_state(ClientLifecycleState::Draining),
+        route_write_gate: test_route_write_gate(),
+    };
+    assert_eq!(
+        draining_authority
+            .get_route(&namespace, &authority, &scoped_key)
+            .expect("draining authority should still serve reads"),
+        Some(route.clone())
+    );
+    assert!(matches!(
+        draining_authority.compare_and_swap_route(
+            &namespace,
+            &authority,
+            &scoped_key,
+            Some(route.version),
+            Some(&updated),
+        ),
+        Err(StoreError::InvalidState(_))
+    ));
+    let draining_replace = draining_authority.batch_replace_routes(
+        &namespace,
+        &authority,
+        &[RouteCasRequest {
+            key: scoped_key.clone(),
+            expected: None,
+            next: Some(route.clone()),
+        }],
+    );
+    assert!(matches!(
+        draining_replace[0],
+        Err(StoreError::InvalidState(_))
+    ));
+
+    let draining_allocator = LocalAllocatorAdapter {
+        runtime: client.runtime_id().clone(),
+        allocator: client.allocator.clone(),
+        storage_owner: client.storage_owner.clone(),
+        lifecycle_state: test_lifecycle_state(ClientLifecycleState::Draining),
+        transfer_stall_timeout: Duration::from_secs(1),
+        request_timeout_override: None,
+    };
+    assert!(matches!(
+        draining_allocator.reserve_any(client.runtime_id(), 8),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(draining_allocator
+        .batch_reserve_any(client.runtime_id(), &[8, 8])
+        .into_iter()
+        .all(|result| matches!(result, Err(StoreError::InvalidState(_)))));
 
     let lease = client.lease().clone();
     let control = client.control_client.clone();
@@ -5829,9 +5863,47 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         )
         .expect("wrong-owner release should still reply");
     assert!(matches!(wrong_release[0], Err(StoreError::InvalidState(_))));
+    client
+        .enter_draining()
+        .expect("client should enter draining");
+    let draining_rpc_get = control
+        .batch_get_routes(
+            &client.lease(),
+            &namespace,
+            &authority,
+            std::slice::from_ref(&scoped_key),
+        )
+        .expect("draining rpc get should still reply");
+    assert!(draining_rpc_get[0]
+        .as_ref()
+        .expect("draining route get should decode")
+        .is_some());
+    let draining_rpc_cas = control
+        .batch_compare_and_swap_routes(
+            &client.lease(),
+            &namespace,
+            &authority,
+            &[RouteCasRequest {
+                key: scoped_key.clone(),
+                expected: None,
+                next: Some(route.clone()),
+            }],
+        )
+        .expect("draining rpc cas should still reply");
+    assert!(matches!(
+        draining_rpc_cas[0],
+        Err(StoreError::InvalidState(_))
+    ));
+    let draining_rpc_reserve = control
+        .batch_reserve_any(&client.lease(), client.runtime_id(), &[8])
+        .expect("draining reserve should still reply");
+    assert!(matches!(
+        draining_rpc_reserve[0],
+        Err(StoreError::InvalidState(_))
+    ));
     let missing_rpc_get = control
         .batch_get_routes(
-            &lease,
+            &client.lease(),
             &namespace,
             &missing_authority,
             std::slice::from_ref(&scoped_key),
@@ -6600,13 +6672,8 @@ fn draining_route_authority_mirrors_local_routes_before_restart() {
 
     let namespace = metadata.route_namespace();
     let scoped_key = ObjectKey::new(format!("default::{key}"));
-    authority_replace(
-        &namespace,
-        &store.runtime_id().stable_id,
-        &scoped_key,
-        None,
-    )
-    .expect("test should remove store mirror");
+    authority_replace(&namespace, &store.runtime_id().stable_id, &scoped_key, None)
+        .expect("test should remove store mirror");
     authority_replace(
         &namespace,
         &authority.runtime_id().stable_id,
@@ -6631,6 +6698,110 @@ fn draining_route_authority_mirrors_local_routes_before_restart() {
         reader
             .get(key)
             .expect("reader should find route after authority restart"),
+        value
+    );
+}
+
+#[test]
+fn routed_put_skips_draining_storage_and_authority() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let victim_transport = Arc::new(TestTransport::new("drain-fallback-victim-segment"));
+    let survivor_transport = Arc::new(victim_transport.peer("drain-fallback-survivor-segment"));
+    let writer_transport = Arc::new(victim_transport.peer("drain-fallback-writer-segment"));
+    let reader_transport = Arc::new(victim_transport.peer("drain-fallback-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut victim = StoreClientBuilder::new(metadata.clone(), "drain-fallback-victim")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "true")
+        .label("route_scope", "drain-fallback-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(victim_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("victim build should succeed");
+    let survivor = StoreClientBuilder::new(metadata.clone(), "drain-fallback-survivor")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "true")
+        .label("route_scope", "drain-fallback-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(survivor_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("survivor build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "drain-fallback-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "drain-fallback-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "drain-fallback-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "drain-fallback-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    victim
+        .register_local_memory()
+        .expect("victim memory should register");
+    survivor
+        .register_local_memory()
+        .expect("survivor memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&victim, &survivor, &writer, &reader]);
+
+    victim
+        .enter_draining()
+        .expect("victim should enter draining");
+
+    let key = "drain-fallback-key";
+    let value = b"drain-fallback-value";
+    let route = writer
+        .put_with_policy(
+            key,
+            value,
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .with_soft_pin(true)
+                .preferred_storage_owners([
+                    victim.runtime_id().storage_key(),
+                    survivor.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("writer should skip draining victim and write survivor");
+
+    assert_eq!(route.replicas[0].owner, *survivor.runtime_id());
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new(format!("default::{key}"));
+    assert!(
+        authority_get(&namespace, &survivor.runtime_id().stable_id, &scoped_key)
+            .expect("survivor authority should be readable")
+            .is_some()
+    );
+    assert_eq!(
+        reader.get(key).expect("reader should read survivor copy"),
         value
     );
 }
@@ -7156,6 +7327,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         runtime: owner.clone(),
         allocator: shared_allocator.clone(),
         storage_owner: test_storage_owner_state(&owner, shared_allocator.clone()),
+        lifecycle_state: test_lifecycle_state(ClientLifecycleState::Active),
         transfer_stall_timeout: Duration::from_secs(1),
         request_timeout_override: None,
     };

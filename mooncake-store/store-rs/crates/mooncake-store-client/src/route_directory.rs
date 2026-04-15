@@ -1917,7 +1917,9 @@ mod tests {
         };
         let results = directory
             .compare_and_swap_object_routes(&observer, std::slice::from_ref(&request))
-            .expect("first cas should succeed via mirrored authority after quarantining dead authority");
+            .expect(
+                "first cas should succeed via mirrored authority after quarantining dead authority",
+            );
         assert!(
             results[0]
                 .as_ref()

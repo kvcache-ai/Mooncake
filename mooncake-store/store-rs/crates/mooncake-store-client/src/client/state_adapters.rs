@@ -1,4 +1,29 @@
-struct LocalAuthorityAdapter;
+struct LocalAuthorityAdapter {
+    lifecycle_state: SharedLifecycleState,
+    route_write_gate: SharedRouteWriteGate,
+}
+
+fn lifecycle_accepts_writes(lifecycle_state: &SharedLifecycleState, component: &str) -> Result<()> {
+    let state = decode_lifecycle_state(lifecycle_state.load(Ordering::SeqCst));
+    if state == ClientLifecycleState::Active {
+        return Ok(());
+    }
+    Err(StoreError::InvalidState(format!(
+        "{component} is {state:?}; refusing new writes"
+    )))
+}
+
+impl LocalAuthorityAdapter {
+    fn ensure_accepting_writes(&self) -> Result<()> {
+        lifecycle_accepts_writes(&self.lifecycle_state, "route authority")
+    }
+
+    fn write_guard(&self) -> Result<parking_lot::MutexGuard<'_, ()>> {
+        let guard = self.route_write_gate.lock();
+        self.ensure_accepting_writes()?;
+        Ok(guard)
+    }
+}
 
 impl AuthorityService for LocalAuthorityAdapter {
     fn get_route(
@@ -27,6 +52,7 @@ impl AuthorityService for LocalAuthorityAdapter {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
+        let _guard = self.write_guard()?;
         authority_compare_and_swap(namespace, authority, key, expected, next)
     }
 
@@ -37,6 +63,7 @@ impl AuthorityService for LocalAuthorityAdapter {
         key: &ObjectKey,
         next: Option<&ObjectRoute>,
     ) -> Result<()> {
+        let _guard = self.write_guard()?;
         authority_replace(namespace, authority, key, next)
     }
 
@@ -61,6 +88,12 @@ impl AuthorityService for LocalAuthorityAdapter {
         authority: &ClientStableId,
         requests: &[RouteCasRequest],
     ) -> Vec<Result<CasResult>> {
+        let _guard = match self.write_guard() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return requests.iter().map(|_| Err(error.clone())).collect();
+            }
+        };
         match authority_compare_and_swap_many(namespace, authority, requests) {
             Ok(results) => results.into_iter().map(Ok).collect(),
             Err(error) => requests
@@ -76,6 +109,12 @@ impl AuthorityService for LocalAuthorityAdapter {
         authority: &ClientStableId,
         requests: &[RouteCasRequest],
     ) -> Vec<Result<()>> {
+        let _guard = match self.write_guard() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return requests.iter().map(|_| Err(error.clone())).collect();
+            }
+        };
         match authority_replace_many(namespace, authority, requests) {
             Ok(()) => requests.iter().map(|_| Ok(())).collect(),
             Err(error) => requests
@@ -90,11 +129,16 @@ struct LocalAllocatorAdapter {
     runtime: ClientRuntimeId,
     allocator: Arc<Mutex<LocalAllocatorState>>,
     storage_owner: Arc<StorageOwnerState>,
+    lifecycle_state: SharedLifecycleState,
     transfer_stall_timeout: Duration,
     request_timeout_override: Option<Duration>,
 }
 
 impl LocalAllocatorAdapter {
+    fn ensure_accepting_writes(&self) -> Result<()> {
+        lifecycle_accepts_writes(&self.lifecycle_state, "storage allocator")
+    }
+
     fn pending_publish_deadline_ms(&self, length_bytes: u64) -> u64 {
         pending_publish_deadline_ms(
             length_bytes,
@@ -186,6 +230,7 @@ impl AllocatorService for LocalAllocatorAdapter {
                 owner, self.runtime
             )));
         }
+        self.ensure_accepting_writes()?;
         self.reserve_any_with_eviction(owner, length_bytes)
     }
 
@@ -201,6 +246,7 @@ impl AllocatorService for LocalAllocatorAdapter {
                 owner, self.runtime
             )));
         }
+        self.ensure_accepting_writes()?;
         self.reserve_specific_with_eviction(owner, segment_name, length_bytes)
     }
 
@@ -238,6 +284,9 @@ impl AllocatorService for LocalAllocatorAdapter {
                 })
                 .collect();
         }
+        if let Err(error) = self.ensure_accepting_writes() {
+            return length_bytes.iter().map(|_| Err(error.clone())).collect();
+        }
         length_bytes
             .iter()
             .map(|length_bytes| self.reserve_any_with_eviction(owner, *length_bytes))
@@ -259,6 +308,9 @@ impl AllocatorService for LocalAllocatorAdapter {
                     )))
                 })
                 .collect();
+        }
+        if let Err(error) = self.ensure_accepting_writes() {
+            return requests.iter().map(|_| Err(error.clone())).collect();
         }
         requests
             .iter()
