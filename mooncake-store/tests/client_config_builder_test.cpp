@@ -21,11 +21,9 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
         "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
         std::nullopt, "127.0.0.1:50051", kTieredConfigJson);
 
-    EXPECT_EQ(config.local_copy_async_key_threshold, 2u);
-    EXPECT_EQ(config.local_copy_async_worker_num, 1u);
-    EXPECT_EQ(config.local_copy_async_queue_depth, 1024u);
-    EXPECT_EQ(config.remote_batch_async_key_threshold, 2u);
-    EXPECT_EQ(config.remote_batch_async_worker_num, 0u);
+    // TE mode: async copy params use struct defaults (not builder defaults)
+    EXPECT_EQ(config.local_memcpy_async_worker_num, 32u);
+    EXPECT_EQ(config.local_memcpy_async_queue_depth, 2048u);
     EXPECT_EQ(config.local_transfer_mode,
               P2PClientConfig::LocalTransferMode::TE);
 }
@@ -34,15 +32,12 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigAcceptsCustomAsyncCopyConfig) 
     auto config = ClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
         std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr, "", 12345,
-        8, 2048, 512 * 1024 * 1024, 120000, 5, 3, 256, "te", 7, 6);
+        8, 2048, 512 * 1024 * 1024, 120000, "memcpy", 3, 256);
 
-    EXPECT_EQ(config.local_copy_async_key_threshold, 5u);
-    EXPECT_EQ(config.local_copy_async_worker_num, 3u);
-    EXPECT_EQ(config.local_copy_async_queue_depth, 256u);
-    EXPECT_EQ(config.remote_batch_async_key_threshold, 7u);
-    EXPECT_EQ(config.remote_batch_async_worker_num, 6u);
+    EXPECT_EQ(config.local_memcpy_async_worker_num, 3u);
+    EXPECT_EQ(config.local_memcpy_async_queue_depth, 256u);
     EXPECT_EQ(config.local_transfer_mode,
-              P2PClientConfig::LocalTransferMode::TE);
+              P2PClientConfig::LocalTransferMode::MEMCPY);
 }
 
 TEST(ClientConfigBuilderTest, BuildP2PClientConfigRejectsInvalidTransferMode) {
@@ -50,7 +45,7 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigRejectsInvalidTransferMode) {
         ClientConfigBuilder::build_p2p_real_client(
             "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
             std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr,
-            "", 12345, 8, 2048, 512 * 1024 * 1024, 120000, 5, 3, 256,
+            "", 12345, 8, 2048, 512 * 1024 * 1024, 120000,
             "invalid_mode"),
         std::runtime_error);
 }

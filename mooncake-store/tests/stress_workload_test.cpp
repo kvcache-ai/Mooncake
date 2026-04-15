@@ -44,20 +44,14 @@ DEFINE_uint64(ram_buffer_size_gb, 15,
 DEFINE_string(local_hostname, "localhost:12345", "Local hostname for client");
 DEFINE_string(metadata_connection_string, "P2PHANDSHAKE",
               "Metadata connection string");
-DEFINE_uint64(async_copy_threshold, 2,
-              "Threshold for enabling async local copy (P2P)");
-DEFINE_uint64(async_copy_worker_num, 4,
-              "Number of worker threads for async local copy (P2P)");
-DEFINE_uint64(async_copy_queue_depth, 1024,
-              "Queue depth for async local copy (P2P)");
-DEFINE_uint64(
-    remote_async_threshold, 2,
-    "Threshold for enabling async remote batch fan-out (P2P)");
-DEFINE_uint64(
-    remote_async_worker_num, 0,
-    "Worker count for async remote batch fan-out (P2P). "
-    "Set to 0 to keep synchronous behavior");
-
+DEFINE_string(p2p_local_transfer_mode, "te",
+              "Local transfer mode for P2P local Get/Put path: memcpy|te");
+DEFINE_uint64(local_memcpy_async_worker_num, 32,
+              "If set p2p_local_transfer_mode=memcpy, Worker number for async "
+              "local memcpy executor (P2P)");
+DEFINE_uint64(local_memcpy_async_queue_depth, 2048,
+              "If set p2p_local_transfer_mode=memcpy, Queue depth for async "
+              "local memcpy executor (P2P)");
 namespace mooncake {
 namespace benchmark {
 
@@ -156,15 +150,13 @@ bool initialize_client() {
         }
         auto config = ClientConfigBuilder::build_p2p_real_client(
             FLAGS_local_hostname, FLAGS_metadata_connection_string,
-            FLAGS_protocol, device_names, FLAGS_master_address,
-            tiered_config, 0, nullptr, "", 12345,
+            FLAGS_protocol, device_names, FLAGS_master_address, tiered_config,
+            0, nullptr, "", 12345,
             /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
             /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
-            /*route_cache_ttl_ms=*/5 * 60 * 1000,
-            FLAGS_async_copy_threshold, FLAGS_async_copy_worker_num,
-            FLAGS_async_copy_queue_depth,
-            /*local_transfer_mode=*/"te", FLAGS_remote_async_threshold,
-            FLAGS_remote_async_worker_num);
+            /*route_cache_ttl_ms=*/5 * 60 * 1000, FLAGS_p2p_local_transfer_mode,
+            FLAGS_local_memcpy_async_worker_num,
+            FLAGS_local_memcpy_async_queue_depth);
         client_opt = ClientService::Create(config);
     } else {
         auto config = ClientConfigBuilder::build_centralized_real_client(

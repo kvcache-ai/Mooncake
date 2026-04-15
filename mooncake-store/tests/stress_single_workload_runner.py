@@ -15,12 +15,14 @@ Usage:
 # Single comparison run (Centralization vs P2P) with batch=4:
   python3 stress_single_workload_runner.py --mode both --threads 8 --value_size 1048576 --batch 4
 
-# P2P only, sweep async worker counts:
-  python3 stress_single_workload_runner.py --mode P2P --threads 8 --value_size 1048576 --async_workers 1,4,8
+# P2P only, sweep async worker counts (memcpy mode):
+  python3 stress_single_workload_runner.py --mode P2P --threads 8 --value_size 1048576 \
+      --p2p_local_transfer_mode memcpy --local_memcpy_async_worker_num 32
 
-# Matrix sweep: all combinations of threads/value_size/batch, save to CSV:
-  python3 stress_single_workload_runner.py --matrix --threads 4,8,16 --value_size 1048576,4194304 \
-      --batch 1,4 --async_threshold 2,8 --async_workers 1,4 --output results.csv
+# Matrix sweep: all combinations of threads/value_size/batch/transfer-mode, save to CSV:
+  python3 stress_single_workload_runner.py --matrix --threads 16 --value_size 1048576,4194304 \
+      --batch 1,4,16,32 --p2p_local_transfer_mode te,memcpy --local_memcpy_async_worker_num 32 --local_memcpy_async_queue_depth 2048 \
+      --output results.csv
 
 Arguments:
 ----------
@@ -37,11 +39,9 @@ Arguments:
 
 P2P-Specific (ignored in Centralization mode):
 ----------------------------------------------
---async_threshold:   Min key count to trigger async copy, supports lists like "2,8,256" (default: 2)
---async_workers:     Number of async copy worker threads, supports lists like "1,4,8" (default: 4)
---async_queue_depth: Async copy task queue depth, supports lists like "256,1024" (default: 1024)
---remote_async_threshold: Min key count to trigger async remote batch fan-out (default: 2)
---remote_async_workers:   Number of async remote batch workers, 0 keeps sync behavior (default: 0)
+--p2p_local_transfer_mode:      Local transfer mode: te|memcpy, supports lists like "te,memcpy" (default: te)
+--local_memcpy_async_worker_num:  Async memcpy worker threads, supports lists like "4,16,32" (default: 32, memcpy mode only)
+--local_memcpy_async_queue_depth: Async memcpy queue depth, supports lists like "256,1024,2048" (default: 2048, memcpy mode only)
 """
 
 import subprocess
@@ -121,28 +121,27 @@ def parse_metrics(output):
     return metrics
 
 def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
-                         batch=1, async_threshold=2, async_workers=1, async_queue_depth=1024,
-                         remote_async_threshold=2, remote_async_workers=0):
+                         batch=1, p2p_local_transfer_mode="te",
+                         local_memcpy_async_worker_num=32, local_memcpy_async_queue_depth=2048):
     """Run a specific configuration for a single mode."""
     kill_existing_processes()
-    
+
     master_cmd = f"{MASTER_BIN} --rpc_port={RPC_PORT} --metrics_port={METRICS_PORT} --deployment_mode={mode} --rpc_thread_num={rpc_threads}"
     master_proc = subprocess.Popen(master_cmd.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2) # Wait for master
-    
+
     all_rounds_metrics = []
     for r in range(1, rounds + 1):
         test_cmd = (f"{TEST_BIN} --client_type={mode} --num_threads={threads} --value_size={value_size} "
                     f"--test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb} --batch_size={batch}")
-        
+
         if mode == "P2P":
-            test_cmd += (
-                f" --async_copy_threshold={async_threshold}"
-                f" --async_copy_worker_num={async_workers}"
-                f" --async_copy_queue_depth={async_queue_depth}"
-                f" --remote_async_threshold={remote_async_threshold}"
-                f" --remote_async_worker_num={remote_async_workers}"
-            )
+            test_cmd += f" --p2p_local_transfer_mode={p2p_local_transfer_mode}"
+            if p2p_local_transfer_mode == "memcpy":
+                test_cmd += (
+                    f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
+                    f" --local_memcpy_async_queue_depth={local_memcpy_async_queue_depth}"
+                )
             
         output = run_command(test_cmd)
         metrics = parse_metrics(output)
@@ -186,15 +185,13 @@ def main():
     parser.add_argument("--batch", type=str, default="1", help="Batch size (list: 1,4,16)")
     parser.add_argument("--ram_buffer_size_gb", type=str, default="15", help="RAM buffer size in GB (list: 8,16,32)")
     
-    # P2P Specific async copy parameters
-    parser.add_argument("--async_threshold", type=str, default="2", help="Async copy threshold (P2P only, list: 2,8,256)")
-    parser.add_argument("--async_workers", type=str, default="4", help="Async copy workers (P2P only, list: 1,4,8)")
-    parser.add_argument("--async_queue_depth", type=str, default="1024", help="Async copy queue depth (P2P only, list: 256,1024)")
-    parser.add_argument("--remote_async_threshold", type=str, default="2",
-                        help="Async remote batch threshold (P2P only, list: 2,8,256)")
-    parser.add_argument("--remote_async_workers", type=str, default="0",
-                        help="Async remote batch workers (P2P only, list: 0,2,4)")
-    
+    # P2P Specific parameters
+    parser.add_argument("--p2p_local_transfer_mode", type=str, default="te",
+                        help="P2P local transfer mode: te|memcpy (list: te,memcpy)")
+    parser.add_argument("--local_memcpy_async_worker_num", type=str, default="32",
+                        help="Async memcpy worker threads (memcpy mode only, list: 4,16,32)")
+    parser.add_argument("--local_memcpy_async_queue_depth", type=str, default="2048",
+                        help="Async memcpy queue depth (memcpy mode only, list: 256,1024,2048)")
     # Flags
     parser.add_argument("--matrix", action="store_true", help="Enable matrix sweep mode")
     parser.add_argument("--output", type=str, help="Output file path (ends in .csv or .json)")
@@ -221,11 +218,9 @@ def main():
 
     # P2P specific sweep dims
     p2p_extra_dims = {
-        "async_threshold": parse_list_arg(args.async_threshold),
-        "async_workers": parse_list_arg(args.async_workers),
-        "async_queue_depth": parse_list_arg(args.async_queue_depth),
-        "remote_async_threshold": parse_list_arg(args.remote_async_threshold),
-        "remote_async_workers": parse_list_arg(args.remote_async_workers),
+        "p2p_local_transfer_mode": parse_list_arg(args.p2p_local_transfer_mode, type_fn=str),
+        "local_memcpy_async_worker_num": parse_list_arg(args.local_memcpy_async_worker_num),
+        "local_memcpy_async_queue_depth": parse_list_arg(args.local_memcpy_async_queue_depth),
     }
 
     results = []
@@ -244,9 +239,7 @@ def main():
     if "Centralization" in modes:
         total_runs += len(base_combinations)
     if "P2P" in modes:
-        for base_combo in base_combinations:
-            base_cfg_tmp = dict(zip(base_keys, base_combo))
-            total_runs += 1 if base_cfg_tmp["batch"] == 1 else len(p2p_combinations)
+        total_runs += len(base_combinations) * len(p2p_combinations)
 
     current = 0
     print(f"Starting {('matrix' if args.matrix else 'comparison')} benchmark...")
@@ -270,36 +263,30 @@ def main():
                 config_results["Centralization"] = avg
                 print_single_result("Centralization", avg)
 
-        # 2. Run P2P with all extra dims (skip async param sweep when batch=1)
+        # 2. Run P2P with all extra dims
         if "P2P" in modes:
-            active_p2p_combinations = [p2p_combinations[0]] if batch == 1 else p2p_combinations
-            for p2p_combo in active_p2p_combinations:
+            for p2p_combo in p2p_combinations:
                 current += 1
                 p2p_cfg = dict(zip(p2p_keys, p2p_combo))
-                a_th = p2p_cfg["async_threshold"]
-                a_wk = p2p_cfg["async_workers"]
-                a_qd = p2p_cfg["async_queue_depth"]
-                ra_th = p2p_cfg["remote_async_threshold"]
-                ra_wk = p2p_cfg["remote_async_workers"]
+                transfer_mode = p2p_cfg["p2p_local_transfer_mode"]
+                wk = p2p_cfg["local_memcpy_async_worker_num"]
+                qd = p2p_cfg["local_memcpy_async_queue_depth"]
 
                 print(f"\n[{current}/{total_runs}] Testing: mode=P2P")
                 print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
-                if batch > 1:
-                    print(
-                        f"    async_threshold={a_th}, async_workers={a_wk}, "
-                        f"async_queue_depth={a_qd}, remote_async_threshold={ra_th}, "
-                        f"remote_async_workers={ra_wk}"
-                    )
+                extra = f"p2p_local_transfer_mode={transfer_mode}"
+                if transfer_mode == "memcpy":
+                    extra += f", local_memcpy_async_worker_num={wk}, local_memcpy_async_queue_depth={qd}"
+                print(f"    {extra}")
 
                 avg = run_benchmark_config("P2P", args.rounds, th, v_size, ops, r_th, r_buf_gb,
-                                           batch=batch, async_threshold=a_th,
-                                           async_workers=a_wk, async_queue_depth=a_qd,
-                                           remote_async_threshold=ra_th,
-                                           remote_async_workers=ra_wk)
+                                           batch=batch, p2p_local_transfer_mode=transfer_mode,
+                                           local_memcpy_async_worker_num=wk,
+                                           local_memcpy_async_queue_depth=qd)
                 if avg:
-                    entry = {"mode": "P2P", **base_cfg, **(p2p_cfg if batch > 1 else {}), **avg}
+                    entry = {"mode": "P2P", **base_cfg, **p2p_cfg, **avg}
                     results.append(entry)
-                    config_results["P2P"] = avg # Note: only last p2p result is kept for print_comparison_table
+                    config_results["P2P"] = avg  # only last p2p result is kept for print_comparison_table
                     print_single_result("P2P", avg)
 
         # If comparison mode (single combo), we just show the comparison of Centralization vs LAST P2P run
@@ -349,31 +336,29 @@ def print_comparison_table(threads, value_size, rpc_threads, ops, ram_buffer_siz
     print("=" * 80 + "\n")
 
 def print_matrix_summary(results):
-    print("\n" + "="*180)
+    print("\n" + "="*200)
     print("MATRIX SWEEP SUMMARY")
-    print("-" * 180)
+    print("-" * 200)
     latency_hdr = " | ".join([f"{'P-P50':<6} {'P-P90':<6} {'P-P99':<6}",
                                f"{'G-P50':<6} {'G-P90':<6} {'G-P99':<6}"])
     header = (
         f"{'Mode':<15} | {'Th':<3} | {'Bch':<3} | {'Val(MB)':<7} | {'RPC':<3} | "
-        f"{'Ops':<5} | {'Buf':<3} | {'A-Th':<5} | {'A-Wk':<4} | {'A-QD':<5} | "
-        f"{'R-Th':<5} | {'R-Wk':<4} | {'PUT-MB/s':<10} | {'GET-MB/s':<10} | {latency_hdr}"
+        f"{'Ops':<5} | {'Buf':<3} | {'TransferMode':<12} | {'Workers':<7} | {'QDepth':<7} | "
+        f"{'PUT-MB/s':<10} | {'GET-MB/s':<10} | {latency_hdr}"
     )
     print(header)
-    print("-" * 180)
+    print("-" * 200)
     for r in results:
         put_lat = f"{r['put_p50']:<6.1f} {r['put_p90']:<6.1f} {r['put_p99']:<6.1f}"
         get_lat = f"{r['get_p50']:<6.1f} {r['get_p90']:<6.1f} {r['get_p99']:<6.1f}"
-        a_th = str(r.get('async_threshold', '-'))
-        a_wk = str(r.get('async_workers', '-'))
-        a_qd = str(r.get('async_queue_depth', '-'))
-        r_th = str(r.get('remote_async_threshold', '-'))
-        r_wk = str(r.get('remote_async_workers', '-'))
+        transfer_mode = str(r.get('p2p_local_transfer_mode', '-'))
+        wk = str(r.get('local_memcpy_async_worker_num', '-'))
+        qd = str(r.get('local_memcpy_async_queue_depth', '-'))
         print(f"{r['mode']:<15} | {r['threads']:<3} | {r.get('batch', 1):<3} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "
-              f"{a_th:<5} | {a_wk:<4} | {a_qd:<5} | {r_th:<5} | {r_wk:<4} | "
+              f"{transfer_mode:<12} | {wk:<7} | {qd:<7} | "
               f"{r['put_throughput']:<10.1f} | {r['get_throughput']:<10.1f} | "
               f"{put_lat} | {get_lat}")
-    print("=" * 180 + "\n")
+    print("=" * 200 + "\n")
 
 def save_results(results, path):
     print(f"Saving results to {path}...")

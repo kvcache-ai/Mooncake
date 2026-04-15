@@ -82,8 +82,13 @@ class PeerClientPerfTest : public ::testing::Test {
         ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 
+        LocalTransferConfig local_transfer_config;
+        local_transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+        local_transfer_config.local_memcpy_async_worker_num = 32;
+        local_transfer_config.local_memcpy_async_queue_depth = 2048;
         data_manager_ = std::make_unique<DataManager>(
-            std::move(tiered_backend_), transfer_engine_);
+            std::move(tiered_backend_), transfer_engine_, 1024,
+            local_transfer_config);
 
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
 
@@ -530,8 +535,13 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         ASSERT_TRUE(backend_rc.has_value())
             << "Failed to initialize TieredBackend";
 
+        LocalTransferConfig local_transfer_config;
+        local_transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+        local_transfer_config.local_memcpy_async_worker_num = 32;
+        local_transfer_config.local_memcpy_async_queue_depth = 2048;
         data_manager_ = std::make_unique<DataManager>(
-            std::move(tiered_backend_), transfer_engine_);
+            std::move(tiered_backend_), transfer_engine_, 1024,
+            local_transfer_config);
 
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
 
@@ -592,8 +602,10 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
     void PopulateKey(const std::string& key, size_t data_size) {
         auto data = std::make_unique<char[]>(data_size);
         std::memset(data.get(), 'A', data_size);
-        auto rc = data_manager_->Put(key, {data.get(), data_size});
+        std::vector<Slice> slices{{data.get(), data_size}};
+        auto rc = data_manager_->Put(key, slices);
         ASSERT_TRUE(rc.has_value()) << "PopulateKey failed for " << key;
+        rc.value()->Wait();
     }
 
     RemoteReadRequest MakeRdmaReadRequest(size_t index, size_t data_size) {
@@ -953,8 +965,7 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
             // Verify one write for correctness (not timed)
             RunRdmaAsyncWrites(1, data_size);
             std::string first_key = "rdma_perf_write_key_0";
-            auto get_rc = data_manager_->Get(first_key);
-            bool write_ok = get_rc.has_value();
+            bool write_ok = data_manager_->Exist(first_key);
             data_manager_->Delete(first_key);
 
             double sync_tp = ThroughputMBps(n, data_size, sync_ms);

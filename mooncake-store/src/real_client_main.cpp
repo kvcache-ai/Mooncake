@@ -30,21 +30,14 @@ DEFINE_uint64(lock_shard_count, 1024,
 DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
 DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
               "TTL for RouteCache entries in ms");
-DEFINE_uint64(local_copy_async_key_threshold, 2,
-              "Batch key count threshold to enable async local memcpy (P2P)");
-DEFINE_uint64(local_copy_async_worker_num, 1,
-              "Worker number for async local memcpy executor (P2P)");
-DEFINE_uint64(local_copy_async_queue_depth, 1024,
-              "Queue depth for async local memcpy executor (P2P)");
 DEFINE_string(p2p_local_transfer_mode, "te",
               "Local transfer mode for P2P local Get/Put path: memcpy|te");
-DEFINE_uint64(
-    remote_batch_async_key_threshold, 2,
-    "Batch key count threshold to enable async remote BatchGet/BatchPut fan-out (P2P)");
-DEFINE_uint64(
-    remote_batch_async_worker_num, 0,
-    "Max in-flight worker number for async remote BatchGet/BatchPut fan-out (P2P). "
-    "Set to 0 to keep synchronous behavior.");
+DEFINE_uint64(local_memcpy_async_worker_num, 32,
+              "If set p2p_local_transfer_mode=memcpy, Worker number for async "
+              "local memcpy executor (P2P), 0 means forbid async memcpy");
+DEFINE_uint64(local_memcpy_async_queue_depth, 2048,
+              "If set p2p_local_transfer_mode=memcpy, Queue depth for async "
+              "local memcpy executor (P2P), 0 means forbid async memcpy");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -105,13 +98,9 @@ int main(int argc, char* argv[]) {
                 static_cast<uint32_t>(FLAGS_rpc_thread_num),
                 FLAGS_lock_shard_count,
                 string_to_byte_size(FLAGS_route_cache_max_memory),
-                FLAGS_route_cache_ttl_ms,
-                static_cast<size_t>(FLAGS_local_copy_async_key_threshold),
-                static_cast<size_t>(FLAGS_local_copy_async_worker_num),
-                static_cast<size_t>(FLAGS_local_copy_async_queue_depth),
-                FLAGS_p2p_local_transfer_mode,
-                static_cast<size_t>(FLAGS_remote_batch_async_key_threshold),
-                static_cast<size_t>(FLAGS_remote_batch_async_worker_num));
+                FLAGS_route_cache_ttl_ms, FLAGS_p2p_local_transfer_mode,
+                static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
+                static_cast<size_t>(FLAGS_local_memcpy_async_queue_depth));
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)

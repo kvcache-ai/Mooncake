@@ -8,12 +8,46 @@
 #include <mutex>
 #include <optional>
 #include <ylt/util/tl/expected.hpp>
+#include "async_memcpy_executor.h"
+#include "client_buffer.hpp"
+#include "client_config_builder.h"
+#include "task_handle.h"
 #include "tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
 #include "client_rpc_types.h"
+#include "client_config_builder.h"
 
 namespace mooncake {
+
+/**
+ * @struct ReadTaskHandle
+ * @brief Handle for a read operation
+ */
+struct ReadTaskHandle {
+    std::unique_ptr<TaskHandle<void>> task_handle;
+    int64_t data_size;
+
+    // if user use zero-copy get(), the var is useless;
+    // if user provides allocator, the var is the buffer allocated by allocator;
+    std::shared_ptr<BufferHandle> read_buf;
+};
+
+/**
+ * @struct LocalTransferConfig
+ * @brief Configuration for local data transfer operations
+ */
+struct LocalTransferConfig {
+    P2PClientConfig::LocalTransferMode mode =
+        P2PClientConfig::LocalTransferMode::TE;
+
+    // When mode == TE, the following parameters are used:
+    std::string te_endpoint;
+
+    // When mode == MEMCPY, the following parameters are used:
+    size_t local_memcpy_async_worker_num = 32;
+    size_t local_memcpy_async_queue_depth = 2048;
+};
 
 /**
  * @class DataManager
@@ -36,12 +70,13 @@ class DataManager {
      */
     DataManager(std::unique_ptr<TieredBackend> tiered_backend,
                 std::shared_ptr<TransferEngine> transfer_engine,
-                size_t lock_shard_count = 1024);
+                size_t lock_shard_count = 1024,
+                const LocalTransferConfig& local_transfer_config = {});
 
-    /**
-     * @brief Graceful stop: delegates to TieredBackend::Stop().
-     */
     void Stop() {
+        if (async_memcpy_executor_) {
+            async_memcpy_executor_->Shutdown();
+        }
         if (tiered_backend_) {
             tiered_backend_->Stop();
         }
@@ -56,35 +91,27 @@ class DataManager {
         }
     }
 
-    /**
-     * @brief Put data locally into tiered storage
-     * @param key Object key
-     * @param data Source data buffer (takes ownership, zero-copy)
-     * @param size Data size in bytes
-     * @param tier_id Optional tier ID (nullopt = use default tier selection)
-     * @return ErrorCode indicating success or failure
-     */
-    tl::expected<void, ErrorCode> Put(
-        const std::string& key, const Slice& slice,
-        std::optional<UUID> tier_id = std::nullopt);
+    // ================================================================
+    // Public local read/write interface
+    // Internally selects TE or Memcpy path based on config.
+    // ================================================================
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> Put(
+        const std::string& key, std::vector<Slice>& slices);
 
-    /**
-     * @brief Get data handle from tiered storage (local access)
-     * @param key Object key
-     * @param tier_id Optional tier ID (nullopt = use highest priority tier)
-     * @return AllocationHandle or error
-     * @note Caller must keep the handle alive to access the data.
-     *       Access data via handle->loc.data
-     */
-    tl::expected<AllocationHandle, ErrorCode> Get(
-        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
+    // Attention!!!
+    // Get() method run without key lock.
+    // It works based on two assumptions:
+    // 1. We assume that each key will not be updated after they are created.
+    // 2. The key is acquired by handle which protect the data accessibility
+    //    based on ref count. Once the method acquire handle successfully, the
+    //    accessor can safely access the data until the handle is released.
+    tl::expected<ReadTaskHandle, ErrorCode> Get(
+        const std::string& key, const std::vector<Slice>& slices);
 
-    /**
-     * @brief Delete data from tiered storage
-     * @param key Object key
-     * @param tier_id Optional tier ID (nullopt = delete all replicas)
-     * @return ErrorCode indicating success or failure
-     */
+    tl::expected<ReadTaskHandle, ErrorCode> Get(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator);
+
     tl::expected<void, ErrorCode> Delete(
         const std::string& key, std::optional<UUID> tier_id = std::nullopt);
 
@@ -92,6 +119,10 @@ class DataManager {
      * @brief Get tier views from underlying tiered storage
      */
     std::vector<TierView> GetTierViews() const;
+
+    // ================================================================
+    // Remote data transfer — called by RPC service layer
+    // ================================================================
 
     /**
      * @brief Read data and transfer to remote destination buffers
@@ -120,6 +151,10 @@ class DataManager {
         const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
 
+    // ================================================================
+    // Utilities
+    // ================================================================
+
     /**
      * @brief Rectify stale read route by checking local key existence
      * and removing replica from master if key is not found locally.
@@ -138,12 +173,10 @@ class DataManager {
     void SetRectifyCallback(
         std::function<void(const std::string&, std::optional<UUID>)> fn);
 
-   private:
-    std::shared_mutex& GetKeyLock(const std::string& key) {
-        size_t hash = std::hash<std::string>{}(key);
-        return lock_shards_[hash % lock_shard_count_];
-    }
+    bool Exist(const std::string& key,
+               std::optional<UUID> tier_id = std::nullopt) const;
 
+   private:
     /**
      * @brief Transfer data from local source to remote destination buffers
      * @param handle Local allocation handle (source)
@@ -165,22 +198,67 @@ class DataManager {
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
 
+    std::shared_mutex& GetKeyLock(const std::string& key) {
+        size_t hash = std::hash<std::string>{}(key);
+        return lock_shards_[hash % lock_shard_count_];
+    }
+
+    tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopier(
+        const AllocationHandle& handle, const std::string& key,
+        const std::vector<Slice>& slices);
+
+    tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopierViaTe(
+        const AllocationHandle& handle, const std::vector<Slice>& slices);
+
+    tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopierViaMemcpy(
+        const AllocationHandle& handle, const std::string& key,
+        const std::vector<Slice>& slices);
+
+    tl::expected<LocalCopyPlan, ErrorCode> BuildLocalCopyPlan(
+        const std::string& key, const AllocationHandle& handle,
+        const std::vector<Slice>& slices) const;
+    // --- Put dispatch by transfer mode ---
+
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> PutViaTe(
+        const std::string& key, std::vector<Slice>& slices);
+
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> PutViaMemcpy(
+        const std::string& key, std::vector<Slice>& slices);
+
+    // --- Conversion helpers ---
+
+    std::vector<RemoteBufferDesc> SlicesToRemoteBufferDescs(
+        const std::vector<Slice>& slices) const;
+
+    // --- TE transfer helpers ---
+    struct TeSubmitResult {
+        std::vector<std::tuple<BatchID, size_t, std::string>> transfer_batches;
+        // Temp DRAM buffer used when source or destination is non-DRAM.
+        // Non-null means a post-copy (for Write) or pre-copy (for Read) is
+        // required.
+        std::shared_ptr<void> temp_buffer;
+        AllocationHandle handle;  // Ensure local memory is not released
+    };
+
+    tl::expected<TeSubmitResult, ErrorCode> SubmitTeTransferInternal(
+        const AllocationHandle& handle,
+        const std::vector<RemoteBufferDesc>& remote_buffers,
+        Transport::TransferRequest::OpCode opcode);
+
     /**
      * @brief Helper to wait for a transfer batch to complete
      * @param batch_id Batch ID to poll
      * @param num_tasks Number of tasks in the batch
      * @param segment_name Name of the segment for logging
-     * @param function_name Name of the calling function for logging
      * @return ErrorCode indicating success or failure
      */
     tl::expected<void, ErrorCode> WaitTransferBatch(
-        BatchID batch_id, size_t num_tasks,
+        Transport::BatchID batch_id, size_t num_tasks,
         const std::string& segment_endpoint);
 
     /**
      * @brief Validate remote buffer descriptors
      * @param buffers Buffer descriptors to validate
-     * @param function_name Name of the calling function for logging
      * @return ErrorCode if validation fails, otherwise OK
      */
     tl::expected<void, ErrorCode> ValidateRemoteBuffers(
@@ -231,25 +309,24 @@ class DataManager {
      * @param segment_name Segment name (for logging)
      * @param seg Segment handle (already opened)
      * @param requests Transfer requests to submit
-     * @param function_name Name of the calling function for logging
      * @return BatchID if successful, or error
      */
-    tl::expected<BatchID, ErrorCode> SubmitTransferRequests(
-        const std::string& segment_endpoint, SegmentHandle seg,
-        const std::vector<TransferRequest>& requests,
-        const std::string& function_name);
+    tl::expected<Transport::BatchID, ErrorCode> SubmitTransferRequests(
+        const std::string& segment_endpoint, Transport::SegmentHandle seg,
+        const std::vector<Transport::TransferRequest>& requests);
 
     /**
      * @brief Wait for multiple transfer batches to complete
      * @param batches Vector of (batch_id, num_tasks, segment_endpoint) tuples
-     * @param function_name Name of the calling function for logging
      * @return ErrorCode indicating success or failure. If any batch fails,
      *         remaining batch IDs are freed and error is returned immediately.
      */
     tl::expected<void, ErrorCode> WaitAllTransferBatches(
-        const std::vector<std::tuple<BatchID, size_t, std::string>>& batches);
+        const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
+            batches);
 
-    std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
+   private:
+    std::unique_ptr<TieredBackend> tiered_backend_;
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
 
     // Sharded locks for concurrent access
@@ -261,6 +338,9 @@ class DataManager {
     // Callback for rectifying stale read routes
     std::function<void(const std::string&, std::optional<UUID>)>
         rectify_wrong_route_fn_;
+
+    LocalTransferConfig local_transfer_config_;
+    std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
 };
 
 }  // namespace mooncake

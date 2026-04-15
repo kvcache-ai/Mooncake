@@ -144,25 +144,16 @@ struct P2PClientConfig : RealClientConfigBase {
     size_t route_cache_max_memory_bytes = 300 * 1024 * 1024;  // 300MB
     uint64_t route_cache_ttl_ms = 5 * 60 * 1000;              // 5min
 
-    // Async local memcpy configuration for P2P local read path.
-    // If batch key count >= local_copy_async_key_threshold, local memcpy tasks
-    // in BatchGet are submitted asynchronously.
-    size_t local_copy_async_key_threshold = 2;
-    size_t local_copy_async_worker_num = 4;
-    size_t local_copy_async_queue_depth = 1024;
-
-    // Async remote batch RPC configuration for P2P BatchGet/BatchPut fallback
-    // path.
-    // If worker_num is 0, remote batch path keeps synchronous behavior.
-    // Otherwise, when batch key count >= remote_batch_async_key_threshold,
-    // remote keys are processed with bounded in-flight fan-out.
-    size_t remote_batch_async_key_threshold = 2;
-    size_t remote_batch_async_worker_num = 0;
-
     // Local transfer mode for P2P local Get/Put path.
     // - MEMCPY: copy through local CPU memory path
     // - TE: transfer through local TransferEngine path
     LocalTransferMode local_transfer_mode = LocalTransferMode::TE;
+
+    // When local_transfer_mode == MEMCPY, the following parameters are used:
+    // 0 of local_memcpy_async_worker_num or 0 of local_memcpy_async_queue_depth
+    // means forbid async memcpy.
+    size_t local_memcpy_async_worker_num = 32;
+    size_t local_memcpy_async_queue_depth = 2048;
 };
 
 // ============================================================================
@@ -220,12 +211,9 @@ class ClientConfigBuilder {
         size_t lock_shard_count = 1024,
         size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
         uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
-        size_t local_copy_async_key_threshold = 2,
-        size_t local_copy_async_worker_num = 1,
-        size_t local_copy_async_queue_depth = 1024,
         const std::string& local_transfer_mode = "te",
-        size_t remote_batch_async_key_threshold = 2,
-        size_t remote_batch_async_worker_num = 0,
+        size_t local_memcpy_async_worker_num = 32,
+        size_t local_memcpy_async_queue_depth = 2048,
         const std::map<std::string, std::string>& labels = {}) {
         P2PClientConfig config;
         fill_real_client_config_base(
@@ -237,14 +225,15 @@ class ClientConfigBuilder {
         config.lock_shard_count = lock_shard_count;
         config.route_cache_max_memory_bytes = route_cache_max_memory_bytes;
         config.route_cache_ttl_ms = route_cache_ttl_ms;
-        config.local_copy_async_key_threshold = local_copy_async_key_threshold;
-        config.local_copy_async_worker_num = local_copy_async_worker_num;
-        config.local_copy_async_queue_depth = local_copy_async_queue_depth;
         config.local_transfer_mode =
             parse_p2p_local_transfer_mode(local_transfer_mode);
-        config.remote_batch_async_key_threshold =
-            remote_batch_async_key_threshold;
-        config.remote_batch_async_worker_num = remote_batch_async_worker_num;
+        if (config.local_transfer_mode ==
+            P2PClientConfig::LocalTransferMode::MEMCPY) {
+            config.local_memcpy_async_worker_num =
+                local_memcpy_async_worker_num;
+            config.local_memcpy_async_queue_depth =
+                local_memcpy_async_queue_depth;
+        }
 
         Json::Value tiered_config;
         std::string actual_json = tiered_backend_config_json;
@@ -325,10 +314,9 @@ class ClientConfigBuilder {
 
     static P2PClientConfig::LocalTransferMode parse_p2p_local_transfer_mode(
         std::string mode) {
-        std::transform(mode.begin(), mode.end(), mode.begin(),
-                       [](unsigned char c) {
-                           return static_cast<char>(std::tolower(c));
-                       });
+        std::transform(
+            mode.begin(), mode.end(), mode.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (mode == "memcpy") {
             return P2PClientConfig::LocalTransferMode::MEMCPY;
         }

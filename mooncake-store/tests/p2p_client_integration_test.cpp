@@ -35,9 +35,7 @@ class P2PClientIntegrationTest : public ::testing::Test {
 
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port = 0,
-        const std::string& local_transfer_mode = "te",
-        size_t remote_batch_async_key_threshold = 2,
-        size_t remote_batch_async_worker_num = 0) {
+        const std::string& local_transfer_mode = "te") {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
 
         auto config = ClientConfigBuilder::build_p2p_real_client(
@@ -51,9 +49,6 @@ class P2PClientIntegrationTest : public ::testing::Test {
             config.local_transfer_mode =
                 P2PClientConfig::LocalTransferMode::MEMCPY;
         }
-        config.remote_batch_async_key_threshold =
-            remote_batch_async_key_threshold;
-        config.remote_batch_async_worker_num = remote_batch_async_worker_num;
 
         auto client = std::make_shared<P2PClientService>(
             config.local_ip, config.te_port, config.metadata_connstring,
@@ -257,27 +252,15 @@ TEST_F(P2PClientIntegrationTest, BatchPutAndBatchQuery) {
 }
 
 TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
-    struct Scenario {
-        std::string local_transfer_mode;
-        size_t remote_async_workers = 0;
-    };
-    // Matrix coverage:
-    // 1) local transfer mode: te/memcpy
-    // 2) remote batch fan-out workers: 0(sync compatibility)/4(async enabled)
-    const std::vector<Scenario> scenarios = {
-        {"te", 0}, {"te", 4}, {"memcpy", 0}, {"memcpy", 4}};
+    // Test both local transfer modes: te and memcpy.
+    const std::vector<std::string> transfer_modes = {"te", "memcpy"};
 
-    for (const auto& scenario : scenarios) {
-        SCOPED_TRACE("local_transfer_mode=" + scenario.local_transfer_mode +
-                     ", remote_async_workers=" +
-                     std::to_string(scenario.remote_async_workers));
+    for (const auto& mode : transfer_modes) {
+        SCOPED_TRACE("local_transfer_mode=" + mode);
 
         std::string host =
             "localhost:" + std::to_string(getFreeTcpPort());
-        auto remote_writer = CreateP2PClient(
-            host, /*rpc_port=*/0, scenario.local_transfer_mode,
-            /*remote_batch_async_key_threshold=*/2,
-            scenario.remote_async_workers);
+        auto remote_writer = CreateP2PClient(host, /*rpc_port=*/0, mode);
         ASSERT_NE(remote_writer, nullptr);
 
         const int batch_size = 6;
@@ -289,10 +272,7 @@ TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
         payloads.reserve(batch_size);
         batched_slices.reserve(batch_size);
         for (int i = 0; i < batch_size; ++i) {
-            std::string key_prefix = "p2p_remote_batch_" +
-                                     scenario.local_transfer_mode + "_" +
-                                     std::to_string(scenario.remote_async_workers) +
-                                     "_";
+            std::string key_prefix = "p2p_remote_batch_" + mode + "_";
             keys.push_back(key_prefix + "key_" + std::to_string(i));
             payloads.push_back(key_prefix + "payload_" + std::to_string(i));
         }

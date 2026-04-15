@@ -1,13 +1,12 @@
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
-#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
-#include <queue>
 #include <thread>
 #include <utility>
+#include <future>
+#include <async_simple/Try.h>
 
 #include "client_service.h"
 #include "data_manager.h"
@@ -15,6 +14,7 @@
 #include "peer_client.h"
 #include "p2p_master_client.h"
 #include "route_cache.h"
+#include "task_handle.h"
 
 namespace mooncake {
 
@@ -226,141 +226,36 @@ class P2PClientService final : public ClientService {
     HeartbeatRequest build_heartbeat_request() override;
 
    private:
-    // --- Internal helpers for P2P read/write modes ---
-
-    /**
-     * @brief Put data to local TieredBackend via DataManager.
-     */
-    tl::expected<void, ErrorCode> PutLocal(const std::string& key,
-                                           std::vector<Slice>& slices);
-
-    /**
-     * @brief Put data to a remote node via Master's write route.
-     * Gets write route from Master, then uses PeerClient to write.
-     */
-    tl::expected<void, ErrorCode> PutViaRoute(
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> CreatePutHandle(
         const std::string& key, std::vector<Slice>& slices,
         const WriteRouteRequestConfig& config);
 
-    /**
-     * @brief Get data from local TieredBackend via DataManager.
-     */
-    tl::expected<size_t, ErrorCode> GetLocal(const std::string& key,
-                                             std::vector<Slice>& slices);
+    void OnRemoteWriteComplete(
+        std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise,
+        async_simple::Try<tl::expected<UUID, ErrorCode>> result,
+        const std::string& key, const P2PProxyDescriptor& proxy);
 
-    struct LocalCopyPlan {
-        // Keep source handle alive until memcpy finishes.
-        AllocationHandle source_handle;
-        // Source memory view from local TieredBackend object.
-        const char* source_ptr = nullptr;
-        size_t source_size = 0;
-        // Fast path for one contiguous destination slice (the common case in
-        // stress workload and allocator-based Get).
-        bool use_single_dest = false;
-        void* single_dest_ptr = nullptr;
-        size_t single_dest_size = 0;
-        // Caller-provided destination slices.
-        std::vector<Slice> dest_slices;
-    };
+    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator,
+        const ReadRouteConfig& config);
 
-    class AsyncMemcpyExecutor {
-       public:
-        template <typename ResultType>
-        struct BatchState {
-            std::vector<ResultType> results;
-            std::atomic<size_t> remaining{0};
-            std::mutex done_mutex;
-            std::condition_variable done_cv;
-            bool done = false;
-        };
-
-        template <typename ResultType>
-        struct BatchHandle {
-            std::shared_ptr<BatchState<ResultType>> state;
-
-            std::vector<ResultType> Wait() const {
-                if (!state) {
-                    return {};
-                }
-                if (state->remaining.load(std::memory_order_acquire) > 0) {
-                    std::unique_lock<std::mutex> lock(state->done_mutex);
-                    auto state_ptr = state;
-                    state->done_cv.wait(lock,
-                                        [state_ptr] { return state_ptr->done; });
-                }
-                return state->results;
-            }
-        };
-
-        AsyncMemcpyExecutor(size_t worker_num, size_t max_queue_size);
-        ~AsyncMemcpyExecutor();
-
-        // Generic batched submit/wait path used by both local memcpy and
-        // remote BatchGet/BatchPut fan-out.
-        template <typename ResultType, typename TaskFn, typename ErrorFn>
-        BatchHandle<ResultType> SubmitBatchTasks(
-            const std::vector<size_t>& indices, TaskFn&& task_fn,
-            ErrorFn&& on_error);
-
-        void Shutdown();
-
-       private:
-        struct QueueTask {
-            std::function<void()> run;
-            std::function<void()> cancel;
-        };
-
-        // Long-running worker loop consuming submitted async tasks.
-        void WorkerMain();
-        template <typename ResultType>
-        static void FinishBatchTask(
-            const std::shared_ptr<BatchState<ResultType>>& state,
-            size_t batch_index, ResultType result) {
-            if (!state || batch_index >= state->results.size()) {
-                return;
-            }
-            state->results[batch_index] = std::move(result);
-            if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) ==
-                1) {
-                std::lock_guard<std::mutex> lock(state->done_mutex);
-                state->done = true;
-                state->done_cv.notify_one();
-            }
-        }
-
-        size_t max_queue_size_ = 0;
-        bool shutting_down_ = false;
-        std::mutex mutex_;
-        std::condition_variable queue_not_empty_cv_;
-        std::condition_variable queue_not_full_cv_;
-        std::queue<QueueTask> tasks_;
-        std::vector<std::thread> workers_;
-    };
-    friend class AsyncMemcpyExecutor;
-
-    tl::expected<LocalCopyPlan, ErrorCode> BuildLocalCopyPlan(
-        const std::string& key, const AllocationHandle& handle,
-        const std::vector<Slice>& slices) const;
-    // Execute one local copy plan synchronously in the current thread.
-    static ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan);
-    // Single-key synchronous memcpy fast path (no LocalCopyPlan allocation).
-    static tl::expected<size_t, ErrorCode> CopyLocalBufferSync(
-        const std::string& key, const AllocationHandle& handle,
-        const std::vector<Slice>& slices);
-    bool ShouldUseAsyncLocalCopy(size_t batch_key_count) const;
-    // Remote async fan-out in BatchGet/BatchPut is controlled by dedicated
-    // remote-batch knobs and defaults to disabled for compatibility.
-    bool ShouldUseAsyncBatchRpc(size_t batch_key_count) const;
-    bool UseLocalTeTransfer() const;
-
-    /**
-     * @brief Get data from a remote node via a list of proxy descriptors.
-     * Iterates through the list; stops, returns the slice of proxies from the
-     * successful one to the end.
-     */
-    tl::expected<void, ErrorCode> GetRemoteViaRoute(
+    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
         const std::string& key, std::vector<Slice>& slices,
-        const std::vector<P2PProxyDescriptor>& proxies, bool is_cached_proxies);
+        const ReadRouteConfig& config);
+
+    struct ResolvedRoute {
+        PeerClient* peer = nullptr;
+        uint64_t object_size = 0;
+        bool is_cached = false;
+    };
+
+    tl::expected<ResolvedRoute, ErrorCode> ResolveRoute(
+        const std::string& key, const ReadRouteConfig& config);
+
+    tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
+        const std::string& key, std::vector<Slice>& slices,
+        const ReadRouteConfig& config, const ResolvedRoute* resolved = nullptr);
 
     /**
      * @brief Query Master for replica list and calculate total object size.
@@ -391,17 +286,6 @@ class P2PClientService final : public ClientService {
 
     // Route cache for reducing Master query pressure
     std::optional<RouteCache> route_cache_;
-
-    // Async local copy configuration
-    size_t local_copy_async_key_threshold_ = 2;
-    size_t local_copy_async_worker_num_ = 1;
-    size_t local_copy_async_queue_depth_ = 1024;
-    std::unique_ptr<AsyncMemcpyExecutor> async_local_copy_executor_;
-    size_t remote_batch_async_key_threshold_ = 2;
-    size_t remote_batch_async_worker_num_ = 0;
-    std::unique_ptr<AsyncMemcpyExecutor> async_remote_batch_executor_;
-    P2PClientConfig::LocalTransferMode local_transfer_mode_ =
-        P2PClientConfig::LocalTransferMode::TE;
 };
 
 }  // namespace mooncake
