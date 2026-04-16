@@ -26,6 +26,8 @@ With tenant quota policy configured, single-object `put` uses metadata-backed re
 
 Batch APIs are first-class paths rather than thin wrappers around repeated single-item calls.
 
+With tenant quota policy configured, routed `batch_put` now acquires metadata-backed quota reservations in deterministic scoped-key order, admits the batch all-or-nothing, publishes route CAS updates, and only finalizes quota for entries whose authoritative route publish succeeds. Reservation or publish failures abort unfinished quota state so batch retries do not inherit stale pending usage.
+
 ## Buffer-Oriented I/O
 
 ### Registered-buffer path

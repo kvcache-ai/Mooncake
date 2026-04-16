@@ -644,6 +644,7 @@ struct PreparedObjectWrite<'a> {
     qos_tier: Option<&'a str>,
     scoped_key: ObjectKey,
     value: &'a [u8],
+    quota_reservation: Option<mooncake_store_core::TenantQuotaReservationRequest>,
     targets: Vec<ReplicaWriteTarget>,
     reservations: Vec<mooncake_store_core::SegmentReservation>,
 }
@@ -674,6 +675,7 @@ struct PendingRoutePublish {
     key: ObjectKey,
     expected_version: Option<RouteVersion>,
     previous: Option<ObjectRoute>,
+    quota_reservation: Option<mooncake_store_core::TenantQuotaReservationRequest>,
     route: ObjectRoute,
 }
 
