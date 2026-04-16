@@ -250,82 +250,88 @@ impl MooncakeCompatibilityFacade for StoreClient {
             return result;
         }
         let primary = self.segment_name()?;
-        let attach_primary = {
-            let state = self.state.lock();
-            let memory = state.memory_ref()?;
-            !memory.has_storage_segment(&primary) && memory.storage_segments().is_empty()
-        };
-        let segment_name = if attach_primary {
-            primary.clone()
-        } else {
-            let mut state = self.state.lock();
-            state.next_segment_name(&primary)
-        };
-        let transport = if attach_primary {
-            self.transport.clone().ok_or_else(|| {
-                StoreError::Unsupported("transport is not configured".to_string())
-            })?
-        } else {
-            self.transport_factory()?.create(&segment_name.0)?
-        };
-        {
-            let mut state = self.state.lock();
-            state.memory_mut()?.add_storage_segment(
-                transport.as_ref(),
-                StorageSegmentSpec {
-                    segment_name: segment_name.clone(),
-                    capacity_bytes: storage_bytes,
-                    state: SegmentLifecycleState::Active,
-                    tags: self.local_memory.tags.clone(),
-                    location: self.local_memory.location.clone(),
-                    alignment: self.local_memory.alignment,
-                    hugepage_enabled: self.local_memory.hugepage_enabled,
-                    hugepage_size_bytes: self.local_memory.hugepage_size_bytes,
-                },
-            )?;
-            if !attach_primary {
-                state
-                    .local_transports
-                    .insert(segment_name.0.clone(), transport);
-            }
-        };
-        let segment_info = self
-            .state
-            .lock()
-            .memory_ref()?
-            .storage_segments()
-            .into_iter()
-            .find(|entry| entry.segment_name == segment_name)
-            .ok_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "expanded storage segment {} is missing",
-                    segment_name.0
-                ))
-            })?;
-        let announcement = SegmentAnnouncement {
-            owner: self.lease.runtime.clone(),
-            segment_name,
-            capacity_bytes: segment_info.capacity_bytes,
-            used_bytes: 0,
-            state: SegmentLifecycleState::Active,
-            alignment_bytes: segment_info.alignment_bytes,
-            tags: segment_info.tags,
-        };
-        self.allocator.lock().upsert(&announcement);
-        info!(
-            runtime = %self.lease.runtime,
-            segment = %announcement.segment_name.0,
-            storage_bytes,
-            "expanded local memory with a new active segment"
-        );
-        let publish_result = self.metadata.publish_segment(&announcement);
-        tracker.finish(&publish_result, 0);
+        let mut announcements = Vec::new();
+        for segment_bytes in self.storage_segment_sizes(storage_bytes)? {
+            let attach_primary = {
+                let state = self.state.lock();
+                let memory = state.memory_ref()?;
+                !memory.has_storage_segment(&primary) && memory.storage_segments().is_empty()
+            };
+            let segment_name = if attach_primary {
+                primary.clone()
+            } else {
+                let mut state = self.state.lock();
+                state.next_segment_name(&primary)
+            };
+            let transport = if attach_primary {
+                self.transport.clone().ok_or_else(|| {
+                    StoreError::Unsupported("transport is not configured".to_string())
+                })?
+            } else {
+                self.transport_factory()?.create(&segment_name.0)?
+            };
+            {
+                let mut state = self.state.lock();
+                state.memory_mut()?.add_storage_segment(
+                    transport.as_ref(),
+                    StorageSegmentSpec {
+                        segment_name: segment_name.clone(),
+                        capacity_bytes: segment_bytes,
+                        state: SegmentLifecycleState::Active,
+                        tags: self.local_memory.tags.clone(),
+                        location: self.local_memory.location.clone(),
+                        alignment: self.local_memory.alignment,
+                        hugepage_enabled: self.local_memory.hugepage_enabled,
+                        hugepage_size_bytes: self.local_memory.hugepage_size_bytes,
+                    },
+                )?;
+                if !attach_primary {
+                    state
+                        .local_transports
+                        .insert(segment_name.0.clone(), transport);
+                }
+            };
+            let segment_info = self
+                .state
+                .lock()
+                .memory_ref()?
+                .storage_segments()
+                .into_iter()
+                .find(|entry| entry.segment_name == segment_name)
+                .ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "expanded storage segment {} is missing",
+                        segment_name.0
+                    ))
+                })?;
+            let announcement = SegmentAnnouncement {
+                owner: self.lease.runtime.clone(),
+                segment_name,
+                capacity_bytes: segment_info.capacity_bytes,
+                used_bytes: 0,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: segment_info.alignment_bytes,
+                tags: segment_info.tags,
+            };
+            self.allocator.lock().upsert(&announcement);
+            info!(
+                runtime = %self.lease.runtime,
+                segment = %announcement.segment_name.0,
+                storage_bytes = segment_bytes,
+                "expanded local memory with a new active segment"
+            );
+            self.metadata.publish_segment(&announcement)?;
+            announcements.push(announcement);
+        }
+        let result = announcements.into_iter().next().ok_or_else(|| {
+            StoreError::InvalidState("expand_local_memory produced no segment".to_string())
+        });
+        tracker.finish(&result, 0);
         registry::record_segment_lifecycle(
             "expand_local_memory",
-            if publish_result.is_ok() { "ok" } else { "error" },
+            if result.is_ok() { "ok" } else { "error" },
         );
-        publish_result?;
-        Ok(announcement)
+        result
     }
 
     fn drain_segment(&self, segment: &SegmentName) -> Result<()> {

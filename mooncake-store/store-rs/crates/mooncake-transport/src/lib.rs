@@ -49,11 +49,29 @@ pub fn default_upstream_build_dir() -> &'static str {
     mooncake_transport_sys::DEFAULT_UPSTREAM_BUILD_DIR
 }
 
+pub fn rdma_device_max_registration_size() -> Option<usize> {
+    usize::try_from(unsafe { mooncake_transport_sys::tent::mooncake_tent_probe_rdma_max_mr_size() })
+        .ok()
+        .filter(|value| *value > 0)
+}
+
+pub(crate) fn clamp_registration_size(
+    probed_limit: Option<usize>,
+    configured_cap: Option<usize>,
+) -> Option<usize> {
+    match (probed_limit, configured_cap) {
+        (Some(probed), Some(configured)) => Some(probed.min(configured)),
+        (Some(probed), None) => Some(probed),
+        (None, Some(configured)) => Some(configured),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        default_upstream_build_dir, Opcode, TransferProgress, TransferRequest, TransferStatus,
-        TransportEngineKind,
+        clamp_registration_size, default_upstream_build_dir, rdma_device_max_registration_size,
+        Opcode, TransferProgress, TransferRequest, TransferStatus, TransportEngineKind,
     };
 
     #[test]
@@ -77,5 +95,14 @@ mod tests {
             TransportEngineKind::ClassicTe
         );
         assert!(!default_upstream_build_dir().is_empty());
+    }
+
+    #[test]
+    fn rdma_registration_limit_helpers_preserve_smallest_positive_limit() {
+        assert_eq!(clamp_registration_size(Some(64), Some(32)), Some(32));
+        assert_eq!(clamp_registration_size(Some(64), None), Some(64));
+        assert_eq!(clamp_registration_size(None, Some(32)), Some(32));
+        assert_eq!(clamp_registration_size(None, None), None);
+        assert!(rdma_device_max_registration_size().is_none_or(|value| value > 0));
     }
 }

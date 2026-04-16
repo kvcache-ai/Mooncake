@@ -108,6 +108,9 @@ pub trait StoreTransport: Send + Sync {
     }
     fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void>;
     fn free_memory(&self, addr: *mut c_void) -> Result<()>;
+    fn max_registration_bytes(&self) -> Option<usize> {
+        None
+    }
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
     fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
     fn allocate_batch(&self, batch_size: usize) -> Result<u64>;
@@ -119,6 +122,50 @@ pub trait StoreTransport: Send + Sync {
 
 pub trait StoreTransportFactory: Send + Sync {
     fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>>;
+}
+
+fn registration_chunks(
+    addr: *mut c_void,
+    size: usize,
+    max_registration_bytes: Option<usize>,
+) -> Result<Vec<(*mut c_void, usize)>> {
+    let chunk_bytes = max_registration_bytes
+        .filter(|value| *value > 0)
+        .unwrap_or(size.max(1));
+    let mut chunks = Vec::new();
+    if size == 0 {
+        chunks.push((addr, 0));
+        return Ok(chunks);
+    }
+
+    let base = addr as usize;
+    let mut offset = 0usize;
+    while offset < size {
+        let chunk_len = (size - offset).min(chunk_bytes);
+        let chunk_addr = base.checked_add(offset).ok_or_else(|| {
+            StoreError::Transport("registration chunk address overflow".to_string())
+        })? as *mut c_void;
+        chunks.push((chunk_addr, chunk_len));
+        offset = offset.checked_add(chunk_len).ok_or_else(|| {
+            StoreError::Transport("registration chunk offset overflow".to_string())
+        })?;
+    }
+    Ok(chunks)
+}
+
+fn for_each_registration_chunk<F>(
+    addr: *mut c_void,
+    size: usize,
+    max_registration_bytes: Option<usize>,
+    mut operation: F,
+) -> Result<()>
+where
+    F: FnMut(*mut c_void, usize) -> Result<()>,
+{
+    for (chunk_addr, chunk_len) in registration_chunks(addr, size, max_registration_bytes)? {
+        operation(chunk_addr, chunk_len)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -193,12 +240,26 @@ impl StoreTransport for TentEngine {
         TentEngine::free_memory(self, addr)
     }
 
+    fn max_registration_bytes(&self) -> Option<usize> {
+        TentEngine::max_registration_bytes(self)
+    }
+
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
-        TentEngine::register_memory(self, addr, size)
+        for_each_registration_chunk(
+            addr,
+            size,
+            self.max_registration_bytes(),
+            |chunk_addr, chunk_len| TentEngine::register_memory(self, chunk_addr, chunk_len),
+        )
     }
 
     fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
-        TentEngine::unregister_memory(self, addr, size)
+        for_each_registration_chunk(
+            addr,
+            size,
+            self.max_registration_bytes(),
+            |chunk_addr, chunk_len| TentEngine::unregister_memory(self, chunk_addr, chunk_len),
+        )
     }
 
     fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
@@ -233,6 +294,7 @@ pub struct ClassicTeTransport {
     engine: RwLock<ClassicTransferEngine>,
     config: ClassicEngineConfig,
     segment_name: String,
+    max_registration_bytes: Option<usize>,
     allocations: Mutex<BTreeMap<usize, ClassicAllocationRecord>>,
 }
 
@@ -240,9 +302,43 @@ impl ClassicTeTransport {
     fn new(config: ClassicEngineConfig, segment_name: &str) -> Result<Self> {
         Ok(Self {
             engine: RwLock::new(ClassicTransferEngine::new(&config, segment_name)?),
+            max_registration_bytes: matches!(
+                config.transport_protocol(),
+                mooncake_transport::ClassicTransportProtocol::Rdma
+            )
+            .then(ClassicTransferEngine::rdma_max_registration_size)
+            .flatten(),
             config,
             segment_name: segment_name.to_string(),
             allocations: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn register_memory_with_engine(
+        &self,
+        engine: &ClassicTransferEngine,
+        addr: *mut c_void,
+        size: usize,
+        location: &str,
+    ) -> Result<()> {
+        for_each_registration_chunk(
+            addr,
+            size,
+            self.max_registration_bytes,
+            |chunk_addr, chunk_len| {
+                engine.register_local_memory(chunk_addr, chunk_len, location, true)
+            },
+        )
+    }
+
+    fn unregister_memory_with_engine(
+        &self,
+        engine: &ClassicTransferEngine,
+        addr: *mut c_void,
+        size: usize,
+    ) -> Result<()> {
+        for_each_registration_chunk(addr, size, self.max_registration_bytes, |chunk_addr, _| {
+            engine.unregister_local_memory(chunk_addr)
         })
     }
 
@@ -255,11 +351,11 @@ impl ClassicTeTransport {
             .collect::<Vec<_>>();
         let replacement = ClassicTransferEngine::new(&self.config, &self.segment_name)?;
         for (addr, record) in &allocations {
-            replacement.register_local_memory(
+            self.register_memory_with_engine(
+                &replacement,
                 *addr as *mut c_void,
                 record.size,
                 &record.location,
-                true,
             )?;
         }
         let mut engine = self.engine.write();
@@ -296,14 +392,18 @@ impl StoreTransport for ClassicTeTransport {
             StoreError::Transport(format!("classic segment handle {handle} does not fit i32"))
         })?;
         let engine = self.engine.read();
-        let (base, length) = engine.first_buffer(handle)?;
-        Ok(SegmentInfo {
-            kind: SegmentKind::Memory,
-            buffers: vec![SegmentBuffer {
+        let buffers = engine
+            .segment_buffers(handle)?
+            .into_iter()
+            .map(|(base, length)| SegmentBuffer {
                 base,
                 length,
                 location: "cpu:0".to_string(),
-            }],
+            })
+            .collect::<Vec<_>>();
+        Ok(SegmentInfo {
+            kind: SegmentKind::Memory,
+            buffers,
         })
     }
 
@@ -343,6 +443,10 @@ impl StoreTransport for ClassicTeTransport {
         Ok(addr)
     }
 
+    fn max_registration_bytes(&self) -> Option<usize> {
+        self.max_registration_bytes
+    }
+
     fn free_memory(&self, addr: *mut c_void) -> Result<()> {
         let record = self
             .allocations
@@ -373,13 +477,13 @@ impl StoreTransport for ClassicTeTransport {
                 .location
                 .clone()
         };
-        self.engine
-            .read()
-            .register_local_memory(addr, size, &location, true)
+        let engine = self.engine.read();
+        self.register_memory_with_engine(&engine, addr, size, &location)
     }
 
-    fn unregister_memory(&self, addr: *mut c_void, _size: usize) -> Result<()> {
-        self.engine.read().unregister_local_memory(addr)
+    fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
+        let engine = self.engine.read();
+        self.unregister_memory_with_engine(&engine, addr, size)
     }
 
     fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
@@ -504,8 +608,8 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        parse_rpc_server_address, wait_for_batch_completion, wait_for_batch_completion_detailed,
-        BatchWaitFailureKind, StoreTransport,
+        parse_rpc_server_address, registration_chunks, wait_for_batch_completion,
+        wait_for_batch_completion_detailed, BatchWaitFailureKind, StoreTransport,
     };
 
     struct ScriptedTransport {
@@ -789,5 +893,22 @@ mod tests {
             parse_rpc_server_address("runtime-a").expect("bare host should parse"),
             ("runtime-a".to_string(), 0)
         );
+    }
+
+    #[test]
+    fn registration_chunks_split_ranges_by_max_registration_size() {
+        let chunks = registration_chunks(0x1000usize as *mut c_void, 10, Some(4))
+            .expect("chunking should succeed");
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], (0x1000usize as *mut c_void, 4));
+        assert_eq!(chunks[1], (0x1004usize as *mut c_void, 4));
+        assert_eq!(chunks[2], (0x1008usize as *mut c_void, 2));
+    }
+
+    #[test]
+    fn registration_chunks_handle_zero_length_without_overflow() {
+        let chunks = registration_chunks(std::ptr::null_mut(), 0, Some(4))
+            .expect("zero-length registration should succeed");
+        assert_eq!(chunks, vec![(std::ptr::null_mut(), 0)]);
     }
 }

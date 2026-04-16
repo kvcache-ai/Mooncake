@@ -1,5 +1,6 @@
 #include "transfer_engine.h"
 #include "transfer_engine_c.h"
+#include "config.h"
 
 extern "C" int mooncake_classic_republish_local_metadata(
     transfer_engine_t engine) {
@@ -67,4 +68,52 @@ extern "C" int mooncake_classic_get_segment_first_buffer(
     *addr_out = desc->buffers[0].addr;
     *length_out = desc->buffers[0].length;
     return 0;
+}
+
+extern "C" int mooncake_classic_get_segment_buffer_count(
+    transfer_engine_t engine, segment_handle_t segment_id, size_t *count_out) {
+    if (engine == nullptr || count_out == nullptr) {
+        return -1;
+    }
+
+    auto *native = reinterpret_cast<mooncake::TransferEngine *>(engine);
+    auto metadata = native->getMetadata();
+    if (!metadata) {
+        return -1;
+    }
+
+    auto desc = metadata->getSegmentDescByID(segment_id);
+    if (!desc) {
+        return -1;
+    }
+
+    *count_out = desc->buffers.size();
+    return 0;
+}
+
+extern "C" int mooncake_classic_get_segment_buffer(
+    transfer_engine_t engine, segment_handle_t segment_id, size_t index,
+    uint64_t *addr_out, uint64_t *length_out) {
+    if (engine == nullptr || addr_out == nullptr || length_out == nullptr) {
+        return -1;
+    }
+
+    auto *native = reinterpret_cast<mooncake::TransferEngine *>(engine);
+    auto metadata = native->getMetadata();
+    if (!metadata) {
+        return -1;
+    }
+
+    auto desc = metadata->getSegmentDescByID(segment_id);
+    if (!desc || index >= desc->buffers.size()) {
+        return -1;
+    }
+
+    *addr_out = desc->buffers[index].addr;
+    *length_out = desc->buffers[index].length;
+    return 0;
+}
+
+extern "C" uint64_t mooncake_classic_get_max_mr_size() {
+    return mooncake::globalConfig().max_mr_size;
 }

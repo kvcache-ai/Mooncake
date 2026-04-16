@@ -70,6 +70,7 @@ struct TestTransportState {
     registered_memory: BTreeMap<usize, usize>,
     republish_local_metadata_calls: usize,
     fail_next_submit_segments: BTreeSet<String>,
+    max_registration_bytes: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -868,6 +869,7 @@ impl TestTransport {
                 registered_memory: BTreeMap::new(),
                 republish_local_metadata_calls: 0,
                 fail_next_submit_segments: BTreeSet::new(),
+                max_registration_bytes: None,
             })),
         }
     }
@@ -883,6 +885,10 @@ impl TestTransport {
         Arc::new(TestTransportFactory {
             state: self.state.clone(),
         })
+    }
+
+    fn set_max_registration_bytes(&self, value: Option<usize>) {
+        self.state.lock().max_registration_bytes = value;
     }
 
     fn add_external_segment(&self, segment_name: &str, size: usize) -> u64 {
@@ -1037,6 +1043,10 @@ impl StoreTransport for TestTransport {
         }
         state.registered_memory.remove(&key);
         Ok(())
+    }
+
+    fn max_registration_bytes(&self) -> Option<usize> {
+        self.state.lock().max_registration_bytes
     }
 
     fn register_memory(&self, addr: *mut c_void, size: usize) -> mooncake_store_core::Result<()> {
@@ -2036,6 +2046,35 @@ fn rw_only_client_can_expand_into_primary_segment() {
             .expect("local get after expansion should succeed"),
         b"hello"
     );
+}
+
+#[test]
+fn register_local_memory_splits_initial_storage_by_registration_limit() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("split-storage-store"));
+    transport.set_max_registration_bytes(Some(64));
+    let client = StoreClientBuilder::new(metadata, "split-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(storage_config_with_bytes(160).scratch_bytes(16))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+
+    client
+        .register_local_memory()
+        .expect("local memory registration should succeed");
+
+    let mut capacities = client
+        .list_segments()
+        .expect("segments should list")
+        .into_iter()
+        .map(|segment| segment.capacity_bytes)
+        .collect::<Vec<_>>();
+    capacities.sort_unstable();
+    assert_eq!(capacities, vec![32, 64, 64]);
 }
 
 #[test]

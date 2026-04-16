@@ -5,7 +5,10 @@ use mooncake_store_core::{Result, StoreError};
 use mooncake_transport_sys::classic as ffi;
 
 use crate::env::EnvOverrideGuard;
-use crate::{Opcode, TransferProgress, TransferRequest, TransferStatus};
+use crate::{
+    clamp_registration_size, rdma_device_max_registration_size, Opcode, TransferProgress,
+    TransferRequest, TransferStatus,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassicEngineConfig {
@@ -209,6 +212,38 @@ impl ClassicTransferEngine {
         };
         check_zero(rc, "mooncake_classic_get_segment_first_buffer")?;
         Ok((addr, length))
+    }
+
+    pub fn segment_buffers(&self, segment_id: i32) -> Result<Vec<(u64, u64)>> {
+        let mut count = 0usize;
+        let rc = unsafe {
+            ffi::mooncake_classic_get_segment_buffer_count(self.raw, segment_id, &mut count)
+        };
+        check_zero(rc, "mooncake_classic_get_segment_buffer_count")?;
+        let mut buffers = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut addr = 0u64;
+            let mut length = 0u64;
+            let rc = unsafe {
+                ffi::mooncake_classic_get_segment_buffer(
+                    self.raw,
+                    segment_id,
+                    index,
+                    &mut addr,
+                    &mut length,
+                )
+            };
+            check_zero(rc, "mooncake_classic_get_segment_buffer")?;
+            buffers.push((addr, length));
+        }
+        Ok(buffers)
+    }
+
+    pub fn rdma_max_registration_size() -> Option<usize> {
+        let configured_cap = usize::try_from(unsafe { ffi::mooncake_classic_get_max_mr_size() })
+            .ok()
+            .filter(|value| *value > 0);
+        clamp_registration_size(rdma_device_max_registration_size(), configured_cap)
     }
 
     pub fn allocate_batch(&self, batch_size: usize) -> Result<u64> {

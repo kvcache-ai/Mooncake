@@ -103,6 +103,19 @@ pub mod classic {
             addr_out: *mut u64,
             length_out: *mut u64,
         ) -> c_int;
+        pub fn mooncake_classic_get_segment_buffer_count(
+            engine: TransferEngineHandle,
+            segment_id: SegmentId,
+            count_out: *mut usize,
+        ) -> c_int;
+        pub fn mooncake_classic_get_segment_buffer(
+            engine: TransferEngineHandle,
+            segment_id: SegmentId,
+            index: usize,
+            addr_out: *mut u64,
+            length_out: *mut u64,
+        ) -> c_int;
+        pub fn mooncake_classic_get_max_mr_size() -> u64;
     }
 }
 
@@ -220,6 +233,7 @@ pub mod tent {
             size: usize,
         ) -> c_int;
         pub fn mooncake_tent_platform_free_memory(addr: *mut c_void, size: usize) -> c_int;
+        pub fn mooncake_tent_probe_rdma_max_mr_size() -> u64;
         pub fn tent_allocate_batch(engine: TentEngineHandle, batch_size: usize) -> BatchId;
         pub fn tent_free_batch(engine: TentEngineHandle, batch_id: BatchId) -> c_int;
         pub fn tent_submit(
