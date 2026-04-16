@@ -21,8 +21,8 @@ use tokio::runtime::Runtime;
 use tracing::{info, warn};
 
 use crate::config::CompatTimeoutConfig;
-use crate::hot_cache::{HotCacheHandle, HotCacheKey, LocalHotCache};
 use crate::dummy_service::pb;
+use crate::hot_cache::{HotCacheHandle, HotCacheKey, LocalHotCache};
 use crate::shm::{DummyClientId, OwnedMappedRegion};
 
 type RegionKey = (u64, u64, u64);
@@ -461,7 +461,10 @@ impl StoreDispatcher {
             return;
         };
         let tenant = normalized_tenant(self.client.as_ref(), tenant.as_deref().unwrap_or_default());
-        cache.invalidate_many(keys.into_iter().map(|key| HotCacheKey::new(tenant.clone(), key)));
+        cache.invalidate_many(
+            keys.into_iter()
+                .map(|key| HotCacheKey::new(tenant.clone(), key)),
+        );
     }
 
     #[cfg(test)]
@@ -537,7 +540,12 @@ impl StoreDispatcher {
         let regions = self.regions.clone();
         let hot_cache = self.hot_cache.clone();
         self.run_async(move |client| {
-            Ok(execute_batch_get_into(client, hot_cache.as_ref(), &regions, request))
+            Ok(execute_batch_get_into(
+                client,
+                hot_cache.as_ref(),
+                &regions,
+                request,
+            ))
         })
         .await
     }
@@ -562,8 +570,15 @@ impl StoreDispatcher {
     pub async fn remove_all(&self, force: bool) -> Result<(i32, i64), StoreError> {
         let state = self.state.clone();
         let hot_cache = self.hot_cache.clone();
-        self.run_async(move |client| Ok(execute_remove_all(client, hot_cache.as_ref(), &state, force)))
-            .await
+        self.run_async(move |client| {
+            Ok(execute_remove_all(
+                client,
+                hot_cache.as_ref(),
+                &state,
+                force,
+            ))
+        })
+        .await
     }
 
     pub fn shutdown(&self) {
@@ -819,7 +834,10 @@ fn execute_batch_get_values(
         misses.push((index, key.clone()));
     }
     if !objects.is_empty() {
-        for ((index, key), value) in misses.into_iter().zip(client.batch_get(&objects)?.into_iter()) {
+        for ((index, key), value) in misses
+            .into_iter()
+            .zip(client.batch_get(&objects)?.into_iter())
+        {
             insert_hot_cache(
                 hot_cache,
                 HotCacheKey::new(tenant.clone(), key.clone()),
@@ -1103,7 +1121,9 @@ fn execute_batch_get_into_multi_buffers(
                         let mut request =
                             MultiBufferGetRequest::new(item.key.as_str(), buffers.as_mut_slice());
                         request = request.tenant(tenant.as_str());
-                        match client.batch_get_into_multi_buffers(std::slice::from_mut(&mut request)) {
+                        match client
+                            .batch_get_into_multi_buffers(std::slice::from_mut(&mut request))
+                        {
                             Ok(mut sizes) => Some(sizes.pop().unwrap_or_default()),
                             Err(_) => None,
                         }
@@ -1162,7 +1182,9 @@ fn execute_batch_get_values_into(
     let mut requests = misses
         .iter()
         .zip(buffers.iter_mut())
-        .map(|((_, key, _, _), buffer)| GetRequest::new(key.as_str(), buffer).tenant(tenant.as_str()))
+        .map(|((_, key, _, _), buffer)| {
+            GetRequest::new(key.as_str(), buffer).tenant(tenant.as_str())
+        })
         .collect::<Vec<_>>();
     let sizes = client.batch_get_into(requests.as_mut_slice())?;
     for (((index, key, _, _), buffer), copied) in misses
@@ -1191,10 +1213,14 @@ fn execute_batch_get_values_into_multi(
     let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
     let mut lengths = Vec::with_capacity(keys.len());
     for ((key, buffer_ptrs), sizes) in keys.into_iter().zip(all_buffer_ptrs).zip(all_sizes) {
-        lengths.push(
-            execute_get_into_multi_value(client, hot_cache, &tenant, key, buffer_ptrs, sizes)?
-                as i64,
-        );
+        lengths.push(execute_get_into_multi_value(
+            client,
+            hot_cache,
+            &tenant,
+            key,
+            buffer_ptrs,
+            sizes,
+        )? as i64);
     }
     Ok(lengths)
 }
@@ -1246,11 +1272,7 @@ fn hot_cache_miss_reply() -> pb::HotCacheAcquireReply {
     }
 }
 
-fn insert_hot_cache(
-    hot_cache: Option<&Arc<LocalHotCache>>,
-    key: HotCacheKey,
-    value: &[u8],
-) {
+fn insert_hot_cache(hot_cache: Option<&Arc<LocalHotCache>>, key: HotCacheKey, value: &[u8]) {
     if let Some(cache) = hot_cache {
         let _ = cache.insert(key, value);
     }

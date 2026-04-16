@@ -304,7 +304,9 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         request: Request<pb::BatchHotCacheAcquireRequest>,
     ) -> Result<Response<pb::BatchHotCacheAcquireReply>, Status> {
         Ok(Response::new(
-            self.context.client.batch_acquire_hot_cache(request.into_inner()),
+            self.context
+                .client
+                .batch_acquire_hot_cache(request.into_inner()),
         ))
     }
 

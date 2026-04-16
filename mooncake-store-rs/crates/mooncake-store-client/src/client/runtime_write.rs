@@ -51,18 +51,12 @@ impl StoreClient {
                 let mut state = self.state.lock();
                 state.open_segment_with_info(transport, &target.segment_name.0)?
             };
-            let buffer = info.buffers.first().ok_or_else(|| {
-                StoreError::Transport(format!(
-                    "segment {} exposes no buffers",
-                    target.segment_name.0
-                ))
-            })?;
-            let target_offset = buffer
-                .base
-                .checked_add(reservation.offset_bytes)
-                .ok_or_else(|| {
-                    StoreError::Transport("remote target offset overflow".to_string())
-                })?;
+            let target_offset = Self::segment_relative_target_offset(
+                &info,
+                &target.segment_name,
+                reservation.offset_bytes,
+                value.len() as u64,
+            )?;
             remote_requests.push((index, handle, target_offset));
             absolute_offsets[index] = target_offset;
         }
@@ -472,18 +466,12 @@ impl StoreClient {
                             let mut state = self.state.lock();
                             state.open_segment_with_info(transport, &target.segment_name.0)?
                         };
-                        let buffer = info.buffers.first().ok_or_else(|| {
-                            StoreError::Transport(format!(
-                                "segment {} exposes no buffers",
-                                target.segment_name.0
-                            ))
-                        })?;
-                        let target_offset = buffer
-                            .base
-                            .checked_add(reservation.offset_bytes)
-                            .ok_or_else(|| {
-                                StoreError::Transport("remote target offset overflow".to_string())
-                            })?;
+                        let target_offset = Self::segment_relative_target_offset(
+                            &info,
+                            &target.segment_name,
+                            reservation.offset_bytes,
+                            entry.value.len() as u64,
+                        )?;
                         remote_requests.push(TransferRequest {
                             opcode: Opcode::Write,
                             source: remote_scratch

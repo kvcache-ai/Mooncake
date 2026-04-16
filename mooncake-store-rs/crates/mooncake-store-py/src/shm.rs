@@ -282,7 +282,9 @@ pub fn hot_cache_ipc_socket_path(server_addr: &str) -> PathBuf {
             _ => '_',
         })
         .collect::<String>();
-    std::env::temp_dir().join(format!("mooncake-store-rs-dummy-hot-cache-{sanitized}.sock"))
+    std::env::temp_dir().join(format!(
+        "mooncake-store-rs-dummy-hot-cache-{sanitized}.sock"
+    ))
 }
 
 pub fn send_shm_register_request(
@@ -333,14 +335,18 @@ pub fn recv_shm_register_request(listener: &UnixListener) -> Result<(ShmRegister
     Ok((request, fd))
 }
 
-pub fn recv_hot_cache_fd_request(listener: &UnixListener) -> Result<(UnixStream, HotCacheFdRequest)> {
+pub fn recv_hot_cache_fd_request(
+    listener: &UnixListener,
+) -> Result<(UnixStream, HotCacheFdRequest)> {
     let (stream, _) = listener.accept().map_err(|error| {
         StoreError::Transport(format!("failed to accept hot cache fd request: {error}"))
     })?;
     let mut request: HotCacheFdRequest = unsafe { zeroed() };
-    (&stream).read_exact(as_bytes_mut(&mut request)).map_err(|error| {
-        StoreError::Transport(format!("failed to read hot cache fd request: {error}"))
-    })?;
+    (&stream)
+        .read_exact(as_bytes_mut(&mut request))
+        .map_err(|error| {
+            StoreError::Transport(format!("failed to read hot cache fd request: {error}"))
+        })?;
     if request.magic != HOT_CACHE_FD_MAGIC {
         return Err(StoreError::Transport(format!(
             "invalid hot cache fd magic: {}",
@@ -350,11 +356,7 @@ pub fn recv_hot_cache_fd_request(listener: &UnixListener) -> Result<(UnixStream,
     Ok((stream, request))
 }
 
-pub fn send_hot_cache_fd_response(
-    stream: &UnixStream,
-    fd: &OwnedFd,
-    size: usize,
-) -> Result<()> {
+pub fn send_hot_cache_fd_response(stream: &UnixStream, fd: &OwnedFd, size: usize) -> Result<()> {
     let response = HotCacheFdResponse {
         magic: HOT_CACHE_FD_MAGIC,
         status: 0,

@@ -1229,6 +1229,7 @@ fn validate_request_bounds(
 
 fn storage_config() -> LocalMemoryConfig {
     LocalMemoryConfig::new()
+        .numa_aware(false)
         .storage_bytes(4096)
         .scratch_bytes(4096)
         .reclaim_grace_ms(0)
@@ -1236,6 +1237,7 @@ fn storage_config() -> LocalMemoryConfig {
 
 fn storage_config_with_bytes(storage_bytes: usize) -> LocalMemoryConfig {
     LocalMemoryConfig::new()
+        .numa_aware(false)
         .storage_bytes(storage_bytes)
         .scratch_bytes(4096)
         .alignment(1)
@@ -1248,6 +1250,7 @@ fn storage_config_with_background_eviction(
     low_percent: u8,
 ) -> LocalMemoryConfig {
     LocalMemoryConfig::new()
+        .numa_aware(false)
         .storage_bytes(storage_bytes)
         .scratch_bytes(4096)
         .alignment(1)
@@ -1262,6 +1265,7 @@ fn storage_config_with_layout(
     alignment: usize,
 ) -> LocalMemoryConfig {
     LocalMemoryConfig::new()
+        .numa_aware(false)
         .storage_bytes(storage_bytes)
         .scratch_bytes(scratch_bytes)
         .alignment(alignment)
@@ -4958,6 +4962,7 @@ fn remove_defers_reclaim_until_grace_deadline() {
         .transport(transport)
         .local_memory(
             LocalMemoryConfig::new()
+                .numa_aware(false)
                 .storage_bytes(4096)
                 .scratch_bytes(4096)
                 .reclaim_grace_ms(30),

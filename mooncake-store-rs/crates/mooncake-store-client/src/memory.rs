@@ -13,6 +13,7 @@ const DEFAULT_ALIGNMENT: usize = 64;
 const DEFAULT_EVICTION_HIGH_WATERMARK_PERCENT: u8 = 90;
 const DEFAULT_EVICTION_LOW_WATERMARK_PERCENT: u8 = 80;
 const DEFAULT_EVICTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_NUMA_AWARE: bool = true;
 
 #[derive(Clone, Debug)]
 pub struct LocalMemoryConfig {
@@ -27,6 +28,7 @@ pub struct LocalMemoryConfig {
     pub eviction_poll_interval: Duration,
     pub hugepage_enabled: Option<bool>,
     pub hugepage_size_bytes: Option<usize>,
+    pub numa_aware: bool,
 }
 
 impl LocalMemoryConfig {
@@ -86,6 +88,11 @@ impl LocalMemoryConfig {
         self
     }
 
+    pub fn numa_aware(mut self, enabled: bool) -> Self {
+        self.numa_aware = enabled;
+        self
+    }
+
     pub fn hugepage(&self) -> Result<Option<HugePageConfig>> {
         HugePageConfig::resolve(self.hugepage_enabled, self.hugepage_size_bytes)
     }
@@ -123,6 +130,75 @@ impl LocalMemoryConfig {
         let _ = self.hugepage()?;
         Ok(())
     }
+
+    pub fn storage_region_plans(
+        &self,
+        max_segment_bytes: Option<usize>,
+    ) -> Result<Vec<LocalRegionPlan>> {
+        self.region_plans(self.storage_bytes, max_segment_bytes)
+    }
+
+    fn scratch_region_plans(&self) -> Result<Vec<LocalRegionPlan>> {
+        self.region_plans(self.scratch_bytes, None)
+    }
+
+    fn region_plans(
+        &self,
+        total_bytes: usize,
+        max_segment_bytes: Option<usize>,
+    ) -> Result<Vec<LocalRegionPlan>> {
+        if total_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let locations = self.region_locations();
+        let base = total_bytes / locations.len();
+        let remainder = total_bytes % locations.len();
+        let chunk_limit = max_segment_bytes.filter(|value| *value > 0);
+        let mut remaining = locations
+            .iter()
+            .enumerate()
+            .map(|(index, _)| base + usize::from(index < remainder))
+            .collect::<Vec<_>>();
+        let mut plans = Vec::new();
+        while remaining.iter().any(|bytes| *bytes != 0) {
+            for (index, location) in locations.iter().enumerate() {
+                if remaining[index] == 0 {
+                    continue;
+                }
+                let chunk = chunk_limit
+                    .unwrap_or(remaining[index])
+                    .min(remaining[index]);
+                plans.push(LocalRegionPlan {
+                    capacity_bytes: chunk,
+                    location: location.clone(),
+                });
+                remaining[index] = remaining[index].saturating_sub(chunk);
+            }
+        }
+        Ok(plans)
+    }
+
+    fn region_locations(&self) -> Vec<String> {
+        if !self.numa_aware || !is_host_memory_location(&self.location) {
+            return vec![self.location.clone()];
+        }
+        let mut discovered = discovered_cpu_locations();
+        if discovered.is_empty() {
+            vec![self.location.clone()]
+        } else {
+            if let Some(preferred_index) = parse_cpu_location(&self.location)
+                .map(|node| format!("cpu:{node}"))
+                .and_then(|preferred| {
+                    discovered
+                        .iter()
+                        .position(|candidate| candidate == &preferred)
+                })
+            {
+                discovered.rotate_left(preferred_index);
+            }
+            discovered
+        }
+    }
 }
 
 impl Default for LocalMemoryConfig {
@@ -139,6 +215,7 @@ impl Default for LocalMemoryConfig {
             eviction_poll_interval: DEFAULT_EVICTION_POLL_INTERVAL,
             hugepage_enabled: None,
             hugepage_size_bytes: None,
+            numa_aware: DEFAULT_NUMA_AWARE,
         }
     }
 }
@@ -146,7 +223,13 @@ impl Default for LocalMemoryConfig {
 #[derive(Debug)]
 pub struct LocalMemoryState {
     storage: BTreeMap<SegmentName, StorageExtent>,
-    scratch: RegisteredRegion,
+    scratch: ScratchSpace,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRegionPlan {
+    pub capacity_bytes: usize,
+    pub location: String,
 }
 
 #[derive(Clone, Debug)]
@@ -180,10 +263,9 @@ impl LocalMemoryState {
         } else {
             None
         };
-        let scratch = match RegisteredRegion::register(
+        let scratch = match ScratchSpace::register(
             transport,
-            config.scratch_bytes,
-            &config.location,
+            &config.scratch_region_plans()?,
             config.alignment,
             hugepage,
         ) {
@@ -242,15 +324,7 @@ impl LocalMemoryState {
     }
 
     pub fn plan_scratch(&self, lengths: &[usize]) -> Result<Vec<RegionAllocation>> {
-        let mut cursor = 0usize;
-        let mut allocations = Vec::with_capacity(lengths.len());
-        for length in lengths {
-            allocations.push(self.scratch.plan(cursor, *length)?);
-            cursor = cursor
-                .checked_add(align_up(*length, self.scratch.alignment))
-                .ok_or_else(|| StoreError::Allocator("scratch cursor overflow".to_string()))?;
-        }
-        Ok(allocations)
+        self.scratch.plan(lengths)
     }
 
     pub fn has_storage_segment(&self, segment: &SegmentName) -> bool {
@@ -328,6 +402,76 @@ struct StorageExtent {
     tags: Vec<String>,
 }
 
+#[derive(Debug)]
+struct ScratchSpace {
+    regions: Vec<RegisteredRegion>,
+}
+
+impl ScratchSpace {
+    fn register(
+        transport: &dyn StoreTransport,
+        plans: &[LocalRegionPlan],
+        alignment: usize,
+        hugepage: Option<HugePageConfig>,
+    ) -> Result<Self> {
+        if plans.is_empty() {
+            return Err(StoreError::Allocator(
+                "scratch region plans must not be empty".to_string(),
+            ));
+        }
+        let mut regions = Vec::with_capacity(plans.len());
+        for plan in plans {
+            match RegisteredRegion::register(
+                transport,
+                plan.capacity_bytes,
+                &plan.location,
+                alignment,
+                hugepage,
+            ) {
+                Ok(region) => regions.push(region),
+                Err(error) => {
+                    let _ = release_registered_regions(transport, regions);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self { regions })
+    }
+
+    fn plan(&self, lengths: &[usize]) -> Result<Vec<RegionAllocation>> {
+        let mut cursors = vec![0usize; self.regions.len()];
+        let mut allocations = Vec::with_capacity(lengths.len());
+        for (index, length) in lengths.iter().copied().enumerate() {
+            let start = index % self.regions.len();
+            let mut placed = None;
+            for step in 0..self.regions.len() {
+                let region_index = (start + step) % self.regions.len();
+                let region = &self.regions[region_index];
+                match region.reserve(cursors[region_index], length) {
+                    Ok((allocation, next_cursor)) => {
+                        cursors[region_index] = next_cursor;
+                        placed = Some(allocation);
+                        break;
+                    }
+                    Err(StoreError::Allocator(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let Some(allocation) = placed else {
+                return Err(StoreError::Allocator(format!(
+                    "scratch capacity exhausted: requested={length}"
+                )));
+            };
+            allocations.push(allocation);
+        }
+        Ok(allocations)
+    }
+
+    fn release(self, transport: &dyn StoreTransport) -> Result<()> {
+        release_registered_regions(transport, self.regions)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RegionAllocation {
     pub addr: *mut c_void,
@@ -378,7 +522,13 @@ impl RegisteredRegion {
         })
     }
 
+    #[cfg(test)]
     fn plan(&self, cursor: usize, length: usize) -> Result<RegionAllocation> {
+        self.reserve(cursor, length)
+            .map(|(allocation, _)| allocation)
+    }
+
+    fn reserve(&self, cursor: usize, length: usize) -> Result<(RegionAllocation, usize)> {
         if length == 0 {
             return Err(StoreError::Allocator(
                 "zero-length allocations are not supported".to_string(),
@@ -395,7 +545,7 @@ impl RegisteredRegion {
                 self.capacity.saturating_sub(offset)
             )));
         }
-        self.allocation_at(offset)
+        Ok((self.allocation_at(offset)?, end))
     }
 
     fn allocation_at(&self, offset: usize) -> Result<RegionAllocation> {
@@ -477,6 +627,7 @@ fn allocate_hugepage_region(
             std::io::Error::last_os_error()
         )));
     }
+    bind_mapped_region_to_location(base, mapped_len, location);
     Ok((base, mapped_len, RegionOwner::HugePageMmap { mapped_len }))
 }
 
@@ -499,9 +650,179 @@ fn hugepage_map_flag(hugepage: HugePageConfig) -> i32 {
     }
 }
 
+fn release_registered_regions(
+    transport: &dyn StoreTransport,
+    regions: Vec<RegisteredRegion>,
+) -> Result<()> {
+    let mut first_error = None;
+    for region in regions.into_iter().rev() {
+        if let Err(error) = region.release(transport) {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 fn align_up(value: usize, alignment: usize) -> usize {
     let mask = alignment.saturating_sub(1);
     value.saturating_add(mask) & !mask
+}
+
+fn is_host_memory_location(location: &str) -> bool {
+    location == "*" || parse_cpu_location(location).is_some()
+}
+
+fn parse_cpu_location(location: &str) -> Option<i32> {
+    let node = location.strip_prefix("cpu:")?.parse::<i32>().ok()?;
+    (node >= 0).then_some(node)
+}
+
+fn discovered_cpu_locations() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(locations) = test_numa_locations() {
+        return locations;
+    }
+    discovered_cpu_locations_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn discovered_cpu_locations_impl() -> Vec<String> {
+    if !linux_numa_available() {
+        return Vec::new();
+    }
+    let configured = configured_linux_numa_nodes();
+    let allowed = current_process_allowed_numa_nodes();
+    let nodes = match (configured.is_empty(), allowed) {
+        (_, Some(allowed)) if allowed.is_empty() => Vec::new(),
+        (true, Some(allowed)) => allowed,
+        (false, Some(allowed)) => configured
+            .into_iter()
+            .filter(|node| allowed.binary_search(node).is_ok())
+            .collect(),
+        (false, None) => configured,
+        (true, None) => Vec::new(),
+    };
+    nodes
+        .into_iter()
+        .map(|node| format!("cpu:{node}"))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn configured_linux_numa_nodes() -> Vec<i32> {
+    let count = unsafe { linux_numa::numa_num_configured_nodes() };
+    if count <= 0 {
+        return Vec::new();
+    }
+    (0..count).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_allowed_numa_nodes() -> Option<Vec<i32>> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("Mems_allowed_list:")
+            .and_then(parse_numa_node_list)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_numa_node_list(value: &str) -> Option<Vec<i32>> {
+    let mut nodes = Vec::new();
+    for part in value.trim().split(',').filter(|part| !part.is_empty()) {
+        let (start, end): (i32, i32) = match part.split_once('-') {
+            Some((start, end)) => (
+                start.trim().parse::<i32>().ok()?,
+                end.trim().parse::<i32>().ok()?,
+            ),
+            None => {
+                let node = part.trim().parse::<i32>().ok()?;
+                (node, node)
+            }
+        };
+        if start > end || start < 0 {
+            return None;
+        }
+        nodes.extend(start..=end);
+    }
+    nodes.sort_unstable();
+    nodes.dedup();
+    Some(nodes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn discovered_cpu_locations_impl() -> Vec<String> {
+    Vec::new()
+}
+
+fn bind_mapped_region_to_location(base: *mut c_void, size: usize, location: &str) {
+    let Some(node) = parse_cpu_location(location) else {
+        return;
+    };
+    bind_mapped_region_to_numa_node(base, size, node);
+}
+
+#[cfg(target_os = "linux")]
+fn bind_mapped_region_to_numa_node(base: *mut c_void, size: usize, node: i32) {
+    if !linux_numa_available() {
+        return;
+    }
+    unsafe { linux_numa::numa_tonode_memory(base, size, node) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_mapped_region_to_numa_node(_base: *mut c_void, _size: usize, _node: i32) {}
+
+#[cfg(target_os = "linux")]
+fn linux_numa_available() -> bool {
+    unsafe { linux_numa::numa_available() >= 0 }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_numa {
+    use std::ffi::c_void;
+
+    #[link(name = "numa")]
+    extern "C" {
+        pub fn numa_available() -> i32;
+        pub fn numa_num_configured_nodes() -> i32;
+        pub fn numa_tonode_memory(start: *mut c_void, size: usize, node: i32);
+    }
+}
+
+#[cfg(test)]
+static TEST_NUMA_LOCATIONS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn test_numa_locations() -> Option<Vec<String>> {
+    TEST_NUMA_LOCATIONS
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+#[cfg(test)]
+fn with_test_numa_locations<T>(locations: &[&str], f: impl FnOnce() -> T) -> T {
+    {
+        let mut guard = TEST_NUMA_LOCATIONS
+            .lock()
+            .expect("test numa locations lock should not be poisoned");
+        *guard = Some(
+            locations
+                .iter()
+                .map(|location| (*location).to_string())
+                .collect(),
+        );
+    }
+    let result = f();
+    let mut guard = TEST_NUMA_LOCATIONS
+        .lock()
+        .expect("test numa locations lock should not be poisoned");
+    *guard = None;
+    result
 }
 
 #[cfg(test)]
@@ -516,8 +837,8 @@ mod tests {
 
     use super::{
         align_up, allocate_hugepage_region, free_hugepage_region, hugepage_map_flag,
-        LocalMemoryConfig, LocalMemoryState, RegionOwner, RegisteredRegion, StorageSegmentSpec,
-        StoreTransport,
+        with_test_numa_locations, LocalMemoryConfig, LocalMemoryState, LocalRegionPlan,
+        RegionOwner, RegisteredRegion, StorageSegmentSpec, StoreTransport,
     };
 
     struct NoopTransport;
@@ -918,6 +1239,7 @@ mod tests {
     #[test]
     fn local_memory_config_resolves_explicit_hugepage() {
         let config = LocalMemoryConfig::new()
+            .numa_aware(false)
             .use_hugepage(true)
             .hugepage_size_bytes(2 * 1024 * 1024);
         let hugepage = config
@@ -948,17 +1270,20 @@ mod tests {
     #[test]
     fn local_memory_config_validate_rejects_invalid_inputs() {
         LocalMemoryConfig::new()
+            .numa_aware(false)
             .storage_bytes(0)
             .validate()
             .expect("zero storage should be allowed for rw-only clients");
 
         let error = LocalMemoryConfig::new()
+            .numa_aware(false)
             .scratch_bytes(0)
             .validate()
             .expect_err("zero scratch must fail");
         assert!(matches!(error, StoreError::Allocator(_)));
 
         let error = LocalMemoryConfig::new()
+            .numa_aware(false)
             .location("")
             .validate()
             .expect_err("empty location must fail");
@@ -968,12 +1293,115 @@ mod tests {
     #[test]
     fn local_memory_config_builder_keeps_tags_and_alignment_floor() {
         let config = LocalMemoryConfig::new()
+            .numa_aware(false)
             .tags(vec!["nvme".to_string(), "warm".to_string()])
             .alignment(0)
             .reclaim_grace_ms(7);
         assert_eq!(config.tags, vec!["nvme".to_string(), "warm".to_string()]);
         assert_eq!(config.alignment, 1);
         assert_eq!(config.reclaim_grace_ms, 7);
+    }
+
+    #[test]
+    fn local_memory_config_distributes_regions_across_test_numa_nodes() {
+        with_test_numa_locations(&["cpu:0", "cpu:1"], || {
+            let config = LocalMemoryConfig::new()
+                .storage_bytes(10)
+                .scratch_bytes(6)
+                .location("cpu:0")
+                .numa_aware(true);
+            assert_eq!(
+                config
+                    .storage_region_plans(Some(3))
+                    .expect("storage plans should succeed"),
+                vec![
+                    LocalRegionPlan {
+                        capacity_bytes: 3,
+                        location: "cpu:0".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 3,
+                        location: "cpu:1".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 2,
+                        location: "cpu:0".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 2,
+                        location: "cpu:1".to_string(),
+                    },
+                ]
+            );
+            assert_eq!(
+                config
+                    .scratch_region_plans()
+                    .expect("scratch plans should succeed"),
+                vec![
+                    LocalRegionPlan {
+                        capacity_bytes: 3,
+                        location: "cpu:0".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 3,
+                        location: "cpu:1".to_string(),
+                    },
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn local_memory_config_honors_preferred_numa_start_node() {
+        with_test_numa_locations(&["cpu:0", "cpu:1", "cpu:2"], || {
+            let config = LocalMemoryConfig::new()
+                .storage_bytes(9)
+                .scratch_bytes(3)
+                .location("cpu:1")
+                .numa_aware(true);
+
+            assert_eq!(
+                config
+                    .storage_region_plans(Some(2))
+                    .expect("storage plans should succeed"),
+                vec![
+                    LocalRegionPlan {
+                        capacity_bytes: 2,
+                        location: "cpu:1".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 2,
+                        location: "cpu:2".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 2,
+                        location: "cpu:0".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 1,
+                        location: "cpu:1".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 1,
+                        location: "cpu:2".to_string(),
+                    },
+                    LocalRegionPlan {
+                        capacity_bytes: 1,
+                        location: "cpu:0".to_string(),
+                    },
+                ]
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn numa_node_list_parser_handles_cgroup_ranges() {
+        assert_eq!(super::parse_numa_node_list("0"), Some(vec![0]));
+        assert_eq!(super::parse_numa_node_list("0-2,4"), Some(vec![0, 1, 2, 4]));
+        assert_eq!(super::parse_numa_node_list("2,0-1,2"), Some(vec![0, 1, 2]));
+        assert_eq!(super::parse_numa_node_list("3-1"), None);
+        assert_eq!(super::parse_numa_node_list("bad"), None);
     }
 
     #[test]
@@ -1029,6 +1457,7 @@ mod tests {
             &transport,
             &primary,
             &LocalMemoryConfig::new()
+                .numa_aware(false)
                 .storage_bytes(256)
                 .scratch_bytes(128)
                 .alignment(16)
@@ -1095,6 +1524,7 @@ mod tests {
             &transport,
             &primary,
             &LocalMemoryConfig::new()
+                .numa_aware(false)
                 .storage_bytes(64)
                 .scratch_bytes(64)
                 .alignment(8),
@@ -1148,6 +1578,7 @@ mod tests {
             &transport,
             &primary,
             &LocalMemoryConfig::new()
+                .numa_aware(false)
                 .storage_bytes(0)
                 .scratch_bytes(128)
                 .alignment(16),

@@ -52,7 +52,8 @@ impl CompatRuntimeArgs {
         let mut local_memory = LocalMemoryConfig::new()
             .storage_bytes(plan.storage_bytes)
             .scratch_bytes(plan.scratch_bytes)
-            .location("cpu:0");
+            .location("cpu:0")
+            .numa_aware(true);
         if let Some(use_hugepage) = plan.use_hugepage {
             local_memory = local_memory.use_hugepage(use_hugepage);
         }
