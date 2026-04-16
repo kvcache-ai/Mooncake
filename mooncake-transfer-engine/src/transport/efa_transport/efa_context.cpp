@@ -332,8 +332,7 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
     mrMeta.length = length;
 
     // For EFA, we need local read/write and remote read/write
-    uint64_t fi_access =
-        FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    uint64_t fi_access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
 
     // Detect memory type and use fi_mr_regattr() for GPU memory.
     // The EFA provider's fi_mr_reg() hardcodes iface=FI_HMEM_SYSTEM,
@@ -345,16 +344,14 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
 #if defined(USE_CUDA)
     cudaPointerAttributes attributes;
     cudaError_t cuda_ret = cudaPointerGetAttributes(&attributes, addr);
-    if (cuda_ret == cudaSuccess &&
-        attributes.type == cudaMemoryTypeDevice) {
+    if (cuda_ret == cudaSuccess && attributes.type == cudaMemoryTypeDevice) {
         iface = FI_HMEM_CUDA;
         device_ordinal = attributes.device;
     }
 #elif defined(USE_HIP)
     hipPointerAttribute_t attributes;
     hipError_t hip_ret = hipPointerGetAttributes(&attributes, addr);
-    if (hip_ret == hipSuccess &&
-        attributes.type == hipMemoryTypeDevice) {
+    if (hip_ret == hipSuccess && attributes.type == hipMemoryTypeDevice) {
         iface = FI_HMEM_ROCR;
         device_ordinal = attributes.device;
     }
@@ -380,8 +377,8 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
         }
     } else {
         // CPU memory: fi_mr_reg is sufficient
-        ret = fi_mr_reg(domain_, addr, length, fi_access, 0, 0, 0,
-                        &mrMeta.mr, nullptr);
+        ret = fi_mr_reg(domain_, addr, length, fi_access, 0, 0, 0, &mrMeta.mr,
+                        nullptr);
         if (ret) {
             LOG(ERROR) << "fi_mr_reg failed for " << addr << ": "
                        << fi_strerror(-ret);
