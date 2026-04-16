@@ -57,3 +57,10 @@ add_test(NAME tent_failover_test COMMAND tent_failover_test)
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
 target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main)
 add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
+
+add_executable(tent_fault_proxy_test fault_proxy_test.cpp)
+target_link_libraries(tent_fault_proxy_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+target_include_directories(tent_fault_proxy_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_fault_proxy_test COMMAND tent_fault_proxy_test)
