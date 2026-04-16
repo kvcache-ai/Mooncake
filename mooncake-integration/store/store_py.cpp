@@ -939,7 +939,8 @@ class MooncakeStorePyWrapper {
                     all_chunk_keys.push_back(
                         get_tp_key_name(base_keys[i], rank));
                     all_chunks_list.append(chunk);
-                    py::tuple chunk_shape = chunk.attr("shape").cast<py::tuple>();
+                    py::tuple chunk_shape =
+                        chunk.attr("shape").cast<py::tuple>();
                     chunk_split_sizes[i][rank] =
                         chunk_shape[split_dim].cast<int64_t>();
                 }
@@ -1033,8 +1034,8 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &base_keys,
         const pybind11::list &tensor_chunks, int tp_rank = 0, int tp_size = 1,
         int split_dim = 0,
-        const std::optional<std::vector<std::vector<int64_t>>> &full_shapes_arg =
-            std::nullopt,
+        const std::optional<std::vector<std::vector<int64_t>>>
+            &full_shapes_arg = std::nullopt,
         const ReplicateConfig &config = ReplicateConfig{}) {
         if (base_keys.size() != tensor_chunks.size()) {
             if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
@@ -1367,8 +1368,8 @@ class MooncakeStorePyWrapper {
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes, int tp_rank, int tp_size = 1,
         int split_dim = 0,
-        const std::optional<std::vector<std::vector<int64_t>>> &full_shapes_arg =
-            std::nullopt,
+        const std::optional<std::vector<std::vector<int64_t>>>
+            &full_shapes_arg = std::nullopt,
         const ReplicateConfig &config = ReplicateConfig{}) {
         if (base_keys.size() != buffer_ptrs.size() ||
             base_keys.size() != sizes.size()) {
@@ -1431,7 +1432,8 @@ class MooncakeStorePyWrapper {
 
         for (size_t i = 0; i < num_keys; ++i) {
             if (results[i] != 0) continue;
-            memcpy(&tensor_metas[i], reinterpret_cast<const void *>(buffer_ptrs[i]),
+            memcpy(&tensor_metas[i],
+                   reinterpret_cast<const void *>(buffer_ptrs[i]),
                    sizeof(TensorMetadata));
 
             std::optional<std::vector<int64_t>> single_full_shape;
