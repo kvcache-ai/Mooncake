@@ -34,6 +34,11 @@ pub(crate) const ROUTE_CAS_TOTAL: &str = "mooncake_store_route_cas_total";
 pub(crate) const REPLICATION_PUBLISH_DURATION: &str =
     "mooncake_store_replication_publish_duration_seconds";
 pub(crate) const CHECKSUM_VALIDATION_TOTAL: &str = "mooncake_store_checksum_validation_total";
+pub(crate) const TENANT_QUOTA_RESERVATION_TOTAL: &str =
+    "mooncake_store_tenant_quota_reservation_total";
+pub(crate) const TENANT_QUOTA_FINALIZE_TOTAL: &str = "mooncake_store_tenant_quota_finalize_total";
+pub(crate) const TENANT_QUOTA_ABORT_TOTAL: &str = "mooncake_store_tenant_quota_abort_total";
+pub(crate) const TENANT_QUOTA_RECONCILE_TOTAL: &str = "mooncake_store_tenant_quota_reconcile_total";
 pub(crate) const REBALANCE_ROUTES_TOTAL: &str = "mooncake_store_rebalance_routes_total";
 pub(crate) const REBALANCE_BYTES_TOTAL: &str = "mooncake_store_rebalance_bytes_total";
 pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecycle_total";
@@ -71,6 +76,10 @@ pub struct MetricsSnapshot {
     pub route_cas: Vec<CounterSample<ResultKey>>,
     pub replication_publish_duration: Vec<HistogramSample<ResultKey>>,
     pub checksum_validation: Vec<CounterSample<ResultKey>>,
+    pub tenant_quota_reservation: Vec<CounterSample<ResultKey>>,
+    pub tenant_quota_finalize: Vec<CounterSample<ResultKey>>,
+    pub tenant_quota_abort: Vec<CounterSample<ResultKey>>,
+    pub tenant_quota_reconcile: Vec<CounterSample<ResultKey>>,
     pub rebalance_routes: Vec<CounterSample<PhaseResultKey>>,
     pub rebalance_bytes: Vec<CounterSample<PhaseKey>>,
     pub segment_lifecycle: Vec<CounterSample<ActionResultKey>>,
@@ -335,6 +344,10 @@ struct MetricsRegistry {
     route_cas: CounterFamily<ResultKey>,
     replication_publish_duration: HistogramFamily<ResultKey>,
     checksum_validation: CounterFamily<ResultKey>,
+    tenant_quota_reservation: CounterFamily<ResultKey>,
+    tenant_quota_finalize: CounterFamily<ResultKey>,
+    tenant_quota_abort: CounterFamily<ResultKey>,
+    tenant_quota_reconcile: CounterFamily<ResultKey>,
     rebalance_routes: CounterFamily<PhaseResultKey>,
     rebalance_bytes: CounterFamily<PhaseKey>,
     segment_lifecycle: CounterFamily<ActionResultKey>,
@@ -422,6 +435,10 @@ impl MetricsRegistry {
             route_cas: self.route_cas.snapshot(),
             replication_publish_duration: self.replication_publish_duration.snapshot(),
             checksum_validation: self.checksum_validation.snapshot(),
+            tenant_quota_reservation: self.tenant_quota_reservation.snapshot(),
+            tenant_quota_finalize: self.tenant_quota_finalize.snapshot(),
+            tenant_quota_abort: self.tenant_quota_abort.snapshot(),
+            tenant_quota_reconcile: self.tenant_quota_reconcile.snapshot(),
             rebalance_routes: self.rebalance_routes.snapshot(),
             rebalance_bytes: self.rebalance_bytes.snapshot(),
             segment_lifecycle: self.segment_lifecycle.snapshot(),
@@ -563,6 +580,38 @@ pub(crate) fn record_checksum_validation(result: &'static str) {
         .lock()
         .expect("metrics lock poisoned")
         .checksum_validation
+        .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_tenant_quota_reservation(result: &'static str) {
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .tenant_quota_reservation
+        .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_tenant_quota_finalize(result: &'static str) {
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .tenant_quota_finalize
+        .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_tenant_quota_abort(result: &'static str) {
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .tenant_quota_abort
+        .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_tenant_quota_reconcile(result: &'static str) {
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .tenant_quota_reconcile
         .add(ResultKey { result }, 1);
 }
 

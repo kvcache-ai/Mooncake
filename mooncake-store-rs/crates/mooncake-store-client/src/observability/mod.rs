@@ -335,6 +335,10 @@ pub fn record_heartbeat_health(runtime: &str, consecutive_failures: u64, last_su
     registry::record_heartbeat_health(runtime, consecutive_failures, last_success_ms);
 }
 
+pub fn record_tenant_quota_reconcile(result: &'static str) {
+    registry::record_tenant_quota_reconcile(result);
+}
+
 #[cfg(test)]
 pub fn reset_metrics() {
     registry::reset_metrics();

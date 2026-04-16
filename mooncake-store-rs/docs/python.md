@@ -249,6 +249,18 @@ mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy get \
   --tenant tenant-a
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reservations \
+  --tenant tenant-a \
+  --state pending
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reconcile \
+  --tenant tenant-a \
+  --dry-run
 ```
 
 Notes:

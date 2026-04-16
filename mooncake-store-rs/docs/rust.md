@@ -275,6 +275,8 @@ Key functions:
 - `start_metrics_http_server(...)`
 - `stop_metrics_http_server()`
 
+The exported metrics now include strict tenant quota counters for reservation, finalize, abort, and reconcile outcomes, in addition to the existing request, route-CAS, replication, eviction, and process families.
+
 ## Full Example
 
 The most complete runnable example is `crates/mooncake-store-e2e/src/main.rs`.

@@ -3,7 +3,7 @@ use std::error::Error;
 use _store_rs::admin::{
     format_policy_scope, format_route_policy_domain, format_tenant_object_accounting_state,
     format_tenant_quota_reservation_state, redact_redis_url, route_policy_domain, AdminService,
-    PolicyPatchInput,
+    PolicyPatchInput, TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
 };
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::MetadataKeyspace;
@@ -86,6 +86,20 @@ enum QuotaCommand {
         scope: PolicyScopeArgs,
         #[arg(long, value_enum)]
         state: Option<ReservationStateArg>,
+    },
+    Abort {
+        #[command(flatten)]
+        scope: PolicyScopeArgs,
+        #[arg(long)]
+        reservation_id: String,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    Reconcile {
+        #[command(flatten)]
+        scope: PolicyScopeArgs,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -235,6 +249,23 @@ fn run_quota_command(
         QuotaCommand::Reservations { scope, state } => {
             quota_reservations(service, args, scope, state.map(Into::into))
         }
+        QuotaCommand::Abort {
+            scope,
+            reservation_id,
+            dry_run,
+        } => quota_abort(
+            service,
+            args,
+            scope,
+            reservation_id,
+            TenantQuotaAbortRequest { dry_run: *dry_run },
+        ),
+        QuotaCommand::Reconcile { scope, dry_run } => quota_reconcile(
+            service,
+            args,
+            scope,
+            TenantQuotaReconcileRequest { dry_run: *dry_run },
+        ),
     }
 }
 
@@ -450,6 +481,60 @@ fn quota_reservations(
         println!("    expires_at_ms: {}", reservation.expires_at_ms);
         println!("    created_at_ms: {}", reservation.created_at_ms);
         println!("    writer_runtime: {}", reservation.writer_runtime);
+    }
+    Ok(())
+}
+
+fn quota_abort(
+    service: &AdminService,
+    args: &Args,
+    scope: &PolicyScopeArgs,
+    reservation_id: &str,
+    request: TenantQuotaAbortRequest,
+) -> Result<(), Box<dyn Error>> {
+    let response = service.abort_tenant_quota_reservation(
+        &scope.tenant,
+        scope.domain.as_deref(),
+        scope.object_set.as_deref(),
+        reservation_id,
+        request.dry_run,
+    )?;
+    println!("tenant quota abort:");
+    println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+    println!("  keyspace: {}", current_keyspace(args).prefix());
+    println!("  scope: {}", format_policy_scope(&response.scope));
+    println!("  reservation_id: {}", response.reservation_id);
+    println!("  dry_run: {}", response.dry_run);
+    println!("  aborted: {}", response.aborted);
+    Ok(())
+}
+
+fn quota_reconcile(
+    service: &AdminService,
+    args: &Args,
+    scope: &PolicyScopeArgs,
+    request: TenantQuotaReconcileRequest,
+) -> Result<(), Box<dyn Error>> {
+    let report = service.reconcile_tenant_quota_reservations(
+        &scope.tenant,
+        scope.domain.as_deref(),
+        scope.object_set.as_deref(),
+        request.dry_run,
+    )?;
+    println!("tenant quota reconcile:");
+    println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+    println!("  keyspace: {}", current_keyspace(args).prefix());
+    println!("  scope: {}", format_policy_scope(&report.scope));
+    println!("  dry_run: {}", report.dry_run);
+    println!("  inspected: {}", report.inspected);
+    println!("  finalized: {}", report.finalized);
+    println!("  aborted: {}", report.aborted);
+    println!("  skipped: {}", report.skipped);
+    for action in report.actions {
+        println!("  - reservation_id: {}", action.reservation_id);
+        println!("    key: {}", action.key);
+        println!("    action: {}", action.action);
+        println!("    reason: {}", action.reason);
     }
     Ok(())
 }
@@ -682,6 +767,60 @@ mod tests {
             } => {
                 assert_eq!(scope.tenant, "tenant-a");
                 assert_eq!(state, ReservationStateArg::Pending);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quota_abort_parses_reservation_id_and_dry_run() {
+        let args = Args::parse_from([
+            "mooncake-store-admin",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "quota",
+            "abort",
+            "--tenant",
+            "tenant-a",
+            "--reservation-id",
+            "res-a",
+            "--dry-run",
+        ]);
+        match args.command {
+            Command::Quota {
+                command:
+                    QuotaCommand::Abort {
+                        scope,
+                        reservation_id,
+                        dry_run,
+                    },
+            } => {
+                assert_eq!(scope.tenant, "tenant-a");
+                assert_eq!(reservation_id, "res-a");
+                assert!(dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quota_reconcile_parses_dry_run() {
+        let args = Args::parse_from([
+            "mooncake-store-admin",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "quota",
+            "reconcile",
+            "--tenant",
+            "tenant-a",
+            "--dry-run",
+        ]);
+        match args.command {
+            Command::Quota {
+                command: QuotaCommand::Reconcile { scope, dry_run },
+            } => {
+                assert_eq!(scope.tenant, "tenant-a");
+                assert!(dry_run);
             }
             other => panic!("unexpected command: {other:?}"),
         }

@@ -297,6 +297,7 @@ The runtime records:
 - total latency
 - max latency
 - status labels such as `ok` and `error`
+- strict tenant quota counters for reservation, finalize, abort, and reconcile outcomes
 
 ### HTTP export
 

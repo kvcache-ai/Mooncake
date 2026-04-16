@@ -511,6 +511,12 @@ mooncake-store-admin \
   quota reservations \
   --tenant tenant-a \
   --state pending
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reconcile \
+  --tenant tenant-a \
+  --dry-run
 ```
 
 Useful options:

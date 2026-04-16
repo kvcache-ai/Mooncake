@@ -573,11 +573,25 @@ Keep reconciliation simple and operator-visible:
 
 Suggested admin surface:
 
-- `mooncake-store-admin inspect quota-state --tenant <t>`
-- `mooncake-store-admin inspect quota-reservations --tenant <t>`
-- `mooncake-store-admin reconcile quota-reservations --tenant <t>`
+- `mooncake-store-admin quota state --tenant <t>`
+- `mooncake-store-admin quota reservations --tenant <t>`
+- `mooncake-store-admin quota abort --tenant <t> --reservation-id <id> [--dry-run]`
+- `mooncake-store-admin quota reconcile --tenant <t> [--dry-run]`
 
-This matches the existing admin philosophy in `docs/multi-tenant-admin-control-plane-design.md`.
+The current implementation also exposes matching HTTP endpoints:
+
+- `GET /v1/tenant-quotas/<scope>`
+- `GET /v1/tenant-quotas/<scope>/reservations?state=pending|finalized|aborted`
+- `POST /v1/tenant-quotas/<scope>/reservations/<reservation_id>/abort`
+- `POST /v1/tenant-quotas/<scope>/reconcile`
+
+Current reconcile behavior is intentionally conservative:
+
+- expired pending reservations are aborted
+- pending reservations whose route and object-accounting state already match an authoritative active object are finalized
+- other mismatches remain inspectable and are reported as skipped for operator review
+
+This matches the existing admin philosophy in `docs/multi-tenant-admin-control-plane-design.md`. Runtimes now also export tenant-quota reservation/finalize/abort/reconcile counters through the built-in Prometheus metrics registry.
 
 ---
 
