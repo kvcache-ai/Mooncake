@@ -1,13 +1,16 @@
 use std::error::Error;
 
 use _store_rs::admin::{
-    format_policy_scope, format_route_policy_domain, redact_redis_url, route_policy_domain,
-    AdminService, PolicyPatchInput,
+    format_policy_scope, format_route_policy_domain, format_tenant_object_accounting_state,
+    format_tenant_quota_reservation_state, redact_redis_url, route_policy_domain, AdminService,
+    PolicyPatchInput,
 };
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::MetadataKeyspace;
 use mooncake_store_client::{init_tracing, RouteControlMode};
-use mooncake_store_core::{RoutePolicy, TenantPolicy, TenantPolicySpec};
+use mooncake_store_core::{
+    RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaReservationState,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-admin")]
@@ -29,6 +32,10 @@ enum Command {
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
+    },
+    Quota {
+        #[command(subcommand)]
+        command: QuotaCommand,
     },
 }
 
@@ -59,6 +66,26 @@ enum PolicyCommand {
     List {
         #[arg(long)]
         tenant: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum QuotaCommand {
+    State {
+        #[command(flatten)]
+        scope: PolicyScopeArgs,
+    },
+    Object {
+        #[command(flatten)]
+        scope: PolicyScopeArgs,
+        #[arg(long)]
+        key: String,
+    },
+    Reservations {
+        #[command(flatten)]
+        scope: PolicyScopeArgs,
+        #[arg(long, value_enum)]
+        state: Option<ReservationStateArg>,
     },
 }
 
@@ -118,6 +145,13 @@ enum RouteControlArg {
     MetadataOnly,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ReservationStateArg {
+    Pending,
+    Finalized,
+    Aborted,
+}
+
 impl From<RouteControlArg> for RouteControlMode {
     fn from(value: RouteControlArg) -> Self {
         match value {
@@ -147,6 +181,16 @@ impl From<&PolicyValueArgs> for PolicyPatchInput {
     }
 }
 
+impl From<ReservationStateArg> for TenantQuotaReservationState {
+    fn from(value: ReservationStateArg) -> Self {
+        match value {
+            ReservationStateArg::Pending => TenantQuotaReservationState::Pending,
+            ReservationStateArg::Finalized => TenantQuotaReservationState::Finalized,
+            ReservationStateArg::Aborted => TenantQuotaReservationState::Aborted,
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     init_tracing(args.trace_filter.as_deref())?;
@@ -155,6 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match &args.command {
         Command::CleanupStaleSegments => cleanup_stale_segments(&service),
         Command::Policy { command } => run_policy_command(&service, &args, command),
+        Command::Quota { command } => run_quota_command(&service, &args, command),
     }
 }
 
@@ -176,6 +221,20 @@ fn run_policy_command(
             expected_version,
         } => delete_policy(service, args, scope, *expected_version),
         PolicyCommand::List { tenant } => list_policies(service, args, tenant.as_deref()),
+    }
+}
+
+fn run_quota_command(
+    service: &AdminService,
+    args: &Args,
+    command: &QuotaCommand,
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        QuotaCommand::State { scope } => quota_state(service, args, scope),
+        QuotaCommand::Object { scope, key } => quota_object(service, args, scope, key),
+        QuotaCommand::Reservations { scope, state } => {
+            quota_reservations(service, args, scope, state.map(Into::into))
+        }
     }
 }
 
@@ -280,6 +339,117 @@ fn list_policies(
         println!("    updated_at_ms: {}", policy.updated_at_ms);
         println!("    updated_by: {}", policy.updated_by);
         print_policy_spec(&policy.spec, 4);
+    }
+    Ok(())
+}
+
+fn quota_state(
+    service: &AdminService,
+    args: &Args,
+    scope: &PolicyScopeArgs,
+) -> Result<(), Box<dyn Error>> {
+    let response = service.get_tenant_quota_state(
+        &scope.tenant,
+        scope.domain.as_deref(),
+        scope.object_set.as_deref(),
+    )?;
+    println!("tenant quota state:");
+    println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+    println!("  keyspace: {}", current_keyspace(args).prefix());
+    println!("  scope: {}", format_policy_scope(&response.scope));
+    if let Some(state) = response.state.as_ref() {
+        println!("  version: {}", state.version);
+        println!("  used_bytes: {}", state.used_bytes);
+        println!("  used_objects: {}", state.used_objects);
+        println!("  pending_reserved_bytes: {}", state.pending_reserved_bytes);
+        println!(
+            "  pending_reserved_objects: {}",
+            state.pending_reserved_objects
+        );
+        println!("  updated_at_ms: {}", state.updated_at_ms);
+        println!("  updated_by: {}", state.updated_by);
+    } else {
+        println!("  status: not found");
+    }
+    Ok(())
+}
+
+fn quota_object(
+    service: &AdminService,
+    args: &Args,
+    scope: &PolicyScopeArgs,
+    key: &str,
+) -> Result<(), Box<dyn Error>> {
+    let response = service.get_tenant_object_accounting(
+        &scope.tenant,
+        scope.domain.as_deref(),
+        scope.object_set.as_deref(),
+        key,
+    )?;
+    println!("tenant object accounting:");
+    println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+    println!("  keyspace: {}", current_keyspace(args).prefix());
+    println!("  scope: {}", format_policy_scope(&response.scope));
+    println!("  key: {}", response.key);
+    if let Some(accounting) = response.accounting.as_ref() {
+        println!("  version: {}", accounting.version);
+        println!("  committed_length: {}", accounting.committed_length);
+        println!(
+            "  route_version: {}",
+            accounting
+                .route_version
+                .map(|version| version.0.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        println!(
+            "  state: {}",
+            format_tenant_object_accounting_state(accounting.state)
+        );
+        println!("  last_writer: {}", accounting.last_writer);
+        println!("  updated_at_ms: {}", accounting.updated_at_ms);
+    } else {
+        println!("  status: not found");
+    }
+    Ok(())
+}
+
+fn quota_reservations(
+    service: &AdminService,
+    args: &Args,
+    scope: &PolicyScopeArgs,
+    state: Option<TenantQuotaReservationState>,
+) -> Result<(), Box<dyn Error>> {
+    let response = service.list_tenant_quota_reservations(
+        &scope.tenant,
+        scope.domain.as_deref(),
+        scope.object_set.as_deref(),
+        state,
+    )?;
+    println!("tenant quota reservations:");
+    println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+    println!("  keyspace: {}", current_keyspace(args).prefix());
+    println!("  scope: {}", format_policy_scope(&response.scope));
+    println!("  count: {}", response.count);
+    for reservation in response.reservations {
+        println!("  - reservation_id: {}", reservation.reservation_id);
+        println!("    key: {}", reservation.key.0);
+        println!("    version: {}", reservation.version);
+        println!(
+            "    expected_object_version: {}",
+            reservation
+                .expected_object_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        println!("    delta_bytes: {}", reservation.delta_bytes);
+        println!("    delta_objects: {}", reservation.delta_objects);
+        println!(
+            "    state: {}",
+            format_tenant_quota_reservation_state(reservation.state)
+        );
+        println!("    expires_at_ms: {}", reservation.expires_at_ms);
+        println!("    created_at_ms: {}", reservation.created_at_ms);
+        println!("    writer_runtime: {}", reservation.writer_runtime);
     }
     Ok(())
 }
@@ -487,6 +657,50 @@ mod tests {
         assert_eq!(patch.route_topk, Some(3));
         assert_eq!(patch.route_control, Some(RouteControlMode::MetadataOnly));
         assert_eq!(patch.max_bytes, Some(9));
+    }
+
+    #[test]
+    fn quota_reservations_parses_state_filter() {
+        let args = Args::parse_from([
+            "mooncake-store-admin",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "quota",
+            "reservations",
+            "--tenant",
+            "tenant-a",
+            "--state",
+            "pending",
+        ]);
+        match args.command {
+            Command::Quota {
+                command:
+                    QuotaCommand::Reservations {
+                        scope,
+                        state: Some(state),
+                    },
+            } => {
+                assert_eq!(scope.tenant, "tenant-a");
+                assert_eq!(state, ReservationStateArg::Pending);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reservation_state_arg_maps_to_core_state() {
+        assert_eq!(
+            TenantQuotaReservationState::from(ReservationStateArg::Pending),
+            TenantQuotaReservationState::Pending
+        );
+        assert_eq!(
+            TenantQuotaReservationState::from(ReservationStateArg::Finalized),
+            TenantQuotaReservationState::Finalized
+        );
+        assert_eq!(
+            TenantQuotaReservationState::from(ReservationStateArg::Aborted),
+            TenantQuotaReservationState::Aborted
+        );
     }
 
     #[test]

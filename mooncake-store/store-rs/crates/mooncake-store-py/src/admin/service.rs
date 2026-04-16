@@ -3,18 +3,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_core::{
-    ClientEpoch, ClientRuntimeId, MetadataBackend, NamespaceScope, RoutePolicy, RoutePolicyDomain,
-    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantPlacementPolicy,
-    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy, TenantRoutePolicy,
-    DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
+    ClientEpoch, ClientRuntimeId, LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey,
+    RoutePolicy, RoutePolicyDomain, StoreError, TenantBandwidthShapingPolicy,
+    TenantExecutionFairnessPolicy, TenantObjectAccountingState, TenantPlacementPolicy,
+    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
+    TenantQuotaReservationState, TenantRoutePolicy, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
 };
 use url::Url;
 
 use crate::config::build_metadata_backend;
 
 use super::models::{
-    AdminCleanupReport, DeleteTenantPolicyResponse, GetTenantPolicyResponse, PolicyPatchInput,
-    RoutePolicyResponse,
+    AdminCleanupReport, DeleteTenantPolicyResponse, GetTenantObjectAccountingResponse,
+    GetTenantPolicyResponse, GetTenantQuotaStateResponse, ListTenantQuotaReservationsResponse,
+    PolicyPatchInput, RoutePolicyResponse,
 };
 
 pub type AdminResult<T> = mooncake_store_core::Result<T>;
@@ -160,6 +162,70 @@ impl AdminService {
         }
         policies.sort_by(|left, right| left.scope.cmp(&right.scope));
         Ok(policies)
+    }
+
+    pub fn get_tenant_quota_state(
+        &self,
+        tenant: &str,
+        domain: Option<&str>,
+        object_set: Option<&str>,
+    ) -> AdminResult<GetTenantQuotaStateResponse> {
+        let scope = tenant_policy_scope(tenant, domain, object_set)?;
+        let root_scope = root_tenant_scope(&scope)?;
+        let state = self.backend.get_tenant_quota_state(&root_scope)?;
+        Ok(GetTenantQuotaStateResponse {
+            scope: root_scope,
+            found: state.is_some(),
+            state,
+        })
+    }
+
+    pub fn get_tenant_object_accounting(
+        &self,
+        tenant: &str,
+        domain: Option<&str>,
+        object_set: Option<&str>,
+        key: &str,
+    ) -> AdminResult<GetTenantObjectAccountingResponse> {
+        let scope = tenant_policy_scope(tenant, domain, object_set)?;
+        let root_scope = root_tenant_scope(&scope)?;
+        let object_id = LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some(tenant), domain, object_set),
+            key.to_string(),
+        );
+        let scoped_key = ObjectKey::from_logical_id(&object_id);
+        let accounting = self.backend.get_tenant_object_accounting(&scoped_key)?;
+        Ok(GetTenantObjectAccountingResponse {
+            scope: root_scope,
+            key: scoped_key.0,
+            found: accounting.is_some(),
+            accounting,
+        })
+    }
+
+    pub fn list_tenant_quota_reservations(
+        &self,
+        tenant: &str,
+        domain: Option<&str>,
+        object_set: Option<&str>,
+        state: Option<TenantQuotaReservationState>,
+    ) -> AdminResult<ListTenantQuotaReservationsResponse> {
+        let scope = tenant_policy_scope(tenant, domain, object_set)?;
+        let root_scope = root_tenant_scope(&scope)?;
+        let mut reservations = self.backend.list_tenant_quota_reservations(&root_scope)?;
+        if let Some(state) = state {
+            reservations.retain(|reservation| reservation.state == state);
+        }
+        reservations.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.reservation_id.cmp(&right.reservation_id))
+        });
+        Ok(ListTenantQuotaReservationsResponse {
+            scope: root_scope,
+            count: reservations.len(),
+            reservations,
+        })
     }
 
     pub fn cleanup_stale_segments(&self) -> AdminResult<AdminCleanupReport> {
@@ -332,6 +398,27 @@ pub fn format_policy_scope(scope: &TenantPolicyScope) -> String {
     formatted
 }
 
+pub fn root_tenant_scope(scope: &TenantPolicyScope) -> AdminResult<TenantPolicyScope> {
+    let root_scope = TenantPolicyScope::new(scope.tenant.clone(), None::<String>, None::<String>);
+    root_scope.validate()?;
+    Ok(root_scope)
+}
+
+pub fn format_tenant_object_accounting_state(state: TenantObjectAccountingState) -> &'static str {
+    match state {
+        TenantObjectAccountingState::Active => "active",
+        TenantObjectAccountingState::Deleted => "deleted",
+    }
+}
+
+pub fn format_tenant_quota_reservation_state(state: TenantQuotaReservationState) -> &'static str {
+    match state {
+        TenantQuotaReservationState::Pending => "pending",
+        TenantQuotaReservationState::Finalized => "finalized",
+        TenantQuotaReservationState::Aborted => "aborted",
+    }
+}
+
 pub fn default_namespace() -> NamespaceScope {
     NamespaceScope::with_defaults(Some("default"), None::<&str>, None::<&str>)
 }
@@ -359,5 +446,155 @@ pub fn redact_redis_url(url: &str) -> String {
             parsed.to_string()
         }
         Err(_) => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mooncake_metadata::InMemoryMetadataBackend;
+    use mooncake_store_core::{
+        ClientEpoch, ClientRuntimeId, MetadataBackend, TenantObjectAccountingState, TenantPolicy,
+        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
+        TenantQuotaReservationState,
+    };
+
+    use super::*;
+
+    fn test_service() -> AdminService {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        AdminService::new(backend, "memory://test", MetadataKeyspace::default())
+    }
+
+    fn put_quota_policy(service: &AdminService) {
+        service
+            .backend()
+            .put_tenant_policy(
+                &TenantPolicy {
+                    scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                    spec: TenantPolicySpec {
+                        quota: Some(TenantQuotaPolicy {
+                            max_bytes: Some(1024),
+                            max_objects: Some(16),
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 1,
+                    updated_by: "tester".to_string(),
+                },
+                None,
+            )
+            .expect("tenant policy should store");
+    }
+
+    #[test]
+    fn root_scope_helpers_collapse_nested_scope() {
+        let nested = TenantPolicyScope::new("tenant-a", Some("domain-a"), Some("set-a"));
+        let root = root_tenant_scope(&nested).expect("root scope should build");
+        assert_eq!(root.tenant, "tenant-a");
+        assert!(root.domain.is_none());
+        assert!(root.object_set.is_none());
+    }
+
+    #[test]
+    fn admin_service_reads_quota_state_and_reservations_at_root_scope() {
+        let service = test_service();
+        put_quota_policy(&service);
+        service
+            .backend()
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "res-a".to_string(),
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                key: ObjectKey::new("tenant-a::object-a"),
+                expected_object_version: None,
+                delta_bytes: 10,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(1024),
+                    max_objects: Some(16),
+                },
+                expires_at_ms: 10,
+                created_at_ms: 5,
+                writer_runtime: ClientRuntimeId::new("writer-a", ClientEpoch(1)),
+            })
+            .expect("reservation should store");
+
+        let quota = service
+            .get_tenant_quota_state("tenant-a", Some("domain-a"), Some("set-a"))
+            .expect("quota state should read");
+        assert_eq!(
+            quota.scope,
+            TenantPolicyScope::new("tenant-a", None::<String>, None::<String>)
+        );
+        assert_eq!(
+            quota
+                .state
+                .expect("quota state should exist")
+                .pending_reserved_bytes,
+            10
+        );
+
+        let reservations = service
+            .list_tenant_quota_reservations(
+                "tenant-a",
+                Some("domain-a"),
+                Some("set-a"),
+                Some(TenantQuotaReservationState::Pending),
+            )
+            .expect("reservations should read");
+        assert_eq!(reservations.scope.tenant, "tenant-a");
+        assert_eq!(reservations.count, 1);
+        assert_eq!(reservations.reservations[0].reservation_id, "res-a");
+    }
+
+    #[test]
+    fn admin_service_reads_object_accounting_from_scoped_key() {
+        let service = test_service();
+        put_quota_policy(&service);
+        service
+            .backend()
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "res-a".to_string(),
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                key: ObjectKey::new("tenant-a::object-a"),
+                expected_object_version: None,
+                delta_bytes: 12,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(1024),
+                    max_objects: Some(16),
+                },
+                expires_at_ms: 10,
+                created_at_ms: 5,
+                writer_runtime: ClientRuntimeId::new("writer-a", ClientEpoch(1)),
+            })
+            .expect("reservation should store");
+        service
+            .backend()
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "res-a".to_string(),
+                expected_object_version: None,
+                committed_length: Some(12),
+                route_version: None,
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 6,
+                updated_by: "writer-a".to_string(),
+            })
+            .expect("finalize should succeed");
+
+        let accounting = service
+            .get_tenant_object_accounting("tenant-a", Some("domain-a"), Some("set-a"), "object-a")
+            .expect("object accounting should read");
+        assert_eq!(accounting.scope.tenant, "tenant-a");
+        assert_eq!(accounting.key, "tenant-a::object-a");
+        assert_eq!(
+            accounting
+                .accounting
+                .expect("accounting should exist")
+                .committed_length,
+            12
+        );
     }
 }

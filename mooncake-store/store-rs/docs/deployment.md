@@ -487,7 +487,7 @@ mooncake-store-admin \
   cleanup-stale-segments
 ```
 
-You can also manage tenant route policy through the same binary:
+You can also manage tenant route policy and inspect strict-quota metadata through the same binary:
 
 ```bash
 mooncake-store-admin \
@@ -500,6 +500,17 @@ mooncake-store-admin \
   --tenant tenant-a \
   --route-topk 3 \
   --route-control embedded-wrh
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota state \
+  --tenant tenant-a
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reservations \
+  --tenant tenant-a \
+  --state pending
 ```
 
 Useful options:

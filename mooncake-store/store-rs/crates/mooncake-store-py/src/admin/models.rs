@@ -1,5 +1,8 @@
 use mooncake_store_client::RouteControlMode;
-use mooncake_store_core::{RoutePolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec};
+use mooncake_store_core::{
+    RoutePolicy, TenantObjectAccounting, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaReservation, TenantQuotaReservationState, TenantQuotaState,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -63,6 +66,33 @@ pub struct RoutePolicyResponse {
     pub domain: String,
     pub found: bool,
     pub policy: Option<RoutePolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GetTenantQuotaStateResponse {
+    pub scope: TenantPolicyScope,
+    pub found: bool,
+    pub state: Option<TenantQuotaState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GetTenantObjectAccountingResponse {
+    pub scope: TenantPolicyScope,
+    pub key: String,
+    pub found: bool,
+    pub accounting: Option<TenantObjectAccounting>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReservationFilterInput {
+    pub state: Option<TenantQuotaReservationState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListTenantQuotaReservationsResponse {
+    pub scope: TenantPolicyScope,
+    pub count: usize,
+    pub reservations: Vec<TenantQuotaReservation>,
 }
 
 fn default_updated_by() -> String {
