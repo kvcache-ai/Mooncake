@@ -524,6 +524,30 @@ Useful options:
 - `--keyspace <prefix>` to target a non-default metadata namespace for either policy management or stale cleanup
 - `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` for Redis ACL authentication
 
+### Local e2e validation
+
+The repository's main end-to-end validation binary is `crates/mooncake-store-e2e/src/main.rs`, and the standard local entrypoint is:
+
+```bash
+scripts/e2e/run-local-e2e.sh
+```
+
+For fast local verification while iterating on quota behavior, reduce benchmark noise and disable RDMA probing:
+
+```bash
+MC_STORE_RS_ENABLE_RDMA=0 \
+MC_STORE_RS_BENCH_ITERS=1 \
+scripts/e2e/run-local-e2e.sh
+```
+
+The local e2e now includes a focused strict tenant quota scenario that proves all of the following against Redis-backed metadata state:
+
+- a tenant quota policy is applied before the quota-scoped writer starts
+- an admitted write consumes quota and leaves `pending_reserved_* == 0` after finalize
+- a second over-limit write is rejected without drifting quota state or reservation count
+- authoritative delete refunds quota immediately and makes the same capacity reusable
+- object accounting and finalized reservation records are visible in metadata for the test tenant
+
 The command removes:
 
 - stale segment hash keys owned by clients with no live lease

@@ -287,6 +287,7 @@ It covers:
 - request-level replication
 - batch put/get
 - strict tenant quota on single-object and routed batch writes
+- strict tenant quota e2e validation for Redis-backed admit/finalize/reject/delete-refund state
 - registered-buffer and multi-buffer paths
 - delete reclaim and overwrite reclaim
 - dynamic expansion, true client shrink, and hot-upgrade
