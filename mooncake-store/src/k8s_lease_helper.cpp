@@ -125,9 +125,9 @@ ErrorCode K8sLeaseHelper::WatchHolder(
     const std::string& ns, const std::string& lease, void* callback_context,
     void (*callback_func)(void*, const char*, size_t, int64_t)) {
     char* err_msg = nullptr;
-    int ret = K8sLeaseWatchHolder(
-        const_cast<char*>(ns.c_str()), const_cast<char*>(lease.c_str()),
-        callback_context, reinterpret_cast<void*>(callback_func), &err_msg);
+    int ret = K8sLeaseWatchHolder(const_cast<char*>(ns.c_str()),
+                                  const_cast<char*>(lease.c_str()),
+                                  callback_context, callback_func, &err_msg);
     if (ret != 0) {
         LOG(ERROR) << "WatchHolder failed: " << err_msg;
         free(err_msg);

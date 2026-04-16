@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <optional>
+#include <string>
 #include <thread>
 
 #include <glog/logging.h>
@@ -20,6 +22,19 @@ constexpr int kDefaultLeaseDurationSec = 5;
 constexpr int kDefaultRenewDeadlineSec = 3;
 constexpr int kDefaultRetryPeriodSec = 1;
 constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
+
+std::atomic<uint64_t> g_session_sequence{0};
+
+OwnerToken MakeOwnerToken(const std::string& namespace_name,
+                          const std::string& lease_name,
+                          const std::string& leader_address,
+                          int64_t lease_transitions) {
+    const auto sequence =
+        g_session_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    return namespace_name + "/" + lease_name + "/" +
+           std::to_string(lease_transitions) + "/" + std::to_string(sequence) +
+           "/" + leader_address;
+}
 
 class K8sLeadershipMonitorHandle final : public LeadershipMonitorHandle {
    public:
@@ -122,7 +137,8 @@ K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
     }
 
     // We are the leader
-    OwnerToken token = namespace_ + "/" + lease_name_;
+    OwnerToken token =
+        MakeOwnerToken(namespace_, lease_name_, leader_address, transitions);
     LeadershipSession session{
         .view =
             MasterView{.leader_address = leader_address,
@@ -131,12 +147,22 @@ K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         .lease_ttl = std::chrono::seconds(kDefaultLeaseDurationSec),
     };
 
+    std::thread thread_to_join;
     {
         std::lock_guard<std::mutex> lock(election_mutex_);
+        if (election_monitor_thread_.joinable() && election_monitor_stopped_) {
+            thread_to_join = std::move(election_monitor_thread_);
+        }
         election_identity_ = leader_address;
+        election_owner_token_ = session.owner_token;
         election_active_ = true;
+        election_monitor_stopped_ = false;
         election_shutdown_requested_ = false;
         ClearLeadershipMonitorStateLocked();
+    }
+
+    if (thread_to_join.joinable()) {
+        thread_to_join.join();
     }
 
     return AcquireLeadershipResult{
@@ -152,46 +178,72 @@ tl::expected<bool, ErrorCode> K8sLeaderCoordinator::RenewLeadership(
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
-
-    std::lock_guard<std::mutex> lock(election_mutex_);
-
-    if (election_shutdown_requested_) {
-        return false;
-    }
-    if (!election_active_) {
-        return false;
+    if (session.owner_token.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // client-go handles renewal internally. If election is still active,
-    // leadership is being renewed. Start the monitor thread if not running.
-    if (!election_monitor_thread_.joinable()) {
-        election_monitor_thread_ = std::thread([this,
-                                                token = session.owner_token]() {
-            auto rc = K8sLeaseHelper::WaitLost(namespace_, lease_name_);
+    std::thread thread_to_join;
+    {
+        std::lock_guard<std::mutex> lock(election_mutex_);
 
-            std::shared_ptr<std::atomic<bool>> monitor_armed;
-            LeadershipLostCallback on_leadership_lost;
-            LeadershipLossReason loss_reason =
-                (rc == ErrorCode::OK) ? LeadershipLossReason::kLostLeadership
-                                      : LeadershipLossReason::kRenewError;
-            {
-                std::lock_guard<std::mutex> lock(election_mutex_);
-                election_active_ = false;
-                if (!election_shutdown_requested_ &&
-                    leadership_monitor_owner_token_ == token) {
-                    monitor_armed = leadership_monitor_armed_;
-                    on_leadership_lost =
-                        std::move(leadership_monitor_callback_);
-                    leadership_monitor_armed_.reset();
-                    leadership_monitor_owner_token_.clear();
-                }
-            }
+        if (election_shutdown_requested_) {
+            return false;
+        }
+        if (!election_active_) {
+            return false;
+        }
+        if (election_owner_token_ != session.owner_token) {
+            return false;
+        }
 
-            if (monitor_armed != nullptr && monitor_armed->exchange(false) &&
-                on_leadership_lost != nullptr) {
-                on_leadership_lost(loss_reason);
+        // client-go handles renewal internally. If election is still active,
+        // leadership is being renewed. Start the monitor thread if not running.
+        if (election_monitor_thread_.joinable()) {
+            if (!election_monitor_stopped_) {
+                return true;
             }
-        });
+            thread_to_join = std::move(election_monitor_thread_);
+            election_monitor_stopped_ = false;
+        }
+
+        if (!election_monitor_thread_.joinable()) {
+            election_monitor_thread_ =
+                std::thread([this, token = session.owner_token]() {
+                    auto rc = K8sLeaseHelper::WaitLost(namespace_, lease_name_);
+
+                    std::shared_ptr<std::atomic<bool>> monitor_armed;
+                    LeadershipLostCallback on_leadership_lost;
+                    LeadershipLossReason loss_reason =
+                        (rc == ErrorCode::OK)
+                            ? LeadershipLossReason::kLostLeadership
+                            : LeadershipLossReason::kRenewError;
+                    {
+                        std::lock_guard<std::mutex> lock(election_mutex_);
+                        election_monitor_stopped_ = true;
+                        if (election_owner_token_ == token) {
+                            election_active_ = false;
+                        }
+                        if (!election_shutdown_requested_ &&
+                            leadership_monitor_owner_token_ == token) {
+                            monitor_armed = leadership_monitor_armed_;
+                            on_leadership_lost =
+                                std::move(leadership_monitor_callback_);
+                            leadership_monitor_armed_.reset();
+                            leadership_monitor_owner_token_.clear();
+                        }
+                    }
+
+                    if (monitor_armed != nullptr &&
+                        monitor_armed->exchange(false) &&
+                        on_leadership_lost != nullptr) {
+                        on_leadership_lost(loss_reason);
+                    }
+                });
+        }
+    }
+
+    if (thread_to_join.joinable()) {
+        thread_to_join.join();
     }
 
     return true;
@@ -254,7 +306,13 @@ K8sLeaderCoordinator::StartLeadershipMonitor(
     if (election_shutdown_requested_) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    if (session.owner_token.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (!election_active_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (election_owner_token_ != session.owner_token) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (leadership_monitor_armed_ != nullptr &&
@@ -272,11 +330,21 @@ K8sLeaderCoordinator::StartLeadershipMonitor(
 
 ErrorCode K8sLeaderCoordinator::ReleaseLeadership(
     const LeadershipSession& session) {
+    if (session.owner_token.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     std::thread thread_to_join;
     {
         std::lock_guard<std::mutex> lock(election_mutex_);
+        if (!election_owner_token_.empty() &&
+            election_owner_token_ != session.owner_token) {
+            return ErrorCode::INVALID_PARAMS;
+        }
         election_shutdown_requested_ = true;
         election_active_ = false;
+        election_monitor_stopped_ = true;
+        election_owner_token_.clear();
         ClearLeadershipMonitorStateLocked();
         if (election_monitor_thread_.joinable()) {
             thread_to_join = std::move(election_monitor_thread_);
@@ -308,6 +376,8 @@ ErrorCode K8sLeaderCoordinator::ShutdownElection() {
         election_shutdown_requested_ = true;
         should_cancel = election_active_;
         election_active_ = false;
+        election_monitor_stopped_ = true;
+        election_owner_token_.clear();
         ClearLeadershipMonitorStateLocked();
         if (election_monitor_thread_.joinable()) {
             thread_to_join = std::move(election_monitor_thread_);

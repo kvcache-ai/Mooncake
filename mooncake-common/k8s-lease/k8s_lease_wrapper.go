@@ -374,8 +374,8 @@ func K8sLeaseWatchHolder(
 		*errMsg = C.CString("callback function is nil")
 		return -1
 	}
-	if err := ensureClientInitialized(); err != nil {
-		*errMsg = C.CString(err.Error())
+	if globalClient == nil {
+		*errMsg = C.CString("k8s client not initialized")
 		return -1
 	}
 

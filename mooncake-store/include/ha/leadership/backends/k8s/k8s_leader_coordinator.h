@@ -56,7 +56,9 @@ class K8sLeaderCoordinator final : public LeaderCoordinator {
     std::mutex election_mutex_;
     std::thread election_monitor_thread_;
     std::string election_identity_;
+    OwnerToken election_owner_token_;
     bool election_active_ = false;
+    bool election_monitor_stopped_ = false;
     bool election_shutdown_requested_ = false;
     LeadershipLostCallback leadership_monitor_callback_;
     std::shared_ptr<std::atomic<bool>> leadership_monitor_armed_;
