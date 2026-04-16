@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::slice;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc, OnceLock,
 };
 use std::thread::sleep;
@@ -15,7 +15,8 @@ use mooncake_store_core::{
     MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result,
     RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState,
     RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
-    TenantPlacementPolicy, TenantPolicySpec,
+    TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
 };
 use mooncake_transport::{
     Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
@@ -50,6 +51,7 @@ const DEFAULT_REQUEST_FAILOVER_SLACK: Duration = Duration::from_millis(250);
 const DEFAULT_REQUEST_THROUGHPUT_FLOOR_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 const DEFAULT_ROUTE_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DEFAULT_PUT_WRITE_RETRY_LIMIT: usize = 4;
+const DEFAULT_TENANT_QUOTA_RESERVATION_TTL_MS: u64 = 60_000;
 const STABLE_PHASE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const STABLE_PHASE_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
@@ -92,6 +94,7 @@ pub struct StoreClient {
     route_write_gate: SharedRouteWriteGate,
     startup_activation_pending: AtomicBool,
     heartbeat_repair_pending: AtomicUsize,
+    tenant_quota_reservation_counter: AtomicU64,
     namespace_quota: Option<NamespaceQuota>,
     execution_fairness: Option<ExecutionFairness>,
     bandwidth_shaping: Option<BandwidthShaping>,

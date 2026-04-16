@@ -631,6 +631,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             tracker.finish(&result, 0);
             return result;
         };
+        let quota_reservation = self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
         let cas = self.route_directory.compare_and_swap_object_route(
             &self.lease,
             &object_key,
@@ -638,8 +639,26 @@ impl MooncakeCompatibilityFacade for StoreClient {
             None,
         )?;
         let result = if cas.applied {
-            self.schedule_route_reclaim(&route)
+            match self.finalize_tenant_quota_delete(quota_reservation.as_ref()) {
+                Ok(()) => {
+                    if let Err(error) = self.schedule_route_reclaim(&route) {
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            tenant,
+                            key,
+                            error = %error,
+                            "route delete reclaim scheduling failed after authoritative delete"
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         } else {
+            let _ = self.abort_tenant_quota_reservation(
+                quota_reservation.as_ref(),
+                "route_delete_compare_and_swap_conflict",
+            );
             Err(StoreError::Conflict(format!(
                 "route delete lost race for tenant={tenant} key={key}"
             )))
@@ -672,6 +691,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 tracker.finish(&result, 0);
                 return result;
             };
+            let quota_reservation =
+                self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
             let cas = self.route_directory.compare_and_swap_object_route(
                 &self.lease,
                 &object_key,
@@ -679,8 +700,21 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 None,
             )?;
             if cas.applied {
-                self.schedule_route_reclaim(&route)?;
+                self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
+                if let Err(error) = self.schedule_route_reclaim(&route) {
+                    warn!(
+                        runtime = %self.lease.runtime,
+                        tenant,
+                        key = object.key,
+                        error = %error,
+                        "batch route delete reclaim scheduling failed after authoritative delete"
+                    );
+                }
             } else {
+                let _ = self.abort_tenant_quota_reservation(
+                    quota_reservation.as_ref(),
+                    "batch_route_delete_compare_and_swap_conflict",
+                );
                 let result = Err(StoreError::Conflict(format!(
                     "route delete lost race for tenant={tenant} key={}",
                     object.key

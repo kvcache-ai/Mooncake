@@ -297,6 +297,8 @@ For strict quota rollout, the metadata model now also includes tenant-root quota
 
 In Phase 1, these primitives exist in the shared contracts and all three metadata backends. The in-memory backend applies them under one write lock, Redis uses backend-atomic Lua reserve/finalize/abort scripts, and etcd uses multi-key compare-and-swap txn loops.
 
+Phase 3 now wires those primitives into the single-object client path: `put` reserves tenant quota before allocation/write, publishes the route, then finalizes quota before returning success. `remove` now reserves and finalizes the negative delta at delete CAS time, so quota/accounting state tracks authoritative object visibility rather than delayed storage reclaim.
+
 ### Backend support
 
 | Backend | Use Case |
