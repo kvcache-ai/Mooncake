@@ -62,6 +62,19 @@ struct PyTensorInfo {
     }
 };
 
+bool validate_serialized_tensor_buffer(uintptr_t buffer_ptr, size_t size,
+                                       const std::string &buffer_name) {
+    if (buffer_ptr == 0) {
+        LOG(ERROR) << buffer_name << " pointer cannot be null";
+        return false;
+    }
+    if (size <= sizeof(TensorMetadata)) {
+        LOG(ERROR) << buffer_name << " size too small for tensor metadata";
+        return false;
+    }
+    return true;
+}
+
 PyTensorInfo extract_tensor_info(const py::object &tensor,
                                  const std::string &key_name = "") {
     PyTensorInfo info = {
@@ -225,6 +238,21 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
     }
 }
 
+py::object decode_serialized_tensor_buffer(uintptr_t buffer_ptr, size_t size,
+                                           const std::string &context) {
+    if (!validate_serialized_tensor_buffer(buffer_ptr, size, context)) {
+        return py::none();
+    }
+
+    py::object tensor =
+        buffer_to_tensor(nullptr, reinterpret_cast<char *>(buffer_ptr),
+                         static_cast<int64_t>(size));
+    if (tensor.is_none()) {
+        LOG(ERROR) << "Failed to decode tensor buffer for " << context;
+    }
+    return tensor;
+}
+
 std::vector<std::vector<void *>> CastAddrs2Ptrs(
     const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs) {
     std::vector<std::vector<void *>> all_buffers;
@@ -285,7 +313,7 @@ class MooncakeStorePyWrapper {
         return store_->health_check();
     }
 
-    std::string get_tp_key_name(const std::string &base_key, int rank) {
+    static std::string get_tp_key_name(const std::string &base_key, int rank) {
         return base_key + "_tp_" + std::to_string(rank);
     }
 
@@ -360,11 +388,12 @@ class MooncakeStorePyWrapper {
         return batch_get_tensor(shard_keys);
     }
 
-    std::string get_chunk_meta_key_name(const std::string &base_key, int rank) {
+    static std::string get_chunk_meta_key_name(const std::string &base_key,
+                                               int rank) {
         return get_tp_key_name(base_key, rank) + "_meta";
     }
 
-    std::string get_global_meta_key_name(const std::string &base_key) {
+    static std::string get_global_meta_key_name(const std::string &base_key) {
         return base_key + "_global_meta";
     }
 
