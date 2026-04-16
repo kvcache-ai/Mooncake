@@ -20,6 +20,7 @@ use mooncake_transport::{TentEngine, TentEngineConfig};
 const LEASE_MS: u64 = 30_000;
 const MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const SCRATCH_BYTES: usize = 16 * 1024 * 1024;
+const BENCH_HEARTBEAT_EVERY: usize = 32;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     init_tracing_from_env("MC_STORE_RS_TRACE", "MC_STORE_RS_TRACE_FILTER")?;
@@ -111,7 +112,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             ("storage", "true"),
         ],
     )?;
-    let target_c = build_client(
+    let mut target_c = build_client(
         metadata.clone(),
         "store-c",
         ClientEpoch(1),
@@ -135,7 +136,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "tenant-a",
         &[("pool", "pool-a"), ("role", "upgrade"), ("storage", "true")],
     )?;
-    let reclaim_writer = build_client(
+    let mut reclaim_writer = build_client(
         metadata.clone(),
         "store-reclaim",
         ClientEpoch(1),
@@ -154,7 +155,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             ("storage", "true"),
         ],
     )?;
-    let router = build_routed_client(
+    let mut router = build_routed_client(
         metadata.clone(),
         "router",
         ClientEpoch(1),
@@ -170,7 +171,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         planner.clone(),
         1,
     )?;
-    let router_replica = build_routed_client(
+    let mut router_replica = build_routed_client(
         metadata.clone(),
         "router-replica",
         ClientEpoch(1),
@@ -194,7 +195,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         planner.clone(),
         2,
     )?;
-    let reader = build_client(
+    let mut reader = build_client(
         metadata.clone(),
         "reader",
         ClientEpoch(1),
@@ -204,7 +205,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "tenant-a",
         &[("pool", "pool-a"), ("role", "reader"), ("storage", "false")],
     )?;
-    let elastic_target = build_client(
+    let mut elastic_target = build_client(
         metadata.clone(),
         "elastic-target",
         ClientEpoch(1),
@@ -227,7 +228,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             ("storage", "true"),
         ],
     )?;
-    let elastic_router = build_routed_client(
+    let mut elastic_router = build_routed_client(
         metadata.clone(),
         "elastic-router",
         ClientEpoch(1),
@@ -299,8 +300,63 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         value_size,
     )?;
 
-    run_batch_put_benchmark(&router, value_size, batch_bench_iters)?;
-    run_batch_get_benchmark(&target_upgrade, &reader, value_size, batch_bench_iters)?;
+    heartbeat_clients(&mut [
+        &mut target_a,
+        &mut target_b,
+        &mut target_c,
+        &mut target_upgrade,
+        &mut reclaim_writer,
+        &mut router,
+        &mut router_replica,
+        &mut reader,
+        &mut elastic_target,
+        &mut elastic_router,
+    ])?;
+    run_batch_put_benchmark(
+        &mut router,
+        value_size,
+        batch_bench_iters,
+        &mut [
+            &mut target_a,
+            &mut target_b,
+            &mut target_c,
+            &mut target_upgrade,
+            &mut reclaim_writer,
+            &mut router_replica,
+            &mut reader,
+            &mut elastic_target,
+            &mut elastic_router,
+        ],
+    )?;
+    run_batch_get_benchmark(
+        &mut target_upgrade,
+        &mut reader,
+        value_size,
+        batch_bench_iters,
+        &mut [
+            &mut target_a,
+            &mut target_b,
+            &mut target_c,
+            &mut reclaim_writer,
+            &mut router,
+            &mut router_replica,
+            &mut elastic_target,
+            &mut elastic_router,
+        ],
+    )?;
+    sleep(Duration::from_secs(6));
+    heartbeat_clients(&mut [
+        &mut target_a,
+        &mut target_b,
+        &mut target_c,
+        &mut target_upgrade,
+        &mut reclaim_writer,
+        &mut router,
+        &mut router_replica,
+        &mut reader,
+        &mut elastic_target,
+        &mut elastic_router,
+    ])?;
     verify_true_client_shrink(&mut target_b, &router, &reader, value_size)?;
 
     println!(
@@ -903,17 +959,28 @@ fn verify_true_client_shrink(
     _reader: &StoreClient,
     value_size: usize,
 ) -> Result<()> {
+    let target_storage = target.runtime_id().storage_key();
     let mut owned = Vec::new();
     for index in 0..32 {
         let key = format!("shrink-key-{index}");
         let value = payload(&format!("shrink-value-{index}"), value_size);
-        router.put_with_policy(&key, &value, &ReplicationPolicy::new().prefer_local(false))?;
+        router.put_with_policy(
+            &key,
+            &value,
+            &ReplicationPolicy::new()
+                .prefer_local(false)
+                .preferred_storage_owner(target_storage.clone()),
+        )?;
         let route = router
             .query_route(&key)?
             .ok_or_else(|| StoreError::NotFound(key.clone()))?;
-        if route.replicas[0].owner == *target.runtime_id() {
-            owned.push((key, value));
+        if route.replicas[0].owner != *target.runtime_id() {
+            return Err(StoreError::InvalidState(format!(
+                "true client shrink routed key {key} to unexpected owner {}",
+                route.replicas[0].owner
+            )));
         }
+        owned.push((key, value));
     }
     if owned.is_empty() {
         return Err(StoreError::InvalidState(
@@ -921,7 +988,33 @@ fn verify_true_client_shrink(
         ));
     }
     for (key, value) in &owned {
-        let actual = router.get(key)?;
+        let mut actual = None;
+        let mut last_error = None;
+        for _ in 0..50 {
+            match router.get(key) {
+                Ok(payload) => {
+                    if payload == *value {
+                        actual = Some(payload);
+                        last_error = None;
+                        break;
+                    }
+                    actual = Some(payload);
+                    last_error = None;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+            sleep(Duration::from_millis(100));
+        }
+        let actual = actual.unwrap_or_default();
+        if actual != *value {
+            return Err(StoreError::Transport(format!(
+                "true shrink preflight failed for key {key}: target_state={:?} route={:?} last_error={last_error:?}",
+                router.runtime_state(target.runtime_id())?,
+                router.query_route(key)?
+            )));
+        }
         ensure_payload(&format!("true shrink preflight {key}"), value, &actual)?;
     }
 
@@ -958,18 +1051,30 @@ fn verify_true_client_shrink(
                 "true client shrink route still references evacuated runtime for key {key}"
             )));
         }
-        let mut actual = router.get(&key)?;
-        for _ in 0..20 {
-            if actual == value {
-                break;
+        let mut actual = None;
+        let mut last_error = None;
+        for _ in 0..50 {
+            match router.get(&key) {
+                Ok(payload) => {
+                    if payload == value {
+                        actual = Some(payload);
+                        last_error = None;
+                        break;
+                    }
+                    actual = Some(payload);
+                    last_error = None;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
             }
             sleep(Duration::from_millis(100));
-            actual = router.get(&key)?;
         }
+        let actual = actual.unwrap_or_default();
         if actual != value {
             let reader_route = router.query_route(&key)?;
             return Err(StoreError::Transport(format!(
-                "true shrink payload mismatch for key {key}: router_route={route:?} reader_route={reader_route:?}"
+                "true shrink payload mismatch for key {key}: router_route={route:?} reader_route={reader_route:?} last_error={last_error:?}"
             )));
         }
         ensure_payload(&format!("true shrink {key}"), &value, &actual)?;
@@ -1222,9 +1327,10 @@ fn verify_hot_upgrade(
 }
 
 fn run_batch_put_benchmark(
-    writer: &StoreClient,
+    writer: &mut StoreClient,
     value_size: usize,
     iterations: usize,
+    other_clients: &mut [&mut StoreClient],
 ) -> Result<()> {
     for batch_size in [1usize, 8, 64] {
         let items = build_items(
@@ -1242,9 +1348,13 @@ fn run_batch_put_benchmark(
             .collect::<Vec<_>>();
         let start = Instant::now();
         let mut total_bytes = 0usize;
-        for _ in 0..iterations {
-            writer.batch_put(&puts)?;
+        for iteration in 0..iterations {
+            batch_put_with_retry(writer, &puts)?;
             total_bytes += batch_size * value_size;
+            if (iteration + 1) % BENCH_HEARTBEAT_EVERY == 0 {
+                heartbeat_clients(other_clients)?;
+                writer.heartbeat(now_ms().saturating_add(LEASE_MS))?;
+            }
         }
         print_bench(
             "put",
@@ -1259,10 +1369,11 @@ fn run_batch_put_benchmark(
 }
 
 fn run_batch_get_benchmark(
-    writer: &StoreClient,
-    reader: &StoreClient,
+    writer: &mut StoreClient,
+    reader: &mut StoreClient,
     value_size: usize,
     iterations: usize,
+    other_clients: &mut [&mut StoreClient],
 ) -> Result<()> {
     let items = build_items("bench-get", "get", 64, value_size);
     let puts = items
@@ -1271,7 +1382,7 @@ fn run_batch_get_benchmark(
             PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str())
         })
         .collect::<Vec<_>>();
-    writer.batch_put(&puts)?;
+    batch_put_with_retry(writer, &puts)?;
 
     for batch_size in [1usize, 8, 64] {
         let subset = &items[..batch_size];
@@ -1284,7 +1395,7 @@ fn run_batch_get_benchmark(
         }
         let start = Instant::now();
         let bench_result = (|| {
-            for _ in 0..iterations {
+            for iteration in 0..iterations {
                 let mut gets = subset
                     .iter()
                     .zip(buffers.iter_mut())
@@ -1304,6 +1415,11 @@ fn run_batch_get_benchmark(
                         )));
                     }
                 }
+                if (iteration + 1) % BENCH_HEARTBEAT_EVERY == 0 {
+                    heartbeat_clients(other_clients)?;
+                    writer.heartbeat(now_ms().saturating_add(LEASE_MS))?;
+                    reader.heartbeat(now_ms().saturating_add(LEASE_MS))?;
+                }
             }
             Ok(())
         })();
@@ -1322,6 +1438,31 @@ fn run_batch_get_benchmark(
         );
     }
     Ok(())
+}
+
+fn heartbeat_clients(clients: &mut [&mut StoreClient]) -> Result<()> {
+    let expires_at_ms = now_ms().saturating_add(LEASE_MS);
+    for client in clients.iter_mut() {
+        client.heartbeat(expires_at_ms)?;
+    }
+    Ok(())
+}
+
+fn batch_put_with_retry(writer: &StoreClient, puts: &[PutRequest<'_>]) -> Result<()> {
+    let mut last_conflict = None;
+    for _ in 0..8 {
+        match writer.batch_put(puts) {
+            Ok(_) => return Ok(()),
+            Err(StoreError::Conflict(error)) => {
+                last_conflict = Some(error);
+                sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(StoreError::Conflict(last_conflict.unwrap_or_else(|| {
+        "benchmark batch_put exhausted route CAS retries".to_string()
+    })))
 }
 
 fn print_bench(
