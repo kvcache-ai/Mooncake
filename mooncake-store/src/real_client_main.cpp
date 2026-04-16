@@ -3,6 +3,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
+#include "common.h"
 #include "config.h"
 #include "real_client.h"
 
@@ -113,10 +114,12 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, "127.0.0.1");
+    auto [bind_host, _] = parseHostNameWithPort(FLAGS_host);
+    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, bind_host);
     RegisterClientRpcService(server, *client_inst);
 
-    LOG(INFO) << "Starting real client service on 127.0.0.1:" << FLAGS_port;
+    LOG(INFO) << "Starting real client service on " << bind_host << ":"
+              << FLAGS_port;
 
     return server.start();
 }
