@@ -8,7 +8,10 @@ use mooncake_store_core::{Result, StoreError};
 use mooncake_transport_sys::tent as ffi;
 
 use crate::env::EnvOverrideGuard;
-use crate::{Opcode, TransferProgress, TransferRequest, TransferStatus};
+use crate::{
+    clamp_registration_size, rdma_device_max_registration_size, Opcode, TransferProgress,
+    TransferRequest, TransferStatus,
+};
 
 #[derive(Clone, Default)]
 pub struct TentEngineConfig {
@@ -47,6 +50,12 @@ impl TentEngineConfig {
     pub fn redis_db_index(mut self, db_index: impl Into<String>) -> Self {
         self.redis_db_index = Some(db_index.into());
         self
+    }
+
+    fn rdma_enabled(&self) -> bool {
+        self.overrides
+            .get("transports/rdma/enable")
+            .is_some_and(|value| parse_config_bool(value))
     }
 
     fn apply(&self) -> Result<()> {
@@ -100,6 +109,7 @@ pub struct SegmentBuffer {
 pub struct TentEngine {
     raw: RwLock<ffi::TentEngineHandle>,
     config: TentEngineConfig,
+    max_registration_bytes: Option<usize>,
     registered_regions: Mutex<BTreeMap<usize, usize>>,
     owned_allocations: Mutex<BTreeMap<usize, TentOwnedAllocation>>,
     generation: AtomicU64,
@@ -120,6 +130,10 @@ impl TentEngine {
         Ok(Self {
             raw: RwLock::new(raw),
             config: config.clone(),
+            max_registration_bytes: config
+                .rdma_enabled()
+                .then(tent_rdma_registration_limit)
+                .flatten(),
             registered_regions: Mutex::new(BTreeMap::new()),
             owned_allocations: Mutex::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
@@ -154,6 +168,10 @@ impl TentEngine {
 
     fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    pub fn max_registration_bytes(&self) -> Option<usize> {
+        self.max_registration_bytes
     }
 
     fn snapshot_registered_regions(&self) -> Result<Vec<(*mut c_void, usize)>> {
@@ -385,6 +403,29 @@ impl Drop for TentEngine {
     }
 }
 
+fn parse_config_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn parse_max_registration_size(value: Option<&str>) -> Option<usize> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn tent_rdma_registration_limit() -> Option<usize> {
+    clamp_registration_size(
+        rdma_device_max_registration_size(),
+        parse_max_registration_size(std::env::var("MC_MAX_MR_SIZE").ok().as_deref()),
+    )
+}
+
 fn to_cstring(field: &str, value: &str) -> Result<CString> {
     CString::new(value)
         .map_err(|_| StoreError::Transport(format!("{field} contains an embedded NUL byte")))
@@ -486,14 +527,22 @@ mod tests {
     use std::ffi::CString;
     use std::os::raw::c_char;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
 
     use mooncake_transport_sys::tent as ffi;
 
     use super::{
-        check_zero, cstring_from_path, decode_status, encode_opcode, read_segment_buffers,
-        read_string, to_cstring, TentEngineConfig,
+        check_zero, cstring_from_path, decode_status, encode_opcode, parse_config_bool,
+        parse_max_registration_size, read_segment_buffers, read_string,
+        tent_rdma_registration_limit, to_cstring, TentEngineConfig,
     };
+    use crate::env::EnvOverrideGuard;
     use crate::{Opcode, TransferStatus};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn tent_config_builders_accumulate_overrides() {
@@ -512,6 +561,28 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(debug.contains("7"));
         assert!(!debug.contains("secret-pass"));
+    }
+
+    #[test]
+    fn tent_rdma_enable_and_max_registration_helpers_parse_expected_values() {
+        let config = TentEngineConfig::new().set("transports/rdma/enable", "true");
+        assert!(config.rdma_enabled());
+        let tcp_only = TentEngineConfig::new().set("transports/rdma/enable", "false");
+        assert!(!tcp_only.rdma_enabled());
+        assert!(parse_config_bool("ON"));
+        assert!(!parse_config_bool("off"));
+        assert_eq!(parse_max_registration_size(Some("4096")), Some(4096));
+        assert_eq!(parse_max_registration_size(Some("0")), None);
+        assert_eq!(parse_max_registration_size(Some("")), None);
+        assert_eq!(parse_max_registration_size(Some("bad")), None);
+    }
+
+    #[test]
+    fn tent_rdma_registration_limit_uses_device_probe_with_env_cap() {
+        let _lock = env_test_lock().lock().expect("env lock poisoned");
+        let mut env = EnvOverrideGuard::new();
+        env.set_optional("MC_MAX_MR_SIZE", Some("4096"));
+        assert!(tent_rdma_registration_limit().is_some_and(|value| value <= 4096));
     }
 
     #[test]

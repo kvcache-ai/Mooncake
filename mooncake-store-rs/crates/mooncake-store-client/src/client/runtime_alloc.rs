@@ -411,13 +411,33 @@ impl StoreClient {
         })
     }
 
+    fn storage_segment_chunk_limit(&self) -> Result<Option<usize>> {
+        Ok(self.transport()?.max_registration_bytes().filter(|value| *value > 0))
+    }
+
+    fn storage_segment_sizes(&self, storage_bytes: usize) -> Result<Vec<usize>> {
+        let limit = self.storage_segment_chunk_limit()?;
+        let mut remaining = storage_bytes;
+        let mut sizes = Vec::new();
+        while remaining != 0 {
+            let segment_bytes = limit.unwrap_or(remaining).min(remaining);
+            sizes.push(segment_bytes);
+            remaining = remaining.saturating_sub(segment_bytes);
+        }
+        Ok(sizes)
+    }
+
     fn ensure_local_memory(&self) -> Result<()> {
         if self.state.lock().memory.is_some() {
             return Ok(());
         }
         let transport = self.transport()?;
         let primary_segment = self.segment_name()?;
-        let memory = LocalMemoryState::register(transport, &primary_segment, &self.local_memory)?;
+        let storage_segments = self.storage_segment_sizes(self.local_memory.storage_bytes)?;
+        let primary_storage_bytes = storage_segments.first().copied().unwrap_or(0);
+        let mut initial_config = self.local_memory.clone();
+        initial_config.storage_bytes = primary_storage_bytes;
+        let memory = LocalMemoryState::register(transport, &primary_segment, &initial_config)?;
         let primary = memory
             .storage_segments()
             .into_iter()
@@ -432,10 +452,48 @@ impl StoreClient {
             }
             state.memory = Some(memory);
         }
-        match primary {
-            Some(primary) => self.publish_local_segment(&primary, 0),
-            None => Ok(()),
+        if let Some(primary) = primary {
+            self.publish_local_segment(&primary, 0)?;
         }
+        for segment_bytes in storage_segments.into_iter().skip(1) {
+            let segment_name = {
+                let mut state = self.state.lock();
+                state.next_segment_name(&primary_segment)
+            };
+            let local_transport = self.transport_factory()?.create(&segment_name.0)?;
+            let segment_info = {
+                let mut state = self.state.lock();
+                state.memory_mut()?.add_storage_segment(
+                    local_transport.as_ref(),
+                    StorageSegmentSpec {
+                        segment_name: segment_name.clone(),
+                        capacity_bytes: segment_bytes,
+                        state: SegmentLifecycleState::Active,
+                        tags: self.local_memory.tags.clone(),
+                        location: self.local_memory.location.clone(),
+                        alignment: self.local_memory.alignment,
+                        hugepage_enabled: self.local_memory.hugepage_enabled,
+                        hugepage_size_bytes: self.local_memory.hugepage_size_bytes,
+                    },
+                )?;
+                state
+                    .local_transports
+                    .insert(segment_name.0.clone(), local_transport);
+                state
+                    .memory_ref()?
+                    .storage_segments()
+                    .into_iter()
+                    .find(|entry| entry.segment_name == segment_name)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "initial storage segment {} is missing",
+                            segment_name.0
+                        ))
+                    })?
+            };
+            self.publish_local_segment(&segment_info, 0)?;
+        }
+        Ok(())
     }
 
     fn scoped_key(&self, tenant: &str, key: &str) -> ObjectKey {
