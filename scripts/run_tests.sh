@@ -31,19 +31,12 @@ MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 pytho
 sleep 1
 # DEBUG: who holds port 50052 right before mooncake_client starts?
 echo "=== port 50052 diagnostic ==="
-echo "--- all LISTEN sockets ---"
 ss -tlnp 2>&1 | head -30 || true
-echo "--- 50051/50052/9300/9003 (LISTEN only) ---"
-ss -tlnp 2>&1 | grep -E ":(50051|50052|9300|9003)" || echo "(nothing LISTEN on these ports)"
-echo "--- ANY state on port 50052 ---"
-ss -tanp 2>&1 | grep -E ":50052" || echo "(no 50052 in any state)"
-echo "--- lsof ---"
+echo "--- specifically port 50052 ---"
+ss -tlnp 2>&1 | grep -E ":(50051|50052|9300|9003)" || echo "(nothing on 50051/50052/9300/9003)"
 lsof -iTCP:50052 2>&1 || echo "(no lsof for 50052)"
 echo "--- sysctl ip_local_port_range ---"
 sysctl net.ipv4.ip_local_port_range || true
-echo "--- tcp_tw_reuse / tcp_tw_recycle ---"
-sysctl net.ipv4.tcp_tw_reuse 2>&1 || true
-sysctl net.ipv4.tcp_tw_recycle 2>&1 || true
 echo "=== end port 50052 diagnostic ==="
 
 mooncake_client &
