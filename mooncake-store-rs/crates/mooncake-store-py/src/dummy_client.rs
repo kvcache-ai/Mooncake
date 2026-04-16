@@ -13,8 +13,9 @@ use tonic::transport::{Channel, Endpoint};
 use crate::config::CompatTimeoutConfig;
 use crate::dummy_service::pb;
 use crate::shm::{
-    dummy_ipc_socket_path, resolve_shared_region, send_shm_register_request,
-    shared_region_for_registration, DummyClientId, ShmRegisterRequest,
+    dummy_ipc_socket_path, hot_cache_ipc_socket_path, request_hot_cache_region,
+    resolve_shared_region, send_shm_register_request, shared_region_for_registration,
+    DummyClientId, OwnedMappedRegion, ShmRegisterRequest,
 };
 
 static DUMMY_RUNTIME: LazyLock<Runtime> =
@@ -24,9 +25,11 @@ pub struct DummySession {
     channel: Channel,
     server_addr: String,
     socket_path: PathBuf,
+    hot_cache_socket_path: PathBuf,
     client_id: DummyClientId,
     rpc_timeout: Duration,
     registered_regions: Mutex<BTreeMap<usize, RegisteredRegion>>,
+    hot_cache_region: Mutex<Option<OwnedMappedRegion>>,
 }
 
 #[derive(Clone, Copy)]
@@ -61,14 +64,18 @@ impl DummySession {
                 }
             }
         };
-        Ok(Self {
+        let session = Self {
             channel,
             server_addr: server_addr.to_string(),
             socket_path: dummy_ipc_socket_path(server_addr),
+            hot_cache_socket_path: hot_cache_ipc_socket_path(server_addr),
             client_id: DummyClientId::new(),
             rpc_timeout: rpc_timeout.max(Duration::from_millis(1)),
             registered_regions: Mutex::new(BTreeMap::new()),
-        })
+            hot_cache_region: Mutex::new(None),
+        };
+        session.try_map_hot_cache();
+        Ok(session)
     }
 
     pub fn server_addr(&self) -> &str {
@@ -85,6 +92,7 @@ impl DummySession {
         for pointer in pointers {
             let _ = self.unregister_buffer(pointer, None);
         }
+        let _ = self.hot_cache_region.lock().take();
     }
 
     pub fn health_check(&self) -> i32 {
@@ -115,6 +123,9 @@ impl DummySession {
     }
 
     pub fn get(&self, key: &str, tenant: Option<&str>) -> Result<(i32, Vec<u8>)> {
+        if let Some(value) = self.try_get_hot_cache_bytes(key, tenant)? {
+            return Ok((0, value));
+        }
         let request = pb::GetRequest {
             key: key.to_string(),
             tenant: tenant.unwrap_or_default().to_string(),
@@ -271,13 +282,38 @@ impl DummySession {
         items: &[(String, usize, usize)],
         tenant: Option<&str>,
     ) -> Result<Vec<i64>> {
+        let mut lengths = vec![-1; items.len()];
+        let hot_replies = self.batch_acquire_hot_cache(items, tenant)?;
+        let mut hit_handles = Vec::new();
+        let mut misses = Vec::new();
+
+        for (index, ((key, ptr, size), reply)) in items.iter().zip(hot_replies.iter()).enumerate() {
+            if reply.status == 0 {
+                let region = resolve_shared_region(*ptr, *size)?;
+                self.ensure_region_registered(region.base)?;
+                let target = unsafe { std::slice::from_raw_parts_mut(*ptr as *mut u8, *size) };
+                lengths[index] = self.copy_hot_cache_reply_to_slice(reply, target)? as i64;
+                hit_handles.push(pb::HotCacheReleaseRequest {
+                    block_id: reply.block_id,
+                    generation: reply.generation,
+                });
+            } else {
+                misses.push((index, key.clone(), *ptr, *size));
+            }
+        }
+        self.batch_release_hot_cache_handles(hit_handles)?;
+
+        if misses.is_empty() {
+            return Ok(lengths);
+        }
+
         let request = pb::BatchGetIntoRequest {
             client_id_hi: self.client_id.high,
             client_id_lo: self.client_id.low,
             tenant: tenant.unwrap_or_default().to_string(),
-            items: items
+            items: misses
                 .iter()
-                .map(|(key, ptr, size)| {
+                .map(|(_, key, ptr, size)| {
                     let region = resolve_shared_region(*ptr, *size)?;
                     self.ensure_region_registered(region.base)?;
                     Ok(pb::SharedGetItem {
@@ -291,10 +327,14 @@ impl DummySession {
                 })
                 .collect::<Result<Vec<_>>>()?,
         };
-        Ok(self
+        let miss_lengths = self
             .rpc(|mut client| async move { client.batch_get_into(request).await })?
             .into_inner()
-            .lengths)
+            .lengths;
+        for ((index, _, _, _), length) in misses.into_iter().zip(miss_lengths.into_iter()) {
+            lengths[index] = length;
+        }
+        Ok(lengths)
     }
 
     pub fn batch_get_into_multi_buffers(
@@ -302,13 +342,44 @@ impl DummySession {
         items: &[(String, Vec<(usize, usize)>)],
         tenant: Option<&str>,
     ) -> Result<Vec<i64>> {
+        let mut lengths = vec![-1; items.len()];
+        let hot_replies = self.batch_acquire_hot_cache_multi(items, tenant)?;
+        let mut hit_handles = Vec::new();
+        let mut misses = Vec::new();
+
+        for (index, ((key, buffers), reply)) in items.iter().zip(hot_replies.iter()).enumerate() {
+            if reply.status == 0 {
+                let mut targets = buffers
+                    .iter()
+                    .map(|(ptr, size)| {
+                        let region = resolve_shared_region(*ptr, *size)?;
+                        self.ensure_region_registered(region.base)?;
+                        Ok(unsafe { std::slice::from_raw_parts_mut(*ptr as *mut u8, *size) })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                lengths[index] =
+                    self.copy_hot_cache_reply_to_slices(reply, targets.as_mut_slice())? as i64;
+                hit_handles.push(pb::HotCacheReleaseRequest {
+                    block_id: reply.block_id,
+                    generation: reply.generation,
+                });
+            } else {
+                misses.push((index, key.clone(), buffers.clone()));
+            }
+        }
+        self.batch_release_hot_cache_handles(hit_handles)?;
+
+        if misses.is_empty() {
+            return Ok(lengths);
+        }
+
         let request = pb::BatchGetIntoMultiBuffersRequest {
             client_id_hi: self.client_id.high,
             client_id_lo: self.client_id.low,
             tenant: tenant.unwrap_or_default().to_string(),
-            items: items
+            items: misses
                 .iter()
-                .map(|(key, buffers)| {
+                .map(|(_, key, buffers)| {
                     Ok(pb::SharedMultiGetItem {
                         key: key.clone(),
                         buffers: Some(pb::SharedBufferGroup {
@@ -321,10 +392,14 @@ impl DummySession {
                 })
                 .collect::<Result<Vec<_>>>()?,
         };
-        Ok(self
+        let miss_lengths = self
             .rpc(|mut client| async move { client.batch_get_into_multi_buffers(request).await })?
             .into_inner()
-            .lengths)
+            .lengths;
+        for ((index, _, _), length) in misses.into_iter().zip(miss_lengths.into_iter()) {
+            lengths[index] = length;
+        }
+        Ok(lengths)
     }
 
     pub fn get_into(
@@ -343,11 +418,185 @@ impl DummySession {
 
     pub fn remove_all(&self, force: bool) -> Result<(i32, i64)> {
         let reply = self
-            .rpc(
-                |mut client| async move { client.remove_all(pb::RemoveAllRequest { force }).await },
-            )?
+            .rpc(|mut client| async move { client.remove_all(pb::RemoveAllRequest { force }).await })?
             .into_inner();
         Ok((reply.status, reply.removed))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_hot_cache_mapping(&self) -> bool {
+        self.hot_cache_region.lock().is_some()
+    }
+
+    fn try_map_hot_cache(&self) {
+        if let Ok(region) = request_hot_cache_region(&self.hot_cache_socket_path, self.client_id) {
+            *self.hot_cache_region.lock() = Some(region);
+        }
+    }
+
+    fn try_get_hot_cache_bytes(&self, key: &str, tenant: Option<&str>) -> Result<Option<Vec<u8>>> {
+        let Some(reply) = self.acquire_hot_cache(key, tenant)? else {
+            return Ok(None);
+        };
+        let value = self.copy_hot_cache_reply_to_vec(&reply)?;
+        self.release_hot_cache_handle(&reply)?;
+        Ok(Some(value))
+    }
+
+    fn acquire_hot_cache(
+        &self,
+        key: &str,
+        tenant: Option<&str>,
+    ) -> Result<Option<pb::HotCacheAcquireReply>> {
+        if self.hot_cache_region.lock().is_none() {
+            return Ok(None);
+        }
+        let request = pb::HotCacheAcquireRequest {
+            key: key.to_string(),
+            tenant: tenant.unwrap_or_default().to_string(),
+        };
+        let reply = self
+            .rpc(|mut client| async move { client.acquire_hot_cache(request).await })?
+            .into_inner();
+        if reply.status == 0 {
+            Ok(Some(reply))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn batch_acquire_hot_cache(
+        &self,
+        items: &[(String, usize, usize)],
+        tenant: Option<&str>,
+    ) -> Result<Vec<pb::HotCacheAcquireReply>> {
+        if self.hot_cache_region.lock().is_none() {
+            return Ok(vec![pb::HotCacheAcquireReply { status: -1, ..Default::default() }; items.len()]);
+        }
+        let request = pb::BatchHotCacheAcquireRequest {
+            objects: items
+                .iter()
+                .map(|(key, _, _)| pb::ObjectRef {
+                    key: key.clone(),
+                    tenant: tenant.unwrap_or_default().to_string(),
+                })
+                .collect(),
+        };
+        Ok(self
+            .rpc(|mut client| async move { client.batch_acquire_hot_cache(request).await })?
+            .into_inner()
+            .items)
+    }
+
+    fn batch_acquire_hot_cache_multi(
+        &self,
+        items: &[(String, Vec<(usize, usize)>)],
+        tenant: Option<&str>,
+    ) -> Result<Vec<pb::HotCacheAcquireReply>> {
+        if self.hot_cache_region.lock().is_none() {
+            return Ok(vec![pb::HotCacheAcquireReply { status: -1, ..Default::default() }; items.len()]);
+        }
+        let request = pb::BatchHotCacheAcquireRequest {
+            objects: items
+                .iter()
+                .map(|(key, _)| pb::ObjectRef {
+                    key: key.clone(),
+                    tenant: tenant.unwrap_or_default().to_string(),
+                })
+                .collect(),
+        };
+        Ok(self
+            .rpc(|mut client| async move { client.batch_acquire_hot_cache(request).await })?
+            .into_inner()
+            .items)
+    }
+
+    fn release_hot_cache_handle(&self, reply: &pb::HotCacheAcquireReply) -> Result<()> {
+        let request = pb::HotCacheReleaseRequest {
+            block_id: reply.block_id,
+            generation: reply.generation,
+        };
+        let _ = self.rpc(|mut client| async move { client.release_hot_cache(request).await })?;
+        Ok(())
+    }
+
+    fn batch_release_hot_cache_handles(
+        &self,
+        handles: Vec<pb::HotCacheReleaseRequest>,
+    ) -> Result<()> {
+        if handles.is_empty() {
+            return Ok(());
+        }
+        let request = pb::BatchHotCacheReleaseRequest { handles };
+        let _ = self.rpc(|mut client| async move { client.batch_release_hot_cache(request).await })?;
+        Ok(())
+    }
+
+    fn copy_hot_cache_reply_to_vec(&self, reply: &pb::HotCacheAcquireReply) -> Result<Vec<u8>> {
+        let region = self.hot_cache_region.lock();
+        let Some(region) = region.as_ref() else {
+            return Err(StoreError::NotFound("dummy hot cache shm is not mapped".to_string()));
+        };
+        let offset = usize::try_from(reply.offset)
+            .map_err(|_| StoreError::Allocator("hot cache offset overflow".to_string()))?;
+        let len = usize::try_from(reply.length)
+            .map_err(|_| StoreError::Allocator("hot cache length overflow".to_string()))?;
+        Ok(region.slice(offset, len)?.to_vec())
+    }
+
+    fn copy_hot_cache_reply_to_slice(
+        &self,
+        reply: &pb::HotCacheAcquireReply,
+        target: &mut [u8],
+    ) -> Result<usize> {
+        let region = self.hot_cache_region.lock();
+        let Some(region) = region.as_ref() else {
+            return Err(StoreError::NotFound("dummy hot cache shm is not mapped".to_string()));
+        };
+        let offset = usize::try_from(reply.offset)
+            .map_err(|_| StoreError::Allocator("hot cache offset overflow".to_string()))?;
+        let len = usize::try_from(reply.length)
+            .map_err(|_| StoreError::Allocator("hot cache length overflow".to_string()))?;
+        if len > target.len() {
+            return Err(StoreError::Allocator(format!(
+                "dummy hot cache target too small: value={len} target={}",
+                target.len()
+            )));
+        }
+        target[..len].copy_from_slice(region.slice(offset, len)?);
+        Ok(len)
+    }
+
+    fn copy_hot_cache_reply_to_slices(
+        &self,
+        reply: &pb::HotCacheAcquireReply,
+        targets: &mut [&mut [u8]],
+    ) -> Result<usize> {
+        let region = self.hot_cache_region.lock();
+        let Some(region) = region.as_ref() else {
+            return Err(StoreError::NotFound("dummy hot cache shm is not mapped".to_string()));
+        };
+        let offset = usize::try_from(reply.offset)
+            .map_err(|_| StoreError::Allocator("hot cache offset overflow".to_string()))?;
+        let len = usize::try_from(reply.length)
+            .map_err(|_| StoreError::Allocator("hot cache length overflow".to_string()))?;
+        let source = region.slice(offset, len)?;
+        let capacity = targets.iter().map(|target| target.len()).sum::<usize>();
+        if len > capacity {
+            return Err(StoreError::Allocator(format!(
+                "dummy hot cache targets too small: value={len} target={capacity}"
+            )));
+        }
+        let mut copied = 0usize;
+        for target in targets {
+            if copied == len {
+                break;
+            }
+            let chunk = target.len().min(len - copied);
+            target[..chunk].copy_from_slice(&source[copied..copied + chunk]);
+            copied += chunk;
+        }
+        Ok(len)
     }
 
     fn ensure_region_registered(&self, base_ptr: usize) -> Result<()> {

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -7,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
-    record_heartbeat_health, stable_phase_spread_ms, HealthChannel, HealthUpdate,
+    record_heartbeat_health, stable_phase_spread_ms, GetRequest, HealthChannel, HealthUpdate,
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
     ReplicationPolicy, StoreClient,
 };
@@ -20,6 +21,7 @@ use tokio::runtime::Runtime;
 use tracing::{info, warn};
 
 use crate::config::CompatTimeoutConfig;
+use crate::hot_cache::{HotCacheHandle, HotCacheKey, LocalHotCache};
 use crate::dummy_service::pb;
 use crate::shm::{DummyClientId, OwnedMappedRegion};
 
@@ -68,6 +70,7 @@ pub struct StoreDispatcher {
     health_timeout: Duration,
     runtime: String,
     heartbeat_health: Arc<Mutex<HeartbeatHealthState>>,
+    hot_cache: Option<Arc<LocalHotCache>>,
 }
 
 impl StoreDispatcher {
@@ -103,6 +106,7 @@ impl StoreDispatcher {
     ) -> Result<Self, StoreError> {
         let runtime = client.runtime_id().to_string();
         let health = Arc::new(client.health_channel());
+        let hot_cache = LocalHotCache::from_env()?.map(Arc::new);
         record_heartbeat_health(&runtime, 0, 0);
         Ok(Self {
             client: Arc::new(client),
@@ -118,6 +122,7 @@ impl StoreDispatcher {
             health_timeout: timeouts.heartbeat_timeout.max(Duration::from_millis(1)),
             runtime,
             heartbeat_health: Arc::new(Mutex::new(HeartbeatHealthState::default())),
+            hot_cache,
         })
     }
 
@@ -322,14 +327,160 @@ impl StoreDispatcher {
             .remove(&region_key(client_id, region_id))
     }
 
+    pub(crate) fn hot_cache_fd(&self) -> Result<Option<(OwnedFd, usize)>, StoreError> {
+        match self.hot_cache.as_ref() {
+            Some(cache) => cache.duplicate_shm_fd(),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn acquire_hot_cache(
+        &self,
+        request: pb::HotCacheAcquireRequest,
+    ) -> pb::HotCacheAcquireReply {
+        acquire_hot_cache_reply(self.hot_cache.as_ref(), self.client.as_ref(), request)
+    }
+
+    pub(crate) fn batch_acquire_hot_cache(
+        &self,
+        request: pb::BatchHotCacheAcquireRequest,
+    ) -> pb::BatchHotCacheAcquireReply {
+        let items = request
+            .objects
+            .into_iter()
+            .map(|object| {
+                acquire_hot_cache_reply(
+                    self.hot_cache.as_ref(),
+                    self.client.as_ref(),
+                    pb::HotCacheAcquireRequest {
+                        key: object.key,
+                        tenant: object.tenant,
+                    },
+                )
+            })
+            .collect();
+        pb::BatchHotCacheAcquireReply { items }
+    }
+
+    pub(crate) fn release_hot_cache(&self, request: pb::HotCacheReleaseRequest) -> i32 {
+        let Some(cache) = self.hot_cache.as_ref() else {
+            return -1;
+        };
+        cache.release(HotCacheHandle {
+            block_id: request.block_id,
+            generation: request.generation,
+            offset: 0,
+            len: 0,
+        });
+        0
+    }
+
+    pub(crate) fn batch_release_hot_cache(&self, request: pb::BatchHotCacheReleaseRequest) -> i32 {
+        let Some(cache) = self.hot_cache.as_ref() else {
+            return -1;
+        };
+        for handle in request.handles {
+            cache.release(HotCacheHandle {
+                block_id: handle.block_id,
+                generation: handle.generation,
+                offset: 0,
+                len: 0,
+            });
+        }
+        0
+    }
+
+    pub fn get_value(&self, key: String, tenant: Option<String>) -> Result<Vec<u8>, StoreError> {
+        let hot_cache = self.hot_cache.clone();
+        self.run(move |client| execute_get_value(client, hot_cache.as_ref(), tenant, key))
+    }
+
+    pub fn batch_get_values(
+        &self,
+        keys: Vec<String>,
+        tenant: Option<String>,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let hot_cache = self.hot_cache.clone();
+        self.run(move |client| execute_batch_get_values(client, hot_cache.as_ref(), tenant, keys))
+    }
+
+    pub fn get_into_buffer(
+        &self,
+        key: String,
+        tenant: Option<String>,
+        buffer_ptr: usize,
+        size: usize,
+    ) -> Result<usize, StoreError> {
+        let hot_cache = self.hot_cache.clone();
+        self.run(move |client| {
+            execute_get_into_value(client, hot_cache.as_ref(), tenant, key, buffer_ptr, size)
+        })
+    }
+
+    pub fn batch_get_into_buffers(
+        &self,
+        items: Vec<(String, usize, usize)>,
+        tenant: Option<String>,
+    ) -> Result<Vec<i64>, StoreError> {
+        let hot_cache = self.hot_cache.clone();
+        self.run(move |client| {
+            execute_batch_get_values_into(client, hot_cache.as_ref(), tenant, items)
+        })
+    }
+
+    pub fn batch_get_into_multi_buffers_raw(
+        &self,
+        keys: Vec<String>,
+        all_buffer_ptrs: Vec<Vec<usize>>,
+        all_sizes: Vec<Vec<usize>>,
+        tenant: Option<String>,
+    ) -> Result<Vec<i64>, StoreError> {
+        let hot_cache = self.hot_cache.clone();
+        self.run(move |client| {
+            execute_batch_get_values_into_multi(
+                client,
+                hot_cache.as_ref(),
+                tenant,
+                keys,
+                all_buffer_ptrs,
+                all_sizes,
+            )
+        })
+    }
+
+    pub fn invalidate_key(&self, key: String, tenant: Option<String>) {
+        let Some(cache) = self.hot_cache.as_ref() else {
+            return;
+        };
+        let tenant = normalized_tenant(self.client.as_ref(), tenant.as_deref().unwrap_or_default());
+        cache.invalidate(&HotCacheKey::new(tenant, key));
+    }
+
+    pub fn invalidate_keys(&self, keys: Vec<String>, tenant: Option<String>) {
+        let Some(cache) = self.hot_cache.as_ref() else {
+            return;
+        };
+        let tenant = normalized_tenant(self.client.as_ref(), tenant.as_deref().unwrap_or_default());
+        cache.invalidate_many(keys.into_iter().map(|key| HotCacheKey::new(tenant.clone(), key)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hot_cache_contains(&self, tenant: &str, key: &str) -> bool {
+        self.hot_cache
+            .as_ref()
+            .is_some_and(|cache| cache.contains(&HotCacheKey::new(tenant, key)))
+    }
+
     pub async fn put(&self, request: pb::PutRequest) -> Result<i32, StoreError> {
         let state = self.state.clone();
-        self.run_async(move |client| Ok(execute_put(client, &state, request)))
+        let hot_cache = self.hot_cache.clone();
+        self.run_async(move |client| Ok(execute_put(client, hot_cache.as_ref(), &state, request)))
             .await
     }
 
     pub async fn get(&self, request: pb::GetRequest) -> Result<pb::GetReply, StoreError> {
-        self.run_async(move |client| Ok(execute_get(client, request)))
+        let hot_cache = self.hot_cache.clone();
+        self.run_async(move |client| Ok(execute_get(client, hot_cache.as_ref(), request)))
             .await
     }
 
@@ -347,8 +498,17 @@ impl StoreDispatcher {
     ) -> Result<Vec<i32>, StoreError> {
         let regions = self.regions.clone();
         let state = self.state.clone();
-        self.run_async(move |client| Ok(execute_batch_put_from(client, &regions, &state, request)))
-            .await
+        let hot_cache = self.hot_cache.clone();
+        self.run_async(move |client| {
+            Ok(execute_batch_put_from(
+                client,
+                hot_cache.as_ref(),
+                &regions,
+                &state,
+                request,
+            ))
+        })
+        .await
     }
 
     pub async fn batch_put_from_multi_buffers(
@@ -357,9 +517,14 @@ impl StoreDispatcher {
     ) -> Result<Vec<i32>, StoreError> {
         let regions = self.regions.clone();
         let state = self.state.clone();
+        let hot_cache = self.hot_cache.clone();
         self.run_async(move |client| {
             Ok(execute_batch_put_from_multi_buffers(
-                client, &regions, &state, request,
+                client,
+                hot_cache.as_ref(),
+                &regions,
+                &state,
+                request,
             ))
         })
         .await
@@ -370,8 +535,11 @@ impl StoreDispatcher {
         request: pb::BatchGetIntoRequest,
     ) -> Result<Vec<i64>, StoreError> {
         let regions = self.regions.clone();
-        self.run_async(move |client| Ok(execute_batch_get_into(client, &regions, request)))
-            .await
+        let hot_cache = self.hot_cache.clone();
+        self.run_async(move |client| {
+            Ok(execute_batch_get_into(client, hot_cache.as_ref(), &regions, request))
+        })
+        .await
     }
 
     pub async fn batch_get_into_multi_buffers(
@@ -379,9 +547,13 @@ impl StoreDispatcher {
         request: pb::BatchGetIntoMultiBuffersRequest,
     ) -> Result<Vec<i64>, StoreError> {
         let regions = self.regions.clone();
+        let hot_cache = self.hot_cache.clone();
         self.run_async(move |client| {
             Ok(execute_batch_get_into_multi_buffers(
-                client, &regions, request,
+                client,
+                hot_cache.as_ref(),
+                &regions,
+                request,
             ))
         })
         .await
@@ -389,7 +561,8 @@ impl StoreDispatcher {
 
     pub async fn remove_all(&self, force: bool) -> Result<(i32, i64), StoreError> {
         let state = self.state.clone();
-        self.run_async(move |client| Ok(execute_remove_all(client, &state, force)))
+        let hot_cache = self.hot_cache.clone();
+        self.run_async(move |client| Ok(execute_remove_all(client, hot_cache.as_ref(), &state, force)))
             .await
     }
 
@@ -571,6 +744,7 @@ impl Drop for StoreDispatcher {
 
 fn execute_put(
     client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
     state: &Arc<Mutex<DispatcherState>>,
     request: pb::PutRequest,
 ) -> i32 {
@@ -583,22 +757,142 @@ fn execute_put(
         None => client.put_in_tenant(&tenant, &request.key, &request.value),
     };
     if result.is_ok() {
-        track_key(state, tenant, request.key);
+        track_key(state, tenant.clone(), request.key.clone());
+        invalidate_hot_cache(hot_cache, &tenant, &request.key);
         0
     } else {
         -1
     }
 }
 
-fn execute_get(client: &StoreClient, request: pb::GetRequest) -> pb::GetReply {
-    let tenant = normalized_tenant(client, &request.tenant);
-    match client.get_in_tenant(&tenant, &request.key) {
+fn execute_get(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    request: pb::GetRequest,
+) -> pb::GetReply {
+    match execute_get_value(client, hot_cache, Some(request.tenant), request.key) {
         Ok(value) => pb::GetReply { status: 0, value },
         Err(_) => pb::GetReply {
             status: -1,
             value: Vec::new(),
         },
     }
+}
+
+fn execute_get_value(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    tenant_hint: Option<String>,
+    key: String,
+) -> Result<Vec<u8>, StoreError> {
+    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
+    let cache_key = HotCacheKey::new(tenant.clone(), key.clone());
+    if let Some(cache) = hot_cache {
+        if let Some(value) = cache.get(&cache_key) {
+            return Ok(value);
+        }
+    }
+    let value = client.get_in_tenant(&tenant, &key)?;
+    insert_hot_cache(hot_cache, cache_key, &value);
+    Ok(value)
+}
+
+fn execute_batch_get_values(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    tenant_hint: Option<String>,
+    keys: Vec<String>,
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
+    let mut results = vec![Vec::new(); keys.len()];
+    let mut misses = Vec::new();
+    let mut objects = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let cache_key = HotCacheKey::new(tenant.clone(), key.clone());
+        if let Some(cache) = hot_cache {
+            if let Some(value) = cache.get(&cache_key) {
+                results[index] = value;
+                continue;
+            }
+        }
+        objects.push(ObjectRef::new(key.as_str()).tenant(tenant.as_str()));
+        misses.push((index, key.clone()));
+    }
+    if !objects.is_empty() {
+        for ((index, key), value) in misses.into_iter().zip(client.batch_get(&objects)?.into_iter()) {
+            insert_hot_cache(
+                hot_cache,
+                HotCacheKey::new(tenant.clone(), key.clone()),
+                &value,
+            );
+            results[index] = value;
+        }
+    }
+    Ok(results)
+}
+
+fn execute_get_into_value(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    tenant_hint: Option<String>,
+    key: String,
+    buffer_ptr: usize,
+    size: usize,
+) -> Result<usize, StoreError> {
+    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
+    let target = unsafe { std::slice::from_raw_parts_mut(buffer_ptr as *mut u8, size) };
+    let cache_key = HotCacheKey::new(tenant.clone(), key.clone());
+    if let Some(cache) = hot_cache {
+        if let Some(hit) = cache.copy_into(&cache_key, target)? {
+            return Ok(hit);
+        }
+    }
+    let copied = client.get_into_in_tenant(&tenant, &key, target)?;
+    insert_hot_cache(hot_cache, cache_key, &target[..copied]);
+    Ok(copied)
+}
+
+fn execute_get_into_multi_value(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    tenant: &str,
+    key: String,
+    buffer_ptrs: Vec<usize>,
+    sizes: Vec<usize>,
+) -> Result<usize, StoreError> {
+    let cache_key = HotCacheKey::new(tenant.to_string(), key.clone());
+    let mut buffers = buffer_ptrs
+        .iter()
+        .zip(sizes.iter())
+        .map(|(buffer_ptr, size)| unsafe {
+            std::slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size)
+        })
+        .collect::<Vec<_>>();
+    if let Some(cache) = hot_cache {
+        if let Some(hit) = cache.copy_into_multi(&cache_key, buffers.as_mut_slice())? {
+            return Ok(hit);
+        }
+    }
+    let source_ptrs = buffers
+        .iter()
+        .map(|buffer| (buffer.as_ptr() as usize, buffer.len()))
+        .collect::<Vec<_>>();
+    let copied = {
+        let mut request = MultiBufferGetRequest::new(key.as_str(), buffers.as_mut_slice());
+        request = request.tenant(tenant);
+        let mut requests = vec![request];
+        client
+            .batch_get_into_multi_buffers(requests.as_mut_slice())?
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    };
+    let sources = source_ptrs
+        .iter()
+        .map(|(ptr, len)| unsafe { std::slice::from_raw_parts(*ptr as *const u8, *len) })
+        .collect::<Vec<_>>();
+    insert_hot_cache_from_slices(hot_cache, cache_key, &sources, copied);
+    Ok(copied)
 }
 
 fn execute_batch_is_exist(client: &StoreClient, request: pb::BatchIsExistRequest) -> Vec<i32> {
@@ -621,6 +915,7 @@ fn execute_batch_is_exist(client: &StoreClient, request: pb::BatchIsExistRequest
 
 fn execute_batch_put_from(
     client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
     regions: &Arc<Mutex<RegionMap>>,
     state: &Arc<Mutex<DispatcherState>>,
     request: pb::BatchPutFromRequest,
@@ -653,6 +948,7 @@ fn execute_batch_put_from(
         };
         if status == 0 {
             track_key(state, tenant.clone(), item.key.clone());
+            invalidate_hot_cache(hot_cache, &tenant, &item.key);
         }
         statuses.push(status);
     }
@@ -661,6 +957,7 @@ fn execute_batch_put_from(
 
 fn execute_batch_put_from_multi_buffers(
     client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
     regions: &Arc<Mutex<RegionMap>>,
     state: &Arc<Mutex<DispatcherState>>,
     request: pb::BatchPutFromMultiBuffersRequest,
@@ -703,6 +1000,7 @@ fn execute_batch_put_from_multi_buffers(
         };
         if status == 0 {
             track_key(state, tenant.clone(), item.key.clone());
+            invalidate_hot_cache(hot_cache, &tenant, &item.key);
         }
         statuses.push(status);
     }
@@ -711,6 +1009,7 @@ fn execute_batch_put_from_multi_buffers(
 
 fn execute_batch_get_into(
     client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
     regions: &Arc<Mutex<RegionMap>>,
     request: pb::BatchGetIntoRequest,
 ) -> Vec<i64> {
@@ -722,10 +1021,29 @@ fn execute_batch_get_into(
             Some(buffer) => {
                 let regions = regions.lock();
                 match resolve_shared_slice_mut(&regions, client_id, buffer) {
-                    Ok(target) => match client.get_into_in_tenant(&tenant, &item.key, target) {
-                        Ok(size) => size as i64,
-                        Err(_) => -1,
-                    },
+                    Ok(target) => {
+                        let cache_key = HotCacheKey::new(tenant.clone(), item.key.clone());
+                        if let Some(cache) = hot_cache {
+                            match cache.copy_into(&cache_key, target) {
+                                Ok(Some(size)) => {
+                                    lengths.push(size as i64);
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(_) => {
+                                    lengths.push(-1);
+                                    continue;
+                                }
+                            }
+                        }
+                        match client.get_into_in_tenant(&tenant, &item.key, target) {
+                            Ok(size) => {
+                                insert_hot_cache(hot_cache, cache_key, &target[..size]);
+                                size as i64
+                            }
+                            Err(_) => -1,
+                        }
+                    }
                     Err(_) => -1,
                 }
             }
@@ -738,6 +1056,7 @@ fn execute_batch_get_into(
 
 fn execute_batch_get_into_multi_buffers(
     client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
     regions: &Arc<Mutex<RegionMap>>,
     request: pb::BatchGetIntoMultiBuffersRequest,
 ) -> Vec<i64> {
@@ -762,12 +1081,45 @@ fn execute_batch_get_into_multi_buffers(
                 if invalid {
                     -1
                 } else {
-                    let mut request =
-                        MultiBufferGetRequest::new(item.key.as_str(), buffers.as_mut_slice());
-                    request = request.tenant(tenant.as_str());
-                    match client.batch_get_into_multi_buffers(std::slice::from_mut(&mut request)) {
-                        Ok(mut sizes) => sizes.pop().map(|size| size as i64).unwrap_or(-1),
-                        Err(_) => -1,
+                    let cache_key = HotCacheKey::new(tenant.clone(), item.key.clone());
+                    if let Some(cache) = hot_cache {
+                        match cache.copy_into_multi(&cache_key, buffers.as_mut_slice()) {
+                            Ok(Some(size)) => {
+                                lengths.push(size as i64);
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                lengths.push(-1);
+                                continue;
+                            }
+                        }
+                    }
+                    let source_ptrs = buffers
+                        .iter()
+                        .map(|buffer| (buffer.as_ptr() as usize, buffer.len()))
+                        .collect::<Vec<_>>();
+                    let copied = {
+                        let mut request =
+                            MultiBufferGetRequest::new(item.key.as_str(), buffers.as_mut_slice());
+                        request = request.tenant(tenant.as_str());
+                        match client.batch_get_into_multi_buffers(std::slice::from_mut(&mut request)) {
+                            Ok(mut sizes) => Some(sizes.pop().unwrap_or_default()),
+                            Err(_) => None,
+                        }
+                    };
+                    match copied {
+                        Some(copied) => {
+                            let sources = source_ptrs
+                                .iter()
+                                .map(|(ptr, len)| unsafe {
+                                    std::slice::from_raw_parts(*ptr as *const u8, *len)
+                                })
+                                .collect::<Vec<_>>();
+                            insert_hot_cache_from_slices(hot_cache, cache_key, &sources, copied);
+                            copied as i64
+                        }
+                        None => -1,
                     }
                 }
             }
@@ -778,8 +1130,78 @@ fn execute_batch_get_into_multi_buffers(
     lengths
 }
 
+fn execute_batch_get_values_into(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    tenant_hint: Option<String>,
+    items: Vec<(String, usize, usize)>,
+) -> Result<Vec<i64>, StoreError> {
+    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
+    let mut lengths = vec![-1; items.len()];
+    let mut misses = Vec::new();
+    for (index, (key, buffer_ptr, size)) in items.iter().enumerate() {
+        let target = unsafe { std::slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size) };
+        let cache_key = HotCacheKey::new(tenant.clone(), key.clone());
+        if let Some(cache) = hot_cache {
+            if let Some(hit) = cache.copy_into(&cache_key, target)? {
+                lengths[index] = hit as i64;
+                continue;
+            }
+        }
+        misses.push((index, key.clone(), *buffer_ptr, *size));
+    }
+    if misses.is_empty() {
+        return Ok(lengths);
+    }
+    let mut buffers = misses
+        .iter()
+        .map(|(_, _, buffer_ptr, size)| unsafe {
+            std::slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size)
+        })
+        .collect::<Vec<_>>();
+    let mut requests = misses
+        .iter()
+        .zip(buffers.iter_mut())
+        .map(|((_, key, _, _), buffer)| GetRequest::new(key.as_str(), buffer).tenant(tenant.as_str()))
+        .collect::<Vec<_>>();
+    let sizes = client.batch_get_into(requests.as_mut_slice())?;
+    for (((index, key, _, _), buffer), copied) in misses
+        .into_iter()
+        .zip(buffers.iter())
+        .zip(sizes.into_iter())
+    {
+        insert_hot_cache(
+            hot_cache,
+            HotCacheKey::new(tenant.clone(), key),
+            &buffer[..copied],
+        );
+        lengths[index] = copied as i64;
+    }
+    Ok(lengths)
+}
+
+fn execute_batch_get_values_into_multi(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    tenant_hint: Option<String>,
+    keys: Vec<String>,
+    all_buffer_ptrs: Vec<Vec<usize>>,
+    all_sizes: Vec<Vec<usize>>,
+) -> Result<Vec<i64>, StoreError> {
+    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
+    let mut lengths = Vec::with_capacity(keys.len());
+    for ((key, buffer_ptrs), sizes) in keys.into_iter().zip(all_buffer_ptrs).zip(all_sizes) {
+        lengths.push(
+            execute_get_into_multi_value(client, hot_cache, &tenant, key, buffer_ptrs, sizes)?
+                as i64,
+        );
+    }
+    Ok(lengths)
+}
+
 fn execute_remove_all(
     client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
     state: &Arc<Mutex<DispatcherState>>,
     force: bool,
 ) -> (i32, i64) {
@@ -787,11 +1209,68 @@ fn execute_remove_all(
     let mut removed = 0i64;
     for (tenant, key) in keys {
         if client.remove_in_tenant(&tenant, &key, force).is_ok() {
+            invalidate_hot_cache(hot_cache, &tenant, &key);
             untrack_key(state, &tenant, &key);
             removed += 1;
         }
     }
     (0, removed)
+}
+
+fn acquire_hot_cache_reply(
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    client: &StoreClient,
+    request: pb::HotCacheAcquireRequest,
+) -> pb::HotCacheAcquireReply {
+    let Some(cache) = hot_cache else {
+        return hot_cache_miss_reply();
+    };
+    let tenant = normalized_tenant(client, &request.tenant);
+    let key = HotCacheKey::new(tenant, request.key);
+    match cache.acquire(&key) {
+        Some(handle) => pb::HotCacheAcquireReply {
+            status: 0,
+            offset: handle.offset as u64,
+            length: handle.len as u64,
+            block_id: handle.block_id,
+            generation: handle.generation,
+        },
+        None => hot_cache_miss_reply(),
+    }
+}
+
+fn hot_cache_miss_reply() -> pb::HotCacheAcquireReply {
+    pb::HotCacheAcquireReply {
+        status: -1,
+        ..Default::default()
+    }
+}
+
+fn insert_hot_cache(
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    key: HotCacheKey,
+    value: &[u8],
+) {
+    if let Some(cache) = hot_cache {
+        let _ = cache.insert(key, value);
+    }
+}
+
+fn insert_hot_cache_from_slices(
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    key: HotCacheKey,
+    sources: &[&[u8]],
+    len: usize,
+) {
+    if let Some(cache) = hot_cache {
+        let _ = cache.insert_from_slices(key, sources, len);
+    }
+}
+
+fn invalidate_hot_cache(hot_cache: Option<&Arc<LocalHotCache>>, tenant: &str, key: &str) {
+    if let Some(cache) = hot_cache {
+        cache.invalidate(&HotCacheKey::new(tenant.to_string(), key.to_string()));
+    }
 }
 
 fn resolve_shared_slice<'a>(
