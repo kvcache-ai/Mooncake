@@ -312,11 +312,18 @@ TEST(FaultProxyFailoverTest, ExhaustAllTransports) {
     EXPECT_FALSE(proxy_rdma->submitTransferTasks(rdma_batch, {req}).ok());
     task.status = TransferStatusEnum::FAILED;
     ++task.failover_count;
+    EXPECT_LE(task.failover_count, kMaxAttempts);  // Still within limit
 
-    // Exceeds limit
+    task.xport_priority++;
+    task.status = TransferStatusEnum::PENDING;
+
+    // Fourth attempt — exceeds limit
+    EXPECT_FALSE(proxy_tcp->submitTransferTasks(tcp_batch, {req}).ok());
+    task.status = TransferStatusEnum::FAILED;
+    ++task.failover_count;
     EXPECT_GT(task.failover_count, kMaxAttempts);
 
-    // Task stays FAILED
+    // Task stays FAILED — no more failover
     EXPECT_EQ(task.status, TransferStatusEnum::FAILED);
     EXPECT_EQ(task.failover_count, kMaxAttempts + 1);
 
