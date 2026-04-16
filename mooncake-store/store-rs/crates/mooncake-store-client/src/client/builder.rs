@@ -461,6 +461,7 @@ impl StoreClientBuilder {
             route_write_gate,
             startup_activation_pending: AtomicBool::new(startup_activation_pending),
             heartbeat_repair_pending: AtomicUsize::new(0),
+            tenant_quota_reservation_counter: AtomicU64::new(1),
             route_control: effective_route_control,
             route_topk: effective_route_topk,
             namespace_quota: resolved_namespace_quota(&effective_tenant_policy)

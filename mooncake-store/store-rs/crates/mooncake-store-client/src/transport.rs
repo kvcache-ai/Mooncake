@@ -2237,6 +2237,48 @@ mod tests {
             Err(StoreError::Unsupported("unused in test".to_string()))
         }
 
+        fn get_tenant_quota_state(
+            &self,
+            _scope: &mooncake_store_core::TenantPolicyScope,
+        ) -> Result<Option<mooncake_store_core::TenantQuotaState>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn get_tenant_object_accounting(
+            &self,
+            _key: &mooncake_store_core::ObjectKey,
+        ) -> Result<Option<mooncake_store_core::TenantObjectAccounting>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn list_tenant_quota_reservations(
+            &self,
+            _scope: &mooncake_store_core::TenantPolicyScope,
+        ) -> Result<Vec<mooncake_store_core::TenantQuotaReservation>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn reserve_tenant_quota(
+            &self,
+            _request: &mooncake_store_core::TenantQuotaReservationRequest,
+        ) -> Result<mooncake_store_core::TenantQuotaReservationOutcome> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn finalize_tenant_quota(
+            &self,
+            _request: &mooncake_store_core::TenantQuotaFinalizeRequest,
+        ) -> Result<mooncake_store_core::TenantQuotaFinalizeOutcome> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn abort_tenant_quota(
+            &self,
+            _reservation_id: &str,
+        ) -> Result<mooncake_store_core::TenantQuotaAbortOutcome> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
         fn put_handoff(&self, _handoff: &mooncake_store_core::HandoffPlan) -> Result<()> {
             Err(StoreError::Unsupported("unused in test".to_string()))
         }

@@ -12,8 +12,10 @@ use mooncake_store_core::{
     ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
     NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantPlacementPolicy,
-    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy, TenantRoutePolicy,
+    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
+    TenantObjectAccounting, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
+    TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy,
+    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
 };
 use mooncake_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferBatchHints, TransferPacingMode,
@@ -99,6 +101,11 @@ struct CountingMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     list_live_clients_calls: AtomicUsize,
     get_object_route_calls: AtomicUsize,
+}
+
+struct FinalizeFailureMetadataBackend {
+    inner: Arc<InMemoryMetadataBackend>,
+    fail_reservation_id: String,
 }
 
 struct StaticAllocatorAdapter {
@@ -255,6 +262,15 @@ impl RecoverableMetadataBackend {
 
     fn segment_key(owner: &ClientRuntimeId, segment: &SegmentName) -> String {
         format!("{}:{}", owner.storage_key(), segment.0)
+    }
+}
+
+impl FinalizeFailureMetadataBackend {
+    fn new(inner: Arc<InMemoryMetadataBackend>, fail_reservation_id: impl Into<String>) -> Self {
+        Self {
+            inner,
+            fail_reservation_id: fail_reservation_id.into(),
+        }
     }
 }
 
@@ -631,6 +647,48 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         self.inner.delete_tenant_policy(scope, expected_version)
     }
 
+    fn get_tenant_quota_state(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+        self.inner.get_tenant_quota_state(scope)
+    }
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+        self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+        self.inner.list_tenant_quota_reservations(scope)
+    }
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaReservationRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+        self.inner.reserve_tenant_quota(request)
+    }
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaFinalizeRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+        self.inner.finalize_tenant_quota(request)
+    }
+
+    fn abort_tenant_quota(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.inner.abort_tenant_quota(reservation_id)
+    }
+
     fn put_handoff(
         &self,
         handoff: &mooncake_store_core::HandoffPlan,
@@ -800,6 +858,263 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.delete_tenant_policy(scope, expected_version)
     }
 
+    fn get_tenant_quota_state(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+        self.inner.get_tenant_quota_state(scope)
+    }
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+        self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+        self.inner.list_tenant_quota_reservations(scope)
+    }
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaReservationRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+        self.inner.reserve_tenant_quota(request)
+    }
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaFinalizeRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+        self.inner.finalize_tenant_quota(request)
+    }
+
+    fn abort_tenant_quota(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.inner.abort_tenant_quota(reservation_id)
+    }
+
+    fn put_handoff(
+        &self,
+        handoff: &mooncake_store_core::HandoffPlan,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_handoff(handoff)
+    }
+
+    fn get_handoff(
+        &self,
+        stable_id: &mooncake_store_core::ClientStableId,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
+        self.inner.get_handoff(stable_id)
+    }
+}
+
+impl MetadataBackend for FinalizeFailureMetadataBackend {
+    fn route_namespace(&self) -> String {
+        self.inner.route_namespace()
+    }
+
+    fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+        self.inner.upsert_client_lease(lease)
+    }
+
+    fn update_client_state(
+        &self,
+        runtime: &ClientRuntimeId,
+        next: ClientLifecycleState,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.update_client_state(runtime, next)
+    }
+
+    fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+        self.inner.list_live_clients()
+    }
+
+    fn publish_segment(&self, segment: &SegmentAnnouncement) -> mooncake_store_core::Result<()> {
+        self.inner.publish_segment(segment)
+    }
+
+    fn unpublish_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.unpublish_segment(owner, segment)
+    }
+
+    fn list_segments(
+        &self,
+        owner: Option<&ClientRuntimeId>,
+    ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+        self.inner.list_segments(owner)
+    }
+
+    fn update_segment_state(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.update_segment_state(owner, segment, next)
+    }
+
+    fn reserve_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+        self.inner.reserve_segment(owner, segment, length_bytes)
+    }
+
+    fn release_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner
+            .release_segment(owner, segment, offset_bytes, length_bytes)
+    }
+
+    fn get_object_route(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
+        self.inner.get_object_route(key)
+    }
+
+    fn list_object_routes(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ObjectRoute>> {
+        self.inner.list_object_routes()
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        key: &ObjectKey,
+        expected: Option<mooncake_store_core::RouteVersion>,
+        next: Option<&mooncake_store_core::ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        self.inner
+            .compare_and_swap_object_route(key, expected, next)
+    }
+
+    fn get_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+    ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+        self.inner.get_route_policy(domain)
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.put_route_policy_if_absent(domain, policy)
+    }
+
+    fn put_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_route_policy(domain, policy)
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_route_policy(domain)
+    }
+
+    fn list_route_policies(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        self.inner.list_route_policies()
+    }
+
+    fn get_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+        self.inner.get_tenant_policy(scope)
+    }
+
+    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies()
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<TenantPolicy> {
+        self.inner.put_tenant_policy(policy, expected_version)
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_tenant_policy(scope, expected_version)
+    }
+
+    fn get_tenant_quota_state(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+        self.inner.get_tenant_quota_state(scope)
+    }
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+        self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+        self.inner.list_tenant_quota_reservations(scope)
+    }
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaReservationRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+        self.inner.reserve_tenant_quota(request)
+    }
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaFinalizeRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+        if request.reservation_id == self.fail_reservation_id {
+            return Err(StoreError::InvalidState(format!(
+                "injected finalize failure for {}",
+                request.reservation_id
+            )));
+        }
+        self.inner.finalize_tenant_quota(request)
+    }
+
+    fn abort_tenant_quota(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.inner.abort_tenant_quota(reservation_id)
+    }
+
     fn put_handoff(
         &self,
         handoff: &mooncake_store_core::HandoffPlan,
@@ -934,6 +1249,93 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         policy: &RoutePolicy,
     ) -> mooncake_store_core::Result<bool> {
         self.inner.put_route_policy_if_absent(domain, policy)
+    }
+
+    fn put_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_route_policy(domain, policy)
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_route_policy(domain)
+    }
+
+    fn list_route_policies(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        self.inner.list_route_policies()
+    }
+
+    fn get_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+        self.inner.get_tenant_policy(scope)
+    }
+
+    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies()
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<TenantPolicy> {
+        self.inner.put_tenant_policy(policy, expected_version)
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_tenant_policy(scope, expected_version)
+    }
+
+    fn get_tenant_quota_state(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+        self.inner.get_tenant_quota_state(scope)
+    }
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+        self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+        self.inner.list_tenant_quota_reservations(scope)
+    }
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaReservationRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+        self.inner.reserve_tenant_quota(request)
+    }
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaFinalizeRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+        self.inner.finalize_tenant_quota(request)
+    }
+
+    fn abort_tenant_quota(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.inner.abort_tenant_quota(reservation_id)
     }
 
     fn put_handoff(
@@ -1507,7 +1909,7 @@ fn publish_storage_node_with_capacity(
     storage
         .register_local_memory()
         .expect("storage memory should register");
-    let runtime = storage.runtime_id().clone();
+    let _runtime = storage.runtime_id().clone();
     test_storage_nodes().lock().push(storage);
     publish_labeled_storage_node_with_capacity(
         metadata,
@@ -4042,6 +4444,11 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
             key: reader.scoped_key("default", "deadline-key"),
             version: RouteVersion(1),
             state: mooncake_store_core::RouteState::Active,
+            namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
+            logical_key: Some("deadline-key".to_string()),
+            canonical_key: None,
+            sharing_scope: Some("default".to_string()),
+            qos_tier: Some("default".to_string()),
             compatibility: reader.lease.compatibility.clone(),
             replicas: vec![replica.clone()],
         },
@@ -4991,8 +5398,8 @@ fn batch_get_fairness_limits_remote_items_per_tenant_per_round() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-batch-fairness-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-batch-fairness",
         "seg-batch-fairness",
         "pool-a",
@@ -5055,8 +5462,8 @@ fn routed_put_fairness_limits_remote_replica_writes_per_batch() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-put-fairness-segment"));
     let remote_a = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-put-fairness-a",
         "seg-put-fairness-a",
         "pool-a",
@@ -5064,8 +5471,8 @@ fn routed_put_fairness_limits_remote_replica_writes_per_batch() {
         1,
     );
     let remote_b = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-put-fairness-b",
         "seg-put-fairness-b",
         "pool-a",
@@ -5104,8 +5511,8 @@ fn batch_get_shaping_caps_remote_batch_bytes() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-batch-shaping-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-batch-shaping",
         "seg-batch-shaping",
         "pool-a",
@@ -5162,8 +5569,8 @@ fn batch_get_emits_transport_pacing_hints() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-batch-pacing-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-batch-pacing",
         "seg-batch-pacing",
         "pool-a",
@@ -5269,8 +5676,8 @@ fn namespace_scoped_placement_and_route_views_stay_isolated() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("namespace-isolation-segment"));
     publish_labeled_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-domain-a",
         "seg-domain-a",
         "pool-a",
@@ -5281,8 +5688,8 @@ fn namespace_scoped_placement_and_route_views_stay_isolated() {
         Some("gold"),
     );
     publish_labeled_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-domain-b",
         "seg-domain-b",
         "pool-a",
@@ -5416,8 +5823,8 @@ fn put_paths_accept_namespace_dimensions_beyond_routed_fast_path() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-namespace-placement-segment"));
     publish_labeled_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-domain-a",
         "seg-domain-a",
         "pool-a",
@@ -5428,8 +5835,8 @@ fn put_paths_accept_namespace_dimensions_beyond_routed_fast_path() {
         Some("gold"),
     );
     publish_labeled_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-domain-b",
         "seg-domain-b",
         "pool-a",
@@ -5550,8 +5957,8 @@ fn routed_put_emits_transport_pacing_hints() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-put-pacing-segment"));
     let remote_a = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-put-pacing-a",
         "seg-put-pacing-a",
         "pool-a",
@@ -5559,8 +5966,8 @@ fn routed_put_emits_transport_pacing_hints() {
         1,
     );
     let remote_b = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-put-pacing-b",
         "seg-put-pacing-b",
         "pool-a",
@@ -5605,8 +6012,8 @@ fn routed_batch_put_emits_transport_pacing_hints() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-batch-put-pacing-segment"));
     let remote_owner = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-batch-put-pacing",
         "seg-batch-put-pacing",
         "pool-a",
@@ -5668,8 +6075,8 @@ fn routed_put_shaping_caps_remote_batch_bytes() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-put-shaping-segment"));
     let remote_a = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-put-shaping-a",
         "seg-put-shaping-a",
         "pool-a",
@@ -5677,8 +6084,8 @@ fn routed_put_shaping_caps_remote_batch_bytes() {
         1,
     );
     let remote_b = publish_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-put-shaping-b",
         "seg-put-shaping-b",
         "pool-a",
@@ -5892,8 +6299,8 @@ fn qos_tier_drives_namespace_governance_and_placement() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("qos-governance-segment"));
     publish_labeled_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-gold",
         "seg-gold",
         "pool-a",
@@ -5904,8 +6311,8 @@ fn qos_tier_drives_namespace_governance_and_placement() {
         Some("gold"),
     );
     publish_labeled_storage_node_with_capacity(
-        metadata.as_ref(),
-        transport.as_ref(),
+        &metadata,
+        &transport,
         "storage-bronze",
         "seg-bronze",
         "pool-a",
@@ -7236,11 +7643,12 @@ fn namespace_quota_rejects_over_limit_writes() {
         )
         .expect("tenant quota policy should store");
     let transport = Arc::new(TestTransport::new("quota-segment"));
-    let client = StoreClientBuilder::new(metadata, "quota-client")
+    let client = StoreClientBuilder::new(metadata.clone(), "quota-client")
         .tenant("tenant-a")
         .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
+        .local_memory(storage_config())
         .build(10_000)
         .expect("quota client should build");
 
@@ -7250,26 +7658,236 @@ fn namespace_quota_rejects_over_limit_writes() {
     let bytes_error = client
         .put("big", b"123456")
         .expect_err("second put should exceed byte quota");
-    assert!(matches!(bytes_error, StoreError::Allocator(_)));
-    assert!(bytes_error.to_string().contains("namespace quota exceeded"));
+    assert!(matches!(
+        bytes_error,
+        StoreError::Conflict(_) | StoreError::Metadata(_)
+    ));
+    assert!(bytes_error
+        .to_string()
+        .contains("tenant quota bytes exceeded"));
 
     let objects_error = client
         .put("other", b"1")
         .expect_err("second object should exceed object quota");
-    assert!(matches!(objects_error, StoreError::Allocator(_)));
+    assert!(matches!(
+        objects_error,
+        StoreError::Conflict(_) | StoreError::Metadata(_)
+    ));
+    assert!(objects_error
+        .to_string()
+        .contains("tenant quota objects exceeded"));
+
+    let quota = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("quota state should load")
+        .expect("quota state should exist");
+    assert_eq!(quota.used_bytes, 4);
+    assert_eq!(quota.used_objects, 1);
+    assert_eq!(quota.pending_reserved_bytes, 0);
+    assert_eq!(quota.pending_reserved_objects, 0);
+}
+
+#[test]
+fn namespace_quota_overwrite_uses_committed_delta() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(5),
+                        max_objects: Some(1),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant quota policy should store");
+    let transport = Arc::new(TestTransport::new("overwrite-quota-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "overwrite-quota-client")
+        .tenant("tenant-a")
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    client
+        .put("key", b"1234")
+        .expect("initial put should succeed");
+    client
+        .put("key", b"12345")
+        .expect("same object should grow by one byte within quota");
+    let error = client
+        .put("key", b"123456")
+        .expect_err("same object should fail once growth exceeds remaining quota");
+    assert!(matches!(
+        error,
+        StoreError::Conflict(_) | StoreError::Metadata(_)
+    ));
+    assert!(error.to_string().contains("tenant quota bytes exceeded"));
+
+    let quota = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("quota state should load")
+        .expect("quota state should exist");
+    assert_eq!(quota.used_bytes, 5);
+    assert_eq!(quota.used_objects, 1);
+
+    let accounting = metadata
+        .get_tenant_object_accounting(&ObjectKey::new("tenant-a::key"))
+        .expect("object accounting should load")
+        .expect("object accounting should exist");
+    assert_eq!(accounting.committed_length, 5);
+}
+
+#[test]
+fn remove_refunds_quota_when_delete_becomes_authoritative() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(8),
+                        max_objects: Some(1),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant quota policy should store");
+    let transport = Arc::new(TestTransport::new("remove-quota-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "remove-quota-client")
+        .tenant("tenant-a")
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    client.put("key", b"12345678").expect("put should succeed");
+    client.remove("key", true).expect("remove should succeed");
+    client
+        .put("other", b"12345678")
+        .expect("quota should be refunded immediately on delete");
+
+    let quota = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("quota state should load")
+        .expect("quota state should exist");
+    assert_eq!(quota.used_bytes, 8);
+    assert_eq!(quota.used_objects, 1);
+    assert_eq!(quota.pending_reserved_bytes, 0);
+    assert_eq!(quota.pending_reserved_objects, 0);
+    assert!(metadata
+        .get_tenant_object_accounting(&ObjectKey::new("tenant-a::key"))
+        .expect("deleted accounting lookup should succeed")
+        .is_none());
+}
+
+#[test]
+fn put_returns_error_when_route_publish_succeeds_but_quota_finalize_fails() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    inner
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(16),
+                        max_objects: Some(2),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant quota policy should store");
+    let metadata = Arc::new(FinalizeFailureMetadataBackend::new(
+        inner.clone(),
+        "quota-client:1:tenant-a:1",
+    ));
+    let transport = Arc::new(TestTransport::new("finalize-failure-segment"));
+    let client = StoreClientBuilder::new(metadata, "quota-client")
+        .tenant("tenant-a")
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    let error = client
+        .put("key", b"1234")
+        .expect_err("put should fail when quota finalization fails");
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    assert!(error.to_string().contains("injected finalize failure"));
+
+    let route = client
+        .query_route_in_tenant("tenant-a", "key")
+        .expect("route lookup should succeed")
+        .expect("route should have been published before finalize failure");
+    assert_eq!(route.replicas[0].length, 4);
+
+    let quota = inner
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("quota state should load")
+        .expect("quota state should exist");
+    assert_eq!(quota.used_bytes, 0);
+    assert_eq!(quota.used_objects, 0);
+    assert_eq!(quota.pending_reserved_bytes, 4);
+    assert_eq!(quota.pending_reserved_objects, 1);
 }
 
 #[test]
 fn runtime_uses_metadata_authored_fairness_shaping_and_placement_defaults() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("runtime-policy-client-segment"));
-    let owner_a = publish_storage_node(
-        metadata.as_ref(),
-        transport.as_ref(),
-        "owner-a",
-        "seg-a",
-        "pool-a",
-    );
+    let owner_a = publish_storage_node(&metadata, &transport, "owner-a", "seg-a", "pool-a");
     metadata
         .put_tenant_policy(
             &TenantPolicy {
@@ -9503,6 +10121,11 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         }));
     let pending_route = mooncake_store_core::ObjectRoute {
         key: ObjectKey::new("default::allocator-pending"),
+        namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
+        logical_key: Some("allocator-pending".to_string()),
+        canonical_key: None,
+        sharing_scope: Some("default".to_string()),
+        qos_tier: Some("default".to_string()),
         version: RouteVersion(1),
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
@@ -9703,6 +10326,11 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
     );
     let route = mooncake_store_core::ObjectRoute {
         key: ObjectKey::new("default::pending-route"),
+        namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
+        logical_key: Some("pending-route".to_string()),
+        canonical_key: None,
+        sharing_scope: Some("default".to_string()),
+        qos_tier: Some("default".to_string()),
         version: RouteVersion(1),
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),

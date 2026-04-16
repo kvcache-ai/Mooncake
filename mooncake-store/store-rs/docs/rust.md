@@ -87,6 +87,8 @@ fn main() -> Result<()> {
 
 `tenant(...)` remains the normal way to select the default scope used for startup policy lookup and request builders. `route_topk(...)`, `route_control(...)`, `namespace_quota(...)`, `execution_fairness(...)`, and `bandwidth_shaping(...)` are compatibility fallbacks; admin-managed tenant policy in metadata is the preferred authoring surface when those settings are tenant-scoped.
 
+When tenant quota policy is present, single-object `put` and `remove` now use metadata-backed reservation/finalize semantics instead of relying only on the older runtime-local preflight check. The write call returns success only after route publication and quota finalization both succeed. Overwrites are charged on committed byte delta, and deletes refund quota when the route delete CAS becomes authoritative rather than waiting for later segment reclaim.
+
 ## Transport Backends
 
 The Rust transport layer exposes two explicit choices:

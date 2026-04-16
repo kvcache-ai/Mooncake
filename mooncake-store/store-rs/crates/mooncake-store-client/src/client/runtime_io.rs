@@ -62,6 +62,161 @@ impl StoreClient {
         Ok(())
     }
 
+    fn tenant_quota_policy(&self) -> Option<TenantQuotaPolicy> {
+        self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
+            max_bytes: quota.max_bytes,
+            max_objects: quota.max_objects,
+        })
+    }
+
+    fn tenant_quota_scope(&self, object_id: &LogicalObjectId) -> TenantPolicyScope {
+        TenantPolicyScope::new(object_id.scope.tenant.clone(), None::<String>, None::<String>)
+    }
+
+    fn route_committed_length(route: Option<&ObjectRoute>) -> u64 {
+        route
+            .and_then(|current| current.replicas.iter().min_by_key(|replica| replica.priority))
+            .map(|replica| replica.length)
+            .unwrap_or(0)
+    }
+
+    fn next_tenant_quota_reservation_id(&self, object_id: &LogicalObjectId) -> String {
+        let next = self
+            .tenant_quota_reservation_counter
+            .fetch_add(1, Ordering::Relaxed);
+        format!(
+            "{}:{}:{}:{}",
+            self.lease.runtime.stable_id.0,
+            self.lease.runtime.epoch.0,
+            object_id.scope.tenant,
+            next
+        )
+    }
+
+    fn reserve_tenant_quota_for_put(
+        &self,
+        object_id: &LogicalObjectId,
+        scoped_key: &ObjectKey,
+        current: Option<&ObjectRoute>,
+        value_len: usize,
+    ) -> Result<Option<TenantQuotaReservationRequest>> {
+        let Some(limit) = self.tenant_quota_policy() else {
+            return Ok(None);
+        };
+        let current_object = self.metadata.get_tenant_object_accounting(scoped_key)?;
+        let previous_len = current_object
+            .as_ref()
+            .map(|object| object.committed_length)
+            .unwrap_or_else(|| Self::route_committed_length(current));
+        let delta_bytes = value_len as i64 - previous_len as i64;
+        let delta_objects = if previous_len == 0 { 1 } else { 0 };
+        let created_at_ms = now_ms();
+        let request = TenantQuotaReservationRequest {
+            reservation_id: self.next_tenant_quota_reservation_id(object_id),
+            scope: self.tenant_quota_scope(object_id),
+            key: scoped_key.clone(),
+            expected_object_version: current_object.as_ref().map(|object| object.version),
+            delta_bytes,
+            delta_objects,
+            limit,
+            expires_at_ms: created_at_ms.saturating_add(DEFAULT_TENANT_QUOTA_RESERVATION_TTL_MS),
+            created_at_ms,
+            writer_runtime: self.lease.runtime.clone(),
+        };
+        self.metadata.reserve_tenant_quota(&request)?;
+        Ok(Some(request))
+    }
+
+    fn reserve_tenant_quota_for_delete(
+        &self,
+        object_id: &LogicalObjectId,
+        scoped_key: &ObjectKey,
+        route: &ObjectRoute,
+    ) -> Result<Option<TenantQuotaReservationRequest>> {
+        let Some(limit) = self.tenant_quota_policy() else {
+            return Ok(None);
+        };
+        let current_object = self.metadata.get_tenant_object_accounting(scoped_key)?;
+        let previous_len = current_object
+            .as_ref()
+            .map(|object| object.committed_length)
+            .unwrap_or_else(|| Self::route_committed_length(Some(route)));
+        let created_at_ms = now_ms();
+        let request = TenantQuotaReservationRequest {
+            reservation_id: self.next_tenant_quota_reservation_id(object_id),
+            scope: self.tenant_quota_scope(object_id),
+            key: scoped_key.clone(),
+            expected_object_version: current_object.as_ref().map(|object| object.version),
+            delta_bytes: -(previous_len as i64),
+            delta_objects: -1,
+            limit,
+            expires_at_ms: created_at_ms.saturating_add(DEFAULT_TENANT_QUOTA_RESERVATION_TTL_MS),
+            created_at_ms,
+            writer_runtime: self.lease.runtime.clone(),
+        };
+        self.metadata.reserve_tenant_quota(&request)?;
+        Ok(Some(request))
+    }
+
+    fn finalize_tenant_quota_put(
+        &self,
+        reservation: Option<&TenantQuotaReservationRequest>,
+        route: &ObjectRoute,
+        value_len: usize,
+    ) -> Result<()> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        self.metadata.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+            reservation_id: reservation.reservation_id.clone(),
+            expected_object_version: reservation.expected_object_version,
+            committed_length: Some(value_len as u64),
+            route_version: Some(route.version),
+            state: TenantObjectAccountingState::Active,
+            updated_at_ms: now_ms(),
+            updated_by: self.lease.runtime.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn finalize_tenant_quota_delete(
+        &self,
+        reservation: Option<&TenantQuotaReservationRequest>,
+    ) -> Result<()> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        self.metadata.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+            reservation_id: reservation.reservation_id.clone(),
+            expected_object_version: reservation.expected_object_version,
+            committed_length: None,
+            route_version: None,
+            state: TenantObjectAccountingState::Deleted,
+            updated_at_ms: now_ms(),
+            updated_by: self.lease.runtime.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn abort_tenant_quota_reservation(
+        &self,
+        reservation: Option<&TenantQuotaReservationRequest>,
+        context: &str,
+    ) -> Result<()> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        self.metadata
+            .abort_tenant_quota(&reservation.reservation_id)
+            .map(|_| ())
+            .map_err(|error| {
+                StoreError::InvalidState(format!(
+                    "failed to abort tenant quota reservation {} after {context}: {error}",
+                    reservation.reservation_id
+                ))
+            })
+    }
+
     fn put_object_with_policy_current(
         &self,
         object_id: &LogicalObjectId,
@@ -99,13 +254,27 @@ impl StoreClient {
         let mut attempt = 0usize;
         loop {
             attempt = attempt.saturating_add(1);
-            self.enforce_namespace_quota(&object_id, value.len(), current.as_ref())?;
             self.flush_due_reclaims()?;
+            let quota_reservation = self.reserve_tenant_quota_for_put(
+                object_id,
+                &scoped_key,
+                current.as_ref(),
+                value.len(),
+            )?;
             let reserve_tracker =
                 OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
             let reserve_result = self.reserve_replica_targets(&object_ref, value.len(), &policy);
             reserve_tracker.finish(&reserve_result, 0);
-            let (targets, reservations) = reserve_result?;
+            let (targets, reservations) = match reserve_result {
+                Ok(reserved) => reserved,
+                Err(error) => {
+                    let _ = self.abort_tenant_quota_reservation(
+                        quota_reservation.as_ref(),
+                        "allocation_reserve_failed",
+                    );
+                    return Err(error);
+                }
+            };
             let write_tracker =
                 OperationTracker::new("put_stage_write").input_bytes(value.len() as u64);
             let write_result = self.write_reserved_replicas(&targets, &reservations, value);
@@ -114,11 +283,11 @@ impl StoreClient {
                 Ok(offsets) => offsets,
                 Err(error) => {
                     let _ = self.release_reserved_allocations(&targets, &reservations);
-                    self.note_remote_write_failure(
-                        &targets,
-                        &error,
-                        "remote_write_failed",
+                    let _ = self.abort_tenant_quota_reservation(
+                        quota_reservation.as_ref(),
+                        "replica_write_failed",
                     );
+                    self.note_remote_write_failure(&targets, &error, "remote_write_failed");
                     if attempt < max_write_attempts
                         && self.should_retry_put_after_write_failure(&error, &policy)
                     {
@@ -190,6 +359,10 @@ impl StoreClient {
             let cas = cas_result?;
             if !cas.applied {
                 let _ = self.release_reserved_allocations(&targets, &reservations);
+                let _ = self.abort_tenant_quota_reservation(
+                    quota_reservation.as_ref(),
+                    "route_compare_and_swap_conflict",
+                );
                 if attempt < max_write_attempts {
                     current = cas.current;
                     continue;
@@ -201,8 +374,19 @@ impl StoreClient {
             route.qos_tier = Some(qos_tier.to_string());
             self.storage_owner.track_route(&route);
             self.track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
+            let finalize_result =
+                self.finalize_tenant_quota_put(quota_reservation.as_ref(), &route, value.len());
+            finalize_result?;
             if let Some(previous) = current.as_ref() {
-                self.reclaim_route(previous, reclaim_mode)?;
+                if let Err(error) = self.reclaim_route(previous, reclaim_mode) {
+                    warn!(
+                        runtime = %self.lease.runtime,
+                        tenant,
+                        key,
+                        error = %error,
+                        "route overwrite reclaim failed after authoritative publish"
+                    );
+                }
             }
             return Ok(route);
         }

@@ -15,6 +15,8 @@ This document explains the implemented capabilities by function rather than by c
 
 These APIs are the simplest entry points for applications that treat the store as an object service.
 
+With tenant quota policy configured, single-object `put` uses metadata-backed reserve/finalize/abort semantics and `remove` applies the matching refund when the delete becomes authoritative. This gives create, overwrite, and delete a tenant-root quota state that survives concurrent writers better than the older best-effort namespace scan.
+
 ### Batch operations
 
 - `batch_put`
@@ -228,6 +230,8 @@ When a key is overwritten, old replicas are scheduled for release.
 ### Delete reclaim
 
 When a key is removed, route state is removed and segment space is reclaimed.
+
+For tenant-scoped quota policy, delete now also finalizes a negative quota delta when the route delete CAS succeeds. That means quota refund is tied to authoritative object deletion, not to later background reclaim of the freed segment space.
 
 ### Graceful reclaim
 
