@@ -89,16 +89,17 @@ impl StoreClient {
         if qos_tier != mooncake_store_core::DEFAULT_QOS_TIER {
             object_ref = object_ref.qos_tier(qos_tier);
         }
-        self.enforce_namespace_quota(&object_id, value.len(), current)?;
         let policy = self.resolve_replication_policy(policy)?;
         let max_write_attempts = if policy.with_soft_pin {
             DEFAULT_PUT_WRITE_RETRY_LIMIT
         } else {
             1
         };
+        let mut current = current.cloned();
         let mut attempt = 0usize;
         loop {
             attempt = attempt.saturating_add(1);
+            self.enforce_namespace_quota(&object_id, value.len(), current.as_ref())?;
             self.flush_due_reclaims()?;
             let reserve_tracker =
                 OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
@@ -135,8 +136,9 @@ impl StoreClient {
                     return Err(error);
                 }
             };
-            let expected_version = current.map(|route| route.version);
+            let expected_version = current.as_ref().map(|route| route.version);
             let next_version = current
+                .as_ref()
                 .map(|route| route.version.next())
                 .unwrap_or(RouteVersion(1));
             let checksum = payload_checksum(value);
@@ -188,6 +190,10 @@ impl StoreClient {
             let cas = cas_result?;
             if !cas.applied {
                 let _ = self.release_reserved_allocations(&targets, &reservations);
+                if attempt < max_write_attempts {
+                    current = cas.current;
+                    continue;
+                }
                 return Err(StoreError::Conflict(format!(
                     "route update lost race for tenant={tenant} key={key}"
                 )));
@@ -195,7 +201,7 @@ impl StoreClient {
             route.qos_tier = Some(qos_tier.to_string());
             self.storage_owner.track_route(&route);
             self.track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
-            if let Some(previous) = current {
+            if let Some(previous) = current.as_ref() {
                 self.reclaim_route(previous, reclaim_mode)?;
             }
             return Ok(route);
