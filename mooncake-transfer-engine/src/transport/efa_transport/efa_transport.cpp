@@ -308,14 +308,34 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         resolved_name = name;
     }
 
-    // Pre-compute NIC assignments for per-NIC partition.
-    // When buffer is split into multiple chunks, each chunk is registered on
-    // a disjoint subset of NICs (since per-NIC total MR = max_mr_size).
-    // This allows registering buffers up to max_mr_size × num_NICs.
-    std::vector<std::vector<size_t>> nic_assignments(chunks.size());
-    if (chunks.size() > 1) {
-        size_t num_nics = context_list_.size();
-        size_t num_chunks = chunks.size();
+    // Pre-compute NIC assignments for each chunk.
+    // Strategy: if total PTE usage per NIC fits within the PTE budget,
+    // register ALL chunks on ALL NICs (full coverage → max throughput).
+    // Otherwise fall back to disjoint per-NIC partition.
+    size_t num_nics = context_list_.size();
+    size_t num_chunks = chunks.size();
+    size_t total_pages_per_nic = length / page_size;
+    bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries());
+
+    std::vector<std::vector<size_t>> nic_assignments(num_chunks);
+    if (chunks.size() <= 1) {
+        // Single chunk: all NICs
+        for (size_t n = 0; n < num_nics; ++n) {
+            nic_assignments[0].push_back(n);
+        }
+    } else if (use_full_coverage) {
+        // Multi-chunk, PTE budget OK: every chunk on every NIC
+        LOG(WARNING) << "Full NIC coverage: " << num_chunks << " chunks × "
+                     << num_nics << " NICs (total PTE/NIC="
+                     << total_pages_per_nic << ", budget="
+                     << getMaxPteEntries() << ")";
+        for (size_t ci = 0; ci < num_chunks; ++ci) {
+            for (size_t n = 0; n < num_nics; ++n) {
+                nic_assignments[ci].push_back(n);
+            }
+        }
+    } else {
+        // Multi-chunk, PTE budget exceeded: disjoint partition
         if (num_chunks > num_nics) {
             LOG(ERROR) << "Buffer requires " << num_chunks
                        << " chunks but only " << num_nics
@@ -332,18 +352,17 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 nic_assignments[ci].push_back(n);
             }
         }
+        LOG(WARNING) << "Disjoint NIC partition: PTE/NIC="
+                     << total_pages_per_nic << " exceeds budget="
+                     << getMaxPteEntries();
         for (size_t ci = 0; ci < num_chunks; ++ci) {
             std::string nic_list;
             for (size_t j = 0; j < nic_assignments[ci].size(); ++j) {
                 if (j > 0) nic_list += ",";
                 nic_list += std::to_string(nic_assignments[ci][j]);
             }
-            LOG(WARNING) << "Per-NIC partition: chunk " << ci
+            LOG(WARNING) << "  chunk " << ci
                          << " -> NICs [" << nic_list << "]";
-        }
-    } else {
-        for (size_t n = 0; n < context_list_.size(); ++n) {
-            nic_assignments[0].push_back(n);
         }
     }
 
