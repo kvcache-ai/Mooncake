@@ -2077,7 +2077,7 @@ std::vector<int> Client::GetNicNumaNodes() const {
 
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
-    const std::string& location) {
+    const std::string& location, const std::string& shm_path) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -2102,7 +2102,8 @@ tl::expected<void, ErrorCode> Client::MountSegment(
         }
 
         int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                       location, true, true);
+                                                       location, true, true,
+                                                       shm_path);
         if (rc != 0) {
             LOG(ERROR) << "register_local_memory_failed base=" << buffer
                        << " size=" << size << ", error=" << rc;
@@ -2186,13 +2187,15 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
-    bool remote_accessible, bool update_metadata) {
+    bool remote_accessible, bool update_metadata,
+    const std::string& shm_path) {
     auto check_result = CheckRegisterMemoryParams(addr, length);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
     if (this->transfer_engine_->registerLocalMemory(
-            addr, length, location, remote_accessible, update_metadata) != 0) {
+            addr, length, location, remote_accessible, update_metadata,
+            shm_path) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};

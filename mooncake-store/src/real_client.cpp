@@ -1,4 +1,6 @@
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -15,6 +17,7 @@
 #include <cctype>
 #include <limits>
 #include <optional>
+#include <random>
 #include <vector>
 
 #include "real_client.h"
@@ -447,6 +450,48 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+namespace {
+// Generate a random POSIX shared memory name for cross-process segment sharing.
+std::string generate_shm_name() {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::string name = "mooncake_seg_";
+    for (int i = 0; i < 8; ++i)
+        name += static_cast<char>('a' + rng() % 26);
+    return name;
+}
+
+// Allocate memory via POSIX shared memory (shm_open + MAP_SHARED).
+void *allocate_shm_segment(size_t size, std::string &shm_name) {
+    shm_name = generate_shm_name();
+    int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        PLOG(ERROR) << "shm_open failed for " << shm_name;
+        return nullptr;
+    }
+    if (ftruncate64(fd, size) < 0) {
+        PLOG(ERROR) << "ftruncate64 failed for " << shm_name;
+        close(fd);
+        shm_unlink(shm_name.c_str());
+        return nullptr;
+    }
+    void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (ptr == MAP_FAILED) {
+        PLOG(ERROR) << "mmap MAP_SHARED failed for " << shm_name;
+        shm_unlink(shm_name.c_str());
+        return nullptr;
+    }
+    return ptr;
+}
+
+bool use_tent_shm() {
+    const char *tent = std::getenv("MC_USE_TENT");
+    const char *tev1 = std::getenv("MC_USE_TEV1");
+    const char *shm = std::getenv("MC_STORE_SHM_SEGMENTS");
+    return (tent || tev1 || (shm && std::string(shm) != "0"));
+}
+}  // namespace
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -627,9 +672,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
+            std::string shm_name;
+            const bool want_shm = use_tent_shm();
 
             if (!seg_numa_nodes.empty()) {
-                // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
@@ -643,6 +689,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
                                                   get_hugepage_size_from_env());
+            } else if (want_shm) {
+                // POSIX shared memory: enables TENT ShmTransport for
+                // cross-process same-node GPU↔CPU via cudaMemcpy.
+                ptr = allocate_shm_segment(segment_size, shm_name);
+                LOG(INFO) << "Allocated SHM segment: " << shm_name
+                          << " (" << segment_size << " bytes)";
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -656,15 +708,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
             } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
-                // NUMA-segmented or hugepage: track as mmap allocation for
-                // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
+            } else if (!shm_name.empty()) {
+                shm_segment_ptrs_.emplace_back(
+                    ptr, ShmSegmentDeleter{mapped_size, shm_name});
             } else {
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
+                client_->MountSegment(ptr, mapped_size, protocol, seg_location,
+                                      shm_name);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());

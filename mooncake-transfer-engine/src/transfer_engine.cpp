@@ -78,7 +78,8 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         const std::string& location,
                                         bool remote_accessible,
-                                        bool update_metadata) {
+                                        bool update_metadata,
+                                        const std::string& /* shm_path */) {
     return impl_->registerLocalMemory(addr, length, location, remote_accessible,
                                       update_metadata);
 }
@@ -366,11 +367,14 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         const std::string& location,
                                         bool remote_accessible,
-                                        bool update_metadata) {
+                                        bool update_metadata,
+                                        const std::string& shm_path) {
     if (use_tent_) {
         mooncake::tent::MemoryOptions option;
         if (!location.empty() && location != kWildcardLocation)
             option.location = location;
+        if (!shm_path.empty())
+            option.shm_path = shm_path;
         auto status = impl_tent_->registerLocalMemory(addr, length, option);
         return (int)status.code();
     } else

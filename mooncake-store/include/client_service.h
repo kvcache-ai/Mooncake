@@ -281,7 +281,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> MountSegment(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
-        const std::string& location = kWildcardLocation);
+        const std::string& location = kWildcardLocation,
+        const std::string& shm_path = "");
 
     /**
      * @brief Unregisters a memory segment from master
@@ -299,11 +300,13 @@ class Client {
      * @param location Device location (e.g. "cpu:0")
      * @param remote_accessible Whether the memory can be accessed remotely
      * @param update_metadata Whether to update metadata service
+     * @param shm_path POSIX shared memory name (enables ShmTransport in TENT)
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> RegisterLocalMemory(
         void* addr, size_t length, const std::string& location,
-        bool remote_accessible = true, bool update_metadata = true);
+        bool remote_accessible = true, bool update_metadata = true,
+        const std::string& shm_path = "");
 
     /**
      * @brief Unregisters memory buffer from TransferEngine

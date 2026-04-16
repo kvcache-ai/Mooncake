@@ -6,6 +6,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <sys/mman.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -689,9 +690,24 @@ class RealClient : public PyClient {
         }
     };
 
+    struct ShmSegmentDeleter {
+        size_t size = 0;
+        std::string shm_name;
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                munmap(ptr, size);
+            }
+            if (!shm_name.empty()) {
+                shm_unlink(shm_name.c_str());
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::vector<std::unique_ptr<void, ShmSegmentDeleter>>
+        shm_segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::string protocol;
