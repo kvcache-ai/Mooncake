@@ -5,6 +5,45 @@ use mooncake_store_core::{
 };
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaReconcileAction {
+    pub reservation_id: String,
+    pub key: String,
+    pub action: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaReconcileReport {
+    pub scope: TenantPolicyScope,
+    pub dry_run: bool,
+    pub inspected: usize,
+    pub finalized: usize,
+    pub aborted: usize,
+    pub skipped: usize,
+    pub actions: Vec<TenantQuotaReconcileAction>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaReconcileRequest {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaAbortRequest {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaAbortResponse {
+    pub scope: TenantPolicyScope,
+    pub reservation_id: String,
+    pub dry_run: bool,
+    pub aborted: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PolicyPatchInput {
     pub route_topk: Option<u32>,

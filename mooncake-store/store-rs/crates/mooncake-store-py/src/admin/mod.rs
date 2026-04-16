@@ -7,7 +7,8 @@ pub use models::{
     AdminCleanupReport, DeleteTenantPolicyResponse, ErrorResponse,
     GetTenantObjectAccountingResponse, GetTenantPolicyResponse, GetTenantQuotaStateResponse,
     ListTenantQuotaReservationsResponse, PolicyPatchInput, PutTenantPolicyRequest,
-    ReservationFilterInput, RoutePolicyResponse,
+    ReservationFilterInput, RoutePolicyResponse, TenantQuotaAbortRequest, TenantQuotaAbortResponse,
+    TenantQuotaReconcileAction, TenantQuotaReconcileReport, TenantQuotaReconcileRequest,
 };
 pub use service::{
     default_domain_name, default_namespace, default_object_set_name, format_policy_scope,

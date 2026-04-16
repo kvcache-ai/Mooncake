@@ -2,12 +2,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_store_client::record_tenant_quota_reconcile;
 use mooncake_store_core::{
-    ClientEpoch, ClientRuntimeId, LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey,
-    RoutePolicy, RoutePolicyDomain, StoreError, TenantBandwidthShapingPolicy,
-    TenantExecutionFairnessPolicy, TenantObjectAccountingState, TenantPlacementPolicy,
-    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
-    TenantQuotaReservationState, TenantRoutePolicy, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
+    route_logical_object_id, ClientEpoch, ClientRuntimeId, LogicalObjectId, MetadataBackend,
+    NamespaceScope, ObjectKey, RoutePolicy, RoutePolicyDomain, StoreError,
+    TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantObjectAccountingState,
+    TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationState, TenantRoutePolicy,
+    DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
 };
 use url::Url;
 
@@ -16,7 +18,8 @@ use crate::config::build_metadata_backend;
 use super::models::{
     AdminCleanupReport, DeleteTenantPolicyResponse, GetTenantObjectAccountingResponse,
     GetTenantPolicyResponse, GetTenantQuotaStateResponse, ListTenantQuotaReservationsResponse,
-    PolicyPatchInput, RoutePolicyResponse,
+    PolicyPatchInput, RoutePolicyResponse, TenantQuotaAbortResponse, TenantQuotaReconcileAction,
+    TenantQuotaReconcileReport,
 };
 
 pub type AdminResult<T> = mooncake_store_core::Result<T>;
@@ -226,6 +229,166 @@ impl AdminService {
             count: reservations.len(),
             reservations,
         })
+    }
+
+    pub fn abort_tenant_quota_reservation(
+        &self,
+        tenant: &str,
+        domain: Option<&str>,
+        object_set: Option<&str>,
+        reservation_id: &str,
+        dry_run: bool,
+    ) -> AdminResult<TenantQuotaAbortResponse> {
+        let scope = tenant_policy_scope(tenant, domain, object_set)?;
+        let root_scope = root_tenant_scope(&scope)?;
+        let reservations = self.backend.list_tenant_quota_reservations(&root_scope)?;
+        let reservation = reservations
+            .into_iter()
+            .find(|entry| entry.reservation_id == reservation_id)
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "tenant quota reservation {reservation_id} was not found in {}",
+                    format_policy_scope(&root_scope)
+                ))
+            })?;
+        if reservation.state != TenantQuotaReservationState::Pending {
+            return Ok(TenantQuotaAbortResponse {
+                scope: root_scope,
+                reservation_id: reservation_id.to_string(),
+                dry_run,
+                aborted: false,
+            });
+        }
+        if !dry_run {
+            let abort_result = self.backend.abort_tenant_quota(reservation_id);
+            record_tenant_quota_reconcile(match &abort_result {
+                Ok(_) => "aborted",
+                Err(_) => "error",
+            });
+            abort_result?;
+        }
+        Ok(TenantQuotaAbortResponse {
+            scope: root_scope,
+            reservation_id: reservation_id.to_string(),
+            dry_run,
+            aborted: true,
+        })
+    }
+
+    pub fn reconcile_tenant_quota_reservations(
+        &self,
+        tenant: &str,
+        domain: Option<&str>,
+        object_set: Option<&str>,
+        dry_run: bool,
+    ) -> AdminResult<TenantQuotaReconcileReport> {
+        let scope = tenant_policy_scope(tenant, domain, object_set)?;
+        let root_scope = root_tenant_scope(&scope)?;
+        let now = now_ms();
+        let mut reservations = self.backend.list_tenant_quota_reservations(&root_scope)?;
+        reservations.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.reservation_id.cmp(&right.reservation_id))
+        });
+        let mut report = TenantQuotaReconcileReport {
+            scope: root_scope.clone(),
+            dry_run,
+            inspected: reservations.len(),
+            finalized: 0,
+            aborted: 0,
+            skipped: 0,
+            actions: Vec::new(),
+        };
+        for reservation in reservations {
+            if reservation.state != TenantQuotaReservationState::Pending {
+                report.skipped = report.skipped.saturating_add(1);
+                continue;
+            }
+            if reservation.expires_at_ms <= now {
+                if !dry_run {
+                    let abort_result = self.backend.abort_tenant_quota(&reservation.reservation_id);
+                    record_tenant_quota_reconcile(match &abort_result {
+                        Ok(_) => "aborted",
+                        Err(_) => "error",
+                    });
+                    abort_result?;
+                }
+                report.aborted = report.aborted.saturating_add(1);
+                report.actions.push(TenantQuotaReconcileAction {
+                    reservation_id: reservation.reservation_id,
+                    key: reservation.key.0,
+                    action: "abort".to_string(),
+                    reason: "expired_pending_reservation".to_string(),
+                });
+                continue;
+            }
+            let route = self.backend.get_object_route(&reservation.key)?;
+            let accounting = self
+                .backend
+                .get_tenant_object_accounting(&reservation.key)?;
+            let route_matches_accounting = route
+                .as_ref()
+                .and_then(|route| {
+                    let object_id = route_logical_object_id(route).ok()?;
+                    (object_id.scope.tenant == root_scope.tenant).then_some(route)
+                })
+                .zip(accounting.as_ref())
+                .is_some_and(|(route, accounting)| {
+                    route.state == mooncake_store_core::RouteState::Active
+                        && accounting.state == TenantObjectAccountingState::Active
+                        && accounting.route_version == Some(route.version)
+                        && accounting.committed_length
+                            == route
+                                .replicas
+                                .iter()
+                                .min_by_key(|replica| replica.priority)
+                                .map(|replica| replica.length)
+                                .unwrap_or(0)
+                });
+            if route_matches_accounting {
+                if !dry_run {
+                    let committed_length = route
+                        .as_ref()
+                        .and_then(|route| {
+                            route
+                                .replicas
+                                .iter()
+                                .min_by_key(|replica| replica.priority)
+                                .map(|replica| replica.length)
+                        })
+                        .unwrap_or(0);
+                    let finalize_result =
+                        self.backend
+                            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                                reservation_id: reservation.reservation_id.clone(),
+                                expected_object_version: reservation.expected_object_version,
+                                committed_length: Some(committed_length),
+                                route_version: accounting
+                                    .as_ref()
+                                    .and_then(|accounting| accounting.route_version),
+                                state: TenantObjectAccountingState::Active,
+                                updated_at_ms: now,
+                                updated_by: "admin-reconcile".to_string(),
+                            });
+                    record_tenant_quota_reconcile(match &finalize_result {
+                        Ok(_) => "finalized",
+                        Err(_) => "error",
+                    });
+                    finalize_result?;
+                }
+                report.finalized = report.finalized.saturating_add(1);
+                report.actions.push(TenantQuotaReconcileAction {
+                    reservation_id: reservation.reservation_id,
+                    key: reservation.key.0,
+                    action: "finalize-visible-route".to_string(),
+                    reason: "route_and_accounting_are_authoritative".to_string(),
+                });
+            } else {
+                report.skipped = report.skipped.saturating_add(1);
+            }
+        }
+        Ok(report)
     }
 
     pub fn cleanup_stale_segments(&self) -> AdminResult<AdminCleanupReport> {
@@ -455,9 +618,10 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
-        ClientEpoch, ClientRuntimeId, MetadataBackend, TenantObjectAccountingState, TenantPolicy,
-        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
-        TenantQuotaReservationState,
+        ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, MetadataBackend, ObjectRoute,
+        ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentName,
+        TenantObjectAccountingState, TenantPolicy, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
+        TenantQuotaReservationRequest, TenantQuotaReservationState,
     };
 
     use super::*;
@@ -487,6 +651,27 @@ mod tests {
                 None,
             )
             .expect("tenant policy should store");
+    }
+
+    fn reserve_quota(service: &AdminService, reservation_id: &str, key: &str, expires_at_ms: u64) {
+        service
+            .backend()
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: reservation_id.to_string(),
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                key: ObjectKey::new(key),
+                expected_object_version: None,
+                delta_bytes: 12,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(1024),
+                    max_objects: Some(16),
+                },
+                expires_at_ms,
+                created_at_ms: 5,
+                writer_runtime: ClientRuntimeId::new("writer-a", ClientEpoch(1)),
+            })
+            .expect("reservation should store");
     }
 
     #[test]
@@ -553,24 +738,7 @@ mod tests {
     fn admin_service_reads_object_accounting_from_scoped_key() {
         let service = test_service();
         put_quota_policy(&service);
-        service
-            .backend()
-            .reserve_tenant_quota(&TenantQuotaReservationRequest {
-                reservation_id: "res-a".to_string(),
-                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
-                key: ObjectKey::new("tenant-a::object-a"),
-                expected_object_version: None,
-                delta_bytes: 12,
-                delta_objects: 1,
-                limit: TenantQuotaPolicy {
-                    max_bytes: Some(1024),
-                    max_objects: Some(16),
-                },
-                expires_at_ms: 10,
-                created_at_ms: 5,
-                writer_runtime: ClientRuntimeId::new("writer-a", ClientEpoch(1)),
-            })
-            .expect("reservation should store");
+        reserve_quota(&service, "res-a", "tenant-a::object-a", 10);
         service
             .backend()
             .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
@@ -596,5 +764,136 @@ mod tests {
                 .committed_length,
             12
         );
+    }
+
+    #[test]
+    fn admin_service_abort_returns_true_for_pending_reservation() {
+        let service = test_service();
+        put_quota_policy(&service);
+        reserve_quota(&service, "res-pending", "tenant-a::object-a", u64::MAX);
+
+        let response = service
+            .abort_tenant_quota_reservation("tenant-a", None, None, "res-pending", false)
+            .expect("abort should succeed");
+        assert!(response.aborted);
+
+        let reservations = service
+            .list_tenant_quota_reservations("tenant-a", None, None, None)
+            .expect("reservations should read");
+        assert_eq!(
+            reservations.reservations[0].state,
+            TenantQuotaReservationState::Aborted
+        );
+    }
+
+    #[test]
+    fn admin_service_reconcile_aborts_expired_pending_reservations() {
+        let service = test_service();
+        put_quota_policy(&service);
+        reserve_quota(&service, "res-expired", "tenant-a::object-expired", 0);
+
+        let report = service
+            .reconcile_tenant_quota_reservations("tenant-a", None, None, false)
+            .expect("reconcile should succeed");
+        assert_eq!(report.aborted, 1);
+        assert_eq!(report.finalized, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.actions[0].reservation_id, "res-expired");
+        assert_eq!(report.actions[0].action, "abort");
+
+        let reservations = service
+            .list_tenant_quota_reservations("tenant-a", None, None, None)
+            .expect("reservations should read");
+        assert_eq!(
+            reservations.reservations[0].state,
+            TenantQuotaReservationState::Aborted
+        );
+    }
+
+    #[test]
+    fn admin_service_reconcile_finalizes_visible_route_reservations() {
+        let service = test_service();
+        put_quota_policy(&service);
+        reserve_quota(&service, "res-seed", "tenant-a::object-visible", u64::MAX);
+        service
+            .backend()
+            .compare_and_swap_object_route(
+                &ObjectKey::new("tenant-a::object-visible"),
+                None,
+                Some(&ObjectRoute {
+                    key: ObjectKey::new("tenant-a::object-visible"),
+                    namespace: Some(NamespaceScope::with_defaults(
+                        Some("tenant-a"),
+                        None::<&str>,
+                        None::<&str>,
+                    )),
+                    logical_key: Some("object-visible".to_string()),
+                    canonical_key: None,
+                    sharing_scope: None,
+                    qos_tier: None,
+                    version: RouteVersion(1),
+                    state: RouteState::Active,
+                    compatibility: CompatibilityDescriptor::default(),
+                    replicas: vec![ReplicaRoute {
+                        owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
+                        segment_name: SegmentName::new("segment-a"),
+                        offset: 0,
+                        segment_offset: 0,
+                        length: 12,
+                        checksum: None,
+                        tier: ReplicaTier::Nvme,
+                        priority: 0,
+                    }],
+                }),
+            )
+            .expect("route cas should succeed");
+        service
+            .backend()
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "res-seed".to_string(),
+                expected_object_version: None,
+                committed_length: Some(12),
+                route_version: Some(RouteVersion(1)),
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 6,
+                updated_by: "writer-a".to_string(),
+            })
+            .expect("seed finalize should succeed");
+        service
+            .backend()
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "res-visible".to_string(),
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                key: ObjectKey::new("tenant-a::object-visible"),
+                expected_object_version: Some(1),
+                delta_bytes: 0,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(1024),
+                    max_objects: Some(16),
+                },
+                expires_at_ms: u64::MAX,
+                created_at_ms: 7,
+                writer_runtime: ClientRuntimeId::new("writer-a", ClientEpoch(1)),
+            })
+            .expect("visible reservation should store");
+
+        let report = service
+            .reconcile_tenant_quota_reservations("tenant-a", None, None, false)
+            .expect("reconcile should succeed");
+        assert_eq!(report.finalized, 1);
+        assert_eq!(report.aborted, 0);
+        assert_eq!(report.actions[0].reservation_id, "res-visible");
+        assert_eq!(report.actions[0].action, "finalize-visible-route");
+
+        let reservations = service
+            .list_tenant_quota_reservations("tenant-a", None, None, None)
+            .expect("reservations should read");
+        let visible = reservations
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.reservation_id == "res-visible")
+            .expect("visible reservation should exist");
+        assert_eq!(visible.state, TenantQuotaReservationState::Finalized);
     }
 }

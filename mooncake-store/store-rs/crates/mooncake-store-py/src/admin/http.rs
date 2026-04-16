@@ -7,7 +7,9 @@ use std::time::Duration;
 use mooncake_store_core::StoreError;
 use serde::Serialize;
 
-use super::models::{ErrorResponse, PutTenantPolicyRequest};
+use super::models::{
+    ErrorResponse, PutTenantPolicyRequest, TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
+};
 use super::service::AdminService;
 
 const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -224,13 +226,13 @@ fn route_tenant_quota_request(
     request: HttpRequest,
     path_only: &str,
 ) -> String {
-    if request.method != "GET" {
-        return http_error_response("405 Method Not Allowed", "method not allowed");
-    }
     let Some(scope) = parse_quota_scope_path(path_only) else {
         return http_error_response("404 Not Found", "not found");
     };
     if path_only.ends_with("/reservations") {
+        if request.method != "GET" {
+            return http_error_response("405 Method Not Allowed", "method not allowed");
+        }
         let state = match query_param(&request.path, "state") {
             Some(value) => match parse_reservation_state_query(&value) {
                 Ok(state) => Some(state),
@@ -247,6 +249,42 @@ fn route_tenant_quota_request(
             Ok(response) => http_json_response("200 OK", &response),
             Err(error) => http_store_error(error),
         };
+    }
+    if let Some(reservation_id) = parse_quota_abort_path(path_only, &scope) {
+        if request.method != "POST" {
+            return http_error_response("405 Method Not Allowed", "method not allowed");
+        }
+        let payload =
+            serde_json::from_slice::<TenantQuotaAbortRequest>(&request.body).unwrap_or_default();
+        return match service.abort_tenant_quota_reservation(
+            &scope.tenant,
+            scope.domain.as_deref(),
+            scope.object_set.as_deref(),
+            &reservation_id,
+            payload.dry_run,
+        ) {
+            Ok(response) => http_json_response("200 OK", &response),
+            Err(error) => http_store_error(error),
+        };
+    }
+    if path_only.ends_with("/reconcile") {
+        if request.method != "POST" {
+            return http_error_response("405 Method Not Allowed", "method not allowed");
+        }
+        let payload = serde_json::from_slice::<TenantQuotaReconcileRequest>(&request.body)
+            .unwrap_or_default();
+        return match service.reconcile_tenant_quota_reservations(
+            &scope.tenant,
+            scope.domain.as_deref(),
+            scope.object_set.as_deref(),
+            payload.dry_run,
+        ) {
+            Ok(response) => http_json_response("200 OK", &response),
+            Err(error) => http_store_error(error),
+        };
+    }
+    if request.method != "GET" {
+        return http_error_response("405 Method Not Allowed", "method not allowed");
     }
     match service.get_tenant_quota_state(
         &scope.tenant,
@@ -292,10 +330,73 @@ fn parse_policy_scope_path(path: &str) -> Option<PolicyScopePath> {
 }
 
 fn parse_quota_scope_path(path: &str) -> Option<PolicyScopePath> {
-    let scope = parse_policy_scope_with_prefix(path, "/v1/tenant-quotas/")?;
-    let suffix = format!("/v1/tenant-quotas/{}", format_scope_suffix(&scope));
-    let reservations_suffix = format!("{suffix}/reservations");
-    (path == suffix || path == reservations_suffix).then_some(scope)
+    let prefix = "/v1/tenant-quotas/";
+    let rest = path.strip_prefix(prefix)?;
+    let parts = rest
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [tenant] => Some(PolicyScopePath {
+            tenant: (*tenant).to_string(),
+            domain: None,
+            object_set: None,
+        }),
+        [tenant, "reservations"] | [tenant, "reconcile"] => Some(PolicyScopePath {
+            tenant: (*tenant).to_string(),
+            domain: None,
+            object_set: None,
+        }),
+        [tenant, "reservations", _reservation_id, "abort"] => Some(PolicyScopePath {
+            tenant: (*tenant).to_string(),
+            domain: None,
+            object_set: None,
+        }),
+        [tenant, domain] => Some(PolicyScopePath {
+            tenant: (*tenant).to_string(),
+            domain: Some((*domain).to_string()),
+            object_set: None,
+        }),
+        [tenant, domain, "reservations"] | [tenant, domain, "reconcile"] => Some(PolicyScopePath {
+            tenant: (*tenant).to_string(),
+            domain: Some((*domain).to_string()),
+            object_set: None,
+        }),
+        [tenant, domain, "reservations", _reservation_id, "abort"] => Some(PolicyScopePath {
+            tenant: (*tenant).to_string(),
+            domain: Some((*domain).to_string()),
+            object_set: None,
+        }),
+        [tenant, domain, object_set] => Some(PolicyScopePath {
+            tenant: (*tenant).to_string(),
+            domain: Some((*domain).to_string()),
+            object_set: Some((*object_set).to_string()),
+        }),
+        [tenant, domain, object_set, "reservations"]
+        | [tenant, domain, object_set, "reconcile"] => Some(PolicyScopePath {
+            tenant: (*tenant).to_string(),
+            domain: Some((*domain).to_string()),
+            object_set: Some((*object_set).to_string()),
+        }),
+        [tenant, domain, object_set, "reservations", _reservation_id, "abort"] => {
+            Some(PolicyScopePath {
+                tenant: (*tenant).to_string(),
+                domain: Some((*domain).to_string()),
+                object_set: Some((*object_set).to_string()),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_quota_abort_path(path: &str, scope: &PolicyScopePath) -> Option<String> {
+    let prefix = format!(
+        "/v1/tenant-quotas/{}/reservations/",
+        format_scope_suffix(scope)
+    );
+    let rest = path.strip_prefix(&prefix)?;
+    let reservation_id = rest.strip_suffix("/abort")?;
+    percent_decode_component(reservation_id)
 }
 
 fn parse_object_accounting_path(path: &str) -> Option<(PolicyScopePath, String)> {
@@ -557,8 +658,8 @@ mod tests {
     use crate::admin::service::AdminService;
 
     use super::{
-        http_store_error, parse_policy_scope_path, percent_decode_component, query_flag,
-        query_param, AdminHttpServerHandle,
+        http_store_error, parse_policy_scope_path, parse_quota_abort_path, parse_quota_scope_path,
+        percent_decode_component, query_flag, query_param, AdminHttpServerHandle, PolicyScopePath,
     };
 
     fn http_request(address: &str, request: &str) -> String {
@@ -873,6 +974,109 @@ mod tests {
         assert!(reservations.contains("HTTP/1.1 200 OK"));
         assert!(reservations.contains("\"reservation_id\":\"res-b\""));
         assert!(!reservations.contains("\"reservation_id\":\"res-a\""));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn quota_scope_parser_accepts_reconcile_and_abort_paths() {
+        let root = parse_quota_scope_path("/v1/tenant-quotas/tenant-a/reconcile")
+            .expect("reconcile path should parse");
+        assert_eq!(root.tenant, "tenant-a");
+        assert!(root.domain.is_none());
+        assert!(root.object_set.is_none());
+
+        let nested = parse_quota_scope_path(
+            "/v1/tenant-quotas/tenant-a/domain-a/set-a/reservations/res-1/abort",
+        )
+        .expect("abort path should parse");
+        assert_eq!(nested.tenant, "tenant-a");
+        assert_eq!(nested.domain.as_deref(), Some("domain-a"));
+        assert_eq!(nested.object_set.as_deref(), Some("set-a"));
+
+        let reservation_id = parse_quota_abort_path(
+            "/v1/tenant-quotas/tenant-a/domain-a/set-a/reservations/res%2F1/abort",
+            &PolicyScopePath {
+                tenant: "tenant-a".to_string(),
+                domain: Some("domain-a".to_string()),
+                object_set: Some("set-a".to_string()),
+            },
+        )
+        .expect("reservation id should decode");
+        assert_eq!(reservation_id, "res/1");
+    }
+
+    #[test]
+    fn admin_http_server_serves_quota_abort_endpoint() {
+        let service = test_service();
+        service
+            .backend()
+            .put_tenant_policy(
+                &mooncake_store_core::TenantPolicy {
+                    scope: mooncake_store_core::TenantPolicyScope::new(
+                        "tenant-a",
+                        None::<String>,
+                        None::<String>,
+                    ),
+                    spec: TenantPolicySpec {
+                        quota: Some(TenantQuotaPolicy {
+                            max_bytes: Some(1024),
+                            max_objects: Some(16),
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 1,
+                    updated_by: "tester".to_string(),
+                },
+                None,
+            )
+            .expect("tenant policy should store");
+        service
+            .backend()
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "res-abort".to_string(),
+                scope: mooncake_store_core::TenantPolicyScope::new(
+                    "tenant-a",
+                    None::<String>,
+                    None::<String>,
+                ),
+                key: mooncake_store_core::ObjectKey::new("tenant-a::object-abort"),
+                expected_object_version: None,
+                delta_bytes: 3,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(1024),
+                    max_objects: Some(16),
+                },
+                expires_at_ms: u64::MAX,
+                created_at_ms: 8,
+                writer_runtime: ClientRuntimeId::new("writer-b", ClientEpoch(1)),
+            })
+            .expect("pending reservation should store");
+
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service.clone()).expect("server start");
+        let address = server.address().to_string();
+        let body = serde_json::json!({"dry_run": false}).to_string();
+        let response = http_request(
+            &address,
+            &format!(
+                "POST /v1/tenant-quotas/tenant-a/reservations/res-abort/abort HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"aborted\":true"));
+
+        let reservations = service
+            .list_tenant_quota_reservations("tenant-a", None, None, None)
+            .expect("reservations should read");
+        assert_eq!(
+            reservations.reservations[0].state,
+            mooncake_store_core::TenantQuotaReservationState::Aborted
+        );
 
         server.shutdown().expect("server shutdown");
     }

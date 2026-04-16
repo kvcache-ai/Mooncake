@@ -71,7 +71,13 @@ impl StoreClient {
             created_at_ms,
             writer_runtime: self.lease.runtime.clone(),
         };
-        self.metadata.reserve_tenant_quota(&request)?;
+        let reserve_result = self.metadata.reserve_tenant_quota(&request);
+        registry::record_tenant_quota_reservation(match &reserve_result {
+            Ok(_) => "ok",
+            Err(StoreError::Conflict(_)) => "conflict",
+            Err(_) => "error",
+        });
+        reserve_result?;
         Ok(Some(request))
     }
 
@@ -102,7 +108,13 @@ impl StoreClient {
             created_at_ms,
             writer_runtime: self.lease.runtime.clone(),
         };
-        self.metadata.reserve_tenant_quota(&request)?;
+        let reserve_result = self.metadata.reserve_tenant_quota(&request);
+        registry::record_tenant_quota_reservation(match &reserve_result {
+            Ok(_) => "ok",
+            Err(StoreError::Conflict(_)) => "conflict",
+            Err(_) => "error",
+        });
+        reserve_result?;
         Ok(Some(request))
     }
 
@@ -115,7 +127,7 @@ impl StoreClient {
         let Some(reservation) = reservation else {
             return Ok(());
         };
-        self.metadata.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+        let finalize_result = self.metadata.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
             reservation_id: reservation.reservation_id.clone(),
             expected_object_version: reservation.expected_object_version,
             committed_length: Some(value_len as u64),
@@ -123,7 +135,13 @@ impl StoreClient {
             state: TenantObjectAccountingState::Active,
             updated_at_ms: now_ms(),
             updated_by: self.lease.runtime.to_string(),
-        })?;
+        });
+        registry::record_tenant_quota_finalize(match &finalize_result {
+            Ok(_) => "ok",
+            Err(StoreError::Conflict(_)) => "conflict",
+            Err(_) => "error",
+        });
+        finalize_result?;
         Ok(())
     }
 
@@ -134,7 +152,7 @@ impl StoreClient {
         let Some(reservation) = reservation else {
             return Ok(());
         };
-        self.metadata.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+        let finalize_result = self.metadata.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
             reservation_id: reservation.reservation_id.clone(),
             expected_object_version: reservation.expected_object_version,
             committed_length: None,
@@ -142,7 +160,13 @@ impl StoreClient {
             state: TenantObjectAccountingState::Deleted,
             updated_at_ms: now_ms(),
             updated_by: self.lease.runtime.to_string(),
-        })?;
+        });
+        registry::record_tenant_quota_finalize(match &finalize_result {
+            Ok(_) => "ok",
+            Err(StoreError::Conflict(_)) => "conflict",
+            Err(_) => "error",
+        });
+        finalize_result?;
         Ok(())
     }
 
@@ -154,15 +178,18 @@ impl StoreClient {
         let Some(reservation) = reservation else {
             return Ok(());
         };
-        self.metadata
-            .abort_tenant_quota(&reservation.reservation_id)
-            .map(|_| ())
-            .map_err(|error| {
-                StoreError::InvalidState(format!(
-                    "failed to abort tenant quota reservation {} after {context}: {error}",
-                    reservation.reservation_id
-                ))
-            })
+        let abort_result = self.metadata.abort_tenant_quota(&reservation.reservation_id);
+        registry::record_tenant_quota_abort(match &abort_result {
+            Ok(_) => "ok",
+            Err(StoreError::Conflict(_)) => "conflict",
+            Err(_) => "error",
+        });
+        abort_result.map(|_| ()).map_err(|error| {
+            StoreError::InvalidState(format!(
+                "failed to abort tenant quota reservation {} after {context}: {error}",
+                reservation.reservation_id
+            ))
+        })
     }
 
     fn put_object_with_policy_current(

@@ -358,12 +358,14 @@ The same data is also exposed over the admin HTTP surface:
 ```text
 GET /v1/tenant-quotas/<tenant>[/<domain>[/<object_set>]]
 GET /v1/tenant-quotas/<tenant>[/<domain>[/<object_set>]]/reservations?state=pending|finalized|aborted
+POST /v1/tenant-quotas/<tenant>[/<domain>[/<object_set>]]/reservations/<reservation_id>/abort
+POST /v1/tenant-quotas/<tenant>[/<domain>[/<object_set>]]/reconcile
 GET /v1/tenant-object-accounting/<tenant>/objects/<key>
 GET /v1/tenant-object-accounting/<tenant>/<domain>/objects/<key>
 GET /v1/tenant-object-accounting/<tenant>/<domain>/<object_set>/objects/<key>
 ```
 
-Quota state and reservation listing intentionally collapse to the tenant-root scope because Phase 1 stores strict quota state authoritatively at the tenant root. Object-accounting lookup still accepts nested scope selectors so operators can ask for the logical object they care about while the service derives the canonical scoped key.
+Quota state and reservation listing intentionally collapse to the tenant-root scope because Phase 1 stores strict quota state authoritatively at the tenant root. Object-accounting lookup still accepts nested scope selectors so operators can ask for the logical object they care about while the service derives the canonical scoped key. The Phase 5 maintenance surface now adds explicit reservation abort and reconcile commands with `--dry-run` support so operators can inspect expired or visible-but-unfinalized reservations before applying repair.
 
 ### 3. Explicit maintenance
 

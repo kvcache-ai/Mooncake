@@ -347,12 +347,14 @@ Examples include:
 - control-plane batch operations
 - bytes in and bytes out
 - accumulated latency and max latency
+- tenant quota reservation / finalize / abort / reconcile outcomes
 
 The same tracker framework also covers eviction-related work such as:
 
 - storage-owner eviction attempts
 - route-hit reporting RPC
 - replica-route tracking RPC
+- strict tenant quota protocol transitions
 
 ### Tracing
 
