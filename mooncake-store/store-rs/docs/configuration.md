@@ -324,6 +324,25 @@ worker count when a deployment needs more concurrent route / allocator RPCs or
 when an embedded client should keep its thread footprint smaller. The default
 is `2`; values must be positive integers.
 
+## Python Local Hot Cache
+
+The local hot cache lives inside the Python compatibility runtime and the standalone dummy daemon. It stays disabled unless `MC_STORE_LOCAL_HOT_CACHE_SIZE` is set to a positive integer.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MC_STORE_LOCAL_HOT_CACHE_SIZE` | disabled | total cache capacity in bytes; unset or invalid values disable the cache |
+| `MC_STORE_LOCAL_HOT_BLOCK_SIZE` | `16777216` (`16 MiB`) | block size in bytes and the maximum payload size that can be cached |
+| `MC_STORE_LOCAL_HOT_CACHE_USE_SHM` | disabled | set to `1` to back cached payloads with shm so dummy clients on the same daemon can reuse them |
+
+Behavior notes:
+
+- effective cache capacity is `floor(total_size / block_size)` blocks
+- values larger than `block_size` bypass the cache instead of being partially cached
+- successful read misses populate the cache from the fetched value
+- successful local writes and deletes invalidate the matching local cache entry on that daemon
+- shm mode shares payload bytes with dummy clients connected to the same `mooncake-store-client`, while LRU metadata, generations, and pins remain private to the daemon
+- cache entries are daemon-local only and are never published to Redis or etcd
+
 ## Read-side Membership and Failure Semantics
 
 The client keeps membership refresh out of the steady-state request path.
@@ -372,6 +391,9 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRANSFER_TIMEOUT_MS` | legacy compatibility alias | deprecated alias of `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` |
 | `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` | dummy compatibility clients | dummy gRPC timeout; falls back to `MC_STORE_RS_REQUEST_TIMEOUT_MS` when unset |
 | `MC_STORE_RS_CONTROL_PLANE_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the shared control-plane RPC runtime; default `2`; must be `> 0` |
+| `MC_STORE_LOCAL_HOT_CACHE_SIZE` | Python compatibility runtime, standalone dummy daemon, and local e2e | total byte budget for the daemon-local hot read cache; unset disables it |
+| `MC_STORE_LOCAL_HOT_BLOCK_SIZE` | Python compatibility runtime, standalone dummy daemon, and local e2e | cache block size and maximum cached object size; default `16777216` (`16 MiB`) |
+| `MC_STORE_LOCAL_HOT_CACHE_USE_SHM` | standalone dummy daemon, dummy compatibility clients, and local e2e | set to `1` to back cached payloads with shm so dummy clients attached to the same daemon can reuse them |
 | `MC_STORE_RS_TRACE` | Python wrapper setup fallback, e2e, and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |
 | `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |

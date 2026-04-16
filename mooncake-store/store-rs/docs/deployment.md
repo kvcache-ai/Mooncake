@@ -62,6 +62,32 @@ What the script does:
 - creates two Python clients
 - validates single-object, batch, zero-copy, multi-buffer, route, and metrics paths
 
+### Local hot-cache e2e
+
+Run the daemon-local hot-cache validation:
+
+```bash
+./scripts/e2e/run-local-hot-cache-e2e.sh
+```
+
+What the script does:
+
+- rebuilds or reuses `.venv-wheel`, then builds the standalone `mooncake-store-client` binary
+- Phase A validates that a real-mode reader reuses daemon-local cached bytes after the origin key is removed remotely
+- Phase B validates that two dummy clients attached to one standalone daemon reuse a shm-backed hot-cache hit
+- starts a temporary Redis instance automatically and tears it down after the run
+
+Important inputs:
+
+| Variable | Default | Used By |
+|----------|---------|---------|
+| `MC_STORE_RS_REFRESH_WHEEL` | `1` | rebuild and reinstall the latest wheel into `.venv-wheel` |
+| `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_REDIS_PORT` | auto | temporary Redis port |
+| `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_STORAGE_BYTES` | `64 MiB` | storage bytes for the local standalone daemon |
+| `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_SCRATCH_BYTES` | `16 MiB` | scratch bytes per local client |
+| `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_CACHE_BYTES` | `1 MiB` | hot-cache capacity under test |
+| `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_BLOCK_BYTES` | `8192` | hot-cache block size under test |
+
 ### Real-mode read/write validation
 
 Run the real-mode black-box validator:
