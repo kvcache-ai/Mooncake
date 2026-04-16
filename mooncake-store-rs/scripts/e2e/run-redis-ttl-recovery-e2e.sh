@@ -167,6 +167,13 @@ resolve_python_bin() {
   printf '%s\n' python3
 }
 
+python_can_import_store() {
+  local python_bin=$1
+  "${python_bin}" - <<'PY' >/dev/null 2>&1
+from mooncake.store import MooncakeDistributedStore  # noqa: F401
+PY
+}
+
 ensure_runtime_ready() {
   local python_bin
   python_bin=$(resolve_python_bin)
@@ -179,26 +186,21 @@ ensure_runtime_ready() {
     return 0
   fi
 
-  if [[ ! -x "${python_bin}" ]]; then
-    echo "python runtime not found at ${python_bin}; rebuilding wheel runtime" >&2
-    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
-    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
+  if [[ -x "${python_bin}" ]] && python_can_import_store "${python_bin}"; then
+    PYTHON_BIN="${python_bin}"
     return 0
   fi
 
-  if ! "${python_bin}" - <<'PY' >/dev/null 2>&1
-from mooncake.store import MooncakeDistributedStore  # noqa: F401
-PY
-  then
-    echo "==> installed wheel missing or stale; rebuilding .venv-wheel runtime"
-    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
-    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
+  if [[ "${python_bin}" != "python3" ]] && command -v python3 >/dev/null 2>&1 && python_can_import_store python3; then
+    echo "==> wheel runtime unavailable; falling back to system python3"
+    PYTHON_BIN="python3"
     return 0
   fi
 
-  PYTHON_BIN="${python_bin}"
+  echo "==> installed wheel missing or stale; rebuilding .venv-wheel runtime"
+  bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
+  bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
+  PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
 }
 
 wait_for_redis_up() {
@@ -417,14 +419,16 @@ cleanup() {
     fi
   done
 
-  if redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
+  if [[ -n "${REDIS_PORT:-}" ]] && redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
     redis-cli -p "${REDIS_PORT}" shutdown nosave >/dev/null 2>&1 || true
   fi
 
-  if [[ "${status}" != "0" && "${MC_STORE_RS_KEEP_TEMP:-0}" == "1" ]]; then
-    echo "preserving temp dir: ${TEMP_DIR}" >&2
-  else
-    rm -rf "${TEMP_DIR}"
+  if [[ -n "${TEMP_DIR:-}" ]]; then
+    if [[ "${status}" != "0" && "${MC_STORE_RS_KEEP_TEMP:-0}" == "1" ]]; then
+      echo "preserving temp dir: ${TEMP_DIR}" >&2
+    else
+      rm -rf "${TEMP_DIR}"
+    fi
   fi
   exit "${status}"
 }
@@ -443,6 +447,7 @@ export MOONCAKE_UPSTREAM_DIR="${UPSTREAM_DIR}"
 export MOONCAKE_UPSTREAM_BUILD_DIR="${UPSTREAM_BUILD_DIR}"
 export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${LD_LIBRARY_PATH:-}"
 export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/python:${PYTHONPATH:-}"
 
 ensure_runtime_ready
 

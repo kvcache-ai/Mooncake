@@ -2283,6 +2283,93 @@ mod tests {
             self.inner.put_route_policy_if_absent(domain, policy)
         }
 
+        fn put_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+            policy: &RoutePolicy,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.put_route_policy(domain, policy)
+        }
+
+        fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> mooncake_store_core::Result<bool> {
+            self.inner.delete_route_policy(domain)
+        }
+
+        fn list_route_policies(
+            &self,
+        ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+            self.inner.list_route_policies()
+        }
+
+        fn get_tenant_policy(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+            self.inner.get_tenant_policy(scope)
+        }
+
+        fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+            self.inner.list_tenant_policies()
+        }
+
+        fn put_tenant_policy(
+            &self,
+            policy: &TenantPolicy,
+            expected_version: Option<u64>,
+        ) -> mooncake_store_core::Result<TenantPolicy> {
+            self.inner.put_tenant_policy(policy, expected_version)
+        }
+
+        fn delete_tenant_policy(
+            &self,
+            scope: &TenantPolicyScope,
+            expected_version: Option<u64>,
+        ) -> mooncake_store_core::Result<bool> {
+            self.inner.delete_tenant_policy(scope, expected_version)
+        }
+
+        fn get_tenant_quota_state(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+            self.inner.get_tenant_quota_state(scope)
+        }
+
+        fn get_tenant_object_accounting(
+            &self,
+            key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+            self.inner.get_tenant_object_accounting(key)
+        }
+
+        fn list_tenant_quota_reservations(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+            self.inner.list_tenant_quota_reservations(scope)
+        }
+
+        fn reserve_tenant_quota(
+            &self,
+            request: &TenantQuotaReservationRequest,
+        ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+            self.inner.reserve_tenant_quota(request)
+        }
+
+        fn finalize_tenant_quota(
+            &self,
+            request: &TenantQuotaFinalizeRequest,
+        ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+            self.inner.finalize_tenant_quota(request)
+        }
+
+        fn abort_tenant_quota(
+            &self,
+            reservation_id: &str,
+        ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+            self.inner.abort_tenant_quota(reservation_id)
+        }
+
         fn put_handoff(&self, handoff: &HandoffPlan) -> mooncake_store_core::Result<()> {
             self.inner.put_handoff(handoff)
         }
