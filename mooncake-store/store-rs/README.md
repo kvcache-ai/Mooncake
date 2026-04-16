@@ -589,6 +589,17 @@ The runtime transport switch belongs to the compatibility layer:
 - `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
 
+### Metadata restart and reconnect behavior
+
+Both real transport backends self-heal after Redis metadata connectivity returns:
+
+- transient Redis outages keep the process alive; heartbeat recovery republishes store metadata and transport metadata after Redis is reachable again
+- fresh Redis restarts are supported as long as the storage clients survive long enough to renew their lease and repair local metadata
+- `classic-te` rebuilds the transport engine and republishes its local buffers
+- `tent` rebuilds the transport engine and re-registers its local buffers back into transport metadata
+
+During the outage window, new routed writes or remote reads can fail because leases or segment metadata are unavailable. After Redis recovers and the local heartbeat repair runs, existing storage clients become writable and readable again without manual cleanup.
+
 ### Routed writes
 
 ```rust

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use mooncake_store_core::{Result, StoreError};
 use mooncake_transport_sys::tent as ffi;
@@ -97,14 +98,35 @@ pub struct SegmentBuffer {
 }
 
 pub struct TentEngine {
-    raw: ffi::TentEngineHandle,
+    raw: RwLock<ffi::TentEngineHandle>,
+    config: TentEngineConfig,
+    registered_regions: Mutex<BTreeMap<usize, usize>>,
+    owned_allocations: Mutex<BTreeMap<usize, TentOwnedAllocation>>,
+    generation: AtomicU64,
 }
 
 unsafe impl Send for TentEngine {}
 unsafe impl Sync for TentEngine {}
 
+#[derive(Copy, Clone, Debug)]
+struct TentOwnedAllocation {
+    generation: u64,
+    size: usize,
+}
+
 impl TentEngine {
     pub fn new(config: &TentEngineConfig) -> Result<Self> {
+        let raw = Self::create_engine_handle(config)?;
+        Ok(Self {
+            raw: RwLock::new(raw),
+            config: config.clone(),
+            registered_regions: Mutex::new(BTreeMap::new()),
+            owned_allocations: Mutex::new(BTreeMap::new()),
+            generation: AtomicU64::new(0),
+        })
+    }
+
+    fn create_engine_handle(config: &TentEngineConfig) -> Result<ffi::TentEngineHandle> {
         let _lock = tent_engine_create_lock()
             .lock()
             .expect("tent engine create lock poisoned");
@@ -116,18 +138,81 @@ impl TentEngine {
                 "tent_create_engine returned a null pointer".to_string(),
             ));
         }
-        Ok(Self { raw })
+        Ok(raw)
+    }
+
+    fn lock_error(name: &str) -> StoreError {
+        StoreError::Transport(format!("{name} lock poisoned"))
+    }
+
+    fn engine_handle(&self) -> Result<ffi::TentEngineHandle> {
+        self.raw
+            .read()
+            .map(|guard| *guard)
+            .map_err(|_| Self::lock_error("tent raw"))
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn snapshot_registered_regions(&self) -> Result<Vec<(*mut c_void, usize)>> {
+        Ok(self
+            .registered_regions
+            .lock()
+            .map_err(|_| Self::lock_error("tent registered_regions"))?
+            .iter()
+            .map(|(addr, size)| (*addr as *mut c_void, *size))
+            .collect::<Vec<_>>())
+    }
+
+    fn mark_owned_allocation(&self, addr: *mut c_void, size: usize) -> Result<()> {
+        self.owned_allocations
+            .lock()
+            .map_err(|_| Self::lock_error("tent owned_allocations"))?
+            .insert(
+                addr as usize,
+                TentOwnedAllocation {
+                    generation: self.current_generation(),
+                    size,
+                },
+            );
+        Ok(())
+    }
+
+    fn take_owned_allocation(&self, addr: *mut c_void) -> Result<Option<TentOwnedAllocation>> {
+        Ok(self
+            .owned_allocations
+            .lock()
+            .map_err(|_| Self::lock_error("tent owned_allocations"))?
+            .remove(&(addr as usize)))
+    }
+
+    fn rebuild_engine_for_metadata_recovery(&self) -> Result<ffi::TentEngineHandle> {
+        let replacement = Self::create_engine_handle(&self.config)?;
+        let previous = {
+            let mut raw = self.raw.write().map_err(|_| Self::lock_error("tent raw"))?;
+            std::mem::replace(&mut *raw, replacement)
+        };
+        unsafe { ffi::tent_destroy_engine(previous) };
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.engine_handle()
     }
 
     pub fn segment_name(&self) -> Result<String> {
-        read_engine_string(self.raw, ffi::tent_segment_name, "tent_segment_name")
+        read_engine_string(
+            self.engine_handle()?,
+            ffi::tent_segment_name,
+            "tent_segment_name",
+        )
     }
 
     pub fn rpc_server_address(&self) -> Result<(String, u16)> {
         let mut buffer = vec![0 as c_char; 256];
         let mut port = 0u16;
+        let raw = self.engine_handle()?;
         let rc = unsafe {
-            ffi::tent_rpc_server_addr_port(self.raw, buffer.as_mut_ptr(), buffer.len(), &mut port)
+            ffi::tent_rpc_server_addr_port(raw, buffer.as_mut_ptr(), buffer.len(), &mut port)
         };
         check_zero(rc, "tent_rpc_server_addr_port")?;
         Ok((read_string(&buffer), port))
@@ -136,13 +221,15 @@ impl TentEngine {
     pub fn open_segment(&self, segment_name: &str) -> Result<u64> {
         let segment_name = to_cstring("segment_name", segment_name)?;
         let mut handle = 0u64;
-        let rc = unsafe { ffi::tent_open_segment(self.raw, &mut handle, segment_name.as_ptr()) };
+        let rc = unsafe {
+            ffi::tent_open_segment(self.engine_handle()?, &mut handle, segment_name.as_ptr())
+        };
         check_zero(rc, "tent_open_segment")?;
         Ok(handle)
     }
 
     pub fn close_segment(&self, handle: u64) -> Result<()> {
-        let rc = unsafe { ffi::tent_close_segment(self.raw, handle) };
+        let rc = unsafe { ffi::tent_close_segment(self.engine_handle()?, handle) };
         check_zero(rc, "tent_close_segment")
     }
 
@@ -152,7 +239,7 @@ impl TentEngine {
             num_buffers: 0,
             buffers: std::ptr::null_mut(),
         };
-        let rc = unsafe { ffi::tent_get_segment_info(self.raw, handle, &mut info) };
+        let rc = unsafe { ffi::tent_get_segment_info(self.engine_handle()?, handle, &mut info) };
         check_zero(rc, "tent_get_segment_info")?;
         let buffers = unsafe { read_segment_buffers(&info) };
         unsafe { ffi::tent_free_segment_info(&mut info) };
@@ -168,31 +255,66 @@ impl TentEngine {
     pub fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void> {
         let location = to_cstring("location", location)?;
         let mut addr = std::ptr::null_mut();
-        let rc = unsafe { ffi::tent_allocate_memory(self.raw, &mut addr, size, location.as_ptr()) };
+        let rc = unsafe {
+            ffi::tent_allocate_memory(self.engine_handle()?, &mut addr, size, location.as_ptr())
+        };
         check_zero(rc, "tent_allocate_memory")?;
+        self.mark_owned_allocation(addr, size)?;
         Ok(addr)
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn free_memory(&self, addr: *mut c_void) -> Result<()> {
-        let rc = unsafe { ffi::tent_free_memory(self.raw, addr) };
-        check_zero(rc, "tent_free_memory")
+        self.registered_regions
+            .lock()
+            .map_err(|_| Self::lock_error("tent registered_regions"))?
+            .remove(&(addr as usize));
+        let Some(allocation) = self.take_owned_allocation(addr)? else {
+            let rc = unsafe { ffi::tent_free_memory(self.engine_handle()?, addr) };
+            return check_zero(rc, "tent_free_memory");
+        };
+        if allocation.generation == self.current_generation() {
+            let rc = unsafe { ffi::tent_free_memory(self.engine_handle()?, addr) };
+            return check_zero(rc, "tent_free_memory");
+        }
+        let rc = unsafe { ffi::mooncake_tent_platform_free_memory(addr, allocation.size) };
+        check_zero(rc, "mooncake_tent_platform_free_memory")
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
-        let rc = unsafe { ffi::tent_register_memory(self.raw, addr, size) };
-        check_zero(rc, "tent_register_memory")
+        let rc = unsafe { ffi::tent_register_memory(self.engine_handle()?, addr, size) };
+        check_zero(rc, "tent_register_memory")?;
+        self.registered_regions
+            .lock()
+            .map_err(|_| Self::lock_error("tent registered_regions"))?
+            .insert(addr as usize, size);
+        Ok(())
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
-        let rc = unsafe { ffi::tent_unregister_memory(self.raw, addr, size) };
-        check_zero(rc, "tent_unregister_memory")
+        let rc = unsafe { ffi::tent_unregister_memory(self.engine_handle()?, addr, size) };
+        check_zero(rc, "tent_unregister_memory")?;
+        self.registered_regions
+            .lock()
+            .map_err(|_| Self::lock_error("tent registered_regions"))?
+            .remove(&(addr as usize));
+        Ok(())
+    }
+
+    pub fn republish_local_metadata(&self) -> Result<()> {
+        let regions = self.snapshot_registered_regions()?;
+        let raw = self.rebuild_engine_for_metadata_recovery()?;
+        for (addr, size) in regions {
+            let register_rc = unsafe { ffi::tent_register_memory(raw, addr, size) };
+            check_zero(register_rc, "tent_register_memory")?;
+        }
+        Ok(())
     }
 
     pub fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
-        let batch_id = unsafe { ffi::tent_allocate_batch(self.raw, batch_size) };
+        let batch_id = unsafe { ffi::tent_allocate_batch(self.engine_handle()?, batch_size) };
         if batch_id == u64::MAX {
             return Err(StoreError::Transport(format!(
                 "tent_allocate_batch failed for batch_size={batch_size}"
@@ -202,7 +324,7 @@ impl TentEngine {
     }
 
     pub fn free_batch(&self, batch_id: u64) -> Result<()> {
-        let rc = unsafe { ffi::tent_free_batch(self.raw, batch_id) };
+        let rc = unsafe { ffi::tent_free_batch(self.engine_handle()?, batch_id) };
         check_zero(rc, "tent_free_batch")
     }
 
@@ -219,7 +341,7 @@ impl TentEngine {
             .collect::<Vec<_>>();
         let rc = unsafe {
             ffi::tent_submit(
-                self.raw,
+                self.engine_handle()?,
                 batch_id,
                 native_requests.as_mut_ptr(),
                 native_requests.len(),
@@ -230,7 +352,8 @@ impl TentEngine {
 
     pub fn task_status(&self, batch_id: u64, task_id: usize) -> Result<TransferProgress> {
         let mut status = ffi::TentStatus::default();
-        let rc = unsafe { ffi::tent_task_status(self.raw, batch_id, task_id, &mut status) };
+        let rc =
+            unsafe { ffi::tent_task_status(self.engine_handle()?, batch_id, task_id, &mut status) };
         check_zero(rc, "tent_task_status")?;
         Ok(TransferProgress {
             status: decode_status(status.status),
@@ -240,7 +363,7 @@ impl TentEngine {
 
     pub fn overall_status(&self, batch_id: u64) -> Result<TransferProgress> {
         let mut status = ffi::TentStatus::default();
-        let rc = unsafe { ffi::tent_overall_status(self.raw, batch_id, &mut status) };
+        let rc = unsafe { ffi::tent_overall_status(self.engine_handle()?, batch_id, &mut status) };
         check_zero(rc, "tent_overall_status")?;
         Ok(TransferProgress {
             status: decode_status(status.status),
@@ -251,7 +374,14 @@ impl TentEngine {
 
 impl Drop for TentEngine {
     fn drop(&mut self) {
-        unsafe { ffi::tent_destroy_engine(self.raw) };
+        let raw = self
+            .raw
+            .write()
+            .map(|mut guard| std::mem::replace(&mut *guard, std::ptr::null_mut()))
+            .unwrap_or(std::ptr::null_mut());
+        if !raw.is_null() {
+            unsafe { ffi::tent_destroy_engine(raw) };
+        }
     }
 }
 

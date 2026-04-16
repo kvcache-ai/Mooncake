@@ -480,6 +480,13 @@ Port roles stay the same across backends:
 - `client_server_address` is the dummy compatibility gRPC port
 - `metrics_addr` / `MC_STORE_RS_METRICS_ADDR` is the Prometheus `/metrics` listener
 
+Backend reconnect behavior:
+
+- when Redis metadata connectivity returns, the heartbeat recovery path republishes both store metadata and transport metadata
+- `classic_te` repairs fresh Redis restarts by recreating its engine and republishing local buffers
+- `tent` repairs fresh Redis restarts by recreating its engine and re-registering the local buffers it still owns
+- the process must remain alive across the outage for automatic recovery; a dead client still needs normal restart and lease takeover semantics
+
 ## Routing Modes
 
 ### `EmbeddedWrh`
