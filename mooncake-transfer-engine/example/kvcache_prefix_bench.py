@@ -32,6 +32,7 @@ import signal
 import statistics
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def parse_args():
@@ -101,6 +102,13 @@ def parse_args():
     )
     parser.add_argument(
         "--gpu_id", type=int, default=0, help="GPU device ID (default: 0)"
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="Number of threads for concurrent transfer (default: 1). "
+        "Each thread transfers a chunk of the prefix in parallel.",
     )
     return parser.parse_args()
 
@@ -222,6 +230,7 @@ def run_initiator(args):
     print(f"Pool size: {args.pool_size_gb} GB")
     print(f"Protocol: {args.protocol}")
     print(f"KV bytes/token: {args.kv_bytes_per_token}")
+    print(f"Threads: {args.threads}")
 
     if not args.target_server_name:
         raise RuntimeError("--target_server_name required in initiator mode")
@@ -283,6 +292,34 @@ def run_initiator(args):
         )
     print("  Connection ready.")
 
+    num_threads = args.threads
+
+    def do_transfer(local_addr, remote_addr_with_offset, size):
+        """Single transfer_sync_read call, suitable for thread pool."""
+        return engine.transfer_sync_read(
+            args.target_server_name, local_addr,
+            remote_addr_with_offset, size
+        )
+
+    def threaded_transfer(local_base, remote_base, total_size, pool):
+        """Split transfer across threads; return max of 0 (ok) or error code."""
+        if num_threads <= 1:
+            return engine.transfer_sync_read(
+                args.target_server_name, local_base, remote_base, total_size
+            )
+        chunk = total_size // num_threads
+        # Align chunk to 4KB
+        chunk = chunk & ~0xFFF
+        futures = []
+        for t in range(num_threads):
+            off = t * chunk
+            sz = chunk if t < num_threads - 1 else (total_size - off)
+            futures.append(
+                pool.submit(do_transfer, local_base + off,
+                            remote_base + off, sz)
+            )
+        return max(f.result() for f in futures)
+
     # Run benchmarks
     print(f"\n{'='*72}")
     print(
@@ -292,7 +329,8 @@ def run_initiator(args):
     print(f"{'='*72}")
 
     results = []
-    for tokens, transfer_size in zip(prefix_tokens_list, transfer_sizes):
+    with ThreadPoolExecutor(max_workers=num_threads) as pool:
+      for tokens, transfer_size in zip(prefix_tokens_list, transfer_sizes):
         if transfer_size > recv_bytes:
             print(f"  SKIP {tokens} tokens: transfer {transfer_size} > recv buffer")
             continue
@@ -307,9 +345,8 @@ def run_initiator(args):
                     offset = ((i * transfer_size) % max_offset) & ~0xFFF
                 else:
                     offset = 0
-                ret = engine.transfer_sync_read(
-                    args.target_server_name, recv_addr,
-                    remote_addr + offset, transfer_size
+                ret = threaded_transfer(
+                    recv_addr, remote_addr + offset, transfer_size, pool
                 )
                 if ret != 0:
                     print(f"  WARNING: warmup transfer failed: {ret}")
@@ -328,11 +365,8 @@ def run_initiator(args):
                 offset = 0
 
             t0 = time.perf_counter()
-            ret = engine.transfer_sync_read(
-                args.target_server_name,
-                recv_addr,
-                remote_addr + offset,
-                transfer_size,
+            ret = threaded_transfer(
+                recv_addr, remote_addr + offset, transfer_size, pool
             )
             elapsed = time.perf_counter() - t0
 
@@ -372,6 +406,7 @@ def run_initiator(args):
                 "p50_latency_ms": round(p50_ms, 3),
                 "p99_latency_ms": round(p99_ms, 3),
                 "throughput_gbs": round(throughput_gbs, 3),
+                "threads": num_threads,
             }
         )
 
@@ -379,13 +414,14 @@ def run_initiator(args):
 
     # Summary
     if results:
-        print(f"\n=== Summary (pool_size={args.pool_size_gb}GB) ===")
+        print(f"\n=== Summary (pool_size={args.pool_size_gb}GB, threads={num_threads}) ===")
         print(json.dumps(results, indent=2))
 
         # Save results
+        thr_tag = f"_t{num_threads}" if num_threads > 1 else ""
         out_file = (
             f"kvcache_bench_pool{args.pool_size_gb}gb"
-            f"{'_gpu' if args.use_gpu else '_cpu'}.json"
+            f"{'_gpu' if args.use_gpu else '_cpu'}{thr_tag}.json"
         )
         with open(out_file, "w") as f:
             json.dump(
@@ -394,6 +430,7 @@ def run_initiator(args):
                     "protocol": args.protocol,
                     "use_gpu": args.use_gpu,
                     "kv_bytes_per_token": args.kv_bytes_per_token,
+                    "threads": num_threads,
                     "iterations": args.iterations,
                     "results": results,
                 },
