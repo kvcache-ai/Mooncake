@@ -474,10 +474,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                                       ? globalConfig().max_mr_size
                                       : global_segment_size;
         size_t max_seg_gib = max_segment_size / kGiB;
-        if (max_seg_gib == 0) max_seg_gib = 1;  // max_mr_size < 1 GiB: 1 GiB cap
+        if (max_seg_gib == 0)
+            max_seg_gib = 1;  // max_mr_size < 1 GiB: 1 GiB cap
         size_t total_gib_ceil = (global_segment_size + kGiB - 1) / kGiB;
-        size_t num_segments =
-            std::max<size_t>(1, (total_gib_ceil + max_seg_gib - 1) / max_seg_gib);
+        size_t num_segments = std::max<size_t>(
+            1, (total_gib_ceil + max_seg_gib - 1) / max_seg_gib);
 
         // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
         // and distribute global_segment across them for full NIC utilization.
@@ -498,8 +499,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 
         // Two parallel trackers:
-        //   remaining_gib_ceil — GiB quota (ceil-rounded), drives even splitting
-        //   remaining_bytes    — actual bytes left, determines real segment size
+        //   remaining_gib_ceil — GiB quota (ceil-rounded), drives even
+        //   splitting remaining_bytes    — actual bytes left, determines real
+        //   segment size
         size_t remaining_gib_ceil = total_gib_ceil;
         size_t remaining_bytes = global_segment_size;
         size_t mounted_bytes = 0;
@@ -517,7 +519,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment [" << i + 1 << "/" << num_segments
                       << "]: " << segment_size / kGiB << " GiB"
                       << (segment_size % kGiB
-                              ? " + " + std::to_string(segment_size % kGiB) + " B"
+                              ? " + " + std::to_string(segment_size % kGiB) +
+                                    " B"
                               : std::string{})
                       << " (" << segment_size << " bytes)"
                       << ", " << mounted_bytes << " of " << global_segment_size
