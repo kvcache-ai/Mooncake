@@ -1632,6 +1632,57 @@ def batch_get_tensor_with_tp(self, base_keys: List[str], tp_rank: int = 0, tp_si
 
   - `List[torch.Tensor]`: List of retrieved tensors (or shards). Contains `None` for missing keys.
 
+#### put_tensor_chunk_with_tp()
+
+Put one already-split TP shard under `key_tp_<tp_rank>` and write TP metadata alongside it.
+This API is useful when the caller already owns the sharding plan and wants Mooncake to persist shard placement metadata without reconstructing or re-splitting the full tensor.
+
+```python
+def put_tensor_chunk_with_tp(self, key: str, tensor_chunk: torch.Tensor, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0, full_shape: Optional[List[int]] = None, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+
+  - `key` (str): Base identifier for the logical tensor.
+  - `tensor_chunk` (torch.Tensor): One shard for rank `tp_rank`.
+  - `tp_rank` (int): Writer rank for this shard.
+  - `tp_size` (int): Total writer shard count.
+  - `split_dim` (int): Tensor dimension used for sharding.
+  - `full_shape` (Optional[List[int]]): Full logical tensor shape. Required when the final shard sizes cannot be inferred by `chunk_shape * tp_size`, such as uneven splits.
+  - `config` (ReplicateConfig, optional): Replication configuration for the shard and metadata objects.
+
+**Returns:**
+
+  - `int`: Status code (0 = success, non-zero = error code).
+
+**Metadata written:**
+
+  - `key_tp_<tp_rank>`: the shard payload
+  - `key_tp_<tp_rank>_meta`: `ChunkMetadata(start_idx, size)` for this shard
+  - `key_global_meta`: `GlobalMetadata(dtype, ndim, split_dim, put_tp_size, shape)` written by rank 0
+
+#### batch_put_tensor_chunk_with_tp()
+
+Batch version of `put_tensor_chunk_with_tp()`. Each input tensor is treated as one already-split shard for the same `tp_rank`.
+
+```python
+def batch_put_tensor_chunk_with_tp(self, base_keys: List[str], tensor_chunks: List[torch.Tensor], tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0, full_shapes: Optional[List[List[int]]] = None, config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+
+  - `base_keys` (List[str]): Base identifiers for logical tensors.
+  - `tensor_chunks` (List[torch.Tensor]): One shard per logical tensor.
+  - `tp_rank` (int): Writer rank shared by all input shards.
+  - `tp_size` (int): Total writer shard count.
+  - `split_dim` (int): Tensor dimension used for sharding.
+  - `full_shapes` (Optional[List[List[int]]]): Full logical tensor shapes, one per item. Provide these for uneven splits.
+  - `config` (ReplicateConfig, optional): Replication configuration.
+
+**Returns:**
+
+  - `List[int]`: Per-item status codes.
+
 ---
 #### put_tensor()
 
@@ -2089,6 +2140,52 @@ def batch_put_tensor_with_tp_from(self, base_keys: List[str], buffer_ptrs: List[
 **Returns:**
 
   - `List[int]`: List of status codes for each tensor operation (0 = success, non-zero = error code).
+
+#### put_tensor_chunk_with_tp_from()
+
+Store one serialized TP shard from a registered buffer and write the corresponding TP metadata. The buffer layout must be **\[TensorMetadata\]\[tensor data\]** for the shard itself, not the full logical tensor.
+
+```python
+def put_tensor_chunk_with_tp_from(self, key: str, buffer_ptr: int, size: int, tp_rank: int, tp_size: int = 1, split_dim: int = 0, full_shape: Optional[List[int]] = None, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+
+  - `key` (str): Base identifier for the logical tensor.
+  - `buffer_ptr` (int): Registered buffer pointer containing one serialized shard.
+  - `size` (int): Actual serialized byte length of the shard buffer.
+  - `tp_rank` (int): Writer rank for this shard.
+  - `tp_size` (int): Total writer shard count.
+  - `split_dim` (int): Tensor dimension used for sharding.
+  - `full_shape` (Optional[List[int]]): Full logical tensor shape. Provide this for uneven splits.
+  - `config` (ReplicateConfig, optional): Replication configuration.
+
+**Returns:**
+
+  - `int`: Status code (0 = success, non-zero = error code).
+
+#### batch_put_tensor_chunk_with_tp_from()
+
+Batch version of `put_tensor_chunk_with_tp_from()`. Each buffer contains one serialized shard in **\[TensorMetadata\]\[tensor data\]** layout.
+
+```python
+def batch_put_tensor_chunk_with_tp_from(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int, tp_size: int = 1, split_dim: int = 0, full_shapes: Optional[List[List[int]]] = None, config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+
+  - `base_keys` (List[str]): Base identifiers for logical tensors.
+  - `buffer_ptrs` (List[int]): Registered buffer pointers, one shard per item.
+  - `sizes` (List[int]): Actual serialized byte lengths for each shard buffer.
+  - `tp_rank` (int): Writer rank shared by all input shards.
+  - `tp_size` (int): Total writer shard count.
+  - `split_dim` (int): Tensor dimension used for sharding.
+  - `full_shapes` (Optional[List[List[int]]]): Full logical tensor shapes, one per item. Provide these for uneven splits.
+  - `config` (ReplicateConfig, optional): Replication configuration.
+
+**Returns:**
+
+  - `List[int]`: Per-item status codes.
 
 ---
 

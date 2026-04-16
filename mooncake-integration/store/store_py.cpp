@@ -240,6 +240,15 @@ std::vector<std::vector<void *>> CastAddrs2Ptrs(
     return all_buffers;
 }
 
+std::vector<void *> CastAddrs2Ptrs(const std::vector<uintptr_t> &buffer_ptrs) {
+    std::vector<void *> buffers;
+    buffers.reserve(buffer_ptrs.size());
+    for (uintptr_t ptr : buffer_ptrs) {
+        buffers.push_back(reinterpret_cast<void *>(ptr));
+    }
+    return buffers;
+}
+
 // Helper function to convert ErrorCode to Python return value
 // ErrorCode values are already negative, so just cast to int
 inline int to_py_ret(ErrorCode error_code) {
@@ -349,6 +358,146 @@ class MooncakeStorePyWrapper {
             shard_keys.push_back(get_tp_key_name(key, tp_rank));
         }
         return batch_get_tensor(shard_keys);
+    }
+
+    std::string get_chunk_meta_key_name(const std::string &base_key, int rank) {
+        return get_tp_key_name(base_key, rank) + "_meta";
+    }
+
+    std::string get_global_meta_key_name(const std::string &base_key) {
+        return base_key + "_global_meta";
+    }
+
+    static std::pair<int64_t, int64_t> calculate_chunk_range(int64_t dim_size,
+                                                             int tp_rank,
+                                                             int tp_size) {
+        int64_t base = dim_size / tp_size;
+        int extra = dim_size % tp_size;
+        int64_t start_idx = base * tp_rank + std::min(tp_rank, extra);
+        int64_t size = base + (tp_rank < extra ? 1 : 0);
+        return {start_idx, size};
+    }
+
+    static void batch_put_metadata_and_update_results(
+        PyClient *store, const std::vector<std::string> &meta_keys,
+        const std::vector<void *> &meta_buffers,
+        const std::vector<size_t> &meta_sizes,
+        const std::vector<size_t> &meta_indices, std::vector<int> &results,
+        const ReplicateConfig &config) {
+        if (meta_keys.empty()) return;
+
+        std::vector<std::span<const char>> meta_spans;
+        meta_spans.reserve(meta_keys.size());
+        for (size_t i = 0; i < meta_keys.size(); ++i) {
+            meta_spans.emplace_back(
+                reinterpret_cast<const char *>(meta_buffers[i]), meta_sizes[i]);
+        }
+
+        int meta_ret;
+        {
+            py::gil_scoped_release release_gil;
+            meta_ret = store->put_batch(meta_keys, meta_spans, config);
+        }
+        if (meta_ret != 0) {
+            for (size_t j = 0; j < meta_indices.size(); ++j) {
+                results[meta_indices[j]] = meta_ret;
+            }
+        }
+    }
+
+    static void calculate_full_shape(
+        const TensorMetadata &chunk_meta, int split_dim, int tp_size,
+        const std::optional<std::vector<int64_t>> &full_shape_arg,
+        int64_t full_shape[4]) {
+        if (full_shape_arg.has_value()) {
+            const auto &arg_shape = full_shape_arg.value();
+            if (arg_shape.size() != static_cast<size_t>(chunk_meta.ndim)) {
+                throw std::runtime_error("Provided full_shape dim mismatch");
+            }
+            for (int i = 0; i < 4; ++i) {
+                full_shape[i] = (i < chunk_meta.ndim) ? arg_shape[i] : -1;
+            }
+        } else {
+            for (int i = 0; i < chunk_meta.ndim; i++) {
+                if (i == split_dim && split_dim >= 0 &&
+                    split_dim < chunk_meta.ndim) {
+                    full_shape[i] = chunk_meta.shape[i] * tp_size;
+                } else {
+                    full_shape[i] = chunk_meta.shape[i];
+                }
+            }
+            for (int i = chunk_meta.ndim; i < 4; ++i) {
+                full_shape[i] = -1;
+            }
+        }
+    }
+
+    static GlobalMetadata create_global_metadata(
+        const TensorMetadata &tensor_meta, int split_dim, int put_tp_size,
+        const int64_t *full_shape) {
+        GlobalMetadata global_meta;
+        global_meta.dtype = tensor_meta.dtype;
+        global_meta.ndim = tensor_meta.ndim;
+        global_meta.split_dim = split_dim;
+        global_meta.put_tp_size = put_tp_size;
+        for (int i = 0; i < 4; i++) {
+            global_meta.shape[i] = full_shape[i];
+        }
+        return global_meta;
+    }
+
+    int store_tensor_tp_metadata(
+        const std::string &logical_key, int put_tp_rank, int put_tp_size,
+        int split_dim, const TensorMetadata &tensor_meta,
+        const int64_t *full_shape,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        int64_t dim_size = full_shape[split_dim];
+        auto [start_idx, calculated_size] =
+            calculate_chunk_range(dim_size, put_tp_rank, put_tp_size);
+        (void)calculated_size;
+        int64_t chunk_size = tensor_meta.shape[split_dim];
+
+        ChunkMetadata chunk_meta{start_idx, chunk_size};
+
+        std::string chunk_meta_key =
+            get_chunk_meta_key_name(logical_key, put_tp_rank);
+        int ret;
+        {
+            py::gil_scoped_release release_gil;
+            ret = store_->put(chunk_meta_key,
+                              std::span<const char>(
+                                  reinterpret_cast<const char *>(&chunk_meta),
+                                  sizeof(ChunkMetadata)),
+                              config);
+        }
+        if (ret != 0) {
+            LOG(ERROR) << "Failed to store chunk metadata for rank "
+                       << put_tp_rank;
+            return ret;
+        }
+
+        if (put_tp_rank == 0) {
+            GlobalMetadata global_meta = create_global_metadata(
+                tensor_meta, split_dim, put_tp_size, full_shape);
+            std::string global_meta_key = get_global_meta_key_name(logical_key);
+
+            {
+                py::gil_scoped_release release_gil;
+                ret = store_->put(
+                    global_meta_key,
+                    std::span<const char>(
+                        reinterpret_cast<const char *>(&global_meta),
+                        sizeof(GlobalMetadata)),
+                    config);
+            }
+
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to store global metadata, ret=" << ret;
+                return ret;
+            }
+        }
+
+        return 0;
     }
 
     pybind11::object get_tensor(const std::string &key) {
@@ -563,6 +712,62 @@ class MooncakeStorePyWrapper {
                                ReplicateConfig{});  // Default config
     }
 
+    int put_tensor_chunk_with_tp(
+        const std::string &logical_key, pybind11::object tensor_chunk,
+        int put_tp_rank, int put_tp_size = 1, int split_dim = 0,
+        const std::optional<std::vector<int64_t>> &full_shape_arg =
+            std::nullopt,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        if (!tensor_chunk.attr("is_contiguous")().cast<bool>()) {
+            tensor_chunk = tensor_chunk.attr("contiguous")();
+        }
+
+        if (put_tp_size <= 1) {
+            return put_tensor(logical_key, tensor_chunk);
+        }
+        if (put_tp_rank < 0 || put_tp_rank >= put_tp_size) {
+            LOG(ERROR) << "Invalid put_tp_rank: " << put_tp_rank
+                       << ", must be in range [0, " << put_tp_size << ")";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        auto info = extract_tensor_info(tensor_chunk, logical_key);
+        if (!info.valid()) {
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        int64_t full_shape[4] = {0};
+        try {
+            calculate_full_shape(info.metadata, split_dim, put_tp_size,
+                                 full_shape_arg, full_shape);
+        } catch (const std::exception &e) {
+            LOG(ERROR) << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        std::string chunk_key = get_tp_key_name(logical_key, put_tp_rank);
+        int ret = put_tensor_impl(chunk_key, tensor_chunk, config);
+        if (ret != 0) {
+            return ret;
+        }
+
+        ret = store_tensor_tp_metadata(logical_key, put_tp_rank, put_tp_size,
+                                       split_dim, info.metadata, full_shape,
+                                       config);
+        if (ret != 0) {
+            store_->remove(chunk_key);
+            return ret;
+        }
+
+        return 0;
+    }
+
     int put_tensor_with_tp_impl(
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
@@ -578,9 +783,8 @@ class MooncakeStorePyWrapper {
 
             for (int rank = 0; rank < tp_size; ++rank) {
                 pybind11::object chunk = chunks[rank].attr("contiguous")();
-                std::string tp_key = get_tp_key_name(key, rank);
-
-                int ret = put_tensor_impl(tp_key, chunk, config);
+                int ret = put_tensor_chunk_with_tp(
+                    key, chunk, rank, tp_size, split_dim, std::nullopt, config);
                 if (ret != 0) return ret;
             }
             return 0;
@@ -703,14 +907,20 @@ class MooncakeStorePyWrapper {
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(),
                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+        std::vector<PyTensorInfo> tensor_infos(base_keys.size());
+        std::vector<std::vector<int64_t>> chunk_split_sizes(base_keys.size());
 
         try {
-            // Chunking phase (GIL Held)
             for (size_t i = 0; i < base_keys.size(); ++i) {
                 py::object tensor = tensors_list[i];
-                // Quick validation
                 if (tensor.is_none() ||
                     !tensor.attr("shape").cast<py::tuple>()) {
+                    final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+
+                tensor_infos[i] = extract_tensor_info(tensor, base_keys[i]);
+                if (!tensor_infos[i].valid()) {
                     final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
@@ -723,42 +933,259 @@ class MooncakeStorePyWrapper {
                 }
 
                 processed_indices.push_back(i);
+                chunk_split_sizes[i].resize(tp_size);
                 for (int rank = 0; rank < tp_size; ++rank) {
+                    py::object chunk = chunks[rank].attr("contiguous")();
                     all_chunk_keys.push_back(
                         get_tp_key_name(base_keys[i], rank));
-                    all_chunks_list.append(chunks[rank].attr(
-                        "contiguous")());  // Ensure contiguous here
+                    all_chunks_list.append(chunk);
+                    py::tuple chunk_shape = chunk.attr("shape").cast<py::tuple>();
+                    chunk_split_sizes[i][rank] =
+                        chunk_shape[split_dim].cast<int64_t>();
                 }
             }
 
             if (all_chunk_keys.empty()) return final_results;
 
-            // Reuse the standard batch_put implementation
             std::vector<int> chunk_results =
                 batch_put_tensor_impl(all_chunk_keys, all_chunks_list, config);
 
-            // Aggregate results
             for (size_t i = 0; i < processed_indices.size(); ++i) {
                 size_t original_idx = processed_indices[i];
-                bool all_ok = true;
+                final_results[original_idx] = 0;
                 for (int j = 0; j < tp_size; ++j) {
                     int res = chunk_results[i * tp_size + j];
                     if (res != 0) {
-                        final_results[original_idx] = res;  // First error wins
-                        all_ok = false;
+                        final_results[original_idx] = res;
                         break;
                     }
                 }
-                if (all_ok) {
-                    final_results[original_idx] = 0;
+            }
+
+            size_t valid_count = 0;
+            for (size_t idx : processed_indices) {
+                if (final_results[idx] == 0) valid_count++;
+            }
+
+            std::vector<ChunkMetadata> chunk_meta_storage;
+            std::vector<std::string> chunk_meta_keys;
+            std::vector<void *> chunk_meta_buffers;
+            std::vector<size_t> chunk_meta_sizes;
+            std::vector<size_t> chunk_meta_indices;
+            chunk_meta_storage.reserve(valid_count * tp_size);
+
+            for (size_t idx : processed_indices) {
+                if (final_results[idx] != 0) continue;
+
+                int64_t dim_size = tensor_infos[idx].metadata.shape[split_dim];
+                for (int rank = 0; rank < tp_size; ++rank) {
+                    auto [start_idx, calculated_size] =
+                        calculate_chunk_range(dim_size, rank, tp_size);
+                    (void)calculated_size;
+                    int64_t chunk_size = chunk_split_sizes[idx][rank];
+
+                    chunk_meta_storage.push_back(
+                        ChunkMetadata{start_idx, chunk_size});
+                    chunk_meta_keys.push_back(
+                        get_chunk_meta_key_name(base_keys[idx], rank));
+                    chunk_meta_buffers.push_back(&chunk_meta_storage.back());
+                    chunk_meta_sizes.push_back(sizeof(ChunkMetadata));
+                    chunk_meta_indices.push_back(idx);
                 }
             }
+
+            batch_put_metadata_and_update_results(
+                store_.get(), chunk_meta_keys, chunk_meta_buffers,
+                chunk_meta_sizes, chunk_meta_indices, final_results, config);
+
+            std::vector<GlobalMetadata> global_meta_storage;
+            std::vector<std::string> global_meta_keys;
+            std::vector<void *> global_meta_buffers;
+            std::vector<size_t> global_meta_sizes;
+            std::vector<size_t> global_meta_indices;
+            global_meta_storage.reserve(valid_count);
+
+            for (size_t idx : processed_indices) {
+                if (final_results[idx] != 0) continue;
+
+                global_meta_storage.push_back(create_global_metadata(
+                    tensor_infos[idx].metadata, split_dim, tp_size,
+                    tensor_infos[idx].metadata.shape));
+                global_meta_keys.push_back(
+                    get_global_meta_key_name(base_keys[idx]));
+                global_meta_buffers.push_back(&global_meta_storage.back());
+                global_meta_sizes.push_back(sizeof(GlobalMetadata));
+                global_meta_indices.push_back(idx);
+            }
+
+            batch_put_metadata_and_update_results(
+                store_.get(), global_meta_keys, global_meta_buffers,
+                global_meta_sizes, global_meta_indices, final_results, config);
 
         } catch (const std::exception &e) {
             LOG(ERROR) << "Batch put with TP failed: " << e.what();
         }
 
         return final_results;
+    }
+
+    std::vector<int> batch_put_tensor_chunk_with_tp(
+        const std::vector<std::string> &base_keys,
+        const pybind11::list &tensor_chunks, int tp_rank = 0, int tp_size = 1,
+        int split_dim = 0,
+        const std::optional<std::vector<std::vector<int64_t>>> &full_shapes_arg =
+            std::nullopt,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (base_keys.size() != tensor_chunks.size()) {
+            if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        if (full_shapes_arg.has_value() &&
+            full_shapes_arg->size() != base_keys.size()) {
+            LOG(ERROR) << "Size mismatch: full_shapes must match keys size";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        if (tp_size <= 1) {
+            return batch_put_tensor_impl(base_keys, tensor_chunks, config);
+        }
+
+        if (tp_rank < 0 || tp_rank >= tp_size) {
+            LOG(ERROR) << "Invalid put_tp_rank: " << tp_rank
+                       << ", must be in range [0, " << tp_size << ")";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        const size_t num_keys = base_keys.size();
+        if (num_keys == 0) {
+            return std::vector<int>();
+        }
+
+        std::vector<int> results(num_keys, 0);
+        std::vector<PyTensorInfo> infos(num_keys);
+        std::vector<pybind11::object> contiguous_tensors;
+        contiguous_tensors.reserve(num_keys);
+
+        for (size_t i = 0; i < num_keys; ++i) {
+            pybind11::object tensor_chunk = tensor_chunks[i].cast<py::object>();
+
+            if (!tensor_chunk.attr("is_contiguous")().cast<bool>()) {
+                tensor_chunk = tensor_chunk.attr("contiguous")();
+            }
+            contiguous_tensors.push_back(tensor_chunk);
+
+            infos[i] = extract_tensor_info(tensor_chunk, base_keys[i]);
+            if (!infos[i].valid()) {
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+        }
+
+        std::vector<std::array<int64_t, 4>> full_shapes(num_keys);
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (!infos[i].valid()) continue;
+
+            std::optional<std::vector<int64_t>> single_full_shape_arg;
+            if (full_shapes_arg.has_value()) {
+                single_full_shape_arg = (*full_shapes_arg)[i];
+            }
+            try {
+                calculate_full_shape(infos[i].metadata, split_dim, tp_size,
+                                     single_full_shape_arg,
+                                     full_shapes[i].data());
+            } catch (const std::exception &e) {
+                LOG(ERROR) << "Provided full_shape dim mismatch for key: "
+                           << base_keys[i];
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+        }
+
+        std::vector<std::string> chunk_keys;
+        pybind11::list valid_chunks;
+        std::vector<size_t> valid_indices;
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (infos[i].valid() && results[i] == 0) {
+                chunk_keys.push_back(get_tp_key_name(base_keys[i], tp_rank));
+                valid_chunks.append(contiguous_tensors[i]);
+                valid_indices.push_back(i);
+            }
+        }
+
+        if (!valid_chunks.empty()) {
+            std::vector<int> chunk_put_results =
+                batch_put_tensor_impl(chunk_keys, valid_chunks, config);
+            for (size_t j = 0; j < valid_indices.size(); ++j) {
+                results[valid_indices[j]] = chunk_put_results[j];
+            }
+        }
+
+        std::vector<std::string> chunk_meta_keys;
+        std::vector<void *> chunk_meta_buffers;
+        std::vector<size_t> chunk_meta_sizes;
+        std::vector<size_t> chunk_meta_indices;
+        std::vector<ChunkMetadata> chunk_meta_storage;
+        chunk_meta_storage.reserve(num_keys);
+
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (!infos[i].valid() || results[i] != 0) continue;
+
+            int64_t dim_size = full_shapes[i][split_dim];
+            auto [start_idx, calculated_size] =
+                calculate_chunk_range(dim_size, tp_rank, tp_size);
+            (void)calculated_size;
+            int64_t chunk_size = infos[i].metadata.shape[split_dim];
+
+            chunk_meta_storage.push_back(ChunkMetadata{start_idx, chunk_size});
+
+            chunk_meta_keys.push_back(
+                get_chunk_meta_key_name(base_keys[i], tp_rank));
+            chunk_meta_buffers.push_back(&chunk_meta_storage.back());
+            chunk_meta_sizes.push_back(sizeof(ChunkMetadata));
+            chunk_meta_indices.push_back(i);
+        }
+
+        batch_put_metadata_and_update_results(
+            store_.get(), chunk_meta_keys, chunk_meta_buffers, chunk_meta_sizes,
+            chunk_meta_indices, results, config);
+
+        if (tp_rank == 0) {
+            std::vector<std::string> global_meta_keys;
+            std::vector<void *> global_meta_buffers;
+            std::vector<size_t> global_meta_sizes;
+            std::vector<size_t> global_meta_indices;
+            std::vector<GlobalMetadata> global_meta_storage;
+            global_meta_storage.reserve(num_keys);
+
+            for (size_t i = 0; i < num_keys; ++i) {
+                if (!infos[i].valid() || results[i] != 0) continue;
+
+                global_meta_storage.push_back(
+                    create_global_metadata(infos[i].metadata, split_dim,
+                                           tp_size, full_shapes[i].data()));
+
+                global_meta_keys.push_back(
+                    get_global_meta_key_name(base_keys[i]));
+                global_meta_buffers.push_back(&global_meta_storage.back());
+                global_meta_sizes.push_back(sizeof(GlobalMetadata));
+                global_meta_indices.push_back(i);
+            }
+
+            batch_put_metadata_and_update_results(
+                store_.get(), global_meta_keys, global_meta_buffers,
+                global_meta_sizes, global_meta_indices, results, config);
+        }
+
+        return results;
     }
 
     std::vector<int> batch_put_tensor_with_tp(
@@ -864,28 +1291,220 @@ class MooncakeStorePyWrapper {
                 << "put_tensor_with_tp_from is not supported for dummy client";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (buffer_ptr == 0) {
-            LOG(ERROR) << "Buffer pointer cannot be null";
+        if (tp_size <= 1) {
+            return put_tensor_from(key, buffer_ptr, size);
+        }
+        py::object tensor = decode_serialized_tensor_buffer(
+            buffer_ptr, size, "put_tensor_with_tp_from");
+        if (tensor.is_none()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (size <= sizeof(TensorMetadata)) {
-            LOG(ERROR) << "Buffer size too small for tensor metadata";
+        return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
+                                       tp_size, split_dim);
+    }
+
+    int put_tensor_chunk_with_tp_from(
+        const std::string &key, uintptr_t buffer_ptr, size_t size, int tp_rank,
+        int tp_size = 1, int split_dim = 0,
+        const std::optional<std::vector<int64_t>> &full_shape_arg =
+            std::nullopt,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (use_dummy_client_) {
+            LOG(ERROR) << "put_tensor_chunk_with_tp_from is not supported for "
+                          "dummy client";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         if (tp_size <= 1) {
             return put_tensor_from(key, buffer_ptr, size);
         }
-
-        pybind11::object tensor =
-            buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
-                             static_cast<int64_t>(size));
-        if (tensor.is_none()) {
-            LOG(ERROR) << "Failed to decode full tensor buffer for "
-                          "put_tensor_with_tp_from";
+        if (buffer_ptr == 0 || size <= sizeof(TensorMetadata)) {
+            LOG(ERROR) << "Invalid buffer for put_tensor_chunk_with_tp_from";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
-                                       tp_size, split_dim);
+        if (tp_rank < 0 || tp_rank >= tp_size) {
+            LOG(ERROR) << "Invalid tp_rank: " << tp_rank;
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        TensorMetadata tensor_meta;
+        memcpy(&tensor_meta, reinterpret_cast<const void *>(buffer_ptr),
+               sizeof(TensorMetadata));
+
+        int64_t full_shape[4] = {0};
+        try {
+            calculate_full_shape(tensor_meta, split_dim, tp_size,
+                                 full_shape_arg, full_shape);
+        } catch (const std::exception &e) {
+            LOG(ERROR) << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        std::string tp_key = get_tp_key_name(key, tp_rank);
+        int ret;
+        {
+            py::gil_scoped_release release_gil;
+            ret = store_->put_from(tp_key, reinterpret_cast<void *>(buffer_ptr),
+                                   size, config);
+        }
+        if (ret != 0) return ret;
+
+        ret = store_tensor_tp_metadata(key, tp_rank, tp_size, split_dim,
+                                       tensor_meta, full_shape, config);
+        if (ret != 0) {
+            store_->remove(tp_key);
+            return ret;
+        }
+
+        return 0;
+    }
+
+    std::vector<int> batch_put_tensor_chunk_with_tp_from(
+        const std::vector<std::string> &base_keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes, int tp_rank, int tp_size = 1,
+        int split_dim = 0,
+        const std::optional<std::vector<std::vector<int64_t>>> &full_shapes_arg =
+            std::nullopt,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (base_keys.size() != buffer_ptrs.size() ||
+            base_keys.size() != sizes.size()) {
+            LOG(ERROR)
+                << "Size mismatch in batch_put_tensor_chunk_with_tp_from";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (use_dummy_client_) {
+            LOG(ERROR) << "batch_put_tensor_chunk_with_tp_from is not "
+                          "supported for dummy client";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (tp_size <= 1) {
+            return batch_put_tensor_from(base_keys, buffer_ptrs, sizes);
+        }
+        if (tp_rank < 0 || tp_rank >= tp_size) {
+            LOG(ERROR) << "Invalid tp_rank: " << tp_rank;
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (full_shapes_arg.has_value() &&
+            full_shapes_arg->size() != base_keys.size()) {
+            LOG(ERROR) << "Size mismatch: full_shapes must match keys size";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        const size_t num_keys = base_keys.size();
+        if (num_keys == 0) return std::vector<int>();
+
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (buffer_ptrs[i] == 0 || sizes[i] <= sizeof(TensorMetadata)) {
+                LOG(ERROR) << "Invalid buffer at index " << i;
+                return std::vector<int>(num_keys,
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+        }
+
+        std::vector<std::string> chunk_keys;
+        chunk_keys.reserve(num_keys);
+        for (const auto &key : base_keys) {
+            chunk_keys.push_back(get_tp_key_name(key, tp_rank));
+        }
+        std::vector<int> results;
+        {
+            py::gil_scoped_release release_gil;
+            results = store_->batch_put_from(
+                chunk_keys, CastAddrs2Ptrs(buffer_ptrs), sizes, config);
+        }
+
+        std::vector<TensorMetadata> tensor_metas(num_keys);
+        std::vector<std::array<int64_t, 4>> full_shapes(num_keys);
+
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (results[i] != 0) continue;
+            memcpy(&tensor_metas[i], reinterpret_cast<const void *>(buffer_ptrs[i]),
+                   sizeof(TensorMetadata));
+
+            std::optional<std::vector<int64_t>> single_full_shape;
+            if (full_shapes_arg.has_value()) {
+                single_full_shape = (*full_shapes_arg)[i];
+            }
+            try {
+                calculate_full_shape(tensor_metas[i], split_dim, tp_size,
+                                     single_full_shape, full_shapes[i].data());
+            } catch (const std::exception &e) {
+                LOG(ERROR) << e.what();
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+        }
+
+        size_t valid_count = 0;
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (results[i] == 0) valid_count++;
+        }
+
+        std::vector<ChunkMetadata> chunk_meta_storage;
+        std::vector<std::string> chunk_meta_keys;
+        std::vector<void *> chunk_meta_buffers;
+        std::vector<size_t> chunk_meta_sizes;
+        std::vector<size_t> chunk_meta_indices;
+        chunk_meta_storage.reserve(valid_count);
+
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (results[i] != 0) continue;
+            int64_t dim_size = full_shapes[i][split_dim];
+            auto [start_idx, calculated_size] =
+                calculate_chunk_range(dim_size, tp_rank, tp_size);
+            (void)calculated_size;
+            int64_t chunk_size = tensor_metas[i].shape[split_dim];
+
+            chunk_meta_storage.push_back(ChunkMetadata{start_idx, chunk_size});
+            chunk_meta_keys.push_back(
+                get_chunk_meta_key_name(base_keys[i], tp_rank));
+            chunk_meta_buffers.push_back(&chunk_meta_storage.back());
+            chunk_meta_sizes.push_back(sizeof(ChunkMetadata));
+            chunk_meta_indices.push_back(i);
+        }
+
+        batch_put_metadata_and_update_results(
+            store_.get(), chunk_meta_keys, chunk_meta_buffers, chunk_meta_sizes,
+            chunk_meta_indices, results, config);
+
+        if (tp_rank == 0) {
+            std::vector<GlobalMetadata> global_meta_storage;
+            std::vector<std::string> global_meta_keys;
+            std::vector<void *> global_meta_buffers;
+            std::vector<size_t> global_meta_sizes;
+            std::vector<size_t> global_meta_indices;
+            global_meta_storage.reserve(valid_count);
+
+            for (size_t i = 0; i < num_keys; ++i) {
+                if (results[i] != 0) continue;
+                global_meta_storage.push_back(
+                    create_global_metadata(tensor_metas[i], split_dim, tp_size,
+                                           full_shapes[i].data()));
+                global_meta_keys.push_back(
+                    get_global_meta_key_name(base_keys[i]));
+                global_meta_buffers.push_back(&global_meta_storage.back());
+                global_meta_sizes.push_back(sizeof(GlobalMetadata));
+                global_meta_indices.push_back(i);
+            }
+
+            batch_put_metadata_and_update_results(
+                store_.get(), global_meta_keys, global_meta_buffers,
+                global_meta_sizes, global_meta_indices, results, config);
+        }
+
+        return results;
     }
 
     std::vector<int> batch_put_tensor_with_tp_from(
@@ -916,31 +1535,16 @@ class MooncakeStorePyWrapper {
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
-
         py::list tensors_list;
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(), 0);
 
         for (size_t i = 0; i < base_keys.size(); ++i) {
-            if (buffer_ptrs[i] == 0) {
-                LOG(ERROR) << "Buffer pointer at index " << i
-                           << " cannot be null";
-                final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
-            if (sizes[i] <= sizeof(TensorMetadata)) {
-                LOG(ERROR) << "Buffer size at index " << i
-                           << " too small for tensor metadata";
-                final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
-
-            py::object tensor =
-                buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptrs[i]),
-                                 static_cast<int64_t>(sizes[i]));
+            py::object tensor = decode_serialized_tensor_buffer(
+                buffer_ptrs[i], sizes[i],
+                "batch_put_tensor_with_tp_from buffer at index " +
+                    std::to_string(i));
             if (tensor.is_none()) {
-                LOG(ERROR) << "Failed to decode full tensor buffer at index "
-                           << i;
                 final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                 continue;
             }
@@ -1760,6 +2364,22 @@ PYBIND11_MODULE(store, m) {
              py::arg("split_dim") = 0,
              "Put a batch of PyTorch tensors into the store, splitting each "
              "into shards for tensor parallelism.")
+        .def("put_tensor_chunk_with_tp",
+             &MooncakeStorePyWrapper::put_tensor_chunk_with_tp, py::arg("key"),
+             py::arg("tensor_chunk"), py::arg("tp_rank") = 0,
+             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
+             py::arg("full_shape") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Put one tensor-parallel shard and write ChunkMetadata plus "
+             "GlobalMetadata (rank 0 only).")
+        .def("batch_put_tensor_chunk_with_tp",
+             &MooncakeStorePyWrapper::batch_put_tensor_chunk_with_tp,
+             py::arg("base_keys"), py::arg("tensor_chunks"),
+             py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+             py::arg("split_dim") = 0, py::arg("full_shapes") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Put a batch of tensor-parallel shards and write TP metadata for "
+             "each item.")
         .def("put_tensor", &MooncakeStorePyWrapper::put_tensor, py::arg("key"),
              py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def("batch_get_tensor", &MooncakeStorePyWrapper::batch_get_tensor,
@@ -1862,6 +2482,22 @@ PYBIND11_MODULE(store, m) {
              "Put a batch of full tensors directly from pre-allocated "
              "buffers for Tensor Parallelism. Each buffer is internally split "
              "and stored under key_tp_<rank> for all ranks.")
+        .def("put_tensor_chunk_with_tp_from",
+             &MooncakeStorePyWrapper::put_tensor_chunk_with_tp_from,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             py::arg("tp_rank"), py::arg("tp_size") = 1,
+             py::arg("split_dim") = 0, py::arg("full_shape") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Store a serialized tensor shard from a registered buffer and "
+             "write TP metadata.")
+        .def("batch_put_tensor_chunk_with_tp_from",
+             &MooncakeStorePyWrapper::batch_put_tensor_chunk_with_tp_from,
+             py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("tp_rank"), py::arg("tp_size") = 1,
+             py::arg("split_dim") = 0, py::arg("full_shapes") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Store a batch of serialized tensor shards from registered "
+             "buffers and write TP metadata.")
         .def("upsert_tensor", &MooncakeStorePyWrapper::upsert_tensor,
              py::arg("key"), py::arg("tensor"),
              "Upsert a PyTorch tensor into the store (insert or update)")
