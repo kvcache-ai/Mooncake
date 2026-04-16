@@ -605,7 +605,15 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce() -> Result<T, StoreError> + Send + 'static,
     {
-        match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
+        /*
+         * Keep blocking store operations off the caller runtime.
+         *
+         * Dummy gRPC requests run on their own Tokio runtime. If we use the
+         * caller runtime's blocking pool here, canceled or stalled store
+         * requests can poison the dummy server itself and future RPCs stop
+         * reaching `store.get`/`store.put`.
+         */
+        match tokio::time::timeout(timeout, DISPATCHER_RUNTIME.spawn_blocking(f)).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => Err(StoreError::Transport(format!(
                 "store dispatcher worker failed: {error}"
