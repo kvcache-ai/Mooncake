@@ -17,8 +17,8 @@ use dummy_client::DummySession;
 use mooncake_store_client::{
     init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
     start_metrics_http_server, stop_metrics_http_server, MooncakeCompatibilityFacade,
-    MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest,
-    ReplicationPolicy, RouteControlMode,
+    MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest, ReplicationPolicy,
+    RouteControlMode,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
@@ -631,7 +631,10 @@ impl PyMooncakeDistributedStore {
                 }
                 let item_count = items.len();
                 let tenant = tenant.map(str::to_string);
-                let cache_keys = items.iter().map(|(key, _, _)| key.clone()).collect::<Vec<_>>();
+                let cache_keys = items
+                    .iter()
+                    .map(|(key, _, _)| key.clone())
+                    .collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
                 dispatcher
                     .run(move |client| {
@@ -1860,6 +1863,7 @@ mod tests {
             .transport(transport)
             .local_memory(
                 LocalMemoryConfig::new()
+                    .numa_aware(false)
                     .storage_bytes(4 * 1024)
                     .scratch_bytes(4 * 1024)
                     .alignment(1)
@@ -2338,7 +2342,8 @@ mod tests {
         async fn batch_acquire_hot_cache(
             &self,
             _request: tonic::Request<pb::BatchHotCacheAcquireRequest>,
-        ) -> std::result::Result<tonic::Response<pb::BatchHotCacheAcquireReply>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<pb::BatchHotCacheAcquireReply>, tonic::Status>
+        {
             self.wait().await;
             Ok(tonic::Response::new(pb::BatchHotCacheAcquireReply {
                 items: vec![],
@@ -3248,8 +3253,8 @@ mod tests {
         dispatcher
             .register_local_memory()
             .expect("local memory should register");
-        let server =
-            start_dummy_store_server(dispatcher.clone(), &bind_addr()).expect("server should start");
+        let server = start_dummy_store_server(dispatcher.clone(), &bind_addr())
+            .expect("server should start");
         let dummy_one = DummySession::connect(server.address()).expect("dummy one should connect");
         let dummy_two = DummySession::connect(server.address()).expect("dummy two should connect");
         assert!(dummy_one.has_hot_cache_mapping());
@@ -3258,7 +3263,9 @@ mod tests {
         dispatcher
             .run(|client| client.put("alpha", b"one"))
             .expect("put should succeed");
-        let (status, value) = dummy_one.get("alpha", None).expect("first dummy get should work");
+        let (status, value) = dummy_one
+            .get("alpha", None)
+            .expect("first dummy get should work");
         assert_eq!(status, 0);
         assert_eq!(value, b"one");
         assert!(dispatcher.hot_cache_contains("default", "alpha"));
@@ -3819,6 +3826,7 @@ mod tests {
             .transport(transport.clone())
             .local_memory(
                 LocalMemoryConfig::new()
+                    .numa_aware(false)
                     .storage_bytes(4 * 1024)
                     .scratch_bytes(4 * 1024)
                     .alignment(1)

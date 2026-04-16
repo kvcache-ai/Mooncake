@@ -415,16 +415,13 @@ impl StoreClient {
         Ok(self.transport()?.max_registration_bytes().filter(|value| *value > 0))
     }
 
-    fn storage_segment_sizes(&self, storage_bytes: usize) -> Result<Vec<usize>> {
-        let limit = self.storage_segment_chunk_limit()?;
-        let mut remaining = storage_bytes;
-        let mut sizes = Vec::new();
-        while remaining != 0 {
-            let segment_bytes = limit.unwrap_or(remaining).min(remaining);
-            sizes.push(segment_bytes);
-            remaining = remaining.saturating_sub(segment_bytes);
-        }
-        Ok(sizes)
+    fn storage_segment_plans(
+        &self,
+        storage_bytes: usize,
+    ) -> Result<Vec<crate::memory::LocalRegionPlan>> {
+        let mut config = self.local_memory.clone();
+        config.storage_bytes = storage_bytes;
+        config.storage_region_plans(self.storage_segment_chunk_limit()?)
     }
 
     fn ensure_local_memory(&self) -> Result<()> {
@@ -433,10 +430,16 @@ impl StoreClient {
         }
         let transport = self.transport()?;
         let primary_segment = self.segment_name()?;
-        let storage_segments = self.storage_segment_sizes(self.local_memory.storage_bytes)?;
-        let primary_storage_bytes = storage_segments.first().copied().unwrap_or(0);
+        let storage_segments = self.storage_segment_plans(self.local_memory.storage_bytes)?;
+        let primary_segment_plan = storage_segments.first().cloned();
         let mut initial_config = self.local_memory.clone();
-        initial_config.storage_bytes = primary_storage_bytes;
+        initial_config.storage_bytes = primary_segment_plan
+            .as_ref()
+            .map(|plan| plan.capacity_bytes)
+            .unwrap_or(0);
+        if let Some(plan) = &primary_segment_plan {
+            initial_config.location = plan.location.clone();
+        }
         let memory = LocalMemoryState::register(transport, &primary_segment, &initial_config)?;
         let primary = memory
             .storage_segments()
@@ -455,7 +458,7 @@ impl StoreClient {
         if let Some(primary) = primary {
             self.publish_local_segment(&primary, 0)?;
         }
-        for segment_bytes in storage_segments.into_iter().skip(1) {
+        for plan in storage_segments.into_iter().skip(1) {
             let segment_name = {
                 let mut state = self.state.lock();
                 state.next_segment_name(&primary_segment)
@@ -467,10 +470,10 @@ impl StoreClient {
                     local_transport.as_ref(),
                     StorageSegmentSpec {
                         segment_name: segment_name.clone(),
-                        capacity_bytes: segment_bytes,
+                        capacity_bytes: plan.capacity_bytes,
                         state: SegmentLifecycleState::Active,
                         tags: self.local_memory.tags.clone(),
-                        location: self.local_memory.location.clone(),
+                        location: plan.location,
                         alignment: self.local_memory.alignment,
                         hugepage_enabled: self.local_memory.hugepage_enabled,
                         hugepage_size_bytes: self.local_memory.hugepage_size_bytes,

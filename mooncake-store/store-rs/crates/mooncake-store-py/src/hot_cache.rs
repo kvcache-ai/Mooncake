@@ -73,7 +73,11 @@ fn positive_usize_env(name: &str) -> EnvValue {
         return EnvValue::Missing;
     };
     let invalid = || {
-        warn!(name, value = raw, "invalid local hot cache env, disabling override");
+        warn!(
+            name,
+            value = raw,
+            "invalid local hot cache env, disabling override"
+        );
         EnvValue::Invalid
     };
     if raw.starts_with('-') {
@@ -169,7 +173,6 @@ impl LocalHotCache {
             }),
         })
     }
-
 
     pub(crate) fn duplicate_shm_fd(&self) -> Result<Option<(OwnedFd, usize)>> {
         let CacheBacking::Shm { base, len } = self.backing else {

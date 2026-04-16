@@ -284,10 +284,17 @@ impl StoreTransport for TentEngine {
 }
 
 #[derive(Clone, Debug)]
+enum ClassicAllocationOwner {
+    Borrowed,
+    Posix,
+    Numa,
+}
+
+#[derive(Clone, Debug)]
 struct ClassicAllocationRecord {
     location: String,
     size: usize,
-    owned: bool,
+    owner: ClassicAllocationOwner,
 }
 
 pub struct ClassicTeTransport {
@@ -340,6 +347,11 @@ impl ClassicTeTransport {
         for_each_registration_chunk(addr, size, self.max_registration_bytes, |chunk_addr, _| {
             engine.unregister_local_memory(chunk_addr)
         })
+    }
+
+    fn buffer_location(&self, base: u64, length: u64) -> String {
+        let allocations = self.allocations.lock();
+        classic_buffer_location(&allocations, base, length)
     }
 
     fn rebuild_engine_for_metadata_recovery(&self) -> Result<()> {
@@ -398,7 +410,7 @@ impl StoreTransport for ClassicTeTransport {
             .map(|(base, length)| SegmentBuffer {
                 base,
                 length,
-                location: "cpu:0".to_string(),
+                location: self.buffer_location(base, length),
             })
             .collect::<Vec<_>>();
         Ok(SegmentInfo {
@@ -418,26 +430,32 @@ impl StoreTransport for ClassicTeTransport {
             .or_insert_with(|| ClassicAllocationRecord {
                 location: location.to_string(),
                 size: _size,
-                owned: false,
+                owner: ClassicAllocationOwner::Borrowed,
             });
         Ok(())
     }
 
     fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void> {
-        let alignment = default_classic_alignment();
-        let mut addr = std::ptr::null_mut();
-        let rc = unsafe { libc::posix_memalign(&mut addr, alignment, size.max(1)) };
-        if rc != 0 {
-            return Err(StoreError::Allocator(format!(
-                "classic posix_memalign failed with rc={rc} size={size} alignment={alignment}"
-            )));
-        }
+        let (addr, owner) = match try_allocate_classic_numa_memory(size, location)? {
+            Some((addr, owner)) => (addr, owner),
+            None => {
+                let alignment = default_classic_alignment();
+                let mut addr = std::ptr::null_mut();
+                let rc = unsafe { libc::posix_memalign(&mut addr, alignment, size.max(1)) };
+                if rc != 0 {
+                    return Err(StoreError::Allocator(format!(
+                        "classic posix_memalign failed with rc={rc} size={size} alignment={alignment}"
+                    )));
+                }
+                (addr, ClassicAllocationOwner::Posix)
+            }
+        };
         self.allocations.lock().insert(
             addr as usize,
             ClassicAllocationRecord {
                 location: location.to_string(),
                 size,
-                owned: true,
+                owner,
             },
         );
         Ok(addr)
@@ -458,10 +476,17 @@ impl StoreTransport for ClassicTeTransport {
                     addr
                 ))
             })?;
-        if record.owned {
-            unsafe { libc::free(addr) };
+        match record.owner {
+            ClassicAllocationOwner::Borrowed => Ok(()),
+            ClassicAllocationOwner::Posix => {
+                unsafe { libc::free(addr) };
+                Ok(())
+            }
+            ClassicAllocationOwner::Numa => {
+                classic_numa_free(addr, record.size);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
@@ -472,7 +497,7 @@ impl StoreTransport for ClassicTeTransport {
                 .or_insert_with(|| ClassicAllocationRecord {
                     location: "cpu:0".to_string(),
                     size,
-                    owned: false,
+                    owner: ClassicAllocationOwner::Borrowed,
                 })
                 .location
                 .clone()
@@ -513,6 +538,104 @@ fn default_classic_alignment() -> usize {
         4096
     } else {
         usize::try_from(page).unwrap_or(4096).max(64)
+    }
+}
+
+fn try_allocate_classic_numa_memory(
+    size: usize,
+    location: &str,
+) -> Result<Option<(*mut c_void, ClassicAllocationOwner)>> {
+    let Some(node) = parse_classic_cpu_location(location) else {
+        return Ok(None);
+    };
+    #[cfg(target_os = "linux")]
+    {
+        if !classic_numa_available() {
+            if node == 0 {
+                return Ok(None);
+            }
+            return Err(StoreError::Allocator(format!(
+                "NUMA is unavailable; cannot allocate classic transport memory on {location}"
+            )));
+        }
+        let node_count = unsafe { classic_linux_numa::numa_num_configured_nodes() };
+        if node >= node_count {
+            return Err(StoreError::Allocator(format!(
+                "NUMA node {node} is out of range for location {location}"
+            )));
+        }
+        let addr = unsafe { classic_linux_numa::numa_alloc_onnode(size.max(1), node) };
+        if addr.is_null() {
+            return Err(StoreError::Allocator(format!(
+                "classic numa_alloc_onnode failed for location {location} size={size}"
+            )));
+        }
+        return Ok(Some((addr, ClassicAllocationOwner::Numa)));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = size;
+        let _ = location;
+        Ok(None)
+    }
+}
+
+fn parse_classic_cpu_location(location: &str) -> Option<i32> {
+    let node = location.strip_prefix("cpu:")?.parse::<i32>().ok()?;
+    (node >= 0).then_some(node)
+}
+
+fn classic_buffer_location(
+    allocations: &BTreeMap<usize, ClassicAllocationRecord>,
+    base: u64,
+    length: u64,
+) -> String {
+    let Some(start) = usize::try_from(base).ok() else {
+        return "*".to_string();
+    };
+    let Some(len) = usize::try_from(length).ok() else {
+        return "*".to_string();
+    };
+    let Some(end) = start.checked_add(len) else {
+        return "*".to_string();
+    };
+    allocations
+        .range(..=start)
+        .next_back()
+        .and_then(|(allocation_base, record)| {
+            let allocation_end = allocation_base.checked_add(record.size)?;
+            (end <= allocation_end).then(|| record.location.clone())
+        })
+        .unwrap_or_else(|| "*".to_string())
+}
+
+fn classic_numa_free(addr: *mut c_void, size: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        classic_linux_numa::numa_free(addr, size.max(1));
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        libc::free(addr);
+        let _ = size;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classic_numa_available() -> bool {
+    unsafe { classic_linux_numa::numa_available() >= 0 }
+}
+
+#[cfg(target_os = "linux")]
+mod classic_linux_numa {
+    use std::ffi::c_void;
+
+    #[link(name = "numa")]
+    extern "C" {
+        pub fn numa_available() -> i32;
+        pub fn numa_num_configured_nodes() -> i32;
+        pub fn numa_alloc_onnode(size: usize, node: i32) -> *mut c_void;
+        pub fn numa_free(mem: *mut c_void, size: usize);
     }
 }
 
@@ -598,7 +721,7 @@ pub(crate) fn wait_for_batch_completion_detailed(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::ffi::c_void;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -608,8 +731,9 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        parse_rpc_server_address, registration_chunks, wait_for_batch_completion,
-        wait_for_batch_completion_detailed, BatchWaitFailureKind, StoreTransport,
+        classic_buffer_location, parse_rpc_server_address, registration_chunks,
+        wait_for_batch_completion, wait_for_batch_completion_detailed, BatchWaitFailureKind,
+        ClassicAllocationOwner, ClassicAllocationRecord, StoreTransport,
     };
 
     struct ScriptedTransport {
@@ -910,5 +1034,22 @@ mod tests {
         let chunks = registration_chunks(std::ptr::null_mut(), 0, Some(4))
             .expect("zero-length registration should succeed");
         assert_eq!(chunks, vec![(std::ptr::null_mut(), 0)]);
+    }
+
+    #[test]
+    fn classic_buffer_location_resolves_owned_ranges_without_fake_cpu0() {
+        let allocations = BTreeMap::from([(
+            0x1000usize,
+            ClassicAllocationRecord {
+                location: "cpu:1".to_string(),
+                size: 0x100,
+                owner: ClassicAllocationOwner::Borrowed,
+            },
+        )]);
+
+        assert_eq!(classic_buffer_location(&allocations, 0x1000, 0x80), "cpu:1");
+        assert_eq!(classic_buffer_location(&allocations, 0x1080, 0x80), "cpu:1");
+        assert_eq!(classic_buffer_location(&allocations, 0x1080, 0x81), "*");
+        assert_eq!(classic_buffer_location(&allocations, 0x2000, 0x10), "*");
     }
 }

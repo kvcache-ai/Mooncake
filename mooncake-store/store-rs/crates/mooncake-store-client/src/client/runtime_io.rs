@@ -1449,27 +1449,42 @@ impl StoreClient {
         })
     }
 
+    fn segment_relative_target_offset(
+        info: &SegmentInfo,
+        segment_name: &SegmentName,
+        segment_offset: u64,
+        length: u64,
+    ) -> Result<u64> {
+        if info.buffers.is_empty() {
+            return Err(StoreError::Transport(format!(
+                "segment {} exposes no buffers",
+                segment_name.0
+            )));
+        }
+        for buffer in &info.buffers {
+            let Some(target_offset) = buffer.base.checked_add(segment_offset) else {
+                continue;
+            };
+            if Self::segment_info_contains_target(info, target_offset, length) {
+                return Ok(target_offset);
+            }
+        }
+        Err(StoreError::Transport(format!(
+            "segment offset {} length {} is outside segment {}",
+            segment_offset, length, segment_name.0
+        )))
+    }
+
     fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
         if Self::segment_info_contains_target(info, replica.offset, replica.length) {
             return Ok(replica.offset);
         }
-        let buffer = info.buffers.first().ok_or_else(|| {
-            StoreError::Transport(format!(
-                "segment {} exposes no buffers",
-                replica.segment_name.0
-            ))
-        })?;
-        let target_offset = buffer
-            .base
-            .checked_add(replica.segment_offset)
-            .ok_or_else(|| StoreError::Transport("remote target offset overflow".to_string()))?;
-        if Self::segment_info_contains_target(info, target_offset, replica.length) {
-            return Ok(target_offset);
-        }
-        Err(StoreError::Transport(format!(
-            "replica offset {} is outside segment {}",
-            replica.offset, replica.segment_name.0
-        )))
+        Self::segment_relative_target_offset(
+            info,
+            &replica.segment_name,
+            replica.segment_offset,
+            replica.length,
+        )
     }
 
     fn ensure_remote_runtime_reachable(

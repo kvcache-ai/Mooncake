@@ -251,7 +251,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         }
         let primary = self.segment_name()?;
         let mut announcements = Vec::new();
-        for segment_bytes in self.storage_segment_sizes(storage_bytes)? {
+        for plan in self.storage_segment_plans(storage_bytes)? {
             let attach_primary = {
                 let state = self.state.lock();
                 let memory = state.memory_ref()?;
@@ -276,10 +276,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     transport.as_ref(),
                     StorageSegmentSpec {
                         segment_name: segment_name.clone(),
-                        capacity_bytes: segment_bytes,
+                        capacity_bytes: plan.capacity_bytes,
                         state: SegmentLifecycleState::Active,
                         tags: self.local_memory.tags.clone(),
-                        location: self.local_memory.location.clone(),
+                        location: plan.location,
                         alignment: self.local_memory.alignment,
                         hugepage_enabled: self.local_memory.hugepage_enabled,
                         hugepage_size_bytes: self.local_memory.hugepage_size_bytes,
@@ -317,7 +317,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             info!(
                 runtime = %self.lease.runtime,
                 segment = %announcement.segment_name.0,
-                storage_bytes = segment_bytes,
+                storage_bytes = announcement.capacity_bytes,
                 "expanded local memory with a new active segment"
             );
             self.metadata.publish_segment(&announcement)?;

@@ -418,7 +418,9 @@ impl DummySession {
 
     pub fn remove_all(&self, force: bool) -> Result<(i32, i64)> {
         let reply = self
-            .rpc(|mut client| async move { client.remove_all(pb::RemoveAllRequest { force }).await })?
+            .rpc(
+                |mut client| async move { client.remove_all(pb::RemoveAllRequest { force }).await },
+            )?
             .into_inner();
         Ok((reply.status, reply.removed))
     }
@@ -471,7 +473,13 @@ impl DummySession {
         tenant: Option<&str>,
     ) -> Result<Vec<pb::HotCacheAcquireReply>> {
         if self.hot_cache_region.lock().is_none() {
-            return Ok(vec![pb::HotCacheAcquireReply { status: -1, ..Default::default() }; items.len()]);
+            return Ok(vec![
+                pb::HotCacheAcquireReply {
+                    status: -1,
+                    ..Default::default()
+                };
+                items.len()
+            ]);
         }
         let request = pb::BatchHotCacheAcquireRequest {
             objects: items
@@ -494,7 +502,13 @@ impl DummySession {
         tenant: Option<&str>,
     ) -> Result<Vec<pb::HotCacheAcquireReply>> {
         if self.hot_cache_region.lock().is_none() {
-            return Ok(vec![pb::HotCacheAcquireReply { status: -1, ..Default::default() }; items.len()]);
+            return Ok(vec![
+                pb::HotCacheAcquireReply {
+                    status: -1,
+                    ..Default::default()
+                };
+                items.len()
+            ]);
         }
         let request = pb::BatchHotCacheAcquireRequest {
             objects: items
@@ -528,14 +542,17 @@ impl DummySession {
             return Ok(());
         }
         let request = pb::BatchHotCacheReleaseRequest { handles };
-        let _ = self.rpc(|mut client| async move { client.batch_release_hot_cache(request).await })?;
+        let _ =
+            self.rpc(|mut client| async move { client.batch_release_hot_cache(request).await })?;
         Ok(())
     }
 
     fn copy_hot_cache_reply_to_vec(&self, reply: &pb::HotCacheAcquireReply) -> Result<Vec<u8>> {
         let region = self.hot_cache_region.lock();
         let Some(region) = region.as_ref() else {
-            return Err(StoreError::NotFound("dummy hot cache shm is not mapped".to_string()));
+            return Err(StoreError::NotFound(
+                "dummy hot cache shm is not mapped".to_string(),
+            ));
         };
         let offset = usize::try_from(reply.offset)
             .map_err(|_| StoreError::Allocator("hot cache offset overflow".to_string()))?;
@@ -551,7 +568,9 @@ impl DummySession {
     ) -> Result<usize> {
         let region = self.hot_cache_region.lock();
         let Some(region) = region.as_ref() else {
-            return Err(StoreError::NotFound("dummy hot cache shm is not mapped".to_string()));
+            return Err(StoreError::NotFound(
+                "dummy hot cache shm is not mapped".to_string(),
+            ));
         };
         let offset = usize::try_from(reply.offset)
             .map_err(|_| StoreError::Allocator("hot cache offset overflow".to_string()))?;
@@ -574,7 +593,9 @@ impl DummySession {
     ) -> Result<usize> {
         let region = self.hot_cache_region.lock();
         let Some(region) = region.as_ref() else {
-            return Err(StoreError::NotFound("dummy hot cache shm is not mapped".to_string()));
+            return Err(StoreError::NotFound(
+                "dummy hot cache shm is not mapped".to_string(),
+            ));
         };
         let offset = usize::try_from(reply.offset)
             .map_err(|_| StoreError::Allocator("hot cache offset overflow".to_string()))?;
