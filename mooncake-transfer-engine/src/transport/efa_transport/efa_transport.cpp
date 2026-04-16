@@ -64,8 +64,7 @@ static size_t detectBufferPageSize(void* addr) {
             if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
                 in_range = (target >= start && target < end);
             }
-        } else if (in_range &&
-                   line.compare(0, 15, "KernelPageSize:") == 0) {
+        } else if (in_range && line.compare(0, 15, "KernelPageSize:") == 0) {
             unsigned long kb = 0;
             if (sscanf(line.c_str(), "KernelPageSize: %lu kB", &kb) == 1 &&
                 kb > 0) {
@@ -276,8 +275,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     size_t chunk_limit = (max_mr > 0) ? std::min(max_mr, pte_limit) : 0;
     LOG(INFO) << "Auto-split params: page_size=" << page_size
               << ", max_pte_entries=" << getMaxPteEntries()
-              << ", pte_limit=" << pte_limit
-              << ", max_mr_size=" << max_mr
+              << ", pte_limit=" << pte_limit << ", max_mr_size=" << max_mr
               << ", chunk_limit=" << chunk_limit;
 
     // Determine chunk boundaries
@@ -290,8 +288,8 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
             offset += chunk_len;
         }
         LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
-                     << " bytes) into " << chunks.size() << " chunks of <= "
-                     << chunk_limit << " bytes each";
+                     << " bytes) into " << chunks.size()
+                     << " chunks of <= " << chunk_limit << " bytes each";
     } else {
         chunks.emplace_back(addr, length);
     }
@@ -326,9 +324,9 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     } else if (use_full_coverage) {
         // Multi-chunk, PTE budget OK: every chunk on every NIC
         LOG(WARNING) << "Full NIC coverage: " << num_chunks << " chunks × "
-                     << num_nics << " NICs (total PTE/NIC="
-                     << total_pages_per_nic << ", budget="
-                     << getMaxPteEntries() << ")";
+                     << num_nics
+                     << " NICs (total PTE/NIC=" << total_pages_per_nic
+                     << ", budget=" << getMaxPteEntries() << ")";
         for (size_t ci = 0; ci < num_chunks; ++ci) {
             for (size_t n = 0; n < num_nics; ++n) {
                 nic_assignments[ci].push_back(n);
@@ -353,16 +351,15 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
             }
         }
         LOG(WARNING) << "Disjoint NIC partition: PTE/NIC="
-                     << total_pages_per_nic << " exceeds budget="
-                     << getMaxPteEntries();
+                     << total_pages_per_nic
+                     << " exceeds budget=" << getMaxPteEntries();
         for (size_t ci = 0; ci < num_chunks; ++ci) {
             std::string nic_list;
             for (size_t j = 0; j < nic_assignments[ci].size(); ++j) {
                 if (j > 0) nic_list += ",";
                 nic_list += std::to_string(nic_assignments[ci][j]);
             }
-            LOG(WARNING) << "  chunk " << ci
-                         << " -> NICs [" << nic_list << "]";
+            LOG(WARNING) << "  chunk " << ci << " -> NICs [" << nic_list << "]";
         }
     }
 
@@ -400,13 +397,11 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
 
             for (size_t j = 0; j < assigned_nics.size(); ++j) {
                 size_t nic_idx = assigned_nics[j];
-                reg_threads.emplace_back(
-                    [this, &ret_codes, j, nic_idx, chunk_addr, chunk_len,
-                     ar]() {
-                        ret_codes[j] =
-                            context_list_[nic_idx]->registerMemoryRegion(
-                                chunk_addr, chunk_len, ar);
-                    });
+                reg_threads.emplace_back([this, &ret_codes, j, nic_idx,
+                                          chunk_addr, chunk_len, ar]() {
+                    ret_codes[j] = context_list_[nic_idx]->registerMemoryRegion(
+                        chunk_addr, chunk_len, ar);
+                });
             }
 
             for (auto& thread : reg_threads) {
@@ -426,9 +421,8 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 int ret = context_list_[nic_idx]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights);
                 if (ret) {
-                    LOG(ERROR)
-                        << "Failed to register memory region chunk " << ci
-                        << " with EFA context " << nic_idx;
+                    LOG(ERROR) << "Failed to register memory region chunk "
+                               << ci << " with EFA context " << nic_idx;
                     return ret;
                 }
             }
@@ -442,19 +436,16 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
 
         if (globalConfig().trace) {
             LOG(INFO) << "EFA registerMemoryRegion: chunk " << ci
-                      << ", addr=" << chunk_addr
-                      << ", length=" << chunk_len
-                      << ", nics=" << assigned_nics.size()
-                      << "/" << context_list_.size()
-                      << ", parallel="
-                      << (use_parallel_reg ? "true" : "false")
+                      << ", addr=" << chunk_addr << ", length=" << chunk_len
+                      << ", nics=" << assigned_nics.size() << "/"
+                      << context_list_.size()
+                      << ", parallel=" << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
         }
 
         LOG(WARNING) << "Chunk " << ci << "/" << chunks.size()
                      << " registered on " << assigned_nics.size() << " NICs"
-                     << ", addr=" << chunk_addr
-                     << ", length=" << chunk_len
+                     << ", addr=" << chunk_addr << ", length=" << chunk_len
                      << ", duration=" << reg_duration_ms << "ms";
 
         // Collect keys: assigned NICs have valid keys, others get 0
@@ -477,8 +468,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         std::vector<ChunkRegistration> regs;
         regs.reserve(chunks.size());
         for (size_t ci = 0; ci < chunks.size(); ++ci) {
-            regs.push_back(
-                {(uint64_t)chunks[ci].first, nic_assignments[ci]});
+            regs.push_back({(uint64_t)chunks[ci].first, nic_assignments[ci]});
         }
         chunk_map_[(uint64_t)addr] = std::move(regs);
     }
@@ -1005,7 +995,8 @@ int EfaTransport::initializeEfaResources() {
     }
 
     // Query EFA device max_mr_size via ibverbs and clamp globalConfig.
-    // libfabric does not expose max_mr_size, so we go through the ibverbs layer.
+    // libfabric does not expose max_mr_size, so we go through the ibverbs
+    // layer.
     {
         int num_devices = 0;
         struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
@@ -1069,19 +1060,16 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
             device_id =
                 hint.empty()
                     ? desc->topology.selectDevice(buffer.name, try_count)
-                    : desc->topology.selectDevice(buffer.name, hint,
-                                                   try_count);
+                    : desc->topology.selectDevice(buffer.name, hint, try_count);
             if (device_id >= 0 &&
                 static_cast<size_t>(device_id) < buffer.rkey.size() &&
                 buffer.rkey[device_id] != 0) {
                 return 0;
             }
-            device_id =
-                hint.empty()
-                    ? desc->topology.selectDevice(kWildcardLocation,
-                                                   try_count)
-                    : desc->topology.selectDevice(kWildcardLocation, hint,
-                                                   try_count);
+            device_id = hint.empty() ? desc->topology.selectDevice(
+                                           kWildcardLocation, try_count)
+                                     : desc->topology.selectDevice(
+                                           kWildcardLocation, hint, try_count);
             if (device_id >= 0 &&
                 static_cast<size_t>(device_id) < buffer.rkey.size() &&
                 buffer.rkey[device_id] != 0) {
