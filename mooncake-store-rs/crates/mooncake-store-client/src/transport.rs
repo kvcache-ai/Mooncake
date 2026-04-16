@@ -181,6 +181,10 @@ impl StoreTransport for TentEngine {
         TentEngine::get_segment_info(self, handle)
     }
 
+    fn republish_local_metadata(&self) -> Result<()> {
+        TentEngine::republish_local_metadata(self)
+    }
+
     fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void> {
         TentEngine::allocate_memory(self, size, location)
     }

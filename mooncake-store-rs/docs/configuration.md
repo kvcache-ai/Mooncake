@@ -95,6 +95,14 @@ Notes:
 - low-level Rust transport construction remains explicit; runtime backend selection is only a compatibility-layer feature
 - current upstream SGLang Mooncake integration does not forward `transport_backend` from `--hicache-storage-backend-extra-config`; use `MC_STORE_RS_TRANSPORT_BACKEND` when SGLang real mode must select `tent` or `classic_te`
 
+Reconnect behavior:
+
+- both backends repair local transport metadata after Redis connectivity returns and the heartbeat repair path runs
+- `classic_te` recreates its transport runtime before republishing local buffers
+- `tent` also recreates its transport runtime before re-registering the local buffers it still owns
+- if Redis restarts from an empty dataset, surviving storage clients republish both lease state and segment metadata during recovery
+- requests that arrive while Redis is unavailable can still fail fast; recovery is designed for self-healing after metadata service returns, not for serving through a metadata blackout
+
 ## Route Control
 
 | Mode | Default | Behavior |

@@ -91,9 +91,7 @@ pub mod classic {
         ) -> c_int;
         pub fn freeBatchID(engine: TransferEngineHandle, batch_id: BatchId) -> c_int;
         pub fn syncSegmentCache(engine: TransferEngineHandle) -> c_int;
-        pub fn mooncake_classic_republish_local_metadata(
-            engine: TransferEngineHandle,
-        ) -> c_int;
+        pub fn mooncake_classic_republish_local_metadata(engine: TransferEngineHandle) -> c_int;
         pub fn mooncake_classic_get_batch_transfer_status(
             engine: TransferEngineHandle,
             batch_id: BatchId,
@@ -221,6 +219,7 @@ pub mod tent {
             addr: *mut c_void,
             size: usize,
         ) -> c_int;
+        pub fn mooncake_tent_platform_free_memory(addr: *mut c_void, size: usize) -> c_int;
         pub fn tent_allocate_batch(engine: TentEngineHandle, batch_size: usize) -> BatchId;
         pub fn tent_free_batch(engine: TentEngineHandle, batch_id: BatchId) -> c_int;
         pub fn tent_submit(
