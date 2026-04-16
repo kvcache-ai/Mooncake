@@ -413,10 +413,6 @@ fn build_tent_bundle(
     })
 }
 
-fn scoped_segment_name(run_id: u64, base: &str) -> String {
-    format!("{base}-{run_id}")
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_client(
     metadata: Arc<RedisMetadataBackend>,
@@ -474,54 +470,6 @@ fn build_routed_client(
         builder = builder.label(*key, *value);
     }
     builder.build(now_ms() + LEASE_MS)
-}
-
-fn wait_for_runtime_visibility(
-    metadata: &dyn MetadataBackend,
-    client: &StoreClient,
-    runtime: &mooncake_store_core::ClientRuntimeId,
-    expected_state: ClientLifecycleState,
-) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match client.runtime_state(runtime) {
-            Ok(Some(state)) if state == expected_state => return Ok(()),
-            Ok(None) | Err(StoreError::NotFound(_)) => {}
-            Err(error) => return Err(error),
-            Ok(Some(_)) => {}
-        }
-        sleep(Duration::from_millis(20));
-    }
-    let visible = metadata
-        .list_live_clients()?
-        .into_iter()
-        .map(|lease| format!("{}({:?})", lease.runtime, lease.state))
-        .collect::<Vec<_>>();
-    Err(StoreError::InvalidState(format!(
-        "runtime {} did not become visible to {} before deadline; metadata leases: {}",
-        runtime,
-        client.runtime_id(),
-        visible.join(", ")
-    )))
-}
-
-fn wait_for_membership_convergence(
-    metadata: &dyn MetadataBackend,
-    clients: &[&StoreClient],
-) -> Result<()> {
-    let runtimes = clients
-        .iter()
-        .map(|client| (client.runtime_id().clone(), client.lease().state))
-        .collect::<Vec<_>>();
-    for client in clients {
-        for (runtime, expected_state) in &runtimes {
-            if runtime == client.runtime_id() {
-                continue;
-            }
-            wait_for_runtime_visibility(metadata, client, runtime, *expected_state)?;
-        }
-    }
-    Ok(())
 }
 
 fn verify_single_put_get(

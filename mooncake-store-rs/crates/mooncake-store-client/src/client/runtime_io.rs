@@ -297,18 +297,6 @@ impl StoreClient {
             .collect())
     }
 
-    fn insert_latest_route(routes: &mut BTreeMap<LogicalObjectId, ObjectRoute>, route: ObjectRoute) {
-        let Ok(object_id) = mooncake_store_core::route_logical_object_id(&route) else {
-            return;
-        };
-        match routes.get(&object_id) {
-            Some(current) if current.version >= route.version => {}
-            _ => {
-                routes.insert(object_id, route);
-            }
-        }
-    }
-
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
         self.route_directory
             .list_routes_by_replica_owner(&self.lease, owner)
