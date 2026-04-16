@@ -170,36 +170,25 @@ impl StoreClient {
         let rank_result = planner.rank_many(self, &object_refs);
         rank_tracker.finish(&rank_result, 0);
         let plans = rank_result?;
-        for (request, object_ref) in requests.iter().zip(object_refs.iter()) {
-            let object_id = LogicalObjectId::new(
-                NamespaceScope::with_defaults(
-                    object_ref.tenant,
-                    object_ref.domain,
-                    object_ref.object_set,
-                ),
-                object_ref.key,
-            );
-            let current = self
-                .route_directory
-                .get_object_route(&self.lease, &ObjectKey::from_logical_id(&object_id))?;
-            self.enforce_namespace_quota(&object_id, request.value.len(), current.as_ref())?;
-        }
 
         struct PendingBatchReservation<'a> {
             tenant: &'a str,
             object_id: LogicalObjectId,
             qos_tier: Option<&'a str>,
             scoped_key: ObjectKey,
+            current: Option<ObjectRoute>,
             value: &'a [u8],
+            quota_reservation: Option<TenantQuotaReservationRequest>,
             candidates: Vec<ReplicaPlacementCandidate>,
             next_candidate: usize,
             targets: Vec<ReplicaWriteTarget>,
             reservations: Vec<mooncake_store_core::SegmentReservation>,
         }
 
-        let release_pending = |entries: &[PendingBatchReservation<'_>]| {
+        let release_pending = |entries: &[PendingBatchReservation<'_>], context: &str| {
             for entry in entries {
                 let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+                let _ = self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
             }
         };
 
@@ -270,8 +259,33 @@ impl StoreClient {
                 });
             }
 
+            let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
+            let object_keys = object_refs
+                .iter()
+                .map(|object_ref| {
+                    let object_id = LogicalObjectId::new(
+                        NamespaceScope::with_defaults(
+                            object_ref.tenant,
+                            object_ref.domain,
+                            object_ref.object_set,
+                        ),
+                        object_ref.key,
+                    );
+                    ObjectKey::from_logical_id(&object_id)
+                })
+                .collect::<Vec<_>>();
+            let current_routes_result =
+                self.route_directory.get_object_routes(&self.lease, &object_keys);
+            route_load_tracker.finish(&current_routes_result, 0);
+            let current_routes = current_routes_result?;
+
             let mut pending = Vec::with_capacity(requests.len());
-            for (request, plan) in requests.iter().zip(plans.iter()) {
+            for (((request, plan), object_ref), current) in requests
+                .iter()
+                .zip(plans.iter())
+                .zip(object_refs.iter())
+                .zip(current_routes.into_iter())
+            {
                 let tenant = request.tenant.unwrap_or(self.default_tenant());
                 let mut candidates = shared_candidates.clone();
                 let mut seen = shared_seen.clone();
@@ -309,13 +323,56 @@ impl StoreClient {
                     tenant,
                     object_id,
                     qos_tier: request.qos_tier,
-                    scoped_key: self.scoped_key(tenant, request.key),
+                    scoped_key: ObjectKey::from_logical_id(&LogicalObjectId::new(
+                        NamespaceScope::with_defaults(
+                            object_ref.tenant,
+                            object_ref.domain,
+                            object_ref.object_set,
+                        ),
+                        object_ref.key,
+                    )),
+                    current,
                     value: request.value,
+                    quota_reservation: None,
                     candidates,
                     next_candidate: 0,
                     targets: Vec::with_capacity(*replica_count),
                     reservations: Vec::with_capacity(*replica_count),
                 });
+            }
+
+            let mut reservation_order = pending
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (index, entry.scoped_key.0.clone()))
+                .collect::<Vec<_>>();
+            reservation_order.sort_by(|left, right| left.1.cmp(&right.1));
+            let mut reserved_indices = Vec::with_capacity(reservation_order.len());
+            for (index, _key) in reservation_order {
+                let reserve_result = {
+                    let entry = &pending[index];
+                    self.reserve_tenant_quota_for_put(
+                        &entry.object_id,
+                        &entry.scoped_key,
+                        entry.current.as_ref(),
+                        entry.value.len(),
+                    )
+                };
+                match reserve_result {
+                    Ok(reservation) => {
+                        pending[index].quota_reservation = reservation;
+                        reserved_indices.push(index);
+                    }
+                    Err(error) => {
+                        for reserved_index in reserved_indices {
+                            let _ = self.abort_tenant_quota_reservation(
+                                pending[reserved_index].quota_reservation.as_ref(),
+                                "batch_put_quota_reserve_failed",
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
             }
 
             while pending
@@ -352,7 +409,7 @@ impl StoreClient {
                     });
                 }
                 if let Some(key) = exhausted_key {
-                    release_pending(&pending);
+                    release_pending(&pending, "batch_put_reserve_failed");
                     return Err(StoreError::InvalidState(format!(
                         "not enough writable owners for key {key}"
                     )));
@@ -386,7 +443,7 @@ impl StoreClient {
                             );
                         }
                         Err(error) => {
-                            release_pending(&pending);
+                            release_pending(&pending, "batch_put_reserve_failed");
                             return Err(error);
                         }
                     }
@@ -398,7 +455,7 @@ impl StoreClient {
                     entry.targets.len() >= resolved_policy.replica_count
                         || entry.next_candidate >= entry.candidates.len()
                 }) {
-                    release_pending(&pending);
+                    release_pending(&pending, "batch_put_reserve_failed");
                     return Err(StoreError::InvalidState(
                         "batch put exhausted all placement candidates".to_string(),
                     ));
@@ -413,6 +470,7 @@ impl StoreClient {
                     qos_tier: entry.qos_tier,
                     scoped_key: entry.scoped_key,
                     value: entry.value,
+                    quota_reservation: entry.quota_reservation,
                     targets: entry.targets,
                     reservations: entry.reservations,
                 });
@@ -421,9 +479,15 @@ impl StoreClient {
         })();
         reserve_tracker.finish(&reserve_result, 0);
         let prepared = reserve_result?;
-        let release_prepared = |entries: &[PreparedObjectWrite<'_>]| {
+        let abort_prepared_quota = |entries: &[PreparedObjectWrite<'_>], context: &str| {
+            for entry in entries {
+                let _ = self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
+            }
+        };
+        let release_prepared = |entries: &[PreparedObjectWrite<'_>], context: &str| {
             for entry in entries {
                 let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+                let _ = self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
             }
         };
         let remote_scratch = match prepared
@@ -461,7 +525,7 @@ impl StoreClient {
         let current_routes = match current_routes_result {
             Ok(routes) => routes,
             Err(error) => {
-                release_prepared(&prepared);
+                release_prepared(&prepared, "batch_put_failed_before_publish");
                 return Err(error);
             }
         };
@@ -613,6 +677,7 @@ impl StoreClient {
                     key: entry.scoped_key.clone(),
                     expected_version,
                     previous: current,
+                    quota_reservation: entry.quota_reservation.clone(),
                     route,
                 });
             }
@@ -622,7 +687,7 @@ impl StoreClient {
         let routes = match write_result {
             Ok(routes) => routes,
             Err(error) => {
-                release_prepared(&prepared);
+                release_prepared(&prepared, "batch_put_failed_before_publish");
                 return Err(error);
             }
         };
@@ -662,7 +727,7 @@ impl StoreClient {
         let cas_results = match cas_results_result {
             Ok(results) => results,
             Err(error) => {
-                release_prepared(&prepared);
+                release_prepared(&prepared, "batch_put_failed_before_publish");
                 return Err(error);
             }
         };
@@ -674,9 +739,24 @@ impl StoreClient {
         {
             match cas_result {
                 Ok(cas) if cas.applied => {
+                    if let Err(error) = self.finalize_tenant_quota_put(
+                        pending.quota_reservation.as_ref(),
+                        &pending.route,
+                        prepared[index].value.len(),
+                    ) {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
                     self.storage_owner.track_route(&pending.route);
                     if let Some(previous) = pending.previous.as_ref() {
-                        self.schedule_route_reclaim(previous)?;
+                        if let Err(error) = self.schedule_route_reclaim(previous) {
+                            warn!(
+                                runtime = %self.lease.runtime,
+                                key = %pending.key.0,
+                                error = %error,
+                                "batch route overwrite reclaim scheduling failed after authoritative publish"
+                            );
+                        }
                     }
                     published.push(pending.route);
                 }
@@ -684,6 +764,10 @@ impl StoreClient {
                     let _ = self.release_reserved_allocations(
                         &prepared[index].targets,
                         &prepared[index].reservations,
+                    );
+                    let _ = self.abort_tenant_quota_reservation(
+                        prepared[index].quota_reservation.as_ref(),
+                        "batch_put_route_compare_and_swap_conflict",
                     );
                     first_error.get_or_insert_with(|| {
                         StoreError::Conflict(format!(
@@ -697,9 +781,16 @@ impl StoreClient {
                         &prepared[index].targets,
                         &prepared[index].reservations,
                     );
+                    let _ = self.abort_tenant_quota_reservation(
+                        prepared[index].quota_reservation.as_ref(),
+                        "batch_put_route_compare_and_swap_error",
+                    );
                     first_error.get_or_insert(error);
                 }
             }
+        }
+        if first_error.is_some() {
+            abort_prepared_quota(&prepared, "batch_put_partial_publish_cleanup");
         }
         self.track_remote_storage_owners_best_effort(&published);
         if let Some(error) = first_error {

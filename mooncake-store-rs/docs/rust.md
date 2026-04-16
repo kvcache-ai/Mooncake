@@ -284,6 +284,7 @@ It covers:
 - local and routed writes
 - request-level replication
 - batch put/get
+- strict tenant quota on single-object and routed batch writes
 - registered-buffer and multi-buffer paths
 - delete reclaim and overwrite reclaim
 - dynamic expansion, true client shrink, and hot-upgrade

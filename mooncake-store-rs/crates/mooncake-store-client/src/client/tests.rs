@@ -1909,20 +1909,12 @@ fn publish_storage_node_with_capacity(
     storage
         .register_local_memory()
         .expect("storage memory should register");
-    let _runtime = storage.runtime_id().clone();
+    let runtime = storage.runtime_id().clone();
+    metadata
+        .upsert_client_lease(&storage.lease())
+        .expect("storage lease should upsert");
     test_storage_nodes().lock().push(storage);
-    publish_labeled_storage_node_with_capacity(
-        metadata,
-        transport,
-        stable_id,
-        segment_name,
-        pool,
-        capacity_bytes,
-        alignment_bytes,
-        None,
-        None,
-        None,
-    )
+    runtime
 }
 
 fn publish_labeled_storage_node_with_capacity(
@@ -7816,6 +7808,164 @@ fn remove_refunds_quota_when_delete_becomes_authoritative() {
         .get_tenant_object_accounting(&ObjectKey::new("tenant-a::key"))
         .expect("deleted accounting lookup should succeed")
         .is_none());
+}
+
+#[test]
+fn routed_batch_put_rejects_over_quota_all_or_nothing() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("batch-quota-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    quota: Some(TenantQuotaPolicy {
+                        max_bytes: Some(7),
+                        max_objects: Some(2),
+                    }),
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant quota policy should store");
+    let client = StoreClientBuilder::new(metadata.clone(), "batch-quota-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(1024))
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    let error = client
+        .batch_put(&[
+            PutRequest::new("key-a", b"1234")
+                .tenant("tenant-a")
+                .replication(ReplicationPolicy::new().replica_count(1)),
+            PutRequest::new("key-b", b"1234")
+                .tenant("tenant-a")
+                .replication(ReplicationPolicy::new().replica_count(1)),
+        ])
+        .expect_err("batch admission should fail atomically when combined bytes exceed quota");
+    assert!(matches!(
+        error,
+        StoreError::Conflict(_) | StoreError::Metadata(_)
+    ));
+
+    assert!(client
+        .query_route_in_tenant("tenant-a", "key-a")
+        .expect("route lookup should succeed")
+        .is_none());
+    assert!(client
+        .query_route_in_tenant("tenant-a", "key-b")
+        .expect("route lookup should succeed")
+        .is_none());
+
+    let quota = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("quota state should load")
+        .expect("quota state should exist");
+    assert_eq!(quota.used_bytes, 0);
+    assert_eq!(quota.used_objects, 0);
+    assert_eq!(quota.pending_reserved_bytes, 0);
+    assert_eq!(quota.pending_reserved_objects, 0);
+}
+
+#[test]
+fn routed_batch_put_preserves_cross_tenant_quota_isolation() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("batch-cross-tenant-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    for tenant in ["tenant-a", "tenant-b"] {
+        metadata
+            .put_tenant_policy(
+                &TenantPolicy {
+                    scope: TenantPolicyScope::new(tenant, None::<String>, None::<String>),
+                    spec: TenantPolicySpec {
+                        quota: Some(TenantQuotaPolicy {
+                            max_bytes: Some(4),
+                            max_objects: Some(1),
+                        }),
+                        routing: Some(TenantRoutePolicy {
+                            route_topk: Some(2),
+                            route_control: Some(RouteControlMode::MetadataOnly),
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 10,
+                    updated_by: "admin".to_string(),
+                },
+                None,
+            )
+            .expect("tenant quota policy should store");
+    }
+    let client = StoreClientBuilder::new(metadata.clone(), "batch-cross-tenant-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(1024))
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    let routes = client
+        .batch_put(&[
+            PutRequest::new("key-a", b"aaaa")
+                .tenant("tenant-a")
+                .replication(ReplicationPolicy::new().replica_count(1)),
+            PutRequest::new("key-b", b"bbbb")
+                .tenant("tenant-b")
+                .replication(ReplicationPolicy::new().replica_count(1)),
+        ])
+        .expect("cross-tenant batch should succeed when each tenant stays within quota");
+    assert_eq!(routes.len(), 2);
+
+    let quota_a = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("tenant-a quota state should load")
+        .expect("tenant-a quota state should exist");
+    let quota_b = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-b",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("tenant-b quota state should load")
+        .expect("tenant-b quota state should exist");
+    assert_eq!(quota_a.used_bytes, 4);
+    assert_eq!(quota_a.used_objects, 1);
+    assert_eq!(quota_b.used_bytes, 4);
+    assert_eq!(quota_b.used_objects, 1);
 }
 
 #[test]

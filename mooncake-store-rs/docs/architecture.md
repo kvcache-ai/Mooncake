@@ -299,6 +299,8 @@ In Phase 1, these primitives exist in the shared contracts and all three metadat
 
 Phase 3 now wires those primitives into the single-object client path: `put` reserves tenant quota before allocation/write, publishes the route, then finalizes quota before returning success. `remove` now reserves and finalizes the negative delta at delete CAS time, so quota/accounting state tracks authoritative object visibility rather than delayed storage reclaim.
 
+Phase 4 extends the same model to routed `batch_put`: the client sorts entries by scoped key before quota admission, reserves quota for every item before storage reservation proceeds, aborts already-acquired reservations if later admission fails, and finalizes quota only after each route CAS is authoritative. That keeps routed batch admission deterministic and prevents partial failures from leaving pending quota behind.
+
 ### Backend support
 
 | Backend | Use Case |
