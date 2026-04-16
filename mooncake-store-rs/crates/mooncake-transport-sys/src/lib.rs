@@ -91,6 +91,9 @@ pub mod classic {
         ) -> c_int;
         pub fn freeBatchID(engine: TransferEngineHandle, batch_id: BatchId) -> c_int;
         pub fn syncSegmentCache(engine: TransferEngineHandle) -> c_int;
+        pub fn mooncake_classic_republish_local_metadata(
+            engine: TransferEngineHandle,
+        ) -> c_int;
         pub fn mooncake_classic_get_batch_transfer_status(
             engine: TransferEngineHandle,
             batch_id: BatchId,

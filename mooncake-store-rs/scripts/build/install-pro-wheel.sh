@@ -38,5 +38,6 @@ echo "wheel:  ${WHEEL_PATH}"
 echo "links:  ${WHEEL_DIR}"
 
 "${PYTHON_BIN}" -m pip install \
+  --force-reinstall \
   --find-links "${WHEEL_DIR}" \
   "${WHEEL_PATH}"

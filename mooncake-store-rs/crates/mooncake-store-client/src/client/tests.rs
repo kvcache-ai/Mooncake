@@ -68,6 +68,7 @@ struct TestTransportState {
     segments_by_handle: BTreeMap<u64, TestSegment>,
     live_batches: BTreeSet<u64>,
     registered_memory: BTreeMap<usize, usize>,
+    republish_local_metadata_calls: usize,
     fail_next_submit_segments: BTreeSet<String>,
 }
 
@@ -865,6 +866,7 @@ impl TestTransport {
                 segments_by_handle: BTreeMap::new(),
                 live_batches: BTreeSet::new(),
                 registered_memory: BTreeMap::new(),
+                republish_local_metadata_calls: 0,
                 fail_next_submit_segments: BTreeSet::new(),
             })),
         }
@@ -924,6 +926,10 @@ impl TestTransport {
             .lock()
             .fail_next_submit_segments
             .insert(segment_name.to_string());
+    }
+
+    fn republish_local_metadata_calls(&self) -> usize {
+        self.state.lock().republish_local_metadata_calls
     }
 }
 
@@ -1038,6 +1044,11 @@ impl StoreTransport for TestTransport {
             .lock()
             .registered_memory
             .insert(addr as usize, size);
+        Ok(())
+    }
+
+    fn republish_local_metadata(&self) -> mooncake_store_core::Result<()> {
+        self.state.lock().republish_local_metadata_calls += 1;
         Ok(())
     }
 
@@ -5923,9 +5934,14 @@ fn heartbeat_recovery_republishes_local_metadata_after_long_redis_outage() {
         .expect("segments should list during outage")
         .is_empty());
 
+    let republish_calls_before_repair = transport.republish_local_metadata_calls();
     client
         .heartbeat(now_ms().saturating_add(30_000))
         .expect("heartbeat should repair local metadata after redis recovery");
+    assert!(
+        transport.republish_local_metadata_calls() > republish_calls_before_repair,
+        "heartbeat recovery should republish local transport metadata"
+    );
     let live = metadata
         .list_live_clients()
         .expect("live clients should list after repair");
