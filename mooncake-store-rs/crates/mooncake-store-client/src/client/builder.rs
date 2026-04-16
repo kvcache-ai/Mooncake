@@ -316,6 +316,10 @@ impl StoreClientBuilder {
             self.route_control,
             self.route_topk,
         )?;
+        let local_authority = Arc::new(LocalAuthorityAdapter {
+            lifecycle_state: lifecycle_state.clone(),
+            route_write_gate: route_write_gate.clone(),
+        });
         let route_directory = build_route_directory(
             self.route_control,
             self.route_topk,
@@ -341,13 +345,15 @@ impl StoreClientBuilder {
         });
         let control_plane = ControlPlaneHandle::spawn(
             &control_bind_host(&endpoints.rpc_address),
-            Arc::new(LocalAuthorityAdapter {
-                lifecycle_state: lifecycle_state.clone(),
-                route_write_gate: route_write_gate.clone(),
-            }),
+            local_authority.clone(),
             storage_adapter.clone(),
             storage_adapter,
         )?;
+        crate::route_directory::bind_local_authority_service(
+            &route_namespace,
+            &runtime.stable_id,
+            local_authority,
+        );
         endpoints
             .labels
             .entry(control_address_label().to_string())

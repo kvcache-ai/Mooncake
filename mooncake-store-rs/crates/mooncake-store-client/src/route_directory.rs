@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 
 use crate::client::{SharedLiveClientCache, SharedSuspectRuntimeCache};
 use crate::{
-    control_plane::ControlPlaneClient,
+    control_plane::{AuthorityService, ControlPlaneClient},
     observability::{registry, OperationTracker},
 };
 
@@ -42,6 +42,16 @@ pub(crate) fn build_route_directory(
             suspect_runtime_cache,
         )),
     }
+}
+
+pub(crate) fn bind_local_authority_service(
+    namespace: &str,
+    authority: &ClientStableId,
+    service: Arc<dyn AuthorityService>,
+) {
+    route_mesh(namespace)
+        .lock()
+        .bind_local_service(authority, service);
 }
 
 struct MetadataRouteDirectory {
@@ -110,6 +120,12 @@ enum RouteAuthorityObservation {
     Unobserved,
     Missing,
     Present(ObjectRoute),
+}
+
+struct RouteCasAttempt {
+    resolved: Vec<Option<Result<CasResult>>>,
+    resolved_authorities: Vec<Option<ClientLease>>,
+    last_errors: Vec<Option<StoreError>>,
 }
 
 impl EmbeddedWrhRouteDirectory {
@@ -220,6 +236,17 @@ impl EmbeddedWrhRouteDirectory {
         self.authority_candidates_once(observer, false)
     }
 
+    fn select_authorities_for_requests(
+        &self,
+        candidates: &[ClientLease],
+        requests: &[RouteCasRequest],
+    ) -> Vec<RouteAuthoritySelection> {
+        requests
+            .iter()
+            .map(|request| self.select_authorities_from_candidates(candidates, &request.key))
+            .collect()
+    }
+
     fn select_authorities_from_candidates(
         &self,
         candidates: &[ClientLease],
@@ -258,6 +285,15 @@ impl EmbeddedWrhRouteDirectory {
         ranked.into_iter().map(|(_, lease)| lease).collect()
     }
 
+    fn local_authority_service(
+        &self,
+        authority: &ClientStableId,
+    ) -> Option<Arc<dyn AuthorityService>> {
+        route_mesh(&self.namespace)
+            .lock()
+            .authority_service(authority)
+    }
+
     fn read_local_batch(
         &self,
         authority: &ClientStableId,
@@ -272,6 +308,13 @@ impl EmbeddedWrhRouteDirectory {
         keys: &[ObjectKey],
     ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
         if self.authority_is_local(authority) {
+            if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
+                return Ok(service.batch_get_routes(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    keys,
+                ));
+            }
             return self
                 .read_local_batch(&authority.runtime.stable_id, keys)
                 .map(|routes| routes.into_iter().map(Ok).collect());
@@ -298,6 +341,13 @@ impl EmbeddedWrhRouteDirectory {
         requests: &[RouteCasRequest],
     ) -> Result<Vec<Result<CasResult>>> {
         if self.authority_is_local(authority) {
+            if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
+                return Ok(service.batch_compare_and_swap_routes(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    requests,
+                ));
+            }
             return self
                 .cas_local_batch(&authority.runtime.stable_id, requests)
                 .map(|results| results.into_iter().map(Ok).collect());
@@ -320,8 +370,16 @@ impl EmbeddedWrhRouteDirectory {
 
     fn mirror_secondary_batch(&self, secondary: &ClientLease, requests: &[RouteCasRequest]) {
         let result = if self.authority_is_local(secondary) {
-            self.replace_local_batch(&secondary.runtime.stable_id, requests)
-                .map(|_| requests.iter().map(|_| Ok(())).collect())
+            if let Some(service) = self.local_authority_service(&secondary.runtime.stable_id) {
+                Ok(service.batch_replace_routes(
+                    &self.namespace,
+                    &secondary.runtime.stable_id,
+                    requests,
+                ))
+            } else {
+                self.replace_local_batch(&secondary.runtime.stable_id, requests)
+                    .map(|_| requests.iter().map(|_| Ok(())).collect())
+            }
         } else {
             self.control_plane.batch_replace_routes(
                 secondary,
@@ -376,6 +434,13 @@ impl EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>> {
         if self.authority_is_local(authority) {
+            if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
+                return service.list_routes_by_replica_owner(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    owner,
+                );
+            }
             return authority_list_routes_by_replica_owner(
                 &self.namespace,
                 &authority.runtime.stable_id,
@@ -663,6 +728,190 @@ impl EmbeddedWrhRouteDirectory {
             }
         }
     }
+
+    fn route_authority_error_should_refresh(error: &StoreError) -> bool {
+        matches!(
+            error,
+            StoreError::Transport(_)
+                | StoreError::NotFound(_)
+                | StoreError::InvalidState(_)
+                | StoreError::Unsupported(_)
+        )
+    }
+
+    fn should_refresh_route_cas_attempt(attempt: &RouteCasAttempt) -> bool {
+        attempt.resolved.iter().enumerate().any(|(index, result)| {
+            if result.is_some() {
+                return false;
+            }
+            match attempt.last_errors[index].as_ref() {
+                Some(error) => Self::route_authority_error_should_refresh(error),
+                None => true,
+            }
+        })
+    }
+
+    fn compare_and_swap_route_selections(
+        &self,
+        selections: &[RouteAuthoritySelection],
+        requests: &[RouteCasRequest],
+    ) -> RouteCasAttempt {
+        let mut resolved = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<_>>();
+        let mut resolved_authorities = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<Option<ClientLease>>>();
+        let mut last_errors = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<Option<StoreError>>>();
+
+        for rank in 0..self.route_topk {
+            let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
+            for (index, selection) in selections.iter().enumerate() {
+                if resolved[index].is_some() {
+                    continue;
+                }
+                let Some(authority) = selection.authorities.get(rank).cloned() else {
+                    continue;
+                };
+                groups
+                    .entry(authority.runtime.stable_id.0.clone())
+                    .or_insert_with(|| (authority, Vec::new()))
+                    .1
+                    .push(index);
+            }
+
+            for (_, (authority, indices)) in groups {
+                let batch_requests = indices
+                    .iter()
+                    .map(|index| requests[*index].clone())
+                    .collect::<Vec<_>>();
+                if self.authority_is_local(&authority) {
+                    if let Some(service) =
+                        self.local_authority_service(&authority.runtime.stable_id)
+                    {
+                        let results = service.batch_compare_and_swap_routes(
+                            &self.namespace,
+                            &authority.runtime.stable_id,
+                            &batch_requests,
+                        );
+                        for ((index, request), result) in indices
+                            .into_iter()
+                            .zip(batch_requests.into_iter())
+                            .zip(results.into_iter())
+                        {
+                            match result {
+                                Ok(result) => {
+                                    resolved[index] = Some(Ok(result));
+                                    resolved_authorities[index] = Some(authority.clone());
+                                }
+                                Err(error) => {
+                                    self.maybe_mark_authority_suspect(
+                                        &authority,
+                                        &error,
+                                        "route_batch_cas_local_failed",
+                                    );
+                                    warn!(
+                                        runtime = %authority.runtime,
+                                        key = %request.key.0,
+                                        error = %error,
+                                        "authority route cas failed; trying next mirrored authority"
+                                    );
+                                    last_errors[index] = Some(error);
+                                }
+                            }
+                        }
+                    } else {
+                        match self.cas_local_batch(&authority.runtime.stable_id, &batch_requests) {
+                            Ok(results) => {
+                                for (index, result) in indices.into_iter().zip(results.into_iter())
+                                {
+                                    resolved[index] = Some(Ok(result));
+                                    resolved_authorities[index] = Some(authority.clone());
+                                }
+                            }
+                            Err(error) => {
+                                self.maybe_mark_authority_suspect(
+                                    &authority,
+                                    &error,
+                                    "route_batch_cas_local_failed",
+                                );
+                                warn!(
+                                    runtime = %authority.runtime,
+                                    error = %error,
+                                    items = batch_requests.len(),
+                                    "authority route batch cas failed; trying next mirrored authority"
+                                );
+                                for index in indices {
+                                    last_errors[index] = Some(error.clone());
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                match self.control_plane.batch_compare_and_swap_routes(
+                    &authority,
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    &batch_requests,
+                ) {
+                    Ok(results) => {
+                        for ((index, request), result) in indices
+                            .into_iter()
+                            .zip(batch_requests.into_iter())
+                            .zip(results.into_iter())
+                        {
+                            match result {
+                                Ok(result) => {
+                                    resolved[index] = Some(Ok(result));
+                                    resolved_authorities[index] = Some(authority.clone());
+                                }
+                                Err(error) => {
+                                    self.maybe_mark_authority_suspect(
+                                        &authority,
+                                        &error,
+                                        "route_batch_cas_failed",
+                                    );
+                                    warn!(
+                                        runtime = %authority.runtime,
+                                        key = %request.key.0,
+                                        error = %error,
+                                        "authority route cas failed; trying next mirrored authority"
+                                    );
+                                    last_errors[index] = Some(error);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.maybe_mark_authority_suspect(
+                            &authority,
+                            &error,
+                            "route_batch_cas_transport_failed",
+                        );
+                        warn!(
+                            runtime = %authority.runtime,
+                            error = %error,
+                            items = batch_requests.len(),
+                            "authority route batch cas failed; trying next mirrored authority"
+                        );
+                        for index in indices {
+                            last_errors[index] = Some(error.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        RouteCasAttempt {
+            resolved,
+            resolved_authorities,
+            last_errors,
+        }
+    }
 }
 
 impl Drop for EmbeddedWrhRouteDirectory {
@@ -765,119 +1014,37 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             return Ok(Vec::new());
         }
         let candidates = self.authority_candidates(observer)?;
-        let selections = requests
-            .iter()
-            .map(|request| self.select_authorities_from_candidates(&candidates, &request.key))
-            .collect::<Vec<_>>();
-        let mut resolved = std::iter::repeat_with(|| None)
-            .take(requests.len())
-            .collect::<Vec<_>>();
-        let mut resolved_authorities = std::iter::repeat_with(|| None)
-            .take(requests.len())
-            .collect::<Vec<Option<ClientLease>>>();
-        let mut last_errors = std::iter::repeat_with(|| None)
-            .take(requests.len())
-            .collect::<Vec<Option<StoreError>>>();
+        let mut selections = self.select_authorities_for_requests(&candidates, requests);
+        let mut attempt = self.compare_and_swap_route_selections(&selections, requests);
 
-        for rank in 0..self.route_topk {
-            let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
-            for (index, selection) in selections.iter().enumerate() {
-                if resolved[index].is_some() {
-                    continue;
-                }
-                let Some(authority) = selection.authorities.get(rank).cloned() else {
-                    continue;
-                };
-                groups
-                    .entry(authority.runtime.stable_id.0.clone())
-                    .or_insert_with(|| (authority, Vec::new()))
-                    .1
-                    .push(index);
-            }
-
-            for (_, (authority, indices)) in groups {
-                let batch_requests = indices
+        if Self::should_refresh_route_cas_attempt(&attempt) {
+            let retry_indices = attempt
+                .resolved
+                .iter()
+                .enumerate()
+                .filter_map(|(index, result)| result.is_none().then_some(index))
+                .collect::<Vec<_>>();
+            if !retry_indices.is_empty() {
+                debug!(
+                    runtime = %observer.runtime,
+                    items = retry_indices.len(),
+                    "refreshing live-client snapshot before retrying route authority selection"
+                );
+                let refreshed_candidates = self.authority_candidates_once(observer, true)?;
+                let retry_requests = retry_indices
                     .iter()
                     .map(|index| requests[*index].clone())
                     .collect::<Vec<_>>();
-                if self.authority_is_local(&authority) {
-                    match self.cas_local_batch(&authority.runtime.stable_id, &batch_requests) {
-                        Ok(results) => {
-                            for (index, result) in indices.into_iter().zip(results.into_iter()) {
-                                resolved[index] = Some(Ok(result));
-                                resolved_authorities[index] = Some(authority.clone());
-                            }
-                        }
-                        Err(error) => {
-                            self.maybe_mark_authority_suspect(
-                                &authority,
-                                &error,
-                                "route_batch_cas_local_failed",
-                            );
-                            warn!(
-                                runtime = %authority.runtime,
-                                error = %error,
-                                items = batch_requests.len(),
-                                "authority route batch cas failed; trying next mirrored authority"
-                            );
-                            for index in indices {
-                                last_errors[index] = Some(error.clone());
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                match self.control_plane.batch_compare_and_swap_routes(
-                    &authority,
-                    &self.namespace,
-                    &authority.runtime.stable_id,
-                    &batch_requests,
-                ) {
-                    Ok(results) => {
-                        for ((index, request), result) in indices
-                            .into_iter()
-                            .zip(batch_requests.into_iter())
-                            .zip(results.into_iter())
-                        {
-                            match result {
-                                Ok(result) => {
-                                    resolved[index] = Some(Ok(result));
-                                    resolved_authorities[index] = Some(authority.clone());
-                                }
-                                Err(error) => {
-                                    self.maybe_mark_authority_suspect(
-                                        &authority,
-                                        &error,
-                                        "route_batch_cas_failed",
-                                    );
-                                    warn!(
-                                        runtime = %authority.runtime,
-                                        key = %request.key.0,
-                                        error = %error,
-                                        "authority route cas failed; trying next mirrored authority"
-                                    );
-                                    last_errors[index] = Some(error);
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        self.maybe_mark_authority_suspect(
-                            &authority,
-                            &error,
-                            "route_batch_cas_transport_failed",
-                        );
-                        warn!(
-                            runtime = %authority.runtime,
-                            error = %error,
-                            items = batch_requests.len(),
-                            "authority route batch cas failed; trying next mirrored authority"
-                        );
-                        for index in indices {
-                            last_errors[index] = Some(error.clone());
-                        }
-                    }
+                let retry_selections =
+                    self.select_authorities_for_requests(&refreshed_candidates, &retry_requests);
+                let retry_attempt =
+                    self.compare_and_swap_route_selections(&retry_selections, &retry_requests);
+                for (retry_pos, index) in retry_indices.into_iter().enumerate() {
+                    selections[index] = retry_selections[retry_pos].clone();
+                    attempt.resolved[index] = retry_attempt.resolved[retry_pos].clone();
+                    attempt.resolved_authorities[index] =
+                        retry_attempt.resolved_authorities[retry_pos].clone();
+                    attempt.last_errors[index] = retry_attempt.last_errors[retry_pos].clone();
                 }
             }
         }
@@ -885,9 +1052,9 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         let mut mirrors = BTreeMap::<String, (ClientLease, Vec<RouteCasRequest>)>::new();
         let mut results = Vec::with_capacity(requests.len());
         for (index, request) in requests.iter().enumerate() {
-            let result = match resolved[index].take() {
+            let result = match attempt.resolved[index].take() {
                 Some(result) => result,
-                None => Err(last_errors[index].take().unwrap_or_else(|| {
+                None => Err(attempt.last_errors[index].take().unwrap_or_else(|| {
                     StoreError::NotFound(format!(
                         "no reachable mirrored route authority for {}",
                         request.key.0
@@ -895,7 +1062,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 })),
             };
             if result.as_ref().ok().is_some_and(|cas| cas.applied) {
-                if let Some(served) = resolved_authorities[index].as_ref() {
+                if let Some(served) = attempt.resolved_authorities[index].as_ref() {
                     for secondary in &selections[index].authorities {
                         if secondary.runtime.stable_id == served.runtime.stable_id {
                             continue;
@@ -1205,6 +1372,7 @@ fn apply_route_update(
 struct ClusterRouteMesh {
     attached_locals: BTreeMap<String, usize>,
     routes_by_authority: BTreeMap<String, BTreeMap<String, ObjectRoute>>,
+    authority_services: BTreeMap<String, Arc<dyn AuthorityService>>,
 }
 
 impl ClusterRouteMesh {
@@ -1215,6 +1383,17 @@ impl ClusterRouteMesh {
             .or_default();
     }
 
+    fn bind_local_service(
+        &mut self,
+        stable_id: &ClientStableId,
+        service: Arc<dyn AuthorityService>,
+    ) {
+        self.routes_by_authority
+            .entry(stable_id.0.clone())
+            .or_default();
+        self.authority_services.insert(stable_id.0.clone(), service);
+    }
+
     fn unregister_local(&mut self, stable_id: &ClientStableId) {
         let key = stable_id.0.clone();
         match self.attached_locals.get_mut(&key) {
@@ -1222,6 +1401,7 @@ impl ClusterRouteMesh {
             Some(_) => {
                 self.attached_locals.remove(&key);
                 self.routes_by_authority.remove(&key);
+                self.authority_services.remove(&key);
             }
             None => {}
         }
@@ -1231,6 +1411,10 @@ impl ClusterRouteMesh {
         self.attached_locals
             .get(&stable_id.0)
             .is_some_and(|count| *count > 0)
+    }
+
+    fn authority_service(&self, stable_id: &ClientStableId) -> Option<Arc<dyn AuthorityService>> {
+        self.authority_services.get(&stable_id.0).cloned()
     }
 }
 
@@ -1396,19 +1580,21 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
-        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        ClientStableId, CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute,
-        ReplicaRoute, ReplicaTier, RouteCasRequest, RouteDirectory, RouteState, RouteVersion,
-        SegmentName,
+        CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState,
+        ClientRuntimeId, ClientStableId, CompatibilityDescriptor, MetadataBackend, ObjectKey,
+        ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteDirectory,
+        RouteState, RouteVersion, SegmentName, StoreError,
     };
 
     use super::{
         authority_compare_and_swap, authority_compare_and_swap_many, authority_get,
         authority_get_many, authority_list_routes_by_replica_owner, authority_replace,
-        authority_replace_many, build_route_directory, compatibility_matches, ranked_before,
-        route_capable, route_mesh, route_weight, stable_hash, weighted_rendezvous_score,
-        ClusterRouteMesh, ControlPlaneClient, EmbeddedWrhRouteDirectory, RouteControlMode,
+        authority_replace_many, bind_local_authority_service, build_route_directory,
+        compatibility_matches, ranked_before, route_capable, route_mesh, route_weight, stable_hash,
+        weighted_rendezvous_score, ClusterRouteMesh, ControlPlaneClient, EmbeddedWrhRouteDirectory,
+        RouteControlMode,
     };
+    use crate::control_plane::AuthorityService;
 
     fn test_future_expiry_ms() -> u64 {
         SystemTime::now()
@@ -1464,6 +1650,144 @@ mod tests {
                 priority: 0,
             }],
         }
+    }
+
+    struct RejectNewWritesAuthorityService;
+
+    impl AuthorityService for RejectNewWritesAuthorityService {
+        fn get_route(
+            &self,
+            namespace: &str,
+            authority: &ClientStableId,
+            key: &ObjectKey,
+        ) -> Result<Option<ObjectRoute>> {
+            authority_get(namespace, authority, key)
+        }
+
+        fn list_routes_by_replica_owner(
+            &self,
+            namespace: &str,
+            authority: &ClientStableId,
+            owner: &ClientRuntimeId,
+        ) -> Result<Vec<ObjectRoute>> {
+            authority_list_routes_by_replica_owner(namespace, authority, owner)
+        }
+
+        fn compare_and_swap_route(
+            &self,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _key: &ObjectKey,
+            _expected: Option<RouteVersion>,
+            _next: Option<&ObjectRoute>,
+        ) -> Result<CasResult> {
+            Err(StoreError::InvalidState(
+                "route authority is Draining; refusing new writes".to_string(),
+            ))
+        }
+
+        fn replace_route(
+            &self,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _key: &ObjectKey,
+            _next: Option<&ObjectRoute>,
+        ) -> Result<()> {
+            Err(StoreError::InvalidState(
+                "route authority is Draining; refusing new writes".to_string(),
+            ))
+        }
+
+        fn batch_compare_and_swap_routes(
+            &self,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            requests: &[RouteCasRequest],
+        ) -> Vec<Result<CasResult>> {
+            requests
+                .iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(
+                        "route authority is Draining; refusing new writes".to_string(),
+                    ))
+                })
+                .collect()
+        }
+
+        fn batch_replace_routes(
+            &self,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            requests: &[RouteCasRequest],
+        ) -> Vec<Result<()>> {
+            requests
+                .iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(
+                        "route authority is Draining; refusing new writes".to_string(),
+                    ))
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn embedded_directory_local_shortcut_uses_authority_service_gate() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-local-gate", 1, false, Some("scope-a"));
+        let authority = lease("authority-local-gate", 9, true, Some("scope-a"));
+        for lease in [observer.clone(), authority.clone()] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_local_gate_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &authority,
+            control,
+            live_client_cache,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::SuspectRuntimeCache::default(),
+            )),
+        );
+        let namespace = metadata.route_namespace();
+        bind_local_authority_service(
+            &namespace,
+            &authority.runtime.stable_id,
+            Arc::new(RejectNewWritesAuthorityService),
+        );
+
+        let key = ObjectKey::new("tenant-a::local-gate-key");
+        let request = RouteCasRequest {
+            key: key.clone(),
+            expected: None,
+            next: Some(route_for(&key.0, &authority.runtime)),
+        };
+        let results = directory
+            .compare_and_swap_object_routes(&observer, std::slice::from_ref(&request))
+            .expect("local shortcut should surface authority-service error");
+        assert!(matches!(
+            &results[0],
+            Err(StoreError::InvalidState(message)) if message.contains("Draining")
+        ));
+        assert!(
+            authority_get(&namespace, &authority.runtime.stable_id, &key)
+                .expect("authority should stay readable")
+                .is_none(),
+            "local shortcut must not bypass the registered authority service gate"
+        );
     }
 
     #[test]
@@ -2018,6 +2342,82 @@ mod tests {
         assert!(
             !suspect_runtime_cache.lock().contains(&dead_mirror.runtime),
             "resolved topk reads must not quarantine untouched mirrors"
+        );
+
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&live_authority.runtime.stable_id);
+    }
+
+    #[test]
+    fn embedded_directory_refreshes_authority_selection_after_stale_primary_failure() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-refresh-cas", 1, false, Some("scope-a"));
+        let mut stale_primary = lease("authority-refresh-dead", 9, true, Some("scope-a"));
+        stale_primary.endpoints.labels.insert(
+            crate::control_plane::control_address_label().to_string(),
+            "127.0.0.1:1".to_string(),
+        );
+        let live_authority = lease("authority-refresh-live", 1, true, Some("scope-a"));
+        for lease in [
+            observer.clone(),
+            stale_primary.clone(),
+            live_authority.clone(),
+        ] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        live_client_cache
+            .lock()
+            .store(vec![observer.clone(), stale_primary.clone()]);
+        let suspect_runtime_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::SuspectRuntimeCache::default(),
+        ));
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &observer,
+            control,
+            live_client_cache,
+            suspect_runtime_cache.clone(),
+        );
+        let namespace = metadata.route_namespace();
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&live_authority.runtime.stable_id);
+
+        let key = ObjectKey::new("tenant-a::refresh-cas-key");
+        let request = RouteCasRequest {
+            key: key.clone(),
+            expected: None,
+            next: Some(route_for(&key.0, &live_authority.runtime)),
+        };
+        let results = directory
+            .compare_and_swap_object_routes(&observer, std::slice::from_ref(&request))
+            .expect("refreshed cas should succeed via live authority");
+        assert!(
+            results[0]
+                .as_ref()
+                .expect("cas reply should decode")
+                .applied
+        );
+        assert!(
+            authority_get(&namespace, &live_authority.runtime.stable_id, &key)
+                .expect("live authority route should be readable")
+                .is_some(),
+            "refresh retry should rerank onto the live authority"
+        );
+        assert!(
+            suspect_runtime_cache
+                .lock()
+                .contains(&stale_primary.runtime),
+            "failed stale primary should still be quarantined after the refresh retry"
         );
 
         route_mesh(&namespace)

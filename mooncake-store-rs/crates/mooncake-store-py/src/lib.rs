@@ -3306,6 +3306,34 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_async_bridge_wakes_foreign_runtime() {
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(build_client("dispatcher-foreign-runtime"), "dispatcher")
+                .expect("dispatcher should spawn"),
+        );
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-foreign-runtime-test".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || {
+                    let runtime =
+                        tokio::runtime::Runtime::new().expect("foreign runtime should build");
+                    runtime.block_on(async move {
+                        for expected in 0..16u32 {
+                            let value = dispatcher
+                                .run_async(move |_client| Ok::<_, StoreError>(expected))
+                                .await
+                                .expect("foreign runtime call should complete");
+                            assert_eq!(value, expected);
+                        }
+                    });
+                }
+            })
+            .expect("foreign runtime worker should spawn");
+        worker.join().expect("foreign runtime worker should join");
+    }
+
+    #[test]
     fn dispatcher_async_wait_returns_timeout_instead_of_hanging() {
         let dispatcher = StoreDispatcher::spawn_with_timeouts(
             build_client("dispatcher-timeout"),

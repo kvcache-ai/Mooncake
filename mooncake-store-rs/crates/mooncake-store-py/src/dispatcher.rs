@@ -18,6 +18,7 @@ use mooncake_store_core::{
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::config::CompatTimeoutConfig;
@@ -605,19 +606,22 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce() -> Result<T, StoreError> + Send + 'static,
     {
+        let (tx, rx) = oneshot::channel();
+        DISPATCHER_RUNTIME.spawn_blocking(move || {
+            let _ = tx.send(f());
+        });
+
         /*
-         * Keep blocking store operations off the caller runtime.
-         *
-         * Dummy gRPC requests run on their own Tokio runtime. If we use the
-         * caller runtime's blocking pool here, canceled or stalled store
-         * requests can poison the dummy server itself and future RPCs stop
-         * reaching `store.get`/`store.put`.
+         * Keep blocking store operations off the caller runtime, but do not
+         * await the dispatcher runtime's JoinHandle from the dummy gRPC
+         * runtime. A plain oneshot is runtime-agnostic, so completion wakes the
+         * caller even after a previous RPC cancellation poisoned an h2 stream.
          */
-        match tokio::time::timeout(timeout, DISPATCHER_RUNTIME.spawn_blocking(f)).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(StoreError::Transport(format!(
-                "store dispatcher worker failed: {error}"
-            ))),
+            Ok(Err(_)) => Err(StoreError::Transport(
+                "store dispatcher worker failed".to_string(),
+            )),
             Err(_) => Err(dispatcher_timeout(context, timeout)),
         }
     }
