@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +23,14 @@ const MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 const BENCH_HEARTBEAT_EVERY: usize = 32;
 
+#[derive(Clone, Debug)]
+struct RdmaMode {
+    requested: bool,
+    supported: bool,
+    enabled: bool,
+    reason: &'static str,
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     init_tracing_from_env("MC_STORE_RS_TRACE", "MC_STORE_RS_TRACE_FILTER")?;
     if let Some(address) = start_metrics_http_server_from_env("MC_STORE_RS_METRICS_ADDR")? {
@@ -41,9 +50,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(128);
-    let rdma_enable = env::var("MC_STORE_RS_ENABLE_RDMA")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
+    let rdma_mode = detect_rdma_mode();
+    println!(
+        "rdma mode: requested={} supported={} enabled={} reason={}",
+        rdma_mode.requested, rdma_mode.supported, rdma_mode.enabled, rdma_mode.reason
+    );
     let keyspace = MetadataKeyspace::new(format!("mc/store-rs/e2e/{}", unique_suffix()));
     let metadata = Arc::new(RedisMetadataBackend::new(
         RedisMetadataConfig::new(redis_url).keyspace(keyspace),
@@ -59,19 +70,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "dynamic-membership".to_string(),
         ]);
 
-    let target_a_bundle = build_tent_bundle(redis_port, "target-a-segment", rdma_enable)?;
-    let target_b_bundle = build_tent_bundle(redis_port, "target-b-segment", rdma_enable)?;
-    let target_c_bundle = build_tent_bundle(redis_port, "target-c-segment", rdma_enable)?;
-    let upgrade_bundle = build_tent_bundle(redis_port, "target-a-upgrade-segment", rdma_enable)?;
-    let reclaim_bundle = build_tent_bundle(redis_port, "target-reclaim-segment", rdma_enable)?;
-    let router_bundle = build_tent_bundle(redis_port, "router-segment", rdma_enable)?;
+    let target_a_bundle = build_tent_bundle(redis_port, "target-a-segment", rdma_mode.enabled)?;
+    let target_b_bundle = build_tent_bundle(redis_port, "target-b-segment", rdma_mode.enabled)?;
+    let target_c_bundle = build_tent_bundle(redis_port, "target-c-segment", rdma_mode.enabled)?;
+    let upgrade_bundle =
+        build_tent_bundle(redis_port, "target-a-upgrade-segment", rdma_mode.enabled)?;
+    let reclaim_bundle =
+        build_tent_bundle(redis_port, "target-reclaim-segment", rdma_mode.enabled)?;
+    let router_bundle = build_tent_bundle(redis_port, "router-segment", rdma_mode.enabled)?;
     let router_replica_bundle =
-        build_tent_bundle(redis_port, "router-replica-segment", rdma_enable)?;
-    let reader_bundle = build_tent_bundle(redis_port, "reader-segment", rdma_enable)?;
+        build_tent_bundle(redis_port, "router-replica-segment", rdma_mode.enabled)?;
+    let reader_bundle = build_tent_bundle(redis_port, "reader-segment", rdma_mode.enabled)?;
     let elastic_target_bundle =
-        build_tent_bundle(redis_port, "elastic-target-segment", rdma_enable)?;
+        build_tent_bundle(redis_port, "elastic-target-segment", rdma_mode.enabled)?;
     let elastic_router_bundle =
-        build_tent_bundle(redis_port, "elastic-router-segment", rdma_enable)?;
+        build_tent_bundle(redis_port, "elastic-router-segment", rdma_mode.enabled)?;
 
     let mut target_a = build_client(
         metadata.clone(),
@@ -277,7 +290,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         redis_port,
         &reader,
         value_size,
-        rdma_enable,
+        &rdma_mode,
     )?;
 
     heartbeat_clients(&mut [
@@ -1268,11 +1281,12 @@ fn verify_rdma_bandwidth_isolation(
     redis_port: u16,
     reader: &StoreClient,
     value_size: usize,
-    rdma_enable: bool,
+    rdma_mode: &RdmaMode,
 ) -> Result<()> {
-    if !rdma_enable {
+    if !rdma_mode.enabled {
         println!(
-            "skip rdma bandwidth isolation: set MC_STORE_RS_ENABLE_RDMA=1 on an RDMA-capable host"
+            "skip rdma bandwidth isolation: {} (requested={} supported={})",
+            rdma_mode.reason, rdma_mode.requested, rdma_mode.supported
         );
         return Ok(());
     }
@@ -1365,6 +1379,7 @@ fn verify_rdma_bandwidth_isolation(
             let start_high = start.clone();
             let done_high = high_done.clone();
             let high_prefix = high_prefix.clone();
+            let high_client = &high;
             scope.spawn(move || {
                 start_high.wait();
                 let begin = Instant::now();
@@ -1372,7 +1387,7 @@ fn verify_rdma_bandwidth_isolation(
                     for index in 0..iterations {
                         let key = format!("{high_prefix}-{index}");
                         let value = payload(&key, value_size);
-                        high.put(&key, &value)?;
+                        high_client.put(&key, &value)?;
                     }
                     Ok::<Duration, StoreError>(begin.elapsed())
                 })();
@@ -1382,6 +1397,7 @@ fn verify_rdma_bandwidth_isolation(
             let start_low = start.clone();
             let done_low = low_done.clone();
             let low_prefix = low_prefix.clone();
+            let low_client = &low;
             scope.spawn(move || {
                 start_low.wait();
                 let begin = Instant::now();
@@ -1389,7 +1405,7 @@ fn verify_rdma_bandwidth_isolation(
                     for index in 0..iterations {
                         let key = format!("{low_prefix}-{index}");
                         let value = payload(&key, value_size);
-                        low.put(&key, &value)?;
+                        low_client.put(&key, &value)?;
                     }
                     Ok::<Duration, StoreError>(begin.elapsed())
                 })();
@@ -1444,6 +1460,51 @@ fn verify_rdma_bandwidth_isolation(
         )));
     }
     Ok(())
+}
+
+fn detect_rdma_mode() -> RdmaMode {
+    let requested = env::var("MC_STORE_RS_ENABLE_RDMA")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let supported = rdma_supported();
+    let (enabled, reason) = if supported {
+        (
+            true,
+            if requested {
+                "explicitly requested and supported"
+            } else {
+                "auto-enabled on RDMA-capable host"
+            },
+        )
+    } else if requested {
+        (
+            false,
+            "requested but ibv_devinfo is unavailable or reports no RDMA support",
+        )
+    } else {
+        (
+            false,
+            "ibv_devinfo is unavailable or reports no RDMA support",
+        )
+    };
+    RdmaMode {
+        requested,
+        supported,
+        enabled,
+        reason,
+    }
+}
+
+fn rdma_supported() -> bool {
+    let output = Command::new("ibv_devinfo").output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.contains("hca_id") || stdout.contains("transport:")
 }
 
 fn run_batch_put_benchmark(
