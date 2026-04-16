@@ -13,12 +13,11 @@ project, both of which exercise the same storage backend code paths as
 this feature.
 
 Prerequisites:
-  - mooncake_master running with:
-      ``MOONCAKE_OFFLOAD_ON_EVICT=1``
-      ``MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/...``
-      ``enable_offload=true`` in master.json
-  - The same ``MOONCAKE_OFFLOAD_*`` env vars set on the pytest side so the
-    client's FileStorage uses the matching backend / path.
+  - mooncake_master running with master.json containing:
+      ``"enable_offload": true``
+      ``"offload_on_evict": true``
+  - ``MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/tmp/...`` env var set on the
+    client side so FileStorage uses the matching backend / path.
 """
 
 import unittest
@@ -78,7 +77,7 @@ class TestOffloadOnEviction(unittest.TestCase):
         is for — avoiding redundant disk I/O for hot data.
 
         A zero disk-replica count thus doubles as a guard that the
-        master is actually running with ``MOONCAKE_OFFLOAD_ON_EVICT=1``.
+        master is actually running with ``offload_on_evict: true`` in config.
         """
         VALUE_SIZE = 1024  # 1 KB
         NUM_KEYS = 16  # 16 KB total, several orders of magnitude below
@@ -122,7 +121,7 @@ class TestOffloadOnEviction(unittest.TestCase):
                 0,
                 f"Offload-on-evict should keep small workloads in DRAM "
                 f"only, but found {disk_replicas} LOCAL_DISK replicas. "
-                f"Is MOONCAKE_OFFLOAD_ON_EVICT=1 set on the master?",
+                f"Is offload_on_evict=true set in master config?",
             )
 
             # Sanity: every key is readable and bit-exact (served from DRAM).

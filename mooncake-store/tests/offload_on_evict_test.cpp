@@ -5,7 +5,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
@@ -15,37 +14,14 @@
 
 namespace mooncake::test {
 
-// RAII helper to set/unset environment variables per test
-class ScopedEnv {
-   public:
-    ScopedEnv(const char* name, const char* value) : name_(name) {
-        if (value) {
-            setenv(name, value, /*overwrite=*/1);
-        } else {
-            unsetenv(name);
-        }
-    }
-    ~ScopedEnv() { unsetenv(name_); }
-
-   private:
-    const char* name_;
-};
-
 class OffloadOnEvictTest : public ::testing::Test {
    protected:
     void SetUp() override {
         google::InitGoogleLogging("OffloadOnEvictTest");
         FLAGS_logtostderr = true;
-        // Clean env vars before each test
-        unsetenv("MOONCAKE_OFFLOAD_ON_EVICT");
-        unsetenv("MOONCAKE_OFFLOAD_FORCE_EVICT");
     }
 
-    void TearDown() override {
-        unsetenv("MOONCAKE_OFFLOAD_ON_EVICT");
-        unsetenv("MOONCAKE_OFFLOAD_FORCE_EVICT");
-        google::ShutdownGoogleLogging();
-    }
+    void TearDown() override { google::ShutdownGoogleLogging(); }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
@@ -136,11 +112,10 @@ class OffloadOnEvictTest : public ::testing::Test {
 };
 
 // =============================================================================
-// Combo A: No env vars (default — offload at PutEnd)
+// Combo A: Default config (offload at PutEnd)
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, ComboA_OffloadAtPutEnd) {
-    // No env vars set — default behavior
     MasterServiceConfig config;
     config.enable_offload = true;
     config.default_kv_lease_ttl = 2000;
@@ -195,14 +170,13 @@ TEST_F(OffloadOnEvictTest, ComboA_EvictionWorks) {
 }
 
 // =============================================================================
-// Combo B: MOONCAKE_OFFLOAD_ON_EVICT=1 (offload on evict, no force-evict)
+// Combo B: offload_on_evict=true (offload on evict, no force-evict)
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, ComboB_PutEndSkipsOffloadQueue) {
-    ScopedEnv env("MOONCAKE_OFFLOAD_ON_EVICT", "1");
-
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.offload_on_evict = true;
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
@@ -225,11 +199,10 @@ TEST_F(OffloadOnEvictTest, ComboB_PutEndSkipsOffloadQueue) {
 }
 
 TEST_F(OffloadOnEvictTest, ComboB_EvictionTriggersOffload) {
-    ScopedEnv env("MOONCAKE_OFFLOAD_ON_EVICT", "1");
-
     const uint64_t kv_lease_ttl = 2000;
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.offload_on_evict = true;
     config.default_kv_lease_ttl = kv_lease_ttl;
     auto service = std::make_unique<MasterService>(config);
 
@@ -275,11 +248,10 @@ TEST_F(OffloadOnEvictTest, ComboB_NoFallbackWithoutForceEvict) {
     // Without force_evict AND without a LocalDiskSegment, offload queue push
     // fails and eviction does NOT force-delete MEMORY (data-preserving).
     // The segment fills and subsequent puts fail — this is the safe default.
-    ScopedEnv env("MOONCAKE_OFFLOAD_ON_EVICT", "1");
-
     const uint64_t kv_lease_ttl = 2000;
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.offload_on_evict = true;
     config.default_kv_lease_ttl = kv_lease_ttl;
     auto service = std::make_unique<MasterService>(config);
 
@@ -301,15 +273,14 @@ TEST_F(OffloadOnEvictTest, ComboB_NoFallbackWithoutForceEvict) {
 }
 
 // =============================================================================
-// Combo C: MOONCAKE_OFFLOAD_ON_EVICT=1 + MOONCAKE_OFFLOAD_FORCE_EVICT=1
+// Combo C: offload_on_evict=true + offload_force_evict=true
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, ComboC_PutEndSkipsOffloadQueue) {
-    ScopedEnv env1("MOONCAKE_OFFLOAD_ON_EVICT", "1");
-    ScopedEnv env2("MOONCAKE_OFFLOAD_FORCE_EVICT", "1");
-
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.offload_force_evict = true;
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
@@ -331,12 +302,11 @@ TEST_F(OffloadOnEvictTest, ComboC_PutEndSkipsOffloadQueue) {
 }
 
 TEST_F(OffloadOnEvictTest, ComboC_EvictionWithForceEvict) {
-    ScopedEnv env1("MOONCAKE_OFFLOAD_ON_EVICT", "1");
-    ScopedEnv env2("MOONCAKE_OFFLOAD_FORCE_EVICT", "1");
-
     const uint64_t kv_lease_ttl = 2000;
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.offload_force_evict = true;
     config.default_kv_lease_ttl = kv_lease_ttl;
     auto service = std::make_unique<MasterService>(config);
 
@@ -361,14 +331,13 @@ TEST_F(OffloadOnEvictTest, ComboC_EvictionWithForceEvict) {
 }
 
 // =============================================================================
-// Combo D: MOONCAKE_OFFLOAD_FORCE_EVICT=1 only (should be no-op)
+// Combo D: offload_force_evict=true only (should be no-op without on_evict)
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, ComboD_ForceEvictAloneIsIgnored) {
-    ScopedEnv env("MOONCAKE_OFFLOAD_FORCE_EVICT", "1");
-
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.offload_force_evict = true;  // on_evict is false → force is ignored
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
@@ -390,11 +359,10 @@ TEST_F(OffloadOnEvictTest, ComboD_ForceEvictAloneIsIgnored) {
 }
 
 TEST_F(OffloadOnEvictTest, ComboD_EvictionWorks) {
-    ScopedEnv env("MOONCAKE_OFFLOAD_FORCE_EVICT", "1");
-
     const uint64_t kv_lease_ttl = 2000;
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.offload_force_evict = true;  // on_evict is false → force is ignored
     config.default_kv_lease_ttl = kv_lease_ttl;
     auto service = std::make_unique<MasterService>(config);
 

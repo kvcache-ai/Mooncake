@@ -167,19 +167,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
-    {
-        const char* env = std::getenv("MOONCAKE_OFFLOAD_ON_EVICT");
-        offload_on_evict_ = enable_offload_ && env && std::string(env) == "1";
-        if (offload_on_evict_) {
-            LOG(INFO) << "Offload-on-evict mode enabled: DRAM offload to "
-                         "LOCAL_DISK will occur at eviction time instead of "
-                         "PutEnd";
-            const char* force_env = std::getenv("MOONCAKE_OFFLOAD_FORCE_EVICT");
-            offload_force_evict_ = force_env && std::string(force_env) == "1";
-            if (offload_force_evict_) {
-                LOG(INFO) << "Force-evict enabled: objects exceeding offload "
-                             "cap will be evicted without disk offload";
-            }
+    offload_on_evict_ = enable_offload_ && config.offload_on_evict;
+    if (offload_on_evict_) {
+        LOG(INFO) << "Offload-on-evict mode enabled: DRAM offload to "
+                     "LOCAL_DISK will occur at eviction time instead of "
+                     "PutEnd";
+        offload_force_evict_ = config.offload_force_evict;
+        if (offload_force_evict_) {
+            LOG(INFO) << "Force-evict enabled: objects exceeding offload "
+                         "cap will be evicted without disk offload";
         }
     }
 
@@ -3843,7 +3839,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
                      << offload_push_failed_forced
                      << " object(s); force-evicted without disk offload "
-                        "(MOONCAKE_OFFLOAD_FORCE_EVICT=1).";
+                        "(offload_force_evict=true).";
     }
 }
 
