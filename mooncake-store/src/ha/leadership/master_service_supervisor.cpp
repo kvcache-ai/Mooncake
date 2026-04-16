@@ -34,18 +34,19 @@ bool HasPodIdentity(const MasterServiceSupervisorConfig& config) {
 
 void TrySetLeaderLabel(const MasterServiceSupervisorConfig& config) {
     if (!HasPodIdentity(config)) return;
-    auto err = K8sLeaseHelper::SetPodLabel(config.pod_namespace, config.pod_name,
-                                           kLeaderLabelKey, kLeaderLabelValue);
+    auto err =
+        K8sLeaseHelper::SetPodLabel(config.pod_namespace, config.pod_name,
+                                    kLeaderLabelKey, kLeaderLabelValue);
     if (err != ErrorCode::OK) {
-        LOG(WARNING) << "Failed to set leader label on pod "
-                     << config.pod_name << ": " << toString(err);
+        LOG(WARNING) << "Failed to set leader label on pod " << config.pod_name
+                     << ": " << toString(err);
     }
 }
 
 void TryClearLeaderLabel(const MasterServiceSupervisorConfig& config) {
     if (!HasPodIdentity(config)) return;
-    auto err = K8sLeaseHelper::ClearPodLabel(
-        config.pod_namespace, config.pod_name, kLeaderLabelKey);
+    auto err = K8sLeaseHelper::ClearPodLabel(config.pod_namespace,
+                                             config.pod_name, kLeaderLabelKey);
     if (err != ErrorCode::OK) {
         LOG(WARNING) << "Failed to clear leader label on pod "
                      << config.pod_name << ": " << toString(err);
@@ -154,10 +155,9 @@ void SetRuntimeState(MasterAdminServer& admin_server,
               << ", role=" << MasterRuntimeRoleToString(state);
 }
 
-void ActivateServingState(
-    MasterAdminServer& admin_server,
-    const std::shared_ptr<WrappedMasterService>& service,
-    const MasterServiceSupervisorConfig& config) {
+void ActivateServingState(MasterAdminServer& admin_server,
+                          const std::shared_ptr<WrappedMasterService>& service,
+                          const MasterServiceSupervisorConfig& config) {
     admin_server.SetServiceDelegate(service);
     admin_server.SetServiceAvailable(true);
     SetRuntimeState(admin_server, MasterRuntimeState::kServing);
