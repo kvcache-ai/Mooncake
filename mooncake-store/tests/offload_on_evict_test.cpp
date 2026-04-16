@@ -271,7 +271,10 @@ TEST_F(OffloadOnEvictTest, ComboB_EvictionTriggersOffload) {
     service->RemoveAll();
 }
 
-TEST_F(OffloadOnEvictTest, ComboB_FallbackWhenNoLocalDiskSegment) {
+TEST_F(OffloadOnEvictTest, ComboB_NoFallbackWithoutForceEvict) {
+    // Without force_evict AND without a LocalDiskSegment, offload queue push
+    // fails and eviction does NOT force-delete MEMORY (data-preserving).
+    // The segment fills and subsequent puts fail — this is the safe default.
     ScopedEnv env("MOONCAKE_OFFLOAD_ON_EVICT", "1");
 
     const uint64_t kv_lease_ttl = 2000;
@@ -286,11 +289,12 @@ TEST_F(OffloadOnEvictTest, ComboB_FallbackWhenNoLocalDiskSegment) {
     auto ctx =
         PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
 
-    // Should still work via force-evict fallback (PushOffloadingQueue fails)
+    // Without force_evict, push failures mean DRAM cannot be freed,
+    // so we can only put up to segment capacity (no overflow).
     int success_puts = FillSegmentUntilEviction(
         *service, ctx.client_id, "evict_b2_", object_size, 1024 * 16 + 50);
-    EXPECT_GT(success_puts, 1024 * 16)
-        << "Offload-on-evict: fallback eviction should work without local disk";
+    EXPECT_LE(success_puts, 1024 * 16)
+        << "Without force_evict, segment should fill and stay full";
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service->RemoveAll();

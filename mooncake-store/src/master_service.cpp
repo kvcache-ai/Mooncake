@@ -48,6 +48,13 @@ namespace {
 
 constexpr size_t kUnlimitedSnapshotList = 0;
 
+// Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
+// when offload-on-evict mode is active. Defers memory eviction for at most
+// this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
+// falls back according to `offload_force_evict_`. A future change may expose
+// this as a configurable parameter if workloads demand tuning.
+constexpr double kOffloadCapRatio = 0.5;
+
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
     kRedis,
@@ -3511,18 +3518,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // --- Offload-on-evict support ---
     long offload_queued_this_cycle = 0;
     long offload_deferred_count = 0;
+    long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
+    long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
     const long offload_cap =
-        offload_on_evict_ ? static_cast<long>(offloading_queue_limit_ * 0.5)
-                          : 0;
+        offload_on_evict_
+            ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
+            : 0;
 
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
 
-    // Returns freed bytes. Returns 0 if offload-queued (no memory freed yet).
+    // Returns freed bytes. Returns 0 if offload-queued and no additional
+    // replicas were evicted (all MEMORY replicas of the key are now pinned).
     auto try_evict_or_offload =
-        [&](const std::string& key, ObjectMetadata& metadata,
-            MetadataShardAccessorRW& shard) -> uint64_t {
+        [&, this](const std::string& key, ObjectMetadata& metadata,
+                  MetadataShardAccessorRW& shard) -> uint64_t {
         if (!offload_on_evict_) {
             // Original behavior
             return metadata.size * evict_replicas(metadata);
@@ -3533,27 +3544,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return metadata.size * evict_replicas(metadata);
         }
 
-        // Force-evict cap: if force_evict enabled and cap reached, force delete
+        // Force-evict cap: if force_evict enabled and cap reached, force
+        // delete. Warning is aggregated at the end of the cycle to avoid log
+        // flooding.
         if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
-            LOG(WARNING) << "[EVICT] Offload cap reached, force-evicting key="
-                         << key << " without disk offload";
+            offload_cap_forced_count++;
             return metadata.size * evict_replicas(metadata);
         }
 
-        // Queue for offload: push to offloading queue + inc_refcnt
+        // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
         metadata.VisitReplicas(
             [](const Replica& r) {
                 return r.is_memory_replica() && r.is_completed() &&
                        r.get_refcnt() == 0;
             },
-            [this, &key, &shard, &queued](Replica& replica) {
+            [this, &key, &shard, &queued, &now](Replica& replica) {
+                if (queued) return;  // only need to pin one replica for offload
                 auto result = PushOffloadingQueue(key, replica);
                 if (result) {
                     replica.inc_refcnt();
                     shard->offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(),
-                                            std::chrono::system_clock::now()});
+                        key, OffloadingTask{replica.id(), now});
                     queued = true;
                 }
             });
@@ -3561,11 +3573,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (queued) {
             offload_queued_this_cycle++;
             offload_deferred_count++;
-            return 0;  // No memory freed yet
+            // Any remaining MEMORY replicas with refcnt==0 are redundant copies
+            // (data survives via the pinned replica → disk). Evict them now to
+            // reclaim memory immediately rather than waiting another cycle.
+            return metadata.size * evict_replicas(metadata);
         }
 
-        // PushOffloadingQueue failed — force-evict as fallback
-        return metadata.size * evict_replicas(metadata);
+        // PushOffloadingQueue failed. Default (data-preserving) behavior is to
+        // skip this cycle — the outer eviction loop will retry after the
+        // offload queue drains. Only force-evict when explicitly opted in, to
+        // prevent silent data loss when the queue is unavailable.
+        if (offload_force_evict_) {
+            offload_push_failed_forced++;
+            return metadata.size * evict_replicas(metadata);
+        }
+        return 0;
     };
 
     // Randomly select a starting shard to avoid imbalance eviction between
@@ -3803,12 +3825,25 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
     VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
             << ", offload_deferred=" << offload_deferred_count
+            << ", offload_cap_forced=" << offload_cap_forced_count
+            << ", offload_push_failed_forced=" << offload_push_failed_forced
             << ", total_freed_size=" << total_freed_size;
     if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
         LOG(WARNING) << "[EVICT] No memory freed this cycle; "
                      << offload_deferred_count
                      << " objects deferred for disk offload. "
                         "Consider lowering eviction_high_watermark_ratio.";
+    }
+    if (offload_cap_forced_count > 0) {
+        LOG(WARNING) << "[EVICT] Offload cap (" << offload_cap
+                     << ") reached; force-evicted " << offload_cap_forced_count
+                     << " object(s) without disk offload this cycle.";
+    }
+    if (offload_push_failed_forced > 0) {
+        LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
+                     << offload_push_failed_forced
+                     << " object(s); force-evicted without disk offload "
+                        "(MOONCAKE_OFFLOAD_FORCE_EVICT=1).";
     }
 }
 
