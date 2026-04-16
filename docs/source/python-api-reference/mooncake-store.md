@@ -1657,9 +1657,11 @@ def put_tensor_chunk_with_tp(self, key: str, tensor_chunk: torch.Tensor, tp_rank
 
 **Metadata written:**
 
-  - `key_tp_<tp_rank>`: the shard payload
-  - `key_tp_<tp_rank>_meta`: `ChunkMetadata(start_idx, size)` for this shard
-  - `key_global_meta`: `GlobalMetadata(dtype, ndim, split_dim, put_tp_size, shape)` written by rank 0
+  - When `tp_size > 1`, the API writes:
+    - `key_tp_<tp_rank>`: the shard payload
+    - `key_tp_<tp_rank>_meta`: `ChunkMetadata(start_idx, size)` for this shard
+    - `key_global_meta`: `GlobalMetadata(dtype, ndim, split_dim, put_tp_size, shape)` written by rank 0
+  - When `tp_size == 1`, this API falls back to plain `put_tensor()` and does not write TP metadata objects.
 
 #### batch_put_tensor_chunk_with_tp()
 
@@ -1682,6 +1684,11 @@ def batch_put_tensor_chunk_with_tp(self, base_keys: List[str], tensor_chunks: Li
 **Returns:**
 
   - `List[int]`: Per-item status codes.
+
+**Notes:**
+
+  - When `tp_rank != 0`, batch shard put writes `key_tp_<tp_rank>` and `key_tp_<tp_rank>_meta`, but does not write `key_global_meta`.
+  - When `tp_size == 1`, this API falls back to plain `batch_put_tensor()` and does not write TP metadata objects.
 
 ---
 #### put_tensor()
@@ -2164,6 +2171,10 @@ def put_tensor_chunk_with_tp_from(self, key: str, buffer_ptr: int, size: int, tp
 
   - `int`: Status code (0 = success, non-zero = error code).
 
+**Notes:**
+
+  - When `tp_size == 1`, this API falls back to plain `put_tensor_from()` and does not write TP metadata objects.
+
 #### batch_put_tensor_chunk_with_tp_from()
 
 Batch version of `put_tensor_chunk_with_tp_from()`. Each buffer contains one serialized shard in **\[TensorMetadata\]\[tensor data\]** layout.
@@ -2186,6 +2197,11 @@ def batch_put_tensor_chunk_with_tp_from(self, base_keys: List[str], buffer_ptrs:
 **Returns:**
 
   - `List[int]`: Per-item status codes.
+
+**Notes:**
+
+  - When `tp_rank != 0`, batch shard put writes `key_tp_<tp_rank>` and `key_tp_<tp_rank>_meta`, but does not write `key_global_meta`.
+  - When `tp_size == 1`, this API falls back to plain `batch_put_tensor_from()` and does not write TP metadata objects.
 
 ---
 

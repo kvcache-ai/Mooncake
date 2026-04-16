@@ -70,6 +70,23 @@ class MooncakeTestBase(unittest.TestCase):
 
 
 class TestTensorChunkAPI(MooncakeTestBase):
+    def test_put_tensor_chunk_with_tp_invalid_split_dim(self):
+        key = "chunk_invalid_split_dim"
+        chunk = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        rc = self.store.put_tensor_chunk_with_tp(
+            key,
+            chunk,
+            tp_rank=0,
+            tp_size=2,
+            split_dim=2,
+            full_shape=[8, 4],
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(self.store.is_exist(f"{key}_tp_0"), 0)
+        self.assertEqual(self.store.is_exist(f"{key}_tp_0_meta"), 0)
+        self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 0)
+
     def test_put_tensor_chunk_with_tp_writes_metadata_and_shard(self):
         key = "chunk_test_single"
         tensor = torch.arange(32, dtype=torch.float32).reshape(8, 4)
@@ -93,6 +110,23 @@ class TestTensorChunkAPI(MooncakeTestBase):
             self.assertEqual(self.store.is_exist(f"{key}_tp_{rank}_meta"), 1)
 
         self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 1)
+
+        chunk_meta = self.store.get(f"{key}_tp_2_meta")
+        self.assertEqual(len(chunk_meta), 16)
+        start_idx = int.from_bytes(chunk_meta[:8], byteorder="little", signed=True)
+        shard_size = int.from_bytes(chunk_meta[8:16], byteorder="little", signed=True)
+        self.assertEqual(start_idx, 4)
+        self.assertEqual(shard_size, 2)
+
+        global_meta = self.store.get(f"{key}_global_meta")
+        self.assertEqual(len(global_meta), 48)
+        split_dim_meta = int.from_bytes(global_meta[8:12], byteorder="little", signed=True)
+        put_tp_size = int.from_bytes(global_meta[12:16], byteorder="little", signed=True)
+        dim0 = int.from_bytes(global_meta[16:24], byteorder="little", signed=True)
+        dim1 = int.from_bytes(global_meta[24:32], byteorder="little", signed=True)
+        self.assertEqual(split_dim_meta, split_dim)
+        self.assertEqual(put_tp_size, tp_size)
+        self.assertEqual((dim0, dim1), tensor.shape)
 
         fast_path = self.store.get_tensor_with_tp(
             key, tp_rank=2, tp_size=tp_size, split_dim=split_dim
@@ -167,7 +201,8 @@ class TestTensorChunkAPI(MooncakeTestBase):
         payload = (ctypes.c_ubyte * size)()
         addr = ctypes.addressof(payload)
         self.assertEqual(self.store.register_buffer(addr, size), 0)
-        self.store.get_tensor_into(seed_key, addr, size)
+        copied = self.store.get_tensor_into(seed_key, addr, size)
+        self.assertIsNotNone(copied)
         try:
             rc = self.store.put_tensor_chunk_with_tp_from(
                 key,
@@ -206,7 +241,8 @@ class TestTensorChunkAPI(MooncakeTestBase):
             self.assertEqual(self.store.put_tensor(seed_key, chunk), 0)
         for ptr, size, seed_key in zip(ptrs, sizes, seed_keys):
             self.assertEqual(self.store.register_buffer(ptr, size), 0)
-            self.store.get_tensor_into(seed_key, ptr, size)
+            copied = self.store.get_tensor_into(seed_key, ptr, size)
+            self.assertIsNotNone(copied)
         try:
             rc = self.store.batch_put_tensor_chunk_with_tp_from(
                 keys,

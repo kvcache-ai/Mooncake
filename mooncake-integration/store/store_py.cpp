@@ -405,10 +405,24 @@ class MooncakeStorePyWrapper {
         }
     }
 
+    static void validate_split_dim(const TensorMetadata &tensor_meta,
+                                   int split_dim) {
+        if (tensor_meta.ndim <= 0 || tensor_meta.ndim > 4) {
+            throw std::runtime_error("Invalid tensor ndim: " +
+                                     std::to_string(tensor_meta.ndim));
+        }
+        if (split_dim < 0 || split_dim >= tensor_meta.ndim) {
+            throw std::runtime_error("Invalid split_dim: " +
+                                     std::to_string(split_dim));
+        }
+    }
+
     static void calculate_full_shape(
         const TensorMetadata &chunk_meta, int split_dim, int tp_size,
         const std::optional<std::vector<int64_t>> &full_shape_arg,
         int64_t full_shape[4]) {
+        validate_split_dim(chunk_meta, split_dim);
+
         if (full_shape_arg.has_value()) {
             const auto &arg_shape = full_shape_arg.value();
             if (arg_shape.size() != static_cast<size_t>(chunk_meta.ndim)) {
@@ -419,8 +433,7 @@ class MooncakeStorePyWrapper {
             }
         } else {
             for (int i = 0; i < chunk_meta.ndim; i++) {
-                if (i == split_dim && split_dim >= 0 &&
-                    split_dim < chunk_meta.ndim) {
+                if (i == split_dim) {
                     full_shape[i] = chunk_meta.shape[i] * tp_size;
                 } else {
                     full_shape[i] = chunk_meta.shape[i];
@@ -435,6 +448,8 @@ class MooncakeStorePyWrapper {
     static GlobalMetadata create_global_metadata(
         const TensorMetadata &tensor_meta, int split_dim, int put_tp_size,
         const int64_t *full_shape) {
+        validate_split_dim(tensor_meta, split_dim);
+
         GlobalMetadata global_meta;
         global_meta.dtype = tensor_meta.dtype;
         global_meta.ndim = tensor_meta.ndim;
@@ -444,6 +459,19 @@ class MooncakeStorePyWrapper {
             global_meta.shape[i] = full_shape[i];
         }
         return global_meta;
+    }
+
+    static void cleanup_partial_tp_chunk_puts(
+        PyClient *store, const std::vector<std::string> &base_keys,
+        const std::vector<int> &results, int tp_rank, bool remove_global_meta) {
+        for (size_t i = 0; i < base_keys.size(); ++i) {
+            if (results[i] == 0) continue;
+            store->remove(get_tp_key_name(base_keys[i], tp_rank));
+            store->remove(get_chunk_meta_key_name(base_keys[i], tp_rank));
+            if (remove_global_meta) {
+                store->remove(get_global_meta_key_name(base_keys[i]));
+            }
+        }
     }
 
     int store_tensor_tp_metadata(
@@ -1130,6 +1158,8 @@ class MooncakeStorePyWrapper {
             }
         }
 
+        std::vector<int> chunk_put_status = results;
+
         std::vector<std::string> chunk_meta_keys;
         std::vector<void *> chunk_meta_buffers;
         std::vector<size_t> chunk_meta_sizes;
@@ -1184,6 +1214,14 @@ class MooncakeStorePyWrapper {
             batch_put_metadata_and_update_results(
                 store_.get(), global_meta_keys, global_meta_buffers,
                 global_meta_sizes, global_meta_indices, results, config);
+        }
+
+        cleanup_partial_tp_chunk_puts(store_.get(), base_keys, results, tp_rank,
+                                      tp_rank == 0);
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (chunk_put_status[i] != 0 && results[i] == 0) {
+                results[i] = chunk_put_status[i];
+            }
         }
 
         return results;
@@ -1427,6 +1465,7 @@ class MooncakeStorePyWrapper {
                 chunk_keys, CastAddrs2Ptrs(buffer_ptrs), sizes, config);
         }
 
+        std::vector<int> chunk_put_status = results;
         std::vector<TensorMetadata> tensor_metas(num_keys);
         std::vector<std::array<int64_t, 4>> full_shapes(num_keys);
 
@@ -1504,6 +1543,14 @@ class MooncakeStorePyWrapper {
             batch_put_metadata_and_update_results(
                 store_.get(), global_meta_keys, global_meta_buffers,
                 global_meta_sizes, global_meta_indices, results, config);
+        }
+
+        cleanup_partial_tp_chunk_puts(store_.get(), base_keys, results, tp_rank,
+                                      tp_rank == 0);
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (chunk_put_status[i] != 0 && results[i] == 0) {
+                results[i] = chunk_put_status[i];
+            }
         }
 
         return results;
