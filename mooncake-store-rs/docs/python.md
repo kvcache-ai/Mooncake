@@ -188,7 +188,6 @@ Useful flags:
 - `--transport-backend tent|classic-te` to choose the real data-plane backend
 - `--transport-rpc-port <port>` to pin the real data-plane TCP port used by real clients
 - `--routed-writes` and `--replica-count` to enable routed writer mode
-<<<<<<< HEAD
 - `--route-topk <n>` as a compatibility fallback for WRH route-authority fanout; it must be `>= 2`, should match any policy already stored in metadata, and admin-managed tenant policy is preferred
 - `--route-control metadata-only|embedded-wrh` as a compatibility fallback for route authority mode; prefer admin-managed tenant policy in metadata
 - `--heartbeat-interval-ms`, `--heartbeat-timeout-ms`, and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`

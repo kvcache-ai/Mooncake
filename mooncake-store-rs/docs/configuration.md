@@ -18,6 +18,21 @@ Keep this distinction clear:
 - `tenant` selects the default scope used for request builders and startup policy lookup
 - request-scoped APIs and per-request `ReplicationPolicy` remain normal execution-time inputs
 - local route/resource knobs are not the preferred long-term policy authoring surface
+- strict quota usage/accounting inspection now comes from admin/metadata surfaces, not builder fields
+
+## Admin strict-quota inspection
+
+Phase 2 exposes read-only inspection for the metadata-backed strict quota primitives added in Phase 1:
+
+- `mooncake-store-admin quota state --tenant <tenant> [--domain <domain>] [--object-set <set>]`
+- `mooncake-store-admin quota object --tenant <tenant> [--domain <domain>] [--object-set <set>] --key <logical-key>`
+- `mooncake-store-admin quota reservations --tenant <tenant> [--domain <domain>] [--object-set <set>] [--state pending|finalized|aborted]`
+
+Operational notes:
+
+- quota state and reservation queries resolve to the tenant-root scope because mutable quota state is tenant-root metadata in Phase 1
+- object-accounting lookups still accept nested selectors so operators can specify the logical object namespace they care about
+- these commands are inspection-only in Phase 2; runtime write/delete enforcement still lands in later phases
 
 ## `StoreClientBuilder`
 

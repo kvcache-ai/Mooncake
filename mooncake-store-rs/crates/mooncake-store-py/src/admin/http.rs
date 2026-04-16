@@ -134,8 +134,18 @@ fn route_request(service: &AdminService, request: HttpRequest) -> String {
                 Err(error) => http_store_error(error),
             }
         }
-        _ => route_policy_scope_request(service, request, path_only.as_str()),
+        _ => route_scoped_request(service, request, path_only.as_str()),
     }
+}
+
+fn route_scoped_request(service: &AdminService, request: HttpRequest, path_only: &str) -> String {
+    if path_only.starts_with("/v1/tenant-quotas/") {
+        return route_tenant_quota_request(service, request, path_only);
+    }
+    if path_only.starts_with("/v1/tenant-object-accounting/") {
+        return route_tenant_object_accounting_request(service, request, path_only);
+    }
+    route_policy_scope_request(service, request, path_only)
 }
 
 fn route_policy_scope_request(
@@ -209,6 +219,67 @@ fn route_policy_scope_request(
     }
 }
 
+fn route_tenant_quota_request(
+    service: &AdminService,
+    request: HttpRequest,
+    path_only: &str,
+) -> String {
+    if request.method != "GET" {
+        return http_error_response("405 Method Not Allowed", "method not allowed");
+    }
+    let Some(scope) = parse_quota_scope_path(path_only) else {
+        return http_error_response("404 Not Found", "not found");
+    };
+    if path_only.ends_with("/reservations") {
+        let state = match query_param(&request.path, "state") {
+            Some(value) => match parse_reservation_state_query(&value) {
+                Ok(state) => Some(state),
+                Err(error) => return http_store_error(error),
+            },
+            None => None,
+        };
+        return match service.list_tenant_quota_reservations(
+            &scope.tenant,
+            scope.domain.as_deref(),
+            scope.object_set.as_deref(),
+            state,
+        ) {
+            Ok(response) => http_json_response("200 OK", &response),
+            Err(error) => http_store_error(error),
+        };
+    }
+    match service.get_tenant_quota_state(
+        &scope.tenant,
+        scope.domain.as_deref(),
+        scope.object_set.as_deref(),
+    ) {
+        Ok(response) => http_json_response("200 OK", &response),
+        Err(error) => http_store_error(error),
+    }
+}
+
+fn route_tenant_object_accounting_request(
+    service: &AdminService,
+    request: HttpRequest,
+    path_only: &str,
+) -> String {
+    if request.method != "GET" {
+        return http_error_response("405 Method Not Allowed", "method not allowed");
+    }
+    let Some((scope, key)) = parse_object_accounting_path(path_only) else {
+        return http_error_response("404 Not Found", "not found");
+    };
+    match service.get_tenant_object_accounting(
+        &scope.tenant,
+        scope.domain.as_deref(),
+        scope.object_set.as_deref(),
+        &key,
+    ) {
+        Ok(response) => http_json_response("200 OK", &response),
+        Err(error) => http_store_error(error),
+    }
+}
+
 #[derive(Debug)]
 struct PolicyScopePath {
     tenant: String,
@@ -217,7 +288,53 @@ struct PolicyScopePath {
 }
 
 fn parse_policy_scope_path(path: &str) -> Option<PolicyScopePath> {
-    let prefix = "/v1/tenant-policies/";
+    parse_policy_scope_with_prefix(path, "/v1/tenant-policies/")
+}
+
+fn parse_quota_scope_path(path: &str) -> Option<PolicyScopePath> {
+    let scope = parse_policy_scope_with_prefix(path, "/v1/tenant-quotas/")?;
+    let suffix = format!("/v1/tenant-quotas/{}", format_scope_suffix(&scope));
+    let reservations_suffix = format!("{suffix}/reservations");
+    (path == suffix || path == reservations_suffix).then_some(scope)
+}
+
+fn parse_object_accounting_path(path: &str) -> Option<(PolicyScopePath, String)> {
+    let prefix = "/v1/tenant-object-accounting/";
+    let rest = path.strip_prefix(prefix)?;
+    let parts = rest
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [tenant, "objects", key] => Some((
+            PolicyScopePath {
+                tenant: (*tenant).to_string(),
+                domain: None,
+                object_set: None,
+            },
+            percent_decode_component(key)?,
+        )),
+        [tenant, domain, "objects", key] => Some((
+            PolicyScopePath {
+                tenant: (*tenant).to_string(),
+                domain: Some((*domain).to_string()),
+                object_set: None,
+            },
+            percent_decode_component(key)?,
+        )),
+        [tenant, domain, object_set, "objects", key] => Some((
+            PolicyScopePath {
+                tenant: (*tenant).to_string(),
+                domain: Some((*domain).to_string()),
+                object_set: Some((*object_set).to_string()),
+            },
+            percent_decode_component(key)?,
+        )),
+        _ => None,
+    }
+}
+
+fn parse_policy_scope_with_prefix(path: &str, prefix: &str) -> Option<PolicyScopePath> {
     let rest = path.strip_prefix(prefix)?;
     let parts = rest
         .split('/')
@@ -240,6 +357,32 @@ fn parse_policy_scope_path(path: &str) -> Option<PolicyScopePath> {
             object_set: Some((*object_set).to_string()),
         }),
         _ => None,
+    }
+}
+
+fn format_scope_suffix(scope: &PolicyScopePath) -> String {
+    let mut suffix = scope.tenant.clone();
+    if let Some(domain) = scope.domain.as_deref() {
+        suffix.push('/');
+        suffix.push_str(domain);
+    }
+    if let Some(object_set) = scope.object_set.as_deref() {
+        suffix.push('/');
+        suffix.push_str(object_set);
+    }
+    suffix
+}
+
+fn parse_reservation_state_query(
+    value: &str,
+) -> Result<mooncake_store_core::TenantQuotaReservationState, StoreError> {
+    match value {
+        "pending" => Ok(mooncake_store_core::TenantQuotaReservationState::Pending),
+        "finalized" => Ok(mooncake_store_core::TenantQuotaReservationState::Finalized),
+        "aborted" => Ok(mooncake_store_core::TenantQuotaReservationState::Aborted),
+        _ => Err(StoreError::InvalidState(
+            "invalid state query parameter: expected pending, finalized, or aborted".to_string(),
+        )),
     }
 }
 
@@ -405,7 +548,10 @@ mod tests {
 
     use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
     use mooncake_store_client::RouteControlMode;
-    use mooncake_store_core::{MetadataBackend, StoreError, TenantPolicySpec, TenantRoutePolicy};
+    use mooncake_store_core::{
+        ClientEpoch, ClientRuntimeId, MetadataBackend, StoreError, TenantObjectAccountingState,
+        TenantPolicySpec, TenantQuotaPolicy, TenantQuotaReservationRequest, TenantRoutePolicy,
+    };
 
     use crate::admin::models::PolicyPatchInput;
     use crate::admin::service::AdminService;
@@ -499,7 +645,7 @@ mod tests {
             ),
         );
         assert!(response.contains("HTTP/1.1 501 Not Implemented"));
-        assert!(response.contains("redis:// metadata only"));
+        assert!(response.contains("supports redis:// and rediss:// metadata only"));
 
         server.shutdown().expect("server shutdown");
     }
@@ -609,5 +755,125 @@ mod tests {
                 ..TenantPolicySpec::default()
             })
         );
+    }
+
+    #[test]
+    fn admin_http_server_serves_quota_observation_endpoints() {
+        let service = test_service();
+        service
+            .backend()
+            .put_tenant_policy(
+                &mooncake_store_core::TenantPolicy {
+                    scope: mooncake_store_core::TenantPolicyScope::new(
+                        "tenant-a",
+                        None::<String>,
+                        None::<String>,
+                    ),
+                    spec: TenantPolicySpec {
+                        quota: Some(TenantQuotaPolicy {
+                            max_bytes: Some(1024),
+                            max_objects: Some(16),
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 1,
+                    updated_by: "tester".to_string(),
+                },
+                None,
+            )
+            .expect("tenant policy should store");
+        service
+            .backend()
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "res-a".to_string(),
+                scope: mooncake_store_core::TenantPolicyScope::new(
+                    "tenant-a",
+                    None::<String>,
+                    None::<String>,
+                ),
+                key: mooncake_store_core::ObjectKey::new("tenant-a::object-a"),
+                expected_object_version: None,
+                delta_bytes: 12,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(1024),
+                    max_objects: Some(16),
+                },
+                expires_at_ms: 10,
+                created_at_ms: 5,
+                writer_runtime: ClientRuntimeId::new("writer-a", ClientEpoch(1)),
+            })
+            .expect("quota reservation should store");
+        service
+            .backend()
+            .finalize_tenant_quota(&mooncake_store_core::TenantQuotaFinalizeRequest {
+                reservation_id: "res-a".to_string(),
+                expected_object_version: None,
+                committed_length: Some(12),
+                route_version: Some(mooncake_store_core::RouteVersion(7)),
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 6,
+                updated_by: "writer-a".to_string(),
+            })
+            .expect("quota finalize should succeed");
+        service
+            .backend()
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "res-b".to_string(),
+                scope: mooncake_store_core::TenantPolicyScope::new(
+                    "tenant-a",
+                    None::<String>,
+                    None::<String>,
+                ),
+                key: mooncake_store_core::ObjectKey::new("tenant-a::object-b"),
+                expected_object_version: None,
+                delta_bytes: 3,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(1024),
+                    max_objects: Some(16),
+                },
+                expires_at_ms: 12,
+                created_at_ms: 8,
+                writer_runtime: ClientRuntimeId::new("writer-b", ClientEpoch(1)),
+            })
+            .expect("pending reservation should store");
+
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let quota_state = http_request(
+            &address,
+            &format!(
+                "GET /v1/tenant-quotas/tenant-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(quota_state.contains("HTTP/1.1 200 OK"));
+        assert!(quota_state.contains("\"used_bytes\":12"));
+        assert!(quota_state.contains("\"pending_reserved_bytes\":3"));
+
+        let object = http_request(
+            &address,
+            &format!(
+                "GET /v1/tenant-object-accounting/tenant-a/objects/object-a HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(object.contains("HTTP/1.1 200 OK"));
+        assert!(object.contains("\"committed_length\":12"));
+        assert!(object.contains("\"state\":\"Active\""));
+
+        let reservations = http_request(
+            &address,
+            &format!(
+                "GET /v1/tenant-quotas/tenant-a/reservations?state=pending HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(reservations.contains("HTTP/1.1 200 OK"));
+        assert!(reservations.contains("\"reservation_id\":\"res-b\""));
+        assert!(!reservations.contains("\"reservation_id\":\"res-a\""));
+
+        server.shutdown().expect("server shutdown");
     }
 }

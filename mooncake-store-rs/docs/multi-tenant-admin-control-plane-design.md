@@ -345,12 +345,25 @@ mooncake-store-admin policy list --tenant t1
 
 ### 2. Scope inspection
 
+Implemented Phase 2 read-only inspection commands currently focus on strict-quota metadata:
+
 ```bash
-mooncake-store-admin inspect routes --tenant t1
-mooncake-store-admin inspect routes --tenant t1 --domain d1 --object-set s1
-mooncake-store-admin inspect owners --tenant t1
-mooncake-store-admin inspect quota-usage --tenant t1
+mooncake-store-admin quota state --tenant t1
+mooncake-store-admin quota object --tenant t1 --key object-a
+mooncake-store-admin quota reservations --tenant t1 --state pending
 ```
+
+The same data is also exposed over the admin HTTP surface:
+
+```text
+GET /v1/tenant-quotas/<tenant>[/<domain>[/<object_set>]]
+GET /v1/tenant-quotas/<tenant>[/<domain>[/<object_set>]]/reservations?state=pending|finalized|aborted
+GET /v1/tenant-object-accounting/<tenant>/objects/<key>
+GET /v1/tenant-object-accounting/<tenant>/<domain>/objects/<key>
+GET /v1/tenant-object-accounting/<tenant>/<domain>/<object_set>/objects/<key>
+```
+
+Quota state and reservation listing intentionally collapse to the tenant-root scope because Phase 1 stores strict quota state authoritatively at the tenant root. Object-accounting lookup still accepts nested scope selectors so operators can ask for the logical object they care about while the service derives the canonical scoped key.
 
 ### 3. Explicit maintenance
 

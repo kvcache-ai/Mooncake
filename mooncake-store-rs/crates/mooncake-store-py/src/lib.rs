@@ -1537,16 +1537,17 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
-        snapshot_metrics, snapshot_metrics, LocalMemoryConfig, LocalMemoryConfig,
-        MooncakeCompatibilityFacade, PlacementPlanner, RouteControlMode, StoreClient, StoreClient,
-        StoreClientBuilder, StoreClientBuilder, StoreTransport, StoreTransport,
+        snapshot_metrics, LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner,
+        RouteControlMode, StoreClient, StoreClientBuilder, StoreTransport,
     };
     use mooncake_store_core::{
         CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
         CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute,
         ReplicaRoute, ReplicaTier, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
         SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
-        TenantPolicy, TenantPolicyScope,
+        TenantObjectAccounting, TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome,
+        TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaReservation,
+        TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaState,
     };
     use mooncake_transport::{
         Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
@@ -1864,19 +1865,19 @@ mod tests {
         state: ClientLifecycleState,
     ) -> StoreClient {
         let transport = Arc::new(TestTransport::new(&format!("{name}-segment")));
-        build_client_with_metadata_and_transport(name, metadata, transport)
+        build_client_with_metadata_and_transport(name, metadata, transport, state)
     }
 
     fn build_client_with_metadata_and_transport(
         name: &str,
         metadata: Arc<dyn MetadataBackend>,
         transport: Arc<TestTransport>,
+        state: ClientLifecycleState,
     ) -> StoreClient {
         let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
         StoreClientBuilder::new(metadata, name)
             .epoch(ClientEpoch(1))
             .state(state)
-            .state(ClientLifecycleState::Active)
             .label("storage", "true")
             .live_client_sync_interval(Duration::from_millis(25))
             .compatibility(CompatibilityDescriptor::default())
@@ -2111,6 +2112,48 @@ mod tests {
             expected_version: Option<u64>,
         ) -> mooncake_store_core::Result<bool> {
             self.inner.delete_tenant_policy(scope, expected_version)
+        }
+
+        fn get_tenant_quota_state(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+            self.inner.get_tenant_quota_state(scope)
+        }
+
+        fn get_tenant_object_accounting(
+            &self,
+            key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+            self.inner.get_tenant_object_accounting(key)
+        }
+
+        fn list_tenant_quota_reservations(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+            self.inner.list_tenant_quota_reservations(scope)
+        }
+
+        fn reserve_tenant_quota(
+            &self,
+            request: &TenantQuotaReservationRequest,
+        ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+            self.inner.reserve_tenant_quota(request)
+        }
+
+        fn finalize_tenant_quota(
+            &self,
+            request: &TenantQuotaFinalizeRequest,
+        ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+            self.inner.finalize_tenant_quota(request)
+        }
+
+        fn abort_tenant_quota(
+            &self,
+            reservation_id: &str,
+        ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+            self.inner.abort_tenant_quota(reservation_id)
         }
 
         fn put_handoff(&self, handoff: &HandoffPlan) -> mooncake_store_core::Result<()> {
