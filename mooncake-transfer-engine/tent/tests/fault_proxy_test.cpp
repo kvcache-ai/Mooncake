@@ -63,8 +63,7 @@ class FakeTransport : public Transport {
     }
 
     Status submitTransferTasks(
-        SubBatchRef batch,
-        const std::vector<Request>& request_list) override {
+        SubBatchRef batch, const std::vector<Request>& request_list) override {
         ++submit_calls;
         auto* fb = static_cast<FakeSubBatch*>(batch);
         for (size_t i = 0; i < request_list.size(); ++i) {

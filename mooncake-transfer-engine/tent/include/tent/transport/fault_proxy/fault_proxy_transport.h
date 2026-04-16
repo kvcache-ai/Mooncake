@@ -93,8 +93,7 @@ class FaultProxyTransport : public Transport {
     // -- Transfer (primary injection points) ---------------------------------
 
     Status submitTransferTasks(
-        SubBatchRef batch,
-        const std::vector<Request>& request_list) override {
+        SubBatchRef batch, const std::vector<Request>& request_list) override {
         // Artificial delay
         if (policy_.submit_delay_us > 0) {
             std::this_thread::sleep_for(
@@ -103,8 +102,7 @@ class FaultProxyTransport : public Transport {
 
         // Deterministic count-based failure
         if (policy_.fail_after_n_submits >= 0) {
-            int count =
-                submit_count_.fetch_add(1, std::memory_order_relaxed);
+            int count = submit_count_.fetch_add(1, std::memory_order_relaxed);
             if (count >= policy_.fail_after_n_submits) {
                 return Status::InternalError(
                     "fault injected: submit failure (count)" LOC_MARK);
