@@ -121,6 +121,60 @@ impl MetadataKeyspace {
         }
     }
 
+    pub fn tenant_quota_state(&self, scope: &TenantPolicyScope) -> String {
+        format!(
+            "{}/system/tenant-quota/tenants/{}",
+            self.prefix,
+            encode_key_component(&scope.tenant)
+        )
+    }
+
+    pub fn tenant_object_accounting(&self, key: &ObjectKey) -> String {
+        format!(
+            "{}/system/tenant-object-accounting/objects/{}",
+            self.prefix, key.0
+        )
+    }
+
+    pub fn tenant_object_accounting_prefix(&self) -> String {
+        format!("{}/system/tenant-object-accounting/objects/", self.prefix)
+    }
+
+    pub fn tenant_quota_reservation(&self, reservation_id: &str) -> String {
+        format!(
+            "{}/system/tenant-quota-reservations/{}",
+            self.prefix,
+            encode_key_component(reservation_id)
+        )
+    }
+
+    pub fn tenant_quota_reservation_prefix(&self, tenant: Option<&str>) -> String {
+        match tenant {
+            Some(tenant) => format!(
+                "{}/system/tenant-quota-reservations/by-tenant/{}/",
+                self.prefix,
+                encode_key_component(tenant)
+            ),
+            None => format!(
+                "{}/system/tenant-quota-reservations/by-tenant/",
+                self.prefix
+            ),
+        }
+    }
+
+    pub fn tenant_quota_reservation_index(
+        &self,
+        scope: &TenantPolicyScope,
+        reservation_id: &str,
+    ) -> String {
+        format!(
+            "{}{}/{}",
+            self.tenant_quota_reservation_prefix(Some(&scope.tenant)),
+            "reservations",
+            encode_key_component(reservation_id)
+        )
+    }
+
     pub fn prefix(&self) -> &str {
         &self.prefix
     }

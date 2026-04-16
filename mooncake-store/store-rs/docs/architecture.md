@@ -280,13 +280,22 @@ For route control, that batch substrate serves both the CAS primary and the mirr
 
 ## Metadata Model
 
-Metadata backends store three persistent categories of data:
+Metadata backends store four persistent categories of data:
 
 - client leases
 - segment announcements and segment lifecycle state
 - object routes, when metadata persistence is needed
+- tenant policy and strict-quota metadata
 
 For membership specifically, metadata is the authoritative lease store, while the client runtime keeps a prewarmed and background-refreshed snapshot for request-path reads.
+
+For strict quota rollout, the metadata model now also includes tenant-root quota primitives:
+
+- `TenantQuotaState` for committed and pending usage
+- `TenantObjectAccounting` for authoritative committed object size/version
+- `TenantQuotaReservation` for reserve/finalize/abort coordination
+
+In Phase 1, these primitives exist in the shared contracts and all three metadata backends. The in-memory backend applies them under one write lock, Redis uses backend-atomic Lua reserve/finalize/abort scripts, and etcd uses multi-key compare-and-swap txn loops.
 
 ### Backend support
 

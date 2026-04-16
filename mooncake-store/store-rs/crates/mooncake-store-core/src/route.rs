@@ -208,6 +208,16 @@ impl TenantPolicyScope {
         Ok(())
     }
 
+    pub fn validate_root_only(&self, context: &str) -> crate::Result<()> {
+        self.validate()?;
+        if self.domain.is_some() || self.object_set.is_some() {
+            return Err(crate::StoreError::InvalidState(format!(
+                "{context} currently supports tenant root scope only"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn matches_namespace(&self, scope: &crate::NamespaceScope) -> bool {
         if self.tenant != scope.tenant {
             return false;
@@ -264,6 +274,163 @@ pub struct TenantQuotaPolicy {
     pub max_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_objects: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TenantObjectAccountingState {
+    #[default]
+    Active,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TenantQuotaReservationState {
+    #[default]
+    Pending,
+    Finalized,
+    Aborted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaState {
+    pub scope: TenantPolicyScope,
+    pub version: u64,
+    pub used_bytes: u64,
+    pub used_objects: u64,
+    pub pending_reserved_bytes: u64,
+    pub pending_reserved_objects: u64,
+    pub updated_at_ms: u64,
+    pub updated_by: String,
+}
+
+impl TenantQuotaState {
+    pub fn validate(&self) -> crate::Result<()> {
+        self.scope.validate_root_only("tenant quota state")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantObjectAccounting {
+    pub key: ObjectKey,
+    pub scope: TenantPolicyScope,
+    pub version: u64,
+    pub committed_length: u64,
+    pub route_version: Option<RouteVersion>,
+    pub state: TenantObjectAccountingState,
+    pub last_writer: String,
+    pub updated_at_ms: u64,
+}
+
+impl TenantObjectAccounting {
+    pub fn validate(&self) -> crate::Result<()> {
+        self.scope.validate_root_only("tenant object accounting")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaReservation {
+    pub reservation_id: String,
+    pub scope: TenantPolicyScope,
+    pub key: ObjectKey,
+    pub version: u64,
+    pub expected_object_version: Option<u64>,
+    pub delta_bytes: i64,
+    pub delta_objects: i64,
+    pub state: TenantQuotaReservationState,
+    pub expires_at_ms: u64,
+    pub created_at_ms: u64,
+    pub writer_runtime: ClientRuntimeId,
+}
+
+impl TenantQuotaReservation {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.reservation_id.is_empty() {
+            return Err(crate::StoreError::InvalidState(
+                "tenant quota reservation_id must not be empty".to_string(),
+            ));
+        }
+        self.scope.validate_root_only("tenant quota reservation")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaReservationRequest {
+    pub reservation_id: String,
+    pub scope: TenantPolicyScope,
+    pub key: ObjectKey,
+    pub expected_object_version: Option<u64>,
+    pub delta_bytes: i64,
+    pub delta_objects: i64,
+    pub limit: TenantQuotaPolicy,
+    pub expires_at_ms: u64,
+    pub created_at_ms: u64,
+    pub writer_runtime: ClientRuntimeId,
+}
+
+impl TenantQuotaReservationRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.reservation_id.is_empty() {
+            return Err(crate::StoreError::InvalidState(
+                "tenant quota reservation request_id must not be empty".to_string(),
+            ));
+        }
+        self.scope
+            .validate_root_only("tenant quota reservation request")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaReservationOutcome {
+    pub quota: TenantQuotaState,
+    pub object: Option<TenantObjectAccounting>,
+    pub reservation: TenantQuotaReservation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaFinalizeRequest {
+    pub reservation_id: String,
+    pub expected_object_version: Option<u64>,
+    pub committed_length: Option<u64>,
+    pub route_version: Option<RouteVersion>,
+    pub state: TenantObjectAccountingState,
+    pub updated_at_ms: u64,
+    pub updated_by: String,
+}
+
+impl TenantQuotaFinalizeRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.reservation_id.is_empty() {
+            return Err(crate::StoreError::InvalidState(
+                "tenant quota finalize reservation_id must not be empty".to_string(),
+            ));
+        }
+        match (self.state, self.committed_length) {
+            (TenantObjectAccountingState::Active, Some(_)) => Ok(()),
+            (TenantObjectAccountingState::Deleted, None) => Ok(()),
+            (TenantObjectAccountingState::Active, None) => Err(crate::StoreError::InvalidState(
+                "tenant quota finalize active object requires committed_length".to_string(),
+            )),
+            (TenantObjectAccountingState::Deleted, Some(_)) => {
+                Err(crate::StoreError::InvalidState(
+                    "tenant quota finalize deleted object must not carry committed_length"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaFinalizeOutcome {
+    pub quota: TenantQuotaState,
+    pub object: Option<TenantObjectAccounting>,
+    pub reservation: TenantQuotaReservation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TenantQuotaAbortOutcome {
+    pub quota: TenantQuotaState,
+    pub reservation: TenantQuotaReservation,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
