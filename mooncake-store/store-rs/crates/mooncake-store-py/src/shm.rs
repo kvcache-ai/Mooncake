@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 
 const SHM_ALLOCATOR_NAME: &str = "mooncake_store_rs_shm";
 const SHM_REGISTER_MAGIC: u32 = 0x4d435348;
+const HOT_CACHE_FD_MAGIC: u32 = 0x4d434846;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct DummyClientId {
@@ -60,6 +61,34 @@ impl ShmRegisterRequest {
             size: size as u64,
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct HotCacheFdRequest {
+    pub magic: u32,
+    pub _reserved: u32,
+    pub client_id_hi: u64,
+    pub client_id_lo: u64,
+}
+
+impl HotCacheFdRequest {
+    pub fn new(client_id: DummyClientId) -> Self {
+        Self {
+            magic: HOT_CACHE_FD_MAGIC,
+            _reserved: 0,
+            client_id_hi: client_id.high,
+            client_id_lo: client_id.low,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct HotCacheFdResponse {
+    pub magic: u32,
+    pub status: i32,
+    pub size: u64,
 }
 
 #[derive(Debug)]
@@ -245,6 +274,17 @@ pub fn dummy_ipc_socket_path(server_addr: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mooncake-store-rs-dummy-{sanitized}.sock"))
 }
 
+pub fn hot_cache_ipc_socket_path(server_addr: &str) -> PathBuf {
+    let sanitized = server_addr
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => ch,
+            _ => '_',
+        })
+        .collect::<String>();
+    std::env::temp_dir().join(format!("mooncake-store-rs-dummy-hot-cache-{sanitized}.sock"))
+}
+
 pub fn send_shm_register_request(
     socket_path: &Path,
     request: &ShmRegisterRequest,
@@ -291,6 +331,63 @@ pub fn recv_shm_register_request(listener: &UnixListener) -> Result<(ShmRegister
             StoreError::Transport(format!("failed to ack shm registration: {error}"))
         })?;
     Ok((request, fd))
+}
+
+pub fn recv_hot_cache_fd_request(listener: &UnixListener) -> Result<(UnixStream, HotCacheFdRequest)> {
+    let (stream, _) = listener.accept().map_err(|error| {
+        StoreError::Transport(format!("failed to accept hot cache fd request: {error}"))
+    })?;
+    let mut request: HotCacheFdRequest = unsafe { zeroed() };
+    (&stream).read_exact(as_bytes_mut(&mut request)).map_err(|error| {
+        StoreError::Transport(format!("failed to read hot cache fd request: {error}"))
+    })?;
+    if request.magic != HOT_CACHE_FD_MAGIC {
+        return Err(StoreError::Transport(format!(
+            "invalid hot cache fd magic: {}",
+            request.magic
+        )));
+    }
+    Ok((stream, request))
+}
+
+pub fn send_hot_cache_fd_response(
+    stream: &UnixStream,
+    fd: &OwnedFd,
+    size: usize,
+) -> Result<()> {
+    let response = HotCacheFdResponse {
+        magic: HOT_CACHE_FD_MAGIC,
+        status: 0,
+        size: size as u64,
+    };
+    send_fd(stream.as_raw_fd(), fd.as_raw_fd(), as_bytes(&response))
+}
+
+pub fn request_hot_cache_region(
+    socket_path: &Path,
+    client_id: DummyClientId,
+) -> Result<OwnedMappedRegion> {
+    let stream = UnixStream::connect(socket_path).map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to connect hot cache socket {}: {error}",
+            socket_path.display()
+        ))
+    })?;
+    let request = HotCacheFdRequest::new(client_id);
+    (&stream).write_all(as_bytes(&request)).map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to write hot cache fd request {}: {error}",
+            socket_path.display()
+        ))
+    })?;
+    let (response, fd) = recv_fd::<HotCacheFdResponse>(stream.as_raw_fd())?;
+    if response.magic != HOT_CACHE_FD_MAGIC || response.status != 0 || response.size == 0 {
+        return Err(StoreError::Transport(format!(
+            "hot cache fd request failed: status={} size={}",
+            response.status, response.size
+        )));
+    }
+    map_registered_region(fd, response.size as usize)
 }
 
 pub fn bind_shm_listener(socket_path: &Path) -> Result<UnixListener> {
@@ -390,6 +487,10 @@ fn dup_fd(fd: RawFd) -> Result<OwnedFd> {
 
 fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
+    unsafe { slice::from_raw_parts_mut((value as *mut T).cast::<u8>(), size_of::<T>()) }
 }
 
 fn send_fd(sock: RawFd, fd: RawFd, payload: &[u8]) -> Result<()> {

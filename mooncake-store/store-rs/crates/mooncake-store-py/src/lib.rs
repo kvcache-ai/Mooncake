@@ -2,6 +2,7 @@ mod config;
 pub mod dispatcher;
 mod dummy_client;
 pub mod dummy_service;
+mod hot_cache;
 pub mod runtime;
 mod shm;
 #[cfg(test)]
@@ -15,8 +16,8 @@ use dispatcher::StoreDispatcher;
 use dummy_client::DummySession;
 use mooncake_store_client::{
     init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
-    start_metrics_http_server, stop_metrics_http_server, GetRequest, MooncakeCompatibilityFacade,
-    MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest,
+    start_metrics_http_server, stop_metrics_http_server, MooncakeCompatibilityFacade,
+    MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest,
     ReplicationPolicy, RouteControlMode,
 };
 use mooncake_store_core::{
@@ -233,6 +234,8 @@ impl PyMooncakeDistributedStore {
             StoreBackend::Real(dispatcher) => {
                 let key = key.to_string();
                 let tenant = tenant.map(str::to_string);
+                let cache_key = key.clone();
+                let cache_tenant = tenant.clone();
                 dispatcher
                     .run(move |client| match (tenant.as_deref(), policy.as_ref()) {
                         (Some(tenant), Some(policy)) => {
@@ -243,6 +246,7 @@ impl PyMooncakeDistributedStore {
                         (None, None) => client.put(&key, &value),
                     })
                     .map_err(store_error_to_py)?;
+                dispatcher.invalidate_key(cache_key, cache_tenant);
                 Ok(0)
             }
         }
@@ -265,16 +269,9 @@ impl PyMooncakeDistributedStore {
                 }
                 value
             }
-            StoreBackend::Real(dispatcher) => {
-                let key = key.to_string();
-                let tenant = tenant.map(str::to_string);
-                dispatcher
-                    .run(move |client| match tenant.as_deref() {
-                        Some(tenant) => client.get_in_tenant(tenant, &key),
-                        None => client.get(&key),
-                    })
-                    .map_err(store_error_to_py)?
-            }
+            StoreBackend::Real(dispatcher) => dispatcher
+                .get_value(key.to_string(), tenant.map(str::to_string))
+                .map_err(store_error_to_py)?,
         };
         Ok(PyBytes::new(py, &value))
     }
@@ -448,6 +445,8 @@ impl PyMooncakeDistributedStore {
                 let _ = pointer_from_usize(buffer_ptr)?;
                 let key = key.to_string();
                 let tenant = tenant.map(str::to_string);
+                let cache_key = key.clone();
+                let cache_tenant = tenant.clone();
                 dispatcher
                     .run(move |client| {
                         let buffer = buffer_ptr as *const c_void;
@@ -464,6 +463,7 @@ impl PyMooncakeDistributedStore {
                         }
                     })
                     .map_err(store_error_to_py)?;
+                dispatcher.invalidate_key(cache_key, cache_tenant);
                 Ok(0)
             }
         }
@@ -491,17 +491,13 @@ impl PyMooncakeDistributedStore {
             }
             StoreBackend::Real(dispatcher) => {
                 let _ = pointer_from_usize(buffer_ptr)?;
-                let key = key.to_string();
-                let tenant = tenant.map(str::to_string);
                 dispatcher
-                    .run(move |client| {
-                        let buffer =
-                            unsafe { slice::from_raw_parts_mut(buffer_ptr as *mut u8, size) };
-                        match tenant.as_deref() {
-                            Some(tenant) => client.get_into_in_tenant(tenant, &key, buffer),
-                            None => client.get_into(&key, buffer),
-                        }
-                    })
+                    .get_into_buffer(
+                        key.to_string(),
+                        tenant.map(str::to_string),
+                        buffer_ptr,
+                        size,
+                    )
                     .map_err(store_error_to_py)
             }
         }
@@ -558,6 +554,8 @@ impl PyMooncakeDistributedStore {
             }
             StoreBackend::Real(dispatcher) => {
                 let tenant = tenant.map(str::to_string);
+                let cache_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+                let cache_tenant = tenant.clone();
                 dispatcher
                     .run(move |client| {
                         let requests = items
@@ -576,6 +574,7 @@ impl PyMooncakeDistributedStore {
                         client.batch_put(&requests).map(|_| ())
                     })
                     .map_err(store_error_to_py)?;
+                dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(0)
             }
         }
@@ -632,6 +631,8 @@ impl PyMooncakeDistributedStore {
                 }
                 let item_count = items.len();
                 let tenant = tenant.map(str::to_string);
+                let cache_keys = items.iter().map(|(key, _, _)| key.clone()).collect::<Vec<_>>();
+                let cache_tenant = tenant.clone();
                 dispatcher
                     .run(move |client| {
                         let requests = items
@@ -654,6 +655,7 @@ impl PyMooncakeDistributedStore {
                         client.batch_put_from(&requests).map(|_| requests.len())
                     })
                     .map_err(store_error_to_py)?;
+                dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(PyList::new(py, vec![0; item_count])?.into_any().unbind())
             }
         }
@@ -773,6 +775,8 @@ impl PyMooncakeDistributedStore {
             }
             StoreBackend::Real(dispatcher) => {
                 let tenant = tenant.map(str::to_string);
+                let cache_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+                let cache_tenant = tenant.clone();
                 dispatcher
                     .run(move |client| {
                         let borrowed = items
@@ -802,6 +806,7 @@ impl PyMooncakeDistributedStore {
                         client.batch_put_from_multi_buffers(&requests).map(|_| ())
                     })
                     .map_err(store_error_to_py)?;
+                dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(0)
             }
         }
@@ -892,6 +897,8 @@ impl PyMooncakeDistributedStore {
                 }
                 let key_count = keys.len();
                 let tenant = tenant.map(str::to_string);
+                let cache_keys = keys.clone();
+                let cache_tenant = tenant.clone();
                 dispatcher
                     .run(move |client| {
                         let borrowed = all_buffer_ptrs
@@ -925,6 +932,7 @@ impl PyMooncakeDistributedStore {
                         client.batch_put_from_multi_buffers(&requests).map(|_| ())
                     })
                     .map_err(store_error_to_py)?;
+                dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(vec![0; key_count])
             }
         }
@@ -935,12 +943,15 @@ impl PyMooncakeDistributedStore {
         let dispatcher = self.real_dispatcher()?;
         let key = key.to_string();
         let tenant = tenant.map(str::to_string);
+        let cache_key = key.clone();
+        let cache_tenant = tenant.clone();
         dispatcher
             .run(move |client| match tenant.as_deref() {
                 Some(tenant) => client.remove_in_tenant(tenant, &key, force),
                 None => client.remove(&key, force),
             })
             .map_err(store_error_to_py)?;
+        dispatcher.invalidate_key(cache_key, cache_tenant);
         Ok(0)
     }
 
@@ -954,6 +965,8 @@ impl PyMooncakeDistributedStore {
         let dispatcher = self.real_dispatcher()?;
         let key_count = keys.len();
         let tenant = tenant.map(str::to_string);
+        let cache_keys = keys.clone();
+        let cache_tenant = tenant.clone();
         dispatcher
             .run(move |client| {
                 let objects = keys
@@ -969,6 +982,7 @@ impl PyMooncakeDistributedStore {
                 client.batch_remove(&objects, force).map(|_| ())
             })
             .map_err(store_error_to_py)?;
+        dispatcher.invalidate_keys(cache_keys, cache_tenant);
         Ok(vec![0; key_count])
     }
 
@@ -980,21 +994,8 @@ impl PyMooncakeDistributedStore {
         tenant: Option<&str>,
     ) -> PyResult<Vec<Py<PyBytes>>> {
         let dispatcher = self.real_dispatcher()?;
-        let tenant = tenant.map(str::to_string);
         let values = dispatcher
-            .run(move |client| {
-                let objects = keys
-                    .iter()
-                    .map(|key| {
-                        let mut object = ObjectRef::new(key);
-                        if let Some(tenant) = tenant.as_deref() {
-                            object = object.tenant(tenant);
-                        }
-                        object
-                    })
-                    .collect::<Vec<_>>();
-                client.batch_get(&objects)
-            })
+            .batch_get_values(keys, tenant.map(str::to_string))
             .map_err(store_error_to_py)?;
         Ok(values
             .into_iter()
@@ -1027,30 +1028,8 @@ impl PyMooncakeDistributedStore {
                     let _ = pointer_from_usize(*buffer_ptr)?;
                 }
                 let item_count = items.len();
-                let tenant = tenant.map(str::to_string);
                 dispatcher
-                    .run(move |client| {
-                        let mut buffers = items
-                            .iter()
-                            .map(|(_, buffer_ptr, size)| unsafe {
-                                slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size)
-                            })
-                            .collect::<Vec<_>>();
-                        let mut requests = items
-                            .iter()
-                            .zip(buffers.iter_mut())
-                            .map(|((key, _, _), buffer)| {
-                                let mut request = GetRequest::new(key, buffer);
-                                if let Some(tenant) = tenant.as_deref() {
-                                    request = request.tenant(tenant);
-                                }
-                                request
-                            })
-                            .collect::<Vec<_>>();
-                        client
-                            .batch_get_into(&mut requests)
-                            .map(|sizes| sizes.into_iter().map(|size| size as i64).collect())
-                    })
+                    .batch_get_into_buffers(items, tenant.map(str::to_string))
                     .or_else(|error| {
                         if should_soft_miss_error(&error) {
                             Ok(soft_miss_length_result(item_count, &error))
@@ -1137,39 +1116,13 @@ impl PyMooncakeDistributedStore {
                     }
                 }
                 let item_count = keys.len();
-                let tenant = tenant.map(str::to_string);
                 dispatcher
-                    .run(move |client| {
-                        let mut borrowed = all_buffer_ptrs
-                            .iter()
-                            .zip(all_sizes.iter())
-                            .map(|(buffer_ptrs, sizes)| {
-                                buffer_ptrs
-                                    .iter()
-                                    .zip(sizes.iter())
-                                    .map(|(buffer_ptr, size)| unsafe {
-                                        slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size)
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect::<Vec<_>>();
-
-                        let mut requests = keys
-                            .iter()
-                            .zip(borrowed.iter_mut())
-                            .map(|(key, buffers)| {
-                                let mut request =
-                                    MultiBufferGetRequest::new(key, buffers.as_mut_slice());
-                                if let Some(tenant) = tenant.as_deref() {
-                                    request = request.tenant(tenant);
-                                }
-                                request
-                            })
-                            .collect::<Vec<_>>();
-                        client
-                            .batch_get_into_multi_buffers(&mut requests)
-                            .map(|sizes| sizes.into_iter().map(|size| size as i64).collect())
-                    })
+                    .batch_get_into_multi_buffers_raw(
+                        keys,
+                        all_buffer_ptrs,
+                        all_sizes,
+                        tenant.map(str::to_string),
+                    )
                     .or_else(|error| {
                         if should_soft_miss_error(&error) {
                             Ok(soft_miss_length_result(item_count, &error))
@@ -1601,6 +1554,7 @@ mod tests {
     use crate::dispatcher::StoreDispatcher;
     use crate::dummy_service::pb;
     use crate::dummy_service::{start_dummy_store_server, DummyStoreServerHandle};
+    use crate::test_support::env_test_lock;
 
     struct TestTransport {
         local_segment: String,
@@ -2292,6 +2246,35 @@ mod tests {
         (store, server)
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_deref() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     #[derive(Clone)]
     struct BlockingDummyStoreService {
         release: Arc<AtomicBool>,
@@ -2331,6 +2314,43 @@ mod tests {
                 status: 0,
                 value: b"released".to_vec(),
             }))
+        }
+
+        async fn acquire_hot_cache(
+            &self,
+            _request: tonic::Request<pb::HotCacheAcquireRequest>,
+        ) -> std::result::Result<tonic::Response<pb::HotCacheAcquireReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::HotCacheAcquireReply {
+                status: -1,
+                ..Default::default()
+            }))
+        }
+
+        async fn release_hot_cache(
+            &self,
+            _request: tonic::Request<pb::HotCacheReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<pb::StatusReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::StatusReply { status: 0 }))
+        }
+
+        async fn batch_acquire_hot_cache(
+            &self,
+            _request: tonic::Request<pb::BatchHotCacheAcquireRequest>,
+        ) -> std::result::Result<tonic::Response<pb::BatchHotCacheAcquireReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::BatchHotCacheAcquireReply {
+                items: vec![],
+            }))
+        }
+
+        async fn batch_release_hot_cache(
+            &self,
+            _request: tonic::Request<pb::BatchHotCacheReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<pb::StatusReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::StatusReply { status: 0 }))
         }
 
         async fn batch_is_exist(
@@ -3158,6 +3178,103 @@ mod tests {
             .free(read_ptr)
             .expect("dummy read buffer should free");
         server.shutdown().expect("dummy server should stop");
+    }
+
+    #[test]
+    fn real_get_reuses_local_hot_cache_after_remote_delete() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _cache_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
+        let _block_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "1024");
+        let _use_shm = EnvVarGuard::unset("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
+        init_python();
+        let mut store = build_real_store("py-real-hot-cache");
+        store
+            .put(
+                "alpha",
+                b"one".to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("put should succeed");
+
+        Python::with_gil(|py| {
+            assert_eq!(
+                store
+                    .get(py, "alpha", None)
+                    .expect("first get should succeed")
+                    .as_bytes(),
+                b"one"
+            );
+        });
+        assert!(store
+            .real_dispatcher()
+            .expect("real dispatcher should exist")
+            .hot_cache_contains("default", "alpha"));
+        store
+            .real_dispatcher()
+            .expect("real dispatcher should exist")
+            .run(|client| client.remove("alpha", true))
+            .expect("raw remove should succeed");
+        Python::with_gil(|py| {
+            assert_eq!(
+                store
+                    .get(py, "alpha", None)
+                    .expect("cache-backed get should succeed")
+                    .as_bytes(),
+                b"one"
+            );
+        });
+        store.close();
+    }
+
+    #[test]
+    fn dummy_clients_share_hot_cache_shm_hits() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _cache_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
+        let _block_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "1024");
+        let _use_shm = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
+
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(build_client("dummy-hot-cache"), "dummy-hot-cache")
+                .expect("dispatcher should spawn"),
+        );
+        dispatcher
+            .register_local_memory()
+            .expect("local memory should register");
+        let server =
+            start_dummy_store_server(dispatcher.clone(), &bind_addr()).expect("server should start");
+        let dummy_one = DummySession::connect(server.address()).expect("dummy one should connect");
+        let dummy_two = DummySession::connect(server.address()).expect("dummy two should connect");
+        assert!(dummy_one.has_hot_cache_mapping());
+        assert!(dummy_two.has_hot_cache_mapping());
+
+        dispatcher
+            .run(|client| client.put("alpha", b"one"))
+            .expect("put should succeed");
+        let (status, value) = dummy_one.get("alpha", None).expect("first dummy get should work");
+        assert_eq!(status, 0);
+        assert_eq!(value, b"one");
+        assert!(dispatcher.hot_cache_contains("default", "alpha"));
+
+        dispatcher
+            .run(|client| client.remove("alpha", true))
+            .expect("raw remove should succeed");
+        let (status, value) = dummy_two
+            .get("alpha", None)
+            .expect("second dummy should hit shared hot cache");
+        assert_eq!(status, 0);
+        assert_eq!(value, b"one");
+
+        dummy_one.close();
+        dummy_two.close();
+        server.shutdown().expect("server should stop");
     }
 
     #[test]

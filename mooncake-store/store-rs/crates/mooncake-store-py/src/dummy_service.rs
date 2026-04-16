@@ -14,7 +14,8 @@ use tonic::{Request, Response, Status};
 
 use crate::dispatcher::StoreDispatcher;
 use crate::shm::{
-    bind_shm_listener, dummy_ipc_socket_path, map_registered_region, recv_shm_register_request,
+    bind_shm_listener, dummy_ipc_socket_path, hot_cache_ipc_socket_path, map_registered_region,
+    recv_hot_cache_fd_request, recv_shm_register_request, send_hot_cache_fd_response,
     DummyClientId, ShmRegisterRequest,
 };
 
@@ -25,10 +26,12 @@ pub mod pb {
 pub struct DummyStoreServerHandle {
     address: String,
     socket_path: PathBuf,
+    hot_cache_socket_path: Option<PathBuf>,
     shutdown_flag: Arc<AtomicBool>,
     grpc_shutdown: Option<oneshot::Sender<()>>,
     grpc_thread: Option<JoinHandle<()>>,
     shm_thread: Option<JoinHandle<()>>,
+    hot_cache_thread: Option<JoinHandle<()>>,
 }
 
 impl DummyStoreServerHandle {
@@ -46,7 +49,13 @@ impl DummyStoreServerHandle {
             let _ = tx.send(());
         }
         let _ = UnixStream::connect(&self.socket_path);
+        if let Some(path) = self.hot_cache_socket_path.as_ref() {
+            let _ = UnixStream::connect(path);
+        }
         if let Some(thread) = self.shm_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.hot_cache_thread.take() {
             let _ = thread.join();
         }
         if let Some(thread) = self.grpc_thread.take() {
@@ -54,6 +63,11 @@ impl DummyStoreServerHandle {
         }
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
+        }
+        if let Some(path) = self.hot_cache_socket_path.as_ref() {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
         }
         Ok(())
     }
@@ -66,7 +80,13 @@ impl Drop for DummyStoreServerHandle {
             let _ = tx.send(());
         }
         let _ = UnixStream::connect(&self.socket_path);
+        if let Some(path) = self.hot_cache_socket_path.as_ref() {
+            let _ = UnixStream::connect(path);
+        }
         if let Some(thread) = self.shm_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.hot_cache_thread.take() {
             let _ = thread.join();
         }
         if let Some(thread) = self.grpc_thread.take() {
@@ -74,6 +94,11 @@ impl Drop for DummyStoreServerHandle {
         }
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
+        }
+        if let Some(path) = self.hot_cache_socket_path.as_ref() {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -83,6 +108,9 @@ pub fn start_dummy_store_server(
     bind_addr: &str,
 ) -> Result<DummyStoreServerHandle, StoreError> {
     let socket_path = dummy_ipc_socket_path(bind_addr);
+    let hot_cache_socket_path = client
+        .hot_cache_fd()?
+        .map(|_| hot_cache_ipc_socket_path(bind_addr));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let context = Arc::new(DummyStoreContext { client });
 
@@ -109,6 +137,46 @@ pub fn start_dummy_store_server(
             }
         })
         .map_err(|error| StoreError::Transport(format!("failed to spawn shm thread: {error}")))?;
+
+    let hot_cache_thread = if let Some(path) = hot_cache_socket_path.as_ref() {
+        let listener = bind_shm_listener(path)?;
+        let hot_cache_shutdown = shutdown_flag.clone();
+        let hot_cache_context = context.clone();
+        Some(
+            thread::Builder::new()
+                .name("mooncake-store-dummy-hot-cache".to_string())
+                .spawn(move || {
+                    while !hot_cache_shutdown.load(Ordering::SeqCst) {
+                        match recv_hot_cache_fd_request(&listener) {
+                            Ok((stream, _request)) => match hot_cache_context.client.hot_cache_fd() {
+                                Ok(Some((fd, size))) => {
+                                    if let Err(error) =
+                                        send_hot_cache_fd_response(&stream, &fd, size)
+                                    {
+                                        tracing::warn!(error = %error, "dummy hot cache fd reply failed");
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(error = %error, "dummy hot cache fd lookup failed");
+                                }
+                            },
+                            Err(error) => {
+                                if hot_cache_shutdown.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                tracing::warn!(error = %error, "dummy hot cache accept loop failed");
+                            }
+                        }
+                    }
+                })
+                .map_err(|error| {
+                    StoreError::Transport(format!("failed to spawn hot cache thread: {error}"))
+                })?,
+        )
+    } else {
+        None
+    };
 
     let service = GrpcDummyStoreService {
         context: context.clone(),
@@ -140,10 +208,12 @@ pub fn start_dummy_store_server(
     Ok(DummyStoreServerHandle {
         address: bind_addr.to_string(),
         socket_path,
+        hot_cache_socket_path,
         shutdown_flag,
         grpc_shutdown: Some(shutdown_tx),
         grpc_thread: Some(grpc_thread),
         shm_thread: Some(shm_thread),
+        hot_cache_thread,
     })
 }
 
@@ -209,6 +279,45 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
             .await
             .map_err(executor_status)?;
         Ok(Response::new(reply))
+    }
+
+    async fn acquire_hot_cache(
+        &self,
+        request: Request<pb::HotCacheAcquireRequest>,
+    ) -> Result<Response<pb::HotCacheAcquireReply>, Status> {
+        Ok(Response::new(
+            self.context.client.acquire_hot_cache(request.into_inner()),
+        ))
+    }
+
+    async fn release_hot_cache(
+        &self,
+        request: Request<pb::HotCacheReleaseRequest>,
+    ) -> Result<Response<pb::StatusReply>, Status> {
+        Ok(Response::new(pb::StatusReply {
+            status: self.context.client.release_hot_cache(request.into_inner()),
+        }))
+    }
+
+    async fn batch_acquire_hot_cache(
+        &self,
+        request: Request<pb::BatchHotCacheAcquireRequest>,
+    ) -> Result<Response<pb::BatchHotCacheAcquireReply>, Status> {
+        Ok(Response::new(
+            self.context.client.batch_acquire_hot_cache(request.into_inner()),
+        ))
+    }
+
+    async fn batch_release_hot_cache(
+        &self,
+        request: Request<pb::BatchHotCacheReleaseRequest>,
+    ) -> Result<Response<pb::StatusReply>, Status> {
+        Ok(Response::new(pb::StatusReply {
+            status: self
+                .context
+                .client
+                .batch_release_hot_cache(request.into_inner()),
+        }))
     }
 
     async fn batch_is_exist(
