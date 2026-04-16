@@ -192,6 +192,8 @@ impl StoreClient {
         .entered();
         let tracker = OperationTracker::new("repair_local_metadata");
         let result = (|| {
+            let refreshed_transports =
+                self.repair_local_transport_metadata_after_heartbeat_recovery()?;
             bootstrap_route_policy(
                 self.metadata.as_ref(),
                 &self.lease(),
@@ -202,13 +204,14 @@ impl StoreClient {
             for announcement in &announcements {
                 self.metadata.publish_segment(announcement)?;
             }
-            Ok(announcements.len())
+            Ok((announcements.len(), refreshed_transports))
         })();
         match &result {
-            Ok(republished) => {
+            Ok((republished, refreshed_transports)) => {
                 info!(
                     runtime = %self.lease.runtime,
                     republished_segments = *republished,
+                    refreshed_transports = *refreshed_transports,
                     "repaired local metadata after heartbeat recovery"
                 );
             }
@@ -223,6 +226,28 @@ impl StoreClient {
         let metric_result: Result<()> = result.as_ref().map(|_| ()).map_err(Clone::clone);
         tracker.finish(&metric_result, 0);
         result.map(|_| ())
+    }
+
+    fn repair_local_transport_metadata_after_heartbeat_recovery(&self) -> Result<usize> {
+        let mut transports = BTreeMap::new();
+        if let Some(primary_transport) = self.transport.clone() {
+            transports.insert(primary_transport.segment_name()?, primary_transport);
+        }
+        {
+            let state = self.state.lock();
+            if state.memory.is_none() {
+                return Ok(0);
+            }
+            for (segment_name, transport) in &state.local_transports {
+                transports
+                    .entry(segment_name.clone())
+                    .or_insert_with(|| transport.clone());
+            }
+        }
+        for transport in transports.values() {
+            transport.republish_local_metadata()?;
+        }
+        Ok(transports.len())
     }
 
     pub fn default_tenant(&self) -> &str {

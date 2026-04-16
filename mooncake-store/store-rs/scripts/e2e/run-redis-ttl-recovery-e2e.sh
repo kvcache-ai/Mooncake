@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+MODE="${1:-all}"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/e2e/run-redis-ttl-recovery-e2e.sh [all|persisted|fresh]
+
+Bring up a local Redis metadata backend plus two storage clients, then validate:
+
+  persisted  - Redis stays down for longer than the lease TTL, restarts from the
+               same data directory, old keys remain readable, and new writes work.
+  fresh      - Redis stays down for longer than the lease TTL, restarts from an
+               empty data directory, storage clients self-heal metadata, and new
+               writes/reads still work.
+
+Environment:
+  MC_STORE_RS_REFRESH_WHEEL              Rebuild/reinstall the latest wheel into
+                                         .venv-wheel before running (default: 1)
+  MC_STORE_RS_TTL_RECOVERY_REDIS_PORT    Fixed Redis port; auto-allocates when empty
+  MC_STORE_RS_TTL_RECOVERY_PROTOCOL      tcp / rdma / auto (default: tcp)
+  MC_STORE_RS_TTL_RECOVERY_TRANSPORT_BACKEND
+                                         classic-te / tent (default: classic-te)
+  MC_STORE_RS_TTL_RECOVERY_ROUTE_CONTROL embedded-wrh / metadata-only
+                                         (default: embedded-wrh)
+  MC_STORE_RS_TTL_RECOVERY_ROUTE_TOPK    Route authority width (default: 2)
+  MC_STORE_RS_TTL_RECOVERY_REPLICA_NUM   Write replica count (default: 2)
+  MC_STORE_RS_TTL_RECOVERY_NUM_KV        Number of keys per phase (default: 32)
+  MC_STORE_RS_TTL_RECOVERY_VALUE_SIZE    Value size in bytes (default: 4096)
+  MC_STORE_RS_TTL_RECOVERY_BATCH_SIZE    Batch size for rw clients (default: 1)
+  MC_STORE_RS_TTL_RECOVERY_STORAGE_BYTES Storage bytes per storage client
+                                         (default: 128 MiB)
+  MC_STORE_RS_TTL_RECOVERY_SCRATCH_BYTES Scratch bytes per client
+                                         (default: 16 MiB)
+  MC_STORE_RS_TTL_RECOVERY_LEASE_MS      Client lease TTL used for this e2e
+                                         (default: 10000)
+  MC_STORE_RS_TTL_RECOVERY_DOWN_SECONDS  Redis downtime between stop/start
+                                         (default: 15)
+  MC_STORE_RS_TTL_RECOVERY_HOLD_SECONDS  Idle lifetime for storage clients
+                                         (default: 600)
+  MC_STORE_RS_KEEP_TEMP                  Keep temp dir on failure when set to 1
+  MOONCAKE_UPSTREAM_DIR                  Mooncake upstream checkout override
+  MOONCAKE_UPSTREAM_BUILD_DIR            Built upstream directory override
+EOF
+}
+
+if [[ "${MODE}" == "-h" || "${MODE}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "${MODE}" != "all" && "${MODE}" != "persisted" && "${MODE}" != "fresh" ]]; then
+  echo "unsupported mode: ${MODE}" >&2
+  usage >&2
+  exit 1
+fi
+
+PROTOCOL="${MC_STORE_RS_TTL_RECOVERY_PROTOCOL:-tcp}"
+TRANSPORT_BACKEND="${MC_STORE_RS_TTL_RECOVERY_TRANSPORT_BACKEND:-classic-te}"
+ROUTE_CONTROL="${MC_STORE_RS_TTL_RECOVERY_ROUTE_CONTROL:-embedded-wrh}"
+ROUTE_TOPK="${MC_STORE_RS_TTL_RECOVERY_ROUTE_TOPK:-2}"
+REPLICA_NUM="${MC_STORE_RS_TTL_RECOVERY_REPLICA_NUM:-2}"
+NUM_KV="${MC_STORE_RS_TTL_RECOVERY_NUM_KV:-32}"
+VALUE_SIZE="${MC_STORE_RS_TTL_RECOVERY_VALUE_SIZE:-4096}"
+BATCH_SIZE="${MC_STORE_RS_TTL_RECOVERY_BATCH_SIZE:-1}"
+STORAGE_BYTES="${MC_STORE_RS_TTL_RECOVERY_STORAGE_BYTES:-$((128 * 1024 * 1024))}"
+SCRATCH_BYTES="${MC_STORE_RS_TTL_RECOVERY_SCRATCH_BYTES:-$((16 * 1024 * 1024))}"
+LEASE_MS="${MC_STORE_RS_TTL_RECOVERY_LEASE_MS:-10000}"
+DOWN_SECONDS="${MC_STORE_RS_TTL_RECOVERY_DOWN_SECONDS:-15}"
+HOLD_SECONDS="${MC_STORE_RS_TTL_RECOVERY_HOLD_SECONDS:-600}"
+REFRESH_WHEEL="${MC_STORE_RS_REFRESH_WHEEL:-1}"
+
+require_command() {
+  local command_name=$1
+  local cargo_env
+
+  if command -v "${command_name}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "${command_name}" == "cargo" ]]; then
+    cargo_env="${CARGO_HOME:-${HOME}/.cargo}/env"
+    if [[ -f "${cargo_env}" ]]; then
+      # shellcheck disable=SC1090
+      source "${cargo_env}"
+    fi
+  fi
+
+  if command -v "${command_name}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "missing required command: ${command_name}" >&2
+  exit 1
+}
+
+list_upstream_dirs() {
+  local primary_worktree
+
+  if [[ -n "${MOONCAKE_UPSTREAM_DIR:-}" ]]; then
+    printf '%s\n' "${MOONCAKE_UPSTREAM_DIR}"
+  fi
+  printf '%s\n' "${REPO_ROOT}/third_party/Mooncake"
+
+  if primary_worktree=$(git -C "${REPO_ROOT}" worktree list --porcelain 2>/dev/null | awk '/^worktree / { print substr($0, 10); exit }'); then
+    if [[ -n "${primary_worktree}" && "${primary_worktree}" != "${REPO_ROOT}" ]]; then
+      printf '%s\n' "${primary_worktree}/third_party/Mooncake"
+    fi
+  fi
+}
+
+resolve_upstream_build_dir() {
+  local candidates=()
+  local candidate
+  local upstream_dir
+
+  if [[ -n "${MOONCAKE_UPSTREAM_BUILD_DIR:-}" ]]; then
+    candidates+=("${MOONCAKE_UPSTREAM_BUILD_DIR}")
+  fi
+  while IFS= read -r upstream_dir; do
+    [[ -z "${upstream_dir}" ]] && continue
+    candidates+=(
+      "${upstream_dir}/build-rust"
+      "${upstream_dir}/build-wheel-compat"
+    )
+  done < <(list_upstream_dirs)
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}/mooncake-transfer-engine/src/libtransfer_engine.so" ]] \
+      && [[ -f "${candidate}/mooncake-transfer-engine/tent/src/libtent_shared.so" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "unable to find Mooncake runtime libraries under any known Mooncake upstream tree" >&2
+  printf '  %s\n' "${candidates[@]}" >&2
+  exit 1
+}
+
+allocate_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+now_ms() {
+  python3 - <<'PY'
+import time
+
+print(int(time.time() * 1000))
+PY
+}
+
+resolve_python_bin() {
+  if [[ -x "${REPO_ROOT}/.venv-wheel/bin/python" ]]; then
+    printf '%s\n' "${REPO_ROOT}/.venv-wheel/bin/python"
+    return 0
+  fi
+  printf '%s\n' python3
+}
+
+ensure_runtime_ready() {
+  local python_bin
+  python_bin=$(resolve_python_bin)
+
+  if [[ "${REFRESH_WHEEL}" == "1" ]]; then
+    echo "==> rebuilding and reinstalling latest wheel into .venv-wheel"
+    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
+    bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
+    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
+    return 0
+  fi
+
+  if [[ ! -x "${python_bin}" ]]; then
+    echo "python runtime not found at ${python_bin}; rebuilding wheel runtime" >&2
+    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
+    bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
+    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
+    return 0
+  fi
+
+  if ! "${python_bin}" - <<'PY' >/dev/null 2>&1
+from mooncake.store import MooncakeDistributedStore  # noqa: F401
+PY
+  then
+    echo "==> installed wheel missing or stale; rebuilding .venv-wheel runtime"
+    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
+    bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
+    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
+    return 0
+  fi
+
+  PYTHON_BIN="${python_bin}"
+}
+
+wait_for_redis_up() {
+  local deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    if redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "redis on port ${REDIS_PORT} did not become ready" >&2
+  exit 1
+}
+
+wait_for_redis_down() {
+  local deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    if ! redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "redis on port ${REDIS_PORT} did not stop in time" >&2
+  exit 1
+}
+
+start_redis() {
+  local data_dir=$1
+  mkdir -p "${data_dir}"
+  redis-server \
+    --port "${REDIS_PORT}" \
+    --bind 127.0.0.1 \
+    --daemonize yes \
+    --save '' \
+    --appendonly no \
+    --dir "${data_dir}" \
+    --dbfilename dump.rdb \
+    --pidfile "${data_dir}/redis.pid" \
+    --logfile "${data_dir}/redis.log"
+  wait_for_redis_up
+}
+
+stop_redis() {
+  redis-cli -p "${REDIS_PORT}" shutdown nosave >/dev/null 2>&1 || true
+  wait_for_redis_down
+}
+
+save_redis_snapshot() {
+  redis-cli -p "${REDIS_PORT}" SAVE >/dev/null
+}
+
+redis_pattern_count() {
+  local pattern=$1
+  redis-cli -u "${REDIS_URL}" --scan --pattern "${pattern}" | wc -l | tr -d '[:space:]'
+}
+
+wait_for_pattern_count() {
+  local pattern=$1
+  local expected=$2
+  local timeout_seconds=$3
+  local deadline=$((SECONDS + timeout_seconds))
+  local count=0
+
+  while (( SECONDS < deadline )); do
+    count=$(redis_pattern_count "${pattern}")
+    if (( count >= expected )); then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "pattern ${pattern} reached ${count}, expected at least ${expected}" >&2
+  exit 1
+}
+
+wait_for_route_policy() {
+  local deadline=$((SECONDS + 20))
+  local key="${KEYSPACE}/system/route-policy/default"
+  while (( SECONDS < deadline )); do
+    if [[ "$(redis-cli -u "${REDIS_URL}" EXISTS "${key}" | tr -d '[:space:]')" == "1" ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "route policy key did not appear: ${key}" >&2
+  exit 1
+}
+
+wait_for_storage_metadata() {
+  wait_for_pattern_count "${KEYSPACE}/clients/${STORAGE_A_STABLE}:*" 1 25
+  wait_for_pattern_count "${KEYSPACE}/clients/${STORAGE_B_STABLE}:*" 1 25
+  wait_for_pattern_count "${KEYSPACE}/segments/${STORAGE_A_STABLE}:*" 1 25
+  wait_for_pattern_count "${KEYSPACE}/segments/${STORAGE_B_STABLE}:*" 1 25
+  wait_for_route_policy
+}
+
+run_real_client() {
+  local mode=$1
+  local key_prefix=$2
+  local stable_id=$3
+  local local_host=$4
+  local storage_bytes=$5
+  shift 5
+
+  local expires_at_ms
+  expires_at_ms=$(( $(now_ms) + LEASE_MS ))
+  local -a args=(
+    "${PYTHON_BIN}"
+    -u
+    "${REPO_ROOT}/scripts/clients/real_client_rw.py"
+    --local_host "${local_host}"
+    --metadata_url "${REDIS_URL}"
+    --storage-bytes "${storage_bytes}"
+    --scratch-bytes "${SCRATCH_BYTES}"
+    --protocol "${PROTOCOL}"
+    --keyspace "${KEYSPACE}"
+    --stable-id "${stable_id}"
+    --mode "${mode}"
+    --transport-backend "${TRANSPORT_BACKEND}"
+    --route-control "${ROUTE_CONTROL}"
+    --route-topk "${ROUTE_TOPK}"
+    --batch_size "${BATCH_SIZE}"
+    --num_kv "${NUM_KV}"
+    --value_size "${VALUE_SIZE}"
+    --replica_num "${REPLICA_NUM}"
+  )
+  if [[ -n "${key_prefix}" ]]; then
+    args+=(--key_prefix "${key_prefix}")
+  fi
+  if (( storage_bytes == 0 )); then
+    args+=(--routed-writes)
+  fi
+  args+=("$@")
+
+  MC_STORE_RS_EXPIRES_AT_MS="${expires_at_ms}" \
+    PYTHONUNBUFFERED=1 \
+    "${args[@]}"
+}
+
+start_storage_client() {
+  local stable_id=$1
+  local local_host=$2
+  local log_file=$3
+  local expires_at_ms
+
+  expires_at_ms=$(( $(now_ms) + LEASE_MS ))
+
+  MC_STORE_RS_EXPIRES_AT_MS="${expires_at_ms}" \
+    PYTHONUNBUFFERED=1 \
+    "${PYTHON_BIN}" -u "${REPO_ROOT}/scripts/clients/real_client_rw.py" \
+      --local_host "${local_host}" \
+      --metadata_url "${REDIS_URL}" \
+      --storage-bytes "${STORAGE_BYTES}" \
+      --scratch-bytes "${SCRATCH_BYTES}" \
+      --protocol "${PROTOCOL}" \
+      --keyspace "${KEYSPACE}" \
+      --stable-id "${stable_id}" \
+      --mode idle \
+      --hold-seconds "${HOLD_SECONDS}" \
+      --transport-backend "${TRANSPORT_BACKEND}" \
+      --route-control "${ROUTE_CONTROL}" \
+      --route-topk "${ROUTE_TOPK}" \
+      --label pool=pool-a \
+      --label storage=true \
+      >"${log_file}" 2>&1 &
+  PIDS+=($!)
+}
+
+run_persisted_restart_phase() {
+  echo
+  echo "==> persisted restart phase"
+  run_real_client write "persisted-before" "${WRITER_STABLE}-before" "127.0.0.1:${WRITER_PORT}" 0
+  run_real_client read "persisted-before" "${READER_STABLE}-before" "127.0.0.1:${READER_PORT}" 0
+
+  echo "==> saving Redis snapshot and stopping metadata for ${DOWN_SECONDS}s"
+  save_redis_snapshot
+  stop_redis
+  sleep "${DOWN_SECONDS}"
+  start_redis "${REDIS_PERSIST_DIR}"
+  wait_for_storage_metadata
+
+  echo "==> verifying pre-outage keys still read after persisted restart"
+  run_real_client read "persisted-before" "${READER_STABLE}-persisted" "127.0.0.1:${READER_PORT}" 0
+
+  echo "==> verifying new writes after persisted restart"
+  run_real_client write "persisted-after" "${WRITER_STABLE}-persisted" "127.0.0.1:${WRITER_PORT}" 0
+  run_real_client read "persisted-after" "${READER_STABLE}-persisted-new" "127.0.0.1:${READER_PORT}" 0
+}
+
+run_fresh_restart_phase() {
+  echo
+  echo "==> fresh restart phase"
+  stop_redis
+  sleep "${DOWN_SECONDS}"
+  start_redis "${REDIS_FRESH_DIR}"
+  wait_for_storage_metadata
+
+  echo "==> verifying new writes after empty metadata restart"
+  run_real_client write "fresh-after" "${WRITER_STABLE}-fresh" "127.0.0.1:${WRITER_PORT}" 0
+  run_real_client read "fresh-after" "${READER_STABLE}-fresh" "127.0.0.1:${READER_PORT}" 0
+}
+
+cleanup() {
+  local status=$?
+  local pid
+
+  for pid in "${PIDS[@]:-}"; do
+    if kill -0 "${pid}" >/dev/null 2>&1; then
+      kill -TERM "${pid}" >/dev/null 2>&1 || true
+    fi
+  done
+  sleep 0.5
+  for pid in "${PIDS[@]:-}"; do
+    if kill -0 "${pid}" >/dev/null 2>&1; then
+      kill -KILL "${pid}" >/dev/null 2>&1 || true
+    fi
+  done
+
+  if redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
+    redis-cli -p "${REDIS_PORT}" shutdown nosave >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${status}" != "0" && "${MC_STORE_RS_KEEP_TEMP:-0}" == "1" ]]; then
+    echo "preserving temp dir: ${TEMP_DIR}" >&2
+  else
+    rm -rf "${TEMP_DIR}"
+  fi
+  exit "${status}"
+}
+
+trap cleanup EXIT
+
+require_command git
+require_command cargo
+require_command python3
+require_command redis-cli
+require_command redis-server
+
+UPSTREAM_BUILD_DIR=$(resolve_upstream_build_dir)
+UPSTREAM_DIR=$(cd -- "${UPSTREAM_BUILD_DIR}/.." && pwd)
+export MOONCAKE_UPSTREAM_DIR="${UPSTREAM_DIR}"
+export MOONCAKE_UPSTREAM_BUILD_DIR="${UPSTREAM_BUILD_DIR}"
+export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${LD_LIBRARY_PATH:-}"
+export PYTHONDONTWRITEBYTECODE=1
+
+ensure_runtime_ready
+
+TEMP_DIR=$(mktemp -d)
+PIDS=()
+REDIS_PORT="${MC_STORE_RS_TTL_RECOVERY_REDIS_PORT:-$(allocate_port)}"
+REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
+RUN_ID=$(date +%s%N)
+KEYSPACE="mc/store-rs/e2e/redis-ttl-recovery/${RUN_ID}"
+REDIS_PERSIST_DIR="${TEMP_DIR}/redis-persist"
+REDIS_FRESH_DIR="${TEMP_DIR}/redis-fresh"
+STORAGE_A_STABLE="redis-ttl-storage-a-${RUN_ID}"
+STORAGE_B_STABLE="redis-ttl-storage-b-${RUN_ID}"
+WRITER_STABLE="redis-ttl-writer-${RUN_ID}"
+READER_STABLE="redis-ttl-reader-${RUN_ID}"
+STORAGE_A_PORT=$(allocate_port)
+STORAGE_B_PORT=$(allocate_port)
+WRITER_PORT=$(allocate_port)
+READER_PORT=$(allocate_port)
+
+echo "==> protocol:            ${PROTOCOL}"
+echo "==> transport backend:   ${TRANSPORT_BACKEND}"
+echo "==> route control:       ${ROUTE_CONTROL}"
+echo "==> route topk:          ${ROUTE_TOPK}"
+echo "==> replica num:         ${REPLICA_NUM}"
+echo "==> lease ttl ms:        ${LEASE_MS}"
+echo "==> redis down seconds:  ${DOWN_SECONDS}"
+echo "==> python:              ${PYTHON_BIN}"
+echo "==> upstream build dir:  ${UPSTREAM_BUILD_DIR}"
+echo "==> redis url:           ${REDIS_URL}"
+echo "==> keyspace:            ${KEYSPACE}"
+
+start_redis "${REDIS_PERSIST_DIR}"
+
+echo "==> starting storage clients"
+start_storage_client "${STORAGE_A_STABLE}" "127.0.0.1:${STORAGE_A_PORT}" "${TEMP_DIR}/storage-a.log"
+start_storage_client "${STORAGE_B_STABLE}" "127.0.0.1:${STORAGE_B_PORT}" "${TEMP_DIR}/storage-b.log"
+wait_for_storage_metadata
+
+if [[ "${MODE}" == "all" || "${MODE}" == "persisted" ]]; then
+  run_persisted_restart_phase
+fi
+
+if [[ "${MODE}" == "all" || "${MODE}" == "fresh" ]]; then
+  run_fresh_restart_phase
+fi
+
+echo
+echo "PASS: Redis TTL recovery e2e completed"

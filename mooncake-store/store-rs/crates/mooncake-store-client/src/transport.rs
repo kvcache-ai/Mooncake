@@ -9,7 +9,7 @@ use mooncake_transport::{
     ClassicEngineConfig, ClassicTransferEngine, SegmentBuffer, SegmentInfo, SegmentKind,
     TentEngine, TentEngineConfig, TransferProgress, TransferRequest, TransferStatus,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BatchWaitFailureKind {
@@ -100,6 +100,9 @@ pub trait StoreTransport: Send + Sync {
     fn open_segment(&self, segment_name: &str) -> Result<u64>;
     fn close_segment(&self, handle: u64) -> Result<()>;
     fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo>;
+    fn republish_local_metadata(&self) -> Result<()> {
+        Ok(())
+    }
     fn adopt_local_memory(&self, _addr: *mut c_void, _size: usize, _location: &str) -> Result<()> {
         Ok(())
     }
@@ -218,11 +221,13 @@ impl StoreTransport for TentEngine {
 #[derive(Clone, Debug)]
 struct ClassicAllocationRecord {
     location: String,
+    size: usize,
     owned: bool,
 }
 
 pub struct ClassicTeTransport {
-    engine: ClassicTransferEngine,
+    engine: RwLock<ClassicTransferEngine>,
+    config: ClassicEngineConfig,
     segment_name: String,
     allocations: Mutex<BTreeMap<usize, ClassicAllocationRecord>>,
 }
@@ -230,10 +235,33 @@ pub struct ClassicTeTransport {
 impl ClassicTeTransport {
     fn new(config: ClassicEngineConfig, segment_name: &str) -> Result<Self> {
         Ok(Self {
-            engine: ClassicTransferEngine::new(&config, segment_name)?,
+            engine: RwLock::new(ClassicTransferEngine::new(&config, segment_name)?),
+            config,
             segment_name: segment_name.to_string(),
             allocations: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    fn rebuild_engine_for_metadata_recovery(&self) -> Result<()> {
+        let allocations = self
+            .allocations
+            .lock()
+            .iter()
+            .map(|(addr, record)| (*addr, record.clone()))
+            .collect::<Vec<_>>();
+        let replacement = ClassicTransferEngine::new(&self.config, &self.segment_name)?;
+        for (addr, record) in &allocations {
+            replacement.register_local_memory(
+                *addr as *mut c_void,
+                record.size,
+                &record.location,
+                true,
+            )?;
+        }
+        let mut engine = self.engine.write();
+        let previous = std::mem::replace(&mut *engine, replacement);
+        drop(previous);
+        engine.republish_local_metadata()
     }
 }
 
@@ -243,25 +271,28 @@ impl StoreTransport for ClassicTeTransport {
     }
 
     fn rpc_server_address(&self) -> Result<(String, u16)> {
-        parse_rpc_server_address(&self.engine.rpc_server_address_text()?)
+        let engine = self.engine.read();
+        parse_rpc_server_address(&engine.rpc_server_address_text()?)
     }
 
     fn open_segment(&self, segment_name: &str) -> Result<u64> {
-        Ok(self.engine.open_segment(segment_name)? as u64)
+        let engine = self.engine.read();
+        Ok(engine.open_segment(segment_name)? as u64)
     }
 
     fn close_segment(&self, handle: u64) -> Result<()> {
         let handle = i32::try_from(handle).map_err(|_| {
             StoreError::Transport(format!("classic segment handle {handle} does not fit i32"))
         })?;
-        self.engine.close_segment(handle)
+        self.engine.read().close_segment(handle)
     }
 
     fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo> {
         let handle = i32::try_from(handle).map_err(|_| {
             StoreError::Transport(format!("classic segment handle {handle} does not fit i32"))
         })?;
-        let (base, length) = self.engine.first_buffer(handle)?;
+        let engine = self.engine.read();
+        let (base, length) = engine.first_buffer(handle)?;
         Ok(SegmentInfo {
             kind: SegmentKind::Memory,
             buffers: vec![SegmentBuffer {
@@ -272,12 +303,17 @@ impl StoreTransport for ClassicTeTransport {
         })
     }
 
+    fn republish_local_metadata(&self) -> Result<()> {
+        self.rebuild_engine_for_metadata_recovery()
+    }
+
     fn adopt_local_memory(&self, addr: *mut c_void, _size: usize, location: &str) -> Result<()> {
         self.allocations
             .lock()
             .entry(addr as usize)
             .or_insert_with(|| ClassicAllocationRecord {
                 location: location.to_string(),
+                size: _size,
                 owned: false,
             });
         Ok(())
@@ -296,6 +332,7 @@ impl StoreTransport for ClassicTeTransport {
             addr as usize,
             ClassicAllocationRecord {
                 location: location.to_string(),
+                size,
                 owned: true,
             },
         );
@@ -320,38 +357,45 @@ impl StoreTransport for ClassicTeTransport {
     }
 
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
-        let location = self
-            .allocations
-            .lock()
-            .get(&(addr as usize))
-            .map(|record| record.location.clone())
-            .unwrap_or_else(|| "cpu:0".to_string());
+        let location = {
+            let mut allocations = self.allocations.lock();
+            allocations
+                .entry(addr as usize)
+                .or_insert_with(|| ClassicAllocationRecord {
+                    location: "cpu:0".to_string(),
+                    size,
+                    owned: false,
+                })
+                .location
+                .clone()
+        };
         self.engine
+            .read()
             .register_local_memory(addr, size, &location, true)
     }
 
     fn unregister_memory(&self, addr: *mut c_void, _size: usize) -> Result<()> {
-        self.engine.unregister_local_memory(addr)
+        self.engine.read().unregister_local_memory(addr)
     }
 
     fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
-        self.engine.allocate_batch(batch_size)
+        self.engine.read().allocate_batch(batch_size)
     }
 
     fn free_batch(&self, batch_id: u64) -> Result<()> {
-        self.engine.free_batch(batch_id)
+        self.engine.read().free_batch(batch_id)
     }
 
     fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()> {
-        self.engine.submit(batch_id, requests)
+        self.engine.read().submit(batch_id, requests)
     }
 
     fn task_status(&self, batch_id: u64, task_id: usize) -> Result<TransferProgress> {
-        self.engine.task_status(batch_id, task_id)
+        self.engine.read().task_status(batch_id, task_id)
     }
 
     fn overall_status(&self, batch_id: u64) -> Result<TransferProgress> {
-        self.engine.batch_status(batch_id)
+        self.engine.read().batch_status(batch_id)
     }
 }
 

@@ -266,6 +266,11 @@ impl ClassicTransferEngine {
         check_zero(rc, "syncSegmentCache")
     }
 
+    pub fn republish_local_metadata(&self) -> Result<()> {
+        let rc = unsafe { ffi::mooncake_classic_republish_local_metadata(self.raw) };
+        check_zero(rc, "mooncake_classic_republish_local_metadata")
+    }
+
     fn install_transport(&self, protocol: &str) -> Result<()> {
         let protocol = to_cstring("protocol", protocol)?;
         let transport =
