@@ -54,6 +54,12 @@ pub trait MetadataBackend: Send + Sync {
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>>;
 
+    /// Lists object routes in the given namespace scope.
+    ///
+    /// # Performance
+    /// The default implementation filters the full route set in memory and is
+    /// intended for tests or small datasets. Production backends should provide
+    /// a scope-aware implementation.
     fn list_object_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
         Ok(self
             .list_object_routes()?
@@ -66,10 +72,17 @@ pub trait MetadataBackend: Send + Sync {
             .collect())
     }
 
+    /// Looks up an object route by logical object id.
     fn get_object_route_by_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
         self.get_object_route(&ObjectKey::from_logical_id(object_id))
     }
 
+    /// Lists object routes that share the same reuse identity.
+    ///
+    /// # Performance
+    /// The default implementation filters the full route set in memory and is
+    /// intended for tests or small datasets. Production backends should provide
+    /// an indexed implementation when available.
     fn list_reuse_candidates(&self, reuse: &ReuseIdentity) -> Result<Vec<ObjectRoute>> {
         Ok(self
             .list_object_routes()?

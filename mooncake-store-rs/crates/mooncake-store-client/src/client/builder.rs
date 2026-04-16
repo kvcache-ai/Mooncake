@@ -455,8 +455,6 @@ impl StoreClientBuilder {
             transport: self.transport,
             transport_factory: self.transport_factory,
             write_mode: self.write_mode,
-            route_control: self.route_control,
-            route_topk: self.route_topk,
             transfer_stall_timeout: self.transfer_stall_timeout,
             request_timeout_override: self.request_timeout_override,
             lifecycle_state,

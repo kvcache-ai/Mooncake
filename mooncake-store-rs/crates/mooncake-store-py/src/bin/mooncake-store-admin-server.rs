@@ -1,8 +1,11 @@
 use std::error::Error;
+use std::sync::mpsc;
 
 use _store_rs::admin::{AdminHttpServerHandle, AdminService};
 use clap::Parser;
 use mooncake_store_client::init_tracing;
+use tracing::info;
+use url::Url;
 
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-admin-server")]
@@ -20,11 +23,23 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    validate_args(&args)?;
     init_tracing(args.trace_filter.as_deref())?;
     let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
     let mut server = AdminHttpServerHandle::start(&args.bind_addr, service)?;
-    println!("admin http server listening on {}", server.address());
-    std::thread::park();
+    info!(address = %server.address(), "admin http server listening");
+
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = shutdown_tx.send(());
+    })?;
+    let _ = shutdown_rx.recv();
+
     server.shutdown()?;
+    Ok(())
+}
+
+fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
+    Url::parse(&args.metadata_url)?;
     Ok(())
 }

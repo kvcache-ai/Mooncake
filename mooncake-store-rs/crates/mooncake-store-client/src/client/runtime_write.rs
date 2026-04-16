@@ -106,22 +106,18 @@ impl StoreClient {
                         let _ = transport.free_batch(batch_id);
                         return Err(error);
                     }
-                    let wait_result =
-                        wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+                    let wait_result = wait_for_batch_completion_detailed(
+                        transport,
+                        batch_id,
+                        self.transfer_stall_timeout,
+                        request_deadline.instant(),
+                    )
+                    .map_err(StoreError::from);
                     let free_result = transport.free_batch(batch_id);
                     wait_result?;
                     free_result?;
                 }
-                let wait_result = wait_for_batch_completion_detailed(
-                    transport,
-                    batch_id,
-                    self.transfer_stall_timeout,
-                    request_deadline.instant(),
-                )
-                .map_err(StoreError::from);
-                let free_result = transport.free_batch(batch_id);
-                wait_result?;
-                free_result
+                Ok(())
             })();
             tracker.finish(&result, 0);
             result?;

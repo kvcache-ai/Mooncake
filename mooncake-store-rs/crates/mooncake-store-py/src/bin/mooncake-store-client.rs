@@ -666,15 +666,12 @@ mod tests {
     use _store_rs::runtime::CompatTimeoutConfig;
 
     use super::{
-        build_runtime_args, drained_message, effective_heartbeat_interval, emit_compat_warnings,
-        heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms, parse_hugepage_size_arg,
-        parse_label, requested_initial_state, resolve_timeout_config, should_activate_after_ready,
-        start_metrics_if_needed, started_message, startup_initial_state, stopped_message,
-        validate_args, Args, HeartbeatLoopState, InitialStateArg, RouteControlArg,
         build_runtime_args, compat_warnings, drained_message, effective_heartbeat_interval,
         emit_compat_warnings, heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms,
-        parse_hugepage_size_arg, parse_label, start_metrics_if_needed, started_message,
-        stopped_message, validate_args, Args, HeartbeatLoopState, InitialStateArg, RouteControlArg,
+        parse_hugepage_size_arg, parse_label, requested_initial_state, resolve_timeout_config,
+        should_activate_after_ready, start_metrics_if_needed, started_message,
+        startup_initial_state, stopped_message, validate_args, Args, HeartbeatLoopState,
+        InitialStateArg, RouteControlArg,
     };
 
     fn sample_timeouts() -> CompatTimeoutConfig {

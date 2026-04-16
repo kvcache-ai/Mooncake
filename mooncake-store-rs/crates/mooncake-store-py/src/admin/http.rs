@@ -22,7 +22,9 @@ pub struct AdminHttpServerHandle {
 impl AdminHttpServerHandle {
     pub fn start(bind_addr: &str, service: AdminService) -> mooncake_store_core::Result<Self> {
         let listener = TcpListener::bind(bind_addr).map_err(|error| {
-            StoreError::Transport(format!("admin http server failed to bind {bind_addr}: {error}"))
+            StoreError::Transport(format!(
+                "admin http server failed to bind {bind_addr}: {error}"
+            ))
         })?;
         listener.set_nonblocking(true).map_err(|error| {
             StoreError::Transport(format!(
@@ -60,9 +62,9 @@ impl AdminHttpServerHandle {
     pub fn shutdown(&mut self) -> mooncake_store_core::Result<()> {
         let _ = self.shutdown.send(());
         if let Some(thread) = self.thread.take() {
-            thread.join().map_err(|_| {
-                StoreError::InvalidState("admin http server panicked".to_string())
-            })?;
+            thread
+                .join()
+                .map_err(|_| StoreError::InvalidState("admin http server panicked".to_string()))?;
         }
         Ok(())
     }
@@ -109,12 +111,7 @@ struct HttpRequest {
 }
 
 fn route_request(service: &AdminService, request: HttpRequest) -> String {
-    let path_only = request
-        .path
-        .split('?')
-        .next()
-        .unwrap_or("/")
-        .to_string();
+    let path_only = request.path.split('?').next().unwrap_or("/").to_string();
     match (request.method.as_str(), path_only.as_str()) {
         ("GET", "/healthz") | ("GET", "/livez") => http_text_response("200 OK", "ok\n"),
         ("GET", "/v1/tenant-policies") => {
@@ -131,16 +128,21 @@ fn route_request(service: &AdminService, request: HttpRequest) -> String {
                 Err(error) => http_store_error(error),
             }
         }
-        ("POST", "/v1/maintenance/cleanup-stale-segments") => match service.cleanup_stale_segments()
-        {
-            Ok(report) => http_json_response("200 OK", &report),
-            Err(error) => http_store_error(error),
-        },
+        ("POST", "/v1/maintenance/cleanup-stale-segments") => {
+            match service.cleanup_stale_segments() {
+                Ok(report) => http_json_response("200 OK", &report),
+                Err(error) => http_store_error(error),
+            }
+        }
         _ => route_policy_scope_request(service, request, path_only.as_str()),
     }
 }
 
-fn route_policy_scope_request(service: &AdminService, request: HttpRequest, path_only: &str) -> String {
+fn route_policy_scope_request(
+    service: &AdminService,
+    request: HttpRequest,
+    path_only: &str,
+) -> String {
     let Some(scope) = parse_policy_scope_path(path_only) else {
         return http_error_response("404 Not Found", "not found");
     };
@@ -302,26 +304,65 @@ fn query_param(path: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         let (name, value) = pair.split_once('=')?;
         if name == key {
-            return Some(value.to_string());
+            return percent_decode_component(value);
         }
     }
     None
 }
 
+fn percent_decode_component(value: &str) -> Option<String> {
+    if !value.contains('%') && !value.contains('+') {
+        return Some(value.to_string());
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return None;
+                }
+                let hex = &value[index + 1..index + 3];
+                let byte = u8::from_str_radix(hex, 16).ok()?;
+                decoded.push(byte);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).ok()
+}
+
 fn query_flag(path: &str, key: &str) -> bool {
-    matches!(query_param(path, key).as_deref(), Some("1" | "true" | "TRUE" | "yes" | "YES"))
+    matches!(
+        query_param(path, key).as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
 }
 
 fn http_store_error(error: StoreError) -> String {
     match error {
-        StoreError::Conflict(message) => http_error_response("409 Conflict", &message),
+        StoreError::Conflict(message) | StoreError::StaleEpoch(message) => {
+            http_error_response("409 Conflict", &message)
+        }
+        StoreError::NotFound(message) => http_error_response("404 Not Found", &message),
         StoreError::Unsupported(message) => http_error_response("501 Not Implemented", &message),
-        StoreError::InvalidState(message)
-        | StoreError::Metadata(message)
+        StoreError::InvalidState(message) => http_error_response("400 Bad Request", &message),
+        StoreError::Metadata(message)
         | StoreError::Transport(message)
-        | StoreError::Allocator(message)
-        | StoreError::StaleEpoch(message)
-        | StoreError::NotFound(message) => http_error_response("400 Bad Request", &message),
+        | StoreError::Allocator(message) => {
+            http_error_response("500 Internal Server Error", &message)
+        }
     }
 }
 
@@ -364,12 +405,15 @@ mod tests {
 
     use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
     use mooncake_store_client::RouteControlMode;
-    use mooncake_store_core::{MetadataBackend, TenantPolicySpec, TenantRoutePolicy};
+    use mooncake_store_core::{MetadataBackend, StoreError, TenantPolicySpec, TenantRoutePolicy};
 
     use crate::admin::models::PolicyPatchInput;
     use crate::admin::service::AdminService;
 
-    use super::AdminHttpServerHandle;
+    use super::{
+        http_store_error, parse_policy_scope_path, percent_decode_component, query_flag,
+        query_param, AdminHttpServerHandle,
+    };
 
     fn http_request(address: &str, request: &str) -> String {
         let mut stream = TcpStream::connect(address).expect("http client should connect");
@@ -484,16 +528,47 @@ mod tests {
 
     #[test]
     fn query_helpers_and_scope_parser_cover_paths() {
-        assert!(super::query_flag("/v1/tenant-policies/tenant-a?effective=true", "effective"));
+        assert!(query_flag(
+            "/v1/tenant-policies/tenant-a?effective=true",
+            "effective"
+        ));
         assert_eq!(
-            super::query_param("/v1/tenant-policies?tenant=tenant-a", "tenant").as_deref(),
+            query_param("/v1/tenant-policies?tenant=tenant-a", "tenant").as_deref(),
             Some("tenant-a")
         );
-        let parsed = super::parse_policy_scope_path("/v1/tenant-policies/tenant-a/domain-a/set-a")
+        assert_eq!(
+            query_param("/v1/tenant-policies?tenant=tenant+a", "tenant").as_deref(),
+            Some("tenant a")
+        );
+        assert_eq!(
+            query_param("/v1/tenant-policies?tenant=tenant%2Fa", "tenant").as_deref(),
+            Some("tenant/a")
+        );
+        assert_eq!(percent_decode_component("bad%"), None);
+        assert_eq!(percent_decode_component("bad%ZZ"), None);
+        let parsed = parse_policy_scope_path("/v1/tenant-policies/tenant-a/domain-a/set-a")
             .expect("policy path should parse");
         assert_eq!(parsed.tenant, "tenant-a");
         assert_eq!(parsed.domain.as_deref(), Some("domain-a"));
         assert_eq!(parsed.object_set.as_deref(), Some("set-a"));
+    }
+
+    #[test]
+    fn admin_http_error_mapping_uses_specific_status_codes() {
+        assert!(
+            http_store_error(StoreError::NotFound("missing".to_string()))
+                .contains("HTTP/1.1 404 Not Found")
+        );
+        assert!(
+            http_store_error(StoreError::Conflict("conflict".to_string()))
+                .contains("HTTP/1.1 409 Conflict")
+        );
+        assert!(
+            http_store_error(StoreError::StaleEpoch("stale".to_string()))
+                .contains("HTTP/1.1 409 Conflict")
+        );
+        assert!(http_store_error(StoreError::Metadata("boom".to_string()))
+            .contains("HTTP/1.1 500 Internal Server Error"));
     }
 
     #[test]
@@ -513,10 +588,13 @@ mod tests {
                 "tester",
             )
             .expect("tenant policy should store");
-        assert_eq!(stored.spec.routing, Some(TenantRoutePolicy {
-            route_topk: Some(4),
-            route_control: Some(RouteControlMode::MetadataOnly),
-        }));
+        assert_eq!(
+            stored.spec.routing,
+            Some(TenantRoutePolicy {
+                route_topk: Some(4),
+                route_control: Some(RouteControlMode::MetadataOnly),
+            })
+        );
 
         let fetched = service
             .get_tenant_policy("tenant-a", None, None, true)

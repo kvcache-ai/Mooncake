@@ -143,7 +143,9 @@ impl AdminService {
         expected_version: Option<u64>,
     ) -> AdminResult<DeleteTenantPolicyResponse> {
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
-        let removed = self.backend.delete_tenant_policy(&scope, expected_version)?;
+        let removed = self
+            .backend
+            .delete_tenant_policy(&scope, expected_version)?;
         if removed && is_root_tenant_scope(&scope) {
             self.backend
                 .delete_route_policy(&RoutePolicyDomain::Tenant(scope.tenant.clone()))?;
@@ -161,9 +163,11 @@ impl AdminService {
     }
 
     pub fn cleanup_stale_segments(&self) -> AdminResult<AdminCleanupReport> {
-        if !self.metadata_url.starts_with("redis://") {
+        if !self.metadata_url.starts_with("redis://") && !self.metadata_url.starts_with("rediss://")
+        {
             return Err(StoreError::Unsupported(
-                "cleanup-stale-segments currently supports redis:// metadata only".to_string(),
+                "cleanup-stale-segments currently supports redis:// and rediss:// metadata only"
+                    .to_string(),
             ));
         }
         let backend = RedisMetadataBackend::new(

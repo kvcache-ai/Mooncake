@@ -174,14 +174,7 @@ fn run_policy_command(
             values,
             expected_version,
             updated_by,
-        } => set_policy(
-            service,
-            args,
-            scope,
-            values,
-            *expected_version,
-            updated_by,
-        ),
+        } => set_policy(service, args, scope, values, *expected_version, updated_by),
         PolicyCommand::Delete {
             scope,
             expected_version,
@@ -401,7 +394,10 @@ fn cleanup_stale_segments(service: &AdminService) -> Result<(), Box<dyn Error>> 
     println!("  metadata_url: {}", service.redacted_metadata_url());
     println!("  keyspace: {}", service.keyspace().prefix());
     println!("  live_clients: {}", report.live_clients);
-    println!("  inspected_segment_keys: {}", report.inspected_segment_keys);
+    println!(
+        "  inspected_segment_keys: {}",
+        report.inspected_segment_keys
+    );
     println!("  removed_segment_keys: {}", report.removed_segment_keys);
     println!(
         "  removed_segment_index_entries: {}",
@@ -503,7 +499,11 @@ mod tests {
     #[test]
     fn admin_service_round_trips_policy_and_route_mirror() {
         let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
-        let service = AdminService::new(backend.clone(), "memory://test", MetadataKeyspace::default());
+        let service = AdminService::new(
+            backend.clone(),
+            "memory://test",
+            MetadataKeyspace::default(),
+        );
         let stored = service
             .set_tenant_policy(
                 "tenant-a",
@@ -520,14 +520,20 @@ mod tests {
             )
             .expect("policy write should succeed");
         assert_eq!(stored.version, 1);
-        assert_eq!(stored.spec.quota, Some(TenantQuotaPolicy {
-            max_bytes: Some(64),
-            max_objects: None,
-        }));
+        assert_eq!(
+            stored.spec.quota,
+            Some(TenantQuotaPolicy {
+                max_bytes: Some(64),
+                max_objects: None,
+            })
+        );
         let mirrored = service
             .get_route_policy(Some("tenant-a"))
             .expect("route policy read should succeed");
-        assert_eq!(mirrored.policy.expect("mirrored route policy").route_topk, 5);
+        assert_eq!(
+            mirrored.policy.expect("mirrored route policy").route_topk,
+            5
+        );
         let effective = service
             .get_tenant_policy("tenant-a", None, None, true)
             .expect("effective policy read should succeed");
@@ -548,6 +554,9 @@ mod tests {
         let error = service
             .cleanup_stale_segments()
             .expect_err("non-redis cleanup should fail");
-        assert!(matches!(error, mooncake_store_core::StoreError::Unsupported(_)));
+        assert!(matches!(
+            error,
+            mooncake_store_core::StoreError::Unsupported(_)
+        ));
     }
 }

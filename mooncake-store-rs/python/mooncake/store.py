@@ -748,7 +748,7 @@ def _warn_setup_policy_fallback(config: Mapping[str, object], *, source: str) ->
     warnings.warn(
         f"{source} provided {joined}; admin-managed tenant policy in metadata is the preferred configuration surface and these values are treated as compatibility fallbacks",
         UserWarning,
-        stacklevel=3,
+        stacklevel=4 if source == "MooncakeDistributedStore.setup config" else 3,
     )
 
 

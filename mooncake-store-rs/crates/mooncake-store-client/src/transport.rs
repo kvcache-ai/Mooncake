@@ -195,7 +195,10 @@ pub struct HttpStoreTransportFactory {
 }
 
 impl HttpStoreTransportFactory {
-    pub fn new(metadata: Arc<dyn MetadataBackend>, local_runtime_rpc_address: impl Into<String>) -> Self {
+    pub fn new(
+        metadata: Arc<dyn MetadataBackend>,
+        local_runtime_rpc_address: impl Into<String>,
+    ) -> Self {
         Self {
             metadata,
             local_runtime_rpc_address: local_runtime_rpc_address.into(),
@@ -416,12 +419,17 @@ impl HttpStoreTransport {
             .into_iter()
             .find(|lease| lease.runtime == owner)
             .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", owner)))?;
-        lease.endpoints.labels.get(HTTP_TRANSPORT_LABEL).cloned().ok_or_else(|| {
-            StoreError::NotFound(format!(
-                "runtime {} does not expose {}",
-                lease.runtime, HTTP_TRANSPORT_LABEL
-            ))
-        })
+        lease
+            .endpoints
+            .labels
+            .get(HTTP_TRANSPORT_LABEL)
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "runtime {} does not expose {}",
+                    lease.runtime, HTTP_TRANSPORT_LABEL
+                ))
+            })
     }
 }
 
@@ -559,7 +567,10 @@ impl StoreTransport for HttpStoreTransport {
             .get(&handle)
             .cloned()
             .ok_or_else(|| StoreError::NotFound(format!("segment handle {handle} not found")))?;
-        let path = format!("{}/{}", HTTP_TRANSPORT_PATH_OPEN_SEGMENT, segment.remote_segment_name);
+        let path = format!(
+            "{}/{}",
+            HTTP_TRANSPORT_PATH_OPEN_SEGMENT, segment.remote_segment_name
+        );
         let response: HttpJsonResponse<HttpOpenSegmentResponse> = http_json_request(
             &segment.remote_runtime_rpc,
             "GET",
@@ -598,7 +609,9 @@ impl StoreTransport for HttpStoreTransport {
             .allocations
             .lock()
             .remove(&(addr as usize))
-            .ok_or_else(|| StoreError::Allocator(format!("http transport does not own allocation {:p}", addr)))?;
+            .ok_or_else(|| {
+                StoreError::Allocator(format!("http transport does not own allocation {:p}", addr))
+            })?;
         if record.owned {
             unsafe { libc::free(addr) };
         }
@@ -615,7 +628,9 @@ impl StoreTransport for HttpStoreTransport {
 
     fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
         if batch_size == 0 {
-            return Err(StoreError::Transport("batch_size must be greater than zero".to_string()));
+            return Err(StoreError::Transport(
+                "batch_size must be greater than zero".to_string(),
+            ));
         }
         Ok(self.next_batch_id())
     }
@@ -642,11 +657,16 @@ impl StoreTransport for HttpStoreTransport {
         let first = handles
             .get(&requests[0].target_id)
             .cloned()
-            .ok_or_else(|| StoreError::NotFound(format!("segment handle {} not found", requests[0].target_id)))?;
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "segment handle {} not found",
+                    requests[0].target_id
+                ))
+            })?;
         for request in requests.iter().skip(1) {
-            let current = handles
-                .get(&request.target_id)
-                .ok_or_else(|| StoreError::NotFound(format!("segment handle {} not found", request.target_id)))?;
+            let current = handles.get(&request.target_id).ok_or_else(|| {
+                StoreError::NotFound(format!("segment handle {} not found", request.target_id))
+            })?;
             if current.remote_runtime_rpc != first.remote_runtime_rpc {
                 return Err(StoreError::Unsupported(
                     "http transport batches must target a single runtime".to_string(),
@@ -664,7 +684,12 @@ impl StoreTransport for HttpStoreTransport {
                     .lock()
                     .get(&request.target_id)
                     .cloned()
-                    .ok_or_else(|| StoreError::NotFound(format!("segment handle {} not found", request.target_id)))?;
+                    .ok_or_else(|| {
+                        StoreError::NotFound(format!(
+                            "segment handle {} not found",
+                            request.target_id
+                        ))
+                    })?;
                 let body_offset = body.len() as u64;
                 let bytes = unsafe {
                     slice::from_raw_parts(request.source.cast::<u8>(), request.length as usize)
@@ -691,8 +716,10 @@ impl StoreTransport for HttpStoreTransport {
             Some(&request),
             &body,
         )?;
-        let expected_read_body_length = usize::try_from(response.json.read_body_length)
-            .map_err(|_| StoreError::Transport("http read response length does not fit usize".to_string()))?;
+        let expected_read_body_length =
+            usize::try_from(response.json.read_body_length).map_err(|_| {
+                StoreError::Transport("http read response length does not fit usize".to_string())
+            })?;
         if expected_read_body_length != response.raw_body.len() {
             return Err(StoreError::Transport(
                 "http transport read response length header does not match payload".to_string(),
@@ -703,8 +730,9 @@ impl StoreTransport for HttpStoreTransport {
             if request.opcode != Opcode::Read {
                 continue;
             }
-            let len = usize::try_from(request.length)
-                .map_err(|_| StoreError::Transport("request length does not fit usize".to_string()))?;
+            let len = usize::try_from(request.length).map_err(|_| {
+                StoreError::Transport("request length does not fit usize".to_string())
+            })?;
             let end = read_cursor
                 .checked_add(len)
                 .ok_or_else(|| StoreError::Transport("http read response overflow".to_string()))?;
@@ -974,8 +1002,9 @@ fn http_json_request<T: Serialize, R: for<'de> Deserialize<'de>>(
     raw_body: &[u8],
 ) -> Result<HttpJsonResponse<R>> {
     let json = match body {
-        Some(body) => serde_json::to_vec(body)
-            .map_err(|error| StoreError::Transport(format!("http transport failed to encode json: {error}")))?,
+        Some(body) => serde_json::to_vec(body).map_err(|error| {
+            StoreError::Transport(format!("http transport failed to encode json: {error}"))
+        })?,
         None => Vec::new(),
     };
     let header = format!(
@@ -984,22 +1013,32 @@ fn http_json_request<T: Serialize, R: for<'de> Deserialize<'de>>(
         raw_body.len()
     );
     let mut stream = TcpStream::connect(address).map_err(|error| {
-        StoreError::Transport(format!("http transport failed to connect {address}: {error}"))
+        StoreError::Transport(format!(
+            "http transport failed to connect {address}: {error}"
+        ))
     })?;
     stream
         .set_read_timeout(Some(HTTP_TRANSPORT_READ_TIMEOUT))
-        .map_err(|error| StoreError::Transport(format!("http transport failed to set timeout: {error}")))?;
+        .map_err(|error| {
+            StoreError::Transport(format!("http transport failed to set timeout: {error}"))
+        })?;
     stream.write_all(header.as_bytes()).map_err(|error| {
-        StoreError::Transport(format!("http transport failed to write request header: {error}"))
+        StoreError::Transport(format!(
+            "http transport failed to write request header: {error}"
+        ))
     })?;
     if !json.is_empty() {
         stream.write_all(&json).map_err(|error| {
-            StoreError::Transport(format!("http transport failed to write request body: {error}"))
+            StoreError::Transport(format!(
+                "http transport failed to write request body: {error}"
+            ))
         })?;
     }
     if !raw_body.is_empty() {
         stream.write_all(raw_body).map_err(|error| {
-            StoreError::Transport(format!("http transport failed to write payload body: {error}"))
+            StoreError::Transport(format!(
+                "http transport failed to write payload body: {error}"
+            ))
         })?;
     }
     stream.flush().map_err(|error| {
@@ -1013,7 +1052,9 @@ fn http_json_request<T: Serialize, R: for<'de> Deserialize<'de>>(
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| StoreError::Transport("http transport response missing header terminator".to_string()))?;
+        .ok_or_else(|| {
+            StoreError::Transport("http transport response missing header terminator".to_string())
+        })?;
     let header_text = String::from_utf8_lossy(&response[..header_end]);
     let status_line = header_text.lines().next().unwrap_or_default().to_string();
     if !status_line.contains(" 200 ") {
@@ -1030,7 +1071,9 @@ fn http_json_request<T: Serialize, R: for<'de> Deserialize<'de>>(
         ));
     }
     let json = serde_json::from_slice(&body[..json_length]).map_err(|error| {
-        StoreError::Transport(format!("http transport failed to decode response json: {error}"))
+        StoreError::Transport(format!(
+            "http transport failed to decode response json: {error}"
+        ))
     })?;
     Ok(HttpJsonResponse {
         json,
@@ -1063,7 +1106,9 @@ struct HttpServerSegment {
 impl HttpTransportServerHandle {
     pub fn start(bind_addr: &str) -> Result<Self> {
         let listener = TcpListener::bind(bind_addr).map_err(|error| {
-            StoreError::Transport(format!("http transport server failed to bind {bind_addr}: {error}"))
+            StoreError::Transport(format!(
+                "http transport server failed to bind {bind_addr}: {error}"
+            ))
         })?;
         listener.set_nonblocking(true).map_err(|error| {
             StoreError::Transport(format!(
@@ -1118,9 +1163,9 @@ impl HttpTransportServerHandle {
     pub fn shutdown(&mut self) -> Result<()> {
         let _ = self.shutdown.send(());
         if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .map_err(|_| StoreError::InvalidState("http transport server panicked".to_string()))?;
+            thread.join().map_err(|_| {
+                StoreError::InvalidState("http transport server panicked".to_string())
+            })?;
         }
         Ok(())
     }
@@ -1181,7 +1226,8 @@ fn route_http_transport_request(
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/healthz") | ("GET", "/livez") => http_transport_text_response("200 OK", "ok\n"),
         ("POST", HTTP_TRANSPORT_PATH_OPEN_SEGMENT) => {
-            let payload = match serde_json::from_slice::<HttpOpenSegmentRequest>(&request.json_body) {
+            let payload = match serde_json::from_slice::<HttpOpenSegmentRequest>(&request.json_body)
+            {
                 Ok(payload) => payload,
                 Err(error) => {
                     return http_transport_error_response(
@@ -1208,8 +1254,11 @@ fn route_http_transport_request(
                 },
             )
         }
-        ("GET", path) if path.starts_with(&(HTTP_TRANSPORT_PATH_OPEN_SEGMENT.to_string() + "/")) => {
-            let segment_name = path.trim_start_matches(&(HTTP_TRANSPORT_PATH_OPEN_SEGMENT.to_string() + "/"));
+        ("GET", path)
+            if path.starts_with(&(HTTP_TRANSPORT_PATH_OPEN_SEGMENT.to_string() + "/")) =>
+        {
+            let segment_name =
+                path.trim_start_matches(&(HTTP_TRANSPORT_PATH_OPEN_SEGMENT.to_string() + "/"));
             let segments = state.segments.lock();
             let Some(segment) = segments.get(segment_name) else {
                 return http_transport_error_response("404 Not Found", "segment not found");
@@ -1229,7 +1278,8 @@ fn route_http_transport_request(
             )
         }
         ("POST", HTTP_TRANSPORT_PATH_SUBMIT_BATCH) => {
-            let payload = match serde_json::from_slice::<HttpSubmitBatchRequest>(&request.json_body) {
+            let payload = match serde_json::from_slice::<HttpSubmitBatchRequest>(&request.json_body)
+            {
                 Ok(payload) => payload,
                 Err(error) => {
                     return http_transport_error_response(
@@ -1286,7 +1336,9 @@ fn route_http_transport_request(
                 Err(error) => http_transport_error_response("400 Bad Request", &error.to_string()),
             }
         }
-        ("GET", path) if path.starts_with(&(HTTP_TRANSPORT_PATH_BATCH_STATUS.to_string() + "/")) => {
+        ("GET", path)
+            if path.starts_with(&(HTTP_TRANSPORT_PATH_BATCH_STATUS.to_string() + "/")) =>
+        {
             let batch_id = match path
                 .trim_start_matches(&(HTTP_TRANSPORT_PATH_BATCH_STATUS.to_string() + "/"))
                 .parse::<u64>()
@@ -1335,8 +1387,9 @@ fn apply_http_batch(
         }
         match item.opcode {
             Opcode::Write => {
-                let start = usize::try_from(item.body_offset)
-                    .map_err(|_| StoreError::Transport("body offset does not fit usize".to_string()))?;
+                let start = usize::try_from(item.body_offset).map_err(|_| {
+                    StoreError::Transport("body offset does not fit usize".to_string())
+                })?;
                 let end = start
                     .checked_add(len)
                     .ok_or_else(|| StoreError::Transport("body slice overflow".to_string()))?;
@@ -1354,7 +1407,8 @@ fn apply_http_batch(
                 }
             }
             Opcode::Read => unsafe {
-                let source = slice::from_raw_parts((segment.base_addr as *const u8).add(target_offset), len);
+                let source =
+                    slice::from_raw_parts((segment.base_addr as *const u8).add(target_offset), len);
                 read_body.extend_from_slice(source);
             },
         }
@@ -1385,7 +1439,8 @@ fn read_http_transport_request(stream: &mut TcpStream) -> std::io::Result<HttpTr
             header_end = request.windows(4).position(|window| window == b"\r\n\r\n");
             if let Some(index) = header_end {
                 json_length = parse_http_header_usize(&request[..index + 4], "content-length");
-                raw_length = parse_http_header_usize(&request[..index + 4], "x-mooncake-body-length");
+                raw_length =
+                    parse_http_header_usize(&request[..index + 4], "x-mooncake-body-length");
                 let body_len = request.len().saturating_sub(index + 4);
                 if body_len >= json_length.saturating_add(raw_length) {
                     break;
@@ -1445,7 +1500,11 @@ fn http_transport_json_response<T: Serialize>(status: &str, body: &T) -> Vec<u8>
     http_transport_json_response_with_raw(status, body, &[])
 }
 
-fn http_transport_json_response_with_raw<T: Serialize>(status: &str, body: &T, raw_body: &[u8]) -> Vec<u8> {
+fn http_transport_json_response_with_raw<T: Serialize>(
+    status: &str,
+    body: &T,
+    raw_body: &[u8],
+) -> Vec<u8> {
     match serde_json::to_vec(body) {
         Ok(encoded) => {
             let mut response = format!(
@@ -2040,7 +2099,10 @@ mod tests {
             Ok(self.leases.clone())
         }
 
-        fn publish_segment(&self, _segment: &mooncake_store_core::SegmentAnnouncement) -> Result<()> {
+        fn publish_segment(
+            &self,
+            _segment: &mooncake_store_core::SegmentAnnouncement,
+        ) -> Result<()> {
             Err(StoreError::Unsupported("unused in test".to_string()))
         }
 
@@ -2139,7 +2201,12 @@ mod tests {
 
         fn list_route_policies(
             &self,
-        ) -> Result<Vec<(mooncake_store_core::RoutePolicyDomain, mooncake_store_core::RoutePolicy)>> {
+        ) -> Result<
+            Vec<(
+                mooncake_store_core::RoutePolicyDomain,
+                mooncake_store_core::RoutePolicy,
+            )>,
+        > {
             Err(StoreError::Unsupported("unused in test".to_string()))
         }
 
@@ -2221,17 +2288,15 @@ mod tests {
             }],
         });
 
-        let transport = HttpStoreTransport::new(
-            metadata,
-            "local-segment",
-            "127.0.0.1:17000",
-        )
-        .expect("http transport should build");
+        let transport = HttpStoreTransport::new(metadata, "local-segment", "127.0.0.1:17000")
+            .expect("http transport should build");
         let handle = transport
             .open_segment("remote-segment")
             .expect("open_segment should resolve remote runtime");
 
-        let write_batch = transport.allocate_batch(1).expect("write batch should allocate");
+        let write_batch = transport
+            .allocate_batch(1)
+            .expect("write batch should allocate");
         let write_payload = b"hello-http-read";
         let write_request = TransferRequest {
             opcode: Opcode::Write,
@@ -2253,7 +2318,9 @@ mod tests {
             .expect("http write should succeed");
         assert_eq!(&remote_segment[5..5 + write_payload.len()], write_payload);
 
-        let read_batch = transport.allocate_batch(1).expect("read batch should allocate");
+        let read_batch = transport
+            .allocate_batch(1)
+            .expect("read batch should allocate");
         let mut read_buffer = vec![0u8; write_payload.len()];
         let read_request = TransferRequest {
             opcode: Opcode::Read,
