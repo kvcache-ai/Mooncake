@@ -125,7 +125,25 @@ impl StoreClient {
 
 impl MooncakeCompatibilityFacade for StoreClient {
     fn heartbeat(&mut self, expires_at_ms: u64) -> Result<()> {
-        self.prepare_heartbeat(expires_at_ms).publish()
+        let result = self.prepare_heartbeat(expires_at_ms).publish();
+        match result {
+            Ok(()) => {
+                let previous_failures =
+                    self.heartbeat_repair_pending.swap(0, Ordering::SeqCst);
+                if previous_failures == 0 {
+                    return Ok(());
+                }
+                if let Err(error) = self.repair_local_metadata_after_heartbeat_recovery() {
+                    self.heartbeat_repair_pending.store(1, Ordering::SeqCst);
+                    return Err(error);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.heartbeat_repair_pending.fetch_add(1, Ordering::SeqCst);
+                Err(error)
+            }
+        }
     }
 
     fn enter_standby(&mut self) -> Result<()> {

@@ -405,6 +405,7 @@ impl StoreClientBuilder {
             lifecycle_state,
             route_write_gate,
             startup_activation_pending: AtomicBool::new(startup_activation_pending),
+            heartbeat_repair_pending: AtomicUsize::new(0),
             state,
         })
     }

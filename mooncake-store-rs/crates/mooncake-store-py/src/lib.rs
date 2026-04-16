@@ -1567,7 +1567,7 @@ mod tests {
     use std::net::TcpListener;
     use std::ptr;
     use std::slice;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread::sleep;
     use std::time::Duration;
@@ -1923,6 +1923,12 @@ mod tests {
         entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     }
 
+    struct RecoveryCountingMetadata {
+        inner: InMemoryMetadataBackend,
+        lease_failures_remaining: Mutex<usize>,
+        publish_segment_calls: AtomicUsize,
+    }
+
     impl BlockingHealthMetadata {
         fn new(
             block_lease: Arc<AtomicBool>,
@@ -1948,6 +1954,24 @@ mod tests {
                     sleep(Duration::from_millis(10));
                 }
             }
+        }
+    }
+
+    impl RecoveryCountingMetadata {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryMetadataBackend::new(),
+                lease_failures_remaining: Mutex::new(0),
+                publish_segment_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_next_lease_upserts(&self, count: usize) {
+            *self.lease_failures_remaining.lock() = count;
+        }
+
+        fn publish_segment_calls(&self) -> usize {
+            self.publish_segment_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -1978,6 +2002,133 @@ mod tests {
             &self,
             segment: &SegmentAnnouncement,
         ) -> mooncake_store_core::Result<()> {
+            self.inner.publish_segment(segment)
+        }
+
+        fn unpublish_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.unpublish_segment(owner, segment)
+        }
+
+        fn list_segments(
+            &self,
+            owner: Option<&ClientRuntimeId>,
+        ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+            self.inner.list_segments(owner)
+        }
+
+        fn update_segment_state(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            next: SegmentLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_segment_state(owner, segment, next)
+        }
+
+        fn reserve_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            length_bytes: u64,
+        ) -> mooncake_store_core::Result<SegmentReservation> {
+            self.inner.reserve_segment(owner, segment, length_bytes)
+        }
+
+        fn release_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            offset_bytes: u64,
+            length_bytes: u64,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner
+                .release_segment(owner, segment, offset_bytes, length_bytes)
+        }
+
+        fn get_object_route(
+            &self,
+            key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+            self.inner.get_object_route(key)
+        }
+
+        fn list_object_routes(&self) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+            self.inner.list_object_routes()
+        }
+
+        fn compare_and_swap_object_route(
+            &self,
+            key: &ObjectKey,
+            expected: Option<RouteVersion>,
+            next: Option<&ObjectRoute>,
+        ) -> mooncake_store_core::Result<CasResult> {
+            self.inner
+                .compare_and_swap_object_route(key, expected, next)
+        }
+
+        fn get_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+        ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+            self.inner.get_route_policy(domain)
+        }
+
+        fn put_route_policy_if_absent(
+            &self,
+            domain: &RoutePolicyDomain,
+            policy: &RoutePolicy,
+        ) -> mooncake_store_core::Result<bool> {
+            self.inner.put_route_policy_if_absent(domain, policy)
+        }
+
+        fn put_handoff(&self, handoff: &HandoffPlan) -> mooncake_store_core::Result<()> {
+            self.inner.put_handoff(handoff)
+        }
+
+        fn get_handoff(
+            &self,
+            stable_id: &ClientStableId,
+        ) -> mooncake_store_core::Result<Option<HandoffPlan>> {
+            self.inner.get_handoff(stable_id)
+        }
+    }
+
+    impl MetadataBackend for RecoveryCountingMetadata {
+        fn route_namespace(&self) -> String {
+            self.inner.route_namespace()
+        }
+
+        fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+            let mut remaining = self.lease_failures_remaining.lock();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(StoreError::Metadata("simulated redis outage".to_string()));
+            }
+            drop(remaining);
+            self.inner.upsert_client_lease(lease)
+        }
+
+        fn update_client_state(
+            &self,
+            runtime: &ClientRuntimeId,
+            next: ClientLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_client_state(runtime, next)
+        }
+
+        fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+            self.inner.list_live_clients()
+        }
+
+        fn publish_segment(
+            &self,
+            segment: &SegmentAnnouncement,
+        ) -> mooncake_store_core::Result<()> {
+            self.publish_segment_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.publish_segment(segment)
         }
 
@@ -3537,6 +3688,53 @@ mod tests {
             sleep(Duration::from_millis(20));
         }
         panic!("heartbeat should recover after the blocked publish is released");
+    }
+
+    #[test]
+    fn dispatcher_heartbeat_recovery_republishes_local_segments() {
+        let metadata = Arc::new(RecoveryCountingMetadata::new());
+        let transport = Arc::new(TestTransport::new("dispatcher-recovery-segment"));
+        let client = match StoreClientBuilder::new(metadata.clone(), "dispatcher-recovery")
+            .epoch(ClientEpoch(1))
+            .state(ClientLifecycleState::Active)
+            .compatibility(CompatibilityDescriptor::default())
+            .route_control(RouteControlMode::MetadataOnly)
+            .transport(transport.clone())
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .storage_bytes(4 * 1024)
+                    .scratch_bytes(4 * 1024)
+                    .alignment(1)
+                    .reclaim_grace_ms(0),
+            )
+            .build(60_000)
+        {
+            Ok(client) => client,
+            Err(StoreError::Transport(message)) if message.contains("Operation not permitted") => {
+                return;
+            }
+            Err(error) => panic!("dispatcher recovery client should build: {error}"),
+        };
+        let dispatcher = StoreDispatcher::spawn(client, "dispatcher-recovery".to_string())
+            .expect("dispatcher should spawn");
+        dispatcher
+            .register_local_memory()
+            .expect("local memory should register");
+        let initial_publish_calls = metadata.publish_segment_calls();
+        assert!(initial_publish_calls >= 1);
+
+        metadata.fail_next_lease_upserts(2);
+        assert!(dispatcher.heartbeat(60_000).is_err());
+        assert!(dispatcher.heartbeat(60_000).is_err());
+        let before_repair = metadata.publish_segment_calls();
+
+        dispatcher
+            .heartbeat(60_000)
+            .expect("recovered heartbeat should repair local segment metadata");
+        assert!(
+            metadata.publish_segment_calls() > before_repair,
+            "recovered dispatcher heartbeat should republish local segments"
+        );
     }
 
     #[test]

@@ -168,11 +168,24 @@ struct BlockingCasMetadataBackend {
     gate: Arc<(StdMutex<BlockingCasGateState>, Condvar)>,
 }
 
+struct RecoverableMetadataBackend {
+    inner: Arc<InMemoryMetadataBackend>,
+    state: StdMutex<RecoverableMetadataState>,
+}
+
 #[derive(Default)]
 struct BlockingCasGateState {
     entered: bool,
     released: bool,
     blocked_once: bool,
+}
+
+#[derive(Default)]
+struct RecoverableMetadataState {
+    lease_failures_remaining: usize,
+    hidden_clients: BTreeSet<String>,
+    hidden_segments: BTreeSet<String>,
+    hide_route_policy: bool,
 }
 
 impl CountingMetadataBackend {
@@ -190,6 +203,50 @@ impl CountingMetadataBackend {
 
     fn get_object_route_calls(&self) -> usize {
         self.get_object_route_calls.load(Ordering::Relaxed)
+    }
+}
+
+impl RecoverableMetadataBackend {
+    fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
+        Self {
+            inner,
+            state: StdMutex::new(RecoverableMetadataState::default()),
+        }
+    }
+
+    fn fail_next_lease_upserts(&self, count: usize) {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .lease_failures_remaining = count;
+    }
+
+    fn hide_runtime_metadata(&self, runtime: &ClientRuntimeId) {
+        let segments = self
+            .inner
+            .list_segments(Some(runtime))
+            .expect("segments should list before hiding");
+        let mut state = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed");
+        state.hidden_clients.insert(runtime.storage_key());
+        for segment in segments {
+            state
+                .hidden_segments
+                .insert(Self::segment_key(&segment.owner, &segment.segment_name));
+        }
+    }
+
+    fn hide_route_policy(&self) {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hide_route_policy = true;
+    }
+
+    fn segment_key(owner: &ClientRuntimeId, segment: &SegmentName) -> String {
+        format!("{}:{}", owner.storage_key(), segment.0)
     }
 }
 
@@ -231,6 +288,180 @@ impl BlockingCasMetadataBackend {
         let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
         state.released = true;
         condvar.notify_all();
+    }
+}
+
+impl MetadataBackend for RecoverableMetadataBackend {
+    fn route_namespace(&self) -> String {
+        self.inner.route_namespace()
+    }
+
+    fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("recoverable metadata state lock should succeed");
+            if state.lease_failures_remaining > 0 {
+                state.lease_failures_remaining -= 1;
+                return Err(StoreError::Metadata("simulated redis outage".to_string()));
+            }
+            state.hidden_clients.remove(&lease.runtime.storage_key());
+        }
+        self.inner.upsert_client_lease(lease)
+    }
+
+    fn update_client_state(
+        &self,
+        runtime: &ClientRuntimeId,
+        next: ClientLifecycleState,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.update_client_state(runtime, next)
+    }
+
+    fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+        let hidden = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hidden_clients
+            .clone();
+        Ok(self
+            .inner
+            .list_live_clients()?
+            .into_iter()
+            .filter(|lease| !hidden.contains(&lease.runtime.storage_key()))
+            .collect())
+    }
+
+    fn publish_segment(&self, segment: &SegmentAnnouncement) -> mooncake_store_core::Result<()> {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hidden_segments
+            .remove(&Self::segment_key(&segment.owner, &segment.segment_name));
+        self.inner.publish_segment(segment)
+    }
+
+    fn unpublish_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.unpublish_segment(owner, segment)
+    }
+
+    fn list_segments(
+        &self,
+        owner: Option<&ClientRuntimeId>,
+    ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+        let hidden = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hidden_segments
+            .clone();
+        Ok(self
+            .inner
+            .list_segments(owner)?
+            .into_iter()
+            .filter(|segment| {
+                !hidden.contains(&Self::segment_key(&segment.owner, &segment.segment_name))
+            })
+            .collect())
+    }
+
+    fn update_segment_state(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.update_segment_state(owner, segment, next)
+    }
+
+    fn reserve_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+        self.inner.reserve_segment(owner, segment, length_bytes)
+    }
+
+    fn release_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner
+            .release_segment(owner, segment, offset_bytes, length_bytes)
+    }
+
+    fn get_object_route(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
+        self.inner.get_object_route(key)
+    }
+
+    fn list_object_routes(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ObjectRoute>> {
+        self.inner.list_object_routes()
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        key: &ObjectKey,
+        expected: Option<mooncake_store_core::RouteVersion>,
+        next: Option<&mooncake_store_core::ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        self.inner
+            .compare_and_swap_object_route(key, expected, next)
+    }
+
+    fn get_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+    ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+        if self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hide_route_policy
+        {
+            return Ok(None);
+        }
+        self.inner.get_route_policy(domain)
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<bool> {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hide_route_policy = false;
+        self.inner.put_route_policy_if_absent(domain, policy)
+    }
+
+    fn put_handoff(
+        &self,
+        handoff: &mooncake_store_core::HandoffPlan,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_handoff(handoff)
+    }
+
+    fn get_handoff(
+        &self,
+        stable_id: &mooncake_store_core::ClientStableId,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
+        self.inner.get_handoff(stable_id)
     }
 }
 
@@ -5643,6 +5874,75 @@ fn builder_can_stage_active_until_local_memory_registration() {
         .find(|lease| lease.runtime == *client.runtime_id())
         .expect("activated lease should exist");
     assert_eq!(after.state, ClientLifecycleState::Active);
+}
+
+#[test]
+fn heartbeat_recovery_republishes_local_metadata_after_long_redis_outage() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let metadata = Arc::new(RecoverableMetadataBackend::new(inner));
+    let transport = Arc::new(TestTransport::new("redis-recovery-segment"));
+    let mut client = match StoreClientBuilder::new(metadata.clone(), "redis-recovery")
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7012")
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(storage_config_with_bytes(512))
+        .build(test_future_expiry_ms())
+    {
+        Ok(client) => client,
+        Err(StoreError::Transport(message)) if message.contains("Operation not permitted") => {
+            return;
+        }
+        Err(error) => panic!("client build should succeed: {error}"),
+    };
+
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    let runtime = client.runtime_id().clone();
+    let segment = client.segment_name().expect("segment should exist");
+    assert_eq!(
+        metadata
+            .list_segments(Some(&runtime))
+            .expect("segment should be visible before outage")
+            .len(),
+        1
+    );
+
+    metadata.hide_runtime_metadata(&runtime);
+    metadata.hide_route_policy();
+    metadata.fail_next_lease_upserts(2);
+    assert!(client.heartbeat(now_ms().saturating_add(30_000)).is_err());
+    assert!(client.heartbeat(now_ms().saturating_add(30_000)).is_err());
+    assert!(metadata
+        .list_live_clients()
+        .expect("live clients should list during outage")
+        .is_empty());
+    assert!(metadata
+        .list_segments(Some(&runtime))
+        .expect("segments should list during outage")
+        .is_empty());
+
+    client
+        .heartbeat(now_ms().saturating_add(30_000))
+        .expect("heartbeat should repair local metadata after redis recovery");
+    let live = metadata
+        .list_live_clients()
+        .expect("live clients should list after repair");
+    assert!(live.iter().any(|lease| lease.runtime == runtime));
+    assert_eq!(
+        metadata
+            .list_segments(Some(&runtime))
+            .expect("segments should list after repair")
+            .into_iter()
+            .map(|announcement| announcement.segment_name)
+            .collect::<Vec<_>>(),
+        vec![segment]
+    );
+    assert!(metadata
+        .get_route_policy(&RoutePolicyDomain::Default)
+        .expect("route policy should read after repair")
+        .is_some());
 }
 
 #[test]

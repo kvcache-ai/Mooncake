@@ -207,11 +207,13 @@ return {1, used}
 const REDIS_CONNECT_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS";
 const REDIS_IO_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_IO_TIMEOUT_MS";
 const REDIS_AUTH_PROBE_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_AUTH_PROBE_TIMEOUT_MS";
+const REDIS_RETRY_ATTEMPTS_ENV: &str = "MC_STORE_RS_REDIS_RETRY_ATTEMPTS";
+const REDIS_RETRY_DELAY_ENV: &str = "MC_STORE_RS_REDIS_RETRY_DELAY_MS";
 const DEFAULT_REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_REDIS_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_REDIS_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-const READONLY_METADATA_RETRY_ATTEMPTS: usize = 3;
-const READONLY_METADATA_RETRY_DELAY: Duration = Duration::from_millis(25);
+const DEFAULT_REDIS_RETRY_ATTEMPTS: usize = 3;
+const DEFAULT_REDIS_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 pub struct RedisMetadataConfig {
@@ -334,65 +336,90 @@ impl RedisMetadataBackend {
         })
     }
 
-    fn connection_with_client(
+    fn connection_with_client_raw(
         &self,
         client: &redis::Client,
-        operation: &'static str,
-    ) -> Result<redis::Connection> {
-        let connection = client
-            .get_connection_with_timeout(redis_connect_timeout())
-            .map_err(|error| metadata_error(operation, error))?;
+    ) -> std::result::Result<redis::Connection, redis::RedisError> {
+        let connection = client.get_connection_with_timeout(redis_connect_timeout())?;
         connection
             .set_read_timeout(Some(redis_io_timeout()))
-            .map_err(|error| metadata_error("redis set_read_timeout", error))?;
+            .map_err(redis::RedisError::from)?;
         connection
             .set_write_timeout(Some(redis_io_timeout()))
-            .map_err(|error| metadata_error("redis set_write_timeout", error))?;
+            .map_err(redis::RedisError::from)?;
         Ok(connection)
     }
 
-    fn connection(&self) -> Result<redis::Connection> {
+    fn connection_raw(&self) -> std::result::Result<redis::Connection, redis::RedisError> {
         if self.prefer_legacy_auth.load(Ordering::Relaxed) {
             if let Some(client) = &self.legacy_auth_client {
-                return self.connection_with_client(client, "redis get_connection legacy auth");
+                return self.connection_with_client_raw(client);
             }
         }
 
-        match self.connection_with_client(&self.client, "redis get_connection") {
+        match self.connection_with_client_raw(&self.client) {
             Ok(connection) => Ok(connection),
             Err(error) => {
-                if !matches_redis_legacy_auth_mismatch(&error) {
+                if !is_legacy_redis_auth_arity_error(&error.to_string()) {
                     return Err(error);
                 }
                 let Some(client) = &self.legacy_auth_client else {
                     return Err(error);
                 };
-                let connection =
-                    self.connection_with_client(client, "redis get_connection legacy auth")?;
+                let connection = self.connection_with_client_raw(client)?;
                 self.prefer_legacy_auth.store(true, Ordering::Relaxed);
                 Ok(connection)
             }
         }
     }
 
-    fn query_readonly<T, F>(&self, operation: &str, mut query: F) -> Result<T>
+    fn connection(&self) -> Result<redis::Connection> {
+        self.connection_raw()
+            .map_err(|error| metadata_error("redis get_connection", error))
+    }
+
+    fn query_with_retry<T, F>(&self, operation: &str, mut query: F) -> Result<T>
     where
         F: FnMut(&mut redis::Connection) -> std::result::Result<T, redis::RedisError>,
     {
-        for attempt in 0..READONLY_METADATA_RETRY_ATTEMPTS {
-            let mut connection = self.connection()?;
+        let attempts = redis_retry_attempts();
+        let delay = redis_retry_delay();
+        for attempt in 0..attempts {
+            let mut connection = match self.connection_raw() {
+                Ok(connection) => connection,
+                Err(error)
+                    if attempt + 1 < attempts && should_retry_transient_redis_error(&error) =>
+                {
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                Err(error) => return Err(metadata_error(operation, error)),
+            };
             match query(&mut connection) {
                 Ok(value) => return Ok(value),
                 Err(error)
-                    if attempt + 1 < READONLY_METADATA_RETRY_ATTEMPTS
-                        && should_retry_readonly_redis_error(&error) =>
+                    if attempt + 1 < attempts && should_retry_transient_redis_error(&error) =>
                 {
-                    std::thread::sleep(READONLY_METADATA_RETRY_DELAY);
+                    std::thread::sleep(delay);
                 }
                 Err(error) => return Err(metadata_error(operation, error)),
             }
         }
-        unreachable!("readonly metadata query either returns or exhausts retries");
+        unreachable!("redis query either returns or exhausts retries");
+    }
+
+    fn query_readonly<T, F>(&self, operation: &str, mut query: F) -> Result<T>
+    where
+        F: FnMut(&mut redis::Connection) -> std::result::Result<T, redis::RedisError>,
+    {
+        self.query_with_retry(operation, |connection| query(connection))
+    }
+
+    fn query_idempotent_write<T, F>(&self, operation: &str, mut query: F) -> Result<T>
+    where
+        F: FnMut(&mut redis::Connection) -> std::result::Result<T, redis::RedisError>,
+    {
+        self.query_with_retry(operation, |connection| query(connection))
     }
 
     fn load_segment_state(
@@ -607,20 +634,19 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
-        let mut connection = self.connection()?;
         let key = self.keyspace.client(&lease.runtime);
         let payload = serde_json::to_string(lease).map_err(json_error)?;
-        let ttl_ms = lease.expires_at_ms.saturating_sub(now_ms()).max(1);
-        redis::cmd("SET")
-            .arg(&key)
-            .arg(payload)
-            .arg("PX")
-            .arg(ttl_ms)
-            .query::<()>(&mut connection)
-            .map_err(|error| metadata_error("redis set client lease", error))?;
-        connection
-            .sadd::<_, _, ()>(self.keyspace.client_index(), key)
-            .map_err(|error| metadata_error("redis sadd client index", error))
+        self.query_idempotent_write("redis set client lease", |connection| {
+            let ttl_ms = lease.expires_at_ms.saturating_sub(now_ms()).max(1);
+            redis::cmd("SET")
+                .arg(&key)
+                .arg(payload.as_str())
+                .arg("PX")
+                .arg(ttl_ms)
+                .query::<()>(connection)?;
+            connection.sadd::<_, _, ()>(self.keyspace.client_index(), key.as_str())?;
+            Ok(())
+        })
     }
 
     fn update_client_state(
@@ -697,35 +723,31 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
-        let mut connection = self.connection()?;
-        let key = self.keyspace.segment(&segment.owner, &segment.segment_name);
-        let current_payload: Option<String> = redis::cmd("HGET")
-            .arg(&key)
-            .arg("state_json")
-            .query(&mut connection)
-            .map_err(|error| metadata_error("redis hget segment state", error))?;
-        let mut state = match current_payload {
-            Some(payload) => {
-                serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?
-            }
-            None => StoredSegmentState::new(segment.clone()),
-        };
-        state.merge_announcement(segment);
-        self.store_segment_state(&mut connection, &state)
+        self.query_idempotent_write("redis publish segment", |connection| {
+            let key = self.keyspace.segment(&segment.owner, &segment.segment_name);
+            let current_payload: Option<String> = redis::cmd("HGET")
+                .arg(&key)
+                .arg("state_json")
+                .query(connection)?;
+            let mut state = match current_payload {
+                Some(payload) => serde_json::from_str::<StoredSegmentState>(&payload)
+                    .map_err(|error| store_error_to_redis_error(json_error(error)))?,
+                None => StoredSegmentState::new(segment.clone()),
+            };
+            state.merge_announcement(segment);
+            self.store_segment_state(connection, &state)
+                .map_err(store_error_to_redis_error)
+        })
     }
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
-        let mut connection = self.connection()?;
         let key = self.keyspace.segment(owner, segment);
-        connection
-            .del::<_, ()>(&key)
-            .map_err(|error| metadata_error("redis del segment", error))?;
-        connection
-            .srem::<_, _, ()>(self.keyspace.segment_index(None), key.as_str())
-            .map_err(|error| metadata_error("redis srem segment index", error))?;
-        connection
-            .srem::<_, _, ()>(self.keyspace.segment_index(Some(owner)), key)
-            .map_err(|error| metadata_error("redis srem owner segment index", error))
+        self.query_idempotent_write("redis unpublish segment", |connection| {
+            connection.del::<_, ()>(&key)?;
+            connection.srem::<_, _, ()>(self.keyspace.segment_index(None), key.as_str())?;
+            connection.srem::<_, _, ()>(self.keyspace.segment_index(Some(owner)), key.as_str())?;
+            Ok(())
+        })
     }
 
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
@@ -776,10 +798,14 @@ impl MetadataBackend for RedisMetadataBackend {
         segment: &SegmentName,
         next: SegmentLifecycleState,
     ) -> Result<()> {
-        let mut connection = self.connection()?;
-        let mut state = self.load_segment_state(&mut connection, owner, segment)?;
-        state.announcement.state = next;
-        self.store_segment_state(&mut connection, &state)
+        self.query_idempotent_write("redis update segment state", |connection| {
+            let mut state = self
+                .load_segment_state(connection, owner, segment)
+                .map_err(store_error_to_redis_error)?;
+            state.announcement.state = next;
+            self.store_segment_state(connection, &state)
+                .map_err(store_error_to_redis_error)
+        })
     }
 
     fn reserve_segment(
@@ -840,13 +866,14 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
-        let mut connection = self.connection()?;
         let key = self.keyspace.object(key);
-        let payload: Option<String> = redis::cmd("HGET")
-            .arg(key)
-            .arg("payload")
-            .query(&mut connection)
-            .map_err(|error| metadata_error("redis hget route payload", error))?;
+        let payload: Option<String> =
+            self.query_readonly("redis hget route payload", |connection| {
+                redis::cmd("HGET")
+                    .arg(key.as_str())
+                    .arg("payload")
+                    .query(connection)
+            })?;
         payload
             .map(|payload| serde_json::from_str(&payload).map_err(json_error))
             .transpose()
@@ -949,11 +976,9 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
-        let mut connection = self.connection()?;
         let key = self.keyspace.route_policy(domain);
-        let payload: Option<String> = connection
-            .get(&key)
-            .map_err(|error| metadata_error("redis get route policy", error))?;
+        let payload: Option<String> =
+            self.query_readonly("redis get route policy", |connection| connection.get(&key))?;
         payload
             .map(|payload| serde_json::from_str(&payload).map_err(json_error))
             .transpose()
@@ -964,29 +989,25 @@ impl MetadataBackend for RedisMetadataBackend {
         domain: &RoutePolicyDomain,
         policy: &RoutePolicy,
     ) -> Result<bool> {
-        let mut connection = self.connection()?;
         let key = self.keyspace.route_policy(domain);
         let payload = serde_json::to_string(policy).map_err(json_error)?;
-        connection
-            .set_nx(key, payload)
-            .map_err(|error| metadata_error("redis setnx route policy", error))
+        self.query_idempotent_write("redis setnx route policy", |connection| {
+            connection.set_nx(key.as_str(), payload.as_str())
+        })
     }
 
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
-        let mut connection = self.connection()?;
         let key = self.keyspace.handoff(&handoff.stable_id);
         let payload = serde_json::to_string(handoff).map_err(json_error)?;
-        connection
-            .set::<_, _, ()>(key, payload)
-            .map_err(|error| metadata_error("redis set handoff", error))
+        self.query_idempotent_write("redis set handoff", |connection| {
+            connection.set::<_, _, ()>(key.as_str(), payload.as_str())
+        })
     }
 
     fn get_handoff(&self, stable_id: &ClientStableId) -> Result<Option<HandoffPlan>> {
-        let mut connection = self.connection()?;
         let key = self.keyspace.handoff(stable_id);
-        let payload: Option<String> = connection
-            .get(&key)
-            .map_err(|error| metadata_error("redis get handoff", error))?;
+        let payload: Option<String> =
+            self.query_readonly("redis get handoff", |connection| connection.get(&key))?;
         payload
             .map(|payload| serde_json::from_str(&payload).map_err(json_error))
             .transpose()
@@ -1004,13 +1025,6 @@ fn metadata_error(operation: &str, error: redis::RedisError) -> StoreError {
     StoreError::Metadata(format!("{operation}: {error}"))
 }
 
-fn matches_redis_legacy_auth_mismatch(error: &StoreError) -> bool {
-    let StoreError::Metadata(message) = error else {
-        return false;
-    };
-    is_legacy_redis_auth_arity_error(message)
-}
-
 pub fn is_legacy_redis_auth_arity_error(message: &str) -> bool {
     let detail = message.to_ascii_lowercase();
     detail.contains("wrong number of arguments for 'auth' command")
@@ -1018,15 +1032,49 @@ pub fn is_legacy_redis_auth_arity_error(message: &str) -> bool {
         || detail.contains("wrong number of arguments for auth command")
 }
 
+#[cfg(test)]
 fn should_retry_readonly_redis_error(error: &redis::RedisError) -> bool {
+    should_retry_transient_redis_error(error)
+}
+
+fn should_retry_transient_redis_error(error: &redis::RedisError) -> bool {
     let detail = error.to_string().to_ascii_lowercase();
     error.is_timeout()
         || error.is_connection_dropped()
-        || (error.is_io_error() && detail.contains("interrupted"))
+        || error.is_io_error()
+        || detail.contains("interrupted")
+        || detail.contains("connection refused")
+        || detail.contains("connection reset")
+        || detail.contains("connection aborted")
+        || detail.contains("connection closed")
+        || detail.contains("not connected")
+        || detail.contains("broken pipe")
+        || detail.contains("temporarily unavailable")
+        || detail.contains("timed out")
 }
 
 fn json_error(error: serde_json::Error) -> StoreError {
     StoreError::Metadata(format!("json serialization: {error}"))
+}
+
+fn store_error_to_redis_error(error: StoreError) -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::TypeError,
+        "metadata error",
+        error.to_string(),
+    ))
+}
+
+fn redis_retry_attempts() -> usize {
+    std::env::var(REDIS_RETRY_ATTEMPTS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|attempts| *attempts > 0)
+        .unwrap_or(DEFAULT_REDIS_RETRY_ATTEMPTS)
+}
+
+fn redis_retry_delay() -> Duration {
+    duration_from_env_ms(REDIS_RETRY_DELAY_ENV, DEFAULT_REDIS_RETRY_DELAY)
 }
 
 #[cfg(test)]
@@ -1050,11 +1098,12 @@ mod tests {
     use super::{
         is_legacy_redis_auth_arity_error, legacy_auth_connection_info,
         redacted_route_namespace_source, redis_auth_probe_timeout, redis_connect_timeout,
-        redis_connection_info, redis_io_timeout, resolve_redis_auth,
-        should_retry_readonly_redis_error, MetadataKeyspace, RedisMetadataBackend,
-        RedisMetadataConfig, DEFAULT_REDIS_AUTH_PROBE_TIMEOUT, DEFAULT_REDIS_CONNECT_TIMEOUT,
-        DEFAULT_REDIS_IO_TIMEOUT, REDIS_AUTH_PROBE_TIMEOUT_ENV, REDIS_CONNECT_TIMEOUT_ENV,
-        REDIS_IO_TIMEOUT_ENV,
+        redis_connection_info, redis_io_timeout, redis_retry_attempts, redis_retry_delay,
+        resolve_redis_auth, should_retry_readonly_redis_error, MetadataKeyspace,
+        RedisMetadataBackend, RedisMetadataConfig, DEFAULT_REDIS_AUTH_PROBE_TIMEOUT,
+        DEFAULT_REDIS_CONNECT_TIMEOUT, DEFAULT_REDIS_IO_TIMEOUT, DEFAULT_REDIS_RETRY_ATTEMPTS,
+        DEFAULT_REDIS_RETRY_DELAY, REDIS_AUTH_PROBE_TIMEOUT_ENV, REDIS_CONNECT_TIMEOUT_ENV,
+        REDIS_IO_TIMEOUT_ENV, REDIS_RETRY_ATTEMPTS_ENV, REDIS_RETRY_DELAY_ENV,
     };
 
     struct RedisTestServer {
@@ -1072,7 +1121,10 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").ok()?;
             let port = listener.local_addr().ok()?.port();
             drop(listener);
+            Self::start_on_port(port, password)
+        }
 
+        fn start_on_port(port: u16, password: Option<&str>) -> Option<Self> {
             let dir = std::env::temp_dir().join(format!("mooncake-store-rs-redis-{port}"));
             let _ = std::fs::create_dir_all(&dir);
             let mut command = Command::new("redis-server");
@@ -1446,6 +1498,55 @@ mod tests {
     }
 
     #[test]
+    fn redis_backend_idempotent_write_retries_until_reconnected() {
+        let _guard = env_lock();
+        if Command::new("redis-server")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        std::env::set_var(REDIS_RETRY_ATTEMPTS_ENV, "20");
+        std::env::set_var(REDIS_RETRY_DELAY_ENV, "50");
+
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let port = listener
+            .local_addr()
+            .expect("free redis port should have addr")
+            .port();
+        drop(listener);
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(format!("redis://127.0.0.1:{port}/0"))
+                .keyspace(MetadataKeyspace::new("test/redis-retry")),
+        )
+        .expect("redis backend should initialize before server is reachable");
+
+        let server = std::thread::spawn(move || {
+            sleep(Duration::from_millis(150));
+            RedisTestServer::start_on_port(port, None).expect("delayed redis server should start")
+        });
+
+        let lease = sample_lease(ClientLifecycleState::Active);
+        backend
+            .upsert_client_lease(&lease)
+            .expect("lease upsert should reconnect and retry");
+        let _server = server.join().expect("redis server thread should join");
+        assert_eq!(
+            backend
+                .list_live_clients()
+                .expect("live clients should list after reconnect"),
+            vec![lease]
+        );
+
+        std::env::remove_var(REDIS_RETRY_ATTEMPTS_ENV);
+        std::env::remove_var(REDIS_RETRY_DELAY_ENV);
+    }
+
+    #[test]
     fn redis_backend_cleanup_stale_segments_removes_dead_owner_metadata() {
         let Some(server) = RedisTestServer::start() else {
             return;
@@ -1590,17 +1691,25 @@ mod tests {
         std::env::set_var(REDIS_CONNECT_TIMEOUT_ENV, "7000");
         std::env::set_var(REDIS_IO_TIMEOUT_ENV, "11000");
         std::env::set_var(REDIS_AUTH_PROBE_TIMEOUT_ENV, "900");
+        std::env::set_var(REDIS_RETRY_ATTEMPTS_ENV, "9");
+        std::env::set_var(REDIS_RETRY_DELAY_ENV, "80");
 
         assert_eq!(redis_connect_timeout(), Duration::from_secs(7));
         assert_eq!(redis_io_timeout(), Duration::from_secs(11));
         assert_eq!(redis_auth_probe_timeout(), Duration::from_millis(900));
+        assert_eq!(redis_retry_attempts(), 9);
+        assert_eq!(redis_retry_delay(), Duration::from_millis(80));
 
         std::env::remove_var(REDIS_CONNECT_TIMEOUT_ENV);
         std::env::remove_var(REDIS_IO_TIMEOUT_ENV);
         std::env::remove_var(REDIS_AUTH_PROBE_TIMEOUT_ENV);
+        std::env::remove_var(REDIS_RETRY_ATTEMPTS_ENV);
+        std::env::remove_var(REDIS_RETRY_DELAY_ENV);
         assert_eq!(redis_connect_timeout(), DEFAULT_REDIS_CONNECT_TIMEOUT);
         assert_eq!(redis_io_timeout(), DEFAULT_REDIS_IO_TIMEOUT);
         assert_eq!(redis_auth_probe_timeout(), DEFAULT_REDIS_AUTH_PROBE_TIMEOUT);
+        assert_eq!(redis_retry_attempts(), DEFAULT_REDIS_RETRY_ATTEMPTS);
+        assert_eq!(redis_retry_delay(), DEFAULT_REDIS_RETRY_DELAY);
     }
 
     #[test]

@@ -374,6 +374,8 @@ The current repository uses these environment variables.
 | `MC_REDIS_PASSWORD` | Redis metadata backends and transport Redis plugins | optional Redis password; enables auth when set |
 | `MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS` | Redis metadata backend | connection timeout for sync Redis metadata calls |
 | `MC_STORE_RS_REDIS_IO_TIMEOUT_MS` | Redis metadata backend | read/write timeout for sync Redis metadata calls |
+| `MC_STORE_RS_REDIS_RETRY_ATTEMPTS` | Redis metadata backend | retry count for transient Redis reconnect / IO failures on readonly and idempotent metadata operations |
+| `MC_STORE_RS_REDIS_RETRY_DELAY_MS` | Redis metadata backend | delay between transient Redis retry attempts |
 | `MC_STORE_RS_VALUE_SIZE` | Rust e2e | payload size for validation and benchmark loops |
 | `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |
