@@ -72,6 +72,37 @@ Dummy mode is intentionally narrower than real mode. It exists to preserve compa
 
 The standalone server behind dummy mode still uses the same Rust runtime internally, so route publication, reclaim, eviction, tracing, and metrics stay aligned with the real path.
 
+## Local Hot Cache
+
+The Python compatibility layer can enable a daemon-local hot read cache for both real-mode clients and standalone dummy daemons.
+
+In real mode:
+
+- the first remote read populates the local cache
+- later reads from the same runtime can reuse the cached bytes without another remote transfer
+- successful writes or deletes issued by that same runtime invalidate the matching local cache entry
+
+In dummy mode:
+
+- start the standalone daemon with `MC_STORE_LOCAL_HOT_CACHE_USE_SHM=1`
+- each dummy client maps the daemon hot-cache shm region on connect
+- a dummy read first asks the daemon for a hot-cache handle and falls back to the regular dummy RPC path on miss
+
+Configuration uses the upstream environment variable names:
+
+```bash
+export MC_STORE_LOCAL_HOT_CACHE_SIZE=$((256 * 1024 * 1024))
+export MC_STORE_LOCAL_HOT_BLOCK_SIZE=$((4 * 1024 * 1024))
+export MC_STORE_LOCAL_HOT_CACHE_USE_SHM=1   # only needed when dummy clients should share hits
+```
+
+Design boundary:
+
+- the cache is a local read accelerator only
+- it is not written into Redis or etcd
+- it does not change route ownership, replica ownership, or placement policy
+- values larger than the configured block size bypass the cache
+
 ## Build From a Checkout
 
 ```bash
@@ -280,6 +311,26 @@ This script:
 - validates real routed write/read across separate real clients
 
 For path-specific manual checks, keep using the paired helper scripts below.
+
+## Local Hot-Cache Validation
+
+Run the dedicated local hot-cache e2e:
+
+```bash
+./scripts/e2e/run-local-hot-cache-e2e.sh
+```
+
+This script validates two phases:
+
+- Phase A: a real-mode reader reuses daemon-local cached bytes after the origin key is removed remotely
+- Phase B: two dummy clients attached to one standalone daemon reuse a shm-backed hot-cache hit
+
+Useful inputs:
+
+- `MC_STORE_RS_REFRESH_WHEEL=0` to reuse the current `.venv-wheel`
+- `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_REDIS_PORT` to pin the temporary Redis port
+- `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_STORAGE_BYTES` and `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_SCRATCH_BYTES` to size the local runtime
+- `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_CACHE_BYTES` and `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_BLOCK_BYTES` to tune the cache under test
 
 ## Real-Mode Validation Script
 

@@ -123,6 +123,7 @@ The `/metrics` surface is now split by metric family instead of one flat operati
 - Mooncake-style `MooncakeDistributedStore`
 - `MooncakeHostMemAllocator` for registered buffer ownership
 - dummy and real HiCache-compatible execution paths
+- daemon-local hot read cache for the Python compatibility runtime, with optional shm-backed payload sharing for dummy clients attached to the same standalone daemon
 - wheel packaging with bundled native runtime libraries
 - wheel-installed `mooncake-store-client` console command
 - wheel-installed `mooncake-store-admin` maintenance command
@@ -231,6 +232,20 @@ This script verifies both layers:
 
 - PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
 - Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
+
+### Run the local hot-cache validation
+
+```bash
+./scripts/e2e/run-local-hot-cache-e2e.sh
+```
+
+This script verifies:
+
+- a real-mode reader reuses daemon-local cached bytes after the origin key is removed remotely
+- two dummy clients attached to one standalone daemon reuse a shm-backed hot-cache hit
+- local Redis, wheel runtime, and standalone daemon startup are wired automatically for the check
+
+For script knobs and cache tuning, read `docs/deployment.md` and `docs/configuration.md`.
 
 ### Clean stale Redis segment metadata
 

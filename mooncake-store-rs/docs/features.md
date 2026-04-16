@@ -48,6 +48,27 @@ Main capabilities:
 - `batch_get_into_multi_buffers`
 - HiCache-compatible dummy and real paths for the Python layer
 
+## Python Read Acceleration
+
+### Daemon-local hot cache
+
+The Python compatibility runtime can keep recently fetched remote values in a daemon-local hot cache.
+
+What it provides:
+
+- populate on successful read paths such as `get`, `get_into`, `batch_get`, `batch_get_into`, and multi-buffer reads
+- serve repeated reads from local memory without repeating the remote transfer
+- invalidate local entries after successful writes or deletes for the same key on that daemon
+- optional shm-backed payload storage so multiple dummy clients attached to the same standalone daemon can reuse the cached bytes
+- bounded LRU eviction with pin protection while dummy readers hold an acquired handle
+
+Design boundary:
+
+- the cache is a local read accelerator only
+- it does not publish route state, replica state, or metadata
+- a miss falls back to the normal remote read path
+- values larger than the configured cache block size bypass the cache
+
 ## Routing
 
 ### Embedded weighted rendezvous routing
