@@ -434,9 +434,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
-    if (global_segment_size == 0) {
-        LOG(INFO) << "Global segment size is 0, skip mounting segment";
-    } else if (protocol == "cxl") {
+    if (protocol == "cxl") {
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
         if (env) {
@@ -458,6 +456,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
+    } else if (global_segment_size == 0) {
+        LOG(INFO) << "Global segment size is 0, skip mounting segment";
     } else {
         // Only RDMA/EFA needs splitting due to ibv_reg_mr() hardware limits.
         // Other transports mount as a single segment to avoid unnecessary
