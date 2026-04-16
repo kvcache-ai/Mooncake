@@ -330,6 +330,20 @@ ascend_transport
 heterogeneous_ascend
 :::
 
+## Accelerator and Specialized Transports
+
+:::{toctree}
+:maxdepth: 1
+
+nvlink_transport
+nvlink_intra_transport
+hip_transport
+cxl_transport
+barex_transport
+mlu_transport
+maca_transport
+:::
+
 ## Benchmark and Tuning Guide
 
 :::{toctree}
