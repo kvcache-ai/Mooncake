@@ -107,12 +107,12 @@ impl NamespaceQuota {
     }
 
     pub fn max_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_bytes = Some(max_bytes);
+        self.max_bytes = Some(max_bytes.max(1));
         self
     }
 
     pub fn max_objects(mut self, max_objects: usize) -> Self {
-        self.max_objects = Some(max_objects);
+        self.max_objects = Some(max_objects.max(1));
         self
     }
 }

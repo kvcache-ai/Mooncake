@@ -91,7 +91,7 @@ impl StoreClient {
             self.flush_due_reclaims()?;
             let reserve_tracker =
                 OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
-            let reserve_result = self.reserve_replica_targets(tenant, key, value.len(), &policy);
+            let reserve_result = self.reserve_replica_targets(&object_ref, value.len(), &policy);
             reserve_tracker.finish(&reserve_result, 0);
             let (targets, reservations) = reserve_result?;
             let write_tracker =
@@ -176,88 +176,18 @@ impl StoreClient {
             cas_tracker.finish(&cas_result, 0);
             let cas = cas_result?;
             if !cas.applied {
-        let reserve_tracker =
-            OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
-        let reserve_result = self.reserve_replica_targets(&object_ref, value.len(), &policy);
-        reserve_tracker.finish(&reserve_result, 0);
-        let (targets, reservations) = reserve_result?;
-        let write_tracker =
-            OperationTracker::new("put_stage_write").input_bytes(value.len() as u64);
-        let write_result = self.write_reserved_replicas(&targets, &reservations, value);
-        write_tracker.finish(&write_result, value.len() as u64);
-        let offsets = match write_result {
-            Ok(offsets) => offsets,
-            Err(error) => {
                 let _ = self.release_reserved_allocations(&targets, &reservations);
                 return Err(StoreError::Conflict(format!(
                     "route update lost race for tenant={tenant} key={key}"
                 )));
             }
+            route.qos_tier = Some(qos_tier.to_string());
             self.storage_owner.track_route(&route);
             self.track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
             if let Some(previous) = current {
                 self.reclaim_route(previous, reclaim_mode)?;
             }
             return Ok(route);
-        };
-        let expected_version = current.map(|route| route.version);
-        let next_version = current
-            .map(|route| route.version.next())
-            .unwrap_or(RouteVersion(1));
-        let checksum = payload_checksum(value);
-        let mut route = ObjectRoute {
-            key: scoped_key,
-            namespace: None,
-            logical_key: None,
-            canonical_key: None,
-            sharing_scope: None,
-            qos_tier: None,
-            version: next_version,
-            state: RouteState::Active,
-            compatibility: self.lease.compatibility.clone(),
-            replicas: targets
-                .iter()
-                .zip(offsets.iter())
-                .enumerate()
-                .map(|(priority, (target, offset))| ReplicaRoute {
-                    owner: target.storage_runtime.clone(),
-                    segment_name: target.segment_name.clone(),
-                    offset: *offset,
-                    segment_offset: reservations[priority].offset_bytes,
-                    length: value.len() as u64,
-                    checksum: Some(checksum),
-                    tier: ReplicaTier::Dram,
-                    priority: priority as u16,
-                })
-                .collect(),
-        };
-        mooncake_store_core::apply_route_identity(&mut route, &object_id);
-        route.qos_tier = Some(qos_tier.to_string());
-        let cas_tracker = OperationTracker::new("put_stage_route_cas");
-        let publish_started = Instant::now();
-        let cas_result = self.route_directory.compare_and_swap_object_route(
-            &self.lease,
-            &route.key,
-            expected_version,
-            Some(&route),
-        );
-        registry::record_replication_publish(
-            match &cas_result {
-                Ok(cas) if cas.applied => "ok",
-                Ok(_) => "conflict",
-                Err(StoreError::Conflict(_)) => "conflict",
-                Err(_) => "error",
-            },
-            publish_started.elapsed(),
-        );
-        cas_tracker.finish(&cas_result, 0);
-        let cas = cas_result?;
-        if !cas.applied {
-            let _ = self.release_reserved_allocations(&targets, &reservations);
-            return Err(StoreError::Conflict(format!(
-                "route update lost race for tenant={tenant} key={key}"
-            )));
->>>>>>> 215c90f ([Store-RS] centralize namespace identity routing)
         }
     }
 
@@ -1474,31 +1404,6 @@ impl StoreClient {
 
         let mut remote_batch_chunks = 0usize;
         let mut remote_direct_fallbacks = 0usize;
-        while cursor < remote_indices.len() {
-            match self.plan_remote_get_chunk(&remote_indices, &lengths, cursor)? {
-                Some((next, scratch)) => {
-                    match self.execute_remote_batch_get_chunk(
-                        transport,
-                        resolved,
-                        buffers,
-                        &remote_indices[cursor..next],
-                        &scratch,
-                        request_deadline,
-                    ) {
-                        Ok(()) => {
-                            remote_batch_chunks += 1;
-                        }
-                        Err(_) => {
-                            for index in &remote_indices[cursor..next] {
-                                let buffer = &mut *buffers[*index];
-                                self.read_single_object_with_failover(
-                                    transport,
-                                    &mut resolved[*index],
-                                    buffer,
-                                    request_deadline,
-                                    "remote_batch_get_fallback",
-                                )?;
-                                remote_direct_fallbacks += 1;
         let fairness_slices = self.fairness_slice_remote_indices(resolved, &remote_indices);
         let fairness_rounds = fairness_slices.len();
         let shaping_chunk_limit = self.remote_batch_chunk_limit(
@@ -1522,6 +1427,7 @@ impl StoreClient {
                             buffers,
                             &planning_window[..next],
                             &scratch,
+                            request_deadline,
                         ) {
                             Ok(()) => {
                                 remote_batch_chunks += 1;
@@ -1533,6 +1439,7 @@ impl StoreClient {
                                         transport,
                                         &mut resolved[*index],
                                         buffer,
+                                        request_deadline,
                                         "remote_batch_get_fallback",
                                     )?;
                                     remote_direct_fallbacks += 1;
@@ -1548,25 +1455,12 @@ impl StoreClient {
                             transport,
                             &mut resolved[index],
                             buffer,
+                            request_deadline,
                             "remote_direct_get_fallback",
                         )?;
                         remote_direct_fallbacks += 1;
                         cursor += 1;
                     }
-                    cursor = next;
-                }
-                None => {
-                    let index = remote_indices[cursor];
-                    let buffer = &mut *buffers[index];
-                    self.read_single_object_with_failover(
-                        transport,
-                        &mut resolved[index],
-                        buffer,
-                        request_deadline,
-                        "remote_direct_get_fallback",
-                    )?;
-                    remote_direct_fallbacks += 1;
-                    cursor += 1;
                 }
             }
         }

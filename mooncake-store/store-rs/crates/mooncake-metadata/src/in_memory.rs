@@ -219,13 +219,15 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
-        Ok(self
+        let mut policies = self
             .state
             .read()
             .route_policies
             .iter()
             .map(|(domain, policy)| (domain.clone(), policy.clone()))
-            .collect())
+            .collect::<Vec<_>>();
+        policies.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(policies)
     }
 
     fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>> {
@@ -233,13 +235,15 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
-        Ok(self
+        let mut policies = self
             .state
             .read()
             .tenant_policies
             .values()
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        policies.sort_by(|left, right| left.scope.cmp(&right.scope));
+        Ok(policies)
     }
 
     fn put_tenant_policy(

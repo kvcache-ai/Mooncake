@@ -1537,10 +1537,9 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
-        snapshot_metrics, LocalMemoryConfig, MooncakeCompatibilityFacade, RouteControlMode,
-        StoreClient, StoreClientBuilder, StoreTransport,
-        snapshot_metrics, LocalMemoryConfig, PlacementPlanner, StoreClient, StoreClientBuilder,
-        StoreTransport,
+        snapshot_metrics, snapshot_metrics, LocalMemoryConfig, LocalMemoryConfig,
+        MooncakeCompatibilityFacade, PlacementPlanner, RouteControlMode, StoreClient, StoreClient,
+        StoreClientBuilder, StoreClientBuilder, StoreTransport, StoreTransport,
     };
     use mooncake_store_core::{
         CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
@@ -1605,7 +1604,6 @@ mod tests {
                 })),
             }
         }
-
     }
 
     impl StoreTransport for TestTransport {
@@ -3061,7 +3059,9 @@ mod tests {
             Ok(_) => {}
             Err(error) => {
                 assert!(
-                    error.to_string().contains("not enough writable placement targets"),
+                    error
+                        .to_string()
+                        .contains("not enough writable placement targets"),
                     "unexpected shrink result: {error:?}"
                 );
             }

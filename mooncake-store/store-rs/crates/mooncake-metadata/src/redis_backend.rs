@@ -734,16 +734,6 @@ impl MetadataBackend for RedisMetadataBackend {
             connection
                 .sadd::<_, _, ()>(&index, keys.clone())
                 .map_err(|error| metadata_error("redis sadd legacy client index", error))?;
-        let mut keys: Vec<String> = connection
-            .smembers(&index)
-            .map_err(|error| metadata_error("redis smembers client index", error))?;
-        if keys.is_empty() {
-            keys = scan_keys(&mut connection, &self.keyspace.client_pattern())?;
-            if !keys.is_empty() {
-                connection
-                    .sadd::<_, _, ()>(&index, keys.clone())
-                    .map_err(|error| metadata_error("redis sadd legacy client index", error))?;
-            }
         }
         let entries = self.query_readonly("redis fetch client leases", |connection| {
             let mut entries = Vec::with_capacity(keys.len());
@@ -829,12 +819,6 @@ impl MetadataBackend for RedisMetadataBackend {
             }
             Ok(entries)
         })?;
-        let mut keys: Vec<String> = connection
-            .smembers(&index)
-            .map_err(|error| metadata_error("redis smembers segment index", error))?;
-        if keys.is_empty() {
-            keys = scan_keys(&mut connection, &self.keyspace.segment_pattern(owner))?;
-        }
         let mut stale = Vec::new();
         let mut segments = Vec::with_capacity(entries.len());
         for (key, payload) in entries {
@@ -966,12 +950,6 @@ impl MetadataBackend for RedisMetadataBackend {
                 Ok((entries, backfill_index))
             })?;
 
-        let mut keys: Vec<String> = connection
-            .smembers(&index)
-            .map_err(|error| metadata_error("redis smembers object index", error))?;
-        if keys.is_empty() {
-            keys = scan_keys(&mut connection, &self.keyspace.object_pattern())?;
-        }
         let mut stale = Vec::new();
         let mut live_keys = Vec::new();
         let mut routes = Vec::with_capacity(entries.len());
@@ -1161,7 +1139,10 @@ impl MetadataBackend for RedisMetadataBackend {
         let current = if result.1.is_empty() {
             None
         } else {
-            Some(serde_json::from_str::<TenantPolicy>(&result.1).map_err(json_error)?)
+            Some(parse_tenant_policy_cas_payload(
+                &result.1,
+                "redis cas tenant policy",
+            )?)
         };
         match (expected_version, current.as_ref()) {
             (None, Some(_)) => Err(StoreError::Conflict(format!(
@@ -1206,7 +1187,10 @@ impl MetadataBackend for RedisMetadataBackend {
         let current = if result.1.is_empty() {
             None
         } else {
-            Some(serde_json::from_str::<TenantPolicy>(&result.1).map_err(json_error)?)
+            Some(parse_tenant_policy_cas_payload(
+                &result.1,
+                "redis delete tenant policy",
+            )?)
         };
         match (expected_version, current.as_ref()) {
             (None, None) => Ok(false),
@@ -1304,6 +1288,14 @@ fn redis_retry_attempts() -> usize {
 
 fn redis_retry_delay() -> Duration {
     duration_from_env_ms(REDIS_RETRY_DELAY_ENV, DEFAULT_REDIS_RETRY_DELAY)
+}
+
+fn parse_tenant_policy_cas_payload(payload: &str, operation: &str) -> Result<TenantPolicy> {
+    serde_json::from_str::<TenantPolicy>(payload).map_err(|error| {
+        StoreError::Metadata(format!(
+            "{operation}: corrupted tenant policy payload returned from redis CAS: {error}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1675,11 +1667,6 @@ mod tests {
             return;
         };
         let keyspace = MetadataKeyspace::new("test/redis-object-index");
-    fn redis_backend_route_policy_supports_overwrite_list_and_delete() {
-        let Some(server) = RedisTestServer::start() else {
-            return;
-        };
-        let keyspace = MetadataKeyspace::new("test/redis-route-policy");
         let backend = RedisMetadataBackend::new(
             RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
         )
@@ -1724,18 +1711,15 @@ mod tests {
     }
 
     #[test]
-    fn readonly_metadata_retry_classifier_accepts_transient_io() {
-        let interrupted =
-            redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::Interrupted));
-        let timed_out = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
-        let dropped = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-        let refused =
-            redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
-
-        assert!(should_retry_readonly_redis_error(&interrupted));
-        assert!(should_retry_readonly_redis_error(&timed_out));
-        assert!(should_retry_readonly_redis_error(&dropped));
-        assert!(!should_retry_readonly_redis_error(&refused));
+    fn redis_backend_route_policy_supports_overwrite_list_and_delete() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-route-policy");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
         let creator = ClientRuntimeId::new("route-owner", ClientEpoch(7));
         let default_policy = RoutePolicy {
             route_topk: 2,
@@ -1825,6 +1809,21 @@ mod tests {
 
         std::env::remove_var(REDIS_RETRY_ATTEMPTS_ENV);
         std::env::remove_var(REDIS_RETRY_DELAY_ENV);
+    }
+
+    #[test]
+    fn readonly_metadata_retry_classifier_accepts_transient_io() {
+        let interrupted =
+            redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        let timed_out = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let dropped = redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        let refused =
+            redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+
+        assert!(should_retry_readonly_redis_error(&interrupted));
+        assert!(should_retry_readonly_redis_error(&timed_out));
+        assert!(should_retry_readonly_redis_error(&dropped));
+        assert!(!should_retry_readonly_redis_error(&refused));
     }
 
     #[test]

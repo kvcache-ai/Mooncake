@@ -3,9 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
     http_transport_label, ClassicTeTransportFactory, HttpStoreTransportFactory,
-    HttpTransportServerHandle, LocalMemoryConfig, MooncakeCompatibilityFacade,
-    PlacementPlanner, RouteControlMode, StoreClient, StoreClientBuilder, StoreTransportFactory,
-    TentTransportFactory,
+    HttpTransportServerHandle, LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner,
+    RouteControlMode, StoreClient, StoreClientBuilder, StoreTransportFactory, TentTransportFactory,
 };
 use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
 
@@ -21,6 +20,7 @@ pub struct CompatRuntime {
     pub segment_name: String,
     pub expires_at_ms: u64,
     pub lease_ttl_ms: u64,
+    // Keep the embedded HTTP transport server alive for the runtime lifetime.
     _http_transport_server: Option<HttpTransportServerHandle>,
 }
 
@@ -105,7 +105,11 @@ impl CompatRuntimeArgs {
         let client = builder.build(expires_at_ms)?;
         if let Some(server) = http_transport_server.as_ref() {
             client.register_local_memory()?;
-            server.publish_segment(&segment_name, client.local_memory_base_addr()?, plan.storage_bytes);
+            server.publish_segment(
+                &segment_name,
+                client.local_memory_base_addr()?,
+                plan.storage_bytes,
+            );
         }
 
         Ok(CompatRuntime {

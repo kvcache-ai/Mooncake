@@ -93,6 +93,21 @@ mod tests {
     };
 
     #[test]
+    fn transfer_batch_hints_serde_round_trip_preserves_fields() {
+        let hints = TransferBatchHints {
+            pacing_group: Some("tenant:default".to_string()),
+            mode: TransferPacingMode::ThroughputOptimized,
+            max_inflight_bytes: Some(8192),
+        };
+
+        let encoded = serde_json::to_string(&hints).expect("hints should serialize");
+        let decoded: TransferBatchHints =
+            serde_json::from_str(&encoded).expect("hints should deserialize");
+        assert_eq!(decoded, hints);
+        assert!(encoded.contains("ThroughputOptimized"));
+    }
+
+    #[test]
     fn transport_public_types_are_constructible() {
         let request = TransferRequest {
             opcode: Opcode::Write,

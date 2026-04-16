@@ -12,9 +12,8 @@ use mooncake_store_core::{
     ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
     NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
-    TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
-    TenantQuotaPolicy, TenantRoutePolicy,
+    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantPlacementPolicy,
+    TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy, TenantRoutePolicy,
 };
 use mooncake_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferBatchHints, TransferPacingMode,
@@ -7327,7 +7326,9 @@ fn runtime_uses_metadata_authored_fairness_shaping_and_placement_defaults() {
         .resolve_replication_policy(None)
         .expect("default replication policy should resolve");
     assert_eq!(resolved.replica_count, 2);
-    assert!(resolved.preferred_segments.contains(&SegmentName::new("seg-a")));
+    assert!(resolved
+        .preferred_segments
+        .contains(&SegmentName::new("seg-a")));
     assert_eq!(resolved.preferred_storage_runtimes, vec![owner_a]);
     assert!(resolved.prefer_local);
 }

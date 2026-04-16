@@ -195,13 +195,17 @@ fn decode_key_component_checked(value: &str) -> Option<Cow<'_, str>> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
             let hex = &value[index + 1..index + 3];
             if let Ok(byte) = u8::from_str_radix(hex, 16) {
                 decoded.push(byte);
                 index += 3;
                 continue;
             }
+            return None;
         }
         decoded.push(bytes[index]);
         index += 1;
@@ -290,6 +294,16 @@ mod tests {
     }
 
     #[test]
+    fn route_policy_domain_parser_rejects_keys_from_different_namespace() {
+        let keyspace_a = MetadataKeyspace::new("namespace-a");
+        let keyspace_b = MetadataKeyspace::new("namespace-b");
+        let key_from_a =
+            keyspace_a.route_policy(&RoutePolicyDomain::Tenant("tenant/x".to_string()));
+
+        assert_eq!(parse_route_policy_domain(&keyspace_b, &key_from_a), None);
+    }
+
+    #[test]
     fn keyspace_prefix_helpers_cover_route_and_tenant_policy_namespaces() {
         let keyspace = MetadataKeyspace::new("tenant-a");
         assert_eq!(
@@ -316,9 +330,43 @@ mod tests {
     }
 
     #[test]
-    fn tenant_policy_scope_parser_rejects_invalid_utf8_percent_sequences() {
+    fn tenant_policy_scope_parser_rejects_invalid_utf8_after_decoding() {
         let keyspace = MetadataKeyspace::new("tenant-a");
         let key = "tenant-a/system/tenant-policy/tenants/%FF";
         assert_eq!(parse_tenant_policy_scope(&keyspace, key), None);
+    }
+
+    #[test]
+    fn tenant_policy_scope_parser_rejects_incomplete_percent_encoding() {
+        let keyspace = MetadataKeyspace::new("tenant-a");
+        assert_eq!(
+            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%"),
+            None
+        );
+        assert_eq!(
+            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%A"),
+            None
+        );
+        assert_eq!(
+            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%1"),
+            None
+        );
+    }
+
+    #[test]
+    fn tenant_policy_scope_parser_rejects_invalid_hex_chars() {
+        let keyspace = MetadataKeyspace::new("tenant-a");
+        assert_eq!(
+            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%GG"),
+            None
+        );
+        assert_eq!(
+            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%ZZ"),
+            None
+        );
+        assert_eq!(
+            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%1G"),
+            None
+        );
     }
 }
