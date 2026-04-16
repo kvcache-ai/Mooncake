@@ -52,11 +52,7 @@ struct FaultPolicy {
 class FaultProxyTransport : public Transport {
    public:
     FaultProxyTransport(std::shared_ptr<Transport> real, FaultPolicy policy)
-        : real_(std::move(real)),
-          policy_(policy),
-          submit_count_(0),
-          rng_(std::random_device{}()),
-          dist_(0.0, 1.0) {}
+        : real_(std::move(real)), policy_(policy), submit_count_(0) {}
 
     // -- Lifecycle -----------------------------------------------------------
 
@@ -100,25 +96,22 @@ class FaultProxyTransport : public Transport {
                 std::chrono::microseconds(policy_.submit_delay_us));
         }
 
-        // Deterministic count-based failure
-        if (policy_.fail_after_n_submits >= 0) {
-            int count = submit_count_.fetch_add(1, std::memory_order_relaxed);
-            if (count >= policy_.fail_after_n_submits) {
-                return Status::InternalError(
-                    "fault injected: submit failure (count)" LOC_MARK);
-            }
-            return real_->submitTransferTasks(batch, request_list);
+        int count = submit_count_.fetch_add(1, std::memory_order_relaxed);
+
+        // Deterministic count-based failure (takes precedence over rate-based)
+        if (policy_.fail_after_n_submits >= 0 &&
+            count >= policy_.fail_after_n_submits) {
+            return Status::InternalError(
+                "fault injected: submit failure (count)" LOC_MARK);
         }
 
         // Rate-based probabilistic failure
         if (policy_.submit_fail_rate > 0.0 &&
-            dist_(rng_) < policy_.submit_fail_rate) {
-            submit_count_.fetch_add(1, std::memory_order_relaxed);
+            randomDouble() < policy_.submit_fail_rate) {
             return Status::InternalError(
                 "fault injected: submit failure (rate)" LOC_MARK);
         }
 
-        submit_count_.fetch_add(1, std::memory_order_relaxed);
         return real_->submitTransferTasks(batch, request_list);
     }
 
@@ -130,7 +123,7 @@ class FaultProxyTransport : public Transport {
         // Status corruption: flip COMPLETED → FAILED
         if (status.s == TransferStatusEnum::COMPLETED &&
             policy_.status_corrupt_rate > 0.0 &&
-            dist_(rng_) < policy_.status_corrupt_rate) {
+            randomDouble() < policy_.status_corrupt_rate) {
             status.s = TransferStatusEnum::FAILED;
         }
         return s;
@@ -168,6 +161,8 @@ class FaultProxyTransport : public Transport {
     const char* getName() const override { return "<fault-proxy>"; }
 
     // -- Test helpers --------------------------------------------------------
+    // Note: resetPolicy() is intended for single-threaded test scenarios.
+    // It is NOT safe to call concurrently with submitTransferTasks().
 
     void resetPolicy(FaultPolicy new_policy) {
         policy_ = new_policy;
@@ -179,11 +174,16 @@ class FaultProxyTransport : public Transport {
     }
 
    private:
+    // Thread-safe random double in [0.0, 1.0).
+    static double randomDouble() {
+        thread_local std::mt19937 rng(std::random_device{}());
+        thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+        return dist(rng);
+    }
+
     std::shared_ptr<Transport> real_;
     FaultPolicy policy_;
     std::atomic<int> submit_count_;
-    std::mt19937 rng_;
-    std::uniform_real_distribution<double> dist_;
 };
 
 }  // namespace tent
