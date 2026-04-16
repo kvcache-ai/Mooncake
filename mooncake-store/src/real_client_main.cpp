@@ -113,7 +113,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
+    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, "127.0.0.1");
     RegisterClientRpcService(server, *client_inst);
 
     LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"
