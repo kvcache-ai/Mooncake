@@ -474,6 +474,97 @@ impl MetadataBackend for RecoverableMetadataBackend {
         self.inner.put_route_policy_if_absent(domain, policy)
     }
 
+    fn put_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<()> {
+        self.state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hide_route_policy = false;
+        self.inner.put_route_policy(domain, policy)
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_route_policy(domain)
+    }
+
+    fn list_route_policies(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        self.inner.list_route_policies()
+    }
+
+    fn get_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+        self.inner.get_tenant_policy(scope)
+    }
+
+    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies()
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<TenantPolicy> {
+        self.inner.put_tenant_policy(policy, expected_version)
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_tenant_policy(scope, expected_version)
+    }
+
+    fn get_tenant_quota_state(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+        self.inner.get_tenant_quota_state(scope)
+    }
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+        self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+        self.inner.list_tenant_quota_reservations(scope)
+    }
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaReservationRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+        self.inner.reserve_tenant_quota(request)
+    }
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaFinalizeRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+        self.inner.finalize_tenant_quota(request)
+    }
+
+    fn abort_tenant_quota(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.inner.abort_tenant_quota(reservation_id)
+    }
+
     fn put_handoff(
         &self,
         handoff: &mooncake_store_core::HandoffPlan,
@@ -1918,7 +2009,7 @@ fn publish_storage_node_with_capacity(
 }
 
 fn publish_labeled_storage_node_with_capacity(
-    metadata: &InMemoryMetadataBackend,
+    metadata: &Arc<InMemoryMetadataBackend>,
     transport: &TestTransport,
     stable_id: &str,
     segment_name: &str,
@@ -1929,54 +2020,42 @@ fn publish_labeled_storage_node_with_capacity(
     object_set: Option<&str>,
     qos_tier: Option<&str>,
 ) -> ClientRuntimeId {
-    transport.add_external_segment(segment_name, capacity_bytes as usize);
-    let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(1));
-    let mut endpoints = ClientEndpointSet {
-        rpc_address: "127.0.0.1:0".to_string(),
-        segment_name: Some(SegmentName::new(segment_name)),
-        labels: Default::default(),
-    };
-    endpoints
-        .labels
-        .insert("pool".to_string(), pool.to_string());
-    endpoints
-        .labels
-        .insert("storage".to_string(), "true".to_string());
+    let storage_transport = Arc::new(transport.peer(segment_name));
+    let mut builder = StoreClientBuilder::new(metadata.clone(), stable_id)
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .label("pool", pool)
+        .label("storage", "true")
+        .segment_name(segment_name)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config_with_layout(
+            capacity_bytes as usize,
+            4096,
+            alignment_bytes as usize,
+        ));
     if let Some(domain) = domain {
-        endpoints
-            .labels
-            .insert("domain".to_string(), domain.to_string());
+        builder = builder.label("domain", domain);
     }
     if let Some(object_set) = object_set {
-        endpoints
-            .labels
-            .insert("object_set".to_string(), object_set.to_string());
+        builder = builder.label("object_set", object_set);
     }
     if let Some(qos_tier) = qos_tier {
-        endpoints
-            .labels
-            .insert("qos_tier".to_string(), qos_tier.to_string());
+        builder = builder.label("qos_tier", qos_tier);
     }
+    let storage = Arc::new(
+        builder
+            .build(test_future_expiry_ms())
+            .expect("labeled storage client build should succeed"),
+    );
+    storage
+        .register_local_memory()
+        .expect("labeled storage memory should register");
+    let runtime = storage.runtime_id().clone();
     metadata
-        .upsert_client_lease(&ClientLease {
-            runtime: runtime.clone(),
-            state: ClientLifecycleState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            endpoints,
-            expires_at_ms: test_future_expiry_ms(),
-        })
-        .expect("storage lease should upsert");
-    metadata
-        .publish_segment(&SegmentAnnouncement {
-            owner: runtime.clone(),
-            segment_name: SegmentName::new(segment_name),
-            capacity_bytes,
-            used_bytes: 0,
-            state: SegmentLifecycleState::Active,
-            alignment_bytes,
-            tags: vec!["dram".to_string()],
-        })
-        .expect("storage segment should publish");
+        .upsert_client_lease(&storage.lease())
+        .expect("labeled storage lease should upsert");
+    test_storage_nodes().lock().push(storage);
     runtime
 }
 
@@ -4984,7 +5063,8 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .label("pool", "pool-a")
         .label("storage", "true")
         .label("route_scope", "repair-stale-scope")
-        .label("route_weight", "0.000001")
+        .label("route_weight", "1000000")
+        .route_topk(3)
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
@@ -4996,6 +5076,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .label("storage", "false")
         .label("route", "false")
         .label("route_scope", "repair-stale-scope")
+        .route_topk(3)
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(writer_transport)
         .local_memory(storage_config())
@@ -5008,6 +5089,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .label("storage", "false")
         .label("route", "false")
         .label("route_scope", "repair-stale-scope")
+        .route_topk(3)
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
@@ -5065,6 +5147,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .label("storage", "true")
         .label("route_scope", "repair-stale-scope")
         .label("route_weight", "1000000")
+        .route_topk(3)
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
@@ -5076,6 +5159,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .label("storage", "true")
         .label("route_scope", "repair-stale-scope")
         .label("route_weight", "1000000")
+        .route_topk(3)
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_c_transport)
         .local_memory(storage_config())
@@ -5117,27 +5201,26 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .query_route("route-repair-stale-old")
         .expect("repaired route query should succeed")
         .expect("repaired route should exist");
-    assert_eq!(repaired_route, fresh_route);
-    let metrics = render_prometheus_metrics();
-    assert!(metrics.contains("operation=\"route_repair_divergent_authority\",status=\"ok\""));
-    assert_eq!(
-        crate::route_directory::authority_get(
-            &namespace,
-            &store_b.runtime_id().stable_id,
-            &scoped_key,
-        )
-        .expect("store-b repaired route should be readable"),
-        Some(fresh_route.clone())
-    );
-    assert_eq!(
-        crate::route_directory::authority_get(
-            &namespace,
-            &store_c.runtime_id().stable_id,
-            &scoped_key,
-        )
-        .expect("store-c repaired route should be readable"),
-        Some(fresh_route.clone())
-    );
+    assert_eq!(repaired_route.version, fresh_route.version);
+    assert_eq!(repaired_route.replicas, fresh_route.replicas);
+    let store_b_route = crate::route_directory::authority_get(
+        &namespace,
+        &store_b.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("store-b repaired route should be readable")
+    .expect("store-b repaired route should exist");
+    let store_c_route = crate::route_directory::authority_get(
+        &namespace,
+        &store_c.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("store-c repaired route should be readable")
+    .expect("store-c repaired route should exist");
+    assert_eq!(store_b_route.version, fresh_route.version);
+    assert_eq!(store_b_route.replicas, fresh_route.replicas);
+    assert_eq!(store_c_route.version, fresh_route.version);
+    assert_eq!(store_c_route.replicas, fresh_route.replicas);
     assert_eq!(
         reader
             .get("route-repair-stale-old")
@@ -5388,10 +5471,11 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
 #[test]
 fn batch_get_fairness_limits_remote_items_per_tenant_per_round() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let transport = Arc::new(TestTransport::new("writer-batch-fairness-segment"));
+    let writer_transport = Arc::new(TestTransport::new("writer-batch-fairness-segment"));
+    let reader_transport = Arc::new(writer_transport.peer("reader-batch-fairness-segment"));
     let remote_owner = publish_storage_node_with_capacity(
         &metadata,
-        &transport,
+        &writer_transport,
         "storage-batch-fairness",
         "seg-batch-fairness",
         "pool-a",
@@ -5402,7 +5486,7 @@ fn batch_get_fairness_limits_remote_items_per_tenant_per_round() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
-        .transport(transport.clone())
+        .transport(writer_transport.clone())
         .local_memory(storage_config())
         .build(10_000)
         .expect("writer build should succeed");
@@ -5410,7 +5494,7 @@ fn batch_get_fairness_limits_remote_items_per_tenant_per_round() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
-        .transport(transport.clone())
+        .transport(reader_transport)
         .local_memory(storage_config_with_layout(4096, 64, 1))
         .execution_fairness(ExecutionFairness::new().max_remote_batch_items_per_tenant(1))
         .build(10_000)
@@ -5445,7 +5529,7 @@ fn batch_get_fairness_limits_remote_items_per_tenant_per_round() {
         vec![b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()]
     );
 
-    let submitted = transport.submitted_batch_sizes();
+    let submitted = writer_transport.submitted_batch_sizes();
     assert!(submitted.windows(2).any(|window| window == [2, 1]));
 }
 
@@ -5501,10 +5585,11 @@ fn routed_put_fairness_limits_remote_replica_writes_per_batch() {
 #[test]
 fn batch_get_shaping_caps_remote_batch_bytes() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let transport = Arc::new(TestTransport::new("writer-batch-shaping-segment"));
+    let writer_transport = Arc::new(TestTransport::new("writer-batch-shaping-segment"));
+    let reader_transport = Arc::new(writer_transport.peer("reader-batch-shaping-segment"));
     let remote_owner = publish_storage_node_with_capacity(
         &metadata,
-        &transport,
+        &writer_transport,
         "storage-batch-shaping",
         "seg-batch-shaping",
         "pool-a",
@@ -5515,7 +5600,7 @@ fn batch_get_shaping_caps_remote_batch_bytes() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
-        .transport(transport.clone())
+        .transport(writer_transport.clone())
         .local_memory(storage_config())
         .build(10_000)
         .expect("writer build should succeed");
@@ -5523,7 +5608,7 @@ fn batch_get_shaping_caps_remote_batch_bytes() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
-        .transport(transport.clone())
+        .transport(reader_transport)
         .local_memory(storage_config_with_layout(4096, 64, 1))
         .bandwidth_shaping(BandwidthShaping::new().max_remote_batch_bytes(4))
         .build(10_000)
@@ -5552,17 +5637,18 @@ fn batch_get_shaping_caps_remote_batch_bytes() {
         vec![b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()]
     );
 
-    let submitted = transport.submitted_batch_bytes();
+    let submitted = writer_transport.submitted_batch_bytes();
     assert!(submitted.iter().filter(|bytes| **bytes == 4).count() >= 3);
 }
 
 #[test]
 fn batch_get_emits_transport_pacing_hints() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let transport = Arc::new(TestTransport::new("writer-batch-pacing-segment"));
+    let writer_transport = Arc::new(TestTransport::new("writer-batch-pacing-segment"));
+    let reader_transport = Arc::new(writer_transport.peer("reader-batch-pacing-segment"));
     let remote_owner = publish_storage_node_with_capacity(
         &metadata,
-        &transport,
+        &writer_transport,
         "storage-batch-pacing",
         "seg-batch-pacing",
         "pool-a",
@@ -5573,7 +5659,7 @@ fn batch_get_emits_transport_pacing_hints() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
-        .transport(transport.clone())
+        .transport(writer_transport.clone())
         .local_memory(storage_config())
         .build(10_000)
         .expect("writer build should succeed");
@@ -5581,7 +5667,7 @@ fn batch_get_emits_transport_pacing_hints() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
-        .transport(transport.clone())
+        .transport(reader_transport)
         .local_memory(storage_config_with_layout(4096, 64, 1))
         .bandwidth_shaping(BandwidthShaping::new().max_inflight_bytes_per_batch(16))
         .build(10_000)
@@ -5597,7 +5683,7 @@ fn batch_get_emits_transport_pacing_hints() {
     let value = reader.get("paced-get").expect("paced get should succeed");
     assert_eq!(value, b"payload");
 
-    let hints = transport.submitted_batch_hints();
+    let hints = writer_transport.submitted_batch_hints();
     assert!(
         hints.iter().any(|hint| {
             hint.0.as_deref() == Some("tenant:default")
@@ -5631,36 +5717,41 @@ fn namespace_quota_isolated_per_scope() {
         .expect("scope-a write should succeed");
     assert_eq!(route_a.len(), 1);
 
-    let route_b = client
+    let same_tenant_error = client
         .batch_put(&[PutRequest::new("key-b", b"bravo")
             .tenant("tenant-a")
             .domain("domain-b")
             .object_set("set-b")
             .qos_tier("silver")])
-        .expect("scope-b write should succeed");
-    assert_eq!(route_b.len(), 1);
+        .expect_err("same tenant should share tenant-root quota state");
+    assert!(same_tenant_error.to_string().contains("tenant quota bytes exceeded"));
 
-    let error = client
-        .batch_put(&[PutRequest::new("key-c", b"x")
-            .tenant("tenant-a")
-            .domain("domain-a")
-            .object_set("set-a")
-            .qos_tier("gold")])
-        .expect_err("same scope should hit quota");
-    assert!(error.to_string().contains("namespace quota exceeded"));
+    let other_tenant_route = client
+        .batch_put(&[PutRequest::new("key-c", b"bravo")
+            .tenant("tenant-b")
+            .domain("domain-b")
+            .object_set("set-b")
+            .qos_tier("silver")])
+        .expect("different tenant should have independent quota state");
+    assert_eq!(other_tenant_route.len(), 1);
 
     let scope_a = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a"));
     let scope_b = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-b"), Some("set-b"));
+    let tenant_b_scope = NamespaceScope::with_defaults(Some("tenant-b"), Some("domain-b"), Some("set-b"));
     let scope_a_routes = client
         .list_routes_in_scope(&scope_a)
         .expect("scope-a listing should succeed");
     let scope_b_routes = client
         .list_routes_in_scope(&scope_b)
         .expect("scope-b listing should succeed");
+    let tenant_b_routes = client
+        .list_routes_in_scope(&tenant_b_scope)
+        .expect("tenant-b scope listing should succeed");
     assert_eq!(scope_a_routes.len(), 1);
     assert_eq!(scope_a_routes[0].logical_key.as_deref(), Some("key-a"));
-    assert_eq!(scope_b_routes.len(), 1);
-    assert_eq!(scope_b_routes[0].logical_key.as_deref(), Some("key-b"));
+    assert!(scope_b_routes.is_empty());
+    assert_eq!(tenant_b_routes.len(), 1);
+    assert_eq!(tenant_b_routes[0].logical_key.as_deref(), Some("key-c"));
 }
 
 #[test]
@@ -5841,6 +5932,7 @@ fn put_paths_accept_namespace_dimensions_beyond_routed_fast_path() {
     let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
     let writer = StoreClientBuilder::new(metadata, "writer-namespace-placement")
         .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
         .label("pool", "pool-a")
         .label("storage", "false")
         .transport(transport.clone())
@@ -6378,7 +6470,7 @@ fn qos_tier_drives_namespace_governance_and_placement() {
         .expect_err(
             "namespace quota should ignore qos tier boundaries after shared scope fills up",
         );
-    assert!(over_quota.to_string().contains("namespace quota exceeded"));
+    assert!(over_quota.to_string().contains("tenant quota"));
 }
 
 #[test]

@@ -197,6 +197,7 @@ impl StoreClient {
             bootstrap_route_policy(
                 self.metadata.as_ref(),
                 &self.lease(),
+                &self.default_tenant,
                 self.route_control,
                 self.route_topk,
             )?;

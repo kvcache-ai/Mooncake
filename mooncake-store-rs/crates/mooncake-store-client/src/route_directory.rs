@@ -466,12 +466,14 @@ impl EmbeddedWrhRouteDirectory {
     ) -> Result<bool> {
         let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
         for (index, authorities) in ranked_authorities.iter().enumerate() {
-            if resolved[index].is_some() {
-                continue;
-            }
             let Some(authority) = authorities.get(rank).cloned() else {
                 continue;
             };
+            if resolved[index].is_some() {
+                if repairs.is_none() || !self.authority_is_local(&authority) {
+                    continue;
+                }
+            }
             groups
                 .entry(authority.runtime.stable_id.0.clone())
                 .or_insert_with(|| (authority, Vec::new()))

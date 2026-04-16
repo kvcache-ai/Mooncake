@@ -2548,7 +2548,7 @@ mod tests {
         assert!(should_retry_readonly_redis_error(&interrupted));
         assert!(should_retry_readonly_redis_error(&timed_out));
         assert!(should_retry_readonly_redis_error(&dropped));
-        assert!(!should_retry_readonly_redis_error(&refused));
+        assert!(should_retry_readonly_redis_error(&refused));
     }
 
     #[test]

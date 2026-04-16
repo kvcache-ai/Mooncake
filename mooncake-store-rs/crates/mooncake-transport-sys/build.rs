@@ -17,7 +17,13 @@ fn main() {
     let python = detect_python();
     let jsoncpp = detect_jsoncpp();
 
-    ensure_upstream_native_artifacts(&upstream_dir, &build_dir);
+    ensure_upstream_native_artifacts(
+        &upstream_dir,
+        &build_dir,
+        &yalantinglibs_prefix,
+        &python,
+        &jsoncpp,
+    );
     build_native_shims(&upstream_dir, &out_dir);
 
     let classic_dir = build_dir.join("mooncake-transfer-engine/src");
