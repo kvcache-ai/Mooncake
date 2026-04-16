@@ -5,7 +5,10 @@ use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
     SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
-    TenantPolicy, TenantPolicyScope,
+    TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
+    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
+    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
+    TenantQuotaState,
 };
 use redis::cmd;
 use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
@@ -233,6 +236,310 @@ end
 
 redis.call('SET', key, payload)
 return {1, payload}
+"#;
+
+const RESERVE_TENANT_QUOTA_SCRIPT: &str = r#"
+local quota_key = KEYS[1]
+local object_key = KEYS[2]
+local reservation_key = KEYS[3]
+local reservation_index_key = KEYS[4]
+
+local reservation_id = ARGV[1]
+local scope_payload = ARGV[2]
+local object_storage_key = ARGV[3]
+local expected_object_version = ARGV[4]
+local delta_bytes = tonumber(ARGV[5])
+local delta_objects = tonumber(ARGV[6])
+local limit_max_bytes = ARGV[7]
+local limit_max_objects = ARGV[8]
+local expires_at_ms = tonumber(ARGV[9])
+local created_at_ms = tonumber(ARGV[10])
+local writer_runtime_payload = ARGV[11]
+
+local function expected_version_or_nil(value)
+    if value == '__none__' then
+        return nil
+    end
+    return tonumber(value)
+end
+
+local function positive(value)
+    if value > 0 then
+        return value
+    end
+    return 0
+end
+
+local existing_reservation_payload = redis.call('GET', reservation_key)
+if existing_reservation_payload then
+    local reservation = cjson.decode(existing_reservation_payload)
+    local existing_expected = reservation['expected_object_version']
+    if reservation['state'] == 'Pending'
+        and reservation['scope']['tenant'] == cjson.decode(scope_payload)['tenant']
+        and reservation['key'] == object_storage_key
+        and existing_expected == expected_version_or_nil(expected_object_version)
+        and tonumber(reservation['delta_bytes']) == delta_bytes
+        and tonumber(reservation['delta_objects']) == delta_objects then
+        local quota_payload = redis.call('GET', quota_key)
+        local object_payload = redis.call('GET', object_key)
+        return {1, quota_payload or '', object_payload or '', existing_reservation_payload}
+    end
+    return {-2, existing_reservation_payload}
+end
+
+local object_payload = redis.call('GET', object_key)
+local object = nil
+if object_payload then
+    object = cjson.decode(object_payload)
+end
+local actual_object_version = nil
+if object then
+    actual_object_version = tonumber(object['version'])
+end
+local expected_object = expected_version_or_nil(expected_object_version)
+if actual_object_version ~= expected_object then
+    return {-3, object_payload or '', '', ''}
+end
+if object and object['scope']['tenant'] ~= cjson.decode(scope_payload)['tenant'] then
+    return {-4, object_payload or '', '', ''}
+end
+
+local quota_payload = redis.call('GET', quota_key)
+local quota = nil
+if quota_payload then
+    quota = cjson.decode(quota_payload)
+else
+    quota = {
+        scope = cjson.decode(scope_payload),
+        version = 0,
+        used_bytes = 0,
+        used_objects = 0,
+        pending_reserved_bytes = 0,
+        pending_reserved_objects = 0,
+        updated_at_ms = created_at_ms,
+        updated_by = writer_runtime_payload,
+    }
+end
+
+local positive_bytes = positive(delta_bytes)
+local positive_objects = positive(delta_objects)
+if limit_max_bytes ~= '__none__' then
+    local admitted = tonumber(quota['used_bytes']) + tonumber(quota['pending_reserved_bytes']) + positive_bytes
+    if admitted > tonumber(limit_max_bytes) then
+        return {-5, quota_payload or cjson.encode(quota), '', ''}
+    end
+end
+if limit_max_objects ~= '__none__' then
+    local admitted = tonumber(quota['used_objects']) + tonumber(quota['pending_reserved_objects']) + positive_objects
+    if admitted > tonumber(limit_max_objects) then
+        return {-6, quota_payload or cjson.encode(quota), '', ''}
+    end
+end
+
+quota['pending_reserved_bytes'] = tonumber(quota['pending_reserved_bytes']) + positive_bytes
+quota['pending_reserved_objects'] = tonumber(quota['pending_reserved_objects']) + positive_objects
+quota['version'] = tonumber(quota['version']) + 1
+quota['updated_at_ms'] = created_at_ms
+quota['updated_by'] = writer_runtime_payload
+local next_quota_payload = cjson.encode(quota)
+
+local reservation = {
+    reservation_id = reservation_id,
+    scope = cjson.decode(scope_payload),
+    key = object_storage_key,
+    version = 1,
+    expected_object_version = expected_object,
+    delta_bytes = delta_bytes,
+    delta_objects = delta_objects,
+    state = 'Pending',
+    expires_at_ms = expires_at_ms,
+    created_at_ms = created_at_ms,
+    writer_runtime = cjson.decode(writer_runtime_payload),
+}
+local reservation_payload = cjson.encode(reservation)
+redis.call('SET', quota_key, next_quota_payload)
+redis.call('SET', reservation_key, reservation_payload)
+redis.call('SET', reservation_index_key, reservation_key)
+return {2, next_quota_payload, object_payload or '', reservation_payload}
+"#;
+
+const FINALIZE_TENANT_QUOTA_SCRIPT: &str = r#"
+local quota_key = KEYS[1]
+local object_key = KEYS[2]
+local reservation_key = KEYS[3]
+
+local reservation_id = ARGV[1]
+local expected_object_version = ARGV[2]
+local committed_length = ARGV[3]
+local route_version = ARGV[4]
+local object_state = ARGV[5]
+local updated_at_ms = tonumber(ARGV[6])
+local updated_by = ARGV[7]
+
+local function parse_optional_number(value)
+    if value == '__none__' then
+        return nil
+    end
+    return tonumber(value)
+end
+
+local function positive(value)
+    if value > 0 then
+        return value
+    end
+    return 0
+end
+
+local function apply_signed(base, delta)
+    local next = base + delta
+    if next < 0 then
+        return nil
+    end
+    return next
+end
+
+local reservation_payload = redis.call('GET', reservation_key)
+if not reservation_payload then
+    return {-1, ''}
+end
+local reservation = cjson.decode(reservation_payload)
+if reservation['reservation_id'] ~= reservation_id then
+    return {-2, reservation_payload}
+end
+if reservation['state'] == 'Finalized' then
+    local quota_payload = redis.call('GET', quota_key)
+    local object_payload = redis.call('GET', object_key)
+    return {1, quota_payload or '', object_payload or '', reservation_payload}
+end
+if reservation['state'] == 'Aborted' then
+    return {-3, reservation_payload}
+end
+
+local object_payload = redis.call('GET', object_key)
+local object = nil
+if object_payload then
+    object = cjson.decode(object_payload)
+end
+local actual_object_version = nil
+if object then
+    actual_object_version = tonumber(object['version'])
+end
+local expected_object = parse_optional_number(expected_object_version)
+if expected_object == nil then
+    expected_object = reservation['expected_object_version']
+end
+if actual_object_version ~= expected_object then
+    return {-4, object_payload or ''}
+end
+if object and object['scope']['tenant'] ~= reservation['scope']['tenant'] then
+    return {-5, object_payload}
+end
+
+local quota_payload = redis.call('GET', quota_key)
+if not quota_payload then
+    return {-6, ''}
+end
+local quota = cjson.decode(quota_payload)
+local positive_bytes = positive(tonumber(reservation['delta_bytes']))
+local positive_objects = positive(tonumber(reservation['delta_objects']))
+quota['pending_reserved_bytes'] = apply_signed(tonumber(quota['pending_reserved_bytes']), -positive_bytes)
+quota['pending_reserved_objects'] = apply_signed(tonumber(quota['pending_reserved_objects']), -positive_objects)
+quota['used_bytes'] = apply_signed(tonumber(quota['used_bytes']), tonumber(reservation['delta_bytes']))
+quota['used_objects'] = apply_signed(tonumber(quota['used_objects']), tonumber(reservation['delta_objects']))
+if quota['pending_reserved_bytes'] == nil or quota['pending_reserved_objects'] == nil or quota['used_bytes'] == nil or quota['used_objects'] == nil then
+    return {-7, quota_payload}
+end
+quota['version'] = tonumber(quota['version']) + 1
+quota['updated_at_ms'] = updated_at_ms
+quota['updated_by'] = updated_by
+local next_quota_payload = cjson.encode(quota)
+
+local next_object_payload = ''
+if object_state == 'Active' then
+    local next_object = {
+        key = reservation['key'],
+        scope = reservation['scope'],
+        version = (expected_object or 0) + 1,
+        committed_length = tonumber(committed_length),
+        route_version = parse_optional_number(route_version),
+        state = 'Active',
+        last_writer = updated_by,
+        updated_at_ms = updated_at_ms,
+    }
+    next_object_payload = cjson.encode(next_object)
+    redis.call('SET', object_key, next_object_payload)
+else
+    redis.call('DEL', object_key)
+end
+
+reservation['state'] = 'Finalized'
+reservation['version'] = tonumber(reservation['version']) + 1
+local next_reservation_payload = cjson.encode(reservation)
+redis.call('SET', quota_key, next_quota_payload)
+redis.call('SET', reservation_key, next_reservation_payload)
+return {2, next_quota_payload, next_object_payload, next_reservation_payload}
+"#;
+
+const ABORT_TENANT_QUOTA_SCRIPT: &str = r#"
+local quota_key = KEYS[1]
+local reservation_key = KEYS[2]
+
+local reservation_id = ARGV[1]
+
+local function positive(value)
+    if value > 0 then
+        return value
+    end
+    return 0
+end
+
+local function apply_signed(base, delta)
+    local next = base + delta
+    if next < 0 then
+        return nil
+    end
+    return next
+end
+
+local reservation_payload = redis.call('GET', reservation_key)
+if not reservation_payload then
+    return {-1, '', ''}
+end
+local reservation = cjson.decode(reservation_payload)
+if reservation['reservation_id'] ~= reservation_id then
+    return {-2, '', reservation_payload}
+end
+if reservation['state'] == 'Aborted' then
+    local quota_payload = redis.call('GET', quota_key)
+    return {1, quota_payload or '', reservation_payload}
+end
+if reservation['state'] == 'Finalized' then
+    return {-3, '', reservation_payload}
+end
+
+local quota_payload = redis.call('GET', quota_key)
+if not quota_payload then
+    return {-4, '', reservation_payload}
+end
+local quota = cjson.decode(quota_payload)
+local positive_bytes = positive(tonumber(reservation['delta_bytes']))
+local positive_objects = positive(tonumber(reservation['delta_objects']))
+quota['pending_reserved_bytes'] = apply_signed(tonumber(quota['pending_reserved_bytes']), -positive_bytes)
+quota['pending_reserved_objects'] = apply_signed(tonumber(quota['pending_reserved_objects']), -positive_objects)
+if quota['pending_reserved_bytes'] == nil or quota['pending_reserved_objects'] == nil then
+    return {-5, quota_payload, reservation_payload}
+end
+quota['version'] = tonumber(quota['version']) + 1
+quota['updated_at_ms'] = tonumber(reservation['created_at_ms'])
+quota['updated_by'] = cjson.encode(reservation['writer_runtime'])
+local next_quota_payload = cjson.encode(quota)
+
+reservation['state'] = 'Aborted'
+reservation['version'] = tonumber(reservation['version']) + 1
+local next_reservation_payload = cjson.encode(reservation)
+redis.call('SET', quota_key, next_quota_payload)
+redis.call('SET', reservation_key, next_reservation_payload)
+return {2, next_quota_payload, next_reservation_payload}
 "#;
 
 const REDIS_CONNECT_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS";
@@ -1209,6 +1516,349 @@ impl MetadataBackend for RedisMetadataBackend {
         }
     }
 
+    fn get_tenant_quota_state(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> Result<Option<TenantQuotaState>> {
+        let scope = root_scope(scope)?;
+        let mut connection = self.connection()?;
+        let key = self.keyspace.tenant_quota_state(&scope);
+        let payload: Option<String> = connection
+            .get(&key)
+            .map_err(|error| metadata_error("redis get tenant quota state", error))?;
+        payload
+            .map(|payload| {
+                parse_tenant_quota_state_payload(&payload, "redis get tenant quota state")
+            })
+            .transpose()
+    }
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<Option<TenantObjectAccounting>> {
+        let mut connection = self.connection()?;
+        let storage_key = self.keyspace.tenant_object_accounting(key);
+        let payload: Option<String> = connection
+            .get(&storage_key)
+            .map_err(|error| metadata_error("redis get tenant object accounting", error))?;
+        payload
+            .map(|payload| {
+                parse_tenant_object_accounting_payload(
+                    &payload,
+                    "redis get tenant object accounting",
+                )
+            })
+            .transpose()
+    }
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> Result<Vec<TenantQuotaReservation>> {
+        let scope = root_scope(scope)?;
+        let mut connection = self.connection()?;
+        let index_prefix = self
+            .keyspace
+            .tenant_quota_reservation_prefix(Some(&scope.tenant));
+        let index_keys = scan_keys(&mut connection, &format!("{}*", index_prefix))?;
+        let mut reservations = Vec::new();
+        for index_key in index_keys {
+            let reservation_key: Option<String> =
+                connection.get(index_key.as_str()).map_err(|error| {
+                    metadata_error("redis get tenant quota reservation index", error)
+                })?;
+            let Some(reservation_key) = reservation_key else {
+                continue;
+            };
+            let payload: Option<String> = connection
+                .get(reservation_key.as_str())
+                .map_err(|error| metadata_error("redis get tenant quota reservation", error))?;
+            let Some(payload) = payload else {
+                continue;
+            };
+            let reservation = parse_tenant_quota_reservation_payload(
+                &payload,
+                "redis list tenant quota reservations",
+            )?;
+            if reservation.scope == scope {
+                reservations.push(reservation);
+            }
+        }
+        reservations.sort_by(|left, right| left.reservation_id.cmp(&right.reservation_id));
+        Ok(reservations)
+    }
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &TenantQuotaReservationRequest,
+    ) -> Result<TenantQuotaReservationOutcome> {
+        request.validate()?;
+        let scope = root_scope(&request.scope)?;
+        let mut normalized = request.clone();
+        normalized.scope = scope.clone();
+        let mut connection = self.connection()?;
+        let quota_key = self.keyspace.tenant_quota_state(&scope);
+        let object_key = self.keyspace.tenant_object_accounting(&normalized.key);
+        let reservation_key = self
+            .keyspace
+            .tenant_quota_reservation(&normalized.reservation_id);
+        let reservation_index_key = self
+            .keyspace
+            .tenant_quota_reservation_index(&scope, &normalized.reservation_id);
+        let scope_payload = serde_json::to_string(&scope).map_err(json_error)?;
+        let writer_runtime_payload =
+            serde_json::to_string(&normalized.writer_runtime).map_err(json_error)?;
+        let result = Script::new(RESERVE_TENANT_QUOTA_SCRIPT)
+            .key(&quota_key)
+            .key(&object_key)
+            .key(&reservation_key)
+            .key(&reservation_index_key)
+            .arg(&normalized.reservation_id)
+            .arg(scope_payload)
+            .arg(&normalized.key.0)
+            .arg(
+                normalized
+                    .expected_object_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
+            .arg(normalized.delta_bytes)
+            .arg(normalized.delta_objects)
+            .arg(
+                normalized
+                    .limit
+                    .max_bytes
+                    .map(|limit| limit.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
+            .arg(
+                normalized
+                    .limit
+                    .max_objects
+                    .map(|limit| limit.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
+            .arg(normalized.expires_at_ms)
+            .arg(normalized.created_at_ms)
+            .arg(writer_runtime_payload)
+            .invoke::<(i32, String, String, String)>(&mut connection)
+            .map_err(|error| metadata_error("redis reserve tenant quota", error))?;
+
+        match result.0 {
+            1 | 2 => Ok(TenantQuotaReservationOutcome {
+                quota: parse_tenant_quota_state_payload(&result.1, "redis reserve tenant quota")?,
+                object: parse_optional_tenant_object_accounting_payload(
+                    &result.2,
+                    "redis reserve tenant quota",
+                )?,
+                reservation: parse_tenant_quota_reservation_payload(
+                    &result.3,
+                    "redis reserve tenant quota",
+                )?,
+            }),
+            -2 => Err(StoreError::Conflict(format!(
+                "tenant quota reservation {} already exists with different parameters",
+                normalized.reservation_id
+            ))),
+            -3 => Err(version_conflict(
+                "tenant object accounting",
+                &scope,
+                normalized.expected_object_version,
+                parse_optional_tenant_object_accounting_payload(
+                    &result.1,
+                    "redis reserve tenant quota conflict",
+                )?
+                .as_ref()
+                .map(|object| object.version),
+            )),
+            -4 => Err(StoreError::InvalidState(format!(
+                "tenant object accounting scope mismatch for key {}",
+                normalized.key.0
+            ))),
+            -5 => {
+                let quota =
+                    parse_tenant_quota_state_payload(&result.1, "redis reserve tenant quota")?;
+                Err(StoreError::Conflict(format!(
+                    "tenant quota bytes exceeded for {}: used={} pending={} requested={} limit={}",
+                    scope.tenant,
+                    quota.used_bytes,
+                    quota.pending_reserved_bytes,
+                    normalized.delta_bytes.max(0),
+                    normalized.limit.max_bytes.unwrap_or_default()
+                )))
+            }
+            -6 => {
+                let quota =
+                    parse_tenant_quota_state_payload(&result.1, "redis reserve tenant quota")?;
+                Err(StoreError::Conflict(format!(
+                    "tenant quota objects exceeded for {}: used={} pending={} requested={} limit={}",
+                    scope.tenant,
+                    quota.used_objects,
+                    quota.pending_reserved_objects,
+                    normalized.delta_objects.max(0),
+                    normalized.limit.max_objects.unwrap_or_default()
+                )))
+            }
+            code => Err(StoreError::Metadata(format!(
+                "redis reserve tenant quota: unexpected status code {code}"
+            ))),
+        }
+    }
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &TenantQuotaFinalizeRequest,
+    ) -> Result<TenantQuotaFinalizeOutcome> {
+        request.validate()?;
+        let mut connection = self.connection()?;
+        let reservation_key = self
+            .keyspace
+            .tenant_quota_reservation(&request.reservation_id);
+        let reservation_payload: Option<String> =
+            connection.get(&reservation_key).map_err(|error| {
+                metadata_error("redis get tenant quota reservation before finalize", error)
+            })?;
+        let reservation_payload = reservation_payload
+            .ok_or_else(|| StoreError::NotFound(request.reservation_id.clone()))?;
+        let reservation = parse_tenant_quota_reservation_payload(
+            &reservation_payload,
+            "redis finalize tenant quota prefetch",
+        )?;
+        let scope = root_scope(&reservation.scope)?;
+        let quota_key = self.keyspace.tenant_quota_state(&scope);
+        let object_key = self.keyspace.tenant_object_accounting(&reservation.key);
+        let result = Script::new(FINALIZE_TENANT_QUOTA_SCRIPT)
+            .key(&quota_key)
+            .key(&object_key)
+            .key(&reservation_key)
+            .arg(&request.reservation_id)
+            .arg(
+                request
+                    .expected_object_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
+            .arg(
+                request
+                    .committed_length
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
+            .arg(
+                request
+                    .route_version
+                    .map(|version| version.0.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
+            .arg(match request.state {
+                TenantObjectAccountingState::Active => "Active",
+                TenantObjectAccountingState::Deleted => "Deleted",
+            })
+            .arg(request.updated_at_ms)
+            .arg(&request.updated_by)
+            .invoke::<(i32, String, String, String)>(&mut connection)
+            .map_err(|error| metadata_error("redis finalize tenant quota", error))?;
+
+        match result.0 {
+            1 | 2 => Ok(TenantQuotaFinalizeOutcome {
+                quota: parse_tenant_quota_state_payload(&result.1, "redis finalize tenant quota")?,
+                object: parse_optional_tenant_object_accounting_payload(
+                    &result.2,
+                    "redis finalize tenant quota",
+                )?,
+                reservation: parse_tenant_quota_reservation_payload(
+                    &result.3,
+                    "redis finalize tenant quota",
+                )?,
+            }),
+            -3 => Err(StoreError::Conflict(format!(
+                "tenant quota reservation {} is already aborted",
+                request.reservation_id
+            ))),
+            -4 => Err(version_conflict(
+                "tenant object accounting",
+                &scope,
+                request
+                    .expected_object_version
+                    .or(reservation.expected_object_version),
+                parse_optional_tenant_object_accounting_payload(
+                    &result.1,
+                    "redis finalize tenant quota conflict",
+                )?
+                .as_ref()
+                .map(|object| object.version),
+            )),
+            -5 => Err(StoreError::InvalidState(format!(
+                "tenant object accounting scope mismatch for key {}",
+                reservation.key.0
+            ))),
+            -6 => Err(StoreError::InvalidState(format!(
+                "tenant quota state missing for {} while finalizing reservation {}",
+                scope.tenant, request.reservation_id
+            ))),
+            -7 => Err(StoreError::InvalidState(format!(
+                "tenant quota state underflow while finalizing reservation {}",
+                request.reservation_id
+            ))),
+            code => Err(StoreError::Metadata(format!(
+                "redis finalize tenant quota: unexpected status code {code}"
+            ))),
+        }
+    }
+
+    fn abort_tenant_quota(&self, reservation_id: &str) -> Result<TenantQuotaAbortOutcome> {
+        if reservation_id.is_empty() {
+            return Err(StoreError::InvalidState(
+                "tenant quota abort reservation_id must not be empty".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let reservation_key = self.keyspace.tenant_quota_reservation(reservation_id);
+        let reservation_payload: Option<String> =
+            connection.get(&reservation_key).map_err(|error| {
+                metadata_error("redis get tenant quota reservation before abort", error)
+            })?;
+        let reservation_payload =
+            reservation_payload.ok_or_else(|| StoreError::NotFound(reservation_id.to_string()))?;
+        let reservation = parse_tenant_quota_reservation_payload(
+            &reservation_payload,
+            "redis abort tenant quota prefetch",
+        )?;
+        let scope = root_scope(&reservation.scope)?;
+        let quota_key = self.keyspace.tenant_quota_state(&scope);
+        let result = Script::new(ABORT_TENANT_QUOTA_SCRIPT)
+            .key(&quota_key)
+            .key(&reservation_key)
+            .arg(reservation_id)
+            .invoke::<(i32, String, String)>(&mut connection)
+            .map_err(|error| metadata_error("redis abort tenant quota", error))?;
+        match result.0 {
+            1 | 2 => Ok(TenantQuotaAbortOutcome {
+                quota: parse_tenant_quota_state_payload(&result.1, "redis abort tenant quota")?,
+                reservation: parse_tenant_quota_reservation_payload(
+                    &result.2,
+                    "redis abort tenant quota",
+                )?,
+            }),
+            -3 => Err(StoreError::Conflict(format!(
+                "tenant quota reservation {} is already finalized",
+                reservation_id
+            ))),
+            -4 => Err(StoreError::InvalidState(format!(
+                "tenant quota state missing for {} while aborting reservation {}",
+                scope.tenant, reservation_id
+            ))),
+            -5 => Err(StoreError::InvalidState(format!(
+                "tenant quota state underflow while aborting reservation {}",
+                reservation_id
+            ))),
+            code => Err(StoreError::Metadata(format!(
+                "redis abort tenant quota: unexpected status code {code}"
+            ))),
+        }
+    }
+
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
         let key = self.keyspace.handoff(&handoff.stable_id);
         let payload = serde_json::to_string(handoff).map_err(json_error)?;
@@ -1298,6 +1948,80 @@ fn parse_tenant_policy_cas_payload(payload: &str, operation: &str) -> Result<Ten
     })
 }
 
+fn parse_tenant_quota_state_payload(payload: &str, operation: &str) -> Result<TenantQuotaState> {
+    serde_json::from_str::<TenantQuotaState>(payload).map_err(|error| {
+        StoreError::Metadata(format!(
+            "{operation}: corrupted tenant quota state payload from redis: {error}"
+        ))
+    })
+}
+
+fn parse_tenant_object_accounting_payload(
+    payload: &str,
+    operation: &str,
+) -> Result<TenantObjectAccounting> {
+    serde_json::from_str::<TenantObjectAccounting>(payload).map_err(|error| {
+        StoreError::Metadata(format!(
+            "{operation}: corrupted tenant object accounting payload from redis: {error}"
+        ))
+    })
+}
+
+fn parse_optional_tenant_object_accounting_payload(
+    payload: &str,
+    operation: &str,
+) -> Result<Option<TenantObjectAccounting>> {
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    parse_tenant_object_accounting_payload(payload, operation).map(Some)
+}
+
+fn parse_tenant_quota_reservation_payload(
+    payload: &str,
+    operation: &str,
+) -> Result<TenantQuotaReservation> {
+    serde_json::from_str::<TenantQuotaReservation>(payload).map_err(|error| {
+        StoreError::Metadata(format!(
+            "{operation}: corrupted tenant quota reservation payload from redis: {error}"
+        ))
+    })
+}
+
+fn root_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
+    scope.validate_root_only("tenant quota metadata")?;
+    Ok(TenantPolicyScope::new(
+        scope.tenant.clone(),
+        None::<String>,
+        None::<String>,
+    ))
+}
+
+fn version_conflict(
+    entity: &str,
+    scope: &TenantPolicyScope,
+    expected: Option<u64>,
+    actual: Option<u64>,
+) -> StoreError {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => StoreError::Conflict(format!(
+            "{entity} version mismatch for {}: expected={} actual={}",
+            scope.tenant, expected, actual
+        )),
+        (Some(expected), None) => StoreError::Conflict(format!(
+            "{entity} missing for {} at expected version {}",
+            scope.tenant, expected
+        )),
+        (None, Some(actual)) => StoreError::Conflict(format!(
+            "{entity} already exists for {} at version {}",
+            scope.tenant, actual
+        )),
+        (None, None) => {
+            StoreError::Conflict(format!("{entity} write rejected for {}", scope.tenant))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1313,8 +2037,9 @@ mod tests {
         ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy,
         RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-        SegmentName, StoreError, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
-        TenantQuotaPolicy,
+        SegmentName, StoreError, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
+        TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
+        TenantQuotaReservationRequest, TenantQuotaReservationState,
     };
     use redis::Commands;
 
@@ -1954,6 +2679,267 @@ mod tests {
                 .expect("tenant policy read after delete should succeed"),
             None
         );
+    }
+
+    #[test]
+    fn redis_backend_tenant_quota_reservation_finalize_and_abort_follow_versioned_state_machine() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-tenant-quota")),
+        )
+        .expect("redis backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+        let key = ObjectKey::new("tenant-a::alpha");
+        let writer = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        let reserved = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-create".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: None,
+                delta_bytes: 32,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 200,
+                created_at_ms: 100,
+                writer_runtime: writer.clone(),
+            })
+            .expect("reservation should succeed");
+        assert_eq!(reserved.quota.pending_reserved_bytes, 32);
+        assert_eq!(reserved.quota.pending_reserved_objects, 1);
+        assert!(reserved.object.is_none());
+        assert_eq!(
+            reserved.reservation.state,
+            TenantQuotaReservationState::Pending
+        );
+
+        let finalized = backend
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-create".to_string(),
+                expected_object_version: None,
+                committed_length: Some(32),
+                route_version: None,
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 120,
+                updated_by: "writer".to_string(),
+            })
+            .expect("finalize should succeed");
+        assert_eq!(finalized.quota.used_bytes, 32);
+        assert_eq!(finalized.quota.used_objects, 1);
+        assert_eq!(finalized.quota.pending_reserved_bytes, 0);
+        assert_eq!(finalized.quota.pending_reserved_objects, 0);
+        assert_eq!(
+            finalized
+                .object
+                .as_ref()
+                .expect("object accounting should exist")
+                .committed_length,
+            32
+        );
+        assert_eq!(
+            finalized.reservation.state,
+            TenantQuotaReservationState::Finalized
+        );
+
+        let duplicate_finalize = backend
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-create".to_string(),
+                expected_object_version: Some(1),
+                committed_length: Some(32),
+                route_version: None,
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 121,
+                updated_by: "writer".to_string(),
+            })
+            .expect("duplicate finalize should be idempotent");
+        assert_eq!(duplicate_finalize.quota.used_bytes, 32);
+        assert_eq!(duplicate_finalize.reservation.version, 2);
+
+        let overwrite = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-overwrite".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(1),
+                delta_bytes: 8,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 260,
+                created_at_ms: 140,
+                writer_runtime: writer.clone(),
+            })
+            .expect("overwrite reservation should succeed");
+        assert_eq!(
+            overwrite
+                .object
+                .expect("object accounting should exist")
+                .version,
+            1
+        );
+        assert_eq!(overwrite.quota.pending_reserved_bytes, 8);
+
+        let conflict = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-conflict".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(99),
+                delta_bytes: 1,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy::default(),
+                expires_at_ms: 300,
+                created_at_ms: 150,
+                writer_runtime: writer.clone(),
+            })
+            .expect_err("stale object version should fail");
+        assert!(matches!(conflict, StoreError::Conflict(_)));
+
+        let aborted = backend
+            .abort_tenant_quota("resv-overwrite")
+            .expect("abort should succeed");
+        assert_eq!(aborted.quota.pending_reserved_bytes, 0);
+        assert_eq!(aborted.quota.used_bytes, 32);
+        assert_eq!(
+            aborted.reservation.state,
+            TenantQuotaReservationState::Aborted
+        );
+
+        let duplicate_abort = backend
+            .abort_tenant_quota("resv-overwrite")
+            .expect("duplicate abort should be idempotent");
+        assert_eq!(duplicate_abort.quota.pending_reserved_bytes, 0);
+        assert_eq!(duplicate_abort.reservation.version, 2);
+
+        let delete_reserved = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-delete".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(1),
+                delta_bytes: -32,
+                delta_objects: -1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 400,
+                created_at_ms: 200,
+                writer_runtime: writer.clone(),
+            })
+            .expect("delete reservation should succeed");
+        assert_eq!(delete_reserved.quota.pending_reserved_bytes, 0);
+        assert_eq!(delete_reserved.quota.used_bytes, 32);
+
+        let deleted = backend
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-delete".to_string(),
+                expected_object_version: Some(1),
+                committed_length: None,
+                route_version: None,
+                state: TenantObjectAccountingState::Deleted,
+                updated_at_ms: 220,
+                updated_by: "writer".to_string(),
+            })
+            .expect("delete finalize should succeed");
+        assert_eq!(deleted.quota.used_bytes, 0);
+        assert_eq!(deleted.quota.used_objects, 0);
+        assert!(deleted.object.is_none());
+        assert!(backend
+            .get_tenant_object_accounting(&key)
+            .expect("object accounting lookup should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn redis_backend_tenant_quota_reservation_enforces_limits_and_lists_by_tenant() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-tenant-quota-limits")),
+        )
+        .expect("redis backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-b", None::<String>, None::<String>);
+        let writer = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-1".to_string(),
+                scope: scope.clone(),
+                key: ObjectKey::new("tenant-b::one"),
+                expected_object_version: None,
+                delta_bytes: 40,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(1),
+                },
+                expires_at_ms: 100,
+                created_at_ms: 10,
+                writer_runtime: writer.clone(),
+            })
+            .expect("first reservation should succeed");
+
+        let byte_limit = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-2".to_string(),
+                scope: scope.clone(),
+                key: ObjectKey::new("tenant-b::two"),
+                expected_object_version: None,
+                delta_bytes: 32,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 110,
+                created_at_ms: 11,
+                writer_runtime: writer.clone(),
+            })
+            .expect_err("bytes over limit should fail");
+        assert!(matches!(byte_limit, StoreError::Conflict(_)));
+
+        let object_limit = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-3".to_string(),
+                scope: scope.clone(),
+                key: ObjectKey::new("tenant-b::three"),
+                expected_object_version: None,
+                delta_bytes: 1,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(128),
+                    max_objects: Some(1),
+                },
+                expires_at_ms: 120,
+                created_at_ms: 12,
+                writer_runtime: writer,
+            })
+            .expect_err("objects over limit should fail");
+        assert!(matches!(object_limit, StoreError::Conflict(_)));
+
+        let reservations = backend
+            .list_tenant_quota_reservations(&scope)
+            .expect("reservation listing should succeed");
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].reservation_id, "resv-1");
+        let quota = backend
+            .get_tenant_quota_state(&scope)
+            .expect("quota state lookup should succeed")
+            .expect("quota state should exist");
+        assert_eq!(quota.pending_reserved_bytes, 40);
+        assert_eq!(quota.pending_reserved_objects, 1);
     }
 
     #[test]

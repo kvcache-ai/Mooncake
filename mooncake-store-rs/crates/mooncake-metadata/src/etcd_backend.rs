@@ -1,16 +1,18 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
+use crate::segment_state::StoredSegmentState;
+use crate::MetadataKeyspace;
 use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
     SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
-    TenantPolicy, TenantPolicyScope,
+    TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
+    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
+    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
+    TenantQuotaReservationState, TenantQuotaState,
 };
-
-use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
-use crate::segment_state::StoredSegmentState;
-use crate::MetadataKeyspace;
 
 #[derive(Clone, Debug)]
 pub struct EtcdMetadataConfig {
@@ -678,6 +680,689 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
+    fn get_tenant_quota_state(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> Result<Option<TenantQuotaState>> {
+        let scope = root_scope(scope)?;
+        let key = self.config.keyspace.tenant_quota_state(&scope);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key, None)
+                .await
+                .map_err(etcd_error("etcd get tenant quota state"))?;
+            response
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice(kv.value()).map_err(json_error))
+                .transpose()
+        })
+    }
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<Option<TenantObjectAccounting>> {
+        let key = self.config.keyspace.tenant_object_accounting(key);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key, None)
+                .await
+                .map_err(etcd_error("etcd get tenant object accounting"))?;
+            response
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice(kv.value()).map_err(json_error))
+                .transpose()
+        })
+    }
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> Result<Vec<TenantQuotaReservation>> {
+        let scope = root_scope(scope)?;
+        let prefix = self
+            .config
+            .keyspace
+            .tenant_quota_reservation_prefix(Some(&scope.tenant));
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(prefix, Some(GetOptions::new().with_prefix()))
+                .await
+                .map_err(etcd_error("etcd list tenant quota reservation indexes"))?;
+            let mut reservations = Vec::new();
+            for kv in response.kvs() {
+                let reservation_key = String::from_utf8(kv.value().to_vec()).map_err(|error| {
+                    StoreError::Metadata(format!(
+                        "etcd list tenant quota reservation indexes: invalid utf8 value: {error}"
+                    ))
+                })?;
+                let reservation_response = client
+                    .get(reservation_key, None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant quota reservation"))?;
+                let Some(kv) = reservation_response.kvs().first() else {
+                    continue;
+                };
+                let reservation: TenantQuotaReservation =
+                    serde_json::from_slice(kv.value()).map_err(json_error)?;
+                if reservation.scope == scope {
+                    reservations.push(reservation);
+                }
+            }
+            reservations.sort_by(|left, right| left.reservation_id.cmp(&right.reservation_id));
+            Ok(reservations)
+        })
+    }
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &TenantQuotaReservationRequest,
+    ) -> Result<TenantQuotaReservationOutcome> {
+        request.validate()?;
+        let scope = root_scope(&request.scope)?;
+        let mut normalized = request.clone();
+        normalized.scope = scope.clone();
+        let quota_key = self.config.keyspace.tenant_quota_state(&scope);
+        let object_key = self
+            .config
+            .keyspace
+            .tenant_object_accounting(&normalized.key);
+        let reservation_key = self
+            .config
+            .keyspace
+            .tenant_quota_reservation(&normalized.reservation_id);
+        let reservation_index_key = self
+            .config
+            .keyspace
+            .tenant_quota_reservation_index(&scope, &normalized.reservation_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let reservation_response = client
+                    .get(reservation_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant quota reservation"))?;
+                if let Some(kv) = reservation_response.kvs().first() {
+                    let existing: TenantQuotaReservation =
+                        serde_json::from_slice(kv.value()).map_err(json_error)?;
+                    return match existing.state {
+                        TenantQuotaReservationState::Pending
+                            if existing.scope == scope
+                                && existing.key == normalized.key
+                                && existing.expected_object_version
+                                    == normalized.expected_object_version
+                                && existing.delta_bytes == normalized.delta_bytes
+                                && existing.delta_objects == normalized.delta_objects =>
+                        {
+                            let quota_response = client
+                                .get(quota_key.clone(), None)
+                                .await
+                                .map_err(etcd_error("etcd get tenant quota state"))?;
+                            let quota = quota_response
+                                .kvs()
+                                .first()
+                                .ok_or_else(|| {
+                                    StoreError::InvalidState(format!(
+                                        "tenant quota state missing for {} while reservation {} exists",
+                                        scope.tenant, normalized.reservation_id
+                                    ))
+                                })
+                                .and_then(|kv| {
+                                    serde_json::from_slice::<TenantQuotaState>(kv.value())
+                                        .map_err(json_error)
+                                })?;
+                            let object = client
+                                .get(object_key.clone(), None)
+                                .await
+                                .map_err(etcd_error("etcd get tenant object accounting"))?
+                                .kvs()
+                                .first()
+                                .map(|kv| {
+                                    serde_json::from_slice::<TenantObjectAccounting>(kv.value())
+                                        .map_err(json_error)
+                                })
+                                .transpose()?;
+                            Ok(TenantQuotaReservationOutcome {
+                                quota,
+                                object,
+                                reservation: existing,
+                            })
+                        }
+                        TenantQuotaReservationState::Pending => Err(StoreError::Conflict(format!(
+                            "tenant quota reservation {} already exists with different parameters",
+                            normalized.reservation_id
+                        ))),
+                        _ => Err(StoreError::Conflict(format!(
+                            "tenant quota reservation {} is already {:?}",
+                            normalized.reservation_id, existing.state
+                        ))),
+                    };
+                }
+
+                let object_response = client
+                    .get(object_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant object accounting"))?;
+                let current_object = object_response
+                    .kvs()
+                    .first()
+                    .map(|kv| {
+                        serde_json::from_slice::<TenantObjectAccounting>(kv.value()).map_err(json_error)
+                    })
+                    .transpose()?;
+                let actual_object_version = current_object.as_ref().map(|object| object.version);
+                if actual_object_version != normalized.expected_object_version {
+                    return Err(version_conflict(
+                        "tenant object accounting",
+                        &scope,
+                        normalized.expected_object_version,
+                        actual_object_version,
+                    ));
+                }
+                if let Some(object) = current_object.as_ref() {
+                    object.validate()?;
+                    if object.scope != scope {
+                        return Err(StoreError::InvalidState(format!(
+                            "tenant object accounting scope mismatch for key {}",
+                            normalized.key.0
+                        )));
+                    }
+                }
+
+                let quota_response = client
+                    .get(quota_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant quota state"))?;
+                let current_quota = quota_response
+                    .kvs()
+                    .first()
+                    .map(|kv| serde_json::from_slice::<TenantQuotaState>(kv.value()).map_err(json_error))
+                    .transpose()?;
+                let mut quota = current_quota.clone().unwrap_or_else(|| TenantQuotaState {
+                    scope: scope.clone(),
+                    version: 0,
+                    used_bytes: 0,
+                    used_objects: 0,
+                    pending_reserved_bytes: 0,
+                    pending_reserved_objects: 0,
+                    updated_at_ms: normalized.created_at_ms,
+                    updated_by: normalized.writer_runtime.to_string(),
+                });
+                quota.validate()?;
+
+                let positive_bytes =
+                    non_negative_i64_to_u64(normalized.delta_bytes.max(0), "delta_bytes")?;
+                let positive_objects =
+                    non_negative_i64_to_u64(normalized.delta_objects.max(0), "delta_objects")?;
+                if let Some(limit) = normalized.limit.max_bytes {
+                    let admitted = quota
+                        .used_bytes
+                        .checked_add(quota.pending_reserved_bytes)
+                        .and_then(|value| value.checked_add(positive_bytes))
+                        .ok_or_else(|| {
+                            StoreError::InvalidState(format!(
+                                "tenant quota admission overflow for {} bytes",
+                                scope.tenant
+                            ))
+                        })?;
+                    if admitted > limit {
+                        return Err(StoreError::Conflict(format!(
+                            "tenant quota bytes exceeded for {}: used={} pending={} requested={} limit={}",
+                            scope.tenant,
+                            quota.used_bytes,
+                            quota.pending_reserved_bytes,
+                            positive_bytes,
+                            limit
+                        )));
+                    }
+                }
+                if let Some(limit) = normalized.limit.max_objects {
+                    let limit = u64::try_from(limit).map_err(|_| {
+                        StoreError::InvalidState(format!(
+                            "tenant object limit overflow for {}",
+                            scope.tenant
+                        ))
+                    })?;
+                    let admitted = quota
+                        .used_objects
+                        .checked_add(quota.pending_reserved_objects)
+                        .and_then(|value| value.checked_add(positive_objects))
+                        .ok_or_else(|| {
+                            StoreError::InvalidState(format!(
+                                "tenant quota admission overflow for {} objects",
+                                scope.tenant
+                            ))
+                        })?;
+                    if admitted > limit {
+                        return Err(StoreError::Conflict(format!(
+                            "tenant quota objects exceeded for {}: used={} pending={} requested={} limit={}",
+                            scope.tenant,
+                            quota.used_objects,
+                            quota.pending_reserved_objects,
+                            positive_objects,
+                            limit
+                        )));
+                    }
+                }
+
+                quota.pending_reserved_bytes = apply_positive_delta(
+                    quota.pending_reserved_bytes,
+                    normalized.delta_bytes,
+                    "pending_reserved_bytes",
+                )?;
+                quota.pending_reserved_objects = apply_positive_delta(
+                    quota.pending_reserved_objects,
+                    normalized.delta_objects,
+                    "pending_reserved_objects",
+                )?;
+                quota.version = quota.version.saturating_add(1);
+                quota.updated_at_ms = normalized.created_at_ms;
+                quota.updated_by = normalized.writer_runtime.to_string();
+                let reservation = TenantQuotaReservation {
+                    reservation_id: normalized.reservation_id.clone(),
+                    scope: scope.clone(),
+                    key: normalized.key.clone(),
+                    version: 1,
+                    expected_object_version: normalized.expected_object_version,
+                    delta_bytes: normalized.delta_bytes,
+                    delta_objects: normalized.delta_objects,
+                    state: TenantQuotaReservationState::Pending,
+                    expires_at_ms: normalized.expires_at_ms,
+                    created_at_ms: normalized.created_at_ms,
+                    writer_runtime: normalized.writer_runtime.clone(),
+                };
+                reservation.validate()?;
+
+                let quota_payload = serde_json::to_string(&quota).map_err(json_error)?;
+                let reservation_payload = serde_json::to_string(&reservation).map_err(json_error)?;
+                let txn = Txn::new()
+                    .when([
+                        if let Some(kv) = quota_response.kvs().first() {
+                            Compare::mod_revision(
+                                quota_key.clone(),
+                                CompareOp::Equal,
+                                kv.mod_revision(),
+                            )
+                        } else {
+                            Compare::version(quota_key.clone(), CompareOp::Equal, 0)
+                        },
+                        if let Some(kv) = object_response.kvs().first() {
+                            Compare::mod_revision(
+                                object_key.clone(),
+                                CompareOp::Equal,
+                                kv.mod_revision(),
+                            )
+                        } else {
+                            Compare::version(object_key.clone(), CompareOp::Equal, 0)
+                        },
+                        Compare::version(reservation_key.clone(), CompareOp::Equal, 0),
+                    ])
+                    .and_then([
+                        TxnOp::put(quota_key.clone(), quota_payload, None),
+                        TxnOp::put(reservation_key.clone(), reservation_payload, None),
+                        TxnOp::put(reservation_index_key.clone(), reservation_key.clone(), None),
+                    ]);
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd reserve tenant quota"))?;
+                if txn_response.succeeded() {
+                    return Ok(TenantQuotaReservationOutcome {
+                        quota,
+                        object: current_object,
+                        reservation,
+                    });
+                }
+            }
+        })
+    }
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &TenantQuotaFinalizeRequest,
+    ) -> Result<TenantQuotaFinalizeOutcome> {
+        request.validate()?;
+        let reservation_key = self
+            .config
+            .keyspace
+            .tenant_quota_reservation(&request.reservation_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let reservation_response = client
+                    .get(reservation_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant quota reservation"))?;
+                let reservation_kv = reservation_response
+                    .kvs()
+                    .first()
+                    .ok_or_else(|| StoreError::NotFound(request.reservation_id.clone()))?;
+                let reservation: TenantQuotaReservation =
+                    serde_json::from_slice(reservation_kv.value()).map_err(json_error)?;
+                match reservation.state {
+                    TenantQuotaReservationState::Finalized => {
+                        let scope = root_scope(&reservation.scope)?;
+                        let quota_key = self.config.keyspace.tenant_quota_state(&scope);
+                        let quota_response = client
+                            .get(quota_key, None)
+                            .await
+                            .map_err(etcd_error("etcd get tenant quota state"))?;
+                        let quota = quota_response
+                            .kvs()
+                            .first()
+                            .ok_or_else(|| {
+                                StoreError::InvalidState(format!(
+                                    "tenant quota state missing for {} while reservation {} is finalized",
+                                    reservation.scope.tenant, reservation.reservation_id
+                                ))
+                            })
+                            .and_then(|kv| {
+                                serde_json::from_slice::<TenantQuotaState>(kv.value())
+                                    .map_err(json_error)
+                            })?;
+                        let object_key = self
+                            .config
+                            .keyspace
+                            .tenant_object_accounting(&reservation.key);
+                        let object = client
+                            .get(object_key, None)
+                            .await
+                            .map_err(etcd_error("etcd get tenant object accounting"))?
+                            .kvs()
+                            .first()
+                            .map(|kv| {
+                                serde_json::from_slice::<TenantObjectAccounting>(kv.value())
+                                    .map_err(json_error)
+                            })
+                            .transpose()?;
+                        return Ok(TenantQuotaFinalizeOutcome {
+                            quota,
+                            object,
+                            reservation,
+                        });
+                    }
+                    TenantQuotaReservationState::Aborted => {
+                        return Err(StoreError::Conflict(format!(
+                            "tenant quota reservation {} is already aborted",
+                            reservation.reservation_id
+                        )));
+                    }
+                    TenantQuotaReservationState::Pending => {}
+                }
+
+                let scope = root_scope(&reservation.scope)?;
+                let quota_key = self.config.keyspace.tenant_quota_state(&scope);
+                let object_key = self.config.keyspace.tenant_object_accounting(&reservation.key);
+                let object_response = client
+                    .get(object_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant object accounting"))?;
+                let current_object = object_response
+                    .kvs()
+                    .first()
+                    .map(|kv| {
+                        serde_json::from_slice::<TenantObjectAccounting>(kv.value()).map_err(json_error)
+                    })
+                    .transpose()?;
+                let actual_object_version = current_object.as_ref().map(|object| object.version);
+                let expected_object_version = request
+                    .expected_object_version
+                    .or(reservation.expected_object_version);
+                if actual_object_version != expected_object_version {
+                    return Err(version_conflict(
+                        "tenant object accounting",
+                        &scope,
+                        expected_object_version,
+                        actual_object_version,
+                    ));
+                }
+                if let Some(object) = current_object.as_ref() {
+                    object.validate()?;
+                    if object.scope != scope {
+                        return Err(StoreError::InvalidState(format!(
+                            "tenant object accounting scope mismatch for key {}",
+                            reservation.key.0
+                        )));
+                    }
+                }
+
+                let quota_response = client
+                    .get(quota_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant quota state"))?;
+                let quota_kv = quota_response.kvs().first().ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "tenant quota state missing for {} while finalizing reservation {}",
+                        scope.tenant, reservation.reservation_id
+                    ))
+                })?;
+                let mut quota: TenantQuotaState =
+                    serde_json::from_slice(quota_kv.value()).map_err(json_error)?;
+                quota.pending_reserved_bytes = apply_signed_delta(
+                    quota.pending_reserved_bytes,
+                    -reservation.delta_bytes.max(0),
+                    "pending_reserved_bytes",
+                )?;
+                quota.pending_reserved_objects = apply_signed_delta(
+                    quota.pending_reserved_objects,
+                    -reservation.delta_objects.max(0),
+                    "pending_reserved_objects",
+                )?;
+                quota.used_bytes =
+                    apply_signed_delta(quota.used_bytes, reservation.delta_bytes, "used_bytes")?;
+                quota.used_objects = apply_signed_delta(
+                    quota.used_objects,
+                    reservation.delta_objects,
+                    "used_objects",
+                )?;
+                quota.version = quota.version.saturating_add(1);
+                quota.updated_at_ms = request.updated_at_ms;
+                quota.updated_by = request.updated_by.clone();
+
+                let next_object = match request.state {
+                    TenantObjectAccountingState::Active => Some(TenantObjectAccounting {
+                        key: reservation.key.clone(),
+                        scope: scope.clone(),
+                        version: expected_object_version.unwrap_or(0).saturating_add(1),
+                        committed_length: request
+                            .committed_length
+                            .expect("validated active finalize request"),
+                        route_version: request.route_version,
+                        state: TenantObjectAccountingState::Active,
+                        last_writer: request.updated_by.clone(),
+                        updated_at_ms: request.updated_at_ms,
+                    }),
+                    TenantObjectAccountingState::Deleted => None,
+                };
+                if let Some(object) = next_object.as_ref() {
+                    object.validate()?;
+                }
+                let mut updated_reservation = reservation.clone();
+                updated_reservation.state = TenantQuotaReservationState::Finalized;
+                updated_reservation.version = updated_reservation.version.saturating_add(1);
+
+                let quota_payload = serde_json::to_string(&quota).map_err(json_error)?;
+                let reservation_payload =
+                    serde_json::to_string(&updated_reservation).map_err(json_error)?;
+                let mut txn = Txn::new().when([
+                    Compare::mod_revision(
+                        reservation_key.clone(),
+                        CompareOp::Equal,
+                        reservation_kv.mod_revision(),
+                    ),
+                    Compare::mod_revision(
+                        quota_key.clone(),
+                        CompareOp::Equal,
+                        quota_kv.mod_revision(),
+                    ),
+                    if let Some(kv) = object_response.kvs().first() {
+                        Compare::mod_revision(
+                            object_key.clone(),
+                            CompareOp::Equal,
+                            kv.mod_revision(),
+                        )
+                    } else {
+                        Compare::version(object_key.clone(), CompareOp::Equal, 0)
+                    },
+                ]);
+                let mut ops = vec![
+                    TxnOp::put(quota_key.clone(), quota_payload, None),
+                    TxnOp::put(reservation_key.clone(), reservation_payload, None),
+                ];
+                match next_object.as_ref() {
+                    Some(object) => ops.push(TxnOp::put(
+                        object_key.clone(),
+                        serde_json::to_string(object).map_err(json_error)?,
+                        None,
+                    )),
+                    None => ops.push(TxnOp::delete(object_key.clone(), None)),
+                }
+                txn = txn.and_then(ops);
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd finalize tenant quota"))?;
+                if txn_response.succeeded() {
+                    return Ok(TenantQuotaFinalizeOutcome {
+                        quota,
+                        object: next_object,
+                        reservation: updated_reservation,
+                    });
+                }
+            }
+        })
+    }
+
+    fn abort_tenant_quota(&self, reservation_id: &str) -> Result<TenantQuotaAbortOutcome> {
+        if reservation_id.is_empty() {
+            return Err(StoreError::InvalidState(
+                "tenant quota abort reservation_id must not be empty".to_string(),
+            ));
+        }
+        let reservation_key = self
+            .config
+            .keyspace
+            .tenant_quota_reservation(reservation_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let reservation_response = client
+                    .get(reservation_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant quota reservation"))?;
+                let reservation_kv = reservation_response
+                    .kvs()
+                    .first()
+                    .ok_or_else(|| StoreError::NotFound(reservation_id.to_string()))?;
+                let reservation: TenantQuotaReservation =
+                    serde_json::from_slice(reservation_kv.value()).map_err(json_error)?;
+                match reservation.state {
+                    TenantQuotaReservationState::Aborted => {
+                        let scope = root_scope(&reservation.scope)?;
+                        let quota_key = self.config.keyspace.tenant_quota_state(&scope);
+                        let quota_response = client
+                            .get(quota_key, None)
+                            .await
+                            .map_err(etcd_error("etcd get tenant quota state"))?;
+                        let quota = quota_response
+                            .kvs()
+                            .first()
+                            .ok_or_else(|| {
+                                StoreError::InvalidState(format!(
+                                    "tenant quota state missing for {} while reservation {} is aborted",
+                                    reservation.scope.tenant, reservation.reservation_id
+                                ))
+                            })
+                            .and_then(|kv| {
+                                serde_json::from_slice::<TenantQuotaState>(kv.value())
+                                    .map_err(json_error)
+                            })?;
+                        return Ok(TenantQuotaAbortOutcome { quota, reservation });
+                    }
+                    TenantQuotaReservationState::Finalized => {
+                        return Err(StoreError::Conflict(format!(
+                            "tenant quota reservation {} is already finalized",
+                            reservation.reservation_id
+                        )));
+                    }
+                    TenantQuotaReservationState::Pending => {}
+                }
+
+                let scope = root_scope(&reservation.scope)?;
+                let quota_key = self.config.keyspace.tenant_quota_state(&scope);
+                let quota_response = client
+                    .get(quota_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant quota state"))?;
+                let quota_kv = quota_response.kvs().first().ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "tenant quota state missing for {} while aborting reservation {}",
+                        scope.tenant, reservation.reservation_id
+                    ))
+                })?;
+                let mut quota: TenantQuotaState =
+                    serde_json::from_slice(quota_kv.value()).map_err(json_error)?;
+                quota.pending_reserved_bytes = apply_signed_delta(
+                    quota.pending_reserved_bytes,
+                    -reservation.delta_bytes.max(0),
+                    "pending_reserved_bytes",
+                )?;
+                quota.pending_reserved_objects = apply_signed_delta(
+                    quota.pending_reserved_objects,
+                    -reservation.delta_objects.max(0),
+                    "pending_reserved_objects",
+                )?;
+                quota.version = quota.version.saturating_add(1);
+                quota.updated_at_ms = reservation.created_at_ms;
+                quota.updated_by = reservation.writer_runtime.to_string();
+                let mut updated_reservation = reservation.clone();
+                updated_reservation.state = TenantQuotaReservationState::Aborted;
+                updated_reservation.version = updated_reservation.version.saturating_add(1);
+
+                let txn = Txn::new()
+                    .when([
+                        Compare::mod_revision(
+                            reservation_key.clone(),
+                            CompareOp::Equal,
+                            reservation_kv.mod_revision(),
+                        ),
+                        Compare::mod_revision(
+                            quota_key.clone(),
+                            CompareOp::Equal,
+                            quota_kv.mod_revision(),
+                        ),
+                    ])
+                    .and_then([
+                        TxnOp::put(
+                            quota_key.clone(),
+                            serde_json::to_string(&quota).map_err(json_error)?,
+                            None,
+                        ),
+                        TxnOp::put(
+                            reservation_key.clone(),
+                            serde_json::to_string(&updated_reservation).map_err(json_error)?,
+                            None,
+                        ),
+                    ]);
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd abort tenant quota"))?;
+                if txn_response.succeeded() {
+                    return Ok(TenantQuotaAbortOutcome {
+                        quota,
+                        reservation: updated_reservation,
+                    });
+                }
+            }
+        })
+    }
+
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
         let key = self.config.keyspace.handoff(&handoff.stable_id);
         let payload = serde_json::to_string(handoff).map_err(json_error)?;
@@ -723,6 +1408,76 @@ fn json_error(error: serde_json::Error) -> StoreError {
     StoreError::Metadata(format!("json serialization: {error}"))
 }
 
+fn root_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
+    scope.validate_root_only("tenant quota metadata")?;
+    Ok(TenantPolicyScope::new(
+        scope.tenant.clone(),
+        None::<String>,
+        None::<String>,
+    ))
+}
+
+fn version_conflict(
+    entity: &str,
+    scope: &TenantPolicyScope,
+    expected: Option<u64>,
+    actual: Option<u64>,
+) -> StoreError {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => StoreError::Conflict(format!(
+            "{entity} version mismatch for {}: expected={} actual={}",
+            scope.tenant, expected, actual
+        )),
+        (Some(expected), None) => StoreError::Conflict(format!(
+            "{entity} missing for {} at expected version {}",
+            scope.tenant, expected
+        )),
+        (None, Some(actual)) => StoreError::Conflict(format!(
+            "{entity} already exists for {} at version {}",
+            scope.tenant, actual
+        )),
+        (None, None) => {
+            StoreError::Conflict(format!("{entity} write rejected for {}", scope.tenant))
+        }
+    }
+}
+
+fn non_negative_i64_to_u64(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| StoreError::InvalidState(format!("{field} must not be negative, got {value}")))
+}
+
+fn magnitude_u64(value: i64, field: &str) -> Result<u64> {
+    value
+        .checked_abs()
+        .ok_or_else(|| StoreError::InvalidState(format!("{field} magnitude overflow: {value}")))
+        .and_then(|magnitude| {
+            u64::try_from(magnitude).map_err(|_| {
+                StoreError::InvalidState(format!("{field} magnitude overflow: {value}"))
+            })
+        })
+}
+
+fn apply_positive_delta(base: u64, delta: i64, field: &str) -> Result<u64> {
+    if delta <= 0 {
+        return Ok(base);
+    }
+    base.checked_add(non_negative_i64_to_u64(delta, field)?)
+        .ok_or_else(|| {
+            StoreError::InvalidState(format!("{field} overflow while applying delta {delta}"))
+        })
+}
+
+fn apply_signed_delta(base: u64, delta: i64, field: &str) -> Result<u64> {
+    if delta >= 0 {
+        return apply_positive_delta(base, delta, field);
+    }
+    let magnitude = magnitude_u64(delta, field)?;
+    base.checked_sub(magnitude).ok_or_else(|| {
+        StoreError::InvalidState(format!("{field} underflow while applying delta {delta}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -736,8 +1491,10 @@ mod tests {
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion,
-        SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError, TenantPolicy,
-        TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
+        SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+        TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
+        TenantQuotaReservationState,
     };
 
     use super::{EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace};
@@ -1095,5 +1852,266 @@ mod tests {
                 .expect("tenant policy read after delete should succeed"),
             None
         );
+    }
+
+    #[test]
+    fn etcd_backend_tenant_quota_reservation_finalize_and_abort_follow_versioned_state_machine() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-tenant-quota")),
+        )
+        .expect("etcd backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+        let key = ObjectKey::new("tenant-a::alpha");
+        let writer = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        let reserved = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-create".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: None,
+                delta_bytes: 32,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 200,
+                created_at_ms: 100,
+                writer_runtime: writer.clone(),
+            })
+            .expect("reservation should succeed");
+        assert_eq!(reserved.quota.pending_reserved_bytes, 32);
+        assert_eq!(reserved.quota.pending_reserved_objects, 1);
+        assert!(reserved.object.is_none());
+        assert_eq!(
+            reserved.reservation.state,
+            TenantQuotaReservationState::Pending
+        );
+
+        let finalized = backend
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-create".to_string(),
+                expected_object_version: None,
+                committed_length: Some(32),
+                route_version: None,
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 120,
+                updated_by: "writer".to_string(),
+            })
+            .expect("finalize should succeed");
+        assert_eq!(finalized.quota.used_bytes, 32);
+        assert_eq!(finalized.quota.used_objects, 1);
+        assert_eq!(finalized.quota.pending_reserved_bytes, 0);
+        assert_eq!(finalized.quota.pending_reserved_objects, 0);
+        assert_eq!(
+            finalized
+                .object
+                .as_ref()
+                .expect("object accounting should exist")
+                .committed_length,
+            32
+        );
+        assert_eq!(
+            finalized.reservation.state,
+            TenantQuotaReservationState::Finalized
+        );
+
+        let duplicate_finalize = backend
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-create".to_string(),
+                expected_object_version: Some(1),
+                committed_length: Some(32),
+                route_version: None,
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 121,
+                updated_by: "writer".to_string(),
+            })
+            .expect("duplicate finalize should be idempotent");
+        assert_eq!(duplicate_finalize.quota.used_bytes, 32);
+        assert_eq!(duplicate_finalize.reservation.version, 2);
+
+        let overwrite = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-overwrite".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(1),
+                delta_bytes: 8,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 260,
+                created_at_ms: 140,
+                writer_runtime: writer.clone(),
+            })
+            .expect("overwrite reservation should succeed");
+        assert_eq!(
+            overwrite
+                .object
+                .expect("object accounting should exist")
+                .version,
+            1
+        );
+        assert_eq!(overwrite.quota.pending_reserved_bytes, 8);
+
+        let conflict = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-conflict".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(99),
+                delta_bytes: 1,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy::default(),
+                expires_at_ms: 300,
+                created_at_ms: 150,
+                writer_runtime: writer.clone(),
+            })
+            .expect_err("stale object version should fail");
+        assert!(matches!(conflict, StoreError::Conflict(_)));
+
+        let aborted = backend
+            .abort_tenant_quota("resv-overwrite")
+            .expect("abort should succeed");
+        assert_eq!(aborted.quota.pending_reserved_bytes, 0);
+        assert_eq!(aborted.quota.used_bytes, 32);
+        assert_eq!(
+            aborted.reservation.state,
+            TenantQuotaReservationState::Aborted
+        );
+
+        let duplicate_abort = backend
+            .abort_tenant_quota("resv-overwrite")
+            .expect("duplicate abort should be idempotent");
+        assert_eq!(duplicate_abort.quota.pending_reserved_bytes, 0);
+        assert_eq!(duplicate_abort.reservation.version, 2);
+
+        let delete_reserved = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-delete".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(1),
+                delta_bytes: -32,
+                delta_objects: -1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 400,
+                created_at_ms: 200,
+                writer_runtime: writer.clone(),
+            })
+            .expect("delete reservation should succeed");
+        assert_eq!(delete_reserved.quota.pending_reserved_bytes, 0);
+        assert_eq!(delete_reserved.quota.used_bytes, 32);
+
+        let deleted = backend
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-delete".to_string(),
+                expected_object_version: Some(1),
+                committed_length: None,
+                route_version: None,
+                state: TenantObjectAccountingState::Deleted,
+                updated_at_ms: 220,
+                updated_by: "writer".to_string(),
+            })
+            .expect("delete finalize should succeed");
+        assert_eq!(deleted.quota.used_bytes, 0);
+        assert_eq!(deleted.quota.used_objects, 0);
+        assert!(deleted.object.is_none());
+        assert!(backend
+            .get_tenant_object_accounting(&key)
+            .expect("object accounting lookup should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn etcd_backend_tenant_quota_reservation_enforces_limits_and_lists_by_tenant() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-tenant-quota-limits")),
+        )
+        .expect("etcd backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-b", None::<String>, None::<String>);
+        let writer = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-1".to_string(),
+                scope: scope.clone(),
+                key: ObjectKey::new("tenant-b::one"),
+                expected_object_version: None,
+                delta_bytes: 40,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(1),
+                },
+                expires_at_ms: 100,
+                created_at_ms: 10,
+                writer_runtime: writer.clone(),
+            })
+            .expect("first reservation should succeed");
+
+        let byte_limit = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-2".to_string(),
+                scope: scope.clone(),
+                key: ObjectKey::new("tenant-b::two"),
+                expected_object_version: None,
+                delta_bytes: 32,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 110,
+                created_at_ms: 11,
+                writer_runtime: writer.clone(),
+            })
+            .expect_err("bytes over limit should fail");
+        assert!(matches!(byte_limit, StoreError::Conflict(_)));
+
+        let object_limit = backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-3".to_string(),
+                scope: scope.clone(),
+                key: ObjectKey::new("tenant-b::three"),
+                expected_object_version: None,
+                delta_bytes: 1,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(128),
+                    max_objects: Some(1),
+                },
+                expires_at_ms: 120,
+                created_at_ms: 12,
+                writer_runtime: writer,
+            })
+            .expect_err("objects over limit should fail");
+        assert!(matches!(object_limit, StoreError::Conflict(_)));
+
+        let reservations = backend
+            .list_tenant_quota_reservations(&scope)
+            .expect("reservation listing should succeed");
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].reservation_id, "resv-1");
+        let quota = backend
+            .get_tenant_quota_state(&scope)
+            .expect("quota state lookup should succeed")
+            .expect("quota state should exist");
+        assert_eq!(quota.pending_reserved_bytes, 40);
+        assert_eq!(quota.pending_reserved_objects, 1);
     }
 }

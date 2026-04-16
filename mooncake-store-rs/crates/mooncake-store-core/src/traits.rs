@@ -6,7 +6,10 @@ use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    SegmentReservation, TenantPolicy, TenantPolicyScope,
+    SegmentReservation, TenantObjectAccounting, TenantPolicy, TenantPolicyScope,
+    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
+    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
+    TenantQuotaState,
 };
 
 pub trait MetadataBackend: Send + Sync {
@@ -130,6 +133,31 @@ pub trait MetadataBackend: Send + Sync {
         scope: &TenantPolicyScope,
         expected_version: Option<u64>,
     ) -> Result<bool>;
+
+    fn get_tenant_quota_state(&self, scope: &TenantPolicyScope)
+        -> Result<Option<TenantQuotaState>>;
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<Option<TenantObjectAccounting>>;
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> Result<Vec<TenantQuotaReservation>>;
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &TenantQuotaReservationRequest,
+    ) -> Result<TenantQuotaReservationOutcome>;
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &TenantQuotaFinalizeRequest,
+    ) -> Result<TenantQuotaFinalizeOutcome>;
+
+    fn abort_tenant_quota(&self, reservation_id: &str) -> Result<TenantQuotaAbortOutcome>;
 
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()>;
 
