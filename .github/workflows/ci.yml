@@ -343,6 +343,14 @@ jobs:
 
     - name: Run tests with ssd
       run: |
+        # Reserve port 50052 (mooncake_client RPC port) so the kernel never
+        # auto-allocates it as ephemeral source port for other outbound
+        # connections in the test suite. Without this, a random Python test
+        # connection can pick src_port=50052, leave a TIME_WAIT on
+        # <eth0_ip>:50052 for 60s, and block mooncake_client's bind to
+        # 0.0.0.0:50052 even with SO_REUSEADDR (Linux only relaxes
+        # TIME_WAIT+bind conflict for same-IP or loopback).
+        sudo sysctl -w net.ipv4.ip_local_reserved_ports=50052
         source test_env/bin/activate
         MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
         rm -rf /tmp/mooncake_test_ssd
