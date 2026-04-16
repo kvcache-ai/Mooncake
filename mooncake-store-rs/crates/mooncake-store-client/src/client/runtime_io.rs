@@ -1,4 +1,15 @@
 impl StoreClient {
+    fn expect_exactly_one_control_plane_result<T>(
+        items: Vec<T>,
+        operation: &str,
+    ) -> std::result::Result<T, StoreError> {
+        Self::expect_exactly_one(items, &format!("control plane {operation}"))
+            .map_err(|error| match error {
+                StoreError::InvalidState(message) => StoreError::Transport(message),
+                other => other,
+            })
+    }
+
     fn enforce_namespace_quota(
         &self,
         object_id: &LogicalObjectId,
@@ -394,11 +405,7 @@ impl StoreClient {
             if object_id.scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
                 object = object.object_set(object_id.scope.object_set.as_str());
             }
-            let payload = writer
-                .batch_get(&[object])?
-                .into_iter()
-                .next()
-                .ok_or_else(|| StoreError::InvalidState("missing batch_get result".to_string()))?;
+            let payload = Self::expect_exactly_one(writer.batch_get(&[object])?, "batch_get")?;
             let Some(confirmed) = self.query_route_by_object_id(&object_id)? else {
                 return Ok(false);
             };
@@ -594,17 +601,13 @@ impl StoreClient {
             expected: None,
             next: Some(route.clone()),
         };
-        let mut results = self.control_client.batch_replace_routes(
+        let results = self.control_client.batch_replace_routes(
             authority,
             &namespace,
             &authority.runtime.stable_id,
             &[request],
         )?;
-        results.pop().ok_or_else(|| {
-            StoreError::Transport(
-                "control plane replace route reply is missing batch item".to_string(),
-            )
-        })?
+        Self::expect_exactly_one_control_plane_result(results, "replace route")?
     }
 
     fn get_route_from_authority(
@@ -616,17 +619,13 @@ impl StoreClient {
         if authority.runtime.stable_id == self.lease.runtime.stable_id {
             return authority_get(&namespace, &authority.runtime.stable_id, key);
         }
-        let mut results = self.control_client.batch_get_routes(
+        let results = self.control_client.batch_get_routes(
             authority,
             &namespace,
             &authority.runtime.stable_id,
             std::slice::from_ref(key),
         )?;
-        results.pop().ok_or_else(|| {
-            StoreError::Transport(
-                "control plane route get reply is missing batch item".to_string(),
-            )
-        })?
+        Self::expect_exactly_one_control_plane_result(results, "get route")?
     }
 
     fn ensure_authority_route_not_stale(

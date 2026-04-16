@@ -114,6 +114,18 @@ pub trait MooncakeCompatibilityFacade {
 }
 
 impl StoreClient {
+    fn expect_exactly_one<T>(mut items: Vec<T>, operation: &str) -> Result<T> {
+        match items.len() {
+            1 => Ok(items.pop().expect("single-item vector should contain one element")),
+            0 => Err(StoreError::InvalidState(format!(
+                "expected exactly one {operation} result, got 0"
+            ))),
+            len => Err(StoreError::InvalidState(format!(
+                "expected exactly one {operation} result, got {len}"
+            ))),
+        }
+    }
+
     fn shared_batch_replication_policy(
         requests: &[PutRequest<'_>],
     ) -> Option<Option<ReplicationPolicy>> {
@@ -975,10 +987,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         .entered();
         let tracker = OperationTracker::new("get");
         let objects = [ObjectRef::new(key).tenant(tenant)];
-        let mut results = self.batch_get(&objects)?;
-        let result = results
-            .pop()
-            .ok_or_else(|| StoreError::InvalidState("missing batch_get result".to_string()));
+        let result = Self::expect_exactly_one(self.batch_get(&objects)?, "batch_get");
         let bytes_out = result.as_ref().map(|value| value.len() as u64).unwrap_or(0);
         tracker.finish(&result, bytes_out);
         result
@@ -999,10 +1008,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         .entered();
         let tracker = OperationTracker::new("get_into");
         let mut requests = [GetRequest::new(key, buffer).tenant(tenant)];
-        let mut sizes = self.batch_get_into(&mut requests)?;
-        let result = sizes
-            .pop()
-            .ok_or_else(|| StoreError::InvalidState("missing batch_get_into result".to_string()));
+        let result = Self::expect_exactly_one(self.batch_get_into(&mut requests)?, "batch_get_into");
         let bytes_out = result.as_ref().copied().unwrap_or(0) as u64;
         tracker.finish(&result, bytes_out);
         result
