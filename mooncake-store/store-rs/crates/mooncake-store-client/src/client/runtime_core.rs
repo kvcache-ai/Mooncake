@@ -184,6 +184,47 @@ impl StoreClient {
         lease
     }
 
+    pub fn repair_local_metadata_after_heartbeat_recovery(&self) -> Result<()> {
+        let _span = info_span!(
+            "store.repair_local_metadata",
+            runtime = %self.lease.runtime
+        )
+        .entered();
+        let tracker = OperationTracker::new("repair_local_metadata");
+        let result = (|| {
+            bootstrap_route_policy(
+                self.metadata.as_ref(),
+                &self.lease(),
+                self.route_control,
+                self.route_topk,
+            )?;
+            let announcements = self.allocator.lock().announcements();
+            for announcement in &announcements {
+                self.metadata.publish_segment(announcement)?;
+            }
+            Ok(announcements.len())
+        })();
+        match &result {
+            Ok(republished) => {
+                info!(
+                    runtime = %self.lease.runtime,
+                    republished_segments = *republished,
+                    "repaired local metadata after heartbeat recovery"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    runtime = %self.lease.runtime,
+                    error = %error,
+                    "failed to repair local metadata after heartbeat recovery"
+                );
+            }
+        }
+        let metric_result: Result<()> = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        tracker.finish(&metric_result, 0);
+        result.map(|_| ())
+    }
+
     pub fn default_tenant(&self) -> &str {
         &self.default_tenant
     }

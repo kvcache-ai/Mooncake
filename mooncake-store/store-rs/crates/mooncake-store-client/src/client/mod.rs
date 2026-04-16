@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::slice;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     Arc, OnceLock,
 };
 use std::thread::sleep;
@@ -88,6 +88,7 @@ pub struct StoreClient {
     lifecycle_state: SharedLifecycleState,
     route_write_gate: SharedRouteWriteGate,
     startup_activation_pending: AtomicBool,
+    heartbeat_repair_pending: AtomicUsize,
     state: Mutex<StoreState>,
 }
 

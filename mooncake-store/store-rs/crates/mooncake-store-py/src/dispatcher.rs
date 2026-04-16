@@ -47,6 +47,7 @@ struct HeartbeatLoopHandle {
 
 #[derive(Clone)]
 struct HealthPublisher {
+    client: Arc<StoreClient>,
     health: Arc<HealthChannel>,
     closed: Arc<AtomicBool>,
     health_inflight: Arc<AtomicBool>,
@@ -457,6 +458,7 @@ impl StoreDispatcher {
 
     fn health_publisher(&self) -> HealthPublisher {
         HealthPublisher {
+            client: self.client.clone(),
             health: self.health.clone(),
             closed: self.closed.clone(),
             health_inflight: self.health_inflight.clone(),
@@ -470,6 +472,10 @@ impl StoreDispatcher {
 impl HealthPublisher {
     fn heartbeat(&self, expires_at_ms: u64) -> Result<(), StoreError> {
         let heartbeat = self.health.prepare_heartbeat(expires_at_ms);
+        let recovered_from_failures = {
+            let heartbeat = self.heartbeat_health.lock();
+            heartbeat.consecutive_failures > 0
+        };
         let result = run_health_update(
             self.closed.as_ref(),
             self.health_inflight.clone(),
@@ -477,12 +483,23 @@ impl HealthPublisher {
             "heartbeat publish",
             heartbeat,
         );
-        if result.is_ok() {
-            self.record_heartbeat_success();
-        } else {
-            self.record_heartbeat_failure();
+        match result {
+            Ok(()) => {
+                if recovered_from_failures {
+                    if let Err(error) = self.client.repair_local_metadata_after_heartbeat_recovery()
+                    {
+                        self.record_heartbeat_failure();
+                        return Err(error);
+                    }
+                }
+                self.record_heartbeat_success();
+                Ok(())
+            }
+            Err(error) => {
+                self.record_heartbeat_failure();
+                Err(error)
+            }
         }
-        result
     }
 
     fn record_heartbeat_success(&self) {
