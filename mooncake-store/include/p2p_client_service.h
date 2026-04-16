@@ -1,11 +1,12 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
-#include <future>
 #include <async_simple/Try.h>
 
 #include "client_service.h"
@@ -230,11 +231,6 @@ class P2PClientService final : public ClientService {
         const std::string& key, std::vector<Slice>& slices,
         const WriteRouteRequestConfig& config);
 
-    void OnRemoteWriteComplete(
-        std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise,
-        async_simple::Try<tl::expected<UUID, ErrorCode>> result,
-        const std::string& key, const P2PProxyDescriptor& proxy);
-
     tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> allocator,
@@ -244,18 +240,14 @@ class P2PClientService final : public ClientService {
         const std::string& key, std::vector<Slice>& slices,
         const ReadRouteConfig& config);
 
-    struct ResolvedRoute {
-        PeerClient* peer = nullptr;
-        uint64_t object_size = 0;
-        bool is_cached = false;
-    };
-
-    tl::expected<ResolvedRoute, ErrorCode> ResolveRoute(
-        const std::string& key, const ReadRouteConfig& config);
-
+    /**
+     * @brief Launch async reads driven by a RouteIterator.
+     *
+     * Creates a ReadRetryContinuation that fires the first RPC immediately
+     * and chains subsequent candidates on failure (no stack recursion).
+     */
     tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
-        const std::string& key, std::vector<Slice>& slices,
-        const ReadRouteConfig& config, const ResolvedRoute* resolved = nullptr);
+        const std::string& key, std::vector<Slice>& slices, RouteIterator iter);
 
     /**
      * @brief Query Master for replica list and calculate total object size.
@@ -270,6 +262,47 @@ class P2PClientService final : public ClientService {
      * Thread-safe via peer_clients_mutex_.
      */
     PeerClient& GetOrCreatePeerClient(const std::string& endpoint);
+
+   private:
+    struct ResolvedRoute {
+        PeerClient* peer = nullptr;
+        uint64_t object_size = 0;
+        bool is_cached = false;
+        P2PProxyDescriptor proxy;  // for RemoveReplica on stale-cache eviction
+    };
+
+    // Yields ResolvedRoute candidates from cache first, then a one-shot lazy
+    // master fallback. Call Prime() to pre-load before accessing object_size().
+    class RouteIterator {
+       public:
+        RouteIterator(std::string key, std::vector<ResolvedRoute> initial,
+                      uint64_t object_size, RouteCache* route_cache,
+                      std::function<std::vector<ResolvedRoute>()> master_fetch);
+
+        uint64_t object_size() const { return object_size_; }
+        bool empty() const { return routes_.empty() && master_queried_; }
+
+        void Prime();
+        std::optional<ResolvedRoute> Next();
+        void Evict(const ResolvedRoute& route);
+
+       private:
+        void UpsertToCache(const std::vector<ResolvedRoute>& routes);
+
+        std::string key_;
+        std::vector<ResolvedRoute> routes_;
+        size_t idx_ = 0;
+        bool master_queried_ = false;
+        uint64_t object_size_ = 0;
+        RouteCache* route_cache_ = nullptr;
+        std::function<std::vector<ResolvedRoute>()> master_fetch_;
+    };
+
+    tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
+        const std::string& key, const ReadRouteConfig& config);
+
+    std::vector<ResolvedRoute> ResolveRoutesFromMaster(
+        const std::string& key, const ReadRouteConfig& config);
 
    private:
     P2PMasterClient master_client_;
