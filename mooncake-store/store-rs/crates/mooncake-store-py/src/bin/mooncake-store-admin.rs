@@ -1,17 +1,13 @@
 use std::error::Error;
-use std::sync::Arc;
 
 use _store_rs::admin::{
     format_policy_scope, format_route_policy_domain, redact_redis_url, route_policy_domain,
     AdminService, PolicyPatchInput,
 };
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
+use mooncake_metadata::MetadataKeyspace;
 use mooncake_store_client::{init_tracing, RouteControlMode};
-use mooncake_store_core::{
-    MetadataBackend, RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaPolicy,
-    TenantRoutePolicy,
-};
+use mooncake_store_core::{RoutePolicy, TenantPolicy, TenantPolicySpec};
 
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-admin")]
@@ -416,8 +412,13 @@ fn cleanup_stale_segments(service: &AdminService) -> Result<(), Box<dyn Error>> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use clap::Parser;
+    use mooncake_metadata::InMemoryMetadataBackend;
+    use mooncake_store_core::{MetadataBackend, TenantQuotaPolicy, TenantRoutePolicy};
+
+    use super::*;
 
     #[test]
     fn route_control_arg_maps_to_runtime_mode() {
