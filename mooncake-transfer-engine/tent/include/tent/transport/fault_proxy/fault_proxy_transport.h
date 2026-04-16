@@ -16,6 +16,7 @@
 #define TENT_FAULT_PROXY_TRANSPORT_H
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <memory>
 #include <random>
@@ -52,7 +53,9 @@ struct FaultPolicy {
 class FaultProxyTransport : public Transport {
    public:
     FaultProxyTransport(std::shared_ptr<Transport> real, FaultPolicy policy)
-        : real_(std::move(real)), policy_(policy), submit_count_(0) {}
+        : real_(std::move(real)), policy_(policy), submit_count_(0) {
+        assert(real_ && "FaultProxyTransport: real transport must not be null");
+    }
 
     // -- Lifecycle -----------------------------------------------------------
 
@@ -136,8 +139,26 @@ class FaultProxyTransport : public Transport {
         return real_->addMemoryBuffer(desc, options);
     }
 
+    Status addMemoryBuffer(std::vector<BufferDesc>& desc_list,
+                           const MemoryOptions& options) override {
+        return real_->addMemoryBuffer(desc_list, options);
+    }
+
     Status removeMemoryBuffer(BufferDesc& desc) override {
         return real_->removeMemoryBuffer(desc);
+    }
+
+    Status allocateLocalMemory(void** addr, size_t size,
+                               MemoryOptions& options) override {
+        return real_->allocateLocalMemory(addr, size, options);
+    }
+
+    Status freeLocalMemory(void* addr, size_t size) override {
+        return real_->freeLocalMemory(addr, size);
+    }
+
+    bool warmupMemory(void* addr, size_t length) override {
+        return real_->warmupMemory(addr, length);
     }
 
     // -- Notifications (pass-through) ----------------------------------------
