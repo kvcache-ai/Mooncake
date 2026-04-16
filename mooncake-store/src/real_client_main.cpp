@@ -116,7 +116,8 @@ int main(int argc, char *argv[]) {
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
     RegisterClientRpcService(server, *client_inst);
 
-    LOG(INFO) << "Starting real client service on " << FLAGS_host << ":" << FLAGS_port;
+    LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"
+              << FLAGS_port;
 
     return server.start();
 }
