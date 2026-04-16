@@ -1025,7 +1025,7 @@ impl StoreClient {
     }
 
     pub fn health_channel(&self) -> HealthChannel {
-        HealthChannel::new(self.metadata.clone(), self.lease.clone())
+        HealthChannel::new(self.metadata.clone(), self.lease())
     }
 
     pub fn evacuate_owned_replicas_when_draining(&self) -> Result<usize> {
@@ -1036,6 +1036,7 @@ impl StoreClient {
     }
 
     pub fn prepare_heartbeat(&mut self, expires_at_ms: u64) -> HeartbeatLease {
+        self.lease.state = self.lifecycle_state();
         self.lease.expires_at_ms = expires_at_ms;
         HealthUpdate::heartbeat(self.metadata.clone(), self.lease.clone())
     }

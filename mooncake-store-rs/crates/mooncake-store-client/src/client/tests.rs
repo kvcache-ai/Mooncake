@@ -5927,6 +5927,36 @@ fn builder_can_stage_active_until_local_memory_registration() {
 }
 
 #[test]
+fn heartbeat_keeps_staged_client_active_after_local_memory_registration() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("staged-heartbeat-segment"));
+    let mut client = StoreClientBuilder::new(metadata.clone(), "staged-heartbeat")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .activate_on_local_memory_registration()
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(storage_config_with_bytes(512))
+        .build(test_future_expiry_ms())
+        .expect("staged heartbeat client should build");
+
+    client
+        .register_local_memory()
+        .expect("local memory registration should activate staged heartbeat client");
+    client
+        .heartbeat(test_future_expiry_ms())
+        .expect("heartbeat should preserve the active lifecycle state");
+
+    let lease = metadata
+        .list_live_clients()
+        .expect("live clients should list")
+        .into_iter()
+        .find(|lease| lease.runtime == *client.runtime_id())
+        .expect("heartbeat lease should exist");
+    assert_eq!(lease.state, ClientLifecycleState::Active);
+}
+
+#[test]
 fn heartbeat_recovery_republishes_local_metadata_after_long_redis_outage() {
     let inner = Arc::new(InMemoryMetadataBackend::new());
     let metadata = Arc::new(RecoverableMetadataBackend::new(inner));
