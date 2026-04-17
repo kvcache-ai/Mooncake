@@ -117,7 +117,7 @@ static int runTarget(TransferEngine* engine) {
     LOG(INFO) << "Registering " << num_bufs << " buffers on all NICs...";
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < num_bufs; ++i) {
-        int ret = engine->registerLocalMemory(bufs[i], buf_bytes, "cpu:0", true);
+        int ret = engine->registerLocalMemory(bufs[i], buf_bytes, "*", true);
         if (ret != 0) {
             LOG(ERROR) << "registerLocalMemory failed at buffer " << i
                        << ": ret=" << ret;
@@ -254,155 +254,135 @@ static int runInitiator(TransferEngine* engine) {
     engine->syncSegmentCache(FLAGS_target);
     segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
 
-    // Warmup iterations
-    LOG(INFO) << "Running " << FLAGS_warmup << " warmup rounds...";
-    for (int w = 0; w < FLAGS_warmup; ++w) {
-        for (int i = 0; i < FLAGS_iterations; ++i) {
-            size_t buf_idx = i % num_remote_bufs;
-            uint64_t remote_addr = segment_desc->buffers[buf_idx].addr;
-            size_t remote_len = segment_desc->buffers[buf_idx].length;
-            size_t actual_xfer = std::min(transfer_bytes, remote_len);
+    // Worker function: each thread runs its own transfer loop
+    struct ThreadResult {
+        std::vector<double> latencies;
+        int errors = 0;
+    };
 
-            auto batch_id = engine->allocateBatchID(1);
+    auto workerFn = [&](int tid, int warmup_iters, int bench_iters,
+                        ThreadResult* result) {
+        void* my_recv = recv_bufs[tid];
+        for (int w = 0; w < warmup_iters; ++w) {
+            size_t buf_idx = (tid + w * FLAGS_threads) % num_remote_bufs;
+            uint64_t raddr = segment_desc->buffers[buf_idx].addr;
+            size_t rlen = segment_desc->buffers[buf_idx].length;
+            size_t xfer = std::min(transfer_bytes, rlen);
+
+            auto bid = engine->allocateBatchID(1);
             TransferRequest req;
             req.opcode = TransferRequest::READ;
-            req.source = (uint8_t*)recv_bufs[0];
+            req.source = (uint8_t*)my_recv;
             req.target_id = segment_id;
-            req.target_offset = remote_addr;
-            req.length = actual_xfer;
-            engine->submitTransfer(batch_id, {req});
+            req.target_offset = raddr;
+            req.length = xfer;
+            engine->submitTransfer(bid, {req});
             while (true) {
-                TransferStatus status;
-                engine->getTransferStatus(batch_id, 0, status);
-                if (status.s == TransferStatusEnum::COMPLETED ||
-                    status.s == TransferStatusEnum::FAILED)
+                TransferStatus st;
+                engine->getTransferStatus(bid, 0, st);
+                if (st.s == TransferStatusEnum::COMPLETED ||
+                    st.s == TransferStatusEnum::FAILED)
                     break;
             }
-            engine->freeBatchID(batch_id);
-        }
-    }
-
-    // Benchmark: single-buffer reads from different remote buffers
-    LOG(INFO) << "Benchmarking " << FLAGS_iterations
-              << " iterations across " << num_remote_bufs << " remote buffers...";
-
-    std::vector<double> latencies;
-    int errors = 0;
-
-    for (int i = 0; i < FLAGS_iterations; ++i) {
-        size_t buf_idx = i % num_remote_bufs;
-        uint64_t remote_addr = segment_desc->buffers[buf_idx].addr;
-        size_t remote_len = segment_desc->buffers[buf_idx].length;
-        size_t actual_xfer = std::min(transfer_bytes, remote_len);
-
-        auto t0 = std::chrono::steady_clock::now();
-
-        auto batch_id = engine->allocateBatchID(1);
-        TransferRequest req;
-        req.opcode = TransferRequest::READ;
-        req.source = (uint8_t*)recv_bufs[0];
-        req.target_id = segment_id;
-        req.target_offset = remote_addr;
-        req.length = actual_xfer;
-        auto s = engine->submitTransfer(batch_id, {req});
-        if (!s.ok()) {
-            LOG(ERROR) << "submitTransfer failed at iter " << i;
-            errors++;
-            engine->freeBatchID(batch_id);
-            continue;
+            engine->freeBatchID(bid);
         }
 
-        while (true) {
-            TransferStatus status;
-            engine->getTransferStatus(batch_id, 0, status);
-            if (status.s == TransferStatusEnum::COMPLETED) break;
-            if (status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "Transfer FAILED at iter " << i;
-                errors++;
-                break;
+        for (int i = 0; i < bench_iters; ++i) {
+            size_t buf_idx =
+                (tid + i * FLAGS_threads) % num_remote_bufs;
+            uint64_t raddr = segment_desc->buffers[buf_idx].addr;
+            size_t rlen = segment_desc->buffers[buf_idx].length;
+            size_t xfer = std::min(transfer_bytes, rlen);
+
+            auto t0 = std::chrono::steady_clock::now();
+            auto bid = engine->allocateBatchID(1);
+            TransferRequest req;
+            req.opcode = TransferRequest::READ;
+            req.source = (uint8_t*)my_recv;
+            req.target_id = segment_id;
+            req.target_offset = raddr;
+            req.length = xfer;
+            auto s = engine->submitTransfer(bid, {req});
+            if (!s.ok()) {
+                result->errors++;
+                engine->freeBatchID(bid);
+                continue;
+            }
+            bool ok = false;
+            while (true) {
+                TransferStatus st;
+                engine->getTransferStatus(bid, 0, st);
+                if (st.s == TransferStatusEnum::COMPLETED) { ok = true; break; }
+                if (st.s == TransferStatusEnum::FAILED) {
+                    result->errors++;
+                    break;
+                }
+            }
+            engine->freeBatchID(bid);
+            if (ok) {
+                auto t1 = std::chrono::steady_clock::now();
+                result->latencies.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
             }
         }
-        engine->freeBatchID(batch_id);
+    };
 
-        auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        latencies.push_back(ms);
+    // Run warmup + benchmark with threads
+    int num_threads = FLAGS_threads;
+    LOG(INFO) << "Running with " << num_threads << " threads, "
+              << FLAGS_warmup << " warmup + " << FLAGS_iterations
+              << " bench iterations per thread...";
+
+    std::vector<ThreadResult> results(num_threads);
+    std::vector<std::thread> threads;
+
+    auto wall_t0 = std::chrono::steady_clock::now();
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back(workerFn, t, FLAGS_warmup * FLAGS_iterations,
+                             FLAGS_iterations, &results[t]);
+    }
+    for (auto& th : threads) th.join();
+    auto wall_t1 = std::chrono::steady_clock::now();
+    double wall_ms =
+        std::chrono::duration<double, std::milli>(wall_t1 - wall_t0).count();
+
+    // Aggregate results
+    std::vector<double> all_latencies;
+    int total_errors = 0;
+    for (auto& r : results) {
+        all_latencies.insert(all_latencies.end(), r.latencies.begin(),
+                             r.latencies.end());
+        total_errors += r.errors;
     }
 
-    if (latencies.empty()) {
+    if (all_latencies.empty()) {
         LOG(ERROR) << "All transfers failed";
         return 1;
     }
 
-    auto stats = computeStats(latencies, transfer_bytes);
-    LOG(INFO) << "=== Results ===";
-    LOG(INFO) << "Transfer: " << FLAGS_transfer_mb << " MB";
-    LOG(INFO) << "Iterations: " << latencies.size()
-              << " (errors: " << errors << ")";
-    LOG(INFO) << "Avg latency:  " << stats.avg_ms << " ms";
-    LOG(INFO) << "p50 latency:  " << stats.p50_ms << " ms";
-    LOG(INFO) << "p99 latency:  " << stats.p99_ms << " ms";
-    LOG(INFO) << "Throughput:   " << stats.throughput_gbs << " GB/s";
+    auto stats = computeStats(all_latencies, transfer_bytes);
+    size_t total_xfers = all_latencies.size();
+    double total_bytes = (double)total_xfers * transfer_bytes;
+    double agg_throughput = total_bytes / 1e9 / (wall_ms / 1000.0);
 
-    // Multi-block batch test: read from multiple remote buffers in one batch
-    if (num_remote_bufs >= 4) {
-        LOG(INFO) << "\n=== Multi-block batch transfer test ===";
-        int batch_n = std::min((int)num_remote_bufs, 16);
-        size_t per_block = std::min(transfer_bytes / batch_n, (size_t)(64 << 20));
+    LOG(INFO) << "=== Results (" << num_threads << " threads) ===";
+    LOG(INFO) << "Transfer: " << FLAGS_transfer_mb << " MB x "
+              << total_xfers << " transfers";
+    LOG(INFO) << "Wall time: " << wall_ms << " ms";
+    LOG(INFO) << "Per-transfer p50: " << stats.p50_ms << " ms"
+              << "  p99: " << stats.p99_ms << " ms";
+    LOG(INFO) << "Per-transfer throughput: " << stats.throughput_gbs << " GB/s";
+    LOG(INFO) << "Aggregate throughput: " << agg_throughput << " GB/s";
+    LOG(INFO) << "Errors: " << total_errors;
 
-        // Allocate a larger recv buffer for batch
-        size_t batch_recv_bytes = per_block * batch_n;
-        void* batch_recv = allocateHugepage(batch_recv_bytes);
-        if (batch_recv) {
-            int ret = engine->registerLocalMemory(batch_recv, batch_recv_bytes,
-                                                  "cpu:0", true);
-            if (ret == 0) {
-                std::vector<double> batch_latencies;
-                for (int i = 0; i < FLAGS_iterations; ++i) {
-                    auto batch_id = engine->allocateBatchID(batch_n);
-                    std::vector<TransferRequest> reqs;
-                    for (int b = 0; b < batch_n; ++b) {
-                        TransferRequest req;
-                        req.opcode = TransferRequest::READ;
-                        req.source = (uint8_t*)batch_recv + b * per_block;
-                        req.target_id = segment_id;
-                        req.target_offset =
-                            segment_desc->buffers[b % num_remote_bufs].addr;
-                        req.length = per_block;
-                        reqs.push_back(req);
-                    }
-
-                    auto t0 = std::chrono::steady_clock::now();
-                    engine->submitTransfer(batch_id, reqs);
-                    for (int b = 0; b < batch_n; ++b) {
-                        while (true) {
-                            TransferStatus status;
-                            engine->getTransferStatus(batch_id, b, status);
-                            if (status.s == TransferStatusEnum::COMPLETED ||
-                                status.s == TransferStatusEnum::FAILED)
-                                break;
-                        }
-                    }
-                    auto t1 = std::chrono::steady_clock::now();
-                    engine->freeBatchID(batch_id);
-                    batch_latencies.push_back(
-                        std::chrono::duration<double, std::milli>(t1 - t0)
-                            .count());
-                }
-
-                auto bstats =
-                    computeStats(batch_latencies, per_block * batch_n);
-                LOG(INFO) << "Batch " << batch_n << " x "
-                          << per_block / (1024 * 1024) << " MB:";
-                LOG(INFO) << "  Avg: " << bstats.avg_ms << " ms"
-                          << "  p50: " << bstats.p50_ms << " ms"
-                          << "  Throughput: " << bstats.throughput_gbs
-                          << " GB/s";
-
-                engine->unregisterLocalMemory(batch_recv);
-            }
-            munmap(batch_recv, batch_recv_bytes);
-        }
+    // Per-thread stats
+    for (int t = 0; t < num_threads; ++t) {
+        if (results[t].latencies.empty()) continue;
+        auto ts = computeStats(results[t].latencies, transfer_bytes);
+        LOG(INFO) << "  Thread " << t << ": p50=" << ts.p50_ms
+                  << "ms  tput=" << ts.throughput_gbs << " GB/s"
+                  << "  iters=" << results[t].latencies.size()
+                  << "  errors=" << results[t].errors;
     }
 
     // Cleanup
@@ -410,7 +390,7 @@ static int runInitiator(TransferEngine* engine) {
         engine->unregisterLocalMemory(recv_bufs[t]);
         munmap(recv_bufs[t], recv_bytes);
     }
-    return errors > 0 ? 1 : 0;
+    return total_errors > 0 ? 1 : 0;
 }
 
 int main(int argc, char** argv) {
@@ -446,6 +426,9 @@ int main(int argc, char** argv) {
         LOG(ERROR) << "installTransport(efa) failed";
         return 1;
     }
+
+    std::string actual_server = engine->getLocalIpAndPort();
+    LOG(INFO) << "Actual server name (use this for --target): " << actual_server;
 
     if (FLAGS_mode == "target") {
         ret = runTarget(engine.get());
