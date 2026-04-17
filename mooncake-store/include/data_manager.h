@@ -38,8 +38,7 @@ struct ReadTaskHandle {
  * @brief Configuration for local data transfer operations
  */
 struct LocalTransferConfig {
-    P2PClientConfig::LocalTransferMode mode =
-        P2PClientConfig::LocalTransferMode::TE;
+    LocalTransferMode mode = LocalTransferMode::TE;
 
     // When mode == TE, the following parameters are used:
     std::string te_endpoint;
@@ -95,6 +94,11 @@ class DataManager {
     // Public local read/write interface
     // Internally selects TE or Memcpy path based on config.
     // ================================================================
+
+    // The Put operation consists of three phases:
+    // 1. Allocation: allocate memory from the tiered backend for the data
+    // 2. Write: write the data to the allocated memory
+    // 3. Commit: commit the data to the tiered backend
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> Put(
         const std::string& key, std::vector<Slice>& slices);
 
@@ -177,6 +181,11 @@ class DataManager {
                std::optional<UUID> tier_id = std::nullopt) const;
 
    private:
+    std::shared_mutex& GetKeyLock(const std::string& key) {
+        size_t hash = std::hash<std::string>{}(key);
+        return lock_shards_[hash % lock_shard_count_];
+    }
+
     /**
      * @brief Transfer data from local source to remote destination buffers
      * @param handle Local allocation handle (source)
@@ -197,11 +206,6 @@ class DataManager {
     tl::expected<void, ErrorCode> TransferDataFromRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
-
-    std::shared_mutex& GetKeyLock(const std::string& key) {
-        size_t hash = std::hash<std::string>{}(key);
-        return lock_shards_[hash % lock_shard_count_];
-    }
 
     tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopier(
         const AllocationHandle& handle, const std::string& key,
@@ -326,7 +330,7 @@ class DataManager {
             batches);
 
    private:
-    std::unique_ptr<TieredBackend> tiered_backend_;
+    std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
 
     // Sharded locks for concurrent access

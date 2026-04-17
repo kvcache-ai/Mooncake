@@ -44,10 +44,10 @@ class P2PClientIntegrationTest : public ::testing::Test {
             /*local_buffer_size=*/0, nullptr, "", rpc_port);
         if (local_transfer_mode == "te") {
             config.local_transfer_mode =
-                P2PClientConfig::LocalTransferMode::TE;
+                LocalTransferMode::TE;
         } else {
             config.local_transfer_mode =
-                P2PClientConfig::LocalTransferMode::MEMCPY;
+                LocalTransferMode::MEMCPY;
         }
 
         auto client = std::make_shared<P2PClientService>(

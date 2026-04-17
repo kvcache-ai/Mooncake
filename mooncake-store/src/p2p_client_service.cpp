@@ -11,6 +11,8 @@
 #include <async_simple/Try.h>
 #include <async_simple/coro/Lazy.h>
 
+#include "utils/scoped_vlog_timer.h"
+
 namespace mooncake {
 
 // ============================================================================
@@ -160,7 +162,7 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 
     LocalTransferConfig local_transfer_config;
     local_transfer_config.mode = config.local_transfer_mode;
-    if (config.local_transfer_mode == P2PClientConfig::LocalTransferMode::TE) {
+    if (config.local_transfer_mode == LocalTransferMode::TE) {
         local_transfer_config.te_endpoint = get_te_endpoint();
     } else {
         local_transfer_config.local_memcpy_async_worker_num =
@@ -378,24 +380,31 @@ P2PClientService::RegisterClient() {
 tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
                                                     std::vector<Slice>& slices,
                                                     const WriteConfig& config) {
+    ScopedVLogTimer timer(1, "P2PClientService::Put");
+    timer.LogRequest("key=", key, "slice_count=", slices.size());
+
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
+        timer.LogResponse("error_code=", ErrorCode::SHUTTING_DOWN);
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
     const auto* route_config = std::get_if<WriteRouteRequestConfig>(&config);
     if (!route_config) {
         LOG(ERROR) << "P2PClientService currently only supports "
                       "WriteRouteRequestConfig";
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto task_handle_ptr = CreatePutHandle(key, slices, *route_config);
     if (!task_handle_ptr) {
         LOG(ERROR) << "Failed to create put handle for key: " << key
                    << ", error: " << task_handle_ptr.error();
+        timer.LogResponse("error_code=", task_handle_ptr.error());
         return tl::unexpected(task_handle_ptr.error());
     } else if (!task_handle_ptr.value()) {
         LOG(ERROR) << "put task handle is null for key: " << key;
+        timer.LogResponse("error_code=", ErrorCode::INTERNAL_ERROR);
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto result = task_handle_ptr.value()->Wait();
@@ -403,6 +412,7 @@ tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
         LOG(ERROR) << "Failed to put key: " << key
                    << ", error: " << result.error();
     }
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -410,9 +420,14 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const WriteConfig& config) {
+    ScopedVLogTimer timer(1, "P2PClientService::BatchPut");
+    timer.LogRequest("batch_size=", keys.size());
+
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
+        timer.LogResponse("success=0 fail=", keys.size(),
+                          " error_code=", ErrorCode::SHUTTING_DOWN);
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::SHUTTING_DOWN));
     }
@@ -422,6 +437,8 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         LOG(ERROR) << "BatchPut input size mismatch";
         std::fill(results.begin(), results.end(),
                   tl::unexpected(ErrorCode::INVALID_PARAMS));
+        timer.LogResponse("success=0 fail=", keys.size(),
+                          " error_code=", ErrorCode::INVALID_PARAMS);
         return results;
     }
 
@@ -431,6 +448,8 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
                       "WriteRouteRequestConfig";
         std::fill(results.begin(), results.end(),
                   tl::unexpected(ErrorCode::INVALID_PARAMS));
+        timer.LogResponse("success=0 fail=", keys.size(),
+                          " error_code=", ErrorCode::INVALID_PARAMS);
         return results;
     }
 
@@ -461,6 +480,12 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
             results[i] = result;
         }
     }
+    size_t success_count = 0;
+    for (const auto& r : results) {
+        if (r) ++success_count;
+    }
+    timer.LogResponse("success=", success_count, " fail=",
+                      keys.size() - success_count);
     return results;
 }
 
@@ -627,13 +652,18 @@ P2PClientService::CreatePutHandle(const std::string& key,
 tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
     const std::string& key, std::shared_ptr<ClientBufferAllocator> allocator,
     const ReadRouteConfig& config) {
+    ScopedVLogTimer timer(1, "P2PClientService::Get");
+    timer.LogRequest("key=", key);
+
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
+        timer.LogResponse("error_code=", ErrorCode::SHUTTING_DOWN);
         return tl::unexpected(ErrorCode::SHUTTING_DOWN);
     }
     if (!allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -641,14 +671,17 @@ tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
     if (!handle) {
         LOG(ERROR) << "Failed to create get handle for key: " << key
                    << ", error: " << handle.error();
+        timer.LogResponse("error_code=", handle.error());
         return tl::unexpected(handle.error());
     }
     auto result = handle->task_handle->Wait();
     if (!result) {
         LOG(ERROR) << "get failed for key: " << key
                    << ", error: " << result.error();
+        timer.LogResponse("error_code=", result.error());
         return tl::unexpected(result.error());
     }
+    timer.LogResponse("error_code=", ErrorCode::OK);
     return handle->read_buf;
 }
 
@@ -656,13 +689,20 @@ std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
 P2PClientService::BatchGet(const std::vector<std::string>& keys,
                            std::shared_ptr<ClientBufferAllocator> allocator,
                            const ReadRouteConfig& config) {
+    ScopedVLogTimer timer(1, "P2PClientService::BatchGet");
+    timer.LogRequest("batch_size=", keys.size());
+
     std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>> results(
         keys.size(), tl::unexpected(ErrorCode::OK));
 
     auto batch_guard = AcquireInflightGuard();
     if (!batch_guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
-        for (auto& r : results) r = tl::unexpected(ErrorCode::SHUTTING_DOWN);
+        for (auto& r : results) {
+            r = tl::unexpected(ErrorCode::SHUTTING_DOWN);
+        }
+        timer.LogResponse("success=0 fail=", keys.size(),
+                          " error_code=", ErrorCode::SHUTTING_DOWN);
         return results;
     }
     if (!allocator) {
@@ -670,6 +710,8 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
         for (auto& r : results) {
             r = tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
+        timer.LogResponse("success=0 fail=", keys.size(),
+                          " error_code=", ErrorCode::INVALID_PARAMS);
         return results;
     }
 
@@ -697,15 +739,25 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
             results[i] = handles[i]->read_buf;
         }
     }
+    size_t success_count = 0;
+    for (const auto& r : results) {
+        if (r) ++success_count;
+    }
+    timer.LogResponse("success=", success_count, " fail=",
+                      keys.size() - success_count);
     return results;
 }
 
 tl::expected<int64_t, ErrorCode> P2PClientService::Get(
     const std::string& key, const std::vector<void*>& buffers,
     const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
+    ScopedVLogTimer timer(1, "P2PClientService::Get");
+    timer.LogRequest("key=", key, "buffer_count=", buffers.size());
+
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
+        timer.LogResponse("error_code=", ErrorCode::SHUTTING_DOWN);
         return tl::unexpected(ErrorCode::SHUTTING_DOWN);
     }
     std::vector<Slice> slices;
@@ -718,14 +770,17 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
     if (!handle) {
         LOG(ERROR) << "Failed to create get handle for key: " << key
                    << ", error: " << handle.error();
+        timer.LogResponse("error_code=", handle.error());
         return tl::unexpected(handle.error());
     }
     auto result = handle->task_handle->Wait();
     if (!result) {
         LOG(ERROR) << "Failed to wait for get handle for key: " << key
                    << ", error: " << result.error();
+        timer.LogResponse("error_code=", result.error());
         return tl::unexpected(result.error());
     }
+    timer.LogResponse("error_code=", ErrorCode::OK, " data_size=", handle->data_size);
     return handle->data_size;
 }
 
@@ -734,15 +789,22 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
     const std::vector<std::vector<void*>>& all_buffers,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReadRouteConfig& config, bool /*aggregate_same_segment_task*/) {
+    ScopedVLogTimer timer(1, "P2PClientService::BatchGet");
+    timer.LogRequest("batch_size=", keys.size());
+
     auto batch_guard = AcquireInflightGuard();
     if (!batch_guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
+        timer.LogResponse("success=0 fail=", keys.size(),
+                          " error_code=", ErrorCode::SHUTTING_DOWN);
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::SHUTTING_DOWN));
     }
 
     if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch";
+        timer.LogResponse("success=0 fail=", keys.size(),
+                          " error_code=", ErrorCode::INVALID_PARAMS);
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -780,6 +842,12 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
             results.push_back(handles[i]->data_size);
         }
     }
+    size_t success_count = 0;
+    for (const auto& r : results) {
+        if (r) ++success_count;
+    }
+    timer.LogResponse("success=", success_count, " fail=",
+                      keys.size() - success_count);
     return results;
 }
 
@@ -810,7 +878,8 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
     }
     auto& iter = iter_result.value();
 
-    // 3. Ensure object_size is known (triggers lazy master load on cache miss).
+    // 3. Ensure object_size is known
+    // (maybe trigger lazy master load on route cache miss).
     iter.Prime();
     if (iter.empty()) {
         return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -866,7 +935,8 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
     }
     auto& iter = iter_result.value();
 
-    // 3. Ensure routes are available (triggers lazy master load on cache miss).
+    // 3. Ensure routes are available
+    // (maybe trigger lazy master load on route cache miss)
     iter.Prime();
     if (iter.empty()) {
         return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -874,6 +944,8 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
 
     auto fetch_result = InnerGetViaRoute(key, slices, std::move(iter));
     if (!fetch_result) {
+        LOG(ERROR) << "Failed to inner get via route for key: " << key
+                   << ", error: " << fetch_result.error();
         return tl::unexpected(fetch_result.error());
     } else if (!fetch_result.value().task_handle) {
         LOG(ERROR) << "get task handle is null for key: " << key;
@@ -983,6 +1055,9 @@ void RouteIterator::Prime() {
     }
     master_queried_ = true;
     auto master_routes = master_fetch_();
+    if (master_routes.empty()) {
+        return;
+    }
     UpsertToCache(master_routes);
     routes_.insert(routes_.end(),
                    std::make_move_iterator(master_routes.begin()),
@@ -1001,11 +1076,14 @@ std::optional<ResolvedRoute> RouteIterator::Next() {
     }
     master_queried_ = true;
     auto master_routes = master_fetch_();
+    if (master_routes.empty()) {
+        return std::nullopt;
+    }
     UpsertToCache(master_routes);
     routes_.insert(routes_.end(),
                    std::make_move_iterator(master_routes.begin()),
                    std::make_move_iterator(master_routes.end()));
-    if (!routes_.empty() && object_size_ == 0) {
+    if (object_size_ == 0) {
         object_size_ = routes_[idx_].object_size;
     }
     if (idx_ < routes_.size()) {
@@ -1105,6 +1183,10 @@ P2PClientService::QueryReplicaSize(const std::string& key,
                                    const ReadRouteConfig& config) {
     auto replica_result = master_client_.GetReplicaList(key, config);
     if (!replica_result) {
+        if (replica_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to query replica size for key: " << key
+                       << ", error: " << replica_result.error();
+        }
         return tl::unexpected(replica_result.error());
     }
 

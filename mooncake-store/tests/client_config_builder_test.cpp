@@ -25,7 +25,7 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
     EXPECT_EQ(config.local_memcpy_async_worker_num, 32u);
     EXPECT_EQ(config.local_memcpy_async_queue_depth, 2048u);
     EXPECT_EQ(config.local_transfer_mode,
-              P2PClientConfig::LocalTransferMode::TE);
+              LocalTransferMode::TE);
 }
 
 TEST(ClientConfigBuilderTest, BuildP2PClientConfigAcceptsCustomAsyncCopyConfig) {
@@ -37,7 +37,7 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigAcceptsCustomAsyncCopyConfig) 
     EXPECT_EQ(config.local_memcpy_async_worker_num, 3u);
     EXPECT_EQ(config.local_memcpy_async_queue_depth, 256u);
     EXPECT_EQ(config.local_transfer_mode,
-              P2PClientConfig::LocalTransferMode::MEMCPY);
+              LocalTransferMode::MEMCPY);
 }
 
 TEST(ClientConfigBuilderTest, BuildP2PClientConfigRejectsInvalidTransferMode) {

@@ -84,7 +84,7 @@ class PeerClientTest : public ::testing::Test {
         // Create DataManager (MEMCPY mode: no TE endpoint available in unit
         // tests)
         LocalTransferConfig local_transfer_config;
-        local_transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+        local_transfer_config.mode = LocalTransferMode::MEMCPY;
         local_transfer_config.local_memcpy_async_worker_num = 32;
         local_transfer_config.local_memcpy_async_queue_depth = 2048;
         data_manager_ = std::make_unique<DataManager>(

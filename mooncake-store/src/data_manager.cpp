@@ -37,8 +37,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
         LOG(FATAL) << "TransferEngine cannot be null";
     }
 
-    if (local_transfer_config_.mode ==
-            P2PClientConfig::LocalTransferMode::MEMCPY &&
+    if (local_transfer_config_.mode == LocalTransferMode::MEMCPY &&
         local_transfer_config_.local_memcpy_async_worker_num > 0 &&
         local_transfer_config_.local_memcpy_async_queue_depth > 0) {
         async_memcpy_executor_ = std::make_unique<AsyncMemcpyExecutor>(
@@ -48,8 +47,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
 
     LOG(INFO) << "DataManager initialized with " << lock_shard_count_
               << " lock shards, local_transfer_mode="
-              << (local_transfer_config_.mode ==
-                          P2PClientConfig::LocalTransferMode::TE
+              << (local_transfer_config_.mode == LocalTransferMode::TE
                       ? "TE"
                       : "MEMCPY")
               << ", te_endpoint=" << local_transfer_config_.te_endpoint
@@ -61,10 +59,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
 
 // ================================================================
 // Put
-// The Put operation consists of three phases:
-// 1. Allocation: allocate memory from the tiered backend for the data
-// 2. Write: write the data to the allocated memory
-// 3. Commit: commit the data to the tiered backend
+// ================================================================
 
 // TODO: wanyue-wy
 // Currently, for performance optimization,
@@ -75,14 +70,12 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
 // in a waste of resources.
 // In future, we will add a pre-occupation mechanism in the Allocation stage
 // to optimize this issue.
-// ================================================================
-
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManager::Put(
     const std::string& key, std::vector<Slice>& slices) {
     switch (local_transfer_config_.mode) {
-        case P2PClientConfig::LocalTransferMode::TE:
+        case LocalTransferMode::TE:
             return PutViaTe(key, slices);
-        case P2PClientConfig::LocalTransferMode::MEMCPY:
+        case LocalTransferMode::MEMCPY:
             return PutViaMemcpy(key, slices);
     }
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
@@ -137,6 +130,9 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
     return CallableTaskHandle<void>::Create(
         [this, ctx = std::move(*submit_result), alloc_handle,
          key]() mutable -> tl::expected<void, ErrorCode> {
+            ScopedVLogTimer timer(1, "DataManager::PutViaTe");
+            timer.LogRequest("key=", key);
+
             auto wait_result = WaitAllTransferBatches(ctx.transfer_batches);
             if (!wait_result) {
                 LOG(ERROR) << "PutViaTe: WaitAllTransferBatches failed"
@@ -145,7 +141,8 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
                 return tl::unexpected(wait_result.error());
             }
 
-            if (ctx.handle->loc.data.type != MemoryType::DRAM && ctx.temp_buffer) {
+            if (ctx.handle->loc.data.type != MemoryType::DRAM &&
+                ctx.temp_buffer) {
                 auto& loc_data = ctx.handle->loc.data;
                 auto copy_result = CopyFromDRAMBuffer(
                     ctx.temp_buffer.get(),
@@ -166,6 +163,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
             if (!commit_result) {
                 LOG(WARNING) << "PutViaTe: commit race for key: " << key;
             }
+            timer.LogResponse("error_code=", ErrorCode::OK);
             return {};
         });
 }
@@ -234,8 +232,10 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
                           ->SubmitSingleTask<tl::expected<void, ErrorCode>>(
                               std::move(write_fn));
         return CallableTaskHandle<void>::Create(
-            [f = std::move(future), commit_fn = std::move(commit_fn)]() mutable
-                -> tl::expected<void, ErrorCode> {
+            [f = std::move(future), commit_fn = std::move(commit_fn),
+             key]() mutable -> tl::expected<void, ErrorCode> {
+                ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
+                timer.LogRequest("key=", key);
                 auto write_result = f.get();
                 if (!write_result) {
                     LOG(ERROR) << "Failed to write data, error: "
@@ -248,14 +248,17 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
                                << commit_result.error();
                     return tl::make_unexpected(commit_result.error());
                 }
+                timer.LogResponse("error_code=", ErrorCode::OK);
                 return {};
             });
     } else {
         // sync write + sync commit
         return CallableTaskHandle<void>::Create(
             [write_fn = std::move(write_fn),
-             commit_fn = std::move(
-                 commit_fn)]() mutable -> tl::expected<void, ErrorCode> {
+             commit_fn = std::move(commit_fn),
+             key]() mutable -> tl::expected<void, ErrorCode> {
+                ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
+                timer.LogRequest("key=", key);
                 auto write_result = write_fn();
                 if (!write_result) {
                     LOG(ERROR) << "Failed to write data, error: "
@@ -268,6 +271,7 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
                                << commit_result.error();
                     return tl::make_unexpected(commit_result.error());
                 }
+                timer.LogResponse("error_code=", ErrorCode::OK);
                 return {};
             });
     }
@@ -275,12 +279,6 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
 
 // ================================================================
 // Get
-// Get() methods run without key lock.
-// They work based on two assumptions:
-// 1. We assume that each key will not be updated after they are created.
-// 2. The key is acquired by handle which protects data accessibility
-//    based on ref count. Once the method acquires handle successfully, the
-//    accessor can safely access the data until the handle is released.
 // ================================================================
 
 tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
@@ -343,9 +341,9 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopier(
     }
 
     switch (local_transfer_config_.mode) {
-        case P2PClientConfig::LocalTransferMode::TE:
+        case LocalTransferMode::TE:
             return BuildDataCopierViaTe(handle, slices);
-        case P2PClientConfig::LocalTransferMode::MEMCPY:
+        case LocalTransferMode::MEMCPY:
             return BuildDataCopierViaMemcpy(handle, key, slices);
     }
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
@@ -376,12 +374,14 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaTe(
     res.task_handle = CallableTaskHandle<void>::Create(
         [this, ctx = std::move(submit_result.value()),
          h = handle]() mutable -> tl::expected<void, ErrorCode> {
+            ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaTe");
             auto wait_result = WaitAllTransferBatches(ctx.transfer_batches);
             if (!wait_result) {
                 LOG(ERROR) << "Failed to wait TE read transfer, error_code="
                            << wait_result.error();
                 return tl::unexpected(wait_result.error());
             }
+            timer.LogResponse("error_code=", ErrorCode::OK);
             return {};
         });
     return res;
@@ -408,24 +408,30 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
         res.task_handle = CallableTaskHandle<void>::Create(
             [f = std::move(future),
              key]() mutable -> tl::expected<void, ErrorCode> {
+                ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaMemcpy");
+                timer.LogRequest("key=", key);
                 ErrorCode ec = f.get();
                 if (ec != ErrorCode::OK) {
                     LOG(ERROR) << "Failed to execute local copy plan"
                                << ", key=" << key << ", error_code=" << ec;
                     return tl::unexpected(ec);
                 }
+                timer.LogResponse("error_code=", ErrorCode::OK);
                 return {};
             });
     } else {
         res.task_handle = CallableTaskHandle<void>::Create(
             [plan = std::move(plan_result.value()),
              key]() mutable -> tl::expected<void, ErrorCode> {
+                ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaMemcpy");
+                timer.LogRequest("key=", key);
                 ErrorCode ec = ExecuteLocalCopyPlan(plan);
                 if (ec != ErrorCode::OK) {
                     LOG(ERROR) << "Failed to execute local copy plan"
                                << ", key=" << key << ", error_code=" << ec;
                     return tl::unexpected(ec);
                 }
+                timer.LogResponse("error_code=", ErrorCode::OK);
                 return {};
             });
     }
@@ -485,8 +491,8 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
 
     auto validate_result = ValidateRemoteBuffers(dest_buffers);
     if (!validate_result) {
-        LOG(ERROR) << "ReadRemoteData: Buffer validation failed for key: " << key
-                   << ", error: " << toString(validate_result.error());
+        LOG(ERROR) << "ReadRemoteData: Buffer validation failed for key: "
+                   << key << ", error: " << toString(validate_result.error());
         timer.LogResponse("error_code=", validate_result.error());
         return tl::make_unexpected(validate_result.error());
     }
@@ -526,8 +532,8 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
 
     auto validate_result = ValidateRemoteBuffers(src_buffers);
     if (!validate_result) {
-        LOG(ERROR) << "WriteRemoteData: Buffer validation failed for key: " << key
-                   << ", error: " << toString(validate_result.error());
+        LOG(ERROR) << "WriteRemoteData: Buffer validation failed for key: "
+                   << key << ", error: " << toString(validate_result.error());
         timer.LogResponse("error_code=", validate_result.error());
         return tl::make_unexpected(validate_result.error());
     }
@@ -866,7 +872,6 @@ DataManager::PrepareDRAMReceiveBuffer(void* dest_ptr, MemoryType dest_type,
     void* transfer_ptr = temp_buffer.get();
     return std::make_pair(transfer_ptr, std::move(temp_buffer));
 }
-
 
 tl::expected<Transport::BatchID, ErrorCode> DataManager::SubmitTransferRequests(
     const std::string& segment_endpoint, Transport::SegmentHandle seg,

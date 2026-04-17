@@ -113,16 +113,17 @@ struct CentralizedClientConfig : RealClientConfigBase {
     bool enable_offload = false;
 };
 
+enum class LocalTransferMode {
+    MEMCPY = 0,
+    TE = 1,
+};
+
 /**
  * @brief Configuration for a P2P real client.
  *
  * Inherits all common real client fields and adds P2P-specific options.
  */
 struct P2PClientConfig : RealClientConfigBase {
-    enum class LocalTransferMode {
-        MEMCPY = 0,
-        TE = 1,
-    };
 
     // Port for P2P RPC service.
     uint16_t client_rpc_port = 12345;
@@ -227,8 +228,7 @@ class ClientConfigBuilder {
         config.route_cache_ttl_ms = route_cache_ttl_ms;
         config.local_transfer_mode =
             parse_p2p_local_transfer_mode(local_transfer_mode);
-        if (config.local_transfer_mode ==
-            P2PClientConfig::LocalTransferMode::MEMCPY) {
+        if (config.local_transfer_mode == LocalTransferMode::MEMCPY) {
             config.local_memcpy_async_worker_num =
                 local_memcpy_async_worker_num;
             config.local_memcpy_async_queue_depth =
@@ -312,16 +312,16 @@ class ClientConfigBuilder {
         config.labels = labels;
     }
 
-    static P2PClientConfig::LocalTransferMode parse_p2p_local_transfer_mode(
+    static LocalTransferMode parse_p2p_local_transfer_mode(
         std::string mode) {
         std::transform(
             mode.begin(), mode.end(), mode.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (mode == "memcpy") {
-            return P2PClientConfig::LocalTransferMode::MEMCPY;
+            return LocalTransferMode::MEMCPY;
         }
         if (mode == "te") {
-            return P2PClientConfig::LocalTransferMode::TE;
+            return LocalTransferMode::TE;
         }
         throw std::runtime_error(
             "Invalid p2p local transfer mode. Expected 'memcpy' or 'te'.");

@@ -78,7 +78,7 @@ class DataManagerTest : public ::testing::Test {
 
         // Create DataManager in MEMCPY mode so Put/Get work without RDMA.
         LocalTransferConfig transfer_config;
-        transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+        transfer_config.mode = LocalTransferMode::MEMCPY;
         transfer_config.local_memcpy_async_worker_num = 32;
         transfer_config.local_memcpy_async_queue_depth = 2048;
         data_manager_ = std::make_unique<DataManager>(
@@ -1255,7 +1255,7 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
         << "Failed to initialize TieredBackend";
 
     LocalTransferConfig local_transfer_config;
-    local_transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+    local_transfer_config.mode = LocalTransferMode::MEMCPY;
     auto rdma_data_manager = std::make_unique<DataManager>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
@@ -1415,7 +1415,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchTransfer) {
         << "Failed to initialize TieredBackend";
 
     LocalTransferConfig local_transfer_config;
-    local_transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+    local_transfer_config.mode = LocalTransferMode::MEMCPY;
     auto rdma_data_manager = std::make_unique<DataManager>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
@@ -1604,7 +1604,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchPartialFailure) {
         << "Failed to initialize TieredBackend";
 
     LocalTransferConfig local_transfer_config;
-    local_transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+    local_transfer_config.mode = LocalTransferMode::MEMCPY;
     auto rdma_data_manager = std::make_unique<DataManager>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
@@ -1749,7 +1749,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteData) {
         << "Failed to initialize TieredBackend";
 
     LocalTransferConfig local_transfer_config;
-    local_transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+    local_transfer_config.mode = LocalTransferMode::MEMCPY;
     auto rdma_data_manager = std::make_unique<DataManager>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
@@ -1911,7 +1911,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
         << "Failed to initialize TieredBackend";
 
     LocalTransferConfig local_transfer_config;
-    local_transfer_config.mode = P2PClientConfig::LocalTransferMode::MEMCPY;
+    local_transfer_config.mode = LocalTransferMode::MEMCPY;
     auto rdma_data_manager = std::make_unique<DataManager>(
         std::move(rdma_tiered_backend), rdma_transfer_engine, 1024,
         local_transfer_config);
