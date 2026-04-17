@@ -11,6 +11,7 @@ WHEEL_DIR="${DIST_DIR}/wheels"
 BIN_DIR="${DIST_DIR}/bin"
 UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}
 UPSTREAM_BUILD_DIR=${MOONCAKE_UPSTREAM_BUILD_DIR:-"${UPSTREAM_DIR}/build-wheel-compat"}
+YALANTINGLIBS_PREFIX=${YALANTINGLIBS_PREFIX:-"${UPSTREAM_BUILD_DIR}/yalantinglibs-install"}
 BUILD_JOBS=${BUILD_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 8)}
 
 usage() {
@@ -23,6 +24,7 @@ Environment:
   DIST_DIR                   Output directory for wheel and binary artifacts
   MOONCAKE_UPSTREAM_DIR      Mooncake upstream submodule path
   MOONCAKE_UPSTREAM_BUILD_DIR  Upstream build directory used for engine/CLI assets
+  YALANTINGLIBS_PREFIX       Install prefix for bundled yalantinglibs
   BUILD_JOBS                 Parallel jobs for CMake builds
 
 Examples:
@@ -62,6 +64,30 @@ require_command cargo
 require_command cmake
 require_command "${PYTHON_BIN}"
 
+ensure_yalantinglibs() {
+  local source_dir="${UPSTREAM_DIR}/extern/yalantinglibs"
+  local build_dir="${UPSTREAM_BUILD_DIR}/yalantinglibs-build"
+  local config_file="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs/yalantinglibsConfig.cmake"
+
+  if [[ -f "${config_file}" ]]; then
+    return 0
+  fi
+  if [[ ! -d "${source_dir}" ]]; then
+    echo "missing yalantinglibs source: ${source_dir}" >&2
+    exit 1
+  fi
+
+  cmake \
+    -S "${source_dir}" \
+    -B "${build_dir}" \
+    -DCMAKE_INSTALL_PREFIX="${YALANTINGLIBS_PREFIX}" \
+    -DBUILD_EXAMPLES=OFF \
+    -DBUILD_BENCHMARK=OFF \
+    -DBUILD_UNIT_TESTS=OFF
+  cmake --build "${build_dir}" -j"${BUILD_JOBS}"
+  cmake --install "${build_dir}"
+}
+
 mkdir -p "${WHEEL_DIR}" "${BIN_DIR}"
 
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
@@ -83,11 +109,14 @@ if ! "${VENV_PYTHON}" -m pip show build >/dev/null 2>&1; then
 fi
 
 git -C "${REPO_ROOT}" submodule update --init --recursive
+ensure_yalantinglibs
 
 PATH="${VENV_BIN}:${PATH}" cmake \
   -S "${UPSTREAM_DIR}" \
   -B "${UPSTREAM_BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="${YALANTINGLIBS_PREFIX}" \
+  -Dyalantinglibs_DIR="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs" \
   -DPython3_EXECUTABLE="${VENV_PYTHON}" \
   -DWITH_TE=ON \
   -DWITH_STORE=ON \

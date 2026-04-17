@@ -309,6 +309,7 @@ RUN apt-get update \
     libasio-dev \
     libboost-all-dev \
     libcurl4-openssl-dev \
+    libgflags-dev \
     libgoogle-glog-dev \
     libgrpc++-dev \
     libgrpc-dev \
