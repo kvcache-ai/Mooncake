@@ -2291,7 +2291,10 @@ mod tests {
             self.inner.put_route_policy(domain, policy)
         }
 
-        fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> mooncake_store_core::Result<bool> {
+        fn delete_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+        ) -> mooncake_store_core::Result<bool> {
             self.inner.delete_route_policy(domain)
         }
 

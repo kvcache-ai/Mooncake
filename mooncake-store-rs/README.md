@@ -889,6 +889,7 @@ crates/
 python/
   mooncake/                 Python convenience package
 scripts/
+  format.sh                 Unified Rust/Python formatter
   run-all-tests.sh            Unified scripts regression runner for CI and local use
   build/                    Wheel, coverage, and packaging helpers
   clients/                  Real-mode and dummy-mode black-box validators
@@ -916,6 +917,34 @@ Useful variants:
 ./scripts/run-all-tests.sh --list
 ./scripts/run-all-tests.sh --skip-tag sglang
 ./scripts/run-all-tests.sh --include rolling
+```
+
+## Formatting
+
+Format the repository before every commit:
+
+```bash
+./scripts/format.sh
+```
+
+Check formatting without modifying files:
+
+```bash
+./scripts/format.sh --check
+```
+
+Enable the repository pre-commit hook in your local clone:
+
+```bash
+git config core.hooksPath scripts/lib/git-hooks
+chmod +x scripts/format.sh scripts/lib/git-hooks/pre-commit
+```
+
+Python formatting uses `ruff` when available and falls back to `black`.
+Install the recommended formatter tooling with:
+
+```bash
+python3 -m pip install -e '.[dev]'
 ```
 
 ## Status

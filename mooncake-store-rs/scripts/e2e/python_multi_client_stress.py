@@ -65,17 +65,21 @@ class StressConfig:
         if not phases:
             phases = ["put", "get", "batch-put", "batch-get"]
         return cls(
-            local_hostname=os.environ.get("MC_STORE_RS_STRESS_LOCAL_HOSTNAME", "127.0.0.1"),
-            redis_url=os.environ.get("MC_STORE_RS_REDIS_URL", "redis://127.0.0.1:6380/0"),
+            local_hostname=os.environ.get(
+                "MC_STORE_RS_STRESS_LOCAL_HOSTNAME", "127.0.0.1"
+            ),
+            redis_url=os.environ.get(
+                "MC_STORE_RS_REDIS_URL", "redis://127.0.0.1:6380/0"
+            ),
             storage_clients=_env_int("MC_STORE_RS_STRESS_STORAGE_CLIENTS", 4),
             writer_clients=_env_int("MC_STORE_RS_STRESS_WRITER_CLIENTS", 8),
-            storage_bytes=_env_int("MC_STORE_RS_STRESS_STORAGE_BYTES", 256 * 1024 * 1024),
+            storage_bytes=_env_int(
+                "MC_STORE_RS_STRESS_STORAGE_BYTES", 256 * 1024 * 1024
+            ),
             storage_scratch_bytes=_env_int(
                 "MC_STORE_RS_STRESS_STORAGE_SCRATCH_BYTES", 16 * 1024 * 1024
             ),
-            writer_storage_bytes=_env_int(
-                "MC_STORE_RS_STRESS_WRITER_STORAGE_BYTES", 0
-            ),
+            writer_storage_bytes=_env_int("MC_STORE_RS_STRESS_WRITER_STORAGE_BYTES", 0),
             writer_scratch_bytes=_env_int(
                 "MC_STORE_RS_STRESS_WRITER_SCRATCH_BYTES", 16 * 1024 * 1024
             ),
@@ -126,7 +130,9 @@ def main() -> int:
 
 
 class StorageCluster:
-    def __init__(self, processes: list[mp.Process], stop_events: list[mp.Event]) -> None:
+    def __init__(
+        self, processes: list[mp.Process], stop_events: list[mp.Event]
+    ) -> None:
         self.processes = processes
         self.stop_events = stop_events
 
@@ -145,7 +151,9 @@ class StorageCluster:
             process.start()
             processes.append(process)
             stop_events.append(stop_event)
-        wait_ready(processes, ready_queue, config.ready_timeout_ms, config.storage_clients)
+        wait_ready(
+            processes, ready_queue, config.ready_timeout_ms, config.storage_clients
+        )
         return cls(processes, stop_events)
 
     def stop(self) -> None:
@@ -161,10 +169,14 @@ class StorageCluster:
 
 def run_phase(ctx: Any, config: StressConfig, phase: str) -> dict[str, Any]:
     if phase == "put":
-        run = run_workers(ctx, config, phase, "put-worker", put_worker_main, measured=True)
+        run = run_workers(
+            ctx, config, phase, "put-worker", put_worker_main, measured=True
+        )
         return finalize_phase(phase, config, run)
     if phase == "get":
-        run = run_workers(ctx, config, phase, "rw-worker", get_worker_main, measured=True)
+        run = run_workers(
+            ctx, config, phase, "rw-worker", get_worker_main, measured=True
+        )
         return finalize_phase(phase, config, run)
     if phase == "batch-put":
         run = run_workers(
@@ -217,7 +229,9 @@ def run_workers(
         remaining = deadline - time.time()
         if remaining <= 0:
             terminate_processes(processes)
-            raise RuntimeError(f"{role} readiness timed out after {config.child_timeout_ms} ms")
+            raise RuntimeError(
+                f"{role} readiness timed out after {config.child_timeout_ms} ms"
+            )
         try:
             message = message_queue.get(timeout=min(remaining, 0.2))
         except queue.Empty:
@@ -307,11 +321,7 @@ def worker_entry(
             )
     except Exception:
         message_queue.put(
-            {
-                "error": "".join(
-                    traceback.format_exception(*sys.exc_info())
-                )
-            }
+            {"error": "".join(traceback.format_exception(*sys.exc_info()))}
         )
         raise
 
@@ -429,7 +439,9 @@ def get_worker_main(
     setup_s = time.perf_counter() - setup_start
     value = payload(f"{phase}-worker-{worker_index}", config.value_size)
     replicate = remote_only_replication(config)
-    keys = build_single_keys(phase, worker_index, config.warmup_iters + config.single_iters)
+    keys = build_single_keys(
+        phase, worker_index, config.warmup_iters + config.single_iters
+    )
     prepare_start = time.perf_counter()
     for key in keys:
         ensure_status(store.put(key, value, config=replicate), f"get preload {key}")
@@ -490,9 +502,14 @@ def batch_put_worker_main(
     value = payload(f"{phase}-worker-{worker_index}", config.value_size)
     replicate = remote_only_replication(config)
     prepare_start = time.perf_counter()
-    for batch_keys in build_batch_keys(phase, worker_index, config.warmup_iters, config.batch_size):
+    for batch_keys in build_batch_keys(
+        phase, worker_index, config.warmup_iters, config.batch_size
+    ):
         items = [(key, value) for key in batch_keys]
-        ensure_status(store.batch_put(items, config=replicate), f"batch-put warmup worker={worker_index}")
+        ensure_status(
+            store.batch_put(items, config=replicate),
+            f"batch-put warmup worker={worker_index}",
+        )
     prepare_s = time.perf_counter() - prepare_start
     if measured:
         message_queue.put(
@@ -506,10 +523,14 @@ def batch_put_worker_main(
         start_event.wait()
     measured_start = time.perf_counter()
     latencies: list[int] = []
-    for batch_keys in build_batch_keys(phase, worker_index, config.batch_iters, config.batch_size):
+    for batch_keys in build_batch_keys(
+        phase, worker_index, config.batch_iters, config.batch_size
+    ):
         items = [(key, value) for key in batch_keys]
         request_start = time.perf_counter_ns()
-        ensure_status(store.batch_put(items, config=replicate), f"batch-put worker={worker_index}")
+        ensure_status(
+            store.batch_put(items, config=replicate), f"batch-put worker={worker_index}"
+        )
         latencies.append((time.perf_counter_ns() - request_start) // 1_000)
     objects = config.batch_iters * config.batch_size
     total_bytes = objects * config.value_size
@@ -563,7 +584,12 @@ def batch_get_worker_main(
         )
     sleep_ms(config.visibility_wait_ms)
     for batch_keys in batches[: config.warmup_iters]:
-        ensure_batch_lengths(batch_get_with_retry(store, batch_keys), config.value_size, len(batch_keys), batch_keys)
+        ensure_batch_lengths(
+            batch_get_with_retry(store, batch_keys),
+            config.value_size,
+            len(batch_keys),
+            batch_keys,
+        )
     prepare_s = time.perf_counter() - prepare_start
     if measured:
         message_queue.put(
@@ -677,7 +703,9 @@ def get_with_retry(store: MooncakeDistributedStore, key: str) -> bytes:
     raise RuntimeError(f"get_with_retry exhausted for key={key}: {last_error}")
 
 
-def batch_get_with_retry(store: MooncakeDistributedStore, keys: list[str]) -> list[bytes]:
+def batch_get_with_retry(
+    store: MooncakeDistributedStore, keys: list[str]
+) -> list[bytes]:
     last_error: Exception | None = None
     for _ in range(8):
         try:
@@ -757,9 +785,7 @@ def finalize_phase(
 ) -> dict[str, Any]:
     workers = list(run["results"])
     latencies = sorted(
-        latency
-        for worker in workers
-        for latency in worker["request_latencies_us"]
+        latency for worker in workers for latency in worker["request_latencies_us"]
     )
     request_count = sum(int(worker["request_count"]) for worker in workers)
     object_count = sum(int(worker["object_count"]) for worker in workers)
@@ -826,7 +852,9 @@ def print_phase(config: StressConfig, phase: str, result: dict[str, Any]) -> Non
     measured_request_rate = (
         0.0 if measured_wall_s == 0 else request_count / measured_wall_s
     )
-    measured_object_rate = 0.0 if measured_wall_s == 0 else object_count / measured_wall_s
+    measured_object_rate = (
+        0.0 if measured_wall_s == 0 else object_count / measured_wall_s
+    )
     measured_throughput_mib_s = (
         0.0 if measured_wall_s == 0 else total_bytes / measured_wall_s / (1024 * 1024)
     )

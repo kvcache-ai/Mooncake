@@ -269,7 +269,9 @@ def apply_compat_defaults(args: argparse.Namespace) -> None:
 
 def validate_args(args: argparse.Namespace) -> None:
     if args.metadata_url == "P2PHANDSHAKE":
-        raise SystemExit("store-rs does not support P2PHANDSHAKE; use redis:// or etcd://")
+        raise SystemExit(
+            "store-rs does not support P2PHANDSHAKE; use redis:// or etcd://"
+        )
     if not (
         args.metadata_url.startswith("redis://")
         or args.metadata_url.startswith("etcd://")
@@ -297,7 +299,11 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if (args.mode in ("write", "read", "both") or args.delete) and not args.key_prefix:
         raise SystemExit("--key_prefix is required unless --mode is idle")
-    if args.mode in ("write", "both") and args.storage_bytes == 0 and not args.routed_writes:
+    if (
+        args.mode in ("write", "both")
+        and args.storage_bytes == 0
+        and not args.routed_writes
+    ):
         raise SystemExit(
             "rw-only writers require --routed-writes when --storage-bytes is 0"
         )
@@ -392,7 +398,9 @@ def chunked(items, chunk_size: int):
         yield items[index : index + chunk_size]
 
 
-def print_throughput(phase: str, item_count: int, value_size: int, elapsed: float) -> None:
+def print_throughput(
+    phase: str, item_count: int, value_size: int, elapsed: float
+) -> None:
     total_bytes = item_count * value_size
     throughput_mib = total_bytes / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
     ops_per_sec = item_count / elapsed if elapsed > 0 else 0.0
@@ -477,7 +485,9 @@ def setup_store(
         message = str(error)
         if "incompatible function arguments" not in message:
             raise
-        print("[WARN] setup() does not support store-rs kwargs; falling back to legacy API")
+        print(
+            "[WARN] setup() does not support store-rs kwargs; falling back to legacy API"
+        )
         legacy_metadata_url = prepare_legacy_metadata_url(metadata_url)
         legacy_master_addr = master_addr or legacy_metadata_url
         return int(
