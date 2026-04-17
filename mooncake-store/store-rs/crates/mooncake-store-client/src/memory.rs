@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::ops::Deref;
 use std::ptr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mooncake_store_core::{HugePageConfig, Result, SegmentLifecycleState, SegmentName, StoreError};
+use parking_lot::Mutex;
 
 use crate::transport::StoreTransport;
 
@@ -329,7 +332,7 @@ impl LocalMemoryState {
         Ok(())
     }
 
-    pub fn plan_scratch(&self, lengths: &[usize]) -> Result<Vec<RegionAllocation>> {
+    pub fn plan_scratch(&self, lengths: &[usize]) -> Result<ScratchReservation> {
         self.scratch.plan(lengths)
     }
 
@@ -411,6 +414,7 @@ struct StorageExtent {
 #[derive(Debug)]
 struct ScratchSpace {
     regions: Vec<RegisteredRegion>,
+    state: Arc<Mutex<ScratchAllocatorState>>,
 }
 
 impl ScratchSpace {
@@ -441,22 +445,25 @@ impl ScratchSpace {
                 }
             }
         }
-        Ok(Self { regions })
+        Ok(Self {
+            state: Arc::new(Mutex::new(ScratchAllocatorState::new(&regions))),
+            regions,
+        })
     }
 
-    fn plan(&self, lengths: &[usize]) -> Result<Vec<RegionAllocation>> {
-        let mut cursors = vec![0usize; self.regions.len()];
+    fn plan(&self, lengths: &[usize]) -> Result<ScratchReservation> {
+        let mut state = self.state.lock();
         let mut allocations = Vec::with_capacity(lengths.len());
+        let mut reservations = Vec::with_capacity(lengths.len());
         for (index, length) in lengths.iter().copied().enumerate() {
             let start = index % self.regions.len();
             let mut placed = None;
             for step in 0..self.regions.len() {
                 let region_index = (start + step) % self.regions.len();
                 let region = &self.regions[region_index];
-                match region.reserve(cursors[region_index], length) {
-                    Ok((allocation, next_cursor)) => {
-                        cursors[region_index] = next_cursor;
-                        placed = Some(allocation);
+                match state.reserve(region_index, region, length) {
+                    Ok((allocation, reservation)) => {
+                        placed = Some((allocation, reservation));
                         break;
                     }
                     Err(StoreError::Allocator(_)) => {}
@@ -464,17 +471,205 @@ impl ScratchSpace {
                 }
             }
             let Some(allocation) = placed else {
+                state.release_all(&reservations);
                 return Err(StoreError::Allocator(format!(
                     "scratch capacity exhausted: requested={length}"
                 )));
             };
-            allocations.push(allocation);
+            allocations.push(allocation.0);
+            reservations.push(allocation.1);
         }
-        Ok(allocations)
+        Ok(ScratchReservation {
+            allocations,
+            reservations,
+            state: Arc::clone(&self.state),
+        })
     }
 
     fn release(self, transport: &dyn StoreTransport) -> Result<()> {
         release_registered_regions(transport, self.regions)
+    }
+}
+
+#[derive(Debug)]
+struct ScratchAllocatorState {
+    regions: Vec<ScratchRegionState>,
+}
+
+impl ScratchAllocatorState {
+    fn new(regions: &[RegisteredRegion]) -> Self {
+        Self {
+            regions: regions
+                .iter()
+                .map(|region| ScratchRegionState::new(region.capacity))
+                .collect(),
+        }
+    }
+
+    fn reserve(
+        &mut self,
+        region_index: usize,
+        region: &RegisteredRegion,
+        length: usize,
+    ) -> Result<(RegionAllocation, ScratchRegionReservation)> {
+        self.regions[region_index].reserve(region, region_index, length)
+    }
+
+    fn release_all(&mut self, reservations: &[ScratchRegionReservation]) {
+        for reservation in reservations.iter().rev().copied() {
+            self.regions[reservation.region_index].release(reservation);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScratchRegionReservation {
+    region_index: usize,
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScratchFreeRange {
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Debug)]
+struct ScratchRegionState {
+    free_ranges: Vec<ScratchFreeRange>,
+}
+
+impl ScratchRegionState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            free_ranges: vec![ScratchFreeRange {
+                offset: 0,
+                len: capacity,
+            }],
+        }
+    }
+
+    fn reserve(
+        &mut self,
+        region: &RegisteredRegion,
+        region_index: usize,
+        length: usize,
+    ) -> Result<(RegionAllocation, ScratchRegionReservation)> {
+        if length == 0 {
+            return Err(StoreError::Allocator(
+                "zero-length allocations are not supported".to_string(),
+            ));
+        }
+
+        let reserved_len = align_up(length, region.alignment);
+        for range_index in 0..self.free_ranges.len() {
+            let range = self.free_ranges[range_index];
+            let start = align_up(range.offset, region.alignment);
+            let Some(end) = start.checked_add(reserved_len) else {
+                return Err(StoreError::Allocator("allocation overflow".to_string()));
+            };
+            let range_end = range.offset.saturating_add(range.len);
+            if end > range_end {
+                continue;
+            }
+
+            self.free_ranges.remove(range_index);
+            if start > range.offset {
+                self.free_ranges.insert(
+                    range_index,
+                    ScratchFreeRange {
+                        offset: range.offset,
+                        len: start - range.offset,
+                    },
+                );
+            }
+            if end < range_end {
+                let insert_index = self
+                    .free_ranges
+                    .iter()
+                    .position(|candidate| candidate.offset > end)
+                    .unwrap_or(self.free_ranges.len());
+                self.free_ranges.insert(
+                    insert_index,
+                    ScratchFreeRange {
+                        offset: end,
+                        len: range_end - end,
+                    },
+                );
+            }
+
+            return Ok((
+                region.allocation_at(start)?,
+                ScratchRegionReservation {
+                    region_index,
+                    offset: start,
+                    len: reserved_len,
+                },
+            ));
+        }
+
+        Err(StoreError::Allocator(format!(
+            "region capacity exhausted: requested={length}"
+        )))
+    }
+
+    fn release(&mut self, reservation: ScratchRegionReservation) {
+        let insert_index = self
+            .free_ranges
+            .iter()
+            .position(|range| range.offset > reservation.offset)
+            .unwrap_or(self.free_ranges.len());
+        self.free_ranges.insert(
+            insert_index,
+            ScratchFreeRange {
+                offset: reservation.offset,
+                len: reservation.len,
+            },
+        );
+        self.merge_neighbors();
+    }
+
+    fn merge_neighbors(&mut self) {
+        if self.free_ranges.len() < 2 {
+            return;
+        }
+        self.free_ranges.sort_by_key(|range| range.offset);
+        let mut merged: Vec<ScratchFreeRange> = Vec::with_capacity(self.free_ranges.len());
+        for range in self.free_ranges.drain(..) {
+            if let Some(previous) = merged.last_mut() {
+                let previous_end = previous.offset.saturating_add(previous.len);
+                if previous_end >= range.offset {
+                    let range_end = range.offset.saturating_add(range.len);
+                    previous.len = range_end.saturating_sub(previous.offset);
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        self.free_ranges = merged;
+    }
+}
+
+#[derive(Debug)]
+pub struct ScratchReservation {
+    allocations: Vec<RegionAllocation>,
+    reservations: Vec<ScratchRegionReservation>,
+    state: Arc<Mutex<ScratchAllocatorState>>,
+}
+
+impl Deref for ScratchReservation {
+    type Target = [RegionAllocation];
+
+    fn deref(&self) -> &Self::Target {
+        self.allocations.as_slice()
+    }
+}
+
+impl Drop for ScratchReservation {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.release_all(&self.reservations);
     }
 }
 
@@ -534,6 +729,7 @@ impl RegisteredRegion {
             .map(|(allocation, _)| allocation)
     }
 
+    #[cfg(test)]
     fn reserve(&self, cursor: usize, length: usize) -> Result<(RegionAllocation, usize)> {
         if length == 0 {
             return Err(StoreError::Allocator(
@@ -1651,6 +1847,44 @@ mod tests {
             .release_scratch(&transport)
             .expect("scratch region should release cleanly");
         assert!(transport.inner.lock().registered.is_empty());
+    }
+
+    #[test]
+    fn local_memory_state_tracks_live_scratch_reservations() {
+        let transport = RecordingTransport::default();
+        let primary = SegmentName::new("primary");
+        let state = LocalMemoryState::register(
+            &transport,
+            &primary,
+            &LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(0)
+                .scratch_bytes(64)
+                .alignment(8),
+        )
+        .expect("scratch-only registration should succeed");
+
+        let first = state
+            .plan_scratch(&[32])
+            .expect("first scratch reservation should succeed");
+        let second = state
+            .plan_scratch(&[32])
+            .expect("second scratch reservation should use a different slot");
+        assert_ne!(first[0].addr as usize, second[0].addr as usize);
+        assert!(state.plan_scratch(&[8]).is_err());
+
+        let second_addr = second[0].addr as usize;
+        drop(second);
+        let third = state
+            .plan_scratch(&[32])
+            .expect("released scratch slot should be reusable");
+        assert_eq!(third[0].addr as usize, second_addr);
+
+        drop(third);
+        drop(first);
+        state
+            .release_scratch(&transport)
+            .expect("scratch region should release cleanly");
     }
 
     #[test]
