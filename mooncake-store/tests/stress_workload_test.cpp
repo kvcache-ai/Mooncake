@@ -138,10 +138,12 @@ bool initialize_client() {
     if (FLAGS_client_type == "P2P") {
         // Build tiered_backend_config from ram_buffer_size_gb so the P2P
         // storage capacity is consistent with the Centralization segment size.
-        // FLAGS_tiered_backend_config can still override this if explicitly set.
+        // FLAGS_tiered_backend_config can still override this if explicitly
+        // set.
         std::string tiered_config = FLAGS_tiered_backend_config;
         if (tiered_config.find("16106127360") != std::string::npos) {
-            // Default value is still 15GB placeholder — replace with actual flag
+            // Default value is still 15GB placeholder — replace with actual
+            // flag
             uint64_t capacity_bytes =
                 FLAGS_ram_buffer_size_gb * 1024ull * 1024 * 1024;
             tiered_config =
@@ -157,8 +159,7 @@ bool initialize_client() {
             /*route_cache_max_memory_bytes=*/FLAGS_route_cache_max_memory_mb *
                 1024 * 1024,
             /*route_cache_ttl_ms=*/FLAGS_route_cache_ttl_ms,
-            FLAGS_p2p_local_transfer_mode,
-            FLAGS_local_memcpy_async_worker_num);
+            FLAGS_p2p_local_transfer_mode, FLAGS_local_memcpy_async_worker_num);
         client_opt = ClientService::Create(config);
     } else {
         auto config = ClientConfigBuilder::build_centralized_real_client(
@@ -325,7 +326,8 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         double per_key_latency_us =
             static_cast<double>(latency_us) / actual_batch;
         for (int j = 0; j < actual_batch; ++j) {
-            stats.operations.push_back({per_key_latency_us, true, key_success[j]});
+            stats.operations.push_back(
+                {per_key_latency_us, true, key_success[j]});
         }
         stats.total_operations += actual_batch;
     }

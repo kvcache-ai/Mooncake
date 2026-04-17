@@ -73,9 +73,9 @@ class AsyncMemcpyExecutor {
     ~AsyncMemcpyExecutor();
 
     template <typename ResultType, typename TaskFn, typename ErrorFn>
-    BatchHandle<ResultType> SubmitBatchTasks(
-        const std::vector<size_t>& indices, TaskFn&& task_fn,
-        ErrorFn&& on_error);
+    BatchHandle<ResultType> SubmitBatchTasks(const std::vector<size_t>& indices,
+                                             TaskFn&& task_fn,
+                                             ErrorFn&& on_error);
 
     template <typename ResultType, typename Fn>
     std::future<ResultType> SubmitSingleTask(Fn&& fn);
@@ -199,8 +199,8 @@ std::future<ResultType> AsyncMemcpyExecutor::SubmitSingleTask(Fn&& fn) {
     };
     task.cancel = [promise]() {
         try {
-            promise->set_exception(std::make_exception_ptr(
-                std::runtime_error("task cancelled")));
+            promise->set_exception(
+                std::make_exception_ptr(std::runtime_error("task cancelled")));
         } catch (...) {
         }
     };

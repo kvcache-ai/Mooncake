@@ -124,7 +124,6 @@ enum class LocalTransferMode {
  * Inherits all common real client fields and adds P2P-specific options.
  */
 struct P2PClientConfig : RealClientConfigBase {
-
     // Port for P2P RPC service.
     uint16_t client_rpc_port = 12345;
 
@@ -320,8 +319,7 @@ class ClientConfigBuilder {
         config.labels = labels;
     }
 
-    static LocalTransferMode parse_p2p_local_transfer_mode(
-        std::string mode) {
+    static LocalTransferMode parse_p2p_local_transfer_mode(std::string mode) {
         std::transform(
             mode.begin(), mode.end(), mode.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });

@@ -250,8 +250,7 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
     } else {
         // sync write + sync commit
         return CallableTaskHandle<void>::Create(
-            [write_fn = std::move(write_fn),
-             commit_fn = std::move(commit_fn),
+            [write_fn = std::move(write_fn), commit_fn = std::move(commit_fn),
              key]() mutable -> tl::expected<void, ErrorCode> {
                 ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
                 timer.LogRequest("key=", key);
@@ -404,7 +403,8 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
         res.task_handle = CallableTaskHandle<void>::Create(
             [f = std::move(future),
              key]() mutable -> tl::expected<void, ErrorCode> {
-                ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaMemcpy");
+                ScopedVLogTimer timer(1,
+                                      "DataManager::BuildDataCopierViaMemcpy");
                 timer.LogRequest("key=", key);
                 ErrorCode ec = f.get();
                 if (ec != ErrorCode::OK) {
@@ -419,7 +419,8 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
         res.task_handle = CallableTaskHandle<void>::Create(
             [plan = std::move(plan_result.value()),
              key]() mutable -> tl::expected<void, ErrorCode> {
-                ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaMemcpy");
+                ScopedVLogTimer timer(1,
+                                      "DataManager::BuildDataCopierViaMemcpy");
                 timer.LogRequest("key=", key);
                 ErrorCode ec = ExecuteLocalCopyPlan(plan);
                 if (ec != ErrorCode::OK) {

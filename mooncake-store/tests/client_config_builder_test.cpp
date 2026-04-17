@@ -25,11 +25,12 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
     EXPECT_EQ(config.local_transfer_mode, LocalTransferMode::TE);
 }
 
-TEST(ClientConfigBuilderTest, BuildP2PClientConfigAcceptsCustomAsyncCopyConfig) {
+TEST(ClientConfigBuilderTest,
+     BuildP2PClientConfigAcceptsCustomAsyncCopyConfig) {
     auto config = ClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
-        std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr, "", 12345,
-        8, 2048, 512 * 1024 * 1024, 120000, "memcpy", 3);
+        std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr, "",
+        12345, 8, 2048, 512 * 1024 * 1024, 120000, "memcpy", 3);
 
     EXPECT_EQ(config.local_memcpy_async_worker_num, 3u);
     EXPECT_EQ(config.local_transfer_mode, LocalTransferMode::MEMCPY);
@@ -39,9 +40,8 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigRejectsInvalidTransferMode) {
     EXPECT_THROW(
         ClientConfigBuilder::build_p2p_real_client(
             "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
-            std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr,
-            "", 12345, 8, 2048, 512 * 1024 * 1024, 120000,
-            "invalid_mode"),
+            std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr, "",
+            12345, 8, 2048, 512 * 1024 * 1024, 120000, "invalid_mode"),
         std::runtime_error);
 }
 

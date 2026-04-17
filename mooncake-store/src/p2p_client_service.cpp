@@ -663,6 +663,8 @@ P2PClientService::CreatePutHandle(const std::string& key,
         if (local_handle) {
             return std::move(local_handle.value());
         }
+        LOG(ERROR) << "Local write failed for key: " << key
+                   << ", error: " << local_handle.error();
         return tl::unexpected(local_handle.error());
     }
 
