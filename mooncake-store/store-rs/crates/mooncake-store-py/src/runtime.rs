@@ -280,12 +280,14 @@ mod tests {
         let metadata_url = format!("{}/{}", server.url().trim_end_matches("/0"), 0);
 
         let mut writer = sample_args("tcp", &metadata_url);
+        writer.setup.transport_backend = Some("tent".to_string());
         writer.setup.stable_id = Some("runtime-writer".to_string());
         writer.setup.keyspace = Some("runtime/test".to_string());
         writer.local_segment_name = Some("runtime-writer-segment".to_string());
         writer.route_control = RouteControlMode::MetadataOnly;
 
         let mut reader = sample_args("tcp", &metadata_url);
+        reader.setup.transport_backend = Some("tent".to_string());
         reader.setup.stable_id = Some("runtime-reader".to_string());
         reader.setup.keyspace = Some("runtime/test".to_string());
         reader.local_segment_name = Some("runtime-reader-segment".to_string());
@@ -445,12 +447,14 @@ mod tests {
         ]);
 
         let mut writer = sample_args("tcp", server.url());
+        writer.setup.transport_backend = Some("tent".to_string());
         writer.setup.stable_id = Some("runtime-auth-writer".to_string());
         writer.setup.keyspace = Some("runtime/auth".to_string());
         writer.local_segment_name = Some("runtime-auth-writer-segment".to_string());
         writer.route_control = RouteControlMode::MetadataOnly;
 
         let mut reader = sample_args("tcp", server.url());
+        reader.setup.transport_backend = Some("tent".to_string());
         reader.setup.stable_id = Some("runtime-auth-reader".to_string());
         reader.setup.keyspace = Some("runtime/auth".to_string());
         reader.local_segment_name = Some("runtime-auth-reader-segment".to_string());
@@ -494,6 +498,7 @@ mod tests {
         let metadata_url = format!("{}/{}", server.url().trim_end_matches("/0"), 0);
 
         let mut predecessor = sample_args("tcp", &metadata_url);
+        predecessor.setup.transport_backend = Some("tent".to_string());
         predecessor.setup.stable_id = Some("runtime-hot-upgrade".to_string());
         predecessor.setup.keyspace = Some("runtime/hot-upgrade".to_string());
         predecessor.setup.expires_at_ms = Some(now_ms() + 10_000);
@@ -518,6 +523,7 @@ mod tests {
         successor.local_segment_name = Some("runtime-hot-upgrade-new".to_string());
 
         let mut reader = sample_args("tcp", &metadata_url);
+        reader.setup.transport_backend = Some("tent".to_string());
         reader.setup.stable_id = Some("runtime-hot-upgrade-reader".to_string());
         reader.setup.keyspace = Some("runtime/hot-upgrade".to_string());
         reader.setup.expires_at_ms = Some(now_ms() + 10_000);

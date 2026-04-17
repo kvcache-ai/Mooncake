@@ -801,6 +801,8 @@ mod linux_numa {
 
 #[cfg(test)]
 static TEST_NUMA_LOCATIONS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_NUMA_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 fn test_numa_locations() -> Option<Vec<String>> {
@@ -812,6 +814,9 @@ fn test_numa_locations() -> Option<Vec<String>> {
 
 #[cfg(test)]
 fn with_test_numa_locations<T>(locations: &[&str], f: impl FnOnce() -> T) -> T {
+    let _guard = TEST_NUMA_GUARD
+        .lock()
+        .expect("test numa guard lock should not be poisoned");
     {
         let mut guard = TEST_NUMA_LOCATIONS
             .lock()

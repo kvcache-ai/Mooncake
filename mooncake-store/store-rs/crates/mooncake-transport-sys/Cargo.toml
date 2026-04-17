@@ -5,3 +5,4 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
+libc = "0.2"

@@ -169,6 +169,18 @@ impl StoreClient {
             if self.lifecycle_state() != ClientLifecycleState::Draining {
                 self.enter_draining()?;
             }
+            let Some(state) = writer.runtime_state(&self.lease.runtime)? else {
+                return Err(StoreError::NotFound(format!(
+                    "runtime {} is not available",
+                    self.lease.runtime
+                )));
+            };
+            if !state.serves_reads() {
+                return Err(StoreError::InvalidState(format!(
+                    "runtime {} is not readable while {state:?}",
+                    self.lease.runtime
+                )));
+            }
             self.evacuate_draining_routes_until_stable(
                 "client shrink still has live bytes on local segments",
                 |route| self.migrate_owned_route_via_writer(writer, route),
