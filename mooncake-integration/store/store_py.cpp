@@ -490,6 +490,22 @@ class MooncakeStorePyWrapper {
         return global_meta;
     }
 
+    static void validate_chunk_matches_tp_plan(const TensorMetadata &chunk_meta,
+                                               const int64_t *full_shape,
+                                               int split_dim, int tp_rank,
+                                               int tp_size) {
+        validate_split_dim(chunk_meta, split_dim);
+        int64_t dim_size = full_shape[split_dim];
+        auto [expected_start_idx, expected_size] =
+            calculate_chunk_range(dim_size, tp_rank, tp_size);
+        (void)expected_start_idx;
+        if (chunk_meta.shape[split_dim] != expected_size) {
+            throw std::runtime_error(
+                "Chunk shape does not match the default TP sharding plan for "
+                "the provided full_shape");
+        }
+    }
+
     static void cleanup_partial_tp_chunk_puts(
         PyClient *store, const std::vector<std::string> &base_keys,
         const std::vector<int> &results, int tp_rank, bool remove_global_meta) {
@@ -500,6 +516,20 @@ class MooncakeStorePyWrapper {
             if (remove_global_meta) {
                 store->remove(get_global_meta_key_name(base_keys[i]));
             }
+        }
+    }
+
+    static void cleanup_partial_tp_puts(PyClient *store,
+                                        const std::vector<std::string> &keys,
+                                        const std::vector<int> &results,
+                                        int tp_size) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (results[i] == 0) continue;
+            for (int rank = 0; rank < tp_size; ++rank) {
+                store->remove(get_tp_key_name(keys[i], rank));
+                store->remove(get_chunk_meta_key_name(keys[i], rank));
+            }
+            store->remove(get_global_meta_key_name(keys[i]));
         }
     }
 
@@ -803,6 +833,8 @@ class MooncakeStorePyWrapper {
         try {
             calculate_full_shape(info.metadata, split_dim, put_tp_size,
                                  full_shape_arg, full_shape);
+            validate_chunk_matches_tp_plan(info.metadata, full_shape, split_dim,
+                                           put_tp_rank, put_tp_size);
         } catch (const std::exception &e) {
             LOG(ERROR) << e.what();
             return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -818,7 +850,8 @@ class MooncakeStorePyWrapper {
                                        split_dim, info.metadata, full_shape,
                                        config);
         if (ret != 0) {
-            store_->remove(chunk_key);
+            cleanup_partial_tp_chunk_puts(store_.get(), {logical_key}, {ret},
+                                          put_tp_rank, put_tp_rank == 0);
             return ret;
         }
 
@@ -1020,6 +1053,9 @@ class MooncakeStorePyWrapper {
                 }
             }
 
+            cleanup_partial_tp_puts(store_.get(), base_keys, final_results,
+                                    tp_size);
+
             size_t valid_count = 0;
             for (size_t idx : processed_indices) {
                 if (final_results[idx] == 0) valid_count++;
@@ -1066,6 +1102,9 @@ class MooncakeStorePyWrapper {
             for (size_t idx : processed_indices) {
                 if (final_results[idx] != 0) continue;
 
+                validate_chunk_matches_tp_plan(tensor_infos[idx].metadata,
+                                               tensor_infos[idx].metadata.shape,
+                                               split_dim, 0, tp_size);
                 global_meta_storage.push_back(create_global_metadata(
                     tensor_infos[idx].metadata, split_dim, tp_size,
                     tensor_infos[idx].metadata.shape));
@@ -1161,6 +1200,9 @@ class MooncakeStorePyWrapper {
                 calculate_full_shape(infos[i].metadata, split_dim, tp_size,
                                      single_full_shape_arg,
                                      full_shapes[i].data());
+                validate_chunk_matches_tp_plan(infos[i].metadata,
+                                               full_shapes[i].data(), split_dim,
+                                               tp_rank, tp_size);
             } catch (const std::exception &e) {
                 LOG(ERROR) << "Provided full_shape dim mismatch for key: "
                            << base_keys[i];
@@ -1511,6 +1553,9 @@ class MooncakeStorePyWrapper {
             try {
                 calculate_full_shape(tensor_metas[i], split_dim, tp_size,
                                      single_full_shape, full_shapes[i].data());
+                validate_chunk_matches_tp_plan(tensor_metas[i],
+                                               full_shapes[i].data(), split_dim,
+                                               tp_rank, tp_size);
             } catch (const std::exception &e) {
                 LOG(ERROR) << e.what();
                 results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);

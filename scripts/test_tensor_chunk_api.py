@@ -87,6 +87,23 @@ class TestTensorChunkAPI(MooncakeTestBase):
         self.assertEqual(self.store.is_exist(f"{key}_tp_0_meta"), 0)
         self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 0)
 
+    def test_put_tensor_chunk_with_tp_rejects_mismatched_chunk_shape(self):
+        key = "chunk_invalid_plan"
+        chunk = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+        rc = self.store.put_tensor_chunk_with_tp(
+            key,
+            chunk,
+            tp_rank=0,
+            tp_size=2,
+            split_dim=0,
+            full_shape=[8, 4],
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(self.store.is_exist(f"{key}_tp_0"), 0)
+        self.assertEqual(self.store.is_exist(f"{key}_tp_0_meta"), 0)
+        self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 0)
+
     def test_put_tensor_chunk_with_tp_writes_metadata_and_shard(self):
         key = "chunk_test_single"
         tensor = torch.arange(32, dtype=torch.float32).reshape(8, 4)
@@ -161,6 +178,27 @@ class TestTensorChunkAPI(MooncakeTestBase):
             self.assertEqual(self.store.is_exist(f"{key}_tp_{tp_rank}_meta"), 1)
             self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 0)
 
+    def test_batch_put_tensor_chunk_with_tp_rejects_mismatched_chunk_shape(self):
+        keys = ["chunk_bad_batch_0", "chunk_bad_batch_1"]
+        chunks = [
+            torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        ]
+
+        rc = self.store.batch_put_tensor_chunk_with_tp(
+            keys,
+            chunks,
+            tp_rank=0,
+            tp_size=2,
+            split_dim=0,
+            full_shapes=[[8, 4], [8, 4]],
+        )
+        self.assertNotEqual(rc, [0, 0])
+        for key in keys:
+            self.assertEqual(self.store.is_exist(f"{key}_tp_0"), 0)
+            self.assertEqual(self.store.is_exist(f"{key}_tp_0_meta"), 0)
+            self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 0)
+
     def test_rank_zero_batch_put_tensor_chunk_with_tp_writes_global_metadata(self):
         keys = ["chunk_batch_rank0_0", "chunk_batch_rank0_1"]
         tensors = [
@@ -186,6 +224,36 @@ class TestTensorChunkAPI(MooncakeTestBase):
         for key in keys:
             self.assertEqual(self.store.is_exist(f"{key}_tp_{tp_rank}_meta"), 1)
             self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 1)
+
+    def test_put_tensor_chunk_with_tp_from_rejects_mismatched_chunk_shape(self):
+        key = "chunk_from_invalid_plan"
+        chunk = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+        seed_key = f"{key}_seed"
+        self.assertEqual(self.store.put_tensor(seed_key, chunk), 0)
+        size = serialized_tensor_size(chunk)
+        payload = (ctypes.c_ubyte * size)()
+        addr = ctypes.addressof(payload)
+        self.assertEqual(self.store.register_buffer(addr, size), 0)
+        copied = self.store.get_tensor_into(seed_key, addr, size)
+        self.assertIsNotNone(copied)
+        try:
+            rc = self.store.put_tensor_chunk_with_tp_from(
+                key,
+                addr,
+                size,
+                tp_rank=0,
+                tp_size=2,
+                split_dim=0,
+                full_shape=[8, 4],
+            )
+            self.assertNotEqual(rc, 0)
+        finally:
+            self.store.unregister_buffer(addr)
+
+        self.assertEqual(self.store.is_exist(f"{key}_tp_0"), 0)
+        self.assertEqual(self.store.is_exist(f"{key}_tp_0_meta"), 0)
+        self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 0)
 
     def test_put_tensor_chunk_with_tp_from_stores_serialized_shard(self):
         key = "chunk_from_single"
@@ -220,6 +288,43 @@ class TestTensorChunkAPI(MooncakeTestBase):
         shard = self.store.get_tensor(f"{key}_tp_{tp_rank}")
         self.assertTrue(torch.equal(shard, chunk))
         self.assertEqual(self.store.is_exist(f"{key}_tp_{tp_rank}_meta"), 1)
+
+    def test_batch_put_tensor_chunk_with_tp_from_rejects_mismatched_chunk_shape(self):
+        keys = ["chunk_from_bad_batch_0", "chunk_from_bad_batch_1"]
+        chunks = [
+            torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        ]
+        seed_keys = [f"{key}_seed" for key in keys]
+        sizes = [serialized_tensor_size(chunk) for chunk in chunks]
+        payloads = [(ctypes.c_ubyte * size)() for size in sizes]
+        ptrs = [ctypes.addressof(payload) for payload in payloads]
+
+        for seed_key, chunk in zip(seed_keys, chunks):
+            self.assertEqual(self.store.put_tensor(seed_key, chunk), 0)
+        for ptr, size, seed_key in zip(ptrs, sizes, seed_keys):
+            self.assertEqual(self.store.register_buffer(ptr, size), 0)
+            copied = self.store.get_tensor_into(seed_key, ptr, size)
+            self.assertIsNotNone(copied)
+        try:
+            rc = self.store.batch_put_tensor_chunk_with_tp_from(
+                keys,
+                ptrs,
+                sizes,
+                tp_rank=0,
+                tp_size=2,
+                split_dim=0,
+                full_shapes=[[8, 4], [8, 4]],
+            )
+            self.assertNotEqual(rc, [0, 0])
+        finally:
+            for ptr in ptrs:
+                self.store.unregister_buffer(ptr)
+
+        for key in keys:
+            self.assertEqual(self.store.is_exist(f"{key}_tp_0"), 0)
+            self.assertEqual(self.store.is_exist(f"{key}_tp_0_meta"), 0)
+            self.assertEqual(self.store.is_exist(f"{key}_global_meta"), 0)
 
     def test_batch_put_tensor_chunk_with_tp_from_writes_metadata(self):
         keys = ["chunk_from_batch_0", "chunk_from_batch_1"]
