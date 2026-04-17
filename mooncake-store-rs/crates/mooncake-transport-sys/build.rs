@@ -138,7 +138,7 @@ if include_dir and libdir and ldlibrary:
 }
 
 fn detect_jsoncpp() -> JsonCppConfig {
-    let include_candidates = ["/usr/include/jsoncpp", "/usr/local/include/jsoncpp"];
+    let include_candidates = ["/usr/include/jsoncpp", "/usr/local/include/jsoncpp", "/usr/include"];
     let library_candidates = [
         "/usr/lib/x86_64-linux-gnu/libjsoncpp.so",
         "/usr/lib64/libjsoncpp.so",
