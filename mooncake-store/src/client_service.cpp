@@ -2509,17 +2509,14 @@ void Client::PutToLocalFile(const std::string& key,
     std::string value;
     value.reserve(total_size);
     for (const auto& slice : slices) {
-        #if defined(USE_CUDA)
+#if defined(USE_CUDA)
         cudaPointerAttributes attributes;
         cudaPointerGetAttributes(&attributes, slice.ptr);
         if (attributes.type == cudaMemoryTypeDevice) {
             auto ddr_buffer = std::make_unique<char[]>(slice.size);
-            cudaError_t cuda_ret = cudaMemcpy(
-                ddr_buffer.get(),
-                slice.ptr,
-                slice.size,
-                cudaMemcpyDeviceToHost
-            );
+            cudaError_t cuda_ret =
+                cudaMemcpy(ddr_buffer.get(), slice.ptr, slice.size,
+                           cudaMemcpyDeviceToHost);
 
             if (cuda_ret == cudaSuccess) {
                 value.append(ddr_buffer.get(), slice.size);
@@ -2527,17 +2524,16 @@ void Client::PutToLocalFile(const std::string& key,
                 // Fallback: try direct copy
                 LOG(WARNING) << "cudaMemcpy failed for key=" << key
                              << ", error=" << cudaGetErrorString(cuda_ret)
-                             << ", ptr=" << slice.ptr
-                             << ", size=" << slice.size
+                             << ", ptr=" << slice.ptr << ", size=" << slice.size
                              << ", attempting direct copy";
                 value.append(static_cast<char*>(slice.ptr), slice.size);
             }
         } else {
             value.append(static_cast<char*>(slice.ptr), slice.size);
         }
-        #else
+#else
         value.append(static_cast<char*>(slice.ptr), slice.size);
-        #endif
+#endif
     }
 
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
