@@ -173,6 +173,7 @@ Status IntraNodeNvlinkTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
+    std::vector<Slice *> async_submitted_slices;
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
@@ -195,17 +196,36 @@ Status IntraNodeNvlinkTransport::submitTransfer(
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
         __sync_fetch_and_add(&task.slice_count, 1);
+
         cudaError_t err;
         if (slice->opcode == TransferRequest::READ)
-            err = cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                             slice->length, cudaMemcpyDefault);
+            err = cudaMemcpyAsync(slice->source_addr,
+                                  (void *)slice->local.dest_addr, slice->length,
+                                  cudaMemcpyDefault, 0);
         else
-            err = cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                             slice->length, cudaMemcpyDefault);
+            err = cudaMemcpyAsync((void *)slice->local.dest_addr,
+                                  slice->source_addr, slice->length,
+                                  cudaMemcpyDefault, 0);
+
         if (err != cudaSuccess)
             slice->markFailed();
         else
-            slice->markSuccess();
+            async_submitted_slices.push_back(slice);
+    }
+
+    if (!async_submitted_slices.empty()) {
+        cudaEvent_t event;
+        cudaError_t event_err =
+            cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (event_err != cudaSuccess) {
+            for (auto *slice : async_submitted_slices) slice->markFailed();
+            return Status::InvalidArgument("cudaEventCreateWithFlags failed");
+        }
+        cudaEventRecord(event, 0);
+        cudaEventSynchronize(event);
+        cudaEventDestroy(event);
+
+        for (auto *slice : async_submitted_slices) slice->markSuccess();
     }
 
     return Status::OK();
@@ -241,6 +261,8 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
 
 Status IntraNodeNvlinkTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+    std::vector<Slice *> async_submitted_slices;
+
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
@@ -263,18 +285,38 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
         slice->status = Slice::PENDING;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
+
         cudaError_t err;
         if (slice->opcode == TransferRequest::READ)
-            err = cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                             slice->length, cudaMemcpyDefault);
+            err = cudaMemcpyAsync(slice->source_addr,
+                                  (void *)slice->local.dest_addr, slice->length,
+                                  cudaMemcpyDefault, 0);
         else
-            err = cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                             slice->length, cudaMemcpyDefault);
+            err = cudaMemcpyAsync((void *)slice->local.dest_addr,
+                                  slice->source_addr, slice->length,
+                                  cudaMemcpyDefault, 0);
+
         if (err != cudaSuccess)
             slice->markFailed();
         else
-            slice->markSuccess();
+            async_submitted_slices.push_back(slice);
     }
+
+    if (!async_submitted_slices.empty()) {
+        cudaEvent_t event;
+        cudaError_t event_err =
+            cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (event_err != cudaSuccess) {
+            for (auto *slice : async_submitted_slices) slice->markFailed();
+            return Status::InvalidArgument("cudaEventCreateWithFlags failed");
+        }
+        cudaEventRecord(event, 0);
+        cudaEventSynchronize(event);
+        cudaEventDestroy(event);
+
+        for (auto *slice : async_submitted_slices) slice->markSuccess();
+    }
+
     return Status::OK();
 }
 
