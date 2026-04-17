@@ -65,6 +65,14 @@ else()
   message(STATUS "Uring: Disabled")
 endif()
 
+if(USE_SUNRISE)
+  target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
+  target_include_directories(tent_interface INTERFACE /usr/local/tangrt/include)
+  target_link_directories(tent_interface INTERFACE
+                          /usr/local/tangrt/lib/linux-x86_64)
+  target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
+endif()
+
 set(YALANTING_TARGET yalantinglibs::yalantinglibs)
 if(NOT TARGET ${YALANTING_TARGET})
   if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -101,6 +109,7 @@ foreach(
   tent_platform_all
   platform_cuda
   platform_ascend
+  platform_sunrise
   tent_xport_gds
   tent_xport_uring
   tent_xport_bufio
@@ -110,13 +119,13 @@ foreach(
   tent_xport_shm
   tent_xport_tcp
   tent_xport_ascend_direct
+  tent_xport_sunrise_link
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})
   endif()
 endforeach()
 target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
-
 install(
   TARGETS tent_shared
   ARCHIVE DESTINATION lib
