@@ -68,8 +68,9 @@ ensure_yalantinglibs() {
   local source_dir="${UPSTREAM_DIR}/extern/yalantinglibs"
   local build_dir="${UPSTREAM_BUILD_DIR}/yalantinglibs-build"
   local config_file="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs/yalantinglibsConfig.cmake"
+  local header_file="${YALANTINGLIBS_PREFIX}/include/ylt/easylog.hpp"
 
-  if [[ -f "${config_file}" ]]; then
+  if [[ -f "${config_file}" && -f "${header_file}" ]]; then
     return 0
   fi
   if [[ ! -d "${source_dir}" ]]; then
@@ -110,6 +111,7 @@ fi
 
 git -C "${REPO_ROOT}" submodule update --init --recursive
 ensure_yalantinglibs
+export CPATH="${YALANTINGLIBS_PREFIX}/include${CPATH:+:${CPATH}}"
 
 PATH="${VENV_BIN}:${PATH}" cmake \
   -S "${UPSTREAM_DIR}" \
