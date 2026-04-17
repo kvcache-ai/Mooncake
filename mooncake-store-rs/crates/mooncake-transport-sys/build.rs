@@ -24,21 +24,26 @@ fn main() {
         &python,
         &jsoncpp,
     );
-    build_native_shims(&upstream_dir, &out_dir);
+    build_native_shims(&upstream_dir, &build_dir, &out_dir);
 
     let classic_dir = build_dir.join("mooncake-transfer-engine/src");
     let tent_dir = build_dir.join("mooncake-transfer-engine/tent/src");
-
-    println!("cargo:rustc-link-search=native={}", classic_dir.display());
-    println!("cargo:rustc-link-search=native={}", tent_dir.display());
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=mooncake_classic_shim");
-    println!("cargo:rustc-link-lib=static=mooncake_tent_shim");
-    println!("cargo:rustc-link-lib=dylib=transfer_engine");
-    println!("cargo:rustc-link-lib=dylib=tent_shared");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", classic_dir.display());
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", tent_dir.display());
+    println!(
+        "cargo:rustc-env=MOONCAKE_CLASSIC_TE_LIB_PATH={}",
+        classic_dir.join("libtransfer_engine.so").display()
+    );
+    println!(
+        "cargo:rustc-env=MOONCAKE_TENT_SHARED_LIB_PATH={}",
+        tent_dir.join("libtent_shared.so").display()
+    );
+    println!(
+        "cargo:rustc-env=MOONCAKE_CLASSIC_SHIM_LIB_PATH={}",
+        out_dir.join("libmooncake_classic_shim.so").display()
+    );
+    println!(
+        "cargo:rustc-env=MOONCAKE_TENT_SHIM_LIB_PATH={}",
+        out_dir.join("libmooncake_tent_shim.so").display()
+    );
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -314,59 +319,68 @@ fn ensure_upstream_native_artifacts(
     );
 }
 
-fn build_native_shims(upstream_dir: &Path, out_dir: &Path) {
+fn build_native_shims(upstream_dir: &Path, build_dir: &Path, out_dir: &Path) {
     let include = upstream_dir.join("mooncake-transfer-engine/include");
     let tent_include = upstream_dir.join("mooncake-transfer-engine/tent/include");
+    let classic_dir = build_dir.join("mooncake-transfer-engine/src");
+    let tent_dir = build_dir.join("mooncake-transfer-engine/tent/src");
 
     build_native_shim(
         out_dir,
         "classic_shim.cc",
-        "libmooncake_classic_shim.a",
+        "libmooncake_classic_shim.so",
         "compile classic transfer-engine shim",
         &[&include],
+        &[(&classic_dir, "transfer_engine")],
+        &[&classic_dir],
     );
     build_native_shim(
         out_dir,
         "tent_shim.cc",
-        "libmooncake_tent_shim.a",
+        "libmooncake_tent_shim.so",
         "compile tent transfer-engine shim",
         &[&include, &tent_include],
+        &[(&tent_dir, "tent_shared")],
+        &[&tent_dir],
     );
 }
 
 fn build_native_shim(
     out_dir: &Path,
     source_name: &str,
-    archive_name: &str,
+    library_name: &str,
     description: &str,
     includes: &[&Path],
+    link_libs: &[(&Path, &str)],
+    rpaths: &[&Path],
 ) {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir must exist"));
     let src = manifest_dir.join("src").join(source_name);
-    let object = out_dir.join(format!("{source_name}.o"));
-    let archive = out_dir.join(archive_name);
+    let library = out_dir.join(library_name);
     let mut compile = Command::new("c++");
-    compile.arg("-std=c++20").arg("-fPIC");
+    compile.arg("-std=c++20").arg("-fPIC").arg("-shared");
     for include in includes {
         compile.arg("-I").arg(include);
     }
-    compile.arg("-c").arg(&src).arg("-o").arg(&object);
-    run(&mut compile, description);
+    for (path, lib) in link_libs {
+        compile.arg("-L").arg(path).arg(format!("-l{lib}"));
+    }
+    for rpath in rpaths {
+        compile.arg(format!("-Wl,-rpath,{}", rpath.display()));
+    }
+    compile.arg(&src).arg("-o").arg(&library);
 
-    if archive.exists() {
-        std::fs::remove_file(&archive).unwrap_or_else(|error| {
+    if library.exists() {
+        std::fs::remove_file(&library).unwrap_or_else(|error| {
             panic!(
-                "failed to remove stale shim archive {}: {error}",
-                archive.display()
+                "failed to remove stale shim library {}: {error}",
+                library.display()
             )
         });
     }
 
-    run(
-        Command::new("ar").arg("crus").arg(&archive).arg(&object),
-        &format!("archive {}", archive_name),
-    );
+    run(&mut compile, description);
 }
 
 fn run(command: &mut Command, description: &str) {

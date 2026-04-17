@@ -1138,6 +1138,40 @@ struct HttpServerSegment {
     length: usize,
 }
 
+fn http_segment_target_range(
+    segment: &HttpServerSegment,
+    target_offset: u64,
+    length: u64,
+) -> Result<std::ops::Range<usize>> {
+    let len = usize::try_from(length)
+        .map_err(|_| StoreError::Transport("item length does not fit usize".to_string()))?;
+    let segment_base = u64::try_from(segment.base_addr)
+        .map_err(|_| StoreError::Transport("segment base address does not fit u64".to_string()))?;
+    let segment_length = u64::try_from(segment.length)
+        .map_err(|_| StoreError::Transport("segment length does not fit u64".to_string()))?;
+    let relative_offset = if target_offset <= segment_length {
+        target_offset
+    } else {
+        target_offset.checked_sub(segment_base).ok_or_else(|| {
+            StoreError::Transport("target offset precedes segment base".to_string())
+        })?
+    };
+    let relative_end = relative_offset
+        .checked_add(length)
+        .ok_or_else(|| StoreError::Transport("target range overflow".to_string()))?;
+    if relative_end > segment_length {
+        return Err(StoreError::Transport(format!(
+            "segment transfer exceeds bounds: offset={target_offset} length={length} segment_base={segment_base} segment_length={segment_length}"
+        )));
+    }
+    let start = usize::try_from(relative_offset)
+        .map_err(|_| StoreError::Transport("target offset does not fit usize".to_string()))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| StoreError::Transport("target range overflow".to_string()))?;
+    Ok(start..end)
+}
+
 impl HttpTransportServerHandle {
     pub fn start(bind_addr: &str) -> Result<Self> {
         let listener = TcpListener::bind(bind_addr).map_err(|error| {
@@ -1409,17 +1443,7 @@ fn apply_http_batch(
         })?;
         let len = usize::try_from(item.length)
             .map_err(|_| StoreError::Transport("item length does not fit usize".to_string()))?;
-        let target_offset = usize::try_from(item.target_offset)
-            .map_err(|_| StoreError::Transport("target offset does not fit usize".to_string()))?;
-        let target_end = target_offset
-            .checked_add(len)
-            .ok_or_else(|| StoreError::Transport("target range overflow".to_string()))?;
-        if target_end > segment.length {
-            return Err(StoreError::Transport(format!(
-                "segment {} transfer exceeds bounds",
-                item.segment_name
-            )));
-        }
+        let target_range = http_segment_target_range(segment, item.target_offset, item.length)?;
         match item.opcode {
             Opcode::Write => {
                 let start = usize::try_from(item.body_offset).map_err(|_| {
@@ -1436,14 +1460,16 @@ fn apply_http_batch(
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         raw_body[start..end].as_ptr(),
-                        (segment.base_addr as *mut u8).add(target_offset),
+                        (segment.base_addr as *mut u8).add(target_range.start),
                         len,
                     );
                 }
             }
             Opcode::Read => unsafe {
-                let source =
-                    slice::from_raw_parts((segment.base_addr as *const u8).add(target_offset), len);
+                let source = slice::from_raw_parts(
+                    (segment.base_addr as *const u8).add(target_range.start),
+                    len,
+                );
                 read_body.extend_from_slice(source);
             },
         }
