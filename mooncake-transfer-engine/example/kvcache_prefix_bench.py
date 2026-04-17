@@ -418,10 +418,10 @@ def run_initiator(args):
         print(json.dumps(results, indent=2))
 
         # Save results
-        thr_tag = f"_t{num_threads}" if num_threads > 1 else ""
+        thread_tag = f"_t{num_threads}" if num_threads > 1 else ""
         out_file = (
             f"kvcache_bench_pool{args.pool_size_gb}gb"
-            f"{'_gpu' if args.use_gpu else '_cpu'}{thr_tag}.json"
+            f"{'_gpu' if args.use_gpu else '_cpu'}{thread_tag}.json"
         )
         with open(out_file, "w") as f:
             json.dump(
