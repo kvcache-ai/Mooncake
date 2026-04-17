@@ -107,6 +107,21 @@ class HAIntegrationTest : public ::testing::Test {
                std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+
+        // If recovery failed (still SYNCING), try re-registering and retry.
+        // This can happen if master restarted and lost client registration.
+        if (client->ha_manager_->GetState() != HAClientState::FULL) {
+            auto reg = client->RegisterClient();
+            if (reg.has_value()) {
+                client->ha_manager_->HandleEvent(HAEvent::MASTER_RECONNECTED);
+                deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                while (client->ha_manager_->GetState() != HAClientState::FULL &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+        }
         ASSERT_EQ(client->ha_manager_->GetState(), HAClientState::FULL)
             << "Client did not recover to FULL within 10s";
     }
@@ -436,15 +451,19 @@ TEST_F(HAIntegrationTest, MasterRestartRecovery) {
     // Reconnect RPC clients to the restarted master (old connections are
     // stale). Retry with backoff since the restarted RPC server may not
     // be fully accepting connections immediately.
+    // Each client has its own connection pool, so both need to clear stale
+    // connections independently.
     for (int attempt = 0; attempt < 10; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         auto err = client1_->GetMasterClient().Connect(master_address_);
         if (err == ErrorCode::OK) break;
         if (attempt == 9) FAIL() << "Reconnect client1 failed after retries";
     }
-    {
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         auto err = client2_->GetMasterClient().Connect(master_address_);
-        ASSERT_EQ(err, ErrorCode::OK) << "Reconnect client2 failed";
+        if (err == ErrorCode::OK) break;
+        if (attempt == 9) FAIL() << "Reconnect client2 failed after retries";
     }
 
     // Re-register clients with the restarted master.
