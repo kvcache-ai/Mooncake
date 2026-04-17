@@ -44,7 +44,7 @@ TEST(EfaCApiTest, RegisterMemoryAfterCApiSetup) {
     ASSERT_NE(installTransport(engine, "efa", NULL), nullptr);
 
     size_t buf_size = 1 << 20;  // 1 MB
-    void *buf = numa_alloc_onnode(buf_size, 0);
+    void* buf = numa_alloc_onnode(buf_size, 0);
     ASSERT_NE(buf, nullptr);
     memset(buf, 0xAB, buf_size);
 
@@ -78,7 +78,7 @@ TEST(EfaCApiTest, RegisterMemoryBatchAfterCApiSetup) {
     int ret = registerLocalMemoryBatch(engine, entries, num_bufs, "cpu:0");
     EXPECT_EQ(ret, 0) << "registerLocalMemoryBatch failed with code " << ret;
 
-    void *addrs[4];
+    void* addrs[4];
     for (int i = 0; i < num_bufs; i++) addrs[i] = entries[i].addr;
     unregisterLocalMemoryBatch(engine, addrs, num_bufs);
     for (int i = 0; i < num_bufs; i++) numa_free(entries[i].addr, buf_size);
@@ -92,12 +92,13 @@ TEST(EfaCApiTest, InstallEfaWithoutDiscoverFails) {
     ASSERT_NE(engine, nullptr);
 
     transport_t xport = installTransport(engine, "efa", NULL);
-    EXPECT_EQ(xport, nullptr) << "installTransport should fail without discover";
+    EXPECT_EQ(xport, nullptr)
+        << "installTransport should fail without discover";
 
     destroyTransferEngine(engine);
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
