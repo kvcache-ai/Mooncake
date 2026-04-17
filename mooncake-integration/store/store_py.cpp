@@ -1448,6 +1448,8 @@ class MooncakeStorePyWrapper {
         try {
             calculate_full_shape(tensor_meta, split_dim, tp_size,
                                  full_shape_arg, full_shape);
+            validate_chunk_matches_tp_plan(tensor_meta, full_shape, split_dim,
+                                           tp_rank, tp_size);
         } catch (const std::exception &e) {
             LOG(ERROR) << e.what();
             return to_py_ret(ErrorCode::INVALID_PARAMS);
