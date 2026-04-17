@@ -775,8 +775,10 @@ tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
 
     auto handle = CreateGetHandle(key, allocator, config);
     if (!handle) {
-        LOG(ERROR) << "Failed to create get handle for key: " << key
-                   << ", error: " << handle.error();
+        if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to create get handle for key: " << key
+                       << ", error: " << handle.error();
+        }
         timer.LogResponse("error_code=", handle.error());
         return tl::unexpected(handle.error());
     }
@@ -831,8 +833,10 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
     // Phase 2: wait on all handles.
     for (size_t i = 0; i < keys.size(); ++i) {
         if (!handles[i]) {
-            LOG(ERROR) << "Failed to create get handle for key: " << keys[i]
-                       << ", error: " << handles[i].error();
+            if (handles[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "Failed to create get handle for key: " << keys[i]
+                           << ", error: " << handles[i].error();
+            }
             results[i] = tl::unexpected(handles[i].error());
             continue;
         }
@@ -874,8 +878,10 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
 
     auto handle = CreateGetHandle(key, slices, config);
     if (!handle) {
-        LOG(ERROR) << "Failed to create get handle for key: " << key
-                   << ", error: " << handle.error();
+        if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to create get handle for key: " << key
+                       << ", error: " << handle.error();
+        }
         timer.LogResponse("error_code=", handle.error());
         return tl::unexpected(handle.error());
     }
@@ -935,8 +941,10 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
     results.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         if (!handles[i]) {
-            LOG(ERROR) << "Failed to create get handle for key: " << keys[i]
-                       << ", error: " << handles[i].error();
+            if (handles[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "Failed to create get handle for key: " << keys[i]
+                           << ", error: " << handles[i].error();
+            }
             results.push_back(tl::unexpected(handles[i].error()));
             continue;
         }
@@ -972,6 +980,11 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
                        << ", error: " << local.error();
             return tl::unexpected(local.error());
         }
+    }
+
+    // DEGRADED: local miss with unreachable master — cannot fetch remote
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     // 2. Build route iterator
@@ -1029,6 +1042,11 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
                        << ", error: " << local.error();
             return tl::unexpected(local.error());
         }
+    }
+
+    // DEGRADED: local miss with unreachable master — cannot fetch remote
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     // 2. Build route iterator

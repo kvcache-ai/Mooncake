@@ -55,6 +55,8 @@ class HAIntegrationTest : public ::testing::Test {
             /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
             /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
             /*route_cache_ttl_ms=*/5 * 60 * 1000,
+            /*local_transfer_mode=*/"memcpy",
+            /*local_memcpy_async_worker_num=*/32,
             /*labels=*/{}, async_sender_thread_count);
 
         auto client = std::make_shared<P2PClientService>(
@@ -258,22 +260,29 @@ TEST_F(HAIntegrationTest, DegradedModeLocalOps) {
     ForceRecover(client1_);
 }
 
-// A3: Degraded mode — remote Get and Query fail with INACCESSIBLE_MASTER.
+// A3: Degraded mode — remote Get returns OBJECT_NOT_FOUND; Query fails with
+//     INACCESSIBLE_MASTER.
 TEST_F(HAIntegrationTest, DegradedModeRemoteOpsFail) {
     // Write on client2 — client1's route cache not populated
     auto put = PutData(client2_, "a3_client2_key", "remote_val");
     ASSERT_TRUE(put.has_value());
 
+    // Verify data is accessible before degradation (client1 → master → client2)
+    auto get_before = GetData(client1_, "a3_client2_key", 10);
+    ASSERT_TRUE(get_before.has_value()) << "Pre-degradation get failed: "
+                                        << static_cast<int>(get_before.error());
+    EXPECT_EQ(get_before.value(), "remote_val");
+
     ForceDegraded(client1_);
 
-    // Get: local miss → cache miss → degraded check → INACCESSIBLE_MASTER
+    // Get: local miss → degraded check → OBJECT_NOT_FOUND (master unreachable)
     std::vector<char> buf(100, 0);
     auto get =
         client1_->Get("a3_client2_key", {(void*)buf.data()}, {buf.size()});
     EXPECT_FALSE(get.has_value());
-    EXPECT_EQ(get.error(), ErrorCode::INACCESSIBLE_MASTER);
+    EXPECT_EQ(get.error(), ErrorCode::OBJECT_NOT_FOUND);
 
-    // Query: requires master → fails
+    // Query: requires master → fails with INACCESSIBLE_MASTER
     auto query = client1_->Query("a3_client1_query_key");
     EXPECT_FALSE(query.has_value());
     EXPECT_EQ(query.error(), ErrorCode::INACCESSIBLE_MASTER);
@@ -286,14 +295,20 @@ TEST_F(HAIntegrationTest, RecoverFromDegradedRemoteGet) {
     auto put = PutData(client2_, "a4_client2_key", "recoverable");
     ASSERT_TRUE(put.has_value());
 
+    // Verify data is accessible before degradation (client1 → master → client2)
+    auto get_before = GetData(client1_, "a4_client2_key", 11);
+    ASSERT_TRUE(get_before.has_value()) << "Pre-degradation get failed: "
+                                        << static_cast<int>(get_before.error());
+    EXPECT_EQ(get_before.value(), "recoverable");
+
     ForceDegraded(client1_);
 
-    // Verify Get fails during degradation
+    // Verify Get fails during degradation (local miss → OBJECT_NOT_FOUND)
     std::vector<char> buf(11, 0);
     auto get_fail =
         client1_->Get("a4_client2_key", {(void*)buf.data()}, {buf.size()});
     EXPECT_FALSE(get_fail.has_value());
-    EXPECT_EQ(get_fail.error(), ErrorCode::INACCESSIBLE_MASTER);
+    EXPECT_EQ(get_fail.error(), ErrorCode::OBJECT_NOT_FOUND);
 
     ForceRecover(client1_);
 
