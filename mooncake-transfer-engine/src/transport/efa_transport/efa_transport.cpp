@@ -332,15 +332,8 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 nic_assignments[ci].push_back(n);
             }
         }
-    } else {
-        // Multi-chunk, PTE budget exceeded: disjoint partition
-        if (num_chunks > num_nics) {
-            LOG(ERROR) << "Buffer requires " << num_chunks
-                       << " chunks but only " << num_nics
-                       << " NICs available. Max registerable size = "
-                       << chunk_limit * num_nics << " bytes";
-            return ERR_INVALID_ARGUMENT;
-        }
+    } else if (num_chunks <= num_nics) {
+        // Multi-chunk, PTE exceeded, more NICs than chunks: disjoint partition
         for (size_t ci = 0; ci < num_chunks; ++ci) {
             size_t nics_per = num_nics / num_chunks;
             size_t extra = num_nics % num_chunks;
@@ -360,6 +353,39 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 nic_list += std::to_string(nic_assignments[ci][j]);
             }
             LOG(WARNING) << "  chunk " << ci << " -> NICs [" << nic_list << "]";
+        }
+    } else {
+        // Multi-chunk, PTE exceeded, more chunks than NICs: round-robin
+        // Each NIC gets multiple chunks; verify per-NIC PTE stays in budget.
+        size_t pte_budget = getMaxPteEntries();
+        std::vector<size_t> pages_per_nic(num_nics, 0);
+        for (size_t ci = 0; ci < num_chunks; ++ci) {
+            size_t nic = ci % num_nics;
+            size_t chunk_pages = chunks[ci].second / page_size;
+            pages_per_nic[nic] += chunk_pages;
+            nic_assignments[ci].push_back(nic);
+        }
+        bool pte_ok = true;
+        for (size_t n = 0; n < num_nics; ++n) {
+            if (pages_per_nic[n] > pte_budget) {
+                pte_ok = false;
+                break;
+            }
+        }
+        if (!pte_ok) {
+            LOG(ERROR) << "Buffer requires " << num_chunks << " chunks ("
+                       << length << " bytes) but per-NIC PTE budget ("
+                       << pte_budget << " entries, page_size=" << page_size
+                       << ") is exceeded even with round-robin across "
+                       << num_nics << " NICs";
+            return ERR_INVALID_ARGUMENT;
+        }
+        LOG(WARNING) << "Round-robin NIC assignment: " << num_chunks
+                     << " chunks across " << num_nics << " NICs";
+        for (size_t ci = 0; ci < num_chunks; ++ci) {
+            LOG(WARNING) << "  chunk " << ci << " ("
+                         << chunks[ci].second / (1024 * 1024) << " MB) -> NIC "
+                         << nic_assignments[ci][0];
         }
     }
 
