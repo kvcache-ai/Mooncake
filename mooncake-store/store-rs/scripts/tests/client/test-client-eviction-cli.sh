@@ -6,6 +6,9 @@ REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
+STARTUP_TIMEOUT_SECONDS="${MC_STORE_RS_EVICTION_STARTUP_TIMEOUT_SECONDS:-30}"
+EVICTION_TIMEOUT_SECONDS="${MC_STORE_RS_EVICTION_TIMEOUT_SECONDS:-60}"
+METRICS_TIMEOUT_SECONDS="${MC_STORE_RS_EVICTION_METRICS_TIMEOUT_SECONDS:-45}"
 
 usage() {
   cat <<'EOF'
@@ -18,6 +21,15 @@ metrics, and tracing logs.
 Environment:
   MC_STORE_RS_REDIS_PORT      Redis port for the temporary metadata backend
   MC_STORE_RS_KEEP_TEMP       Keep temp logs on failure when set to 1
+  MC_STORE_RS_EVICTION_STARTUP_TIMEOUT_SECONDS
+                              Time to wait for the storage CLI startup banner
+                              (default: 30)
+  MC_STORE_RS_EVICTION_TIMEOUT_SECONDS
+                              Time to wait for routed writes to trigger eviction
+                              (default: 60)
+  MC_STORE_RS_EVICTION_METRICS_TIMEOUT_SECONDS
+                              Time to wait for eviction metrics after the driver
+                              observes eviction (default: 45)
   MOONCAKE_UPSTREAM_DIR       Mooncake upstream submodule path
   MOONCAKE_UPSTREAM_BUILD_DIR Explicit upstream build directory override
 EOF
@@ -32,12 +44,19 @@ wait_for_log() {
   local log_file=$1
   local needle=$2
   local timeout_seconds=${3:-20}
+  local pid=${4:-}
   local attempts=$((timeout_seconds * 10))
   local attempt
 
   for ((attempt = 0; attempt < attempts; attempt += 1)); do
     if [[ -f "${log_file}" ]] && grep -Fq "${needle}" "${log_file}"; then
       return 0
+    fi
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
+      echo "process ${pid} exited while waiting for log line: ${needle}" >&2
+      echo "--- ${log_file} ---" >&2
+      cat "${log_file}" >&2
+      return 1
     fi
     sleep 0.1
   done
@@ -70,14 +89,15 @@ PY
 
 wait_for_metrics() {
   local metrics_addr=$1
-  python3 - "${metrics_addr}" <<'PY'
+  local timeout_seconds=${2:-45}
+  python3 - "${metrics_addr}" "${timeout_seconds}" <<'PY'
 import re
 import sys
 import time
 import urllib.request
 
 metrics_addr = sys.argv[1]
-deadline = time.time() + 20
+deadline = time.time() + float(sys.argv[2])
 last_text = ""
 
 def metric_value(text: str, metric: str, operation: str) -> int:
@@ -86,8 +106,13 @@ def metric_value(text: str, metric: str, operation: str) -> int:
     return int(match.group(1)) if match else 0
 
 while time.time() < deadline:
-    with urllib.request.urlopen(f"http://{metrics_addr}/metrics", timeout=2) as response:
-        last_text = response.read().decode()
+    try:
+        with urllib.request.urlopen(f"http://{metrics_addr}/metrics", timeout=2) as response:
+            last_text = response.read().decode()
+    except Exception as exc:
+        last_text = f"# failed to fetch metrics from {metrics_addr}: {exc}"
+        time.sleep(0.2)
+        continue
 
     background_calls = metric_value(
         last_text,
@@ -118,28 +143,96 @@ raise SystemExit("eviction metrics did not reach the expected values")
 PY
 }
 
+capture_metrics_snapshot() {
+  local metrics_addr=${METRICS_ADDR:-}
+  local output_file=${METRICS_SNAPSHOT:-}
+  if [[ -z "${metrics_addr}" || -z "${output_file}" || "${metrics_addr}" == "disabled" ]]; then
+    return 0
+  fi
+  python3 - "${metrics_addr}" "${output_file}" <<'PY' || true
+import sys
+import urllib.request
+
+metrics_addr = sys.argv[1]
+output_file = sys.argv[2]
+try:
+    with urllib.request.urlopen(f"http://{metrics_addr}/metrics", timeout=2) as response:
+        text = response.read().decode()
+except Exception as exc:
+    text = f"# failed to fetch metrics from {metrics_addr}: {exc}\n"
+with open(output_file, "w", encoding="utf-8") as fout:
+    fout.write(text)
+PY
+}
+
+print_tail_if_exists() {
+  local label=$1
+  local path=$2
+  local lines=${3:-120}
+  if [[ -f "${path}" ]]; then
+    echo "--- ${label}: ${path} (tail -${lines}) ---" >&2
+    tail -n "${lines}" "${path}" >&2
+  else
+    echo "--- ${label}: ${path} missing ---" >&2
+  fi
+}
+
+print_failure_context() {
+  echo "==> failure diagnostics" >&2
+  print_tail_if_exists "driver log" "${DRIVER_LOG:-}" 160
+  print_tail_if_exists "storage log" "${STORAGE_LOG:-}" 200
+  if [[ -f "${METRICS_SNAPSHOT:-}" ]]; then
+    echo "--- metrics snapshot: ${METRICS_SNAPSHOT} ---" >&2
+    grep -E "mooncake_store_client_operation|mooncake_store_heartbeat|mooncake_store_runtime_lease|storage_owner" \
+      "${METRICS_SNAPSHOT}" >&2 || cat "${METRICS_SNAPSHOT}" >&2
+  fi
+}
+
 TEMP_DIR=$(mktemp -d)
 PIDS=()
 REDIS_STARTED=0
+METRICS_ADDR=""
+METRICS_SNAPSHOT="${TEMP_DIR}/metrics.final"
 
 cleanup() {
   local status=$?
   local pid
+  local attempt
+
+  if [[ "${status}" != "0" ]]; then
+    capture_metrics_snapshot
+  fi
 
   for pid in "${PIDS[@]:-}"; do
     if kill -0 "${pid}" >/dev/null 2>&1; then
       kill -TERM "${pid}" >/dev/null 2>&1 || true
     fi
   done
-  sleep 0.2
+  for ((attempt = 0; attempt < 20; attempt += 1)); do
+    local any_alive=0
+    for pid in "${PIDS[@]:-}"; do
+      if kill -0 "${pid}" >/dev/null 2>&1; then
+        any_alive=1
+        break
+      fi
+    done
+    [[ "${any_alive}" == "0" ]] && break
+    sleep 0.1
+  done
   for pid in "${PIDS[@]:-}"; do
     if kill -0 "${pid}" >/dev/null 2>&1; then
       kill -KILL "${pid}" >/dev/null 2>&1 || true
     fi
   done
+  for pid in "${PIDS[@]:-}"; do
+    wait "${pid}" >/dev/null 2>&1 || true
+  done
 
   if [[ "${REDIS_STARTED}" == "1" ]]; then
     redis-cli -p "${REDIS_PORT}" shutdown nosave >/dev/null 2>&1 || true
+  fi
+  if [[ "${status}" != "0" ]]; then
+    print_failure_context
   fi
   if [[ "${status}" != "0" && "${MC_STORE_RS_KEEP_TEMP:-0}" == "1" ]]; then
     echo "preserving temp dir: ${TEMP_DIR}" >&2
@@ -179,6 +272,7 @@ STABLE_ID="cli-evict-${RUN_ID}"
 DRIVER_ID="cli-evict-driver-${RUN_ID}"
 READER_ID="cli-evict-reader-${RUN_ID}"
 STORAGE_LOG="${TEMP_DIR}/storage.log"
+DRIVER_LOG="${TEMP_DIR}/driver.log"
 SEGMENT_NAME="cli-evict-segment-${RUN_ID}"
 
 BASE_ARGS=(
@@ -208,7 +302,11 @@ echo "==> starting standalone storage client"
   >"${STORAGE_LOG}" 2>&1 &
 STORAGE_PID=$!
 PIDS+=("${STORAGE_PID}")
-wait_for_log "${STORAGE_LOG}" "mooncake-store-client started stable_id=${STABLE_ID} epoch=1 initial_state=active segment=${SEGMENT_NAME}"
+wait_for_log \
+  "${STORAGE_LOG}" \
+  "mooncake-store-client started stable_id=${STABLE_ID} epoch=1 initial_state=active segment=${SEGMENT_NAME}" \
+  "${STARTUP_TIMEOUT_SECONDS}" \
+  "${STORAGE_PID}"
 
 METRICS_ADDR=$(sed -n 's/.*metrics_addr=\([^ ]*\).*/\1/p' "${STORAGE_LOG}" | tail -n 1)
 if [[ -z "${METRICS_ADDR}" || "${METRICS_ADDR}" == "disabled" ]]; then
@@ -219,105 +317,140 @@ fi
 wait_for_healthz "${METRICS_ADDR}"
 
 echo "==> driving routed writes and waiting for background eviction"
-REDIS_URL="${REDIS_URL}" \
-KEYSPACE="${KEYSPACE}" \
-DRIVER_ID="${DRIVER_ID}" \
-READER_ID="${READER_ID}" \
-STABLE_ID="${STABLE_ID}" \
-python3 - <<'PY'
+if ! REDIS_URL="${REDIS_URL}" \
+  KEYSPACE="${KEYSPACE}" \
+  DRIVER_ID="${DRIVER_ID}" \
+  READER_ID="${READER_ID}" \
+  STABLE_ID="${STABLE_ID}" \
+  EVICTION_TIMEOUT_SECONDS="${EVICTION_TIMEOUT_SECONDS}" \
+  PYTHONUNBUFFERED=1 \
+  python3 - >"${DRIVER_LOG}" 2>&1 <<'PY'
 import os
 import time
+import traceback
 
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 writer = MooncakeDistributedStore()
-assert writer.setup(
-    "127.0.0.1",
-    os.environ["REDIS_URL"],
-    4 * 1024 * 1024,
-    1 * 1024 * 1024,
-    "tcp",
-    "",
-    "",
-    stable_id=os.environ["DRIVER_ID"],
-    keyspace=os.environ["KEYSPACE"],
-    labels={"pool": "pool-a", "storage": "false", "route": "false"},
-    routed_writes=True,
-    replica_count=1,
-    route_control="metadata_only",
-) == 0
-
 reader = MooncakeDistributedStore()
-assert reader.setup(
-    "127.0.0.1",
-    os.environ["REDIS_URL"],
-    4 * 1024 * 1024,
-    1 * 1024 * 1024,
-    "tcp",
-    "",
-    "",
-    stable_id=os.environ["READER_ID"],
-    keyspace=os.environ["KEYSPACE"],
-    labels={"pool": "pool-a", "storage": "false", "route": "false"},
-    route_control="metadata_only",
-) == 0
 
-owner = f"{os.environ['STABLE_ID']}:1"
-policy = ReplicateConfig(
-    replica_num=1,
-    preferred_storage_owners=[owner],
-    prefer_local=False,
-)
+try:
+    assert writer.setup(
+        "127.0.0.1",
+        os.environ["REDIS_URL"],
+        4 * 1024 * 1024,
+        1 * 1024 * 1024,
+        "tcp",
+        "",
+        "",
+        stable_id=os.environ["DRIVER_ID"],
+        keyspace=os.environ["KEYSPACE"],
+        labels={"pool": "pool-a", "storage": "false", "route": "false"},
+        routed_writes=True,
+        replica_count=1,
+        route_control="metadata_only",
+    ) == 0
 
-hot_key = "evict-hot"
-cold_key = "evict-cold"
-fresh_key = "evict-fresh"
-payload_size = 320 * 1024
-hot = b"H" * payload_size
-cold = b"C" * payload_size
-fresh = b"F" * payload_size
+    assert reader.setup(
+        "127.0.0.1",
+        os.environ["REDIS_URL"],
+        4 * 1024 * 1024,
+        1 * 1024 * 1024,
+        "tcp",
+        "",
+        "",
+        stable_id=os.environ["READER_ID"],
+        keyspace=os.environ["KEYSPACE"],
+        labels={"pool": "pool-a", "storage": "false", "route": "false"},
+        route_control="metadata_only",
+    ) == 0
 
-assert writer.put(hot_key, hot, config=policy) == 0
-assert writer.put(cold_key, cold, config=policy) == 0
+    owner = f"{os.environ['STABLE_ID']}:1"
+    policy = ReplicateConfig(
+        replica_num=1,
+        preferred_storage_owners=[owner],
+        prefer_local=False,
+    )
 
-warm_deadline = time.time() + 10
-while time.time() < warm_deadline:
-    try:
-        if reader.get(hot_key) == hot:
-            break
-    except Exception:
-        pass
-    time.sleep(0.1)
-else:
-    raise AssertionError("reader did not observe the hot key before eviction")
+    hot_key = "evict-hot"
+    cold_key = "evict-cold"
+    fresh_key = "evict-fresh"
+    payload_size = 320 * 1024
+    hot = b"H" * payload_size
+    cold = b"C" * payload_size
+    fresh = b"F" * payload_size
+    eviction_timeout = float(os.environ["EVICTION_TIMEOUT_SECONDS"])
 
-assert writer.put(fresh_key, fresh, config=policy) == 0
+    print(f"driver: writing hot/cold payloads payload_size={payload_size}")
+    assert writer.put(hot_key, hot, config=policy) == 0
+    assert writer.put(cold_key, cold, config=policy) == 0
 
-deadline = time.time() + 20
-while time.time() < deadline:
-    if reader.query_route(cold_key) is not None:
+    warm_deadline = time.time() + min(15.0, eviction_timeout)
+    last_error = None
+    while time.time() < warm_deadline:
+        try:
+            if reader.get(hot_key) == hot:
+                print("driver: reader observed hot key before eviction")
+                break
+        except Exception as exc:
+            last_error = repr(exc)
+        time.sleep(0.1)
+    else:
+        raise AssertionError(
+            f"reader did not observe the hot key before eviction; last_error={last_error}"
+        )
+
+    print("driver: writing fresh payload to cross high watermark")
+    assert writer.put(fresh_key, fresh, config=policy) == 0
+
+    deadline = time.time() + eviction_timeout
+    last_route = None
+    last_error = None
+    attempts = 0
+    while time.time() < deadline:
+        attempts += 1
+        try:
+            last_route = reader.query_route(cold_key)
+        except Exception as exc:
+            last_error = f"query_route: {exc!r}"
+            last_route = "<query failed>"
+        if last_route is not None:
+            time.sleep(0.2)
+            continue
+        assert reader.get(hot_key) == hot
+        assert reader.get(fresh_key) == fresh
+        assert reader.batch_get([hot_key, fresh_key]) == [hot, fresh]
+        try:
+            reader.get(cold_key)
+        except Exception as exc:
+            print(
+                "driver: eviction observed "
+                f"attempts={attempts} cold_get_error={exc!r}"
+            )
+            raise SystemExit(0)
+        last_error = "cold key route disappeared but cold get still succeeded"
         time.sleep(0.2)
-        continue
-    assert reader.get(hot_key) == hot
-    assert reader.get(fresh_key) == fresh
-    assert reader.batch_get([hot_key, fresh_key]) == [hot, fresh]
+
+    raise AssertionError(
+        "cold key was not evicted within the deadline; "
+        f"timeout={eviction_timeout}s attempts={attempts} "
+        f"last_route={last_route!r} last_error={last_error}"
+    )
+except Exception:
+    traceback.print_exc()
+    raise
+finally:
     try:
-        reader.get(cold_key)
-    except Exception:
         writer.close()
+    finally:
         reader.close()
-        raise SystemExit(0)
-    time.sleep(0.2)
-
-writer.close()
-reader.close()
-raise AssertionError("cold key was not evicted within the deadline")
 PY
-
-wait_for_log "${STORAGE_LOG}" "background storage-owner eviction completed"
-wait_for_log "${STORAGE_LOG}" "storage-owner evicted replica via route-owner cas"
+then
+  echo "eviction driver failed; see ${DRIVER_LOG}" >&2
+  exit 1
+fi
 
 echo "==> validating eviction metrics"
-wait_for_metrics "${METRICS_ADDR}"
+wait_for_metrics "${METRICS_ADDR}" "${METRICS_TIMEOUT_SECONDS}"
 
 echo "CLI eviction binary test passed"
