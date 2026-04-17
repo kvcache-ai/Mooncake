@@ -15,6 +15,7 @@
 #pragma once
 
 #include <map>
+#include <mutex>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -120,6 +121,7 @@ class SunriseLinkTransport : public Transport {
     // Registered memory regions
     std::map<void*, size_t> registered_memory_;
     std::map<void*, int> registered_memory_gpu_id_;
+    mutable std::mutex registered_memory_mutex_;
 
     struct OpenedIpcEntry {
         void* dev_ptr{nullptr};

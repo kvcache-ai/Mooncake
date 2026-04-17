@@ -219,24 +219,49 @@ struct ScopedTangDeviceOps {
 
 }  // namespace
 
-struct TangStreamSunriseRAII {
-    tangStream_t stream_{nullptr};
-    TangStreamSunriseRAII() {
-        tangError_t e =
-            tangStreamCreateWithFlags(&stream_, tangStreamNonBlocking);
-        if (e != tangSuccess) {
-            LOG(ERROR) << "tangStreamCreateWithFlags failed: " << e << " "
-                       << tangGetErrorString(e);
+class ThreadLocalTangStreamPool {
+   public:
+    tangStream_t getOrCreate(int device_id) {
+        if (device_id < 0) return nullptr;
+        auto it = streams_by_device_.find(device_id);
+        if (it != streams_by_device_.end()) return it->second;
+
+        ScopedTangDeviceOps ctx_lock(device_id, device_id);
+        int saved_dev = -1;
+        tangGetDevice(&saved_dev);
+        tangError_t set_ret = tangSetDevice(device_id);
+        if (set_ret != tangSuccess) {
+            LOG(ERROR) << "tangSetDevice(" << device_id
+                       << ") failed for stream creation: " << set_ret << " "
+                       << tangGetErrorString(set_ret);
+            return nullptr;
+        }
+
+        tangStream_t stream = nullptr;
+        tangError_t create_ret =
+            tangStreamCreateWithFlags(&stream, tangStreamNonBlocking);
+        if (saved_dev >= 0) tangSetDevice(saved_dev);
+        if (create_ret != tangSuccess) {
+            LOG(ERROR) << "tangStreamCreateWithFlags failed: " << create_ret
+                       << " " << tangGetErrorString(create_ret)
+                       << ", device=" << device_id;
+            return nullptr;
+        }
+        streams_by_device_[device_id] = stream;
+        return stream;
+    }
+
+    ~ThreadLocalTangStreamPool() {
+        for (const auto& kv : streams_by_device_) {
+            if (kv.second) tangStreamDestroy(kv.second);
         }
     }
-    ~TangStreamSunriseRAII() {
-        if (stream_) {
-            tangStreamDestroy(stream_);
-        }
-    }
+
+   private:
+    std::unordered_map<int, tangStream_t> streams_by_device_;
 };
 
-thread_local TangStreamSunriseRAII tl_stream_sunrise;
+thread_local ThreadLocalTangStreamPool tl_stream_pool;
 
 SunriseLinkTransport::SunriseLinkTransport() : installed_(false) {
     // Match NVLink-style caps: routing may see MTYPE_CPU if pointer probe fails
@@ -446,6 +471,7 @@ Status SunriseLinkTransport::submitTransferTasks(
 
     auto infer_local_dev = [&](void* ptr) -> int {
         uint64_t p = reinterpret_cast<uint64_t>(ptr);
+        std::lock_guard<std::mutex> guard(registered_memory_mutex_);
         for (const auto& entry : registered_memory_) {
             uint64_t base = reinterpret_cast<uint64_t>(entry.first);
             if (base <= p && p < base + entry.second) {
@@ -520,17 +546,12 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
     }
 
     const size_t len = task->request.length;
-    tangStream_t stream = reinterpret_cast<tangStream_t>(batch->stream);
-    (void)stream;
-    // Disable async memcpy for completion bookkeeping: async success returned
-    // OK with status_word PENDING and relied on tangStreamQuery(stream), which
-    // often never reached idle when stream/device context disagreed (multi-GPU
-    // benches).
-    const bool can_async = false;
+    tangStream_t stream = nullptr;
     int current_dev = -1;
     tangGetDevice(&current_dev);
     auto infer_local_dev = [&](void* ptr) -> int {
         uint64_t p = reinterpret_cast<uint64_t>(ptr);
+        std::lock_guard<std::mutex> guard(registered_memory_mutex_);
         for (const auto& entry : registered_memory_) {
             uint64_t base = reinterpret_cast<uint64_t>(entry.first);
             if (base <= p && p < base + entry.second) {
@@ -606,7 +627,6 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
             return r;
         };
         // ipcC2cTest uses synchronous tangMemcpyPeer only.
-        (void)can_async;
         ret = try_peer_copy();
         if (ret != tangSuccess) {
             int p_sd = -1;
@@ -668,6 +688,13 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
     }
 
     tangError_t ret = tangSuccess;
+    const int stream_dev = (dst_dev >= 0) ? dst_dev : src_dev;
+    if (stream_dev >= 0) {
+        stream = tl_stream_pool.getOrCreate(stream_dev);
+    }
+    const bool can_async =
+        stream && async_memcpy_threshold_ > 0 && len >= async_memcpy_threshold_;
+    batch->stream = reinterpret_cast<void*>(stream);
 
     if (task->is_tang_ipc && src_dev >= 0 && dst_dev >= 0 &&
         src_dev == dst_dev) {
@@ -849,8 +876,11 @@ Status SunriseLinkTransport::addMemoryBuffer(BufferDesc& desc,
         registerMemory(reinterpret_cast<void*>(desc.addr), desc.length);
     if (!status.ok()) return status;
     if (location.type() == "cuda" || location.type() == "npu") {
-        registered_memory_gpu_id_[reinterpret_cast<void*>(desc.addr)] =
-            location.index();
+        {
+            std::lock_guard<std::mutex> guard(registered_memory_mutex_);
+            registered_memory_gpu_id_[reinterpret_cast<void*>(desc.addr)] =
+                location.index();
+        }
         int saved_dev = -1;
         tangGetDevice(&saved_dev);
         if (location.index() >= 0) {
@@ -877,6 +907,7 @@ Status SunriseLinkTransport::addMemoryBuffer(BufferDesc& desc,
             serializeBinaryData(&handle, sizeof(tangIpcMemHandle_t));
     } else if (location.type() == "cpu" ||
                location.type() == kWildcardLocation) {
+        std::lock_guard<std::mutex> guard(registered_memory_mutex_);
         registered_memory_gpu_id_[reinterpret_cast<void*>(desc.addr)] = -1;
     }
     desc.transports.push_back(TransportType::SUNRISE_LINK);
@@ -884,11 +915,13 @@ Status SunriseLinkTransport::addMemoryBuffer(BufferDesc& desc,
 }
 
 Status SunriseLinkTransport::registerMemory(void* addr, size_t size) {
+    std::lock_guard<std::mutex> guard(registered_memory_mutex_);
     registered_memory_[addr] = size;
     return Status::OK();
 }
 
 Status SunriseLinkTransport::deregisterMemory(void* addr) {
+    std::lock_guard<std::mutex> guard(registered_memory_mutex_);
     auto it = registered_memory_.find(addr);
     if (it != registered_memory_.end()) {
         registered_memory_.erase(it);
@@ -924,14 +957,17 @@ Status SunriseLinkTransport::relocateRemoteAddress(uint64_t& dest_addr,
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
     SegmentDesc* desc = nullptr;
-    // P2P registry can briefly serve a stale remote descriptor (without the
-    // just-registered Sunrise IPC handle). On relocate miss, force refresh once
-    // before reading remote buffers.
-    metadata_->segmentManager().invalidateRemote(target_id);
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
     if (!status.ok()) return status;
 
     auto buffer = desc->findBuffer(dest_addr, length);
+    if (!buffer || buffer->shm_path.empty()) {
+        // Cache may be stale right after remote registration; refresh once.
+        metadata_->segmentManager().invalidateRemote(target_id);
+        status = metadata_->segmentManager().getRemoteCached(desc, target_id);
+        if (!status.ok()) return status;
+        buffer = desc->findBuffer(dest_addr, length);
+    }
     if (!buffer || buffer->shm_path.empty()) {
         return Status::InvalidArgument(
             "Requested address is not in registered Sunrise buffer" LOC_MARK);
@@ -995,15 +1031,22 @@ Status SunriseLinkTransport::relocateRemoteAddress(uint64_t& dest_addr,
 Status SunriseLinkTransport::uninstall() {
     if (installed_) {
         std::vector<void*> reg_addrs;
-        reg_addrs.reserve(registered_memory_.size());
-        for (auto& entry : registered_memory_) {
-            reg_addrs.push_back(entry.first);
+        {
+            std::lock_guard<std::mutex> guard(registered_memory_mutex_);
+            reg_addrs.reserve(registered_memory_.size());
+            for (auto& entry : registered_memory_) {
+                reg_addrs.push_back(entry.first);
+            }
         }
         for (void* addr : reg_addrs) {
             auto status = deregisterMemory(addr);
             if (!status.ok()) return status;
         }
-        registered_memory_.clear();
+        {
+            std::lock_guard<std::mutex> guard(registered_memory_mutex_);
+            registered_memory_.clear();
+            registered_memory_gpu_id_.clear();
+        }
 
         if (runtime_lib_handle_) {
             dlclose(runtime_lib_handle_);

@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 #include "tent/common/utils/prefault.h"
 #include <glog/logging.h>
 #include <tang_runtime_api.h>
@@ -268,21 +269,19 @@ const std::vector<RangeLocation> SunrisePlatform::getLocation(
     uintptr_t aligned_start = alignPage((uintptr_t)start);
     int n =
         (uintptr_t(start) - aligned_start + len + kPageSize - 1) / kPageSize;
-    void** pages = (void**)malloc(sizeof(void*) * n);
-    int* status = (int*)malloc(sizeof(int) * n);
+    std::vector<void*> pages(n);
+    std::vector<int> status(n);
     for (int i = 0; i < n; i++) {
-        pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+        pages[i] = reinterpret_cast<void*>(aligned_start + i * kPageSize);
     }
 
     if (!skip_prefault) {
-        prefaultBeforeProbe(pages, n, aligned_start, "SunrisePlatform");
+        prefaultBeforeProbe(pages.data(), n, aligned_start, "SunrisePlatform");
     }
 
-    int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
+    int rc = numa_move_pages(0, n, pages.data(), nullptr, status.data(), 0);
     if (rc != 0) {
         entries.push_back({(uint64_t)start, len, kWildcardLocation});
-        ::free(pages);
-        ::free(status);
         return entries;
     }
 
@@ -300,8 +299,6 @@ const std::vector<RangeLocation> SunrisePlatform::getLocation(
     }
     entries.push_back(
         {start_addr, (uint64_t)start + len - start_addr, genCpuNodeName(node)});
-    ::free(pages);
-    ::free(status);
     return entries;
 }
 

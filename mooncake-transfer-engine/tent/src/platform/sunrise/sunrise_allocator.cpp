@@ -26,11 +26,15 @@ Status SunrisePlatform::allocate(void** pptr, size_t size,
                                  MemoryOptions& options) {
     LocationParser location(options.location);
     if (location.type() == "cuda") {
-        int saved_dev = 0;
-        tangGetDevice(&saved_dev);
-        tangSetDevice(location.index());
+        int saved_dev = -1;
+        const tangError_t get_dev_ret = tangGetDevice(&saved_dev);
+        if (tangSetDevice(location.index()) != tangSuccess) {
+            return Status::InternalError("Unable to switch sunrise device");
+        }
         tangError_t ret = tangMalloc(pptr, size);
-        tangSetDevice(saved_dev);
+        if (get_dev_ret == tangSuccess && saved_dev >= 0) {
+            tangSetDevice(saved_dev);
+        }
         if (ret != tangSuccess)
             return Status::InternalError(
                 "Unable to allocate sunrise device memory");

@@ -16,13 +16,6 @@ if(USE_TENT)
   target_compile_definitions(transfer_engine_bench PRIVATE USE_TENT)
 endif()
 
-add_executable(transfer_engine_sunrise_bench
-               ${WORKSPACE}/transfer_engine_sunrise_bench.cpp)
-target_link_libraries(transfer_engine_sunrise_bench PUBLIC transfer_engine)
-if(USE_TENT)
-  target_link_libraries(transfer_engine_sunrise_bench PUBLIC tent_link_group)
-  target_compile_definitions(transfer_engine_sunrise_bench PRIVATE USE_TENT)
-endif()
 add_executable(transfer_engine_validator
                ${WORKSPACE}/transfer_engine_validator.cpp)
 target_link_libraries(transfer_engine_validator PUBLIC transfer_engine)
