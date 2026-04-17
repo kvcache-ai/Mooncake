@@ -122,7 +122,8 @@ def parse_metrics(output):
 
 def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
                          batch=1, p2p_local_transfer_mode="te",
-                         local_memcpy_async_worker_num=32, local_memcpy_async_queue_depth=2048):
+                         local_memcpy_async_worker_num=32, local_memcpy_async_queue_depth=2048,
+                         route_cache_max_memory_mb=300, route_cache_ttl_ms=300000):
     """Run a specific configuration for a single mode."""
     kill_existing_processes()
 
@@ -136,7 +137,11 @@ def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ra
                     f"--test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb} --batch_size={batch}")
 
         if mode == "P2P":
-            test_cmd += f" --p2p_local_transfer_mode={p2p_local_transfer_mode}"
+            test_cmd += (
+                f" --p2p_local_transfer_mode={p2p_local_transfer_mode}"
+                f" --route_cache_max_memory_mb={route_cache_max_memory_mb}"
+                f" --route_cache_ttl_ms={route_cache_ttl_ms}"
+            )
             if p2p_local_transfer_mode == "memcpy":
                 test_cmd += (
                     f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
@@ -192,6 +197,10 @@ def main():
                         help="Async memcpy worker threads (memcpy mode only, list: 4,16,32)")
     parser.add_argument("--local_memcpy_async_queue_depth", type=str, default="2048",
                         help="Async memcpy queue depth (memcpy mode only, list: 256,1024,2048)")
+    parser.add_argument("--route_cache_max_memory_mb", type=str, default="300",
+                        help="Max memory for RouteCache in MB (P2P mode, list: 100,300,600)")
+    parser.add_argument("--route_cache_ttl_ms", type=str, default="300000",
+                        help="TTL for RouteCache entries in ms (P2P mode, list: 60000,300000)")
     # Flags
     parser.add_argument("--matrix", action="store_true", help="Enable matrix sweep mode")
     parser.add_argument("--output", type=str, help="Output file path (ends in .csv or .json)")
@@ -221,6 +230,8 @@ def main():
         "p2p_local_transfer_mode": parse_list_arg(args.p2p_local_transfer_mode, type_fn=str),
         "local_memcpy_async_worker_num": parse_list_arg(args.local_memcpy_async_worker_num),
         "local_memcpy_async_queue_depth": parse_list_arg(args.local_memcpy_async_queue_depth),
+        "route_cache_max_memory_mb": parse_list_arg(args.route_cache_max_memory_mb),
+        "route_cache_ttl_ms": parse_list_arg(args.route_cache_ttl_ms),
     }
 
     results = []
@@ -271,10 +282,12 @@ def main():
                 transfer_mode = p2p_cfg["p2p_local_transfer_mode"]
                 wk = p2p_cfg["local_memcpy_async_worker_num"]
                 qd = p2p_cfg["local_memcpy_async_queue_depth"]
+                rc_mem = p2p_cfg["route_cache_max_memory_mb"]
+                rc_ttl = p2p_cfg["route_cache_ttl_ms"]
 
                 print(f"\n[{current}/{total_runs}] Testing: mode=P2P")
                 print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
-                extra = f"p2p_local_transfer_mode={transfer_mode}"
+                extra = f"p2p_local_transfer_mode={transfer_mode}, route_cache={rc_mem}MB/{rc_ttl}ms"
                 if transfer_mode == "memcpy":
                     extra += f", local_memcpy_async_worker_num={wk}, local_memcpy_async_queue_depth={qd}"
                 print(f"    {extra}")
@@ -282,7 +295,9 @@ def main():
                 avg = run_benchmark_config("P2P", args.rounds, th, v_size, ops, r_th, r_buf_gb,
                                            batch=batch, p2p_local_transfer_mode=transfer_mode,
                                            local_memcpy_async_worker_num=wk,
-                                           local_memcpy_async_queue_depth=qd)
+                                           local_memcpy_async_queue_depth=qd,
+                                           route_cache_max_memory_mb=rc_mem,
+                                           route_cache_ttl_ms=rc_ttl)
                 if avg:
                     entry = {"mode": "P2P", **base_cfg, **p2p_cfg, **avg}
                     results.append(entry)

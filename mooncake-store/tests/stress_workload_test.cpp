@@ -52,6 +52,10 @@ DEFINE_uint64(local_memcpy_async_worker_num, 32,
 DEFINE_uint64(local_memcpy_async_queue_depth, 2048,
               "If set p2p_local_transfer_mode=memcpy, Queue depth for async "
               "local memcpy executor (P2P)");
+DEFINE_uint64(route_cache_max_memory_mb, 300,
+              "Max memory for RouteCache in MB (P2P mode)");
+DEFINE_uint64(route_cache_ttl_ms, 300000,
+              "TTL for RouteCache entries in ms (P2P mode)");
 namespace mooncake {
 namespace benchmark {
 
@@ -153,8 +157,10 @@ bool initialize_client() {
             FLAGS_protocol, device_names, FLAGS_master_address, tiered_config,
             0, nullptr, "", 12345,
             /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
-            /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
-            /*route_cache_ttl_ms=*/5 * 60 * 1000, FLAGS_p2p_local_transfer_mode,
+            /*route_cache_max_memory_bytes=*/FLAGS_route_cache_max_memory_mb *
+                1024 * 1024,
+            /*route_cache_ttl_ms=*/FLAGS_route_cache_ttl_ms,
+            FLAGS_p2p_local_transfer_mode,
             FLAGS_local_memcpy_async_worker_num,
             FLAGS_local_memcpy_async_queue_depth);
         client_opt = ClientService::Create(config);
@@ -311,20 +317,19 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
 
         // Record metrics. Latency is divided across keys so that percentiles
         // reflect per-key cost rather than batch completion time.
-        bool any_success = false;
+        std::vector<bool> key_success(actual_batch, false);
         for (size_t j = 0; j < results.size(); ++j) {
-            bool success = results[j].has_value();
-            if (success) {
+            if (results[j].has_value()) {
+                key_success[j] = true;
                 stored_keys.push_back(batch_keys[j]);
                 stats.put_operations++;
                 stats.successful_operations++;
-                any_success = true;
             }
         }
         double per_key_latency_us =
             static_cast<double>(latency_us) / actual_batch;
         for (int j = 0; j < actual_batch; ++j) {
-            stats.operations.push_back({per_key_latency_us, true, any_success});
+            stats.operations.push_back({per_key_latency_us, true, key_success[j]});
         }
         stats.total_operations += actual_batch;
     }
@@ -369,19 +374,19 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
                               end_time - start_time)
                               .count();
 
-        bool any_success = false;
-        for (const auto& res : results) {
-            if (res.has_value()) {
+        std::vector<bool> key_success(results.size(), false);
+        for (size_t j = 0; j < results.size(); ++j) {
+            if (results[j].has_value()) {
+                key_success[j] = true;
                 stats.get_operations++;
                 stats.successful_operations++;
-                any_success = true;
             }
         }
         double per_key_latency_us =
             static_cast<double>(latency_us) / actual_batch;
         for (int j = 0; j < actual_batch; ++j) {
             stats.operations.push_back(
-                {per_key_latency_us, false, any_success});
+                {per_key_latency_us, false, key_success[j]});
         }
         stats.total_operations += actual_batch;
     }
