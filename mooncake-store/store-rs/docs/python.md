@@ -139,6 +139,23 @@ Common variants:
 DIST_DIR=artifacts ./scripts/build/build-wheel.sh
 ```
 
+When the host OS is missing build dependencies, use the Ubuntu Docker wrapper
+instead. It reuses `scripts/build/build-wheel.sh` inside the container and
+produces the same `dist/wheels/` and `dist/bin/` outputs:
+
+```bash
+./scripts/build/build-wheel-ubuntu-docker.sh
+PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
+PYTHON_VERSION=3.12 UBUNTU_VERSION=24.04 ./scripts/build/build-wheel-ubuntu-docker.sh
+```
+
+Docker wheel notes:
+
+- `PYTHON_VERSION=system|3.10|3.11|3.12` selects the interpreter installed in the builder image
+- `UBUNTU_VERSION` selects the base image used for the build environment
+- `CN_MIRROR=1` is enabled by default for rustup, cargo, and pip downloads; set `CN_MIRROR=0` to use the upstream endpoints
+- `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are forwarded into the Docker build/run steps for local proxy setups
+
 Install the wheel into any compatible virtualenv:
 
 ```bash
