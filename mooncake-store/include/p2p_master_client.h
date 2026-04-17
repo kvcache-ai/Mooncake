@@ -40,6 +40,18 @@ class P2PMasterClient final : public MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
         const BatchRemoveReplicaRequest& req);
+
+    /**
+     * @brief Batch sync replicas with mixed ADD and REMOVE ops
+     */
+    [[nodiscard]] tl::expected<BatchSyncReplicaResponse, ErrorCode>
+    BatchSyncReplica(const BatchSyncReplicaRequest& req);
+
+    /**
+     * @brief Notify Master that this client has finished syncing metadata
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> SetSyncCompleted(
+        UUID client_id);
 };
 
 }  // namespace mooncake

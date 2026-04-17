@@ -40,6 +40,17 @@ class P2PMasterService : public MasterService {
     auto BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
         -> std::vector<tl::expected<void, ErrorCode>>;
 
+    /**
+     * @brief Batch sync replicas with mixed ADD and REMOVE ops
+     */
+    auto BatchSyncReplica(const BatchSyncReplicaRequest& req)
+        -> BatchSyncReplicaResponse;
+
+    /**
+     * @brief Client notifies Master that metadata sync is complete
+     */
+    auto SetSyncCompleted(UUID client_id) -> tl::expected<void, ErrorCode>;
+
     std::vector<Replica::Descriptor> FilterReplicas(
         const GetReplicaListRequestConfig& config,
         const ObjectMetadata& metadata) override;
@@ -72,6 +83,14 @@ class P2PMasterService : public MasterService {
     void OnReplicaAdded(const Replica& replica) override;
 
    private:
+    tl::expected<void, ErrorCode> InnerAddReplica(
+        MetadataShard& shard, const std::string& key, const UUID& client_id,
+        const UUID& segment_id, size_t size,
+        const std::shared_ptr<P2PClientMeta>& client) NO_THREAD_SAFETY_ANALYSIS;
+    tl::expected<void, ErrorCode> InnerRemoveReplica(
+        MetadataShard& shard, const std::string& key, const UUID& client_id,
+        const UUID& segment_id) NO_THREAD_SAFETY_ANALYSIS;
+
     std::shared_ptr<P2PClientManager> client_manager_;
     std::array<P2PMetadataShard, kNumShards> metadata_shards_;
     // for the number of replicas of a key:

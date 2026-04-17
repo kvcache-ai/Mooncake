@@ -25,6 +25,16 @@ struct RpcNameTraits<&WrappedP2PMasterService::BatchRemoveReplica> {
     static constexpr const char* value = "BatchRemoveReplica";
 };
 
+template <>
+struct RpcNameTraits<&WrappedP2PMasterService::BatchSyncReplica> {
+    static constexpr const char* value = "BatchSyncReplica";
+};
+
+template <>
+struct RpcNameTraits<&WrappedP2PMasterService::SetSyncCompleted> {
+    static constexpr const char* value = "SetSyncCompleted";
+};
+
 tl::expected<WriteRouteResponse, ErrorCode> P2PMasterClient::GetWriteRoute(
     const WriteRouteRequest& req) {
     ScopedVLogTimer timer(1, "P2PMasterClient::GetWriteRoute");
@@ -76,6 +86,29 @@ std::vector<tl::expected<void, ErrorCode>> P2PMasterClient::BatchRemoveReplica(
         return fallback;
     }
     return *result;
+}
+
+tl::expected<BatchSyncReplicaResponse, ErrorCode>
+P2PMasterClient::BatchSyncReplica(const BatchSyncReplicaRequest& req) {
+    ScopedVLogTimer timer(1, "P2PMasterClient::BatchSyncReplica");
+    timer.LogRequest("adds=", req.add_keys.size(),
+                     ", removes=", req.remove_keys.size());
+
+    auto result = invoke_rpc<&WrappedP2PMasterService::BatchSyncReplica,
+                             BatchSyncReplicaResponse>(req);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> P2PMasterClient::SetSyncCompleted(
+    UUID client_id) {
+    ScopedVLogTimer timer(1, "P2PMasterClient::SetSyncCompleted");
+    timer.LogRequest("client_id=", client_id);
+
+    auto result =
+        invoke_rpc<&WrappedP2PMasterService::SetSyncCompleted, void>(client_id);
+    timer.LogResponseExpected(result);
+    return result;
 }
 
 }  // namespace mooncake

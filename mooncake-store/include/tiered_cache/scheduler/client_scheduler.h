@@ -43,6 +43,11 @@ class ClientScheduler {
     // Incoming event hook (thread-safe)
     void OnAccess(const std::string& key);
 
+    /**
+     * @brief Get current hot key statistics for HA recovery prioritization.
+     */
+    AccessStats GetHotKeyStats() const;
+
     // Called when a replica is committed or updated
     void OnCommit(const std::string& key, UUID tier_id, size_t size_bytes);
 

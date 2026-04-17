@@ -1,11 +1,9 @@
 #pragma once
 
-#include <array>
 #include <shared_mutex>
 #include <vector>
 #include <string>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
@@ -125,6 +123,13 @@ class DataManager {
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> allocator);
 
+    /**
+     * @brief Query the size of an object.
+     * @param key Object key
+     * @return Object size in bytes, or ErrorCode on failure
+     */
+    tl::expected<size_t, ErrorCode> QueryObjectSize(const std::string& key);
+
     tl::expected<void, ErrorCode> Delete(
         const std::string& key, std::optional<UUID> tier_id = std::nullopt);
 
@@ -136,6 +141,24 @@ class DataManager {
     // ================================================================
     // Remote data transfer — called by RPC service layer
     // ================================================================
+
+    /**
+     * @brief Iterate all keys in batches.
+     * Delegates to TieredBackend::ForEachKeyBatch().
+     */
+    void ForEachKeyBatch(
+        const std::function<bool(std::vector<ReplicaLocation>&&)>& callback)
+        const;
+
+    /**
+     * @brief Get hot key statistics
+     */
+    AccessStats GetHotKeyStats() const;
+
+    /**
+     * @brief Get all tier IDs where a key has replicas.
+     */
+    std::vector<UUID> GetReplicaTierIds(const std::string& key) const;
 
     /**
      * @brief Read data and transfer to remote destination buffers

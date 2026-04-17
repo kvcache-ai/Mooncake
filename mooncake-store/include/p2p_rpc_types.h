@@ -72,14 +72,16 @@ struct WriteRouteResponse {
 YLT_REFL(WriteRouteResponse, candidates);
 
 /**
- * @brief Request to add a replica
+ * @brief Request to add a replica.
+ *        Master resolves ip_address/rpc_port from registered client info.
  */
 struct AddReplicaRequest {
     std::string key;
     size_t size;
-    P2PProxyDescriptor replica;
+    UUID client_id;
+    UUID segment_id;
 };
-YLT_REFL(AddReplicaRequest, key, size, replica);
+YLT_REFL(AddReplicaRequest, key, size, client_id, segment_id);
 
 /**
  * @brief Request to remove a replica
@@ -100,5 +102,31 @@ struct BatchRemoveReplicaRequest {
     std::vector<UUID> segment_ids;
 };
 YLT_REFL(BatchRemoveReplicaRequest, key, client_id, segment_ids);
+
+/**
+ * @brief Request to batch sync replicas (mixed ADD and REMOVE ops).
+ *        Master only needs client_id + segment_id to identify replicas
+ */
+struct BatchSyncReplicaRequest {
+    UUID client_id;
+    // ADD operations
+    std::vector<std::string> add_keys;
+    std::vector<size_t> add_sizes;
+    std::vector<UUID> add_segment_ids;
+    // REMOVE operations
+    std::vector<std::string> remove_keys;
+    std::vector<UUID> remove_segment_ids;
+};
+YLT_REFL(BatchSyncReplicaRequest, client_id, add_keys, add_sizes,
+         add_segment_ids, remove_keys, remove_segment_ids);
+
+/**
+ * @brief Response for batch sync replicas.
+ */
+struct BatchSyncReplicaResponse {
+    std::vector<ErrorCode> add_results;
+    std::vector<ErrorCode> remove_results;
+};
+YLT_REFL(BatchSyncReplicaResponse, add_results, remove_results);
 
 }  // namespace mooncake

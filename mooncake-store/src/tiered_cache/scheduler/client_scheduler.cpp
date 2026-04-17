@@ -128,6 +128,13 @@ void ClientScheduler::OnAccess(const std::string& key) {
     }
 }
 
+AccessStats ClientScheduler::GetHotKeyStats() const {
+    if (stats_collector_) {
+        return stats_collector_->GetSnapshot();
+    }
+    return {};
+}
+
 void ClientScheduler::OnCommit(const std::string& key, UUID tier_id,
                                size_t size_bytes) {
     auto& shard = GetKeyCacheShard(key);

@@ -145,6 +145,14 @@ struct P2PClientConfig : RealClientConfigBase {
     size_t route_cache_max_memory_bytes = 300 * 1024 * 1024;  // 300MB
     uint64_t route_cache_ttl_ms = 5 * 60 * 1000;              // 5min
 
+    // Async route notification.
+    // async_sender_thread_count > 0 enables async notifier.
+    // async_route_queue_size controls queue capacity
+    // (minimum async_max_batch_size * async_sender_thread_count).
+    size_t async_sender_thread_count = 0;
+    size_t async_max_batch_size = 2000;
+    size_t async_route_queue_size = 0;
+
     // Local transfer mode for P2P local Get/Put path.
     // - MEMCPY: copy through local CPU memory path
     // - TE: transfer through local TransferEngine path
@@ -212,7 +220,9 @@ class ClientConfigBuilder {
         uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
         const std::string& local_transfer_mode = "te",
         size_t local_memcpy_async_worker_num = 32,
-        const std::map<std::string, std::string>& labels = {}) {
+        const std::map<std::string, std::string>& labels = {},
+        size_t async_sender_thread_count = 0,
+        size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0) {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -229,6 +239,9 @@ class ClientConfigBuilder {
             config.local_memcpy_async_worker_num =
                 local_memcpy_async_worker_num;
         }
+        config.async_sender_thread_count = async_sender_thread_count;
+        config.async_max_batch_size = async_max_batch_size;
+        config.async_route_queue_size = async_route_queue_size;
 
         Json::Value tiered_config;
         std::string actual_json = tiered_backend_config_json;

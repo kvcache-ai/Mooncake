@@ -177,6 +177,9 @@ enum class ErrorCode : int32_t {
 
     // Store errors (Range: -1500 to -1599)
     SHUTTING_DOWN = -1500,  ///< Store is shutting down, rejecting new requests.
+    ASYNC_ENQUEUE_FAILED = -1501,  ///< Async metadata notifier enqueue failed
+                                   ///< (queue full/stopped).
+    INACCESSIBLE_MASTER = -1502
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -339,6 +342,61 @@ inline std::ostream& operator<<(std::ostream& os,
                                         : "UNKNOWN");
     return os;
 }
+
+/**
+ * @enum HAClientState
+ * @brief Client-side HA state for Master crash recovery.
+ *        FULL: normal operation
+ *        DEGRADED: Master unreachable, local-only mode
+ *        SYNCING: re-syncing metadata to restarted Master
+ */
+enum class HAClientState : int32_t {
+    FULL = 0,
+    DEGRADED = 1,
+    SYNCING = 2,
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const HAClientState& state) noexcept {
+    switch (state) {
+        case HAClientState::FULL:
+            os << "FULL";
+            break;
+        case HAClientState::DEGRADED:
+            os << "DEGRADED";
+            break;
+        case HAClientState::SYNCING:
+            os << "SYNCING";
+            break;
+        default:
+            os << "UNKNOWN";
+            break;
+    }
+    return os;
+}
+
+/**
+ * @enum HAEvent
+ * @brief Events that drive client-side HA state transitions.
+ */
+enum class HAEvent {
+    MASTER_UNREACHABLE,  // Consecutive heartbeat failures exceeded threshold
+    MASTER_RECONNECTED,  // Master connection restored. Triggered on:
+                         // 1. RegisterClient succeeded (Master restarted or
+                         //    client re-registered after reconnection)
+                         // 2. Heartbeat recovered with HEALTH status after
+                         //    a prior MASTER_UNREACHABLE event
+};
+
+/**
+ * @struct ReplicaLocation
+ * @brief Describes a single replica's key, tier and size.
+ */
+struct ReplicaLocation {
+    std::string key;
+    UUID tier_id;
+    size_t size;
+};
 
 enum class BufferAllocatorType {
     CACHELIB = 0,  // CachelibBufferAllocator

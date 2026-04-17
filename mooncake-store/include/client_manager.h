@@ -164,6 +164,14 @@ class ClientManager {
         const RegisterClientRequest& req) = 0;
 
     /**
+     * @brief Hook called after a client is registered.
+     * Subclasses can override to perform post-registration logic
+     * (e.g., setting is_syncing flag for HA recovery).
+     */
+    virtual void OnClientRegistered(
+        const std::shared_ptr<ClientMeta>& /*meta*/) {}
+
+    /**
      * @brief Get the deployment mode of this ClientManager.
      * Used for architecture validation during client registration.
      */

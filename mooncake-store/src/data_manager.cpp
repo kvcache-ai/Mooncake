@@ -1035,6 +1035,17 @@ std::vector<RemoteBufferDesc> DataManager::SlicesToRemoteBufferDescs(
 // Delete / Exist
 // ================================================================
 
+tl::expected<size_t, ErrorCode> DataManager::QueryObjectSize(
+    const std::string& key) {
+    auto handle = tiered_backend_->Get(key);
+    if (!handle) {
+        return tl::unexpected(handle.error());
+    }
+    auto& loc = handle.value()->loc;
+    size_t size = loc.data.buffer ? loc.data.buffer->size() : 0;
+    return size;
+}
+
 tl::expected<void, ErrorCode> DataManager::Delete(const std::string& key,
                                                   std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Delete");
@@ -1056,6 +1067,23 @@ tl::expected<void, ErrorCode> DataManager::Delete(const std::string& key,
 bool DataManager::Exist(const std::string& key,
                         std::optional<UUID> tier_id) const {
     return tiered_backend_->Exist(key, tier_id);
+}
+
+void DataManager::ForEachKeyBatch(
+    const std::function<bool(std::vector<ReplicaLocation>&&)>& callback) const {
+    if (tiered_backend_) {
+        tiered_backend_->ForEachKeyBatch(callback);
+    }
+}
+
+AccessStats DataManager::GetHotKeyStats() const {
+    if (!tiered_backend_) return {};
+    return tiered_backend_->GetHotKeyStats();
+}
+
+std::vector<UUID> DataManager::GetReplicaTierIds(const std::string& key) const {
+    if (!tiered_backend_) return {};
+    return tiered_backend_->GetReplicaTierIds(key);
 }
 
 // ================================================================
