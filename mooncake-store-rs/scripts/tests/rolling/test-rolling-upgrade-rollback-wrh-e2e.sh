@@ -32,60 +32,11 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/scripts/lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-require_command() {
-  local cmd=$1
-  if command -v "${cmd}" >/dev/null 2>&1; then return 0; fi
-  if [[ "${cmd}" == "cargo" ]]; then
-    local cargo_env="${CARGO_HOME:-${HOME}/.cargo}/env"
-    if [[ -f "${cargo_env}" ]]; then
-      # shellcheck disable=SC1090
-      source "${cargo_env}"
-    fi
-  fi
-  if ! command -v "${cmd}" >/dev/null 2>&1; then
-    echo "${cmd} is required but not found" >&2
-    exit 1
-  fi
-}
-
-list_upstream_dirs() {
-  if [[ -n "${MOONCAKE_UPSTREAM_DIR:-}" ]]; then
-    printf '%s\n' "${MOONCAKE_UPSTREAM_DIR}"
-  fi
-  printf '%s\n' "${REPO_ROOT}/third_party/Mooncake"
-  local primary_worktree
-  if primary_worktree=$(git -C "${REPO_ROOT}" worktree list --porcelain 2>/dev/null \
-    | awk '/^worktree / { print substr($0, 10); exit }'); then
-    if [[ -n "${primary_worktree}" && "${primary_worktree}" != "${REPO_ROOT}" ]]; then
-      printf '%s\n' "${primary_worktree}/third_party/Mooncake"
-    fi
-  fi
-}
-
-resolve_upstream_build_dir() {
-  local candidates=() candidate upstream_dir
-  if [[ -n "${MOONCAKE_UPSTREAM_BUILD_DIR:-}" ]]; then
-    candidates+=("${MOONCAKE_UPSTREAM_BUILD_DIR}")
-  fi
-  while IFS= read -r upstream_dir; do
-    [[ -z "${upstream_dir}" ]] && continue
-    candidates+=("${upstream_dir}/build-rust" "${upstream_dir}/build-wheel-compat")
-  done < <(list_upstream_dirs)
-  for candidate in "${candidates[@]}"; do
-    if [[ -f "${candidate}/mooncake-transfer-engine/src/libtransfer_engine.so" ]] \
-      && [[ -f "${candidate}/mooncake-transfer-engine/tent/src/libtent_shared.so" ]]; then
-      printf '%s\n' "${candidate}"
-      return 0
-    fi
-  done
-  echo "unable to find Mooncake runtime libraries" >&2
-  printf '  checked: %s\n' "${candidates[@]}" >&2
-  exit 1
-}
 
 wait_for_log() {
   local log_file=$1 needle=$2 timeout=${3:-20}
@@ -115,17 +66,13 @@ wait_for_exit() {
 
 # ── setup ──────────────────────────────────────────────────────────────────
 
-require_command cargo
-require_command python3
-require_command redis-cli
-require_command redis-server
+mc_scripts_require_command cargo
+mc_scripts_require_command python3
+mc_scripts_require_command redis-cli
+mc_scripts_require_command redis-server
 
-UPSTREAM_BUILD_DIR=$(resolve_upstream_build_dir)
-UPSTREAM_DIR=$(cd -- "${UPSTREAM_BUILD_DIR}/.." && pwd)
-export MOONCAKE_UPSTREAM_DIR="${UPSTREAM_DIR}"
-export MOONCAKE_UPSTREAM_BUILD_DIR="${UPSTREAM_BUILD_DIR}"
-export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="${REPO_ROOT}/python"
+UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
+mc_scripts_setup_upstream_runtime_env "${REPO_ROOT}" python "${UPSTREAM_BUILD_DIR}"
 export PYTHONDONTWRITEBYTECODE=1
 
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
@@ -173,15 +120,7 @@ trap cleanup EXIT
 
 # ── redis ──────────────────────────────────────────────────────────────────
 
-if ! redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
-  redis-server \
-    --port "${REDIS_PORT}" \
-    --bind 127.0.0.1 \
-    --daemonize yes \
-    --save '' \
-    --appendonly no
-  REDIS_STARTED=1
-fi
+mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 # ── build V1 ───────────────────────────────────────────────────────────────
 

@@ -643,12 +643,33 @@ These values map to the Rust `ReplicationPolicy` used by `StoreClient`.
 
 Validation entry points are now grouped by purpose:
 
+- `scripts/run-all-tests.sh` — unified discovery + execution entrypoint for shell-based regressions
 - `scripts/build/` — wheel build, wheel install, and coverage helpers
 - `scripts/clients/` — black-box real/dummy read-write validators
 - `scripts/e2e/` — generic compatibility and stress runners
+- `scripts/lib/` — shared shell bootstrap helpers used by script entrypoints
 - `scripts/sglang/` — SGLang-specific compatibility and true e2e runners
 - `scripts/tests/client/` — standalone client CLI regressions
 - `scripts/tests/rolling/` — rolling-upgrade and rollback regressions
+
+Run the full shell-based scripts regression suite:
+
+```bash
+./scripts/run-all-tests.sh
+```
+
+Inspect what the runner will execute:
+
+```bash
+./scripts/run-all-tests.sh --list
+```
+
+Typical scoped runs:
+
+```bash
+./scripts/run-all-tests.sh --skip-tag sglang
+./scripts/run-all-tests.sh --tag rolling
+```
 
 Run the Python compatibility validation:
 

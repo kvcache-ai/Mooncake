@@ -447,9 +447,9 @@ impl StoreClient {
         )
     }
 
-    fn route_scan_authorities(&self) -> Result<Vec<ClientLease>> {
+    fn route_scan_authorities(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
         Ok(self
-            .available_compatible_live_clients(true)?
+            .available_compatible_live_clients(force_refresh)?
             .into_iter()
             .filter(|lease| {
                 lease
@@ -462,6 +462,25 @@ impl StoreClient {
             .collect())
     }
 
+    fn active_compatible_runtimes(&self, force_refresh: bool) -> Result<BTreeSet<ClientRuntimeId>> {
+        Ok(self
+            .available_compatible_live_clients(force_refresh)?
+            .into_iter()
+            .filter(|lease| lease.state == ClientLifecycleState::Active)
+            .map(|lease| lease.runtime)
+            .collect())
+    }
+
+    fn active_compatible_runtimes_with_refresh_fallback(
+        &self,
+    ) -> Result<BTreeSet<ClientRuntimeId>> {
+        let active = self.active_compatible_runtimes(false)?;
+        if !active.is_empty() {
+            return Ok(active);
+        }
+        self.active_compatible_runtimes(true)
+    }
+
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
         self.route_directory
             .list_routes_by_replica_owner(&self.lease, owner)
@@ -472,12 +491,7 @@ impl StoreClient {
     }
 
     fn migration_policy_for_route(&self, route: &ObjectRoute) -> Result<ReplicationPolicy> {
-        let active = self
-            .available_compatible_live_clients(true)?
-            .into_iter()
-            .filter(|lease| lease.state == ClientLifecycleState::Active)
-            .map(|lease| lease.runtime)
-            .collect::<BTreeSet<_>>();
+        let active = self.active_compatible_runtimes_with_refresh_fallback()?;
         let preferred = route
             .replicas
             .iter()
@@ -497,12 +511,7 @@ impl StoreClient {
         route: &ObjectRoute,
         successor: &ClientRuntimeId,
     ) -> Result<ReplicationPolicy> {
-        let active = self
-            .available_compatible_live_clients(true)?
-            .into_iter()
-            .filter(|lease| lease.state == ClientLifecycleState::Active)
-            .map(|lease| lease.runtime)
-            .collect::<BTreeSet<_>>();
+        let active = self.active_compatible_runtimes_with_refresh_fallback()?;
         let mut preferred = Vec::new();
         let mut seen = BTreeSet::new();
 
@@ -803,46 +812,59 @@ impl StoreClient {
         if self.route_control == RouteControlMode::MetadataOnly {
             return Ok(0);
         }
-        let mut protected = 0usize;
-        let mut last_error = None;
-        for authority in self.route_scan_authorities()? {
-            let is_excluded =
-                excluded.is_some_and(|stable_id| authority.runtime.stable_id == *stable_id);
-            match self.replace_route_on_authority(&authority, route) {
-                Ok(()) => {
-                    if !is_excluded {
-                        protected = protected.saturating_add(1);
+        let mut force_refresh = false;
+        loop {
+            let authorities = self.route_scan_authorities(force_refresh)?;
+            let mut protected = 0usize;
+            let mut last_error = None;
+
+            for authority in authorities {
+                let is_excluded =
+                    excluded.is_some_and(|stable_id| authority.runtime.stable_id == *stable_id);
+                match self.replace_route_on_authority(&authority, route) {
+                    Ok(()) => {
+                        if !is_excluded {
+                            protected = protected.saturating_add(1);
+                        }
                     }
-                }
-                Err(error) => {
-                    if authority.runtime != self.lease.runtime {
-                        self.mark_runtime_suspect(
-                            &authority.runtime,
-                            "route_sync_authority_replace_failed",
+                    Err(error) => {
+                        if authority.runtime != self.lease.runtime {
+                            self.mark_runtime_suspect(
+                                &authority.runtime,
+                                "route_sync_authority_replace_failed",
+                            );
+                        }
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            authority = %authority.runtime,
+                            key = %route.key.0,
+                            error = %error,
+                            "route authority sync failed during migration"
                         );
-                    }
-                    warn!(
-                        runtime = %self.lease.runtime,
-                        authority = %authority.runtime,
-                        key = %route.key.0,
-                        error = %error,
-                        "route authority sync failed during migration"
-                    );
-                    if !is_excluded {
-                        last_error = Some(error);
+                        if !is_excluded {
+                            last_error = Some(error);
+                        }
                     }
                 }
             }
+
+            if protected > 0 || force_refresh {
+                if excluded.is_some() && protected == 0 {
+                    return Err(last_error.unwrap_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "route {} has no live authority outside the draining runtime",
+                            route.key.0
+                        ))
+                    }));
+                }
+                return Ok(protected);
+            }
+
+            if last_error.is_none() && excluded.is_none() {
+                return Ok(0);
+            }
+            force_refresh = true;
         }
-        if excluded.is_some() && protected == 0 {
-            return Err(last_error.unwrap_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "route {} has no live authority outside the draining runtime",
-                    route.key.0
-                ))
-            }));
-        }
-        Ok(protected)
     }
 
     fn sync_local_authority_routes_to_live_authorities(&self) -> Result<usize> {
@@ -857,7 +879,7 @@ impl StoreClient {
         for route in routes {
             let mut protected = 0usize;
             let mut last_error = None;
-            for authority in self.route_scan_authorities()? {
+            for authority in self.route_scan_authorities(false)? {
                 if authority.runtime.stable_id == self.lease.runtime.stable_id {
                     continue;
                 }

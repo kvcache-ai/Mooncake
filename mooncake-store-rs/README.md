@@ -889,14 +889,33 @@ crates/
 python/
   mooncake/                 Python convenience package
 scripts/
+  run-all-tests.sh            Unified scripts regression runner for CI and local use
   build/                    Wheel, coverage, and packaging helpers
   clients/                  Real-mode and dummy-mode black-box validators
   e2e/                      Generic local compatibility and stress runners
+  lib/                      Shared shell bootstrap helpers for script entrypoints
   sglang/                   SGLang-specific compatibility and true e2e runners
   tests/client/             Standalone client CLI regressions
   tests/rolling/            Rolling-upgrade and rollback regressions
 third_party/
   Mooncake/                 Upstream Mooncake submodule
+```
+
+## Unified Script Runner
+
+Use the unified shell-based regression runner to execute every discovered test
+entrypoint under `scripts/` in one pass:
+
+```bash
+./scripts/run-all-tests.sh
+```
+
+Useful variants:
+
+```bash
+./scripts/run-all-tests.sh --list
+./scripts/run-all-tests.sh --skip-tag sglang
+./scripts/run-all-tests.sh --include rolling
 ```
 
 ## Status

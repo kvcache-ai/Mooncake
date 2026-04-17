@@ -3,45 +3,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/scripts/lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
-UPSTREAM_DIR="${MOONCAKE_UPSTREAM_DIR:-${ROOT_DIR}/third_party/Mooncake}"
-UPSTREAM_BUILD_DIR="${MOONCAKE_UPSTREAM_BUILD_DIR:-${UPSTREAM_DIR}/build-rust}"
-
-if [[ ! -d "${UPSTREAM_DIR}" ]]; then
-  echo "Mooncake upstream submodule missing at ${UPSTREAM_DIR}" >&2
-  echo "Run: git submodule update --init --recursive" >&2
-  exit 1
-fi
-
-if ! redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
-  redis-server \
-    --port "${REDIS_PORT}" \
-    --bind 127.0.0.1 \
-    --daemonize yes \
-    --save '' \
-    --appendonly no
-fi
-
-export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${LD_LIBRARY_PATH:-}"
+mc_scripts_require_command cargo
+mc_scripts_require_command redis-cli
+mc_scripts_require_command redis-server
+UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${ROOT_DIR}")
+mc_scripts_setup_upstream_runtime_env "${ROOT_DIR}" python "${UPSTREAM_BUILD_DIR}"
+mc_scripts_start_local_redis_if_needed "${REDIS_PORT}"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="${ROOT_DIR}/python"
-
-if ! command -v cargo >/dev/null 2>&1; then
-  CARGO_ENV="${CARGO_HOME:-${HOME}/.cargo}/env"
-  if [[ -f "${CARGO_ENV}" ]]; then
-    # shellcheck disable=SC1090
-    source "${CARGO_ENV}"
-  else
-    echo "cargo not found in PATH and ${CARGO_ENV} is missing" >&2
-    exit 1
-  fi
-fi
+export MC_STORE_RS_REDIS_URL="${MC_STORE_RS_REDIS_URL:-redis://127.0.0.1:${REDIS_PORT}/0}"
 
 cd "${ROOT_DIR}"
 cargo build -p mooncake-store-py
 
 python3 - <<'PY'
 import ctypes
+import os
 import subprocess
 import time
 import urllib.request
@@ -56,6 +35,7 @@ from mooncake.store import (
 
 stamp = int(time.time() * 1000)
 keyspace = f"mc/store-rs/py-compat/{stamp}"
+redis_url = os.environ["MC_STORE_RS_REDIS_URL"]
 
 
 def wait_for_embedded_wrh_replication(writer, reader) -> None:
@@ -83,7 +63,7 @@ def wait_for_embedded_wrh_replication(writer, reader) -> None:
 store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1",
-    "redis://127.0.0.1:6380/0",
+    redis_url,
     4 * 1024 * 1024,
     1 * 1024 * 1024,
     "tcp",
@@ -96,7 +76,7 @@ assert store.setup(
 store_peer = MooncakeDistributedStore()
 assert store_peer.setup(
     "127.0.0.1",
-    "redis://127.0.0.1:6380/0",
+    redis_url,
     4 * 1024 * 1024,
     1 * 1024 * 1024,
     "tcp",
@@ -116,7 +96,7 @@ route = store.query_route("py-key")
 assert route is not None and route["key"] == "default::py-key"
 route_key = f"{keyspace}/objects/default::py-key"
 route_exists = subprocess.check_output(
-    ["redis-cli", "-u", "redis://127.0.0.1:6380/0", "EXISTS", route_key],
+    ["redis-cli", "-u", redis_url, "EXISTS", route_key],
     text=True,
 ).strip()
 assert route_exists == "0"
