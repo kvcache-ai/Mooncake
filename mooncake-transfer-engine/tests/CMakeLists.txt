@@ -70,6 +70,9 @@ if (USE_EFA)
 
     add_executable(efa_single_nic_large_mr_test ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
     target_link_libraries(efa_single_nic_large_mr_test PUBLIC transfer_engine gflags::gflags glog::glog)
+
+    add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
+    target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags glog::glog)
 endif()
 
 # UB transport test with URMA endpoint and mock support
