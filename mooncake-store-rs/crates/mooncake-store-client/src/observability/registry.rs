@@ -662,19 +662,7 @@ pub(crate) fn record_membership_refresh(result: &'static str, duration: Duration
 
 pub(crate) fn record_runtime_leases(leases: &[ClientLease]) {
     let mut registry = metrics_registry().lock().expect("metrics lock poisoned");
-    registry.runtime_leases = leases
-        .iter()
-        .map(|lease| {
-            (
-                lease.runtime.to_string(),
-                RuntimeLeaseMetric {
-                    runtime: lease.runtime.to_string(),
-                    state: client_state_label(lease.state),
-                    expires_at_ms: lease.expires_at_ms,
-                },
-            )
-        })
-        .collect();
+    replace_runtime_leases(&mut registry, leases);
 }
 
 pub(crate) fn record_heartbeat_health(
@@ -757,6 +745,31 @@ pub(crate) fn snapshot_metrics(process: ProcessSnapshot) -> MetricsSnapshot {
 #[cfg(test)]
 pub(crate) fn reset_metrics() {
     *metrics_registry().lock().expect("metrics lock poisoned") = MetricsRegistry::default();
+}
+
+fn replace_runtime_leases(registry: &mut MetricsRegistry, leases: &[ClientLease]) {
+    registry.runtime_leases = leases
+        .iter()
+        .map(|lease| {
+            (
+                lease.runtime.to_string(),
+                RuntimeLeaseMetric {
+                    runtime: lease.runtime.to_string(),
+                    state: client_state_label(lease.state),
+                    expires_at_ms: lease.expires_at_ms,
+                },
+            )
+        })
+        .collect();
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_runtime_leases_after_updates(updates: &[&[ClientLease]]) -> MetricsSnapshot {
+    let mut registry = MetricsRegistry::default();
+    for leases in updates {
+        replace_runtime_leases(&mut registry, leases);
+    }
+    registry.snapshot(ProcessSnapshot::default())
 }
 
 fn metrics_registry() -> &'static Mutex<MetricsRegistry> {
