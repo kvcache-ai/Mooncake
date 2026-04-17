@@ -138,8 +138,11 @@ impl LocalMemoryConfig {
         self.region_plans(self.storage_bytes, max_segment_bytes)
     }
 
-    fn scratch_region_plans(&self) -> Result<Vec<LocalRegionPlan>> {
-        self.region_plans(self.scratch_bytes, None)
+    fn scratch_region_plans(
+        &self,
+        max_segment_bytes: Option<usize>,
+    ) -> Result<Vec<LocalRegionPlan>> {
+        self.region_plans(self.scratch_bytes, max_segment_bytes)
     }
 
     fn region_plans(
@@ -263,9 +266,12 @@ impl LocalMemoryState {
         } else {
             None
         };
+        let registration_limit = transport
+            .max_registration_bytes()
+            .filter(|value| *value > 0);
         let scratch = match ScratchSpace::register(
             transport,
-            &config.scratch_region_plans()?,
+            &config.scratch_region_plans(registration_limit)?,
             config.alignment,
             hugepage,
         ) {
@@ -846,6 +852,7 @@ mod tests {
     #[derive(Default, Clone)]
     struct RecordingTransport {
         inner: Arc<Mutex<RecordingTransportState>>,
+        max_registration_bytes: Option<usize>,
     }
 
     #[derive(Default)]
@@ -1015,6 +1022,10 @@ mod tests {
                 .remove(&base)
                 .ok_or_else(|| StoreError::NotFound(format!("allocation {base:#x} not found")))?;
             Ok(())
+        }
+
+        fn max_registration_bytes(&self) -> Option<usize> {
+            self.max_registration_bytes
         }
 
         fn register_memory(
@@ -1335,7 +1346,7 @@ mod tests {
             );
             assert_eq!(
                 config
-                    .scratch_region_plans()
+                    .scratch_region_plans(None)
                     .expect("scratch plans should succeed"),
                 vec![
                     LocalRegionPlan {
@@ -1514,6 +1525,37 @@ mod tests {
             .release_scratch(&transport)
             .expect("releasing scratch region should succeed");
         assert!(transport.inner.lock().registered.is_empty());
+    }
+
+    #[test]
+    fn local_memory_state_splits_scratch_by_registration_limit() {
+        let transport = RecordingTransport {
+            max_registration_bytes: Some(64),
+            ..RecordingTransport::default()
+        };
+        let primary = SegmentName::new("primary");
+        let state = LocalMemoryState::register(
+            &transport,
+            &primary,
+            &LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(0)
+                .scratch_bytes(160)
+                .alignment(8)
+                .reclaim_grace_ms(0),
+        )
+        .expect("scratch registration should split by MR limit");
+
+        let mut registered_sizes = transport
+            .inner
+            .lock()
+            .registered
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        registered_sizes.sort_unstable();
+        assert_eq!(registered_sizes, vec![32, 64, 64]);
+        assert!(state.plan_scratch(&[65]).is_err());
     }
 
     #[test]

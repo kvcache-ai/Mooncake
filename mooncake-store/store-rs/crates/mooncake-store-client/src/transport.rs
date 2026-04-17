@@ -138,14 +138,11 @@ pub trait StoreTransportFactory: Send + Sync {
     fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>>;
 }
 
-fn registration_chunks(
+pub(crate) fn registration_chunks(
     addr: *mut c_void,
     size: usize,
     max_registration_bytes: Option<usize>,
 ) -> Result<Vec<(*mut c_void, usize)>> {
-    let chunk_bytes = max_registration_bytes
-        .filter(|value| *value > 0)
-        .unwrap_or(size.max(1));
     let mut chunks = Vec::new();
     if size == 0 {
         chunks.push((addr, 0));
@@ -155,16 +152,54 @@ fn registration_chunks(
     let base = addr as usize;
     let mut offset = 0usize;
     while offset < size {
-        let chunk_len = (size - offset).min(chunk_bytes);
         let chunk_addr = base.checked_add(offset).ok_or_else(|| {
             StoreError::Transport("registration chunk address overflow".to_string())
         })? as *mut c_void;
+        let chunk_len = (size - offset).min(registration_chunk_capacity(
+            chunk_addr as usize,
+            max_registration_bytes,
+            size,
+        )?);
         chunks.push((chunk_addr, chunk_len));
         offset = offset.checked_add(chunk_len).ok_or_else(|| {
             StoreError::Transport("registration chunk offset overflow".to_string())
         })?;
     }
     Ok(chunks)
+}
+
+fn registration_chunk_capacity(
+    addr: usize,
+    max_registration_bytes: Option<usize>,
+    fallback: usize,
+) -> Result<usize> {
+    let Some(max_bytes) = max_registration_bytes.filter(|value| *value > 0) else {
+        return Ok(fallback.max(1));
+    };
+    let page_size = system_page_size();
+    if max_bytes < page_size {
+        return Ok(max_bytes);
+    }
+    let rounded_max = max_bytes - (max_bytes % page_size);
+    if rounded_max == 0 {
+        return Ok(max_bytes);
+    }
+    let page_offset = addr % page_size;
+    if page_offset >= rounded_max {
+        return Err(StoreError::Transport(format!(
+            "registration chunk limit {max_bytes} is too small for page offset {page_offset}"
+        )));
+    }
+    Ok(rounded_max - page_offset)
+}
+
+fn system_page_size() -> usize {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        4096
+    } else {
+        usize::try_from(page).unwrap_or(4096).max(1)
+    }
 }
 
 fn for_each_registration_chunk<F>(
@@ -1740,7 +1775,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        classic_buffer_location, parse_rpc_server_address, registration_chunks,
+        classic_buffer_location, parse_rpc_server_address, registration_chunks, system_page_size,
         wait_for_batch_completion, wait_for_batch_completion_detailed, BatchWaitFailureKind,
         ClassicAllocationOwner, ClassicAllocationRecord, HttpStoreTransport,
         HttpTransportServerHandle, StoreTransport,
@@ -2053,6 +2088,24 @@ mod tests {
         let chunks = registration_chunks(std::ptr::null_mut(), 0, Some(4))
             .expect("zero-length registration should succeed");
         assert_eq!(chunks, vec![(std::ptr::null_mut(), 0)]);
+    }
+
+    #[test]
+    fn registration_chunks_keep_page_rounded_span_within_limit() {
+        let page = system_page_size();
+        let base = (page + 128) as *mut c_void;
+        let max = page * 2;
+        let chunks = registration_chunks(base, page * 3, Some(max))
+            .expect("unaligned address should split safely");
+
+        assert_eq!(chunks[0], (base, max - 128));
+        for (addr, len) in chunks {
+            let start = addr as usize;
+            let rounded_start = start - (start % page);
+            let end = start + len;
+            let rounded_end = end.div_ceil(page) * page;
+            assert!(rounded_end - rounded_start <= max);
+        }
     }
 
     #[test]
