@@ -495,12 +495,16 @@ jobs:
     name: Check code format
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Need full history for branch comparison
+        persist-credentials: false
 
     - name: Install clang-format 20
       run: |
@@ -509,17 +513,31 @@ jobs:
         sudo ./llvm.sh 20
         sudo apt-get install -y clang-format-20
 
-    - name: run clang-format-20
+    - name: Check code format
       run: |
-        # the old clang-format-14 which is the default version in ubuntu 22.04,
-        # is inconsistent with clang-format-20.
-        ls -lh /usr/bin/clang-format*
-        clang-format --version
-        clang-format-20 --version
-        # skip cachelib_memory_allocator
-        find . -type f \( -name "*.h" -o -name "*.cpp" \) | grep -v cachelib_memory_allocator | xargs clang-format-20 -style=file -i
-        if ! git diff --exit-code; then
-          echo "Please follow the .clang-format code style, try clang-format -i FILENAME"
+        # Check script exists and is executable
+        if [[ ! -x ./scripts/code_format.sh ]]; then
+          echo "Error: code_format.sh not found or not executable"
           exit 1
         fi
+        
+        # Determine base ref for comparison
+        if [ "${{ github.event_name }}" == "pull_request" ]; then
+          # For PRs: compare against the target branch
+          BASE_REF="origin/${{ github.base_ref }}"
+        else
+          # For push events: use github.event.before to handle multi-commit pushes
+          BEFORE_SHA="${{ github.event.before }}"
+          if [ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]; then
+            # New branch push, compare against default branch
+            BASE_REF="origin/${{ github.event.repository.default_branch }}"
+          else
+            # Normal push (single or multiple commits)
+            BASE_REF="${BEFORE_SHA}"
+          fi
+        fi
+        echo "Comparing against: ${BASE_REF}"
+        ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
+
+
