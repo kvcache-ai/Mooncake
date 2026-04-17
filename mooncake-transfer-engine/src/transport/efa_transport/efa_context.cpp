@@ -429,13 +429,11 @@ int EfaContext::preTouchMemory(void* addr, size_t length) {
 
 uint64_t EfaContext::rkey(void* addr) {
     RWSpinlock::ReadGuard guard(mr_lock_);
-    // Range lookup: find the MR that contains this address
-    for (auto& entry : mr_map_) {
-        if ((uint64_t)addr >= entry.first &&
-            (uint64_t)addr < entry.first + entry.second.length) {
-            if (entry.second.mr) {
-                return entry.second.key;
-            }
+    auto it = mr_map_.upper_bound((uint64_t)addr);
+    if (it != mr_map_.begin()) {
+        --it;
+        if ((uint64_t)addr < it->first + it->second.length && it->second.mr) {
+            return it->second.key;
         }
     }
     return 0;
@@ -443,13 +441,11 @@ uint64_t EfaContext::rkey(void* addr) {
 
 uint64_t EfaContext::lkey(void* addr) {
     RWSpinlock::ReadGuard guard(mr_lock_);
-    // Range lookup: find the MR that contains this address
-    for (auto& entry : mr_map_) {
-        if ((uint64_t)addr >= entry.first &&
-            (uint64_t)addr < entry.first + entry.second.length) {
-            if (entry.second.mr) {
-                return fi_mr_key(entry.second.mr);
-            }
+    auto it = mr_map_.upper_bound((uint64_t)addr);
+    if (it != mr_map_.begin()) {
+        --it;
+        if ((uint64_t)addr < it->first + it->second.length && it->second.mr) {
+            return fi_mr_key(it->second.mr);
         }
     }
     return 0;
@@ -457,13 +453,11 @@ uint64_t EfaContext::lkey(void* addr) {
 
 void* EfaContext::mrDesc(void* addr) {
     RWSpinlock::ReadGuard guard(mr_lock_);
-    // Find the MR that contains this address
-    for (auto& entry : mr_map_) {
-        if ((uint64_t)addr >= entry.first &&
-            (uint64_t)addr < entry.first + entry.second.length) {
-            if (entry.second.mr) {
-                return fi_mr_desc(entry.second.mr);
-            }
+    auto it = mr_map_.upper_bound((uint64_t)addr);
+    if (it != mr_map_.begin()) {
+        --it;
+        if ((uint64_t)addr < it->first + it->second.length && it->second.mr) {
+            return fi_mr_desc(it->second.mr);
         }
     }
     return nullptr;

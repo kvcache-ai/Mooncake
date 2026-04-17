@@ -363,6 +363,15 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         }
     }
 
+    auto rollbackChunks = [&](size_t up_to_ci) {
+        for (size_t ri = 0; ri <= up_to_ci; ++ri) {
+            for (size_t nic_idx : nic_assignments[ri]) {
+                context_list_[nic_idx]->unregisterMemoryRegion(
+                    chunks[ri].first);
+            }
+        }
+    };
+
     // Register each chunk on its assigned NICs
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void* chunk_addr = chunks[ci].first;
@@ -375,6 +384,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         if (do_pre_touch) {
             int ret = preTouchMemory(chunk_addr, chunk_len);
             if (ret != 0) {
+                if (ci > 0) rollbackChunks(ci - 1);
                 return ret;
             }
         }
@@ -413,6 +423,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                     LOG(ERROR)
                         << "Failed to register memory region chunk " << ci
                         << " with EFA context " << assigned_nics[j];
+                    rollbackChunks(ci);
                     return ret_codes[j];
                 }
             }
@@ -423,6 +434,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 if (ret) {
                     LOG(ERROR) << "Failed to register memory region chunk "
                                << ci << " with EFA context " << nic_idx;
+                    rollbackChunks(ci);
                     return ret;
                 }
             }
@@ -459,7 +471,10 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         buffer_desc.addr = (uint64_t)chunk_addr;
         buffer_desc.length = chunk_len;
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-        if (rc) return rc;
+        if (rc) {
+            rollbackChunks(ci);
+            return rc;
+        }
     }
 
     // Track chunks and NIC assignments for unregistration
