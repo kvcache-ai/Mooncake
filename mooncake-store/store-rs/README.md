@@ -135,6 +135,104 @@ The `/metrics` surface is now split by metric family instead of one flat operati
 - soft-miss batch compatibility for `batch_get_into`, `batch_get_into_multi_buffers`, and `batch_is_exist`
 - native module backed by the Rust implementation
 
+### Multi-Tenant Isolation
+
+Store-RS now treats tenant isolation as a control-plane feature authored in metadata and enforced inside the runtime.
+
+The intended operator flow is:
+
+1. write tenant policy through `mooncake-store-admin policy ...`
+2. launch runtimes with a tenant identity plus transport and memory configuration
+3. let Store-RS resolve and enforce effective tenant policy from metadata during bootstrap and on write paths
+
+What tenant policy covers:
+
+- routing defaults such as `route_control` and `route_topk`
+- quota limits such as `max_bytes` and `max_objects`
+- placement defaults such as replica count and preferred storage owners
+- QoS-related defaults such as fairness and shaping knobs
+- scope selection at tenant, tenant+domain, or tenant+domain+object-set granularity
+
+Important boundary:
+
+- `mooncake-store-admin` is the preferred management surface for tenant policy and explicit repair
+- request-path enforcement stays inside Store-RS clients and control-plane services
+- runtime-local builder / Python / CLI knobs remain compatibility fallbacks, not the preferred authoring path
+
+Current strict-isolation path:
+
+- strict tenant quota is metadata-authoritative rather than best-effort runtime-local preflight
+- concurrent writes reserve and finalize quota through metadata state instead of relying on stale snapshots
+- delete refunds quota at authoritative delete time, so released capacity is reusable immediately
+- admin inspection and repair surfaces expose `quota state`, `quota object`, `quota reservations`, `quota abort`, and `quota reconcile`
+
+Validation coverage already includes:
+
+- multi-tenant behavior in the main Rust e2e harness
+- strict tenant quota admission, rejection, refund, and reuse checks in `scripts/e2e/run-local-e2e.sh`
+- operator-facing quota inspection and reconcile workflows documented in `docs/deployment.md`
+
+Basic usage:
+
+1. write policy for one tenant:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  policy set \
+  --tenant tenant-a \
+  --route-topk 3 \
+  --route-control embedded-wrh \
+  --max-bytes 1048576 \
+  --max-objects 10
+```
+
+2. start a runtime for that tenant:
+
+```bash
+mooncake-store-client \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  --stable-id tenant-a-store-1 \
+  --tenant tenant-a \
+  --state active \
+  --storage-bytes 268435456 \
+  --scratch-bytes 16777216
+```
+
+For Rust clients, the equivalent scope selection is `.tenant("tenant-a")` on `StoreClientBuilder`.
+
+3. inspect quota state and pending reservations:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota state \
+  --tenant tenant-a
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reservations \
+  --tenant tenant-a \
+  --state pending
+```
+
+4. run explicit repair when needed:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reconcile \
+  --tenant tenant-a \
+  --dry-run
+```
+
+Start here when working on this area:
+
+- `docs/deployment.md` for the recommended admin-first workflow
+- `docs/configuration.md` for tenant-policy precedence and fallback behavior
+- `docs/multi-tenant-admin-control-plane-design.md` for the management-plane model
+- `docs/tenant-quota-consistency-design.md` for strict quota semantics
+
 If you want a feature-by-feature view, read `docs/features.md`.
 
 ## Architecture at a Glance
