@@ -598,6 +598,12 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         avg_gbps = (self.total_bits / 1e9) / avg_time
         print(f"👉 [Result] {name:30} | Avg Time: {avg_time:.4f}s | Throughput: {avg_gbps:.2f} Gbps")
 
+    def _print_payload_perf(self, name, times, payload_bytes):
+        avg_time = np.mean(times)
+        avg_gbps = ((payload_bytes * 8) / 1e9) / avg_time
+        print(f"👉 [Result] {name:30} | Avg Time: {avg_time * 1000:.2f} ms | Throughput: {avg_gbps:.2f} Gbps")
+        return avg_time, avg_gbps
+
     def test_benchmark_01_batch_put_get(self):
         """Benchmark: Standard Batch Put/Get."""
         put_times = []
@@ -774,6 +780,163 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         self.assertEqual(self.store.unregister_buffer(full_buffer_ptr), 0, "Full buffer unregistration failed")
         for buf_info in rank_buffers:
             self.assertEqual(self.store.unregister_buffer(buf_info['base_ptr']), 0, "Buffer unregistration failed")
+
+    def test_benchmark_04_single_put_vs_chunk_put_with_warmup(self):
+        """Benchmark: compare put paths after sufficient warmup."""
+        tp_size = 4
+        split_dim = 0
+        shard_sizes_mb = [256, 512, 1024]
+        warmup_rounds = 3
+        iterations = 5
+
+        dtype_map = {
+            torch.float32: 0,
+            torch.float64: 1,
+            torch.int32: 2,
+            torch.int64: 3,
+            torch.int16: 4,
+            torch.int8: 5,
+            torch.uint8: 6,
+            torch.float16: 7,
+            torch.bool: 8,
+            torch.bfloat16: 9,
+        }
+
+        for shard_size_mb in shard_sizes_mb:
+            num_elements = (shard_size_mb * 1024 * 1024) // 4
+            rows = 1024
+            cols = max(tp_size, num_elements // rows)
+            cols = (cols // tp_size) * tp_size
+            full_tensor = torch.randn(rows, cols, dtype=torch.float32).contiguous()
+            shard = full_tensor.chunk(tp_size, split_dim)[0].contiguous()
+            payload_bytes = serialized_tensor_size(shard)
+            put_times = []
+            put_from_times = []
+            chunk_put_times = []
+            chunk_put_from_times = []
+
+            serialized_buffer = (ctypes.c_ubyte * payload_bytes)()
+            serialized_ptr = ctypes.addressof(serialized_buffer)
+            self.assertEqual(self.store.register_buffer(serialized_ptr, payload_bytes), 0)
+            try:
+                shape = list(shard.shape) + [-1] * (4 - shard.ndim)
+                import struct
+                struct.pack_into(
+                    "<iiqqqq",
+                    serialized_buffer,
+                    0,
+                    dtype_map.get(shard.dtype, 0),
+                    shard.ndim,
+                    *shape[:4],
+                )
+                ctypes.memmove(
+                    serialized_ptr + TENSOR_METADATA_SIZE,
+                    shard.numpy().tobytes(),
+                    shard.numel() * shard.element_size(),
+                )
+
+                print(
+                    f"--- Running warmed single put path benchmark ({iterations} iters, warmup={warmup_rounds}, shard={shard_size_mb}MB, payload={payload_bytes} bytes) ---"
+                )
+
+                for i in range(warmup_rounds):
+                    self.store.remove_all()
+                    rc = self.store.put_tensor_from(
+                        f"bench_warm_put_from_{shard_size_mb}_{i}", serialized_ptr, payload_bytes
+                    )
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(self.store.remove(f"bench_warm_put_from_{shard_size_mb}_{i}"), 0)
+
+                    rc = self.store.put_tensor_chunk_with_tp_from(
+                        f"bench_warm_chunk_put_from_{shard_size_mb}_{i}",
+                        serialized_ptr,
+                        payload_bytes,
+                        tp_rank=0,
+                        tp_size=tp_size,
+                        split_dim=split_dim,
+                        full_shape=list(full_tensor.shape),
+                    )
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(self.store.remove(f"bench_warm_chunk_put_from_{shard_size_mb}_{i}_tp_0"), 0)
+                    self.assertEqual(self.store.remove(f"bench_warm_chunk_put_from_{shard_size_mb}_{i}_tp_0_meta"), 0)
+                    self.assertEqual(self.store.remove(f"bench_warm_chunk_put_from_{shard_size_mb}_{i}_global_meta"), 0)
+
+                for i in range(iterations):
+                    self.store.remove_all()
+
+                    t0 = time.perf_counter()
+                    rc = self.store.put_tensor(f"bench_put_{shard_size_mb}_{i}", shard)
+                    put_times.append(time.perf_counter() - t0)
+                    self.assertEqual(rc, 0)
+
+                    t0 = time.perf_counter()
+                    rc = self.store.put_tensor_from(
+                        f"bench_put_from_{shard_size_mb}_{i}", serialized_ptr, payload_bytes
+                    )
+                    put_from_times.append(time.perf_counter() - t0)
+                    self.assertEqual(rc, 0)
+
+                    t0 = time.perf_counter()
+                    rc = self.store.put_tensor_chunk_with_tp(
+                        f"bench_chunk_put_{shard_size_mb}_{i}",
+                        shard,
+                        tp_rank=0,
+                        tp_size=tp_size,
+                        split_dim=split_dim,
+                        full_shape=list(full_tensor.shape),
+                    )
+                    chunk_put_times.append(time.perf_counter() - t0)
+                    self.assertEqual(rc, 0)
+
+                    t0 = time.perf_counter()
+                    rc = self.store.put_tensor_chunk_with_tp_from(
+                        f"bench_chunk_put_from_{shard_size_mb}_{i}",
+                        serialized_ptr,
+                        payload_bytes,
+                        tp_rank=0,
+                        tp_size=tp_size,
+                        split_dim=split_dim,
+                        full_shape=list(full_tensor.shape),
+                    )
+                    chunk_put_from_times.append(time.perf_counter() - t0)
+                    self.assertEqual(rc, 0)
+            finally:
+                self.store.remove_all()
+                self.assertEqual(self.store.unregister_buffer(serialized_ptr), 0)
+
+            put_avg_time, put_avg_gbps = self._print_payload_perf(
+                f"Regular Put ({shard_size_mb}MB shard)", put_times, payload_bytes
+            )
+            put_from_avg_time, put_from_avg_gbps = self._print_payload_perf(
+                f"Regular Put From ({shard_size_mb}MB shard)", put_from_times, payload_bytes
+            )
+            chunk_avg_time, chunk_avg_gbps = self._print_payload_perf(
+                f"Chunk Put ({shard_size_mb}MB shard)", chunk_put_times, payload_bytes
+            )
+            chunk_from_avg_time, chunk_from_avg_gbps = self._print_payload_perf(
+                f"Chunk Put From ({shard_size_mb}MB shard)", chunk_put_from_times, payload_bytes
+            )
+
+            for name, avg_time, avg_gbps in [
+                ("put_from vs put", put_from_avg_time, put_from_avg_gbps),
+                ("chunk_put vs put", chunk_avg_time, chunk_avg_gbps),
+                ("chunk_put_from vs put_from", chunk_from_avg_time, chunk_from_avg_gbps),
+                ("chunk_put_from vs chunk_put", chunk_from_avg_time, chunk_from_avg_gbps),
+            ]:
+                if name == "put_from vs put":
+                    base_time, base_gbps = put_avg_time, put_avg_gbps
+                elif name == "chunk_put vs put":
+                    base_time, base_gbps = put_avg_time, put_avg_gbps
+                elif name == "chunk_put_from vs put_from":
+                    base_time, base_gbps = put_from_avg_time, put_from_avg_gbps
+                else:
+                    base_time, base_gbps = chunk_avg_time, chunk_avg_gbps
+
+                latency_delta = ((avg_time - base_time) / base_time) * 100 if base_time > 0 else 0.0
+                throughput_delta = ((avg_gbps - base_gbps) / base_gbps) * 100 if base_gbps > 0 else 0.0
+                print(
+                    f"👉 [Compare] {shard_size_mb}MB shard | {name}: Latency delta {latency_delta:+.2f}% | Throughput delta {throughput_delta:+.2f}%"
+                )
 
     def test_benchmark_05_batch_pub_get(self):
         """Benchmark: Standard Batch Pub/Get."""
