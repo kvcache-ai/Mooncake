@@ -14,6 +14,7 @@ REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 UBUNTU_VERSION=${UBUNTU_VERSION:-22.04}
 PYTHON_VERSION=${PYTHON_VERSION:-system}
 DOCKER_IMAGE=${DOCKER_IMAGE:-}
+PYTHON_TAG=
 WORKDIR_IN_CONTAINER=${WORKDIR_IN_CONTAINER:-/work}
 CACHE_DIR=${MOONCAKE_DOCKER_CACHE_DIR:-"${REPO_ROOT}/target/docker-wheel-cache"}
 CACHE_DIR_IN_CONTAINER=${CACHE_DIR_IN_CONTAINER:-/cache}
@@ -48,7 +49,8 @@ Environment:
   REBUILD_IMAGE=1             Rebuild the builder image even if it exists
   PULL_IMAGE=0                Do not pull the Ubuntu base image while rebuilding
   CN_MIRROR=0                 Disable the default China mirrors for rustup/pip/cargo
-  MOONCAKE_DOCKER_CACHE_DIR   Cache for container HOME/CARGO_HOME (default: target/docker-wheel-cache)
+  MOONCAKE_DOCKER_CACHE_DIR   Cache for HOME/CARGO_HOME/upstream CMake builds
+                              (default: target/docker-wheel-cache)
   CACHE_DIR_IN_CONTAINER      Container mountpoint for the cache (default: /cache)
   CN_RUSTUP_DIST_SERVER       Rust toolchain mirror (default: USTC rust-static)
   CN_RUSTUP_UPDATE_ROOT       Rustup metadata mirror (default: USTC rust-static/rustup)
@@ -119,7 +121,6 @@ set_default_if_unset() {
 configure_python_selection() {
   local py_basename=
   local inferred_version=system
-  local python_tag=
 
   if [[ -n "${PYTHON:-}" ]]; then
     py_basename=$(basename -- "${PYTHON}")
@@ -155,9 +156,9 @@ configure_python_selection() {
       ;;
   esac
 
+  PYTHON_TAG="py${PYTHON_VERSION//./}"
   if [[ -z "${DOCKER_IMAGE}" ]]; then
-    python_tag="py${PYTHON_VERSION//./}"
-    DOCKER_IMAGE="mooncake-store-wheel:ubuntu-${UBUNTU_VERSION}-${python_tag}"
+    DOCKER_IMAGE="mooncake-store-wheel:ubuntu-${UBUNTU_VERSION}-${PYTHON_TAG}"
   fi
 }
 
@@ -377,11 +378,17 @@ DOCKERFILE
 
 require_command docker
 configure_python_selection
+HOST_UID=${SUDO_UID:-$(id -u)}
+HOST_GID=${SUDO_GID:-$(id -g)}
+DEFAULT_UPSTREAM_BUILD_DIR="${CACHE_DIR_IN_CONTAINER}/upstream-build/ubuntu-${UBUNTU_VERSION}-${PYTHON_TAG}/build-wheel-compat"
 
 if [[ "${CACHE_DIR}" != /* ]]; then
   CACHE_DIR="${REPO_ROOT}/${CACHE_DIR}"
 fi
-mkdir -p "${CACHE_DIR}/cargo" "${CACHE_DIR}/home"
+mkdir -p "${CACHE_DIR}/cargo" "${CACHE_DIR}/home" "${CACHE_DIR}/upstream-build"
+if [[ "$(id -u)" -eq 0 && -n "${SUDO_UID:-}" ]]; then
+  chown -R "${HOST_UID}:${HOST_GID}" "${CACHE_DIR}"
+fi
 configure_cn_mirrors
 
 if is_truthy "${REBUILD_IMAGE}" || ! docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
@@ -392,11 +399,12 @@ declare -a DOCKER_RUN_ARGS=(
   run
   --rm
   --init
-  --user "$(id -u):$(id -g)"
+  --user "${HOST_UID}:${HOST_GID}"
   -e "HOME=${CACHE_DIR_IN_CONTAINER}/home"
   -e "CARGO_HOME=${CACHE_DIR_IN_CONTAINER}/cargo"
   -e "RUSTUP_HOME=/usr/local/rustup"
   -e "WHEEL_VENV=${CACHE_DIR_IN_CONTAINER}/venv"
+  -e "MOONCAKE_UPSTREAM_BUILD_DIR=${DEFAULT_UPSTREAM_BUILD_DIR}"
   -e "PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   -e "CONTAINER_WORKDIR=${WORKDIR_IN_CONTAINER}"
   -v "${REPO_ROOT}:${WORKDIR_IN_CONTAINER}"
