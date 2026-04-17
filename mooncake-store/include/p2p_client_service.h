@@ -19,6 +19,8 @@
 
 namespace mooncake {
 
+struct ReadRetryContinuation;
+
 class P2PClientService final : public ClientService {
    public:
     /**
@@ -227,43 +229,8 @@ class P2PClientService final : public ClientService {
     HeartbeatRequest build_heartbeat_request() override;
 
    private:
-    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> CreatePutHandle(
-        const std::string& key, std::vector<Slice>& slices,
-        const WriteRouteRequestConfig& config);
+    friend struct ReadRetryContinuation;
 
-    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
-        const std::string& key,
-        std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config);
-
-    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
-        const std::string& key, std::vector<Slice>& slices,
-        const ReadRouteConfig& config);
-
-    /**
-     * @brief Launch async reads driven by a RouteIterator.
-     *
-     * Creates a ReadRetryContinuation that fires the first RPC immediately
-     * and chains subsequent candidates on failure (no stack recursion).
-     */
-    tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
-        const std::string& key, std::vector<Slice>& slices, RouteIterator iter);
-
-    /**
-     * @brief Query Master for replica list and calculate total object size.
-     * @return Pair of (replicas, total_size) on success.
-     */
-    tl::expected<std::pair<std::vector<Replica::Descriptor>, uint64_t>,
-                 ErrorCode>
-    QueryReplicaSize(const std::string& key, const ReadRouteConfig& config);
-
-    /**
-     * @brief Get or create a PeerClient for the given endpoint.
-     * Thread-safe via peer_clients_mutex_.
-     */
-    PeerClient& GetOrCreatePeerClient(const std::string& endpoint);
-
-   private:
     struct ResolvedRoute {
         PeerClient* peer = nullptr;
         uint64_t object_size = 0;
@@ -303,6 +270,43 @@ class P2PClientService final : public ClientService {
 
     std::vector<ResolvedRoute> ResolveRoutesFromMaster(
         const std::string& key, const ReadRouteConfig& config);
+
+   private:
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> CreatePutHandle(
+        const std::string& key, std::vector<Slice>& slices,
+        const WriteRouteRequestConfig& config);
+
+    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator,
+        const ReadRouteConfig& config);
+
+    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
+        const std::string& key, std::vector<Slice>& slices,
+        const ReadRouteConfig& config);
+
+    /**
+     * @brief Launch async reads driven by a RouteIterator.
+     *
+     * Creates a ReadRetryContinuation that fires the first RPC immediately
+     * and chains subsequent candidates on failure (no stack recursion).
+     */
+    tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
+        const std::string& key, std::vector<Slice>& slices, RouteIterator iter);
+
+    /**
+     * @brief Query Master for replica list and calculate total object size.
+     * @return Pair of (replicas, total_size) on success.
+     */
+    tl::expected<std::pair<std::vector<Replica::Descriptor>, uint64_t>,
+                 ErrorCode>
+    QueryReplicaSize(const std::string& key, const ReadRouteConfig& config);
+
+    /**
+     * @brief Get or create a PeerClient for the given endpoint.
+     * Thread-safe via peer_clients_mutex_.
+     */
+    PeerClient& GetOrCreatePeerClient(const std::string& endpoint);
 
    private:
     P2PMasterClient master_client_;

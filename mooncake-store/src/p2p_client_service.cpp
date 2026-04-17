@@ -960,6 +960,10 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
 // Tries remote route from RouteIterator one by one via chained async RPCs;
 struct ReadRetryContinuation
     : std::enable_shared_from_this<ReadRetryContinuation> {
+    // Friend of P2PClientService — may access private nested types.
+    using RouteIterator = P2PClientService::RouteIterator;
+    using ResolvedRoute = P2PClientService::ResolvedRoute;
+
     RouteIterator iter;
     std::shared_ptr<RemoteReadRequest> req;
     std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise;
@@ -987,7 +991,7 @@ struct ReadRetryContinuation
     }
 
     void OnReadResponse(
-        P2PClientService::ResolvedRoute route,
+        ResolvedRoute route,
         async_simple::Try<tl::expected<void, ErrorCode>>&& result) {
         try {
             if (result.value()) {
@@ -1040,13 +1044,10 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
 }
 
 // ============================================================================
-// RouteIterator
+// P2PClientService::RouteIterator
 // ============================================================================
 
-using ResolvedRoute = P2PClientService::ResolvedRoute;
-using RouteIterator = P2PClientService::RouteIterator;
-
-RouteIterator::RouteIterator(
+P2PClientService::RouteIterator::RouteIterator(
     std::string key, std::vector<ResolvedRoute> initial, uint64_t object_size,
     RouteCache* route_cache,
     std::function<std::vector<ResolvedRoute>()> master_fetch)
@@ -1056,7 +1057,7 @@ RouteIterator::RouteIterator(
       route_cache_(route_cache),
       master_fetch_(std::move(master_fetch)) {}
 
-void RouteIterator::Prime() {
+void P2PClientService::RouteIterator::Prime() {
     if (!routes_.empty() || master_queried_) {
         return;
     }
@@ -1074,7 +1075,7 @@ void RouteIterator::Prime() {
     }
 }
 
-std::optional<ResolvedRoute> RouteIterator::Next() {
+auto P2PClientService::RouteIterator::Next() -> std::optional<ResolvedRoute> {
     if (idx_ < routes_.size()) {
         return routes_[idx_++];
     }
@@ -1099,7 +1100,8 @@ std::optional<ResolvedRoute> RouteIterator::Next() {
     return std::nullopt;
 }
 
-void RouteIterator::UpsertToCache(const std::vector<ResolvedRoute>& routes) {
+void P2PClientService::RouteIterator::UpsertToCache(
+    const std::vector<ResolvedRoute>& routes) {
     if (!route_cache_ || routes.empty()) {
         return;
     }
@@ -1111,14 +1113,15 @@ void RouteIterator::UpsertToCache(const std::vector<ResolvedRoute>& routes) {
     route_cache_->Upsert(key_, ps);
 }
 
-void RouteIterator::Evict(const ResolvedRoute& route) {
+void P2PClientService::RouteIterator::Evict(const ResolvedRoute& route) {
     if (route.is_cached && route_cache_) {
         route_cache_->RemoveReplica(key_, {route.proxy});
     }
 }
 
-tl::expected<RouteIterator, ErrorCode> P2PClientService::BuildRouteIter(
-    const std::string& key, const ReadRouteConfig& config) {
+auto P2PClientService::BuildRouteIter(const std::string& key,
+                                      const ReadRouteConfig& config)
+    -> tl::expected<RouteIterator, ErrorCode> {
     std::vector<ResolvedRoute> routes;
 
     // Load all replicas from the route cache.
