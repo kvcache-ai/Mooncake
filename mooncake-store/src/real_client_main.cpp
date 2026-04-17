@@ -35,9 +35,6 @@ DEFINE_string(p2p_local_transfer_mode, "te",
 DEFINE_uint64(local_memcpy_async_worker_num, 32,
               "If set p2p_local_transfer_mode=memcpy, Worker number for async "
               "local memcpy executor (P2P), 0 means forbid async memcpy");
-DEFINE_uint64(local_memcpy_async_queue_depth, 2048,
-              "If set p2p_local_transfer_mode=memcpy, Queue depth for async "
-              "local memcpy executor (P2P), 0 means forbid async memcpy");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -99,8 +96,7 @@ int main(int argc, char* argv[]) {
                 FLAGS_lock_shard_count,
                 string_to_byte_size(FLAGS_route_cache_max_memory),
                 FLAGS_route_cache_ttl_ms, FLAGS_p2p_local_transfer_mode,
-                static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
-                static_cast<size_t>(FLAGS_local_memcpy_async_queue_depth));
+                static_cast<size_t>(FLAGS_local_memcpy_async_worker_num));
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)

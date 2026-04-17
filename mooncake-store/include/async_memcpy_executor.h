@@ -69,7 +69,7 @@ class AsyncMemcpyExecutor {
         }
     };
 
-    AsyncMemcpyExecutor(size_t worker_num, size_t max_queue_size);
+    explicit AsyncMemcpyExecutor(size_t worker_num);
     ~AsyncMemcpyExecutor();
 
     template <typename ResultType, typename TaskFn, typename ErrorFn>
@@ -105,11 +105,9 @@ class AsyncMemcpyExecutor {
         }
     }
 
-    size_t max_queue_size_ = 0;
     bool shutting_down_ = false;
     std::mutex mutex_;
     std::condition_variable queue_not_empty_cv_;
-    std::condition_variable queue_not_full_cv_;
     std::queue<QueueTask> tasks_;
     std::vector<std::thread> workers_;
 };
@@ -141,15 +139,16 @@ AsyncMemcpyExecutor::SubmitBatchTasks(const std::vector<size_t>& indices,
         return BatchHandle<ResultType>{batch_state};
     }
 
-    size_t enqueued = 0;
     {
-        std::unique_lock<std::mutex> lock(mutex_);
-        for (; enqueued < indices.size(); ++enqueued) {
-            queue_not_full_cv_.wait(lock, [this] {
-                return shutting_down_ || tasks_.size() < max_queue_size_;
-            });
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (size_t enqueued = 0; enqueued < indices.size(); ++enqueued) {
             if (shutting_down_) {
-                break;
+                // Cancel remaining slots synchronously.
+                for (size_t slot = enqueued; slot < indices.size(); ++slot) {
+                    FinishBatchTask(batch_state, slot,
+                                    (*on_error_ptr)(indices[slot]));
+                }
+                return BatchHandle<ResultType>{batch_state};
             }
 
             const size_t slot = enqueued;
@@ -178,15 +177,7 @@ AsyncMemcpyExecutor::SubmitBatchTasks(const std::vector<size_t>& indices,
             tasks_.push(std::move(queue_task));
         }
     }
-
-    if (enqueued > 0) {
-        queue_not_empty_cv_.notify_all();
-    }
-
-    for (size_t slot = enqueued; slot < indices.size(); ++slot) {
-        const size_t index = indices[slot];
-        FinishBatchTask(batch_state, slot, (*on_error_ptr)(index));
-    }
+    queue_not_empty_cv_.notify_all();
     return BatchHandle<ResultType>{batch_state};
 }
 
@@ -215,10 +206,7 @@ std::future<ResultType> AsyncMemcpyExecutor::SubmitSingleTask(Fn&& fn) {
     };
 
     {
-        std::unique_lock<std::mutex> lock(mutex_);
-        queue_not_full_cv_.wait(lock, [this] {
-            return shutting_down_ || tasks_.size() < max_queue_size_;
-        });
+        std::lock_guard<std::mutex> lock(mutex_);
         if (shutting_down_) {
             task.cancel();
             return future;

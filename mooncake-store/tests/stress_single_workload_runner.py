@@ -21,7 +21,7 @@ Usage:
 
 # Matrix sweep: all combinations of threads/value_size/batch/transfer-mode, save to CSV:
   python3 stress_single_workload_runner.py --matrix --threads 16 --value_size 1048576,4194304 \
-      --batch 1,4,16,32 --p2p_local_transfer_mode te,memcpy --local_memcpy_async_worker_num 32 --local_memcpy_async_queue_depth 2048 \
+      --batch 1,4,16,32 --p2p_local_transfer_mode te,memcpy --local_memcpy_async_worker_num 32 \
       --output results.csv
 
 Arguments:
@@ -41,7 +41,6 @@ P2P-Specific (ignored in Centralization mode):
 ----------------------------------------------
 --p2p_local_transfer_mode:      Local transfer mode: te|memcpy, supports lists like "te,memcpy" (default: te)
 --local_memcpy_async_worker_num:  Async memcpy worker threads, supports lists like "4,16,32" (default: 32, memcpy mode only)
---local_memcpy_async_queue_depth: Async memcpy queue depth, supports lists like "256,1024,2048" (default: 2048, memcpy mode only)
 """
 
 import subprocess
@@ -122,7 +121,7 @@ def parse_metrics(output):
 
 def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
                          batch=1, p2p_local_transfer_mode="te",
-                         local_memcpy_async_worker_num=32, local_memcpy_async_queue_depth=2048,
+                         local_memcpy_async_worker_num=32,
                          route_cache_max_memory_mb=300, route_cache_ttl_ms=300000):
     """Run a specific configuration for a single mode."""
     kill_existing_processes()
@@ -145,7 +144,6 @@ def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ra
             if p2p_local_transfer_mode == "memcpy":
                 test_cmd += (
                     f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
-                    f" --local_memcpy_async_queue_depth={local_memcpy_async_queue_depth}"
                 )
             
         output = run_command(test_cmd)
@@ -195,8 +193,6 @@ def main():
                         help="P2P local transfer mode: te|memcpy (list: te,memcpy)")
     parser.add_argument("--local_memcpy_async_worker_num", type=str, default="32",
                         help="Async memcpy worker threads (memcpy mode only, list: 4,16,32)")
-    parser.add_argument("--local_memcpy_async_queue_depth", type=str, default="2048",
-                        help="Async memcpy queue depth (memcpy mode only, list: 256,1024,2048)")
     parser.add_argument("--route_cache_max_memory_mb", type=str, default="300",
                         help="Max memory for RouteCache in MB (P2P mode, list: 100,300,600)")
     parser.add_argument("--route_cache_ttl_ms", type=str, default="300000",
@@ -229,7 +225,6 @@ def main():
     p2p_extra_dims = {
         "p2p_local_transfer_mode": parse_list_arg(args.p2p_local_transfer_mode, type_fn=str),
         "local_memcpy_async_worker_num": parse_list_arg(args.local_memcpy_async_worker_num),
-        "local_memcpy_async_queue_depth": parse_list_arg(args.local_memcpy_async_queue_depth),
         "route_cache_max_memory_mb": parse_list_arg(args.route_cache_max_memory_mb),
         "route_cache_ttl_ms": parse_list_arg(args.route_cache_ttl_ms),
     }
@@ -281,7 +276,6 @@ def main():
                 p2p_cfg = dict(zip(p2p_keys, p2p_combo))
                 transfer_mode = p2p_cfg["p2p_local_transfer_mode"]
                 wk = p2p_cfg["local_memcpy_async_worker_num"]
-                qd = p2p_cfg["local_memcpy_async_queue_depth"]
                 rc_mem = p2p_cfg["route_cache_max_memory_mb"]
                 rc_ttl = p2p_cfg["route_cache_ttl_ms"]
 
@@ -289,13 +283,12 @@ def main():
                 print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
                 extra = f"p2p_local_transfer_mode={transfer_mode}, route_cache={rc_mem}MB/{rc_ttl}ms"
                 if transfer_mode == "memcpy":
-                    extra += f", local_memcpy_async_worker_num={wk}, local_memcpy_async_queue_depth={qd}"
+                    extra += f", local_memcpy_async_worker_num={wk}"
                 print(f"    {extra}")
 
                 avg = run_benchmark_config("P2P", args.rounds, th, v_size, ops, r_th, r_buf_gb,
                                            batch=batch, p2p_local_transfer_mode=transfer_mode,
                                            local_memcpy_async_worker_num=wk,
-                                           local_memcpy_async_queue_depth=qd,
                                            route_cache_max_memory_mb=rc_mem,
                                            route_cache_ttl_ms=rc_ttl)
                 if avg:
@@ -358,7 +351,7 @@ def print_matrix_summary(results):
                                f"{'G-P50':<6} {'G-P90':<6} {'G-P99':<6}"])
     header = (
         f"{'Mode':<15} | {'Th':<3} | {'Bch':<3} | {'Val(MB)':<7} | {'RPC':<3} | "
-        f"{'Ops':<5} | {'Buf':<3} | {'TransferMode':<12} | {'Workers':<7} | {'QDepth':<7} | "
+        f"{'Ops':<5} | {'Buf':<3} | {'TransferMode':<12} | {'Workers':<7} | "
         f"{'PUT-MB/s':<10} | {'GET-MB/s':<10} | {latency_hdr}"
     )
     print(header)
@@ -368,9 +361,8 @@ def print_matrix_summary(results):
         get_lat = f"{r['get_p50']:<6.1f} {r['get_p90']:<6.1f} {r['get_p99']:<6.1f}"
         transfer_mode = str(r.get('p2p_local_transfer_mode', '-'))
         wk = str(r.get('local_memcpy_async_worker_num', '-'))
-        qd = str(r.get('local_memcpy_async_queue_depth', '-'))
         print(f"{r['mode']:<15} | {r['threads']:<3} | {r.get('batch', 1):<3} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "
-              f"{transfer_mode:<12} | {wk:<7} | {qd:<7} | "
+              f"{transfer_mode:<12} | {wk:<7} | "
               f"{r['put_throughput']:<10.1f} | {r['get_throughput']:<10.1f} | "
               f"{put_lat} | {get_lat}")
     print("=" * 200 + "\n")

@@ -43,8 +43,8 @@ struct LocalTransferConfig {
     std::string te_endpoint;
 
     // When mode == MEMCPY, the following parameters are used:
+    // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
-    size_t local_memcpy_async_queue_depth = 2048;
 };
 
 /**

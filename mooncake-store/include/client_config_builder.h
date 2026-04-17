@@ -150,11 +150,9 @@ struct P2PClientConfig : RealClientConfigBase {
     // - TE: transfer through local TransferEngine path
     LocalTransferMode local_transfer_mode = LocalTransferMode::TE;
 
-    // When local_transfer_mode == MEMCPY, the following parameters are used:
-    // 0 of local_memcpy_async_worker_num or 0 of local_memcpy_async_queue_depth
-    // means forbid async memcpy.
+    // When local_transfer_mode == MEMCPY, the following parameter is used:
+    // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
-    size_t local_memcpy_async_queue_depth = 2048;
 };
 
 // ============================================================================
@@ -214,7 +212,6 @@ class ClientConfigBuilder {
         uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
         const std::string& local_transfer_mode = "te",
         size_t local_memcpy_async_worker_num = 32,
-        size_t local_memcpy_async_queue_depth = 2048,
         const std::map<std::string, std::string>& labels = {}) {
         P2PClientConfig config;
         fill_real_client_config_base(
@@ -231,8 +228,6 @@ class ClientConfigBuilder {
         if (config.local_transfer_mode == LocalTransferMode::MEMCPY) {
             config.local_memcpy_async_worker_num =
                 local_memcpy_async_worker_num;
-            config.local_memcpy_async_queue_depth =
-                local_memcpy_async_queue_depth;
         }
 
         Json::Value tiered_config;

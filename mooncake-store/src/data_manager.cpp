@@ -38,11 +38,9 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
     }
 
     if (local_transfer_config_.mode == LocalTransferMode::MEMCPY &&
-        local_transfer_config_.local_memcpy_async_worker_num > 0 &&
-        local_transfer_config_.local_memcpy_async_queue_depth > 0) {
+        local_transfer_config_.local_memcpy_async_worker_num > 0) {
         async_memcpy_executor_ = std::make_unique<AsyncMemcpyExecutor>(
-            local_transfer_config_.local_memcpy_async_worker_num,
-            local_transfer_config_.local_memcpy_async_queue_depth);
+            local_transfer_config_.local_memcpy_async_worker_num);
     }
 
     LOG(INFO) << "DataManager initialized with " << lock_shard_count_
@@ -52,9 +50,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
                       : "MEMCPY")
               << ", te_endpoint=" << local_transfer_config_.te_endpoint
               << ", async_memcpy_workers="
-              << local_transfer_config_.local_memcpy_async_worker_num
-              << ", async_memcpy_queue_depth="
-              << local_transfer_config_.local_memcpy_async_queue_depth;
+              << local_transfer_config_.local_memcpy_async_worker_num;
 }
 
 // ================================================================

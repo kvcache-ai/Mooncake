@@ -54,9 +54,7 @@ ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
 // AsyncMemcpyExecutor
 // ============================================================================
 
-AsyncMemcpyExecutor::AsyncMemcpyExecutor(size_t worker_num,
-                                         size_t max_queue_size)
-    : max_queue_size_(std::max<size_t>(1, max_queue_size)) {
+AsyncMemcpyExecutor::AsyncMemcpyExecutor(size_t worker_num) {
     workers_.reserve(std::max<size_t>(1, worker_num));
     for (size_t i = 0; i < std::max<size_t>(1, worker_num); ++i) {
         workers_.emplace_back(&AsyncMemcpyExecutor::WorkerMain, this);
@@ -74,7 +72,6 @@ void AsyncMemcpyExecutor::Shutdown() {
         shutting_down_ = true;
     }
     queue_not_empty_cv_.notify_all();
-    queue_not_full_cv_.notify_all();
 
     for (auto& worker : workers_) {
         if (worker.joinable()) {
@@ -110,7 +107,6 @@ void AsyncMemcpyExecutor::WorkerMain() {
 
             task = std::move(tasks_.front());
             tasks_.pop();
-            queue_not_full_cv_.notify_one();
         }
 
         try {

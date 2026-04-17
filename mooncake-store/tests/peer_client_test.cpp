@@ -86,7 +86,6 @@ class PeerClientTest : public ::testing::Test {
         LocalTransferConfig local_transfer_config;
         local_transfer_config.mode = LocalTransferMode::MEMCPY;
         local_transfer_config.local_memcpy_async_worker_num = 32;
-        local_transfer_config.local_memcpy_async_queue_depth = 2048;
         data_manager_ = std::make_unique<DataManager>(
             std::move(tiered_backend_), transfer_engine_,
             /*lock_shard_count=*/1024, local_transfer_config);

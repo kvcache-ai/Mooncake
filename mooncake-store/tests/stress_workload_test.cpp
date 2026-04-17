@@ -49,9 +49,6 @@ DEFINE_string(p2p_local_transfer_mode, "te",
 DEFINE_uint64(local_memcpy_async_worker_num, 32,
               "If set p2p_local_transfer_mode=memcpy, Worker number for async "
               "local memcpy executor (P2P)");
-DEFINE_uint64(local_memcpy_async_queue_depth, 2048,
-              "If set p2p_local_transfer_mode=memcpy, Queue depth for async "
-              "local memcpy executor (P2P)");
 DEFINE_uint64(route_cache_max_memory_mb, 300,
               "Max memory for RouteCache in MB (P2P mode)");
 DEFINE_uint64(route_cache_ttl_ms, 300000,
@@ -161,8 +158,7 @@ bool initialize_client() {
                 1024 * 1024,
             /*route_cache_ttl_ms=*/FLAGS_route_cache_ttl_ms,
             FLAGS_p2p_local_transfer_mode,
-            FLAGS_local_memcpy_async_worker_num,
-            FLAGS_local_memcpy_async_queue_depth);
+            FLAGS_local_memcpy_async_worker_num);
         client_opt = ClientService::Create(config);
     } else {
         auto config = ClientConfigBuilder::build_centralized_real_client(

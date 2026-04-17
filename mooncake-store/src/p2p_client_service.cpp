@@ -167,8 +167,6 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
     } else {
         local_transfer_config.local_memcpy_async_worker_num =
             config.local_memcpy_async_worker_num;
-        local_transfer_config.local_memcpy_async_queue_depth =
-            config.local_memcpy_async_queue_depth;
     }
 
     data_manager_ = DataManager(std::move(tiered_backend), transfer_engine_,
@@ -484,8 +482,8 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     for (const auto& r : results) {
         if (r) ++success_count;
     }
-    timer.LogResponse("success=", success_count, " fail=",
-                      keys.size() - success_count);
+    timer.LogResponse("success=", success_count,
+                      " fail=", keys.size() - success_count);
     return results;
 }
 
@@ -550,9 +548,13 @@ struct WriteRetryContinuation
                            << ", error: " << val.error();
                 Dispatch();
             }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to write to remote, key: " << key
+                       << ", exception: " << e.what();
+            Dispatch();
         } catch (...) {
             LOG(ERROR) << "Failed to write to remote, key: " << key
-                       << ", exception: " << std::current_exception();
+                       << ", unknown exception";
             Dispatch();
         }
     }
@@ -693,7 +695,7 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
     timer.LogRequest("batch_size=", keys.size());
 
     std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>> results(
-        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        keys.size(), tl::unexpected(ErrorCode::OK));
 
     auto batch_guard = AcquireInflightGuard();
     if (!batch_guard.is_valid()) {
@@ -743,8 +745,8 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
     for (const auto& r : results) {
         if (r) ++success_count;
     }
-    timer.LogResponse("success=", success_count, " fail=",
-                      keys.size() - success_count);
+    timer.LogResponse("success=", success_count,
+                      " fail=", keys.size() - success_count);
     return results;
 }
 
@@ -780,7 +782,8 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
         timer.LogResponse("error_code=", result.error());
         return tl::unexpected(result.error());
     }
-    timer.LogResponse("error_code=", ErrorCode::OK, " data_size=", handle->data_size);
+    timer.LogResponse("error_code=", ErrorCode::OK,
+                      " data_size=", handle->data_size);
     return handle->data_size;
 }
 
@@ -846,8 +849,8 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
     for (const auto& r : results) {
         if (r) ++success_count;
     }
-    timer.LogResponse("success=", success_count, " fail=",
-                      keys.size() - success_count);
+    timer.LogResponse("success=", success_count,
+                      " fail=", keys.size() - success_count);
     return results;
 }
 
@@ -995,9 +998,13 @@ struct ReadRetryContinuation
                 iter.Evict(route);
                 Dispatch();
             }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to get from remote, key: " << req->key
+                       << ", exception: " << e.what();
+            Dispatch();
         } catch (...) {
             LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                       << ", exception: " << std::current_exception();
+                       << ", unknown exception";
             Dispatch();
         }
     }
