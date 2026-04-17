@@ -1849,16 +1849,31 @@ impl StoreClient {
         Ok(best)
     }
 
-    fn segment_info_contains_target(info: &SegmentInfo, target_offset: u64, length: u64) -> bool {
-        info.buffers.iter().any(|buffer| {
+    fn segment_info_covers_target(info: &SegmentInfo, target_offset: u64, length: u64) -> bool {
+        let mut current = target_offset;
+        let mut remaining = length;
+        let mut buffers = info.buffers.iter().collect::<Vec<_>>();
+        buffers.sort_by_key(|buffer| buffer.base);
+        while remaining != 0 {
+            let Some(buffer) = buffers.iter().find(|buffer| {
+                let Some(buffer_end) = buffer.base.checked_add(buffer.length) else {
+                    return false;
+                };
+                current >= buffer.base && current < buffer_end
+            }) else {
+                return false;
+            };
             let Some(buffer_end) = buffer.base.checked_add(buffer.length) else {
                 return false;
             };
-            let Some(target_end) = target_offset.checked_add(length) else {
-                return false;
-            };
-            target_offset >= buffer.base && target_end <= buffer_end
-        })
+            let available = buffer_end - current;
+            if available >= remaining {
+                return true;
+            }
+            remaining -= available;
+            current = buffer_end;
+        }
+        true
     }
 
     fn segment_relative_target_offset(
@@ -1873,13 +1888,19 @@ impl StoreClient {
                 segment_name.0
             )));
         }
+        let mut remaining_offset = segment_offset;
         for buffer in &info.buffers {
-            let Some(target_offset) = buffer.base.checked_add(segment_offset) else {
+            if remaining_offset >= buffer.length {
+                remaining_offset -= buffer.length;
                 continue;
+            }
+            let Some(target_offset) = buffer.base.checked_add(remaining_offset) else {
+                break;
             };
-            if Self::segment_info_contains_target(info, target_offset, length) {
+            if Self::segment_info_covers_target(info, target_offset, length) {
                 return Ok(target_offset);
             }
+            break;
         }
         Err(StoreError::Transport(format!(
             "segment offset {} length {} is outside segment {}",
@@ -1888,7 +1909,7 @@ impl StoreClient {
     }
 
     fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
-        if Self::segment_info_contains_target(info, replica.offset, replica.length) {
+        if Self::segment_info_covers_target(info, replica.offset, replica.length) {
             return Ok(replica.offset);
         }
         Self::segment_relative_target_offset(
@@ -1897,6 +1918,48 @@ impl StoreClient {
             replica.segment_offset,
             replica.length,
         )
+    }
+
+    fn direct_buffer_transfer_requests(
+        segment: u64,
+        target_offset: u64,
+        buffer: *mut c_void,
+        length: u64,
+        max_registration_bytes: Option<usize>,
+    ) -> Result<Vec<TransferRequest>> {
+        let total_len = usize::try_from(length).map_err(|_| {
+            StoreError::Transport(format!(
+                "direct read length {length} does not fit in usize"
+            ))
+        })?;
+        let mut requests = Vec::new();
+        let mut transferred = 0u64;
+        for (chunk_addr, chunk_len) in
+            registration_chunks(buffer, total_len, max_registration_bytes)?
+        {
+            let chunk_len = u64::try_from(chunk_len).map_err(|_| {
+                StoreError::Transport("direct read chunk length does not fit in u64".to_string())
+            })?;
+            let chunk_target_offset = target_offset.checked_add(transferred).ok_or_else(|| {
+                StoreError::Transport("direct read target offset overflow".to_string())
+            })?;
+            requests.push(TransferRequest {
+                opcode: Opcode::Read,
+                source: chunk_addr,
+                target_id: segment,
+                target_offset: chunk_target_offset,
+                length: chunk_len,
+            });
+            transferred = transferred.checked_add(chunk_len).ok_or_else(|| {
+                StoreError::Transport("direct read transferred bytes overflow".to_string())
+            })?;
+        }
+        if transferred != length {
+            return Err(StoreError::Transport(format!(
+                "direct read request planning mismatch: planned={transferred} expected={length}"
+            )));
+        }
+        Ok(requests)
     }
 
     fn ensure_remote_runtime_reachable(
@@ -2082,7 +2145,7 @@ impl StoreClient {
                     registered_here = true;
                 }
             }
-            let request = {
+            let requests = {
                 let mut state = self.state.lock();
                 let (segment, info) = state
                     .open_segment_with_info(transport, &resolved.replica.segment_name.0)
@@ -2101,15 +2164,21 @@ impl StoreClient {
                             )
                         },
                     )?;
-                TransferRequest {
-                    opcode: Opcode::Read,
-                    source: buffer_ptr,
-                    target_id: segment,
+                Self::direct_buffer_transfer_requests(
+                    segment,
                     target_offset,
-                    length: resolved.replica.length,
-                }
+                    buffer_ptr,
+                    resolved.replica.length,
+                    transport.max_registration_bytes(),
+                )
+                .map_err(|error| {
+                    (
+                        error.clone(),
+                        Self::remote_read_failure_marks_runtime_suspect(&error),
+                    )
+                })?
             };
-            let batch_id = transport.allocate_batch(1).map_err(|error| {
+            let batch_id = transport.allocate_batch(requests.len()).map_err(|error| {
                 (
                     error.clone(),
                     Self::remote_read_failure_marks_runtime_suspect(&error),
@@ -2120,7 +2189,7 @@ impl StoreClient {
                 resolved.replica.length,
                 TransferPacingMode::LatencySensitive,
             );
-            let submit_result = transport.submit_with_hints(batch_id, &[request], &hints);
+            let submit_result = transport.submit_with_hints(batch_id, &requests, &hints);
             if let Err(error) = submit_result {
                 let _ = transport.free_batch(batch_id);
                 if registered_here {
@@ -2275,5 +2344,75 @@ impl StoreClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_io_tests {
+    use super::*;
+    use mooncake_transport::{SegmentBuffer, SegmentKind};
+
+    fn memory_segment(buffers: &[(u64, u64)]) -> SegmentInfo {
+        SegmentInfo {
+            kind: SegmentKind::Memory,
+            buffers: buffers
+                .iter()
+                .map(|(base, length)| SegmentBuffer {
+                    base: *base,
+                    length: *length,
+                    location: "cpu:0".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn segment_relative_target_offset_walks_chunked_buffers() {
+        let info = memory_segment(&[(1000, 64), (1064, 64), (1128, 32)]);
+        let segment = SegmentName::new("seg");
+
+        assert_eq!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 80, 16)
+                .expect("offset in second chunk should map"),
+            1080
+        );
+        assert_eq!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 120, 24)
+                .expect("contiguous chunks should cover the transfer"),
+            1120
+        );
+    }
+
+    #[test]
+    fn segment_relative_target_offset_rejects_holes() {
+        let info = memory_segment(&[(1000, 64), (2000, 64)]);
+        let segment = SegmentName::new("seg");
+
+        assert!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 60, 8).is_err(),
+            "logical ranges crossing non-contiguous buffers must not map"
+        );
+    }
+
+    #[test]
+    fn direct_buffer_transfer_requests_split_by_registration_limit() {
+        let requests = StoreClient::direct_buffer_transfer_requests(
+            7,
+            900,
+            100usize as *mut c_void,
+            100,
+            Some(64),
+        )
+        .expect("direct read planning should split requests");
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].source, 100usize as *mut c_void);
+        assert_eq!(requests[0].target_id, 7);
+        assert_eq!(requests[0].target_offset, 900);
+        assert_eq!(requests[0].length, 64);
+        assert_eq!(requests[1].source, 164usize as *mut c_void);
+        assert_eq!(requests[1].target_id, 7);
+        assert_eq!(requests[1].target_offset, 964);
+        assert_eq!(requests[1].length, 36);
     }
 }
