@@ -448,8 +448,28 @@ docker "${DOCKER_RUN_ARGS[@]}" \
   "${DOCKER_IMAGE}" \
   bash -lc '
 set -euo pipefail
+
+configure_git_safe_directories() {
+  local root=$1
+  local modules_file
+  local module_root
+  local key
+  local path
+
+  git config --global --add safe.directory "${root}"
+  git config --global --add safe.directory "${root}/*"
+
+  while IFS= read -r modules_file; do
+    module_root=$(cd -- "$(dirname "${modules_file}")" && pwd)
+    while read -r key path; do
+      [[ -z "${path:-}" ]] && continue
+      git config --global --add safe.directory "${module_root}/${path}"
+    done < <(git config --file "${modules_file}" --get-regexp "^submodule\\..*\\.path$" 2>/dev/null || true)
+  done < <(find "${root}" -name .gitmodules -print)
+}
+
 mkdir -p "${HOME}" "${CARGO_HOME}"
-git config --global --add safe.directory "${CONTAINER_WORKDIR}"
+configure_git_safe_directories "${CONTAINER_WORKDIR}"
 cd "${CONTAINER_WORKDIR}"
 exec ./scripts/build/build-wheel.sh "$@"
 ' bash "$@"
