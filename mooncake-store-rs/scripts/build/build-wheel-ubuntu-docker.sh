@@ -18,6 +18,12 @@ CACHE_DIR=${MOONCAKE_DOCKER_CACHE_DIR:-"${REPO_ROOT}/target/docker-wheel-cache"}
 CACHE_DIR_IN_CONTAINER=${CACHE_DIR_IN_CONTAINER:-/cache}
 REBUILD_IMAGE=${REBUILD_IMAGE:-0}
 PULL_IMAGE=${PULL_IMAGE:-1}
+CN_MIRROR=${CN_MIRROR:-1}
+CN_RUSTUP_DIST_SERVER=${CN_RUSTUP_DIST_SERVER:-https://mirrors.ustc.edu.cn/rust-static}
+CN_RUSTUP_UPDATE_ROOT=${CN_RUSTUP_UPDATE_ROOT:-https://mirrors.ustc.edu.cn/rust-static/rustup}
+CN_PIP_INDEX_URL=${CN_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+CN_PIP_TRUSTED_HOST=${CN_PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+CN_CRATES_REGISTRY=${CN_CRATES_REGISTRY:-sparse+https://mirrors.ustc.edu.cn/crates.io-index/}
 
 usage() {
   cat <<'EOF'
@@ -39,8 +45,14 @@ Environment:
   DOCKER_BUILD_NETWORK        Optional network for docker build
   REBUILD_IMAGE=1             Rebuild the builder image even if it exists
   PULL_IMAGE=0                Do not pull the Ubuntu base image while rebuilding
+  CN_MIRROR=0                 Disable the default China mirrors for rustup/pip/cargo
   MOONCAKE_DOCKER_CACHE_DIR   Cache for container HOME/CARGO_HOME (default: target/docker-wheel-cache)
   CACHE_DIR_IN_CONTAINER      Container mountpoint for the cache (default: /cache)
+  CN_RUSTUP_DIST_SERVER       Rust toolchain mirror (default: USTC rust-static)
+  CN_RUSTUP_UPDATE_ROOT       Rustup metadata mirror (default: USTC rust-static/rustup)
+  CN_PIP_INDEX_URL            Python package mirror (default: Tsinghua PyPI)
+  CN_PIP_TRUSTED_HOST         Trusted host for CN_PIP_INDEX_URL
+  CN_CRATES_REGISTRY          Cargo sparse registry mirror (default: USTC crates.io)
 
 Forwarded build environment:
   BUILD_JOBS
@@ -89,6 +101,47 @@ is_truthy() {
       return 1
       ;;
   esac
+}
+
+set_default_if_unset() {
+  local name=$1
+  local value=$2
+
+  if [[ -z "${!name-}" ]]; then
+    printf -v "${name}" '%s' "${value}"
+    export "${name}"
+  fi
+}
+
+configure_cn_mirrors() {
+  local cargo_config
+
+  if ! is_truthy "${CN_MIRROR}"; then
+    return 0
+  fi
+
+  set_default_if_unset RUSTUP_DIST_SERVER "${CN_RUSTUP_DIST_SERVER}"
+  set_default_if_unset RUSTUP_UPDATE_ROOT "${CN_RUSTUP_UPDATE_ROOT}"
+  set_default_if_unset PIP_INDEX_URL "${CN_PIP_INDEX_URL}"
+  set_default_if_unset PIP_TRUSTED_HOST "${CN_PIP_TRUSTED_HOST}"
+  set_default_if_unset CARGO_REGISTRIES_CRATES_IO_PROTOCOL sparse
+  set_default_if_unset CARGO_NET_GIT_FETCH_WITH_CLI true
+
+  cargo_config="${CACHE_DIR}/cargo/config.toml"
+  if [[ -f "${cargo_config}" ]]; then
+    return 0
+  fi
+
+  cat >"${cargo_config}" <<EOF
+[source.crates-io]
+replace-with = "cn-mirror"
+
+[source.cn-mirror]
+registry = "${CN_CRATES_REGISTRY}"
+
+[net]
+git-fetch-with-cli = true
+EOF
 }
 
 map_repo_path() {
@@ -253,6 +306,7 @@ if [[ "${CACHE_DIR}" != /* ]]; then
   CACHE_DIR="${REPO_ROOT}/${CACHE_DIR}"
 fi
 mkdir -p "${CACHE_DIR}/cargo" "${CACHE_DIR}/home"
+configure_cn_mirrors
 
 if is_truthy "${REBUILD_IMAGE}" || ! docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
   build_image
@@ -310,6 +364,7 @@ ubuntu: ${UBUNTU_VERSION}
 image:  ${DOCKER_IMAGE}
 repo:   ${REPO_ROOT}
 cache:  ${CACHE_DIR}
+mirror: $(if is_truthy "${CN_MIRROR}"; then printf 'cn'; else printf 'off'; fi)
 EOF
 
 docker "${DOCKER_RUN_ARGS[@]}" \
