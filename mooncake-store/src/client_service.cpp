@@ -28,6 +28,10 @@
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 namespace mooncake {
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
@@ -2505,7 +2509,35 @@ void Client::PutToLocalFile(const std::string& key,
     std::string value;
     value.reserve(total_size);
     for (const auto& slice : slices) {
+        #if defined(USE_CUDA)
+        cudaPointerAttributes attributes;
+        cudaPointerGetAttributes(&attributes, slice.ptr);
+        if (attributes.type == cudaMemoryTypeDevice) {
+            auto ddr_buffer = std::make_unique<char[]>(slice.size);
+            cudaError_t cuda_ret = cudaMemcpy(
+                ddr_buffer.get(),
+                slice.ptr,
+                slice.size,
+                cudaMemcpyDeviceToHost
+            );
+
+            if (cuda_ret == cudaSuccess) {
+                value.append(ddr_buffer.get(), slice.size);
+            } else {
+                // Fallback: try direct copy
+                LOG(WARNING) << "cudaMemcpy failed for key=" << key
+                             << ", error=" << cudaGetErrorString(cuda_ret)
+                             << ", ptr=" << slice.ptr
+                             << ", size=" << slice.size
+                             << ", attempting direct copy";
+                value.append(static_cast<char*>(slice.ptr), slice.size);
+            }
+        } else {
+            value.append(static_cast<char*>(slice.ptr), slice.size);
+        }
+        #else
         value.append(static_cast<char*>(slice.ptr), slice.size);
+        #endif
     }
 
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
