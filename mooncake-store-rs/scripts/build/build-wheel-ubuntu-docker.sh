@@ -12,7 +12,8 @@ SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 
 UBUNTU_VERSION=${UBUNTU_VERSION:-22.04}
-DOCKER_IMAGE=${DOCKER_IMAGE:-"mooncake-store-wheel:ubuntu-${UBUNTU_VERSION}"}
+PYTHON_VERSION=${PYTHON_VERSION:-system}
+DOCKER_IMAGE=${DOCKER_IMAGE:-}
 WORKDIR_IN_CONTAINER=${WORKDIR_IN_CONTAINER:-/work}
 CACHE_DIR=${MOONCAKE_DOCKER_CACHE_DIR:-"${REPO_ROOT}/target/docker-wheel-cache"}
 CACHE_DIR_IN_CONTAINER=${CACHE_DIR_IN_CONTAINER:-/cache}
@@ -39,7 +40,8 @@ same artifacts as scripts/build/build-wheel.sh:
 
 Environment:
   UBUNTU_VERSION              Ubuntu base image tag (default: 22.04)
-  DOCKER_IMAGE                Builder image name (default: mooncake-store-wheel:ubuntu-${UBUNTU_VERSION})
+  PYTHON_VERSION              Python runtime in the builder image: system, 3.10, 3.11, 3.12
+  DOCKER_IMAGE                Builder image name (default: mooncake-store-wheel:ubuntu-${UBUNTU_VERSION}-py<version>)
   DOCKER_PLATFORM             Optional Docker platform, e.g. linux/amd64
   DOCKER_NETWORK              Optional network for docker run, e.g. host
   DOCKER_BUILD_NETWORK        Optional network for docker build
@@ -73,6 +75,7 @@ Path rule:
 
 Examples:
   ./scripts/build/build-wheel-ubuntu-docker.sh
+  PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
   BUILD_JOBS=16 ./scripts/build/build-wheel-ubuntu-docker.sh
   UBUNTU_VERSION=24.04 REBUILD_IMAGE=1 ./scripts/build/build-wheel-ubuntu-docker.sh
   DOCKER_NETWORK=host ./scripts/build/build-wheel-ubuntu-docker.sh --compatibility linux
@@ -113,10 +116,61 @@ set_default_if_unset() {
   fi
 }
 
+configure_python_selection() {
+  local py_basename=
+  local inferred_version=system
+  local python_tag=
+
+  if [[ -n "${PYTHON:-}" ]]; then
+    py_basename=$(basename -- "${PYTHON}")
+    case "${py_basename}" in
+      python3.10 | python3.11 | python3.12)
+        inferred_version=${py_basename#python}
+        ;;
+      python3)
+        inferred_version=system
+        ;;
+    esac
+  fi
+
+  if [[ "${PYTHON_VERSION}" == "system" && "${inferred_version}" != "system" ]]; then
+    PYTHON_VERSION=${inferred_version}
+  fi
+
+  case "${PYTHON_VERSION}" in
+    system)
+      ;;
+    3.10 | 3.11 | 3.12)
+      if [[ -z "${PYTHON:-}" ]]; then
+        PYTHON="python${PYTHON_VERSION}"
+        export PYTHON
+      elif [[ -n "${py_basename}" && "${py_basename}" != "python${PYTHON_VERSION}" ]]; then
+        echo "PYTHON_VERSION=${PYTHON_VERSION} conflicts with PYTHON=${PYTHON}" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "unsupported PYTHON_VERSION: ${PYTHON_VERSION} (expected system, 3.10, 3.11, or 3.12)" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ -z "${DOCKER_IMAGE}" ]]; then
+    python_tag="py${PYTHON_VERSION//./}"
+    DOCKER_IMAGE="mooncake-store-wheel:ubuntu-${UBUNTU_VERSION}-${python_tag}"
+  fi
+}
+
 configure_cn_mirrors() {
   local cargo_config
+  local managed_header="# managed by build-wheel-ubuntu-docker.sh"
+
+  cargo_config="${CACHE_DIR}/cargo/config.toml"
 
   if ! is_truthy "${CN_MIRROR}"; then
+    if [[ -f "${cargo_config}" ]] && grep -qF "${managed_header}" "${cargo_config}"; then
+      rm -f "${cargo_config}"
+    fi
     return 0
   fi
 
@@ -127,12 +181,12 @@ configure_cn_mirrors() {
   set_default_if_unset CARGO_REGISTRIES_CRATES_IO_PROTOCOL sparse
   set_default_if_unset CARGO_NET_GIT_FETCH_WITH_CLI true
 
-  cargo_config="${CACHE_DIR}/cargo/config.toml"
-  if [[ -f "${cargo_config}" ]]; then
+  if [[ -f "${cargo_config}" ]] && ! grep -qF "${managed_header}" "${cargo_config}"; then
     return 0
   fi
 
   cat >"${cargo_config}" <<EOF
+# managed by build-wheel-ubuntu-docker.sh
 [source.crates-io]
 replace-with = "cn-mirror"
 
@@ -195,6 +249,7 @@ build_image() {
   local -a docker_build_args=(
     build
     --build-arg "UBUNTU_VERSION=${UBUNTU_VERSION}"
+    --build-arg "PYTHON_VERSION=${PYTHON_VERSION}"
     --tag "${DOCKER_IMAGE}"
   )
   local name
@@ -232,6 +287,7 @@ build_image() {
 
   docker "${docker_build_args[@]}" - <<'DOCKERFILE'
 ARG UBUNTU_VERSION=22.04
+ARG PYTHON_VERSION=system
 FROM ubuntu:${UBUNTU_VERSION}
 
 ARG RUSTUP_DIST_SERVER
@@ -269,6 +325,7 @@ RUN apt-get update \
     libyaml-cpp-dev \
     libzstd-dev \
     ninja-build \
+    gnupg \
     patchelf \
     pkg-config \
     protobuf-compiler \
@@ -279,9 +336,26 @@ RUN apt-get update \
     python3-setuptools \
     python3-venv \
     python3-wheel \
+    software-properties-common \
     unzip \
     wget \
     zlib1g-dev \
+ && if [[ "${PYTHON_VERSION}" != "system" ]]; then add-apt-repository -y ppa:deadsnakes/ppa; fi \
+ && if [[ "${PYTHON_VERSION}" != "system" ]]; then apt-get update; fi \
+ && case "${PYTHON_VERSION}" in \
+      system) \
+        ;; \
+      3.10 | 3.11 | 3.12) \
+        apt-get install -y --no-install-recommends \
+          "python${PYTHON_VERSION}" \
+          "python${PYTHON_VERSION}-dev" \
+          "python${PYTHON_VERSION}-venv" \
+        ;; \
+      *) \
+        echo "unsupported PYTHON_VERSION: ${PYTHON_VERSION}" >&2 \
+        && exit 1 \
+        ;; \
+    esac \
  && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -301,6 +375,7 @@ DOCKERFILE
 }
 
 require_command docker
+configure_python_selection
 
 if [[ "${CACHE_DIR}" != /* ]]; then
   CACHE_DIR="${REPO_ROOT}/${CACHE_DIR}"
@@ -362,6 +437,7 @@ append_repo_path_env_if_set MOONCAKE_UPSTREAM_BUILD_DIR
 cat <<EOF
 ubuntu: ${UBUNTU_VERSION}
 image:  ${DOCKER_IMAGE}
+python: ${PYTHON_VERSION}
 repo:   ${REPO_ROOT}
 cache:  ${CACHE_DIR}
 mirror: $(if is_truthy "${CN_MIRROR}"; then printf 'cn'; else printf 'off'; fi)
