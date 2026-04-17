@@ -13,6 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{Result, StoreError};
+#[cfg(test)]
+use parking_lot::ReentrantMutex;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -22,7 +24,7 @@ pub use registry::{MetricsSnapshot, OperationMetricSnapshot};
 static TRACING_STATE: OnceLock<()> = OnceLock::new();
 static METRICS_HTTP_SERVER: OnceLock<Mutex<Option<MetricsHttpServer>>> = OnceLock::new();
 #[cfg(test)]
-static METRICS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEST_PROCESS_LOCK: OnceLock<ReentrantMutex<()>> = OnceLock::new();
 
 const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_millis(250);
@@ -345,8 +347,13 @@ pub fn reset_metrics() {
 }
 
 #[cfg(test)]
-pub fn metrics_test_lock() -> &'static Mutex<()> {
-    METRICS_TEST_LOCK.get_or_init(|| Mutex::new(()))
+pub(crate) fn test_process_lock() -> &'static ReentrantMutex<()> {
+    TEST_PROCESS_LOCK.get_or_init(|| ReentrantMutex::new(()))
+}
+
+#[cfg(test)]
+pub fn metrics_test_lock() -> &'static ReentrantMutex<()> {
+    test_process_lock()
 }
 
 fn metrics_http_server() -> &'static Mutex<Option<MetricsHttpServer>> {
@@ -454,7 +461,7 @@ mod tests {
 
     #[test]
     fn metrics_http_server_serves_prometheus_text() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         reset_metrics();
         stop_metrics_http_server().expect("metrics server cleanup should succeed");
 
@@ -476,7 +483,7 @@ mod tests {
 
     #[test]
     fn request_metrics_include_histogram_bytes_and_inflight() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         reset_metrics();
 
         let result: Result<()> = Ok(());
@@ -511,7 +518,7 @@ mod tests {
 
     #[test]
     fn process_metrics_are_rendered_with_request_snapshot() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         reset_metrics();
 
         let metrics = render_prometheus_metrics();
@@ -522,7 +529,7 @@ mod tests {
 
     #[test]
     fn metrics_http_server_serves_health_probe() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         stop_metrics_http_server().expect("metrics server cleanup should succeed");
         let address = start_metrics_http_server("127.0.0.1:0")
             .expect("metrics server should start on an ephemeral port");
@@ -534,7 +541,7 @@ mod tests {
 
     #[test]
     fn tracing_init_from_env_covers_invalid_disabled_and_repeated_paths() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         let toggle_env = "MOONCAKE_TEST_TRACING_ENABLED";
         let filter_env = "MOONCAKE_TEST_TRACING_FILTER";
 
@@ -565,7 +572,7 @@ mod tests {
 
     #[test]
     fn trace_file_helpers_ignore_blank_and_open_append_file() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         let path_env = "MOONCAKE_TEST_TRACE_FILE";
         let temp_dir =
             std::env::temp_dir().join(format!("mooncake-store-trace-{}", std::process::id()));
@@ -598,7 +605,7 @@ mod tests {
 
     #[test]
     fn metrics_http_server_env_helpers_reuse_server_and_cover_routes() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         let addr_env = "MOONCAKE_TEST_METRICS_ADDR";
         stop_metrics_http_server().expect("metrics server cleanup should succeed");
 
@@ -651,7 +658,7 @@ mod tests {
 
     #[test]
     fn metrics_http_connection_tolerates_empty_clients() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
         let address = listener
             .local_addr()
@@ -669,16 +676,12 @@ mod tests {
 
     #[test]
     fn runtime_lease_metrics_reconcile_to_latest_live_snapshot() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
-        reset_metrics();
-
-        registry::record_runtime_leases(&[
+        let leases_ab = [
             sample_runtime_lease("runtime-a"),
             sample_runtime_lease("runtime-b"),
-        ]);
-        registry::record_runtime_leases(&[sample_runtime_lease("runtime-a")]);
-
-        let metrics = snapshot_metrics();
+        ];
+        let leases_a = [sample_runtime_lease("runtime-a")];
+        let metrics = registry::snapshot_runtime_leases_after_updates(&[&leases_ab, &leases_a]);
         let runtime_statuses = metrics
             .runtime_status
             .into_iter()
@@ -706,7 +709,7 @@ mod tests {
 
     #[test]
     fn heartbeat_health_metrics_are_rendered() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         reset_metrics();
 
         let runtime = ClientRuntimeId::new("runtime-heartbeat", ClientEpoch(3)).to_string();
@@ -723,7 +726,7 @@ mod tests {
 
     #[test]
     fn metrics_http_server_exposes_heartbeat_health_metrics() {
-        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock();
         reset_metrics();
         stop_metrics_http_server().expect("metrics server cleanup should succeed");
 
@@ -764,6 +767,7 @@ mod tests {
     }
 
     fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = test_process_lock().lock();
         let previous = std::env::var(key).ok();
         match value {
             Some(value) => std::env::set_var(key, value),

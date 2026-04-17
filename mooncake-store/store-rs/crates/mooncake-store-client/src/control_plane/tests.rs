@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -600,13 +599,8 @@ impl Drop for DelayedUnaryHandle {
     }
 }
 
-fn env_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
-    let _guard = env_test_lock().lock();
+    let _guard = crate::observability::test_process_lock().lock();
     let previous = std::env::var(key).ok();
     match value {
         Some(value) => std::env::set_var(key, value),
