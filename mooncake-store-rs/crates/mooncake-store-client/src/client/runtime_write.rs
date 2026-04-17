@@ -508,7 +508,7 @@ impl StoreClient {
         {
             Some(length) => {
                 let state = self.state.lock();
-                Some(state.memory_ref()?.plan_scratch(&[length])?[0])
+                Some(state.memory_ref()?.plan_scratch(&[length])?)
             }
             None => None,
         };
@@ -588,11 +588,13 @@ impl StoreClient {
                         remote_requests.push(TransferRequest {
                             opcode: Opcode::Write,
                             source: remote_scratch
+                                .as_ref()
                                 .ok_or_else(|| {
                                     StoreError::InvalidState(
                                         "remote write is missing a scratch slot".to_string(),
                                     )
                                 })?
+                                [0]
                                 .addr,
                             target_id: handle,
                             target_offset,
@@ -616,12 +618,12 @@ impl StoreClient {
                         remote_requests.iter().map(|request| request.length).sum(),
                         1,
                     );
-                    let scratch = remote_scratch.ok_or_else(|| {
+                    let scratch = remote_scratch.as_ref().ok_or_else(|| {
                         StoreError::InvalidState(
                             "remote write is missing a scratch slot".to_string(),
                         )
                     })?;
-                    copy_into_region(scratch, entry.value);
+                    copy_into_region(scratch[0], entry.value);
                     let batch_id = transport.allocate_batch(remote_requests.len())?;
                     let tenant = entry.value_tenant();
                     let remote_bytes = remote_requests.iter().map(|request| request.length).sum();

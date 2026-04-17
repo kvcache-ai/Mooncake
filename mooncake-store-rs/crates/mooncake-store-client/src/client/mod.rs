@@ -29,7 +29,8 @@ use crate::control_plane::{
     ControlPlaneHandle, EvictionService, ReleaseOp, ReserveSpecificOp,
 };
 use crate::memory::{
-    LocalMemoryConfig, LocalMemoryState, RegionAllocation, StorageExtentInfo, StorageSegmentSpec,
+    LocalMemoryConfig, LocalMemoryState, RegionAllocation, ScratchReservation, StorageExtentInfo,
+    StorageSegmentSpec,
 };
 use crate::observability::{registry, OperationTracker};
 use crate::placement::PlacementPlanner;

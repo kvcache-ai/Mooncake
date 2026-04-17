@@ -1813,7 +1813,7 @@ impl StoreClient {
         remote_indices: &[usize],
         lengths: &[usize],
         start: usize,
-    ) -> Result<Option<(usize, Vec<RegionAllocation>)>> {
+    ) -> Result<Option<(usize, ScratchReservation)>> {
         let mut chunk_lengths = Vec::new();
         let mut best = None;
         for end in start..remote_indices.len() {
