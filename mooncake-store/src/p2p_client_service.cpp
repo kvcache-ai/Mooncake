@@ -546,13 +546,13 @@ struct WriteRetryContinuation
                 promise->set_value({});
             } else {
                 // This candidate failed; try the next one
-                LOG(ERROR) << "Failed to get from remote, key: " << req->key
+                LOG(ERROR) << "Failed to write to remote, key: " << key
                            << ", error: " << val.error();
                 Dispatch();
             }
         } catch (...) {
-            LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                       << ", exeption: " << std::current_exception();
+            LOG(ERROR) << "Failed to write to remote, key: " << key
+                       << ", exception: " << std::current_exception();
             Dispatch();
         }
     }
@@ -693,7 +693,7 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
     timer.LogRequest("batch_size=", keys.size());
 
     std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>> results(
-        keys.size(), tl::unexpected(ErrorCode::OK));
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
 
     auto batch_guard = AcquireInflightGuard();
     if (!batch_guard.is_valid()) {
@@ -991,13 +991,13 @@ struct ReadRetryContinuation
                 promise->set_value({});
             } else {
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                           << ", error: " << result.error();
+                           << ", error: " << result.value().error();
                 iter.Evict(route);
                 Dispatch();
             }
         } catch (...) {
             LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                       << ", exeption: " << std::current_exception();
+                       << ", exception: " << std::current_exception();
             Dispatch();
         }
     }

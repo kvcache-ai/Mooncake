@@ -16,7 +16,6 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "client_rpc_types.h"
-#include "client_config_builder.h"
 
 namespace mooncake {
 
@@ -99,6 +98,11 @@ class DataManager {
     // 1. Allocation: allocate memory from the tiered backend for the data
     // 2. Write: write the data to the allocated memory
     // 3. Commit: commit the data to the tiered backend
+    //
+    // IMPORTANT: The caller must keep the memory referenced by `slices` alive
+    // from the time Put() returns until TaskHandle::Wait() completes. The
+    // returned TaskHandle may capture raw pointers from the slices for
+    // asynchronous transfer.
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> Put(
         const std::string& key, std::vector<Slice>& slices);
 
@@ -109,6 +113,11 @@ class DataManager {
     // 2. The key is acquired by handle which protect the data accessibility
     //    based on ref count. Once the method acquire handle successfully, the
     //    accessor can safely access the data until the handle is released.
+    //
+    // IMPORTANT: The caller must keep the memory referenced by `slices` alive
+    // from the time Get() returns until TaskHandle::Wait() completes. The
+    // returned TaskHandle may capture raw pointers from the slices for
+    // asynchronous data copy.
     tl::expected<ReadTaskHandle, ErrorCode> Get(
         const std::string& key, const std::vector<Slice>& slices);
 

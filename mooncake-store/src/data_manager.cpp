@@ -100,7 +100,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
 
         if (tiered_backend_->Exist(key)) {
             LOG(WARNING) << "PutViaTe: key already exists: " << key;
-            return std::make_unique<ImmediateHandle<void>>();
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
 
         auto alloc_result = tiered_backend_->Allocate(total_size);
