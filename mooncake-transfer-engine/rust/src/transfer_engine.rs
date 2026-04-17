@@ -91,6 +91,27 @@ impl TransferEngine {
         Ok(Self { engine })
     }
 
+    pub fn discover_topology(&self) -> Result<()> {
+        let ret = unsafe { bindings::discoverTopology(self.engine) };
+        if ret != 0 {
+            bail!("Failed to discover topology")
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn install_transport(&self, proto: &str) -> Result<()> {
+        let proto_c = CString::new(proto).map_err(|_| anyhow!("CString::new failed"))?;
+        let ret = unsafe {
+            bindings::installTransport(self.engine, proto_c.as_ptr(), std::ptr::null_mut())
+        };
+        if ret.is_null() {
+            bail!("Failed to install transport '{}'", proto)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn close(&mut self) -> Result<()> {
         unsafe {
             bindings::destroyTransferEngine(self.engine);
