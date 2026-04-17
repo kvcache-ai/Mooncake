@@ -68,6 +68,8 @@ def _load_native():
         raise ImportError(
             "cannot find native mooncake store module; run `cargo build -p mooncake-store-py` first"
         )
+
+
 _native = _load_native()
 
 
@@ -98,9 +100,7 @@ def _normalize_local_hostname_and_transport_port(
     transport_rpc_port,
 ) -> tuple[str, int | None]:
     hostname = str(local_hostname).strip()
-    explicit_port = (
-        None if transport_rpc_port is None else int(transport_rpc_port)
-    )
+    explicit_port = None if transport_rpc_port is None else int(transport_rpc_port)
     embedded_host = hostname
     embedded_port = None
 
@@ -117,7 +117,11 @@ def _normalize_local_hostname_and_transport_port(
             embedded_host = candidate_host
             embedded_port = int(candidate_port)
 
-    if embedded_port is not None and explicit_port is not None and embedded_port != explicit_port:
+    if (
+        embedded_port is not None
+        and explicit_port is not None
+        and embedded_port != explicit_port
+    ):
         raise ValueError(
             "local_hostname embedded transport port conflicts with transport_rpc_port"
         )
@@ -197,12 +201,15 @@ class MooncakeHostMemAllocator:
     def __del__(self) -> None:
         self.close()
 
+
 class _NativeStoreWorker:
     def __init__(self) -> None:
         self._queue: queue.Queue[tuple[str, tuple, dict, Future] | None] = queue.Queue()
         self._closed = False
         self._startup = Future()
-        self._thread = threading.Thread(target=self._run, name="mooncake-store-native", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="mooncake-store-native", daemon=True
+        )
         self._thread.start()
         self._startup.result()
 
@@ -246,6 +253,7 @@ class _NativeStoreWorker:
             else:
                 future.set_result(result)
 
+
 @dataclass
 class ReplicateConfig:
     replica_num: int = 1
@@ -273,17 +281,22 @@ class ReplicateConfig:
 def init_tracing(filter: str | None = None):
     return _native.init_tracing(filter)
 
+
 def metrics_text() -> str:
     return _native.metrics_text()
+
 
 def start_metrics_server(bind_addr: str = "127.0.0.1:0") -> str:
     return _native.start_metrics_server(bind_addr)
 
+
 def stop_metrics_server() -> None:
     _native.stop_metrics_server()
 
+
 def metrics_server_address() -> str | None:
     return _native.metrics_server_address()
+
 
 class MooncakeDistributedStore:
     def __init__(self) -> None:
@@ -299,6 +312,7 @@ class MooncakeDistributedStore:
 
     def _invoke(self, name: str, *args, **kwargs):
         return self._worker.call(name, *args, **kwargs)
+
     def setup(self, *args, **kwargs):
         if len(args) == 1 and isinstance(args[0], Mapping) and not kwargs:
             return self._setup_from_config_dict(dict(args[0]))
@@ -314,9 +328,11 @@ class MooncakeDistributedStore:
         if "hugepage_size" in kwargs:
             kwargs["hugepage_size"] = _normalize_hugepage_size(kwargs["hugepage_size"])
         if args:
-            local_hostname, transport_rpc_port = _normalize_local_hostname_and_transport_port(
-                args[0],
-                kwargs.get("transport_rpc_port"),
+            local_hostname, transport_rpc_port = (
+                _normalize_local_hostname_and_transport_port(
+                    args[0],
+                    kwargs.get("transport_rpc_port"),
+                )
             )
             args[0] = local_hostname
             if transport_rpc_port is not None and "transport_rpc_port" not in kwargs:
@@ -326,8 +342,13 @@ class MooncakeDistributedStore:
         result = self._invoke("setup", *args, **kwargs)
         _start_metrics_server_from_env()
         return result
-    def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str):
-        return self._invoke("setup_dummy", mem_pool_size, local_buffer_size, server_address)
+
+    def setup_dummy(
+        self, mem_pool_size: int, local_buffer_size: int, server_address: str
+    ):
+        return self._invoke(
+            "setup_dummy", mem_pool_size, local_buffer_size, server_address
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -344,6 +365,7 @@ class MooncakeDistributedStore:
             with self._lock:
                 self._registered_buffers[int(buffer_ptr)] = int(size)
         return result
+
     def unregister_buffer(self, buffer_ptr: int, size: int | None = None):
         resolved_size = self._resolve_registered_size(buffer_ptr, size)
         result = self._invoke("unregister_buffer", buffer_ptr, resolved_size)
@@ -351,6 +373,7 @@ class MooncakeDistributedStore:
             with self._lock:
                 self._registered_buffers.pop(int(buffer_ptr), None)
         return result
+
     def put(self, key: str, value, *, tenant: str | None = None, config=None):
         result = self._invoke(
             "put",
@@ -362,6 +385,7 @@ class MooncakeDistributedStore:
         if result == 0:
             self._track_keys([key], tenant=tenant)
         return result
+
     def put_from(
         self,
         key: str,
@@ -382,6 +406,7 @@ class MooncakeDistributedStore:
         if result == 0:
             self._track_keys([key], tenant=tenant)
         return result
+
     def batch_put(
         self,
         items=None,
@@ -401,6 +426,7 @@ class MooncakeDistributedStore:
         if result == 0:
             self._track_keys([key for key, _ in normalized], tenant=tenant)
         return result
+
     def put_batch(
         self,
         keys: Sequence[str],
@@ -410,6 +436,7 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
     ):
         return self.batch_put(keys=keys, values=values, tenant=tenant, config=config)
+
     def batch_put_from(self, *args, tenant: str | None = None, config=None):
         if len(args) == 1:
             items = _normalize_pointer_items(args[0])
@@ -436,6 +463,7 @@ class MooncakeDistributedStore:
         raise TypeError(
             "batch_put_from expects either items or (keys, buffer_ptrs, sizes)"
         )
+
     def batch_put_from_multi_buffers(
         self,
         *args,
@@ -473,22 +501,25 @@ class MooncakeDistributedStore:
         raise TypeError(
             "batch_put_from_multi_buffers expects items or (keys, all_buffer_ptrs, all_sizes)"
         )
+
     def batch_get(self, keys: Sequence[str], *, tenant: str | None = None):
         return self._invoke("batch_get", list(keys), tenant=tenant)
+
     def batch_get_buffer(self, keys: Sequence[str], *, tenant: str | None = None):
         return self._invoke("batch_get_buffer", list(keys), tenant=tenant)
+
     def batch_get_into(self, *args, tenant: str | None = None):
         if len(args) == 1:
             return self._invoke("batch_get_into", args[0], tenant=tenant)
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
             return self._invoke(
-                "batch_get_into_raw",
-                keys, buffer_ptrs, sizes, tenant=tenant
+                "batch_get_into_raw", keys, buffer_ptrs, sizes, tenant=tenant
             )
         raise TypeError(
             "batch_get_into expects either items or (keys, buffer_ptrs, sizes)"
         )
+
     def batch_get_into_multi_buffers(
         self,
         *args,
@@ -496,7 +527,9 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
     ):
         if len(args) == 1:
-            keys, all_buffer_ptrs, all_sizes = _normalize_descriptor_items(list(args[0]))
+            keys, all_buffer_ptrs, all_sizes = _normalize_descriptor_items(
+                list(args[0])
+            )
         elif len(args) == 3:
             keys, all_buffer_ptrs, all_sizes = _normalize_raw_multi_buffer_args(*args)
         else:
@@ -511,21 +544,28 @@ class MooncakeDistributedStore:
             prefer_alloc_in_same_node=prefer_alloc_in_same_node,
             tenant=tenant,
         )
+
     def get(self, key: str, *, tenant: str | None = None):
         return self._invoke("get", key, tenant=tenant)
+
     def is_exist(self, key: str, *, tenant: str | None = None) -> bool:
         return self._invoke("is_exist", key, tenant=tenant)
+
     def batch_is_exist(self, keys: Sequence[str], *, tenant: str | None = None):
         return self._invoke("batch_is_exist", list(keys), tenant=tenant)
+
     def get_hostname(self) -> str:
         return self._invoke("get_hostname")
+
     def get_size(self, key: str, *, tenant: str | None = None) -> int:
         return self._invoke("get_size", key, tenant=tenant)
+
     def remove(self, key: str, *, force: bool = False, tenant: str | None = None):
         result = self._invoke("remove", key, force=force, tenant=tenant)
         if result == 0:
             self._forget_keys([key], tenant=tenant)
         return result
+
     def batch_remove(
         self,
         keys: Sequence[str],
@@ -539,6 +579,7 @@ class MooncakeDistributedStore:
             if int(status) == 0:
                 self._forget_keys([key], tenant=tenant)
         return result
+
     def remove_all(self, force: bool = False):
         try:
             removed = self._invoke("remove_all", force=force)
@@ -555,12 +596,16 @@ class MooncakeDistributedStore:
                     self._forget_keys([key], tenant=tenant)
                     removed += 1
         return removed
+
     def start_metrics_server(self, bind_addr: str = "127.0.0.1:0") -> str:
         return self._invoke("start_metrics_server", bind_addr)
+
     def stop_metrics_server(self) -> None:
         self._invoke("stop_metrics_server")
+
     def metrics_server_address(self) -> str | None:
         return self._invoke("metrics_server_address")
+
     def _resolve_registered_size(self, buffer_ptr: int, size: int | None) -> int:
         if size is not None:
             return int(size)
@@ -570,23 +615,29 @@ class MooncakeDistributedStore:
                     "buffer size is required for unknown pointers; call register_buffer first or pass size explicitly"
                 )
             return self._registered_buffers[int(buffer_ptr)]
+
     def _track_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
         with self._lock:
             for key in keys:
                 self._tracked_keys.add((tenant, str(key)))
+
     def _forget_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
         with self._lock:
             for key in keys:
                 self._tracked_keys.discard((tenant, str(key)))
+
     def _group_tracked_keys(self) -> dict[str | None, list[str]]:
         grouped: dict[str | None, list[str]] = {}
         with self._lock:
             for tenant, key in self._tracked_keys:
                 grouped.setdefault(tenant, []).append(key)
         return grouped
+
     def _setup_from_config_dict(self, config: Mapping[str, object]):
         config = _apply_setup_env_defaults(dict(config))
-        _warn_setup_policy_fallback(config, source="MooncakeDistributedStore.setup config")
+        _warn_setup_policy_fallback(
+            config, source="MooncakeDistributedStore.setup config"
+        )
         if "local_hostname" not in config:
             raise TypeError("setup config requires `local_hostname`")
         metadata_url = config.get("metadata_server", config.get("metadata_url"))
@@ -595,13 +646,16 @@ class MooncakeDistributedStore:
         transport_rpc_port = _coerce_optional_int(
             config.get("transport_rpc_port", config.get("rpc_server_port"))
         )
-        local_hostname, transport_rpc_port = _normalize_local_hostname_and_transport_port(
-            config["local_hostname"],
-            transport_rpc_port,
+        local_hostname, transport_rpc_port = (
+            _normalize_local_hostname_and_transport_port(
+                config["local_hostname"],
+                transport_rpc_port,
+            )
         )
-        initial_state = _coerce_optional_str(
-            config.get("initial_state", config.get("state"))
-        ) or "active"
+        initial_state = (
+            _coerce_optional_str(config.get("initial_state", config.get("state")))
+            or "active"
+        )
         _init_tracing_from_env()
         result = self._invoke(
             "setup",
@@ -635,12 +689,16 @@ class MooncakeDistributedStore:
         _start_metrics_server_from_env()
         return result
 
+
 def _replication_kwargs(config) -> dict:
     if config is None:
         return {}
     preferred_segments = list(getattr(config, "preferred_segments", []) or [])
     preferred_segment = getattr(config, "preferred_segment", "")
-    if preferred_segment not in ("", None) and preferred_segment not in preferred_segments:
+    if (
+        preferred_segment not in ("", None)
+        and preferred_segment not in preferred_segments
+    ):
         preferred_segments.insert(0, preferred_segment)
     preferred_storage_owners = list(
         getattr(config, "preferred_storage_owners", []) or []
@@ -662,6 +720,7 @@ def _replication_kwargs(config) -> dict:
         "with_soft_pin": bool(getattr(config, "with_soft_pin", False)),
     }
 
+
 def _normalize_key_value_items(
     items,
     keys: Sequence[str] | None,
@@ -677,6 +736,7 @@ def _normalize_key_value_items(
         raise ValueError("keys and values must have the same length")
     return list(zip(keys, values))
 
+
 def _normalize_raw_batch_args(
     keys: Sequence[str],
     buffer_ptrs: Sequence[int],
@@ -685,6 +745,7 @@ def _normalize_raw_batch_args(
     if len(keys) != len(buffer_ptrs) or len(keys) != len(sizes):
         raise ValueError("keys, buffer_ptrs, and sizes must have the same length")
     return list(keys), [int(ptr) for ptr in buffer_ptrs], [int(size) for size in sizes]
+
 
 def _normalize_pointer_items(items: Iterable[tuple]):
     normalized = []
@@ -695,12 +756,14 @@ def _normalize_pointer_items(items: Iterable[tuple]):
         normalized.append((str(key), int(buffer_ptr), int(size)))
     return normalized
 
+
 def _coerce_batch_status_result(result, count: int) -> _BatchStatusResult:
     if isinstance(result, int):
         if result != 0:
             raise RuntimeError(f"batch put-from failed with status {result}")
         return _BatchStatusResult([0] * count)
     return _BatchStatusResult([int(status) for status in result])
+
 
 def _coerce_bool(value, default: bool) -> bool:
     if value is None:
@@ -709,25 +772,30 @@ def _coerce_bool(value, default: bool) -> bool:
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
 
+
 def _coerce_optional_bool(value) -> bool | None:
     if value is None:
         return None
     return _coerce_bool(value, False)
+
 
 def _coerce_int(value, default: int) -> int:
     if value is None:
         return default
     return int(value)
 
+
 def _coerce_optional_int(value) -> int | None:
     if value is None:
         return None
     return int(value)
 
+
 def _coerce_optional_str(value) -> str | None:
     if value in ("", None):
         return None
     return str(value)
+
 
 def _coerce_mapping(value) -> dict[str, str] | None:
     if value is None:
@@ -735,6 +803,7 @@ def _coerce_mapping(value) -> dict[str, str] | None:
     if not isinstance(value, Mapping):
         raise TypeError("labels must be a mapping")
     return {str(key): str(item) for key, item in value.items()}
+
 
 def _warn_setup_policy_fallback(config: Mapping[str, object], *, source: str) -> None:
     policy_keys = []
@@ -764,13 +833,17 @@ _SETUP_ENV_DEFAULTS = {
     "replica_count": ("MC_STORE_RS_REPLICA_COUNT", lambda value: _coerce_int(value, 1)),
     "route_topk": ("MC_STORE_RS_ROUTE_TOPK", lambda value: _coerce_int(value, 2)),
     "keyspace": ("MC_STORE_RS_KEYSPACE", _coerce_optional_str),
-    "transport_metadata_url": ("MC_STORE_RS_TRANSPORT_METADATA_URL", _coerce_optional_str),
+    "transport_metadata_url": (
+        "MC_STORE_RS_TRANSPORT_METADATA_URL",
+        _coerce_optional_str,
+    ),
     "transport_rpc_port": ("MC_STORE_RS_TRANSPORT_RPC_PORT", _coerce_optional_int),
     "transport_backend": ("MC_STORE_RS_TRANSPORT_BACKEND", _coerce_optional_str),
     "local_segment_name": ("MC_STORE_RS_LOCAL_SEGMENT_NAME", _coerce_optional_str),
     "expires_at_ms": ("MC_STORE_RS_EXPIRES_AT_MS", _coerce_optional_int),
     "route_control": ("MC_STORE_RS_ROUTE_CONTROL", _coerce_optional_str),
 }
+
 
 def _apply_setup_env_defaults(config: Mapping[str, object]) -> dict:
     merged = dict(config)
@@ -792,8 +865,10 @@ def _apply_setup_env_defaults(config: Mapping[str, object]) -> dict:
             merged["labels"] = labels
     return merged
 
+
 def _has_value(value) -> bool:
     return value not in (None, "")
+
 
 def _labels_from_env() -> dict[str, str] | None:
     value = os.environ.get("MC_STORE_RS_LABELS")
@@ -819,6 +894,7 @@ def _labels_from_env() -> dict[str, str] | None:
         labels[key.strip()] = label_value.strip()
     return labels or None
 
+
 def _start_metrics_server_from_env() -> str | None:
     bind_addr = os.environ.get("MC_STORE_RS_METRICS_ADDR")
     if not _has_value(bind_addr):
@@ -827,6 +903,7 @@ def _start_metrics_server_from_env() -> str | None:
     if existing is not None:
         return existing
     return _native.start_metrics_server(str(bind_addr).strip())
+
 
 def _init_tracing_from_env() -> bool:
     if not _env_truthy(os.environ.get("MC_STORE_RS_TRACE")) and not _has_value(
@@ -837,10 +914,12 @@ def _init_tracing_from_env() -> bool:
     _native.init_tracing(trace_filter)
     return True
 
+
 def _env_truthy(value) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _normalize_raw_multi_buffer_args(
     keys: Sequence[str],
@@ -856,6 +935,7 @@ def _normalize_raw_multi_buffer_args(
         [[int(ptr) for ptr in group] for group in all_buffer_ptrs],
         [[int(size) for size in group] for group in all_sizes],
     )
+
 
 def _normalize_descriptor_items(items: Iterable[tuple]):
     keys = []
@@ -887,6 +967,7 @@ def _normalize_descriptor_items(items: Iterable[tuple]):
         all_sizes.append(sizes)
     return keys, all_buffer_ptrs, all_sizes
 
+
 def _items_use_bytes_payloads(items: Sequence[tuple]) -> bool:
     if not items:
         return True
@@ -898,6 +979,7 @@ def _items_use_bytes_payloads(items: Sequence[tuple]) -> bool:
         return True
     sample = buffers[0]
     return isinstance(sample, (bytes, bytearray, memoryview))
+
 
 __all__ = [
     "MooncakeDistributedStore",

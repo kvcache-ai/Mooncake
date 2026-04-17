@@ -166,7 +166,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.local_buf_size < 0 or args.scratch_size < 0:
         raise SystemExit("--local_buf_size and --scratch_size must be >= 0")
     if args.batch_api == "multi_buffer" and args.batch_size == 1:
-        raise SystemExit("--batch_api=multi_buffer requires --batch_size greater than 1")
+        raise SystemExit(
+            "--batch_api=multi_buffer requires --batch_size greater than 1"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +193,9 @@ def chunked(items, chunk_size: int):
         yield items[index : index + chunk_size]
 
 
-def print_throughput(phase: str, item_count: int, value_size: int, elapsed: float) -> None:
+def print_throughput(
+    phase: str, item_count: int, value_size: int, elapsed: float
+) -> None:
     total_bytes = item_count * value_size
     throughput_mib = total_bytes / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
     ops_per_sec = item_count / elapsed if elapsed > 0 else 0.0
@@ -238,7 +242,9 @@ def apply_replication_config(
         config.with_soft_pin = with_soft_pin
 
 
-def wait_for_dummy_ready(store: MooncakeDistributedStore, timeout_seconds: float = 10.0) -> None:
+def wait_for_dummy_ready(
+    store: MooncakeDistributedStore, timeout_seconds: float = 10.0
+) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
@@ -420,7 +426,9 @@ def read_all_shm(
                 pointers.append(pointer)
             lengths = store.batch_get_into(items, tenant=tenant)
             if len(lengths) != len(batch):
-                raise RuntimeError(f"batch_get_into returned unexpected payload: {lengths!r}")
+                raise RuntimeError(
+                    f"batch_get_into returned unexpected payload: {lengths!r}"
+                )
             for key, pointer, length in zip(batch, pointers, lengths):
                 expected = make_value(key, value_size)
                 actual_length = int(length)

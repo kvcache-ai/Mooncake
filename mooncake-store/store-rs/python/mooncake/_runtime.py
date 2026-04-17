@@ -49,7 +49,11 @@ def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]
         / "mooncake-transfer-engine"
         / "tent"
         / "src",
-        repository / "third_party" / "Mooncake" / "build-wheel-compat" / "mooncake-asio",
+        repository
+        / "third_party"
+        / "Mooncake"
+        / "build-wheel-compat"
+        / "mooncake-asio",
         repository
         / "third_party"
         / "Mooncake"
@@ -116,7 +120,9 @@ def preload_native_libraries(package_root: pathlib.Path | None = None) -> None:
         ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
 
 
-def binary_path(binary_name: str, package_root: pathlib.Path | None = None) -> pathlib.Path:
+def binary_path(
+    binary_name: str, package_root: pathlib.Path | None = None
+) -> pathlib.Path:
     root = package_root if package_root is not None else package_dir()
     repository = repo_root(root)
     candidates = [

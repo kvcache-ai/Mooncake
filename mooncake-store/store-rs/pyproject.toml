@@ -28,6 +28,11 @@ dependencies = [
 Homepage = "https://github.com/kvcache-ai/Mooncake"
 Source = "https://github.com/kvcache-ai/Mooncake"
 
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+]
+
 [project.scripts]
 mooncake_master = "mooncake.cli:main"
 mooncake_client = "mooncake.cli:main"
