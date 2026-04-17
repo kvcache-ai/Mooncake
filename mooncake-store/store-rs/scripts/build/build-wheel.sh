@@ -278,7 +278,10 @@ PY
 readarray -t VERSION_INFO < <("${VENV_PYTHON}" - <<'PY' "${REPO_ROOT}/pyproject.toml"
 import pathlib
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 pyproject = pathlib.Path(sys.argv[1])
 data = tomllib.loads(pyproject.read_text())
