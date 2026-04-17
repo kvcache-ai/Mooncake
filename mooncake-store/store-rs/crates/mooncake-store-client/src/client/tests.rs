@@ -2854,6 +2854,107 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
 }
 
 #[test]
+fn embedded_wrh_evacuation_reuses_live_authority_snapshot() {
+    let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let store_a_transport = Arc::new(TestTransport::new("evacuation-authority-cache-a-segment"));
+    let store_b_transport =
+        Arc::new(store_a_transport.peer("evacuation-authority-cache-b-segment"));
+    let router_transport =
+        Arc::new(store_a_transport.peer("evacuation-authority-cache-router-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "evacuation-authority-cache-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "evacuation-authority-cache-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "evacuation-authority-cache-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+
+    wait_for_membership_convergence(&[&store_a, &store_b, &router]);
+
+    let key = "evacuation-authority-cache-key";
+    let value = b"payload".to_vec();
+    router
+        .put_with_policy(
+            key,
+            &value,
+            &ReplicationPolicy::new()
+                .prefer_local(false)
+                .preferred_storage_owner(store_a.runtime_id().storage_key()),
+        )
+        .expect("seed put should succeed");
+    let route = router
+        .query_route(key)
+        .expect("route query should succeed")
+        .expect("route should exist");
+    assert_eq!(route.replicas[0].owner, *store_a.runtime_id());
+
+    let after_seed = metadata.list_live_clients_calls();
+    let policy = router
+        .migration_policy_for_route(&route)
+        .expect("migration policy should resolve from the shared snapshot");
+    let after_policy = metadata.list_live_clients_calls();
+    assert!(
+        !policy.preferred_storage_owners.is_empty(),
+        "migration policy should retain at least one active target"
+    );
+    assert_eq!(
+        after_policy, after_seed,
+        "migration policy should reuse the shared live snapshot"
+    );
+
+    let protected = router
+        .sync_route_to_live_authorities_excluding(&route, None)
+        .expect("authority sync should succeed");
+    let after_sync = metadata.list_live_clients_calls();
+    assert!(
+        protected > 0,
+        "authority sync should protect at least one authority"
+    );
+    assert_eq!(
+        after_sync, after_seed,
+        "authority sync should reuse the shared live-authority snapshot"
+    );
+}
+
+#[test]
 fn routed_put_reuses_live_client_snapshot_for_placement() {
     let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
         InMemoryMetadataBackend::new(),
@@ -5724,7 +5825,9 @@ fn namespace_quota_isolated_per_scope() {
             .object_set("set-b")
             .qos_tier("silver")])
         .expect_err("same tenant should share tenant-root quota state");
-    assert!(same_tenant_error.to_string().contains("tenant quota bytes exceeded"));
+    assert!(same_tenant_error
+        .to_string()
+        .contains("tenant quota bytes exceeded"));
 
     let other_tenant_route = client
         .batch_put(&[PutRequest::new("key-c", b"bravo")
@@ -5737,7 +5840,8 @@ fn namespace_quota_isolated_per_scope() {
 
     let scope_a = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a"));
     let scope_b = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-b"), Some("set-b"));
-    let tenant_b_scope = NamespaceScope::with_defaults(Some("tenant-b"), Some("domain-b"), Some("set-b"));
+    let tenant_b_scope =
+        NamespaceScope::with_defaults(Some("tenant-b"), Some("domain-b"), Some("set-b"));
     let scope_a_routes = client
         .list_routes_in_scope(&scope_a)
         .expect("scope-a listing should succeed");

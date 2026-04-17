@@ -3,9 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/scripts/lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
-UPSTREAM_DIR="${MOONCAKE_UPSTREAM_DIR:-${ROOT_DIR}/third_party/Mooncake}"
-UPSTREAM_BUILD_DIR="${MOONCAKE_UPSTREAM_BUILD_DIR:-${UPSTREAM_DIR}/build-rust}"
 LOG_DIR="${MC_STORE_RS_STRESS_LOG_DIR:-${ROOT_DIR}/target/stress}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="${MC_STORE_RS_STRESS_LOG_FILE:-${LOG_DIR}/multi-client-stress-${STAMP}.log}"
@@ -40,22 +40,12 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if [[ ! -d "${UPSTREAM_DIR}" ]]; then
-  echo "Mooncake upstream submodule missing at ${UPSTREAM_DIR}" >&2
-  echo "Run: git submodule update --init --recursive" >&2
-  exit 1
-fi
-
-if ! redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
-  redis-server \
-    --port "${REDIS_PORT}" \
-    --bind 127.0.0.1 \
-    --daemonize yes \
-    --save '' \
-    --appendonly no
-fi
-
-export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${LD_LIBRARY_PATH:-}"
+mc_scripts_require_command cargo
+mc_scripts_require_command redis-cli
+mc_scripts_require_command redis-server
+UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${ROOT_DIR}")
+mc_scripts_setup_upstream_runtime_env "${ROOT_DIR}" python "${UPSTREAM_BUILD_DIR}"
+mc_scripts_start_local_redis_if_needed "${REDIS_PORT}"
 export MC_STORE_RS_REDIS_URL="${MC_STORE_RS_REDIS_URL:-redis://127.0.0.1:${REDIS_PORT}/0}"
 export MC_STORE_RS_REDIS_PORT="${REDIS_PORT}"
 export MC_STORE_RS_STRESS_STORAGE_CLIENTS="${MC_STORE_RS_STRESS_STORAGE_CLIENTS:-2}"
@@ -64,18 +54,6 @@ export MC_STORE_RS_STRESS_BATCH_SIZE="${MC_STORE_RS_STRESS_BATCH_SIZE:-16}"
 export MC_STORE_RS_STRESS_SINGLE_ITERS="${MC_STORE_RS_STRESS_SINGLE_ITERS:-128}"
 export MC_STORE_RS_STRESS_BATCH_ITERS="${MC_STORE_RS_STRESS_BATCH_ITERS:-64}"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="${ROOT_DIR}/python${PYTHONPATH:+:${PYTHONPATH}}"
-
-if ! command -v cargo >/dev/null 2>&1; then
-  CARGO_ENV="${CARGO_HOME:-${HOME}/.cargo}/env"
-  if [[ -f "${CARGO_ENV}" ]]; then
-    # shellcheck disable=SC1090
-    source "${CARGO_ENV}"
-  else
-    echo "cargo not found in PATH and ${CARGO_ENV} is missing" >&2
-    exit 1
-  fi
-fi
 
 mkdir -p "${LOG_DIR}"
 
