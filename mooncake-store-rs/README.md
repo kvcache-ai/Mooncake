@@ -377,7 +377,7 @@ To package the Python module and the standalone client command together:
 ./scripts/build/build-wheel.sh
 python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
-./scripts/build/install-pro-wheel.sh --python "$VIRTUAL_ENV/bin/python"
+pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 mooncake-store-client --help
 python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
 ```
@@ -403,21 +403,11 @@ These scripts validate:
 
 ### Run the true SGLang HiCache e2e
 
-Local checkout flow:
-
 ```bash
 ./scripts/sglang/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
 ```
 
-Portable two-machine flow:
-
-```bash
-./scripts/build/build-sglang-e2e-bundle.sh
-scp dist/sglang-true-e2e-bundle.tar.gz other-machine:/tmp/
-ssh other-machine 'rm -rf /tmp/sglang-true-e2e-bundle && tar -xzf /tmp/sglang-true-e2e-bundle.tar.gz -C /tmp && cd /tmp/sglang-true-e2e-bundle && ./scripts/sglang/run-sglang-true-e2e-bundle.sh --model-path /models/Qwen3-0.6B'
-```
-
-These runners perform a full end-to-end run with:
+This script performs a full end-to-end run with:
 
 - two standalone storage `mooncake-store-client` processes
 - one routed rw-only `mooncake-store-client` gateway exposed through `client_server_address`
@@ -427,23 +417,13 @@ These runners perform a full end-to-end run with:
 - forced storage kill validation with retry-based recovery instead of persistent request failure
 - graceful storage shrink validation with request retry and eventual recovery
 
-Portable runner notes:
-
-- machine B only needs `python3`, `python3 -m venv`, `redis-server`, `redis-cli`, GPU/SGLang compatibility, and a model path or explicit download opt-in
-- machine B does not need `git`, `cargo`, `cmake`, or `third_party/Mooncake`
-- the packaged runtime wheel bundles the native Mooncake assets needed by the installed CLI, including `libtransfer_engine.so`, `libtent_shared.so`, and `libhiredis.so.0.14`
-- if you are building for a different Python ABI on machine B, rebuild the bundle with the matching interpreter first (for example `PYTHON=/tmp/python312/bin/python3.12 WHEEL_VENV=/tmp/mc-wheel-venv-py312 ./scripts/build/build-sglang-e2e-bundle.sh`)
-- logs default to `target/sglang-true-e2e/`
-
 Useful knobs:
 
 - `--model-path` or `MC_STORE_RS_SGLANG_MODEL_PATH` to point at the local model directory used by `sglang.launch_server`
 - `--auto-download-model --model-id Qwen/Qwen3-0.6B` or `MC_STORE_RS_SGLANG_AUTO_DOWNLOAD_MODEL=1` for opt-in Hugging Face download
-- `--model-cache` or `MC_STORE_RS_SGLANG_MODEL_CACHE` to control the optional download cache
-- `--workdir` or `MC_STORE_RS_SGLANG_TRUE_E2E_WORKDIR` to control the runtime log directory
 - `MC_STORE_RS_SGLANG_SERVER_A_GPU` and `MC_STORE_RS_SGLANG_SERVER_B_GPU` to pin GPU ids
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the real data-plane backend during validation and current SGLang real-mode compatibility; the default is `classic_te`
-- `MC_STORE_RS_SGLANG_SKIP_WHEEL_BUILD=1` to reuse an existing local wheel build in checkout mode
+- `MC_STORE_RS_SGLANG_SKIP_WHEEL_BUILD=1` to reuse an existing local wheel build
 - `MC_STORE_RS_SGLANG_SKIP_PIP_INSTALL=1` to reuse an already prepared SGLang venv
 
 Manual launch patterns:
