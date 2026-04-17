@@ -20,10 +20,10 @@ Usage:
       --p2p_local_transfer_mode memcpy --local_memcpy_async_worker_num 32
 
 # Matrix sweep: all combinations of threads/value_size/batch/transfer-mode, save to CSV:
-  python3 stress_single_workload_runner.py --matrix --threads 16 --value_size 1048576,4194304 \
-      --batch 1,4,16,32 --p2p_local_transfer_mode te,memcpy --local_memcpy_async_worker_num 32 \
+  python3 stress_single_workload_runner.py --mode both --matrix --rounds 10 --ops 200 --rpc_threads 32 --ram_buffer_size_gb 70 \
+      --threads 16 --batch 1,4,16,32 --value_size 1048576,4194304,8388608 \
+      --p2p_local_transfer_mode te,memcpy --local_memcpy_async_worker_num 32 \
       --output results.csv
-
 Arguments:
 ----------
 --mode:              [Centralization, P2P, both] (default: both)
