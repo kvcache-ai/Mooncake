@@ -480,6 +480,16 @@ mooncake-store-client --help
 python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
 ```
 
+If the host OS is missing build dependencies, use the Ubuntu Docker wrapper:
+
+```bash
+PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
+```
+
+The Docker wrapper produces the same `dist/wheels/` and `dist/bin/` outputs and
+defaults to CN mirrors for rustup, cargo, and pip. Set `CN_MIRROR=0` to force
+the upstream endpoints.
+
 This packaging flow now produces two wheels:
 
 - `mooncake-*.whl` is the real compatibility runtime package imported as `mooncake`
@@ -744,6 +754,12 @@ Build a distributable wheel and package the standalone client binary:
 
 ```bash
 ./scripts/build/build-wheel.sh
+```
+
+Or build in Ubuntu Docker with an explicit Python runtime:
+
+```bash
+PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
 ```
 
 The default output layout is:
