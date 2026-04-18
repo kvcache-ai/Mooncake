@@ -64,7 +64,6 @@ jobs:
           base="${base#${base%%[![:space:]]*}}"
           base="${base%${base##*[![:space:]]}}"
           [ -n "$base" ] || return 1
-          [ "$base" = "https://github.com" ] && base="https://github.com/"
           [ "$base" != "https://github.com/" ] && base="${base%/}/"
           printf '%s\n' "$base"
         }
@@ -123,7 +122,6 @@ jobs:
             base="${base#${base%%[![:space:]]*}}"
             base="${base%${base##*[![:space:]]}}"
             [ -n "$base" ] || return 1
-            [ "$base" = "https://github.com" ] && base="https://github.com/"
             [ "$base" != "https://github.com/" ] && base="${base%/}/"
             printf '%s\n' "$base"
           }
@@ -144,7 +142,7 @@ jobs:
 
         if [ "$submodule_updated" != true ]; then
           if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
-            echo "git submodule update failed, try to cp pybind11..."
+            echo "git submodule update failed (mirrors also exhausted), trying to cp pybind11..."
             if [ -d "../pybind11" ]; then
               cp -r ../pybind11 extern/
             else
