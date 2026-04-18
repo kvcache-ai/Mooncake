@@ -702,8 +702,9 @@ DataManager::SubmitTeTransferInternal(
         SegmentHandle seg = transfer_engine_->openSegment(endpoint);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment '" << endpoint << "'";
-            for (const auto& [bid, n, ep] : submitted_batches)
-                transfer_engine_->freeBatchID(bid);
+            for (const auto& [bid, n, ep] : submitted_batches) {
+                CancelBatchTETask(bid, n);
+            }
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
 
@@ -742,8 +743,9 @@ DataManager::SubmitTeTransferInternal(
         if (!batch_result) {
             LOG(ERROR) << "Failed to submit transfer requests for segment "
                        << endpoint;
-            for (const auto& [bid, n, ep] : submitted_batches)
-                transfer_engine_->freeBatchID(bid);
+            for (const auto& [bid, n, ep] : submitted_batches) {
+                CancelBatchTETask(bid, n);
+            }
             return tl::unexpected(batch_result.error());
         }
         submitted_batches.emplace_back(batch_result.value(), requests.size(),
@@ -883,7 +885,13 @@ tl::expected<Transport::BatchID, ErrorCode> DataManager::SubmitTransferRequests(
     if (!submit_status.ok()) {
         LOG(ERROR) << "Failed to submit transfers, error: "
                    << submit_status.message();
-        transfer_engine_->freeBatchID(batch_id);
+        // Tasks were never dispatched to hardware and will remain in WAITING
+        // state indefinitely, so CancelBatchTETask cannot help here.
+        auto free_status = transfer_engine_->freeBatchID(batch_id);
+        if (!free_status.ok()) {
+            LOG(WARNING) << "freeBatchID failed after submitTransfer error"
+                         << ", BatchDesc may leak: " << free_status.message();
+        }
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
@@ -907,10 +915,11 @@ tl::expected<void, ErrorCode> DataManager::WaitAllTransferBatches(
                        << ", total_batches: " << batches.size()
                        << ", num_tasks: " << num_tasks;
 
-            // Free remaining batch IDs that haven't been processed yet.
+            // Cancel remaining batches that haven't been processed yet.
             // Note: WaitTransferBatch already freed the failed batch ID.
             for (size_t j = i + 1; j < batches.size(); ++j) {
-                transfer_engine_->freeBatchID(std::get<0>(batches[j]));
+                CancelBatchTETask(std::get<0>(batches[j]),
+                                  std::get<1>(batches[j]));
             }
 
             return tl::make_unexpected(wait_result.error());
@@ -935,7 +944,7 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
             LOG(ERROR) << "WaitTransferBatch: Timeout after " << elapsed
                        << " seconds for batch " << batch_id
                        << " for segment endpoint '" << segment_endpoint << "'";
-            transfer_engine_->freeBatchID(batch_id);
+            CancelBatchTETask(batch_id, num_tasks);
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
 
@@ -973,7 +982,7 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
 
         if (has_failure) {
             LOG(ERROR) << "Transfer failed in batch_id " << batch_id;
-            transfer_engine_->freeBatchID(batch_id);
+            CancelBatchTETask(batch_id, num_tasks);
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
 
@@ -988,6 +997,42 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
 
     transfer_engine_->freeBatchID(batch_id);
     return {};
+}
+
+// freeBatchID() only releases BatchDesc when is_finished=true on every task.
+// Then, only COMPLETED and FAILED status of task will trigger to set
+// is_finished=true. And there is no cancel API in TransferEngine. Thus, we must
+// poll until all tasks reach a terminal state before calling freeBatchID.
+void DataManager::CancelBatchTETask(Transport::BatchID batch_id,
+                                    size_t num_tasks) {
+    constexpr int64_t kDrainTimeoutSeconds = 30;
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        bool all_finished = true;
+        for (size_t i = 0; i < num_tasks; ++i) {
+            TransferStatus status;
+            Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
+            if (!s.ok() || (status.s != TransferStatusEnum::COMPLETED &&
+                            status.s != TransferStatusEnum::FAILED)) {
+                all_finished = false;
+                break;
+            }
+        }
+        if (all_finished) {
+            break;
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        if (elapsed >= kDrainTimeoutSeconds) {
+            LOG(WARNING) << "CancelBatchTETask: timed out after " << elapsed
+                         << "s for batch " << batch_id
+                         << " — BatchDesc may leak";
+            return;  // freeBatchID would fail; accept the leak
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    transfer_engine_->freeBatchID(batch_id);
 }
 
 tl::expected<void, ErrorCode> DataManager::CopyFromDRAMBuffer(

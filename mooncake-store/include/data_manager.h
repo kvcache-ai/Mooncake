@@ -361,6 +361,9 @@ class DataManager {
         const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
             batches);
 
+    // Wait for all tasks to reach a terminal state, then free the batch.
+    void CancelBatchTETask(Transport::BatchID batch_id, size_t num_tasks);
+
    private:
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
