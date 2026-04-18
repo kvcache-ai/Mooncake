@@ -7,7 +7,7 @@ add_library(tent_metrics STATIC ${TENT_METRICS_SOURCES})
 # ODR safety: yalantinglibs bundles ASIO headers but does NOT compile ASIO inline because
 # ASIO_SEPARATE_COMPILATION is set globally. All ASIO symbols live exclusively in asio_shared.so,
 # so there is no risk of duplicate symbols between yalantinglibs and the rest of TE.
-# (See mooncake-asio/CMakeLists.txt: "Build asio as a shared library to avoid ODR violations")
+# (See mooncake-common/src/CMakeLists.txt: "Build asio as a shared library to avoid ODR violations")
 target_link_libraries(tent_metrics PUBLIC tent_common tent_interface yalantinglibs::yalantinglibs glog pthread)
 
 # Pass compile definition based on option

@@ -48,9 +48,8 @@ endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
 
-# Define ASIO macros before adding mooncake-asio subdirectory
+# Define ASIO macros before building targets that include ASIO headers.
 add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
-add_subdirectory(mooncake-asio)
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)

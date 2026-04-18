@@ -9,10 +9,11 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
 
-  # Build asio_shared library for standalone build
-  # Set compile definitions before add_subdirectory to ensure proper compilation
+  # Build asio_shared in mooncake-common for standalone builds.
+  # Set compile definitions before adding targets that include ASIO headers.
   add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
-  add_subdirectory(../mooncake-asio ${CMAKE_CURRENT_BINARY_DIR}/mooncake-asio)
+  add_subdirectory(../mooncake-common/src
+                   ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
 endif() # GLOBAL_CONFIG
 
 if (USE_ASCEND)
