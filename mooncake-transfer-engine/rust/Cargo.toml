@@ -3,14 +3,6 @@ name = "transfer_engine_rust"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "transfer_engine_rust"
-path = "src/main.rs"
-
-[[bin]]
-name = "customer_pattern"
-path = "src/customer_pattern.rs"
-
 [dependencies]
 anyhow = "1.0.79"
 libc = "0.2"
