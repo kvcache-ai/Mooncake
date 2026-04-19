@@ -330,85 +330,85 @@ def run_initiator(args):
 
     results = []
     with ThreadPoolExecutor(max_workers=num_threads) as pool:
-      for tokens, transfer_size in zip(prefix_tokens_list, transfer_sizes):
-        if transfer_size > recv_bytes:
-            print(f"  SKIP {tokens} tokens: transfer {transfer_size} > recv buffer")
-            continue
+        for tokens, transfer_size in zip(prefix_tokens_list, transfer_sizes):
+            if transfer_size > recv_bytes:
+                print(f"  SKIP {tokens} tokens: transfer {transfer_size} > recv buffer")
+                continue
 
-        # Warmup: use the same offset pattern as the benchmark to pre-warm
-        # remote memory pages and DMA paths at each offset.
-        pool_bytes = int(args.pool_size_gb * 1024 * 1024 * 1024)
-        max_offset = pool_bytes - transfer_size
-        for w in range(args.warmup):
+            # Warmup: use the same offset pattern as the benchmark to pre-warm
+            # remote memory pages and DMA paths at each offset.
+            pool_bytes = int(args.pool_size_gb * 1024 * 1024 * 1024)
+            max_offset = pool_bytes - transfer_size
+            for w in range(args.warmup):
+                for i in range(args.iterations):
+                    if max_offset > 0:
+                        offset = ((i * transfer_size) % max_offset) & ~0xFFF
+                    else:
+                        offset = 0
+                    ret = threaded_transfer(
+                        recv_addr, remote_addr + offset, transfer_size, pool
+                    )
+                    if ret != 0:
+                        print(f"  WARNING: warmup transfer failed: {ret}")
+                        break
+
+            # Benchmark
+            latencies = []
+            errors = 0
             for i in range(args.iterations):
+                # Use different offset within remote pool for each iteration
+                # to simulate accessing different prefix locations
                 if max_offset > 0:
+                    # Align to 4KB boundary
                     offset = ((i * transfer_size) % max_offset) & ~0xFFF
                 else:
                     offset = 0
+
+                t0 = time.perf_counter()
                 ret = threaded_transfer(
                     recv_addr, remote_addr + offset, transfer_size, pool
                 )
+                elapsed = time.perf_counter() - t0
+
                 if ret != 0:
-                    print(f"  WARNING: warmup transfer failed: {ret}")
-                    break
+                    errors += 1
+                    if errors <= 3:
+                        print(f"  ERROR: transfer failed at iter {i}: {ret}")
+                    continue
 
-        # Benchmark
-        latencies = []
-        errors = 0
-        for i in range(args.iterations):
-            # Use different offset within remote pool for each iteration
-            # to simulate accessing different prefix locations
-            if max_offset > 0:
-                # Align to 4KB boundary
-                offset = ((i * transfer_size) % max_offset) & ~0xFFF
-            else:
-                offset = 0
+                latencies.append(elapsed * 1000)  # ms
 
-            t0 = time.perf_counter()
-            ret = threaded_transfer(
-                recv_addr, remote_addr + offset, transfer_size, pool
-            )
-            elapsed = time.perf_counter() - t0
-
-            if ret != 0:
-                errors += 1
-                if errors <= 3:
-                    print(f"  ERROR: transfer failed at iter {i}: {ret}")
+            if not latencies:
+                print(f"  {tokens:>6}k  ALL FAILED ({errors} errors)")
                 continue
 
-            latencies.append(elapsed * 1000)  # ms
+            latencies.sort()
+            avg_ms = statistics.mean(latencies)
+            p50_ms = latencies[len(latencies) // 2]
+            p99_ms = latencies[int(len(latencies) * 0.99)]
+            throughput_gbs = (transfer_size / 1e9) / (p50_ms / 1000)
 
-        if not latencies:
-            print(f"  {tokens:>6}k  ALL FAILED ({errors} errors)")
-            continue
+            print(
+                f"  {tokens:>6} {transfer_size/1e6:>8.1f}MB "
+                f"{avg_ms:>11.2f} {p50_ms:>10.2f} {p99_ms:>10.2f} "
+                f"{throughput_gbs:>11.2f}"
+            )
 
-        latencies.sort()
-        avg_ms = statistics.mean(latencies)
-        p50_ms = latencies[len(latencies) // 2]
-        p99_ms = latencies[int(len(latencies) * 0.99)]
-        throughput_gbs = (transfer_size / 1e9) / (p50_ms / 1000)
-
-        print(
-            f"  {tokens:>6} {transfer_size/1e6:>8.1f}MB "
-            f"{avg_ms:>11.2f} {p50_ms:>10.2f} {p99_ms:>10.2f} "
-            f"{throughput_gbs:>11.2f}"
-        )
-
-        results.append(
-            {
-                "prefix_tokens": tokens,
-                "transfer_bytes": transfer_size,
-                "transfer_mb": transfer_size / 1e6,
-                "pool_size_gb": args.pool_size_gb,
-                "iterations": len(latencies),
-                "errors": errors,
-                "avg_latency_ms": round(avg_ms, 3),
-                "p50_latency_ms": round(p50_ms, 3),
-                "p99_latency_ms": round(p99_ms, 3),
-                "throughput_gbs": round(throughput_gbs, 3),
-                "threads": num_threads,
-            }
-        )
+            results.append(
+                {
+                    "prefix_tokens": tokens,
+                    "transfer_bytes": transfer_size,
+                    "transfer_mb": transfer_size / 1e6,
+                    "pool_size_gb": args.pool_size_gb,
+                    "iterations": len(latencies),
+                    "errors": errors,
+                    "avg_latency_ms": round(avg_ms, 3),
+                    "p50_latency_ms": round(p50_ms, 3),
+                    "p99_latency_ms": round(p99_ms, 3),
+                    "throughput_gbs": round(throughput_gbs, 3),
+                    "threads": num_threads,
+                }
+            )
 
     print(f"{'='*72}")
 

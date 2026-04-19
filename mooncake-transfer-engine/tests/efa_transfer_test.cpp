@@ -89,13 +89,13 @@ static void* allocateHugepage(size_t size) {
 }
 
 static int runTarget(TransferEngine* engine) {
-    size_t buf_bytes = static_cast<size_t>(FLAGS_buf_size_gb * 1024 * 1024 * 1024);
+    size_t buf_bytes =
+        static_cast<size_t>(FLAGS_buf_size_gb * 1024 * 1024 * 1024);
     int num_bufs = FLAGS_num_bufs;
 
     LOG(INFO) << "=== Target Node ===";
-    LOG(INFO) << "Registering " << num_bufs << " x "
-              << FLAGS_buf_size_gb << " GB = "
-              << num_bufs * FLAGS_buf_size_gb << " GB";
+    LOG(INFO) << "Registering " << num_bufs << " x " << FLAGS_buf_size_gb
+              << " GB = " << num_bufs * FLAGS_buf_size_gb << " GB";
 
     // Allocate buffers
     std::vector<void*> bufs;
@@ -128,8 +128,8 @@ static int runTarget(TransferEngine* engine) {
         if ((i + 1) % 50 == 0 || i == num_bufs - 1) {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - t0).count();
-            LOG(INFO) << "  registered " << (i + 1) << "/" << num_bufs
-                      << " (" << elapsed << "s)";
+            LOG(INFO) << "  registered " << (i + 1) << "/" << num_bufs << " ("
+                      << elapsed << "s)";
         }
     }
     auto t1 = std::chrono::steady_clock::now();
@@ -192,8 +192,8 @@ static int runInitiator(TransferEngine* engine) {
             LOG(ERROR) << "Failed to allocate receive buffer for thread " << t;
             return 1;
         }
-        int ret = engine->registerLocalMemory(recv_bufs[t], recv_bytes,
-                                              "cpu:0", true);
+        int ret = engine->registerLocalMemory(recv_bufs[t], recv_bytes, "cpu:0",
+                                              true);
         if (ret != 0) {
             LOG(ERROR) << "Failed to register receive buffer: " << ret;
             return 1;
@@ -288,8 +288,7 @@ static int runInitiator(TransferEngine* engine) {
         }
 
         for (int i = 0; i < bench_iters; ++i) {
-            size_t buf_idx =
-                (tid + i * FLAGS_threads) % num_remote_bufs;
+            size_t buf_idx = (tid + i * FLAGS_threads) % num_remote_bufs;
             uint64_t raddr = segment_desc->buffers[buf_idx].addr;
             size_t rlen = segment_desc->buffers[buf_idx].length;
             size_t xfer = std::min(transfer_bytes, rlen);
@@ -312,7 +311,10 @@ static int runInitiator(TransferEngine* engine) {
             while (true) {
                 TransferStatus st;
                 engine->getTransferStatus(bid, 0, st);
-                if (st.s == TransferStatusEnum::COMPLETED) { ok = true; break; }
+                if (st.s == TransferStatusEnum::COMPLETED) {
+                    ok = true;
+                    break;
+                }
                 if (st.s == TransferStatusEnum::FAILED) {
                     result->errors++;
                     break;
@@ -329,8 +331,8 @@ static int runInitiator(TransferEngine* engine) {
 
     // Run warmup + benchmark with threads
     int num_threads = FLAGS_threads;
-    LOG(INFO) << "Running with " << num_threads << " threads, "
-              << FLAGS_warmup << " warmup + " << FLAGS_iterations
+    LOG(INFO) << "Running with " << num_threads << " threads, " << FLAGS_warmup
+              << " warmup + " << FLAGS_iterations
               << " bench iterations per thread...";
 
     std::vector<ThreadResult> results(num_threads);
@@ -366,8 +368,8 @@ static int runInitiator(TransferEngine* engine) {
     double agg_throughput = total_bytes / 1e9 / (wall_ms / 1000.0);
 
     LOG(INFO) << "=== Results (" << num_threads << " threads) ===";
-    LOG(INFO) << "Transfer: " << FLAGS_transfer_mb << " MB x "
-              << total_xfers << " transfers";
+    LOG(INFO) << "Transfer: " << FLAGS_transfer_mb << " MB x " << total_xfers
+              << " transfers";
     LOG(INFO) << "Wall time: " << wall_ms << " ms";
     LOG(INFO) << "Per-transfer p50: " << stats.p50_ms << " ms"
               << "  p99: " << stats.p99_ms << " ms";
@@ -428,7 +430,8 @@ int main(int argc, char** argv) {
     }
 
     std::string actual_server = engine->getLocalIpAndPort();
-    LOG(INFO) << "Actual server name (use this for --target): " << actual_server;
+    LOG(INFO) << "Actual server name (use this for --target): "
+              << actual_server;
 
     if (FLAGS_mode == "target") {
         ret = runTarget(engine.get());

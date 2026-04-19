@@ -686,8 +686,8 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
         return ERR_INVALID_ARGUMENT;
     }
     if (desc->devices.empty()) {
-        LOG(WARNING) << "EfaTransport::warmupSegment: segment '"
-                     << segment_name << "' has no devices";
+        LOG(WARNING) << "EfaTransport::warmupSegment: segment '" << segment_name
+                     << "' has no devices";
         return 0;
     }
 
@@ -727,17 +727,18 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
     int ok = 0, fail = 0;
     for (auto& f : futs) {
         int rc = f.get();
-        if (rc == 0) ++ok; else ++fail;
+        if (rc == 0)
+            ++ok;
+        else
+            ++fail;
     }
-    auto elapsed = std::chrono::duration<double>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count();
-    LOG(INFO) << "EfaTransport::warmupSegment('" << segment_name
-              << "'): " << ok << "/" << n_pairs
-              << " endpoints connected (" << fail << " failed) in "
-              << elapsed << "s ("
-              << context_list_.size() << " local NICs × "
-              << peer_paths.size() << " peer NICs)";
+    auto elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count();
+    LOG(INFO) << "EfaTransport::warmupSegment('" << segment_name << "'): " << ok
+              << "/" << n_pairs << " endpoints connected (" << fail
+              << " failed) in " << elapsed << "s (" << context_list_.size()
+              << " local NICs × " << peer_paths.size() << " peer NICs)";
     return fail == 0 ? 0 : ERR_ENDPOINT;
 }
 

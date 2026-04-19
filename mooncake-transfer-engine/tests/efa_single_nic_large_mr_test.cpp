@@ -35,14 +35,16 @@
 
 #include "transfer_engine_c.h"
 
-DEFINE_string(nic, "", "EFA device name (e.g. rdmap85s0). "
+DEFINE_string(nic, "",
+              "EFA device name (e.g. rdmap85s0). "
               "If empty, auto-detects the first rdmap* device.");
 DEFINE_double(size_gb, 200.0, "Total memory in GB to register");
 DEFINE_double(chunk_gb, 0, "Per-buffer chunk size in GB (0 = single buffer)");
 DEFINE_string(server, "127.0.0.1:12345", "Local server name");
 
 static std::string detectFirstEfaDevice() {
-    FILE* fp = popen("ls /sys/class/infiniband/ 2>/dev/null | grep rdmap | head -1", "r");
+    FILE* fp = popen(
+        "ls /sys/class/infiniband/ 2>/dev/null | grep rdmap | head -1", "r");
     if (!fp) return "";
     char buf[256] = {};
     if (fgets(buf, sizeof(buf), fp)) {
@@ -83,8 +85,7 @@ int main(int argc, char** argv) {
     // Install EFA transport — optionally restrict to single NIC
     transport_t xport = nullptr;
     if (!nic.empty()) {
-        std::string matrix =
-            "{\"cpu:0\": [[\"" + nic + "\"], []]}";
+        std::string matrix = "{\"cpu:0\": [[\"" + nic + "\"], []]}";
         LOG(INFO) << "nic_priority_matrix: " << matrix;
         char* matrix_cstr = const_cast<char*>(matrix.c_str());
         void* args[] = {matrix_cstr};
@@ -103,15 +104,15 @@ int main(int argc, char** argv) {
     size_t chunk_bytes = 0;
     int num_bufs = 1;
     if (FLAGS_chunk_gb > 0) {
-        chunk_bytes =
-            static_cast<size_t>(FLAGS_chunk_gb * 1024 * 1024 * 1024);
+        chunk_bytes = static_cast<size_t>(FLAGS_chunk_gb * 1024 * 1024 * 1024);
         num_bufs = (size_bytes + chunk_bytes - 1) / chunk_bytes;
     } else {
         chunk_bytes = size_bytes;
     }
     LOG(INFO) << "Plan: " << num_bufs << " buffers × "
-              << chunk_bytes / (1024 * 1024) << " MB = "
-              << (num_bufs * chunk_bytes) / (1024ULL * 1024 * 1024) << " GB";
+              << chunk_bytes / (1024 * 1024)
+              << " MB = " << (num_bufs * chunk_bytes) / (1024ULL * 1024 * 1024)
+              << " GB";
 
     // Allocate all buffers with hugepages
     std::vector<void*> bufs;
@@ -149,10 +150,9 @@ int main(int argc, char** argv) {
         }
         if ((i + 1) % 50 == 0 || i == num_bufs - 1) {
             auto now = std::chrono::steady_clock::now();
-            double elapsed =
-                std::chrono::duration<double>(now - t0).count();
-            LOG(INFO) << "  registered " << (i + 1) << "/" << num_bufs
-                      << " (" << elapsed << "s)";
+            double elapsed = std::chrono::duration<double>(now - t0).count();
+            LOG(INFO) << "  registered " << (i + 1) << "/" << num_bufs << " ("
+                      << elapsed << "s)";
         }
     }
     auto t1 = std::chrono::steady_clock::now();
