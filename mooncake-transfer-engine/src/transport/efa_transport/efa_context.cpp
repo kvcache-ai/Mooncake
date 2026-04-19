@@ -164,6 +164,15 @@ int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                           int max_endpoints) {
     endpoint_store_ = std::make_shared<EfaEndpointStore>(max_endpoints);
 
+#if !defined(USE_CUDA) && !defined(USE_HIP)
+    // When built without GPU support, prevent libfabric's EFA provider from
+    // dlopen-ing libcudart/libcuda at fi_getinfo/fi_domain time. That
+    // initialization creates a CUDA primary context on GPU 0 and leaks
+    // ~616 MiB of device memory even when no GPU memory is ever registered.
+    // Only set if the user hasn't explicitly configured FI_HMEM.
+    setenv("FI_HMEM", "system", 0);
+#endif
+
     // Setup hints for EFA provider
     hints_ = fi_allocinfo();
     if (!hints_) {
@@ -181,8 +190,11 @@ int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     std::string domain_name = device_name_ + "-rdm";
     hints_->domain_attr->name = strdup(domain_name.c_str());
     hints_->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR |
-                                   FI_MR_ALLOCATED | FI_MR_PROV_KEY |
-                                   FI_MR_HMEM;
+                                   FI_MR_ALLOCATED | FI_MR_PROV_KEY
+#if defined(USE_CUDA) || defined(USE_HIP)
+                                   | FI_MR_HMEM
+#endif
+        ;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
     // Get fabric info
