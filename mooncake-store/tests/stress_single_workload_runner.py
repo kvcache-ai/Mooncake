@@ -221,25 +221,34 @@ def main():
         "batch": parse_list_arg(args.batch),
     }
 
-    # P2P specific sweep dims
-    p2p_extra_dims = {
-        "p2p_local_transfer_mode": parse_list_arg(args.p2p_local_transfer_mode, type_fn=str),
-        "local_memcpy_async_worker_num": parse_list_arg(args.local_memcpy_async_worker_num),
-        "route_cache_max_memory_mb": parse_list_arg(args.route_cache_max_memory_mb),
-        "route_cache_ttl_ms": parse_list_arg(args.route_cache_ttl_ms),
-    }
+    # P2P specific sweep dims — local_memcpy_async_worker_num only applies to memcpy mode.
+    transfer_modes = parse_list_arg(args.p2p_local_transfer_mode, type_fn=str)
+    worker_nums = parse_list_arg(args.local_memcpy_async_worker_num)
+    route_cache_mems = parse_list_arg(args.route_cache_max_memory_mb)
+    route_cache_ttls = parse_list_arg(args.route_cache_ttl_ms)
+
+    p2p_combinations = []
+    for transfer_mode, rc_mem, rc_ttl in itertools.product(transfer_modes, route_cache_mems, route_cache_ttls):
+        if transfer_mode == "te":
+            p2p_combinations.append({
+                "p2p_local_transfer_mode": transfer_mode,
+                "local_memcpy_async_worker_num": None,
+                "route_cache_max_memory_mb": rc_mem,
+                "route_cache_ttl_ms": rc_ttl,
+            })
+        else:
+            for wk in worker_nums:
+                p2p_combinations.append({
+                    "p2p_local_transfer_mode": transfer_mode,
+                    "local_memcpy_async_worker_num": wk,
+                    "route_cache_max_memory_mb": rc_mem,
+                    "route_cache_ttl_ms": rc_ttl,
+                })
 
     results = []
-    
-    # Logic: Iterating through external configurations
-    # For each config, if Centralization is requested, run it once (ignoring P2P dims)
-    # If P2P is requested, run it for all combinations of P2P dims
-    
+
     base_keys = list(base_sweep_dims.keys())
     base_combinations = list(itertools.product(*base_sweep_dims.values()))
-    
-    p2p_keys = list(p2p_extra_dims.keys())
-    p2p_combinations = list(itertools.product(*p2p_extra_dims.values()))
 
     total_runs = 0
     if "Centralization" in modes:
@@ -271,9 +280,8 @@ def main():
 
         # 2. Run P2P with all extra dims
         if "P2P" in modes:
-            for p2p_combo in p2p_combinations:
+            for p2p_cfg in p2p_combinations:
                 current += 1
-                p2p_cfg = dict(zip(p2p_keys, p2p_combo))
                 transfer_mode = p2p_cfg["p2p_local_transfer_mode"]
                 wk = p2p_cfg["local_memcpy_async_worker_num"]
                 rc_mem = p2p_cfg["route_cache_max_memory_mb"]
@@ -360,7 +368,8 @@ def print_matrix_summary(results):
         put_lat = f"{r['put_p50']:<6.1f} {r['put_p90']:<6.1f} {r['put_p99']:<6.1f}"
         get_lat = f"{r['get_p50']:<6.1f} {r['get_p90']:<6.1f} {r['get_p99']:<6.1f}"
         transfer_mode = str(r.get('p2p_local_transfer_mode', '-'))
-        wk = str(r.get('local_memcpy_async_worker_num', '-'))
+        wk_val = r.get('local_memcpy_async_worker_num')
+        wk = '-' if wk_val is None else str(wk_val)
         print(f"{r['mode']:<15} | {r['threads']:<3} | {r.get('batch', 1):<3} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "
               f"{transfer_mode:<12} | {wk:<7} | "
               f"{r['put_throughput']:<10.1f} | {r['get_throughput']:<10.1f} | "

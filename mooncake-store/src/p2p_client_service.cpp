@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <coroutine>
 #include <cstdlib>
 #include <exception>
 #include <future>
@@ -586,72 +587,48 @@ inline bool IsAlreadyExistsError(ErrorCode err) {
            err == ErrorCode::OBJECT_ALREADY_EXISTS;
 }
 
-// Tries remote candidates one at a time via chained async RPCs;
-struct WriteRetryContinuation
-    : std::enable_shared_from_this<WriteRetryContinuation> {
-    std::vector<P2PProxyDescriptor> proxies;  // all remote candidates
-    size_t next = 0;
-    std::shared_ptr<RemoteWriteRequest> write_req;
-    std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise;
-
-    // Nullable — set to nullptr when route cache is disabled.
-    RouteCache* route_cache = nullptr;
-    // Pointer to the service's GetOrCreatePeerClient (thread-safe via mutex).
-    std::function<PeerClient&(const std::string&)> get_peer;
-    std::string key;
-
-    void Dispatch() {
-        if (next >= proxies.size()) {
-            promise->set_value(tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
-            return;
-        }
-
-        auto proxy = proxies[next++];
-        auto self = shared_from_this();
-        std::string endpoint =
-            proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
-        auto& peer = get_peer(endpoint);
-
-        peer.AsyncWriteRemoteData(*write_req)
-            .start(  // callback
-                [self, proxy](
-                    async_simple::Try<tl::expected<UUID, ErrorCode>>&& result) {
-                    self->OnWriteResponse(proxy, std::move(result));
-                });
-    }
-
-    void OnWriteResponse(
-        P2PProxyDescriptor proxy,
-        async_simple::Try<tl::expected<UUID, ErrorCode>>&& result) {
-        try {
-            auto& val = result.value();
-            if (val) {
-                if (route_cache) {
-                    P2PProxyDescriptor np = proxy;
-                    np.segment_id = val.value();
-                    route_cache->Upsert(key, {np});
+// Coroutine tries remote write candidates one at a time, retrying on failure.
+static async_simple::coro::Lazy<void> RunWriteRetry(
+    std::vector<P2PProxyDescriptor> proxies,
+    std::shared_ptr<RemoteWriteRequest> write_req,
+    std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise,
+    RouteCache* route_cache,
+    std::function<PeerClient&(const std::string&)> get_peer, std::string key) {
+    try {
+        for (auto& proxy : proxies) {
+            try {
+                std::string endpoint =
+                    proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+                auto& peer = get_peer(endpoint);
+                auto result = co_await peer.AsyncWriteRemoteData(*write_req);
+                if (result.has_value()) {
+                    if (route_cache) {
+                        P2PProxyDescriptor np = proxy;
+                        np.segment_id = result.value();
+                        route_cache->Upsert(key, {np});
+                    }
+                    promise->set_value({});
+                    co_return;
+                } else if (IsAlreadyExistsError(result.error())) {
+                    promise->set_value({});
+                    co_return;
+                } else {
+                    LOG(ERROR) << "Failed to write to remote, key: " << key
+                               << ", error: " << result.error();
                 }
-                promise->set_value({});
-            } else if (IsAlreadyExistsError(val.error())) {
-                // Key already exists — treat as success.
-                promise->set_value({});
-            } else {
-                // This candidate failed; try the next one
+            } catch (const std::exception& e) {
                 LOG(ERROR) << "Failed to write to remote, key: " << key
-                           << ", error: " << val.error();
-                Dispatch();
+                           << ", exception: " << e.what();
+            } catch (...) {
+                LOG(ERROR) << "Failed to write to remote, key: " << key
+                           << ", unknown exception";
             }
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Failed to write to remote, key: " << key
-                       << ", exception: " << e.what();
-            Dispatch();
-        } catch (...) {
-            LOG(ERROR) << "Failed to write to remote, key: " << key
-                       << ", unknown exception";
-            Dispatch();
         }
+        promise->set_value(tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+    } catch (...) {
+        promise->set_value(tl::unexpected(ErrorCode::INTERNAL_ERROR));
     }
-};
+}
 
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
 P2PClientService::CreatePutHandle(const std::string& key,
@@ -735,17 +712,14 @@ P2PClientService::CreatePutHandle(const std::string& key,
         std::make_shared<std::promise<tl::expected<void, ErrorCode>>>();
     auto future = promise->get_future();
 
-    auto cont = std::make_shared<WriteRetryContinuation>();
-    cont->proxies = std::move(remote_proxies);
-    cont->write_req = write_req;
-    cont->promise = promise;
-    cont->route_cache = route_cache_ ? &(*route_cache_) : nullptr;
-    cont->get_peer = [this](const std::string& ep) -> PeerClient& {
-        return GetOrCreatePeerClient(ep);
-    };
-    cont->key = key;
-
-    cont->Dispatch();  // fires first RPC, returns immediately
+    RunWriteRetry(
+        std::move(remote_proxies), write_req, promise,
+        route_cache_ ? &(*route_cache_) : nullptr,
+        [this](const std::string& ep) -> PeerClient& {
+            return GetOrCreatePeerClient(ep);
+        },
+        key)
+        .start([](auto&&) {});
 
     return RemoteRpcHandle<void>::Create(std::move(write_req),
                                          std::move(future));
@@ -1079,66 +1053,41 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
     return std::move(fetch_result.value());
 }
 
-// Tries remote route from RouteIterator one by one via chained async RPCs;
-struct ReadRetryContinuation
-    : std::enable_shared_from_this<ReadRetryContinuation> {
-    // Friend of P2PClientService — may access private nested types.
-    using RouteIterator = P2PClientService::RouteIterator;
-    using ResolvedRoute = P2PClientService::ResolvedRoute;
-
-    RouteIterator iter;
-    std::shared_ptr<RemoteReadRequest> req;
-    std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise;
-
-    ReadRetryContinuation(
-        RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
-        std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise)
-        : iter(std::move(iter)),
-          req(std::move(req)),
-          promise(std::move(promise)) {}
-
-    void Dispatch() {
-        auto maybe_route = iter.Next();
-        if (!maybe_route) {
-            promise->set_value(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
-            return;
-        }
-        auto route = *maybe_route;
-        auto self = shared_from_this();
-        route.peer->AsyncReadRemoteData(*req).start(  // callback
-            [self,
-             route](async_simple::Try<tl::expected<void, ErrorCode>>&& result) {
-                self->OnReadResponse(route, std::move(result));
-            });
-    }
-
-    void OnReadResponse(
-        ResolvedRoute route,
-        async_simple::Try<tl::expected<void, ErrorCode>>&& result) {
-        try {
-            if (result.value()) {
-                promise->set_value({});
-            } else {
+// Coroutine iterates route candidates and retries on failure.
+async_simple::coro::Lazy<void> P2PClientService::RunReadRetry(
+    RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
+    std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise) {
+    ErrorCode final_result = ErrorCode::OBJECT_NOT_FOUND;
+    try {
+        while (auto route = co_await iter.AsyncNext()) {
+            try {
+                auto result = co_await route->peer->AsyncReadRemoteData(*req);
+                if (result.has_value()) {
+                    promise->set_value({});
+                    co_return;
+                } else if (result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                    LOG(ERROR) << "Failed to get from remote, key: " << req->key
+                               << ", error: " << result.error();
+                } else {
+                    final_result = result.error();
+                }
+            } catch (const std::exception& e) {
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                           << ", error: " << result.value().error();
-                iter.Evict(route);
-                Dispatch();
+                           << ", exception: " << e.what();
+            } catch (...) {
+                LOG(ERROR) << "Failed to get from remote, key: " << req->key
+                           << ", unknown exception";
             }
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                       << ", exception: " << e.what();
-            Dispatch();
-        } catch (...) {
-            LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                       << ", unknown exception";
-            Dispatch();
+            iter.Evict(*route);
         }
+        promise->set_value(tl::unexpected(final_result));
+    } catch (...) {
+        promise->set_value(tl::unexpected(ErrorCode::INTERNAL_ERROR));
     }
-};
+}
 
 tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
     const std::string& key, std::vector<Slice>& slices, RouteIterator iter) {
-    // Build the shared read request (kept alive via shared_ptr across retries).
     auto req = std::make_shared<RemoteReadRequest>();
     req->key = key;
     for (const auto& s : slices) {
@@ -1154,9 +1103,7 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
     auto future = promise->get_future();
 
     const uint64_t object_size = iter.object_size();
-    auto cont =
-        std::make_shared<ReadRetryContinuation>(std::move(iter), req, promise);
-    cont->Dispatch();  // fires first RPC, returns immediately
+    RunReadRetry(std::move(iter), req, promise).start([](auto&&) {});
 
     ReadTaskHandle res;
     res.data_size = object_size;
@@ -1171,8 +1118,7 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
 
 P2PClientService::RouteIterator::RouteIterator(
     std::string key, std::vector<ResolvedRoute> initial, uint64_t object_size,
-    RouteCache* route_cache,
-    std::function<std::vector<ResolvedRoute>()> master_fetch)
+    RouteCache* route_cache, MasterFetch master_fetch)
     : key_(std::move(key)),
       routes_(std::move(initial)),
       object_size_(object_size),
@@ -1184,7 +1130,9 @@ void P2PClientService::RouteIterator::Prime() {
         return;
     }
     master_queried_ = true;
-    auto master_routes = master_fetch_();
+    // syncAwait is safe here: Prime() is always called from the user thread,
+    // not an IO/RPC callback thread.
+    auto master_routes = async_simple::coro::syncAwait(master_fetch_());
     if (master_routes.empty()) {
         return;
     }
@@ -1197,17 +1145,18 @@ void P2PClientService::RouteIterator::Prime() {
     }
 }
 
-auto P2PClientService::RouteIterator::Next() -> std::optional<ResolvedRoute> {
+auto P2PClientService::RouteIterator::AsyncNext()
+    -> async_simple::coro::Lazy<std::optional<ResolvedRoute>> {
     if (idx_ < routes_.size()) {
-        return routes_[idx_++];
+        co_return routes_[idx_++];
     }
     if (master_queried_) {
-        return std::nullopt;
+        co_return std::nullopt;
     }
     master_queried_ = true;
-    auto master_routes = master_fetch_();
+    auto master_routes = co_await master_fetch_();
     if (master_routes.empty()) {
-        return std::nullopt;
+        co_return std::nullopt;
     }
     UpsertToCache(master_routes);
     routes_.insert(routes_.end(),
@@ -1217,9 +1166,9 @@ auto P2PClientService::RouteIterator::Next() -> std::optional<ResolvedRoute> {
         object_size_ = routes_[idx_].object_size;
     }
     if (idx_ < routes_.size()) {
-        return routes_[idx_++];
+        co_return routes_[idx_++];
     }
-    return std::nullopt;
+    co_return std::nullopt;
 }
 
 void P2PClientService::RouteIterator::UpsertToCache(
@@ -1273,25 +1222,41 @@ auto P2PClientService::BuildRouteIter(const std::string& key,
     }
 
     uint64_t object_size = routes.empty() ? 0 : routes.front().object_size;
-    return RouteIterator(
-        key, std::move(routes), object_size,
-        route_cache_ ? &(*route_cache_) : nullptr,
-        [this, key, config]() { return ResolveRoutesFromMaster(key, config); });
+    return RouteIterator(key, std::move(routes), object_size,
+                         route_cache_ ? &(*route_cache_) : nullptr,
+                         [this, key, config]() {
+                             return AsyncResolveRoutesFromMaster(key, config);
+                         });
 }
 
-std::vector<P2PClientService::ResolvedRoute>
-P2PClientService::ResolveRoutesFromMaster(const std::string& key,
-                                          const ReadRouteConfig& config) {
+async_simple::coro::Lazy<std::vector<P2PClientService::ResolvedRoute>>
+P2PClientService::AsyncResolveRoutesFromMaster(const std::string& key,
+                                               const ReadRouteConfig& config) {
     std::vector<ResolvedRoute> result;
-    auto size_result = QueryReplicaSize(key, config);
-    if (!size_result) {
-        if (size_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+    auto replica_result =
+        co_await master_client_.AsyncGetReplicaList(key, config);
+    if (!replica_result) {
+        if (replica_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to query replica size for key: " << key
-                       << ", error: " << size_result.error();
+                       << ", error: " << replica_result.error();
         }
-        return result;
+        co_return result;
     }
-    auto& [replicas, total_size] = size_result.value();
+    auto& replicas = replica_result.value().replicas;
+    if (replicas.empty()) {
+        co_return result;
+    }
+    uint64_t total_size = 0;
+    for (auto& replica : replicas) {
+        if (replica.is_p2p_proxy_replica()) {
+            total_size = calculate_total_size(replica);
+            break;
+        }
+    }
+    if (total_size == 0) {
+        LOG(ERROR) << "Cannot determine size for key: " << key;
+        co_return result;
+    }
     for (const auto& replica : replicas) {
         if (!replica.is_p2p_proxy_replica()) {
             continue;
@@ -1307,39 +1272,7 @@ P2PClientService::ResolveRoutesFromMaster(const std::string& key,
         route.proxy = proxy;
         result.push_back(std::move(route));
     }
-    return result;
-}
-
-tl::expected<std::pair<std::vector<Replica::Descriptor>, uint64_t>, ErrorCode>
-P2PClientService::QueryReplicaSize(const std::string& key,
-                                   const ReadRouteConfig& config) {
-    auto replica_result = master_client_.GetReplicaList(key, config);
-    if (!replica_result) {
-        if (replica_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            LOG(ERROR) << "Failed to query replica size for key: " << key
-                       << ", error: " << replica_result.error();
-        }
-        return tl::unexpected(replica_result.error());
-    }
-
-    auto& replicas = replica_result.value().replicas;
-    if (replicas.empty()) {
-        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    uint64_t total_size = 0;
-    for (auto& replica : replicas) {
-        if (replica.is_p2p_proxy_replica()) {
-            total_size = calculate_total_size(replica);
-            break;
-        }
-    }
-    if (total_size == 0) {
-        LOG(ERROR) << "Cannot determine size for key: " << key;
-        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    return std::make_pair(std::move(replicas), total_size);
+    co_return result;
 }
 
 // ============================================================================

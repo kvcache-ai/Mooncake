@@ -7,7 +7,9 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <coroutine>
 #include <async_simple/Try.h>
+#include <async_simple/coro/Lazy.h>
 
 #include "async_metadata_notifier.h"
 #include "client_service.h"
@@ -20,8 +22,6 @@
 #include "task_handle.h"
 
 namespace mooncake {
-
-struct ReadRetryContinuation;
 
 class P2PClientService final : public ClientService {
    public:
@@ -231,8 +231,6 @@ class P2PClientService final : public ClientService {
     HeartbeatRequest build_heartbeat_request() override;
 
    private:
-    friend struct ReadRetryContinuation;
-
     struct ResolvedRoute {
         PeerClient* peer = nullptr;
         uint64_t object_size = 0;
@@ -244,15 +242,18 @@ class P2PClientService final : public ClientService {
     // master fallback. Call Prime() to pre-load before accessing object_size().
     class RouteIterator {
        public:
+        using MasterFetch = std::function<
+            async_simple::coro::Lazy<std::vector<ResolvedRoute>>()>;
+
         RouteIterator(std::string key, std::vector<ResolvedRoute> initial,
                       uint64_t object_size, RouteCache* route_cache,
-                      std::function<std::vector<ResolvedRoute>()> master_fetch);
+                      MasterFetch master_fetch);
 
         uint64_t object_size() const { return object_size_; }
         bool empty() const { return routes_.empty() && master_queried_; }
 
         void Prime();
-        std::optional<ResolvedRoute> Next();
+        async_simple::coro::Lazy<std::optional<ResolvedRoute>> AsyncNext();
         void Evict(const ResolvedRoute& route);
 
        private:
@@ -264,14 +265,19 @@ class P2PClientService final : public ClientService {
         bool master_queried_ = false;
         uint64_t object_size_ = 0;
         RouteCache* route_cache_ = nullptr;
-        std::function<std::vector<ResolvedRoute>()> master_fetch_;
+        MasterFetch master_fetch_;
     };
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
         const std::string& key, const ReadRouteConfig& config);
 
-    std::vector<ResolvedRoute> ResolveRoutesFromMaster(
-        const std::string& key, const ReadRouteConfig& config);
+    async_simple::coro::Lazy<std::vector<ResolvedRoute>>
+    AsyncResolveRoutesFromMaster(const std::string& key,
+                                 const ReadRouteConfig& config);
+
+    static async_simple::coro::Lazy<void> RunReadRetry(
+        RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
+        std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise);
 
    private:
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> CreatePutHandle(
@@ -295,14 +301,6 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
         const std::string& key, std::vector<Slice>& slices, RouteIterator iter);
-
-    /**
-     * @brief Query Master for replica list and calculate total object size.
-     * @return Pair of (replicas, total_size) on success.
-     */
-    tl::expected<std::pair<std::vector<Replica::Descriptor>, uint64_t>,
-                 ErrorCode>
-    QueryReplicaSize(const std::string& key, const ReadRouteConfig& config);
 
     /**
      * @brief Get or create a PeerClient for the given endpoint.
