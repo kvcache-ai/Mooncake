@@ -454,7 +454,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
-    bool enable_ssd_offload, bool start_offload_rpc_server) {
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage = use_hugepage_ &&
@@ -715,6 +716,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     if (enable_ssd_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
+        if (!ssd_offload_path.empty()) {
+            file_storage_config.storage_filepath = ssd_offload_path;
+        }
         file_storage_ = std::make_shared<FileStorage>(
             file_storage_config, client_, this->local_rpc_addr,
             client_->GetSsdMetricPtr());
@@ -742,11 +746,12 @@ int RealClient::setup_real(
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path, bool enable_ssd_offload) {
+    const std::string &ipc_socket_path, bool enable_ssd_offload,
+    const std::string &ssd_offload_path) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
-        ipc_socket_path, 50052, enable_ssd_offload, true));
+        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path));
 }
 
 namespace {
@@ -837,6 +842,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    std::string ssd_offload_path = get_config(config, "ssd_offload_path");
+
     std::string enable_ssd_offload_str =
         get_config(config, "enable_ssd_offload", "false");
     std::transform(enable_ssd_offload_str.begin(), enable_ssd_offload_str.end(),
@@ -848,7 +855,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     return setup_internal(local_hostname, metadata_server, global_segment_size,
                           local_buffer_size, protocol, rdma_devices,
                           master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true);
+                          enable_ssd_offload, true, ssd_offload_path);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -3890,6 +3897,21 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
         }
     }
     return replica_map;
+}
+
+std::vector<std::string> RealClient::batch_replica_clear(
+    const std::vector<std::string> &keys, const std::string &segment_name) {
+    if (!client_) {
+        LOG(ERROR) << "batch_replica_clear: client not initialized";
+        return {};
+    }
+    auto result =
+        client_->BatchReplicaClear(keys, client_->getClientId(), segment_name);
+    if (result) {
+        return result.value();
+    }
+    LOG(ERROR) << "batch_replica_clear failed: " << toString(result.error());
+    return {};
 }
 
 tl::expected<UUID, ErrorCode> RealClient::create_copy_task(

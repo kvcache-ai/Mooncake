@@ -25,7 +25,8 @@ class DummyClient : public PyClient {
                    const std::string &master_server_addr,
                    const std::shared_ptr<TransferEngine> &transfer_engine,
                    const std::string &ipc_socket_path,
-                   bool enable_ssd_offload = false) {
+                   bool enable_ssd_offload = false,
+                   const std::string &ssd_offload_path = "") {
         // Dummy client does not support real setup
         return -1;
     };
@@ -148,6 +149,12 @@ class DummyClient : public PyClient {
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
+
+    std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") override {
+        return {};
+    }
 
     int tearDownAll();
 

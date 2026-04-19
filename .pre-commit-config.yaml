@@ -23,6 +23,16 @@ repos:
       - id: check-added-large-files
         args: ['--maxkb=1024']
 
+  - repo: local
+    hooks:
+      - id: mooncake-code-format
+        name: Run Mooncake code format script
+        entry: ./scripts/code_format.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        require_serial: true
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.6.9
     hooks:

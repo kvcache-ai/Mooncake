@@ -211,8 +211,8 @@ class PyClient {
         const std::string &protocol, const std::string &rdma_devices,
         const std::string &master_server_addr,
         const std::shared_ptr<TransferEngine> &transfer_engine,
-        const std::string &ipc_socket_path,
-        bool enable_ssd_offload = false) = 0;
+        const std::string &ipc_socket_path, bool enable_ssd_offload = false,
+        const std::string &ssd_offload_path = "") = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
@@ -329,6 +329,10 @@ class PyClient {
     batch_get_replica_desc(const std::vector<std::string> &keys) = 0;
     virtual std::vector<Replica::Descriptor> get_replica_desc(
         const std::string &key) = 0;
+
+    virtual std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") = 0;
 
     virtual int tearDownAll() = 0;
 

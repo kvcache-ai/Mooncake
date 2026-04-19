@@ -61,6 +61,8 @@ class Client {
    public:
     ~Client();
 
+    const UUID& getClientId() const { return client_id_; }
+
     /**
      * @brief Creates and initializes a new Client instance
      * @param local_hostname Local host address (IP:Port)
