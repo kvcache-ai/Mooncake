@@ -272,7 +272,9 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     // so hugepage-backed memory avoids unnecessary splitting.
     size_t page_size = detectBufferPageSize(addr);
     size_t pte_limit = getMaxPteEntries() * page_size;
-    size_t chunk_limit = (max_mr > 0) ? std::min(max_mr, pte_limit) : 0;
+    // When max_mr_size is not configured, fall back to pte_limit so that
+    // PTE-aware splitting still kicks in for large buffers on 4KB pages.
+    size_t chunk_limit = (max_mr > 0) ? std::min(max_mr, pte_limit) : pte_limit;
     LOG(INFO) << "Auto-split params: page_size=" << page_size
               << ", max_pte_entries=" << getMaxPteEntries()
               << ", pte_limit=" << pte_limit << ", max_mr_size=" << max_mr
@@ -280,7 +282,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
 
     // Determine chunk boundaries
     std::vector<std::pair<void*, size_t>> chunks;
-    if (max_mr > 0 && length > chunk_limit) {
+    if (length > chunk_limit) {
         size_t offset = 0;
         while (offset < length) {
             size_t chunk_len = std::min(chunk_limit, length - offset);
