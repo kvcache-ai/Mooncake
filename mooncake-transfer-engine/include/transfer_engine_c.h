@@ -121,6 +121,11 @@ segment_id_t openSegmentNoCache(transfer_engine_t engine,
 
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id);
 
+// Eagerly pre-connect all EFA endpoints to `segment_name`. Eliminates the
+// first-batch fi_av_insert stall (observed ~6 s for 16 local NICs × N peer
+// NICs). No-op on non-EFA installs. Idempotent. Returns 0 on success.
+int warmupEfaSegment(transfer_engine_t engine, const char *segment_name);
+
 int removeLocalSegment(transfer_engine_t engine, const char *segment_name);
 
 void destroyTransferEngine(transfer_engine_t engine);

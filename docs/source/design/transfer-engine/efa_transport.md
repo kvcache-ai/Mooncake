@@ -299,6 +299,27 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 - Allocate buffers on both NUMA nodes for balanced NIC utilization (the bench tool does this by default for CPU mode)
 - On 16-NIC instances (p5en), writes are NUMA-sensitive: 8 local-NUMA NICs reach 90 Gbps each, while 8 cross-NUMA NICs only reach ~20 Gbps without NUMA-split
 
+### Eager endpoint warmup (first-request latency)
+
+libfabric `FI_EP_RDM` endpoints resolve peer addresses lazily: `fi_av_insert()` and the metadata handshake fire on the first send to each `(local_ctx, peer_nic)` pair. On 16-NIC instances that gives `16 × N_peer_NICs` serial handshakes inside the first `submitTransfer`, which shows up as a single-digit-second first-batch stall (measured ~4 s on p6-B300 for a 100 × 0.5 MB batch; the first batch runs at <0.1 GB/s while the CQ drains, steady-state afterwards is unaffected).
+
+Mooncake exposes an explicit eager-warmup API to eliminate the stall:
+
+- C++: `EfaTransport::warmupSegment(const std::string& segment_name)`
+- C: `int warmupEfaSegment(transfer_engine_t engine, const char *segment_name)`
+- Rust: `TransferEngine::warmup_efa_segment(name: &str)`
+
+Call it once per peer segment, right after `openSegment` (or after any metadata change that adds a new peer). Every `(local_ctx, peer_nic)` endpoint is connected concurrently via `std::async`; the critical path becomes `max(handshake RTT)` instead of `sum(handshake RTT)`. The call is idempotent — safe to re-run.
+
+Measured on p6-B300 (16 local NICs × 16 peer NICs, dual-NUMA initiator, 100 × 0.5 MB batch):
+
+| | first-batch latency | steady-state |
+|---|---:|---:|
+| No warmup | 4,043 ms | 141 GB/s |
+| `warmup_efa_segment` (256 endpoints connected in 4.1 s) | **13.5 ms** (~300×) | 230 GB/s |
+
+The warmup call itself takes roughly the same wall time as the stall it replaces — the win is that it's a one-time setup cost decoupled from the critical path of the first real transfer, not paid inside your latency budget.
+
 ## Usage with vLLM
 
 ### Prefill Instance

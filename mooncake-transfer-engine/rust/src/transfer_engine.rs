@@ -263,6 +263,20 @@ impl TransferEngine {
         }
     }
 
+    /// Eagerly establish EFA endpoints to `segment_name` so the first
+    /// `submit_transfer` doesn't pay the serial fi_av_insert cost. No-op on
+    /// non-EFA transports. Call after `open_segment` (and after the metadata
+    /// has the peer's NIC list published).
+    pub fn warmup_efa_segment(&self, name: &str) -> Result<()> {
+        let name_c = CString::new(name).map_err(|_| anyhow!("CString::new failed"))?;
+        let ret = unsafe { bindings::warmupEfaSegment(self.engine, name_c.as_ptr()) };
+        if ret < 0 {
+            bail!("warmupEfaSegment failed for {}: {}", name, ret)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn sync_segment_cache(&self) -> Result<()> {
         let ret = unsafe { bindings::syncSegmentCache(self.engine) };
         if ret < 0 {

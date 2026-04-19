@@ -667,6 +667,78 @@ int EfaTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
+int EfaTransport::warmupSegment(const std::string& segment_name) {
+    if (!metadata_) {
+        LOG(ERROR) << "EfaTransport::warmupSegment: metadata_ is null";
+        return ERR_INVALID_ARGUMENT;
+    }
+    if (segment_name.empty() || segment_name == local_server_name_) {
+        // Loopback / empty name — nothing to pre-connect.
+        return 0;
+    }
+
+    auto desc = metadata_->getSegmentDescByName(segment_name);
+    if (!desc) {
+        LOG(ERROR) << "EfaTransport::warmupSegment: segment '" << segment_name
+                   << "' not found in metadata (did you openSegment() first?)";
+        return ERR_INVALID_ARGUMENT;
+    }
+    if (desc->devices.empty()) {
+        LOG(WARNING) << "EfaTransport::warmupSegment: segment '"
+                     << segment_name << "' has no devices";
+        return 0;
+    }
+
+    // Build peer_nic_path list: "<segment_name>@<device_name>" for each NIC.
+    std::vector<std::string> peer_paths;
+    peer_paths.reserve(desc->devices.size());
+    for (const auto& dev : desc->devices) {
+        peer_paths.emplace_back(segment_name + "@" + dev.name);
+    }
+
+    // Warm up every (local_ctx, peer_nic) pair concurrently. Each
+    // EfaContext::endpoint() + setupConnectionsByActive() is idempotent and
+    // takes its own lock, so parallel calls across distinct peer_nic_paths
+    // (and distinct contexts) are safe. We use std::async to get roughly
+    // per-pair parallelism — the critical path is now max(handshake RTT) not
+    // sum(handshake RTT).
+    auto t0 = std::chrono::steady_clock::now();
+    size_t n_pairs = context_list_.size() * peer_paths.size();
+    std::vector<std::future<int>> futs;
+    futs.reserve(n_pairs);
+    for (auto& ctx : context_list_) {
+        for (const auto& path : peer_paths) {
+            futs.emplace_back(
+                std::async(std::launch::async, [ctx, path]() -> int {
+                    auto ep = ctx->endpoint(path);
+                    if (!ep) {
+                        LOG(WARNING) << "warmupSegment: endpoint() returned "
+                                        "null for "
+                                     << path;
+                        return -1;
+                    }
+                    if (ep->connected()) return 0;
+                    return ep->setupConnectionsByActive();
+                }));
+        }
+    }
+    int ok = 0, fail = 0;
+    for (auto& f : futs) {
+        int rc = f.get();
+        if (rc == 0) ++ok; else ++fail;
+    }
+    auto elapsed = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    LOG(INFO) << "EfaTransport::warmupSegment('" << segment_name
+              << "'): " << ok << "/" << n_pairs
+              << " endpoints connected (" << fail << " failed) in "
+              << elapsed << "s ("
+              << context_list_.size() << " local NICs × "
+              << peer_paths.size() << " peer NICs)";
+    return fail == 0 ? 0 : ERR_ENDPOINT;
+}
+
 Status EfaTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
