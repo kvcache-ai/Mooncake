@@ -224,6 +224,30 @@ Earlier CPU-to-CPU tuning results (before EFA striping optimization, when `MC_SL
 
 </details>
 
+#### p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
+
+Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
+
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=2147483648`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| block=1MB, threads=16, batch=128 | 701 GB/s | **697 GB/s** |
+| **block=1MB, threads=32, batch=64** | **752 GB/s** | 713 GB/s |
+| block=1MB, threads=32, batch=32 | 751 GB/s | - |
+| block=1MB, threads=64, batch=32 | 728 GB/s | - |
+
+> **Peak: 752 GB/s write**, reaching ~94% of the 800 GB/s theoretical line rate (16×400 Gbps). GPUDirect RDMA bypasses DRAM entirely (HBM3e → PCIe switch → NIC), so performance is not bottlenecked by CPU memory bandwidth.
+
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| **block=1MB, threads=32, batch=128, buf=4GB** | **230 GB/s** | 180 GB/s |
+| block=16MB, threads=32, batch=8, buf=8GB (striping off) | 233 GB/s | - |
+
+> CPU-to-CPU is bounded by DRAM bandwidth (~250 GB/s/socket on Xeon 8559C). Per-NIC sampling shows NUMA-0 NICs at 90 Gbps and NUMA-1 NICs at 53 Gbps, confirming DRAM controller saturation rather than NIC limit.
+
 #### p5en.48xlarge (H200, 16 EFA × 200 Gbps)
 
 Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA devices) in the same AWS placement group.
@@ -253,8 +277,10 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 | Transport | Throughput | Notes |
 |-----------|-----------|-------|
+| **EFA GPU-to-GPU (B300)** | **752 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, ~94% line rate |
 | **EFA GPU-to-GPU (H200)** | **347 GB/s** | p5en.48xlarge, 16×200G, block=1MB |
 | **EFA GPU-to-GPU (B200)** | **313 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB |
+| **EFA CPU-to-CPU (B300)** | **230 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, DRAM-limited |
 | **EFA CPU-to-CPU (B200)** | **222 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB, DRAM-limited |
 | **EFA CPU-to-CPU (H200)** | **192 GB/s** | p5en.48xlarge, block=1MB, NUMA-split, DRAM-limited |
 | EFA (default params) | 69.47 GB/s | Default block=64KB |
