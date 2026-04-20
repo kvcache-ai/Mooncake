@@ -49,8 +49,9 @@ FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
 
     config.fsdir = GetEnvStringOr("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
 
-    config.enable_eviction =
-        GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction);
+    config.enable_eviction = GetEnvOr<bool>(
+        "MOONCAKE_OFFLOAD_ENABLE_EVICTION",
+        GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction));
 
     return config;
 }
@@ -64,11 +65,14 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     config.bucket_size_limit = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
 
-    config.max_total_size = GetEnvOr<int64_t>("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
-                                              config.max_total_size);
+    config.max_total_size =
+        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
+                          GetEnvOr<int64_t>("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
+                                            config.max_total_size));
 
-    const auto policy_str =
-        GetEnvStringOr("MOONCAKE_BUCKET_EVICTION_POLICY", "none");
+    const auto policy_str = GetEnvStringOr(
+        "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
+        GetEnvStringOr("MOONCAKE_BUCKET_EVICTION_POLICY", "none"));
     if (policy_str == "fifo") {
         config.eviction_policy = BucketEvictionPolicy::FIFO;
     } else if (policy_str == "lru") {
@@ -1718,6 +1722,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                       << orphaned_space_freed << " bytes";
         }
 
+        // When max_total_size is not explicitly set (<= 0), default to 90% of
+        // the physical disk capacity to match FilePerKey backend behavior.
+        if (bucket_backend_config_.max_total_size <= 0) {
+            constexpr double kDefaultQuotaPercentage = 0.9;
+            const auto space_info = fs::space(storage_path_);
+            bucket_backend_config_.max_total_size = static_cast<int64_t>(
+                space_info.capacity * kDefaultQuotaPercentage);
+            LOG(INFO) << "Bucket backend max_total_size not set; using "
+                      << kDefaultQuotaPercentage * 100 << "% of disk capacity: "
+                      << bucket_backend_config_.max_total_size << " bytes";
+        }
+
         bucket_id_generator_.emplace(max_bucket_id);
         if (max_bucket_id == BucketIdGenerator::INIT_NEW_START_ID) {
             LOG(INFO) << "Initialized BucketIdGenerator with fresh start. "
@@ -2187,8 +2203,7 @@ BucketStorageBackend::PendingEviction BucketStorageBackend::PrepareEviction(
     int64_t required_size) {
     PendingEviction result;
 
-    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE ||
-        bucket_backend_config_.max_total_size <= 0) {
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
         return result;
     }
 

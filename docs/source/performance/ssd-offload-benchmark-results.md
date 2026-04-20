@@ -141,7 +141,7 @@ mooncake_master \
 # SSD Offload Buffer: 20GB
 MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="/mnt/data/file_storage" \
 MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=21474836480 \
-MOONCAKE_USE_URING=1 \
+MOONCAKE_OFFLOAD_USE_URING=1 \
 mooncake_client \
     --host=127.0.0.1 \
     --global_segment_size=80GB \
