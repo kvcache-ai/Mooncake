@@ -183,14 +183,16 @@ impl PyMooncakeDistributedStore {
         server_address: &str,
     ) -> PyResult<i32> {
         let _ = (mem_pool_size, local_buffer_size);
-        let session = DummySession::connect(server_address).map_err(store_error_to_py)?;
+        let server_address = server_address.to_string();
+        let session = run_without_gil(move || DummySession::connect(&server_address))
+            .map_err(store_error_to_py)?;
         self.replace_backend(StoreBackend::Dummy(session));
         Ok(0)
     }
 
     fn close(&mut self) {
         if let Some(backend) = self.backend.take() {
-            backend.close();
+            allow_threads_ungil(move || backend.close());
         }
     }
 
@@ -234,9 +236,10 @@ impl PyMooncakeDistributedStore {
             with_soft_pin,
         );
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => dummy
-                .put(key, &value, tenant, policy.as_ref())
-                .map_err(store_error_to_py),
+            StoreBackend::Dummy(dummy) => {
+                run_without_gil(move || dummy.put(key, &value, tenant, policy.as_ref()))
+                    .map_err(store_error_to_py)
+            }
             StoreBackend::Real(dispatcher) => {
                 let key = key.to_string();
                 let tenant = tenant.map(str::to_string);
@@ -268,7 +271,8 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let value = match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {
-                let (status, value) = dummy.get(key, tenant).map_err(store_error_to_py)?;
+                let (status, value) =
+                    run_without_gil(move || dummy.get(key, tenant)).map_err(store_error_to_py)?;
                 if status != 0 {
                     return Err(PyKeyError::new_err(format!(
                         "dummy store get failed for key={key}"
@@ -288,8 +292,8 @@ impl PyMooncakeDistributedStore {
     fn is_exist(&self, key: &str, tenant: Option<&str>) -> PyResult<bool> {
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {
-                let results = dummy
-                    .batch_is_exist(&[key.to_string()], tenant)
+                let key = key.to_string();
+                let results = run_without_gil(move || dummy.batch_is_exist(&[key], tenant))
                     .map_err(store_error_to_py)?;
                 Ok(results.first().copied().unwrap_or_default() == 1)
             }
@@ -310,9 +314,10 @@ impl PyMooncakeDistributedStore {
     #[pyo3(signature = (keys, *, tenant = None))]
     fn batch_is_exist(&self, keys: Vec<String>, tenant: Option<&str>) -> PyResult<Vec<i32>> {
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => dummy
-                .batch_is_exist(&keys, tenant)
-                .map_err(store_error_to_py),
+            StoreBackend::Dummy(dummy) => {
+                run_without_gil(move || dummy.batch_is_exist(&keys, tenant))
+                    .map_err(store_error_to_py)
+            }
             StoreBackend::Real(dispatcher) => {
                 let item_count = keys.len();
                 let tenant = tenant.map(str::to_string);
@@ -358,7 +363,8 @@ impl PyMooncakeDistributedStore {
     fn get_size(&self, key: &str, tenant: Option<&str>) -> PyResult<usize> {
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {
-                let (status, value) = dummy.get(key, tenant).map_err(store_error_to_py)?;
+                let (status, value) =
+                    run_without_gil(move || dummy.get(key, tenant)).map_err(store_error_to_py)?;
                 if status != 0 {
                     return Ok(0);
                 }
@@ -380,9 +386,10 @@ impl PyMooncakeDistributedStore {
 
     fn register_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => dummy
-                .register_buffer(buffer_ptr, size)
-                .map_err(store_error_to_py),
+            StoreBackend::Dummy(dummy) => {
+                run_without_gil(move || dummy.register_buffer(buffer_ptr, size))
+                    .map_err(store_error_to_py)
+            }
             StoreBackend::Real(dispatcher) => {
                 let _ = pointer_from_usize(buffer_ptr)?;
                 run_without_gil(move || dispatcher.register_buffer(buffer_ptr, size))
@@ -394,9 +401,10 @@ impl PyMooncakeDistributedStore {
 
     fn unregister_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => dummy
-                .unregister_buffer(buffer_ptr, Some(size))
-                .map_err(store_error_to_py),
+            StoreBackend::Dummy(dummy) => {
+                run_without_gil(move || dummy.unregister_buffer(buffer_ptr, Some(size)))
+                    .map_err(store_error_to_py)
+            }
             StoreBackend::Real(dispatcher) => {
                 let _ = pointer_from_usize(buffer_ptr)?;
                 run_without_gil(move || dispatcher.unregister_buffer(buffer_ptr, size))
@@ -448,9 +456,10 @@ impl PyMooncakeDistributedStore {
             with_soft_pin,
         );
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => dummy
-                .put_from(key, buffer_ptr, size, tenant, policy.as_ref())
-                .map_err(store_error_to_py),
+            StoreBackend::Dummy(dummy) => run_without_gil(move || {
+                dummy.put_from(key, buffer_ptr, size, tenant, policy.as_ref())
+            })
+            .map_err(store_error_to_py),
             StoreBackend::Real(dispatcher) => {
                 let _ = pointer_from_usize(buffer_ptr)?;
                 let key = key.to_string();
@@ -490,8 +499,7 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<usize> {
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {
-                let size = dummy
-                    .get_into(key, buffer_ptr, size, tenant)
+                let size = run_without_gil(move || dummy.get_into(key, buffer_ptr, size, tenant))
                     .map_err(store_error_to_py)?;
                 if size < 0 {
                     return Err(PyKeyError::new_err(format!(
@@ -553,17 +561,16 @@ impl PyMooncakeDistributedStore {
             with_soft_pin,
         );
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => {
+            StoreBackend::Dummy(dummy) => run_without_gil(move || {
                 for (key, value) in &items {
-                    let status = dummy
-                        .put(key, value, tenant, policy.as_ref())
-                        .map_err(store_error_to_py)?;
+                    let status = dummy.put(key, value, tenant, policy.as_ref())?;
                     if status != 0 {
                         return Ok(status);
                     }
                 }
                 Ok(0)
-            }
+            })
+            .map_err(store_error_to_py),
             StoreBackend::Real(dispatcher) => {
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
@@ -633,9 +640,9 @@ impl PyMooncakeDistributedStore {
         );
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {
-                let statuses = dummy
-                    .batch_put_from(&items, tenant, policy.as_ref())
-                    .map_err(store_error_to_py)?;
+                let statuses =
+                    run_without_gil(move || dummy.batch_put_from(&items, tenant, policy.as_ref()))
+                        .map_err(store_error_to_py)?;
                 Ok(PyList::new(py, statuses)?.into_any().unbind())
             }
             StoreBackend::Real(dispatcher) => {
@@ -774,22 +781,21 @@ impl PyMooncakeDistributedStore {
             with_soft_pin,
         );
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => {
+            StoreBackend::Dummy(dummy) => run_without_gil(move || {
                 for (key, buffers) in &items {
                     let total = buffers.iter().map(Vec::len).sum();
                     let mut payload = Vec::with_capacity(total);
                     for buffer in buffers {
                         payload.extend_from_slice(buffer);
                     }
-                    let status = dummy
-                        .put(key, &payload, tenant, policy.as_ref())
-                        .map_err(store_error_to_py)?;
+                    let status = dummy.put(key, &payload, tenant, policy.as_ref())?;
                     if status != 0 {
                         return Ok(status);
                     }
                 }
                 Ok(0)
-            }
+            })
+            .map_err(store_error_to_py),
             StoreBackend::Real(dispatcher) => {
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
@@ -898,9 +904,10 @@ impl PyMooncakeDistributedStore {
                         ))
                     })
                     .collect::<PyResult<Vec<_>>>()?;
-                dummy
-                    .batch_put_from_multi_buffers(&items, tenant, policy.as_ref())
-                    .map_err(store_error_to_py)
+                run_without_gil(move || {
+                    dummy.batch_put_from_multi_buffers(&items, tenant, policy.as_ref())
+                })
+                .map_err(store_error_to_py)
             }
             StoreBackend::Real(dispatcher) => {
                 for (buffer_ptrs, sizes) in all_buffer_ptrs.iter().zip(all_sizes.iter()) {
@@ -1041,9 +1048,10 @@ impl PyMooncakeDistributedStore {
         tenant: Option<&str>,
     ) -> PyResult<Vec<i64>> {
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => dummy
-                .batch_get_into(&items, tenant)
-                .map_err(store_error_to_py),
+            StoreBackend::Dummy(dummy) => {
+                run_without_gil(move || dummy.batch_get_into(&items, tenant))
+                    .map_err(store_error_to_py)
+            }
             StoreBackend::Real(dispatcher) => {
                 for (_, buffer_ptr, _) in &items {
                     let _ = pointer_from_usize(*buffer_ptr)?;
@@ -1122,8 +1130,7 @@ impl PyMooncakeDistributedStore {
                         ))
                     })
                     .collect::<PyResult<Vec<_>>>()?;
-                dummy
-                    .batch_get_into_multi_buffers(&items, tenant)
+                run_without_gil(move || dummy.batch_get_into_multi_buffers(&items, tenant))
                     .map_err(store_error_to_py)
             }
             StoreBackend::Real(dispatcher) => {
@@ -1248,7 +1255,8 @@ impl PyMooncakeDistributedStore {
     fn remove_all(&self, force: bool) -> PyResult<i64> {
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {
-                let (status, removed) = dummy.remove_all(force).map_err(store_error_to_py)?;
+                let (status, removed) =
+                    run_without_gil(move || dummy.remove_all(force)).map_err(store_error_to_py)?;
                 if status != 0 {
                     return Err(PyRuntimeError::new_err("dummy remove_all failed"));
                 }
@@ -1262,7 +1270,7 @@ impl PyMooncakeDistributedStore {
 
     fn health_check(&self) -> PyResult<i32> {
         match self.backend.as_ref() {
-            Some(StoreBackend::Dummy(dummy)) => Ok(dummy.health_check()),
+            Some(StoreBackend::Dummy(dummy)) => Ok(allow_threads_ungil(|| dummy.health_check())),
             Some(StoreBackend::Real(_)) => Ok(0),
             None => Ok(1),
         }
@@ -1274,11 +1282,12 @@ impl PyMooncakeDistributedStore {
 
     #[pyo3(signature = (bind_addr = "127.0.0.1:0"))]
     fn start_metrics_server(&self, bind_addr: &str) -> PyResult<String> {
-        start_metrics_http_server(bind_addr).map_err(store_error_to_py)
+        let bind_addr = bind_addr.to_string();
+        run_without_gil(move || start_metrics_http_server(&bind_addr)).map_err(store_error_to_py)
     }
 
     fn stop_metrics_server(&self) -> PyResult<()> {
-        stop_metrics_http_server().map_err(store_error_to_py)
+        run_without_gil(stop_metrics_http_server).map_err(store_error_to_py)
     }
 
     fn metrics_server_address(&self) -> Option<String> {
@@ -1300,12 +1309,13 @@ fn metrics_text() -> String {
 #[pyfunction]
 #[pyo3(signature = (bind_addr = "127.0.0.1:0"))]
 fn start_metrics_server(bind_addr: &str) -> PyResult<String> {
-    start_metrics_http_server(bind_addr).map_err(store_error_to_py)
+    let bind_addr = bind_addr.to_string();
+    run_without_gil(move || start_metrics_http_server(&bind_addr)).map_err(store_error_to_py)
 }
 
 #[pyfunction]
 fn stop_metrics_server() -> PyResult<()> {
-    stop_metrics_http_server().map_err(store_error_to_py)
+    run_without_gil(stop_metrics_http_server).map_err(store_error_to_py)
 }
 
 #[pyfunction]
@@ -1328,7 +1338,7 @@ fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
 impl PyMooncakeDistributedStore {
     fn replace_backend(&mut self, backend: StoreBackend) {
         if let Some(previous) = self.backend.replace(backend) {
-            previous.close();
+            allow_threads_ungil(move || previous.close());
         }
     }
 
@@ -1463,6 +1473,14 @@ fn run_without_gil<T, F>(f: F) -> Result<T, StoreError>
 where
     T: pyo3::marker::Ungil + Send,
     F: pyo3::marker::Ungil + FnOnce() -> Result<T, StoreError>,
+{
+    allow_threads_ungil(f)
+}
+
+fn allow_threads_ungil<T, F>(f: F) -> T
+where
+    T: pyo3::marker::Ungil,
+    F: pyo3::marker::Ungil + FnOnce() -> T,
 {
     Python::with_gil(|py| py.allow_threads(f))
 }
