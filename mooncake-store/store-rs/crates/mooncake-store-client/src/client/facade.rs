@@ -477,8 +477,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
-        self.route_directory
-            .get_object_route(&self.lease, &ObjectKey::from_logical_id(object_id))
+        Ok(self
+            .route_directory
+            .get_object_route(&self.lease, &ObjectKey::from_logical_id(object_id))?
+            .filter(|route| route.state == RouteState::Active))
     }
 
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
@@ -634,12 +636,22 @@ impl MooncakeCompatibilityFacade for StoreClient {
             tracker.finish(&result, 0);
             return result;
         };
+        if route.state != RouteState::Active {
+            let result = if force {
+                Ok(())
+            } else {
+                Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
+            };
+            tracker.finish(&result, 0);
+            return result;
+        }
         let quota_reservation = self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
+        let tombstone = route_tombstone(&route);
         let cas = self.route_directory.compare_and_swap_object_route(
             &self.lease,
             &object_key,
             Some(route.version),
-            None,
+            Some(&tombstone),
         )?;
         let result = if cas.applied {
             match self.finalize_tenant_quota_delete(quota_reservation.as_ref()) {
@@ -697,13 +709,22 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 tracker.finish(&result, 0);
                 return result;
             };
+            if route.state != RouteState::Active {
+                if force {
+                    continue;
+                }
+                let result = Err(StoreError::NotFound(format!("tenant={tenant} key={}", object.key)));
+                tracker.finish(&result, 0);
+                return result;
+            }
             let quota_reservation =
                 self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
+            let tombstone = route_tombstone(&route);
             let cas = self.route_directory.compare_and_swap_object_route(
                 &self.lease,
                 &object_key,
                 Some(route.version),
-                None,
+                Some(&tombstone),
             )?;
             if cas.applied {
                 self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;

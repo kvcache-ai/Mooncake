@@ -1306,8 +1306,8 @@ impl StoreClient {
                     StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
                 })?;
                 if route.state != RouteState::Active {
-                    return Err(StoreError::InvalidState(format!(
-                        "tenant={tenant} key={} is not active",
+                    return Err(StoreError::NotFound(format!(
+                        "tenant={tenant} key={} is not readable",
                         object.key
                     )));
                 }

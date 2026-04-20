@@ -353,7 +353,7 @@ impl StorageOwnerState {
 
         let evicted_replica = route.replicas[replica_index].clone();
         let next = if route.replicas.len() == 1 {
-            None
+            route_tombstone(&route)
         } else {
             let mut replicas = route.replicas.clone();
             replicas.remove(replica_index);
@@ -361,7 +361,7 @@ impl StorageOwnerState {
             for (priority, replica) in replicas.iter_mut().enumerate() {
                 replica.priority = priority as u16;
             }
-            Some(ObjectRoute {
+            ObjectRoute {
                 key: route.key.clone(),
                 namespace: route.namespace.clone(),
                 logical_key: route.logical_key.clone(),
@@ -372,14 +372,14 @@ impl StorageOwnerState {
                 state: route.state,
                 compatibility: route.compatibility.clone(),
                 replicas,
-            })
+            }
         };
 
         let cas = self.route_directory.compare_and_swap_object_route(
             &self.observer,
             &route.key,
             Some(route.version),
-            next.as_ref(),
+            Some(&next),
         )?;
         if !cas.applied {
             match cas.current.as_ref() {
@@ -396,9 +396,7 @@ impl StorageOwnerState {
             evicted_replica.segment_offset,
             evicted_replica.length,
         )?;
-        if let Some(next_route) = next.as_ref() {
-            self.sync_route(next_route);
-        }
+        self.sync_route(&next);
         debug!(
             runtime = %self.runtime,
             key = %route.key.0,

@@ -54,6 +54,14 @@ pub(crate) fn bind_local_authority_service(
         .bind_local_service(authority, service);
 }
 
+pub(crate) fn route_tombstone(route: &ObjectRoute) -> ObjectRoute {
+    let mut tombstone = route.clone();
+    tombstone.version = route.version.next();
+    tombstone.state = RouteState::Tombstone;
+    tombstone.replicas.clear();
+    tombstone
+}
+
 struct MetadataRouteDirectory {
     metadata: Arc<dyn MetadataBackend>,
 }
@@ -1528,7 +1536,11 @@ fn record_cas_outcome(cas: &CasResult, next: Option<&ObjectRoute>, key: &ObjectK
     if cas.applied {
         registry::record_route_cas("ok");
         if let Some(route) = next {
-            registry::record_route(route);
+            if route.state == RouteState::Tombstone {
+                registry::remove_route(key);
+            } else {
+                registry::record_route(route);
+            }
         } else {
             registry::remove_route(key);
         }
@@ -1592,9 +1604,9 @@ mod tests {
         authority_compare_and_swap, authority_compare_and_swap_many, authority_get,
         authority_get_many, authority_list_routes_by_replica_owner, authority_replace,
         authority_replace_many, bind_local_authority_service, build_route_directory,
-        compatibility_matches, ranked_before, route_capable, route_mesh, route_weight, stable_hash,
-        weighted_rendezvous_score, ClusterRouteMesh, ControlPlaneClient, EmbeddedWrhRouteDirectory,
-        RouteControlMode,
+        compatibility_matches, ranked_before, route_capable, route_mesh, route_tombstone,
+        route_weight, stable_hash, weighted_rendezvous_score, ClusterRouteMesh, ControlPlaneClient,
+        EmbeddedWrhRouteDirectory, RouteControlMode,
     };
     use crate::control_plane::AuthorityService;
 
@@ -1913,6 +1925,83 @@ mod tests {
                 .expect("metadata get should succeed"),
             Some(route_v2)
         );
+    }
+
+    #[test]
+    fn embedded_directory_tombstone_suppresses_stale_mirror_route() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-tombstone", 1, false, Some("scope-a"));
+        let authority_a = lease("authority-tombstone-a", 2, true, Some("scope-a"));
+        let authority_b = lease("authority-tombstone-b", 3, true, Some("scope-a"));
+        for lease in [observer.clone(), authority_a.clone(), authority_b.clone()] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_tombstone_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &observer,
+            Arc::new(ControlPlaneClient::new().expect("control client should build")),
+            live_client_cache,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::SuspectRuntimeCache::default(),
+            )),
+        );
+        let namespace = metadata.route_namespace();
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&authority_a.runtime.stable_id);
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&authority_b.runtime.stable_id);
+
+        let key = ObjectKey::new("tenant-a::tombstone-key");
+        let active = route_for(&key.0, &authority_b.runtime);
+        let tombstone = route_tombstone(&active);
+        authority_replace(
+            &namespace,
+            &authority_a.runtime.stable_id,
+            &key,
+            Some(&tombstone),
+        )
+        .expect("tombstone authority should seed");
+        authority_replace(
+            &namespace,
+            &authority_b.runtime.stable_id,
+            &key,
+            Some(&active),
+        )
+        .expect("stale authority should seed");
+
+        let resolved = directory
+            .get_object_route(&observer, &key)
+            .expect("route read should succeed")
+            .expect("tombstone should resolve as authoritative route state");
+        assert_eq!(resolved, tombstone);
+        assert_eq!(
+            authority_get(&namespace, &authority_b.runtime.stable_id, &key)
+                .expect("stale authority should be readable"),
+            Some(tombstone.clone()),
+            "read repair must not resurrect an evicted key from a stale mirror"
+        );
+
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&authority_a.runtime.stable_id);
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&authority_b.runtime.stable_id);
     }
 
     #[test]
