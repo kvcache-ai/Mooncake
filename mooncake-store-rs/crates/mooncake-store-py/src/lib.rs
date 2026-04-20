@@ -3415,7 +3415,7 @@ mod tests {
 
     #[test]
     fn real_get_reuses_local_hot_cache_after_remote_delete() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let _cache_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
         let _block_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "1024");
         let _use_shm = EnvVarGuard::unset("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
@@ -3469,7 +3469,7 @@ mod tests {
 
     #[test]
     fn dummy_clients_share_hot_cache_shm_hits() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let _cache_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
         let _block_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "1024");
         let _use_shm = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");

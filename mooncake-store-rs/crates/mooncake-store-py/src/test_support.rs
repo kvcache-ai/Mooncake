@@ -1,5 +1,8 @@
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+
+#[cfg(test)]
+use parking_lot::Mutex;
 
 #[cfg(test)]
 pub(crate) fn env_test_lock() -> &'static Mutex<()> {

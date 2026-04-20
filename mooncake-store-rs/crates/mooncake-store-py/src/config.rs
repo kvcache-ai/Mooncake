@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn build_classic_config_normalizes_metadata_uri_and_auth() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let config = build_classic_config(
             "node-a:17112",
             "redis://user:pass@cache.local:6381/4",
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn resolve_transport_backend_prefers_explicit_value() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         std::env::set_var("MC_STORE_RS_TRANSPORT_BACKEND", "tent");
         let backend =
             resolve_transport_backend(Some("classic_te")).expect("explicit backend should parse");
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn resolve_transport_backend_reads_env_when_unspecified() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         std::env::set_var("MC_STORE_RS_TRANSPORT_BACKEND", "te");
         let backend = resolve_transport_backend(None).expect("env backend should parse");
         assert_eq!(backend, TransportBackend::ClassicTe);
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn resolve_transport_redis_auth_prefers_url_credentials() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         std::env::set_var("MC_REDIS_USERNAME", "env-user");
         std::env::set_var("MC_REDIS_PASSWORD", "env-pass");
         let auth = resolve_redis_auth("redis://url-user:url-pass@cache.local:6381/3")
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn resolve_transport_redis_auth_falls_back_to_env_password() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         std::env::set_var("MC_REDIS_USERNAME", "env-user");
         std::env::set_var("MC_REDIS_PASSWORD", "env-pass");
         let auth =
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn timeout_config_uses_request_timeout_for_dummy_by_default() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         std::env::set_var(REQUEST_TIMEOUT_ENV, "42000");
         std::env::remove_var(DUMMY_RPC_TIMEOUT_ENV);
         let timeouts = CompatTimeoutConfig::from_env();

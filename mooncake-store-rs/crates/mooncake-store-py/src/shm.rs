@@ -565,8 +565,10 @@ fn recv_fd<T>(sock: RawFd) -> Result<(T, OwnedFd)> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use std::thread;
+
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -588,7 +590,7 @@ mod tests {
 
     #[test]
     fn shared_regions_resolve_subranges() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = test_lock().lock();
         let ptr = allocate_shared_region(4096).expect("shared alloc should succeed");
         let resolved = resolve_shared_region(ptr + 128, 512).expect("subrange should resolve");
         assert_eq!(resolved.offset, 128);
@@ -598,7 +600,7 @@ mod tests {
 
     #[test]
     fn shared_regions_can_use_hugepage_backing_when_available() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = test_lock().lock();
         let hugepage = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
         if !hugepages_available(hugepage.bytes()) {
             return;
@@ -614,7 +616,7 @@ mod tests {
 
     #[test]
     fn shared_region_registration_round_trip_maps_and_slices() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = test_lock().lock();
         let ptr = allocate_shared_region(4096).expect("shared alloc should succeed");
         let registration =
             shared_region_for_registration(ptr, 4096).expect("registration should resolve");
@@ -666,7 +668,7 @@ mod tests {
 
     #[test]
     fn shared_region_helpers_report_kernel_and_range_errors() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = test_lock().lock();
         let sanitized = dummy_ipc_socket_path("tcp://127.0.0.1:7000?slot=1");
         assert!(sanitized
             .to_string_lossy()
@@ -721,7 +723,7 @@ mod tests {
 
     #[test]
     fn shm_registration_rejects_bad_magic() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = test_lock().lock();
         let ptr = allocate_shared_region(1024).expect("shared alloc should succeed");
         let registration =
             shared_region_for_registration(ptr, 1024).expect("registration should resolve");

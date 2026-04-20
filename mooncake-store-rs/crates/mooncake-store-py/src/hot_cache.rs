@@ -441,15 +441,13 @@ fn scatter_copy(source: &[u8], targets: &mut [&mut [u8]]) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use crate::test_support::env_test_lock;
 
     use super::*;
 
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
     #[test]
     fn env_config_uses_upstream_names() {
-        let _guard = env_lock().lock().expect("env lock poisoned");
+        let _guard = env_test_lock().lock();
         clear_env();
         assert_eq!(HotCacheConfig::from_env(), None);
 
@@ -514,10 +512,6 @@ mod tests {
         );
         assert_eq!(&a, b"ab");
         assert_eq!(&b, b"cdef");
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn clear_env() {
