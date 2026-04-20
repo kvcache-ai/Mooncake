@@ -35,6 +35,7 @@ Before running the e2e locally, ensure:
 - Redis is available on the configured port
 - the workspace builds successfully
 - the local environment can run the standard e2e harness
+- `mooncake-store-admin` can reach the same metadata namespace if you want follow-up inspection after the run
 
 The default local script uses the same conventions as the rest of the repository.
 
@@ -145,6 +146,39 @@ When coordinating with QA, ask them to verify:
 - the final success line includes `strict tenant quota`
 - there is no error indicating quota state drift, missing accounting, or missing reservations
 - the scenario passes with the recommended fast command above
+- metadata inspection after the run matches the expected tenant-root strict quota behavior
+
+## Recommended Operator Follow-Up
+
+After a successful or failed run, operators can inspect the same tenant through admin:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota state \
+  --tenant tenant-quota-e2e
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reservations \
+  --tenant tenant-quota-e2e
+```
+
+If the run is interrupted mid-flight and pending reservations remain visible, inspect the repair plan first:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reconcile \
+  --tenant tenant-quota-e2e \
+  --dry-run
+```
+
+Expected operator interpretation:
+
+- after a clean success, `pending_reserved_*` should be `0`
+- finalized reservations should explain the admitted write and the later refund path
+- `quota reconcile --dry-run` should usually report no work on a healthy completed run
 
 ## Optional Follow-Up Checks
 
@@ -158,6 +192,9 @@ Examples include coverage for:
 - overwrite delta charging
 - delete refund behavior
 - routed batch all-or-nothing quota admission
+- tenant-local quota eviction observability via `mooncake_store_tenant_local_eviction_total`
+- successful eviction-triggered writes remaining readable while tenant usage stays within quota
+- cross-tenant isolation during tenant-local quota recovery
 
 Those tests are complementary. The e2e described here is the process-level proof that the Redis-backed runtime path exercises the new logic in a real harness.
 
@@ -166,3 +203,4 @@ Those tests are complementary. The e2e described here is the process-level proof
 - The e2e is intentionally focused and does not try to cover every admin repair flow.
 - Its purpose is to prove the newly added strict quota runtime path is wired into the real end-to-end execution path.
 - Repair-specific behaviors such as admin reconcile/abort remain covered by targeted tests elsewhere in the repository.
+- The recommended mental model is now admin-authored policy plus runtime enforcement, not runtime-local quota configuration alone.

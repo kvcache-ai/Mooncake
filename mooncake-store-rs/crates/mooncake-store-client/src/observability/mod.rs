@@ -406,6 +406,10 @@ pub fn record_tenant_quota_reconcile(result: &'static str) {
     registry::record_tenant_quota_reconcile(result);
 }
 
+pub fn record_tenant_local_eviction(result: &'static str) {
+    registry::record_tenant_local_eviction(result);
+}
+
 #[cfg(test)]
 pub fn reset_metrics() {
     registry::reset_metrics();
