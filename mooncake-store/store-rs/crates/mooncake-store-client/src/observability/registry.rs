@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use mooncake_store_core::{
@@ -356,6 +356,23 @@ struct MetricsRegistry {
     transport_bytes: CounterFamily<TransportBytesKey>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct SharedMetricsRegistry {
+    inner: Arc<Mutex<MetricsRegistry>>,
+}
+
+impl SharedMetricsRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MetricsRegistry::default())),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MetricsRegistry> {
+        self.inner.lock().expect("metrics lock poisoned")
+    }
+}
+
 impl MetricsRegistry {
     fn record_request(
         &mut self,
@@ -520,7 +537,7 @@ impl MetricsRegistry {
     }
 }
 
-static METRICS: OnceLock<Mutex<MetricsRegistry>> = OnceLock::new();
+static METRICS: OnceLock<SharedMetricsRegistry> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct RuntimeLeaseMetric {
@@ -529,7 +546,8 @@ struct RuntimeLeaseMetric {
     expires_at_ms: u64,
 }
 
-pub(crate) fn record_request(
+pub(crate) fn record_request_with_registry(
+    registry: &SharedMetricsRegistry,
     operation: &'static str,
     scope: &'static str,
     result: &'static str,
@@ -537,88 +555,85 @@ pub(crate) fn record_request(
     bytes_out: u64,
     duration: Duration,
 ) {
-    metrics_registry()
+    registry
         .lock()
-        .expect("metrics lock poisoned")
         .record_request(operation, scope, result, bytes_in, bytes_out, duration);
 }
 
-pub(crate) fn increment_inflight(operation: &'static str, scope: &'static str) {
-    metrics_registry()
+pub(crate) fn increment_inflight_with_registry(
+    registry: &SharedMetricsRegistry,
+    operation: &'static str,
+    scope: &'static str,
+) {
+    registry
         .lock()
-        .expect("metrics lock poisoned")
         .request_inflight
         .add(RequestInflightKey { operation, scope }, 1.0);
 }
 
-pub(crate) fn decrement_inflight(operation: &'static str, scope: &'static str) {
-    metrics_registry()
+pub(crate) fn decrement_inflight_with_registry(
+    registry: &SharedMetricsRegistry,
+    operation: &'static str,
+    scope: &'static str,
+) {
+    registry
         .lock()
-        .expect("metrics lock poisoned")
         .request_inflight
         .add(RequestInflightKey { operation, scope }, -1.0);
 }
 
 pub(crate) fn record_route_cas(result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .route_cas
         .add(ResultKey { result }, 1);
 }
 
 pub(crate) fn record_replication_publish(result: &'static str, duration: Duration) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .replication_publish_duration
         .observe(ResultKey { result }, duration.as_secs_f64());
 }
 
 pub(crate) fn record_checksum_validation(result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .checksum_validation
         .add(ResultKey { result }, 1);
 }
 
 pub(crate) fn record_tenant_quota_reservation(result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .tenant_quota_reservation
         .add(ResultKey { result }, 1);
 }
 
 pub(crate) fn record_tenant_quota_finalize(result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .tenant_quota_finalize
         .add(ResultKey { result }, 1);
 }
 
 pub(crate) fn record_tenant_quota_abort(result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .tenant_quota_abort
         .add(ResultKey { result }, 1);
 }
 
 pub(crate) fn record_tenant_quota_reconcile(result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .tenant_quota_reconcile
         .add(ResultKey { result }, 1);
 }
 
 pub(crate) fn record_rebalance_route(phase: &'static str, result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .rebalance_routes
         .add(PhaseResultKey { phase, result }, 1);
 }
@@ -627,9 +642,8 @@ pub(crate) fn record_rebalance_bytes(phase: &'static str, bytes: u64) {
     if bytes == 0 {
         return;
     }
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .rebalance_bytes
         .add(PhaseKey { phase }, bytes);
 }
@@ -638,21 +652,17 @@ pub(crate) fn record_transport_bytes(direction: &'static str, peer_kind: &'stati
     if bytes == 0 {
         return;
     }
-    metrics_registry()
-        .lock()
-        .expect("metrics lock poisoned")
-        .transport_bytes
-        .add(
-            TransportBytesKey {
-                direction,
-                peer_kind,
-            },
-            bytes,
-        );
+    global_metrics_registry().lock().transport_bytes.add(
+        TransportBytesKey {
+            direction,
+            peer_kind,
+        },
+        bytes,
+    );
 }
 
 pub(crate) fn record_membership_refresh(result: &'static str, duration: Duration) {
-    let mut registry = metrics_registry().lock().expect("metrics lock poisoned");
+    let mut registry = global_metrics_registry().lock();
     let key = ResultKey { result };
     registry.membership_refresh.add(key.clone(), 1);
     registry
@@ -661,7 +671,14 @@ pub(crate) fn record_membership_refresh(result: &'static str, duration: Duration
 }
 
 pub(crate) fn record_runtime_leases(leases: &[ClientLease]) {
-    let mut registry = metrics_registry().lock().expect("metrics lock poisoned");
+    record_runtime_leases_with_registry(global_metrics_registry(), leases);
+}
+
+pub(crate) fn record_runtime_leases_with_registry(
+    registry: &SharedMetricsRegistry,
+    leases: &[ClientLease],
+) {
+    let mut registry = registry.lock();
     replace_runtime_leases(&mut registry, leases);
 }
 
@@ -670,7 +687,21 @@ pub(crate) fn record_heartbeat_health(
     consecutive_failures: u64,
     last_success_ms: u64,
 ) {
-    let mut registry = metrics_registry().lock().expect("metrics lock poisoned");
+    record_heartbeat_health_with_registry(
+        global_metrics_registry(),
+        runtime,
+        consecutive_failures,
+        last_success_ms,
+    );
+}
+
+pub(crate) fn record_heartbeat_health_with_registry(
+    registry: &SharedMetricsRegistry,
+    runtime: &str,
+    consecutive_failures: u64,
+    last_success_ms: u64,
+) {
+    let mut registry = registry.lock();
     let key = RuntimeKey {
         runtime: runtime.to_string(),
     };
@@ -683,9 +714,8 @@ pub(crate) fn record_heartbeat_health(
 }
 
 pub(crate) fn record_segment(announcement: &SegmentAnnouncement) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .segments
         .insert(segment_identity(announcement), segment_sample(announcement));
 }
@@ -695,39 +725,32 @@ pub(crate) fn record_segment_removed(announcement: &SegmentAnnouncement) {
     sample.state = "retired";
     sample.used_bytes = 0;
     sample.capacity_bytes = 0;
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .segments
         .insert((sample.runtime.clone(), sample.segment.clone()), sample);
 }
 
 pub(crate) fn record_route(route: &ObjectRoute) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .routes
         .insert(route.key.0.clone(), route.clone());
 }
 
 pub(crate) fn remove_route(key: &ObjectKey) {
-    metrics_registry()
-        .lock()
-        .expect("metrics lock poisoned")
-        .routes
-        .remove(&key.0);
+    global_metrics_registry().lock().routes.remove(&key.0);
 }
 
 pub(crate) fn record_segment_lifecycle(action: &'static str, result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .segment_lifecycle
         .add(ActionResultKey { action, result }, 1);
 }
 
 pub(crate) fn record_eviction(result: &'static str, duration: Duration) {
-    let mut registry = metrics_registry().lock().expect("metrics lock poisoned");
+    let mut registry = global_metrics_registry().lock();
     let key = ResultKey { result };
     registry.eviction.add(key.clone(), 1);
     registry
@@ -735,16 +758,21 @@ pub(crate) fn record_eviction(result: &'static str, duration: Duration) {
         .observe(key, duration.as_secs_f64());
 }
 
-pub(crate) fn snapshot_metrics(process: ProcessSnapshot) -> MetricsSnapshot {
-    metrics_registry()
-        .lock()
-        .expect("metrics lock poisoned")
-        .snapshot(process)
+pub(crate) fn snapshot_metrics_with_registry(
+    registry: &SharedMetricsRegistry,
+    process: ProcessSnapshot,
+) -> MetricsSnapshot {
+    registry.lock().snapshot(process)
 }
 
 #[cfg(test)]
 pub(crate) fn reset_metrics() {
-    *metrics_registry().lock().expect("metrics lock poisoned") = MetricsRegistry::default();
+    reset_metrics_with_registry(global_metrics_registry());
+}
+
+#[cfg(test)]
+pub(crate) fn reset_metrics_with_registry(registry: &SharedMetricsRegistry) {
+    *registry.lock() = MetricsRegistry::default();
 }
 
 fn replace_runtime_leases(registry: &mut MetricsRegistry, leases: &[ClientLease]) {
@@ -772,8 +800,13 @@ pub(crate) fn snapshot_runtime_leases_after_updates(updates: &[&[ClientLease]]) 
     registry.snapshot(ProcessSnapshot::default())
 }
 
-fn metrics_registry() -> &'static Mutex<MetricsRegistry> {
-    METRICS.get_or_init(|| Mutex::new(MetricsRegistry::default()))
+#[cfg(test)]
+pub(crate) fn new_metrics_registry() -> SharedMetricsRegistry {
+    SharedMetricsRegistry::new()
+}
+
+pub(crate) fn global_metrics_registry() -> &'static SharedMetricsRegistry {
+    METRICS.get_or_init(SharedMetricsRegistry::new)
 }
 
 fn segment_identity(announcement: &SegmentAnnouncement) -> (String, String) {
