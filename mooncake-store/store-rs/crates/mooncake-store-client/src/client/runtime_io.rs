@@ -990,6 +990,7 @@ impl StoreClient {
         F: FnMut(&ObjectRoute) -> Result<bool>,
     {
         self.ensure_local_memory()?;
+        self.pin_draining_lease_for_evacuation()?;
         let segments = {
             let state = self.state.lock();
             state.memory_ref()?.storage_segments()
@@ -1004,6 +1005,7 @@ impl StoreClient {
 
         let mut migrated = 0usize;
         loop {
+            self.pin_draining_lease_for_evacuation()?;
             let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
             let had_routes = !routes.is_empty();
             for route in routes {

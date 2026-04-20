@@ -104,6 +104,7 @@ struct CountingMetadataBackend {
     upsert_client_lease_calls: AtomicUsize,
     update_client_state_calls: AtomicUsize,
     reject_state_patch: bool,
+    filter_expired_live_clients: bool,
 }
 
 struct FinalizeFailureMetadataBackend {
@@ -208,12 +209,24 @@ struct RecoverableMetadataState {
 
 impl CountingMetadataBackend {
     fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
-        Self::with_reject_state_patch(inner, false)
+        Self::with_options(inner, false, false)
     }
 
     fn with_reject_state_patch(
         inner: Arc<InMemoryMetadataBackend>,
         reject_state_patch: bool,
+    ) -> Self {
+        Self::with_options(inner, reject_state_patch, false)
+    }
+
+    fn with_expiring_live_clients(inner: Arc<InMemoryMetadataBackend>) -> Self {
+        Self::with_options(inner, false, true)
+    }
+
+    fn with_options(
+        inner: Arc<InMemoryMetadataBackend>,
+        reject_state_patch: bool,
+        filter_expired_live_clients: bool,
     ) -> Self {
         Self {
             inner,
@@ -222,6 +235,7 @@ impl CountingMetadataBackend {
             upsert_client_lease_calls: AtomicUsize::new(0),
             update_client_state_calls: AtomicUsize::new(0),
             reject_state_patch,
+            filter_expired_live_clients,
         }
     }
 
@@ -239,6 +253,18 @@ impl CountingMetadataBackend {
 
     fn update_client_state_calls(&self) -> usize {
         self.update_client_state_calls.load(Ordering::Relaxed)
+    }
+
+    fn visible_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+        let leases = self.inner.list_live_clients()?;
+        if !self.filter_expired_live_clients {
+            return Ok(leases);
+        }
+        let now = now_ms();
+        Ok(leases
+            .into_iter()
+            .filter(|lease| lease.expires_at_ms >= now)
+            .collect())
     }
 }
 
@@ -837,12 +863,20 @@ impl MetadataBackend for CountingMetadataBackend {
         if self.reject_state_patch {
             return Err(StoreError::NotFound(runtime.storage_key()));
         }
+        if self.filter_expired_live_clients
+            && !self
+                .visible_live_clients()?
+                .into_iter()
+                .any(|lease| lease.runtime == *runtime)
+        {
+            return Err(StoreError::NotFound(runtime.storage_key()));
+        }
         self.inner.update_client_state(runtime, next)
     }
 
     fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
         self.list_live_clients_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.list_live_clients()
+        self.visible_live_clients()
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> mooncake_store_core::Result<()> {
@@ -10492,6 +10526,114 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
             .get("pin-upgrade-key")
             .expect("reader get should succeed"),
         b"pin-upgrade-payload"
+    );
+}
+
+#[test]
+fn hot_upgrade_evacuation_refreshes_expired_predecessor_lease() {
+    let metadata = Arc::new(CountingMetadataBackend::with_expiring_live_clients(
+        Arc::new(InMemoryMetadataBackend::new()),
+    ));
+    let predecessor_transport = Arc::new(TestTransport::new("expiring-upgrade-old-segment"));
+    let predecessor_factory = predecessor_transport.factory();
+    let successor_transport = Arc::new(predecessor_transport.peer("expiring-upgrade-new-segment"));
+    let reader_transport = Arc::new(predecessor_transport.peer("expiring-upgrade-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let predecessor_expiry = now_ms().saturating_add(60);
+    let long_expiry = now_ms().saturating_add(10_000);
+    let mut predecessor = StoreClientBuilder::new(metadata.clone(), "expiring-upgrade-store")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(predecessor_transport)
+        .transport_factory(predecessor_factory)
+        .local_memory(storage_config())
+        .build(predecessor_expiry)
+        .expect("predecessor build should succeed");
+    let mut successor = StoreClientBuilder::new(metadata.clone(), "expiring-upgrade-store")
+        .epoch(ClientEpoch(2))
+        .state(ClientLifecycleState::Standby)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(successor_transport)
+        .local_memory(storage_config())
+        .build(long_expiry)
+        .expect("successor build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "expiring-upgrade-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(long_expiry)
+        .expect("reader build should succeed");
+
+    predecessor
+        .register_local_memory()
+        .expect("predecessor memory should register");
+    successor
+        .register_local_memory()
+        .expect("successor memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    predecessor
+        .put("expiring-upgrade-key", b"expiring-upgrade-payload")
+        .expect("seed put should succeed");
+    predecessor
+        .enter_draining()
+        .expect("predecessor should drain");
+    predecessor
+        .plan_handoff(
+            ClientEpoch(2),
+            HandoffKind::HotUpgrade,
+            1,
+            100,
+            Some(u64::MAX),
+        )
+        .expect("handoff planning should succeed");
+    successor
+        .activate_if_targeted_handoff()
+        .expect("successor activation should succeed")
+        .expect("targeted handoff should be visible");
+
+    sleep(Duration::from_millis(80));
+    assert!(
+        metadata
+            .list_live_clients()
+            .expect("live clients should list")
+            .into_iter()
+            .all(|lease| lease.runtime != *predecessor.runtime_id()),
+        "predecessor lease should age out before evacuation begins"
+    );
+
+    let successor_runtime = successor.runtime_id().clone();
+    let migrated = predecessor
+        .evacuate_owned_replicas_to_runtime(&successor_runtime)
+        .expect("evacuation should refresh the predecessor lease before migrating");
+    assert_eq!(migrated, 1);
+
+    let route = reader
+        .query_route("expiring-upgrade-key")
+        .expect("post-upgrade route query should succeed")
+        .expect("post-upgrade route should exist");
+    assert!(route
+        .replicas
+        .iter()
+        .all(|replica| replica.owner != *predecessor.runtime_id()));
+    assert!(route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == successor_runtime));
+    assert_eq!(
+        reader
+            .get("expiring-upgrade-key")
+            .expect("reader get should succeed"),
+        b"expiring-upgrade-payload"
     );
 }
 

@@ -1,4 +1,29 @@
 impl StoreClient {
+    fn drain_lease_guard_timeout(&self) -> Duration {
+        self.request_timeout_override
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_CAP)
+            .max(Duration::from_secs(30))
+            .saturating_add(self.transfer_stall_timeout)
+            .saturating_add(Duration::from_secs(5))
+    }
+
+    fn pin_draining_lease_for_evacuation(&self) -> Result<()> {
+        if self.lifecycle_state() != ClientLifecycleState::Draining {
+            return Ok(());
+        }
+        let min_expires_at_ms = Self::current_time_ms().saturating_add(
+            self.drain_lease_guard_timeout()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        let mut lease = self.lease();
+        if lease.expires_at_ms >= min_expires_at_ms {
+            return Ok(());
+        }
+        lease.expires_at_ms = min_expires_at_ms;
+        self.metadata.upsert_client_lease(&lease)
+    }
+
     pub fn lifecycle_state(&self) -> ClientLifecycleState {
         decode_lifecycle_state(self.lifecycle_state.load(Ordering::SeqCst))
     }
@@ -132,6 +157,7 @@ impl StoreClient {
                 successor
             )));
         }
+        self.pin_draining_lease_for_evacuation()?;
 
         let _span = info_span!(
             "store.evacuate_owned_replicas_to_runtime",
