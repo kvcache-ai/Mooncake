@@ -3,7 +3,6 @@ use std::ffi::c_void;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,8 +28,6 @@ use crate::shm::{DummyClientId, OwnedMappedRegion};
 type RegionKey = (u64, u64, u64);
 type RegionMap = BTreeMap<RegionKey, OwnedMappedRegion>;
 type TrackedKey = (String, String);
-static DISPATCHER_RUNTIME: LazyLock<Runtime> =
-    LazyLock::new(|| Runtime::new().expect("dispatcher runtime should initialize"));
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 
 pub(crate) struct DispatcherState {
@@ -56,6 +53,7 @@ struct HealthPublisher {
     health_inflight: Arc<AtomicBool>,
     health_timeout: Duration,
     runtime: String,
+    executor: Arc<Runtime>,
     heartbeat_health: Arc<Mutex<HeartbeatHealthState>>,
 }
 
@@ -71,8 +69,10 @@ pub struct StoreDispatcher {
     startup_timeout: Duration,
     health_timeout: Duration,
     runtime: String,
+    executor: Arc<Runtime>,
     heartbeat_health: Arc<Mutex<HeartbeatHealthState>>,
     hot_cache: Option<Arc<LocalHotCache>>,
+    compat_scope: String,
 }
 
 impl StoreDispatcher {
@@ -106,14 +106,56 @@ impl StoreDispatcher {
         _thread_name: impl Into<String>,
         timeouts: CompatTimeoutConfig,
     ) -> Result<Self, StoreError> {
+        Self::spawn_with_timeout_config_and_scope(client, _thread_name, timeouts, default_compat_scope())
+    }
+
+    pub fn spawn_with_timeout_config_and_scope(
+        client: StoreClient,
+        _thread_name: impl Into<String>,
+        timeouts: CompatTimeoutConfig,
+        compat_scope: impl Into<String>,
+    ) -> Result<Self, StoreError> {
+        Self::new_with_shared_client(
+            Arc::new(client),
+            timeouts,
+            compat_scope.into(),
+        )
+    }
+
+    pub(crate) fn fork_with_scope(
+        &self,
+        compat_scope: impl Into<String>,
+    ) -> Result<Self, StoreError> {
+        Self::new_with_shared_client(
+            self.client.clone(),
+            CompatTimeoutConfig {
+                request_timeout: self.request_timeout,
+                heartbeat_timeout: self.health_timeout,
+                transfer_stall_timeout: CompatTimeoutConfig::from_env().transfer_stall_timeout,
+                dummy_rpc_timeout: self.request_timeout,
+            },
+            compat_scope.into(),
+        )
+    }
+
+    fn new_with_shared_client(
+        client: Arc<StoreClient>,
+        timeouts: CompatTimeoutConfig,
+        compat_scope: String,
+    ) -> Result<Self, StoreError> {
         let startup_timeout = timeouts
             .startup_timeout_for_registration_bytes(client.local_memory_registration_bytes());
         let runtime = client.runtime_id().to_string();
         let health = Arc::new(client.health_channel());
         let hot_cache = LocalHotCache::from_env()?.map(Arc::new);
+        let executor = Arc::new(
+            Runtime::new().map_err(|error| {
+                StoreError::Transport(format!("dispatcher runtime should initialize: {error}"))
+            })?,
+        );
         record_heartbeat_health(&runtime, 0, 0);
         Ok(Self {
-            client: Arc::new(client),
+            client,
             health,
             regions: Arc::new(Mutex::new(BTreeMap::new())),
             state: Arc::new(Mutex::new(DispatcherState {
@@ -126,8 +168,10 @@ impl StoreDispatcher {
             startup_timeout: startup_timeout.max(Duration::from_millis(1)),
             health_timeout: timeouts.heartbeat_timeout.max(Duration::from_millis(1)),
             runtime,
+            executor,
             heartbeat_health: Arc::new(Mutex::new(HeartbeatHealthState::default())),
             hot_cache,
+            compat_scope,
         })
     }
 
@@ -294,7 +338,7 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
     {
-        self.run_with_timeout("request execution", self.request_timeout, f)
+        self.executor.block_on(self.run_async(f))
     }
 
     pub(crate) fn run_with_timeout<T, F>(
@@ -307,7 +351,7 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
     {
-        DISPATCHER_RUNTIME.block_on(self.run_async_with_timeout(context, timeout, f))
+        self.executor.block_on(self.run_async_with_timeout(context, timeout, f))
     }
 
     pub(crate) async fn run_async<T, F>(&self, f: F) -> Result<T, StoreError>
@@ -635,18 +679,10 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce() -> Result<T, StoreError> + Send + 'static,
     {
-        let (tx, rx) = oneshot::channel();
-        DISPATCHER_RUNTIME.spawn_blocking(move || {
-            let _ = tx.send(f());
-        });
-
         /*
-         * Keep blocking store operations off the caller runtime, but do not
-         * await the dispatcher runtime's JoinHandle from the dummy gRPC
-         * runtime. A plain oneshot is runtime-agnostic, so completion wakes the
-         * caller even after a previous RPC cancellation poisoned an h2 stream.
+         * Keep blocking store operations off the caller runtime.
          */
-        match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout(timeout, self.executor.spawn_blocking(f)).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(StoreError::Transport(
                 "store dispatcher worker failed".to_string(),
@@ -682,6 +718,7 @@ impl StoreDispatcher {
             self.health_timeout,
             context,
             update,
+            self.executor.clone(),
         )
     }
 
@@ -693,6 +730,7 @@ impl StoreDispatcher {
             health_inflight: self.health_inflight.clone(),
             health_timeout: self.health_timeout,
             runtime: self.runtime.clone(),
+            executor: self.executor.clone(),
             heartbeat_health: self.heartbeat_health.clone(),
         }
     }
@@ -711,6 +749,7 @@ impl HealthPublisher {
             self.health_timeout,
             "heartbeat publish",
             heartbeat,
+            self.executor.clone(),
         );
         match result {
             Ok(()) => {
@@ -756,6 +795,7 @@ fn run_health_update(
     timeout: Duration,
     context: &'static str,
     update: HealthUpdate,
+    executor: Arc<Runtime>,
 ) -> Result<(), StoreError> {
     if closed.load(Ordering::SeqCst) {
         return Err(dispatcher_stopped());
@@ -765,10 +805,11 @@ fn run_health_update(
             "store dispatcher {context} is still in flight"
         )));
     }
-    DISPATCHER_RUNTIME.block_on(async move {
+    let executor_for_task = executor.clone();
+    executor.block_on(async move {
         match tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || {
+            executor_for_task.spawn_blocking(move || {
                 let _guard = InflightGuard(inflight);
                 update.publish()
             }),

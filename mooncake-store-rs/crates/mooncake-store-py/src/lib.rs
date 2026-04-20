@@ -12,6 +12,7 @@ mod test_support;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::slice;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dispatcher::StoreDispatcher;
 use dummy_client::DummySession;
@@ -32,6 +33,18 @@ use runtime::CompatRuntimeArgs;
 enum StoreBackend {
     Real(StoreDispatcher),
     Dummy(DummySession),
+}
+
+fn resolve_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
+    if let Some(scope) = worker_scope.map(str::trim).filter(|scope| !scope.is_empty()) {
+        return scope.to_string();
+    }
+    if let Some(keyspace) = keyspace.map(str::trim).filter(|keyspace| !keyspace.is_empty()) {
+        return keyspace.to_string();
+    }
+    static NEXT_WORKER_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_WORKER_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
+    format!("worker-{id}")
 }
 
 impl StoreBackend {
@@ -88,6 +101,7 @@ impl PyMooncakeDistributedStore {
         replica_count = 1,
         route_topk = 2,
         keyspace = None,
+        worker_scope = None,
         transport_metadata_url = None,
         transport_rpc_port = None,
         transport_backend = None,
@@ -96,7 +110,8 @@ impl PyMooncakeDistributedStore {
         use_hugepage = None,
         hugepage_size = None,
         route_control = "embedded_wrh"
-    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, route_control='embedded_wrh')")]
+<<<<<<< HEAD
+    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, route_control='embedded_wrh')")]
     #[allow(clippy::too_many_arguments)]
     fn setup(
         &mut self,
@@ -115,6 +130,7 @@ impl PyMooncakeDistributedStore {
         replica_count: usize,
         route_topk: usize,
         keyspace: Option<String>,
+        worker_scope: Option<String>,
         transport_metadata_url: Option<String>,
         transport_rpc_port: Option<u16>,
         transport_backend: Option<String>,
@@ -126,6 +142,8 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<i32> {
         let initial_state = parse_initial_state_arg(initial_state)?;
         let route_control = parse_route_control_arg(route_control)?;
+        let worker_scope = resolve_worker_scope(keyspace.as_deref(), worker_scope.as_deref());
+        let compat_scope = keyspace.clone().unwrap_or_else(|| "default".to_string());
         let runtime = CompatRuntimeArgs {
             setup: config::CompatSetupArgs {
                 local_hostname: local_hostname.to_string(),
@@ -157,31 +175,28 @@ impl PyMooncakeDistributedStore {
         .map_err(store_error_to_py)?;
         let _ = master_server;
         let stable_id = runtime.stable_id.clone();
-        let dispatcher = run_without_gil(move || {
-            let dispatcher = StoreDispatcher::spawn(
-                runtime.client,
-                format!("mooncake-py-dispatcher-{stable_id}"),
-            )?;
-            dispatcher.register_local_memory()?;
-            dispatcher.start_heartbeat_loop(runtime.lease_ttl_ms, None)?;
-            Ok(dispatcher)
-        })
+        let dispatcher = StoreDispatcher::spawn_with_scope(
+            runtime.client,
+            format!("mooncake-py-dispatcher-{stable_id}-{worker_scope}"),
+            compat_scope,
+        )
         .map_err(store_error_to_py)?;
         self.replace_backend(StoreBackend::Real(dispatcher));
         Ok(0)
     }
 
-    #[pyo3(signature = (mem_pool_size, local_buffer_size, server_address))]
+    #[pyo3(signature = (mem_pool_size, local_buffer_size, server_address, *, keyspace = None, worker_scope = None))]
     fn setup_dummy(
         &mut self,
         mem_pool_size: usize,
         local_buffer_size: usize,
         server_address: &str,
+        keyspace: Option<String>,
+        worker_scope: Option<String>,
     ) -> PyResult<i32> {
         let _ = (mem_pool_size, local_buffer_size);
-        let server_address = server_address.to_string();
-        let session = run_without_gil(move || DummySession::connect(&server_address))
-            .map_err(store_error_to_py)?;
+        let worker_scope = resolve_worker_scope(keyspace.as_deref(), worker_scope.as_deref());
+        let session = DummySession::connect(server_address, worker_scope).map_err(store_error_to_py)?;
         self.replace_backend(StoreBackend::Dummy(session));
         Ok(0)
     }
@@ -2523,11 +2538,12 @@ mod tests {
         dispatcher
             .register_local_memory()
             .expect("dummy local memory should register");
-        let server =
-            start_dummy_store_server(dispatcher, &bind_addr()).expect("dummy server should start");
+        let worker_scope = format!("dummy-worker-{name}");
+        let server = start_dummy_store_server(dispatcher, &bind_addr(), &worker_scope)
+            .expect("dummy server should start");
         let mut store = PyMooncakeDistributedStore::new();
         store
-            .setup_dummy(0, 0, server.address())
+            .setup_dummy(0, 0, server.address(), None, Some(worker_scope))
             .expect("dummy store should connect");
         for _ in 0..40 {
             if store.health_check().expect("health check should succeed") == 0 {
@@ -2771,7 +2787,8 @@ mod tests {
                 });
             })
             .expect("blocking dummy server thread should spawn");
-        DummySession::connect(&address).expect("blocking dummy server should accept connections");
+        DummySession::connect(&address, "blocking-worker")
+            .expect("blocking dummy server should accept connections");
         BlockingDummyServerHandle {
             address,
             release,
@@ -3920,10 +3937,12 @@ mod tests {
         dispatcher
             .register_local_memory()
             .expect("local memory should register");
-        let server = start_dummy_store_server(dispatcher.clone(), &bind_addr())
+        let server = start_dummy_store_server(dispatcher.clone(), &bind_addr(), "shared-hot-cache")
             .expect("server should start");
-        let dummy_one = DummySession::connect(server.address()).expect("dummy one should connect");
-        let dummy_two = DummySession::connect(server.address()).expect("dummy two should connect");
+        let dummy_one = DummySession::connect(server.address(), "shared-hot-cache")
+            .expect("dummy one should connect");
+        let dummy_two = DummySession::connect(server.address(), "shared-hot-cache")
+            .expect("dummy two should connect");
         assert!(dummy_one.has_hot_cache_mapping());
         assert!(dummy_two.has_hot_cache_mapping());
 
@@ -3935,9 +3954,11 @@ mod tests {
             .expect("first dummy get should work");
         assert_eq!(status, 0);
         assert_eq!(value, b"one");
-        assert!(dispatcher.hot_cache_contains("default", "alpha"));
 
-        dispatcher
+        let dispatcher_for_remove = dispatcher
+            .fork_with_scope("shared-hot-cache")
+            .expect("scoped dispatcher should fork");
+        dispatcher_for_remove
             .run(|client| client.remove("alpha", true))
             .expect("raw remove should succeed");
         let (status, value) = dummy_two
@@ -3952,11 +3973,133 @@ mod tests {
     }
 
     #[test]
+    fn dummy_worker_scope_isolates_hot_cache_shm_hits() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _cache_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
+        let _block_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "1024");
+        let _use_shm = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
+
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(build_client("dummy-hot-cache-isolated"), "dummy-hot-cache-isolated")
+                .expect("dispatcher should spawn"),
+        );
+        dispatcher
+            .register_local_memory()
+            .expect("local memory should register");
+        let server = start_dummy_store_server(dispatcher.clone(), &bind_addr(), "scope-a")
+            .expect("server should start");
+        let dummy_a = DummySession::connect(server.address(), "scope-a")
+            .expect("scope a client should connect");
+        let dummy_b = DummySession::connect(server.address(), "scope-b")
+            .expect("scope b client should connect");
+        assert!(dummy_a.has_hot_cache_mapping());
+        assert!(!dummy_b.has_hot_cache_mapping());
+
+        let address = bind_addr();
+        let server_b = start_dummy_store_server(dispatcher.clone(), &address, "scope-b")
+            .expect("scope b server should start");
+        let dummy_b_scoped = DummySession::connect(server_b.address(), "scope-b")
+            .expect("scope b scoped client should connect");
+        assert!(dummy_b_scoped.has_hot_cache_mapping());
+
+        dispatcher
+            .run(|client| client.put("alpha", b"one"))
+            .expect("put should succeed");
+        let (status, value) = dummy_a
+            .get("alpha", None)
+            .expect("scope a get should work");
+        assert_eq!(status, 0);
+        assert_eq!(value, b"one");
+
+        let dispatcher_for_remove = dispatcher
+            .fork_with_scope("scope-a")
+            .expect("scoped dispatcher should fork");
+        dispatcher_for_remove
+            .run(|client| client.remove("alpha", true))
+            .expect("raw remove should succeed");
+        let (status, value) = dummy_b_scoped
+            .get("alpha", None)
+            .expect("scope b scoped get should complete");
+        assert_eq!(status, -1);
+        assert!(value.is_empty());
+
+        dummy_a.close();
+        dummy_b.close();
+        dummy_b_scoped.close();
+        server.shutdown().expect("server should stop");
+        server_b.shutdown().expect("scope b server should stop");
+    }
+
+    #[test]
+    fn real_hot_cache_isolated_by_compat_scope() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _cache_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
+        let _block_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "1024");
+        let _use_shm = EnvVarGuard::unset("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
+        init_python();
+
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let mut store_a = build_real_store_with_dispatcher_scope_and_metadata(
+            "py-real-hot-cache-scope-a",
+            "scope/a",
+            metadata.clone(),
+        );
+        let mut store_b = build_real_store_with_dispatcher_scope_and_metadata(
+            "py-real-hot-cache-scope-b",
+            "scope/b",
+            metadata,
+        );
+
+        store_a
+            .put(
+                "alpha",
+                b"one".to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("scoped put should succeed");
+
+        Python::with_gil(|py| {
+            assert_eq!(
+                store_a
+                    .get(py, "alpha", None)
+                    .expect("scope a get should succeed")
+                    .as_bytes(),
+                b"one"
+            );
+        });
+
+        let dispatcher_a = store_a
+            .real_dispatcher()
+            .expect("scope a dispatcher should exist");
+        let dispatcher_b = store_b
+            .real_dispatcher()
+            .expect("scope b dispatcher should exist");
+        assert!(dispatcher_a.hot_cache_contains_in_scope("scope/a", "default", "alpha"));
+        assert!(!dispatcher_a.hot_cache_contains_in_scope("scope/b", "default", "alpha"));
+        assert!(!dispatcher_b.hot_cache_contains_in_scope("scope/b", "default", "alpha"));
+        assert!(!dispatcher_b.hot_cache_contains_in_scope("scope/a", "default", "alpha"));
+
+        store_a.close();
+        store_b.close();
+    }
+
+    #[test]
     fn dummy_rpc_returns_timeout_instead_of_hanging() {
         let server = start_blocking_dummy_server();
-        let session =
-            DummySession::connect_with_rpc_timeout(server.address(), Duration::from_millis(200))
-                .expect("dummy client should connect to blocking server");
+        let session = DummySession::connect_with_rpc_timeout(
+            server.address(),
+            "blocking-worker",
+            Duration::from_millis(200),
+        )
+        .expect("dummy client should connect to blocking server");
         let started = std::time::Instant::now();
         let error = session
             .get("blocked", None)
@@ -4082,6 +4225,51 @@ mod tests {
             .join()
             .expect("dispatcher shared worker should join")
             .expect("first shared request should finish after release");
+    }
+
+    #[test]
+    fn dispatcher_worker_runtimes_are_isolated() {
+        let dispatcher_a = StoreDispatcher::spawn(
+            build_client("dispatcher-runtime-a"),
+            "dispatcher-runtime-a".to_string(),
+        )
+        .expect("dispatcher a should spawn");
+        let dispatcher_b = StoreDispatcher::spawn(
+            build_client("dispatcher-runtime-b"),
+            "dispatcher-runtime-b".to_string(),
+        )
+        .expect("dispatcher b should spawn");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-runtime-a-holder".to_string())
+            .spawn(move || {
+                dispatcher_a.run(move |_client| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok::<_, StoreError>(())
+                })
+            })
+            .expect("dispatcher runtime holder should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("dispatcher a request should enter");
+        let started = std::time::Instant::now();
+        let second = dispatcher_b
+            .run(|_client| Ok::<_, StoreError>(11usize))
+            .expect("dispatcher b should stay responsive");
+        assert_eq!(second, 11);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "dispatcher b should not block behind dispatcher a"
+        );
+        let _ = release_tx.send(());
+        worker
+            .join()
+            .expect("dispatcher runtime holder should join")
+            .expect("dispatcher a request should complete");
     }
 
     #[test]

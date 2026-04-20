@@ -263,27 +263,29 @@ pub fn resolve_shared_region(ptr: usize, size: usize) -> Result<ResolvedSharedRe
     })
 }
 
-pub fn dummy_ipc_socket_path(server_addr: &str) -> PathBuf {
-    let sanitized = server_addr
+fn sanitize_scope_component(value: &str) -> String {
+    value
         .chars()
         .map(|ch| match ch {
             'a'..='z' | 'A'..='Z' | '0'..='9' => ch,
             _ => '_',
         })
-        .collect::<String>();
-    std::env::temp_dir().join(format!("mooncake-store-rs-dummy-{sanitized}.sock"))
+        .collect::<String>()
 }
 
-pub fn hot_cache_ipc_socket_path(server_addr: &str) -> PathBuf {
-    let sanitized = server_addr
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' => ch,
-            _ => '_',
-        })
-        .collect::<String>();
+pub fn dummy_ipc_socket_path(server_addr: &str, worker_scope: &str) -> PathBuf {
+    let sanitized_addr = sanitize_scope_component(server_addr);
+    let sanitized_scope = sanitize_scope_component(worker_scope);
     std::env::temp_dir().join(format!(
-        "mooncake-store-rs-dummy-hot-cache-{sanitized}.sock"
+        "mooncake-store-rs-dummy-{sanitized_addr}-{sanitized_scope}.sock"
+    ))
+}
+
+pub fn hot_cache_ipc_socket_path(server_addr: &str, worker_scope: &str) -> PathBuf {
+    let sanitized_addr = sanitize_scope_component(server_addr);
+    let sanitized_scope = sanitize_scope_component(worker_scope);
+    std::env::temp_dir().join(format!(
+        "mooncake-store-rs-dummy-hot-cache-{sanitized_addr}-{sanitized_scope}.sock"
     ))
 }
 
@@ -668,11 +670,11 @@ mod tests {
 
     #[test]
     fn shared_region_helpers_report_kernel_and_range_errors() {
-        let _guard = test_lock().lock();
-        let sanitized = dummy_ipc_socket_path("tcp://127.0.0.1:7000?slot=1");
-        assert!(sanitized
-            .to_string_lossy()
-            .contains("tcp___127_0_0_1_7000_slot_1"));
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let sanitized = dummy_ipc_socket_path("tcp://127.0.0.1:7000?slot=1", "scope/a");
+        let rendered = sanitized.to_string_lossy();
+        assert!(rendered.contains("tcp___127_0_0_1_7000_slot_1"));
+        assert!(rendered.contains("scope_a"));
         assert!(matches!(
             allocate_shared_region(0),
             Err(StoreError::Allocator(_))

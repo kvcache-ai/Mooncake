@@ -14,13 +14,19 @@ The repository now builds two Python wheels with different responsibilities:
 Recommended installation flow:
 
 ```bash
+./scripts/build/install-pro-wheel.sh
+```
+
+Equivalent raw pip flow:
+
+```bash
 pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 ```
 
-For local wheelhouse installs you can also use:
+The install helper also supports bundle-local wheelhouses on another machine:
 
 ```bash
-./scripts/build/install-pro-wheel.sh
+./scripts/build/install-pro-wheel.sh --wheel-dir /tmp/sglang-true-e2e-bundle/dist/wheels
 ```
 
 After installation:
@@ -51,6 +57,12 @@ Use `setup(...)` when Python should talk to the native distributed store runtime
 
 For tenant-scoped routing and resource policy, prefer `mooncake-store-admin policy ...` and durable metadata. Python `setup(...)` route knobs are kept as compatibility/bootstrap fallbacks.
 
+Isolation knobs:
+
+- `keyspace` isolates metadata-backed routing, policy lookup, and object visibility
+- `worker_scope` isolates compat-local worker state such as the dispatcher executor and local hot-cache domain
+- when `worker_scope` is omitted, the Python layer derives it from `keyspace` when present; otherwise it allocates a unique per-setup worker scope
+
 This mode:
 
 - constructs a Rust `StoreClient`
@@ -62,6 +74,12 @@ This mode:
 ### Dummy mode
 
 Use `setup_dummy(...)` when Python should behave like the upstream dummy compatibility client.
+
+`setup_dummy(...)` now also accepts optional keyword-only `keyspace=` and `worker_scope=` arguments. They do not change the standalone server's underlying distributed-store namespace by themselves; they control the Python compat worker boundary used by the dummy side channels. In practice:
+
+- `keyspace` remains the metadata/data-plane namespace knob for the real runtime that the standalone daemon was started with
+- `worker_scope` isolates dummy compat-local state such as hot-cache SHM, registered-region side channels, and worker-local dispatcher state
+- when `worker_scope` is omitted, the Python layer derives it from `keyspace` when present; otherwise it allocates a unique per-setup worker scope
 
 This mode:
 
@@ -89,6 +107,8 @@ In dummy mode:
 - start the standalone daemon with `MC_STORE_LOCAL_HOT_CACHE_USE_SHM=1`
 - each dummy client maps the daemon hot-cache shm region on connect
 - a dummy read first asks the daemon for a hot-cache handle and falls back to the regular dummy RPC path on miss
+- dummy clients only share hot-cache SHM hits when they connect through the same worker-scoped dummy server boundary
+- different worker scopes do not reuse each other's cached bytes, even when they point at the same underlying store client/runtime
 
 Configuration uses the upstream environment variable names:
 
@@ -162,6 +182,12 @@ Docker wheel notes:
 - `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are forwarded into the Docker build/run steps for local proxy setups
 
 Install the wheel into any compatible virtualenv:
+
+```bash
+./scripts/build/install-pro-wheel.sh
+```
+
+Or with raw pip:
 
 ```bash
 pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
@@ -495,14 +521,20 @@ Then connect from Python:
 from mooncake.store import MooncakeDistributedStore, MooncakeHostMemAllocator
 
 store = MooncakeDistributedStore()
-store.setup_dummy(64 * 1024 * 1024, 16 * 1024 * 1024, "127.0.0.1:16590")
+store.setup_dummy(
+    64 * 1024 * 1024,
+    16 * 1024 * 1024,
+    "127.0.0.1:16590",
+    keyspace="tenant-a",
+    worker_scope="tenant-a-dummy-worker",
+)
 
 allocator = MooncakeHostMemAllocator()
 ptr = allocator.alloc(4096)
 store.register_buffer(ptr, 4096)
 ```
 
-`setup_dummy(...)` only needs `client_server_address`. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and data-plane endpoint on behalf of the dummy client.
+`setup_dummy(...)` only needs `client_server_address` for the remote endpoint. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and data-plane endpoint on behalf of the dummy client. Use `keyspace` to align with the intended metadata namespace and `worker_scope` when you need an explicit compat worker boundary for dummy-side cache and shm isolation.
 
 ## Host Allocator and Hugepages
 
@@ -751,13 +783,26 @@ Run the HiCache compatibility validations:
 ./scripts/sglang/run-sglang-hicache-real-compat.sh
 ```
 
-Run the full SGLang HiCache e2e:
+Run the full SGLang HiCache e2e from a checkout:
 
 ```bash
 ./scripts/sglang/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
 ```
 
-This script verifies:
+Build a portable bundle for another machine:
+
+```bash
+./scripts/build/build-sglang-e2e-bundle.sh
+```
+
+Then on machine B run:
+
+```bash
+cd /path/to/sglang-true-e2e-bundle
+./scripts/sglang/run-sglang-true-e2e-bundle.sh --model-path /models/Qwen3-0.6B
+```
+
+These runners verify:
 
 - two real storage `mooncake-store-client` processes plus one routed rw-only gateway
 - two `python -m sglang.launch_server` processes using the packaged Mooncake backend
@@ -765,6 +810,13 @@ This script verifies:
 - storage expansion while requests are still served
 - forced storage kill with retry-based recovery instead of persistent request failure
 - graceful storage shrink with retry-based recovery instead of persistent request failure
+
+Portable bundle notes:
+
+- machine B installs `mooncake_pro` from `dist/wheels/` inside the bundle
+- machine B only needs `python3`, working `python3 -m venv`, `redis-server`, `redis-cli`, and a compatible GPU/SGLang stack
+- machine B does not need a source checkout, `git`, `cargo`, `cmake`, or `third_party/Mooncake`
+- logs default to `target/sglang-true-e2e/`, overridable with `--workdir` or `MC_STORE_RS_SGLANG_TRUE_E2E_WORKDIR`
 
 Model selection is explicit:
 

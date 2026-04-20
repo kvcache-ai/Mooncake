@@ -344,10 +344,21 @@ class MooncakeDistributedStore:
         return result
 
     def setup_dummy(
-        self, mem_pool_size: int, local_buffer_size: int, server_address: str
+        self,
+        mem_pool_size: int,
+        local_buffer_size: int,
+        server_address: str,
+        *,
+        keyspace: str | None = None,
+        worker_scope: str | None = None,
     ):
         return self._invoke(
-            "setup_dummy", mem_pool_size, local_buffer_size, server_address
+            "setup_dummy",
+            mem_pool_size,
+            local_buffer_size,
+            server_address,
+            keyspace=keyspace,
+            worker_scope=worker_scope,
         )
 
     def close(self) -> None:
@@ -674,6 +685,7 @@ class MooncakeDistributedStore:
             replica_count=_coerce_int(config.get("replica_count"), 1),
             route_topk=_coerce_int(config.get("route_topk"), 2),
             keyspace=_coerce_optional_str(config.get("keyspace")),
+            worker_scope=_coerce_optional_str(config.get("worker_scope")),
             transport_metadata_url=_coerce_optional_str(
                 config.get("transport_metadata_url")
             ),
