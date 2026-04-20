@@ -68,6 +68,7 @@ pub struct StoreDispatcher {
     health_inflight: Arc<AtomicBool>,
     heartbeat_loop: Arc<Mutex<Option<HeartbeatLoopHandle>>>,
     request_timeout: Duration,
+    startup_timeout: Duration,
     health_timeout: Duration,
     runtime: String,
     heartbeat_health: Arc<Mutex<HeartbeatHealthState>>,
@@ -120,6 +121,7 @@ impl StoreDispatcher {
             health_inflight: Arc::new(AtomicBool::new(false)),
             heartbeat_loop: Arc::new(Mutex::new(None)),
             request_timeout: timeouts.request_timeout.max(Duration::from_millis(1)),
+            startup_timeout: timeouts.startup_timeout.max(Duration::from_millis(1)),
             health_timeout: timeouts.heartbeat_timeout.max(Duration::from_millis(1)),
             runtime,
             heartbeat_health: Arc::new(Mutex::new(HeartbeatHealthState::default())),
@@ -175,7 +177,10 @@ impl StoreDispatcher {
     }
 
     pub fn register_local_memory(&self) -> Result<(), StoreError> {
-        let result = self.run(|client| client.register_local_memory());
+        let result =
+            self.run_with_timeout("startup registration", self.startup_timeout, |client| {
+                client.register_local_memory()
+            });
         if result.is_ok() {
             let state = self.run(|client| Ok::<_, StoreError>(client.lifecycle_state()))?;
             self.health.sync_state(state);
@@ -287,7 +292,20 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
     {
-        DISPATCHER_RUNTIME.block_on(self.run_async(f))
+        self.run_with_timeout("request execution", self.request_timeout, f)
+    }
+
+    pub(crate) fn run_with_timeout<T, F>(
+        &self,
+        context: &'static str,
+        timeout: Duration,
+        f: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
+    {
+        DISPATCHER_RUNTIME.block_on(self.run_async_with_timeout(context, timeout, f))
     }
 
     pub(crate) async fn run_async<T, F>(&self, f: F) -> Result<T, StoreError>
@@ -295,10 +313,24 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
     {
+        self.run_async_with_timeout("request execution", self.request_timeout, f)
+            .await
+    }
+
+    pub(crate) async fn run_async_with_timeout<T, F>(
+        &self,
+        context: &'static str,
+        timeout: Duration,
+        f: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
+    {
         self.ensure_open()?;
         let closed = self.closed.clone();
         let client = self.client.clone();
-        self.await_blocking(move || {
+        self.await_blocking_with_timeout(context, timeout, move || {
             if closed.load(Ordering::SeqCst) {
                 return Err(dispatcher_stopped());
             }
@@ -585,15 +617,6 @@ impl StoreDispatcher {
     pub fn shutdown(&self) {
         self.stop_heartbeat_loop();
         self.closed.store(true, Ordering::SeqCst);
-    }
-
-    async fn await_blocking<T, F>(&self, f: F) -> Result<T, StoreError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> Result<T, StoreError> + Send + 'static,
-    {
-        self.await_blocking_with_timeout("request execution", self.request_timeout, f)
-            .await
     }
 
     async fn await_blocking_with_timeout<T, F>(
