@@ -52,7 +52,7 @@ Supported script inputs:
 | Variable | Default | Used By |
 |----------|---------|---------|
 | `MC_STORE_RS_REDIS_PORT` | `6380` | local Redis port |
-| `MC_STORE_RS_BENCH_ITERS` | `512` | batch benchmark loop count passed into e2e |
+| `MC_STORE_RS_BENCH_ITERS` | `64` | batch benchmark loop count passed into the local Rust e2e |
 | `MC_STORE_RS_VALUE_SIZE` | `4096` | payload size used by e2e |
 | `MOONCAKE_UPSTREAM_DIR` | `third_party/Mooncake` | upstream source location |
 | `MOONCAKE_UPSTREAM_BUILD_DIR` | `third_party/Mooncake/build-rust` | upstream build output location |
