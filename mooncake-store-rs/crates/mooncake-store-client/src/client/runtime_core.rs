@@ -37,10 +37,9 @@ impl StoreClient {
         {
             return Ok(());
         }
-        if let Err(error) = self
-            .metadata
-            .update_client_state(&self.lease.runtime, ClientLifecycleState::Active)
-        {
+        let mut lease = self.lease();
+        lease.state = ClientLifecycleState::Active;
+        if let Err(error) = self.metadata.upsert_client_lease(&lease) {
             self.startup_activation_pending.store(true, Ordering::SeqCst);
             return Err(error);
         }
@@ -193,6 +192,9 @@ impl StoreClient {
     pub fn lease(&self) -> ClientLease {
         let mut lease = self.lease.clone();
         lease.state = self.lifecycle_state();
+        lease.expires_at_ms = lease
+            .expires_at_ms
+            .max(now_ms().saturating_add(self.lease_ttl_ms));
         lease
     }
 
