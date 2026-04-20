@@ -27,25 +27,6 @@ fn main() {
         &jsoncpp,
     );
     build_native_shims(&upstream_dir, &build_dir, &out_dir);
-
-    let classic_dir = build_dir.join("mooncake-transfer-engine/src");
-    let tent_dir = build_dir.join("mooncake-transfer-engine/tent/src");
-    println!(
-        "cargo:rustc-env=MOONCAKE_CLASSIC_TE_LIB_PATH={}",
-        classic_dir.join("libtransfer_engine.so").display()
-    );
-    println!(
-        "cargo:rustc-env=MOONCAKE_TENT_SHARED_LIB_PATH={}",
-        tent_dir.join("libtent_shared.so").display()
-    );
-    println!(
-        "cargo:rustc-env=MOONCAKE_CLASSIC_SHIM_LIB_PATH={}",
-        out_dir.join("libmooncake_classic_shim.so").display()
-    );
-    println!(
-        "cargo:rustc-env=MOONCAKE_TENT_SHIM_LIB_PATH={}",
-        out_dir.join("libmooncake_tent_shim.so").display()
-    );
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -407,7 +388,6 @@ fn build_native_shims(upstream_dir: &Path, build_dir: &Path, out_dir: &Path) {
         "compile classic transfer-engine shim",
         &[&include],
         &[(&classic_dir, "transfer_engine")],
-        &[&classic_dir],
     );
     build_native_shim(
         out_dir,
@@ -416,7 +396,6 @@ fn build_native_shims(upstream_dir: &Path, build_dir: &Path, out_dir: &Path) {
         "compile tent transfer-engine shim",
         &[&include, &tent_include],
         &[(&tent_dir, "tent_shared")],
-        &[&tent_dir],
     );
 }
 
@@ -427,7 +406,6 @@ fn build_native_shim(
     description: &str,
     includes: &[&Path],
     link_libs: &[(&Path, &str)],
-    rpaths: &[&Path],
 ) {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir must exist"));
@@ -440,9 +418,6 @@ fn build_native_shim(
     }
     for (path, lib) in link_libs {
         compile.arg("-L").arg(path).arg(format!("-l{lib}"));
-    }
-    for rpath in rpaths {
-        compile.arg(format!("-Wl,-rpath,{}", rpath.display()));
     }
     compile.arg(&src).arg("-o").arg(&library);
 

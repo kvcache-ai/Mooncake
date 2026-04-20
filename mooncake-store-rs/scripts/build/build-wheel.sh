@@ -62,6 +62,7 @@ require_command() {
 require_command git
 require_command cargo
 require_command cmake
+require_command patchelf
 require_command "${PYTHON_BIN}"
 
 ensure_yalantinglibs() {
@@ -121,7 +122,7 @@ PATH="${VENV_BIN}:${PATH}" cmake \
   -Dyalantinglibs_DIR="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs" \
   -DPython3_EXECUTABLE="${VENV_PYTHON}" \
   -DWITH_TE=ON \
-  -DWITH_STORE=ON \
+  -DWITH_STORE=OFF \
   -DWITH_STORE_RUST=OFF \
   -DBUILD_EXAMPLES=ON \
   -DBUILD_UNIT_TESTS=OFF \
@@ -132,7 +133,7 @@ PATH="${VENV_BIN}:${PATH}" cmake \
   -DBUILD_SHARED_LIBS=ON
 
 PATH="${VENV_BIN}:${PATH}" cmake --build "${UPSTREAM_BUILD_DIR}" \
-  --target engine mooncake_master mooncake_client transfer_engine_bench tent_shared \
+  --target engine transfer_engine_bench tent_shared \
   -j"${BUILD_JOBS}"
 
 export MOONCAKE_UPSTREAM_DIR="${UPSTREAM_DIR}"
@@ -167,6 +168,7 @@ fi
   "${LATEST_WHEEL}" \
   "${REPO_ROOT}" \
   "${UPSTREAM_BUILD_DIR}" \
+  "${REPO_ROOT}/target/release/build" \
   "${REPO_ROOT}/target/release/mooncake-store-client" \
   "${REPO_ROOT}/target/release/mooncake-store-admin"
 import base64
@@ -175,6 +177,7 @@ import hashlib
 import pathlib
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -182,15 +185,15 @@ import zipfile
 wheel_path = pathlib.Path(sys.argv[1])
 repo_root = pathlib.Path(sys.argv[2])
 upstream_build_dir = pathlib.Path(sys.argv[3])
-store_client_path = pathlib.Path(sys.argv[4])
-store_admin_path = pathlib.Path(sys.argv[5])
+transport_build_dir = pathlib.Path(sys.argv[4])
+store_client_path = pathlib.Path(sys.argv[5])
+store_admin_path = pathlib.Path(sys.argv[6])
 upstream_py_dir = repo_root / "third_party" / "Mooncake" / "mooncake-wheel" / "mooncake"
+transport_shim_out_dirs = sorted(transport_build_dir.glob("mooncake-transport-sys-*/out"))
 
 binary_assets = {
     "mooncake-store-client": store_client_path,
     "mooncake-store-admin": store_admin_path,
-    "mooncake_master": upstream_build_dir / "mooncake-store" / "src" / "mooncake_master",
-    "mooncake_client": upstream_build_dir / "mooncake-store" / "src" / "mooncake_client",
     "transfer_engine_bench": upstream_build_dir
     / "mooncake-transfer-engine"
     / "example"
@@ -206,6 +209,20 @@ library_assets = {
     "libtent_shared.so": [
         upstream_build_dir / "mooncake-transfer-engine" / "tent" / "src" / "libtent_shared.so"
     ],
+    "libmooncake_classic_shim.so": [
+        shim_dir / "libmooncake_classic_shim.so" for shim_dir in transport_shim_out_dirs
+    ],
+    "libmooncake_tent_shim.so": [
+        shim_dir / "libmooncake_tent_shim.so" for shim_dir in transport_shim_out_dirs
+    ],
+}
+
+relative_rpath_assets = {
+    "engine.so",
+    "libtransfer_engine.so",
+    "libtent_shared.so",
+    "libmooncake_classic_shim.so",
+    "libmooncake_tent_shim.so",
 }
 
 python_assets = [
@@ -228,6 +245,13 @@ def first_existing(paths):
     raise FileNotFoundError(", ".join(str(path) for path in paths))
 
 
+def set_relative_rpath(path):
+    subprocess.run(
+        ["patchelf", "--set-rpath", "$ORIGIN", str(path)],
+        check=True,
+    )
+
+
 with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
     root = pathlib.Path(temp_dir)
     with zipfile.ZipFile(wheel_path) as source_wheel:
@@ -243,7 +267,10 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
 
     for name, candidates in library_assets.items():
         source = first_existing(candidates)
-        shutil.copy2(source, package_root / name)
+        target = package_root / name
+        shutil.copy2(source, target)
+        if name in relative_rpath_assets:
+            set_relative_rpath(target)
 
     for name in python_assets:
         shutil.copy2(upstream_py_dir / name, package_root / name)

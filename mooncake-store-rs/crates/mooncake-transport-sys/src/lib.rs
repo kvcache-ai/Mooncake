@@ -1,9 +1,7 @@
+use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-
-const CLASSIC_TE_LIB_PATH: &str = env!("MOONCAKE_CLASSIC_TE_LIB_PATH");
-const TENT_SHARED_LIB_PATH: &str = env!("MOONCAKE_TENT_SHARED_LIB_PATH");
-const CLASSIC_SHIM_LIB_PATH: &str = env!("MOONCAKE_CLASSIC_SHIM_LIB_PATH");
-const TENT_SHIM_LIB_PATH: &str = env!("MOONCAKE_TENT_SHIM_LIB_PATH");
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_UPSTREAM_DIR: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../third_party/Mooncake");
@@ -11,6 +9,31 @@ pub const DEFAULT_UPSTREAM_BUILD_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../third_party/Mooncake/build-rust"
 );
+
+const WHEEL_LIB_DIRS: [&str; 2] = ["mooncake.libs", "mooncake_store_rs.libs"];
+
+#[derive(Copy, Clone)]
+struct LibrarySpec {
+    file_name: &'static str,
+    env_key: &'static str,
+}
+
+const CLASSIC_TE_LIBRARY: LibrarySpec = LibrarySpec {
+    file_name: "libtransfer_engine.so",
+    env_key: "MOONCAKE_CLASSIC_TE_LIB_PATH",
+};
+const TENT_SHARED_LIBRARY: LibrarySpec = LibrarySpec {
+    file_name: "libtent_shared.so",
+    env_key: "MOONCAKE_TENT_SHARED_LIB_PATH",
+};
+const CLASSIC_SHIM_LIBRARY: LibrarySpec = LibrarySpec {
+    file_name: "libmooncake_classic_shim.so",
+    env_key: "MOONCAKE_CLASSIC_SHIM_LIB_PATH",
+};
+const TENT_SHIM_LIBRARY: LibrarySpec = LibrarySpec {
+    file_name: "libmooncake_tent_shim.so",
+    env_key: "MOONCAKE_TENT_SHIM_LIB_PATH",
+};
 
 #[derive(Copy, Clone)]
 struct DynamicLibrary(*mut c_void);
@@ -54,12 +77,180 @@ fn dlerror_string() -> String {
     }
 }
 
+fn load_library_from_spec(spec: LibrarySpec) -> Option<DynamicLibrary> {
+    for candidate in resolve_library_candidates(spec) {
+        let candidate_text = candidate.to_string_lossy();
+        if let Some(handle) = load_library(&candidate_text) {
+            return Some(handle);
+        }
+    }
+    load_library(spec.file_name)
+}
+
+fn resolve_library_candidates(spec: LibrarySpec) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os(spec.env_key).map(PathBuf::from) {
+        push_library_candidate(&mut candidates, &path, spec.file_name);
+    }
+    for library_dir in library_search_dirs() {
+        if let Some(candidate) = search_library_in_dir(&library_dir, spec.file_name) {
+            push_unique_path(&mut candidates, candidate);
+        }
+    }
+    candidates
+}
+
+fn library_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(module_path) = current_module_path() {
+        if let Some(module_dir) = module_path.parent() {
+            add_base_search_dirs(module_dir, &mut dirs);
+        }
+    }
+    if let Ok(executable) = env::current_exe() {
+        if let Some(executable_dir) = executable.parent() {
+            add_base_search_dirs(executable_dir, &mut dirs);
+        }
+    }
+    add_upstream_search_dirs(Path::new(DEFAULT_UPSTREAM_BUILD_DIR), &mut dirs);
+    add_upstream_search_dirs(
+        &Path::new(DEFAULT_UPSTREAM_DIR).join("build-wheel-compat"),
+        &mut dirs,
+    );
+    if let Some(build_dir) = env::var_os("MOONCAKE_UPSTREAM_BUILD_DIR").map(PathBuf::from) {
+        add_upstream_search_dirs(&build_dir, &mut dirs);
+    }
+    if let Some(upstream_dir) = env::var_os("MOONCAKE_UPSTREAM_DIR").map(PathBuf::from) {
+        add_upstream_search_dirs(&upstream_dir.join("build-rust"), &mut dirs);
+        add_upstream_search_dirs(&upstream_dir.join("build-wheel-compat"), &mut dirs);
+    }
+    dirs
+}
+
+fn add_base_search_dirs(base_dir: &Path, dirs: &mut Vec<PathBuf>) {
+    push_unique_dir(dirs, base_dir);
+    push_unique_dir(dirs, &base_dir.join("lib"));
+    if let Some(parent) = base_dir.parent() {
+        for wheel_dir in WHEEL_LIB_DIRS {
+            push_unique_dir(dirs, &parent.join(wheel_dir));
+        }
+        if base_dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
+            push_unique_dir(dirs, parent);
+            push_unique_dir(dirs, &parent.join("lib"));
+            if let Some(grandparent) = parent.parent() {
+                for wheel_dir in WHEEL_LIB_DIRS {
+                    push_unique_dir(dirs, &grandparent.join(wheel_dir));
+                }
+            }
+        }
+        add_transport_build_out_dirs(parent, dirs);
+    }
+    add_transport_build_out_dirs(base_dir, dirs);
+}
+
+fn add_upstream_search_dirs(build_dir: &Path, dirs: &mut Vec<PathBuf>) {
+    push_unique_dir(dirs, &build_dir.join("mooncake-asio"));
+    push_unique_dir(
+        dirs,
+        &build_dir.join("mooncake-transfer-engine").join("src"),
+    );
+    push_unique_dir(
+        dirs,
+        &build_dir
+            .join("mooncake-transfer-engine")
+            .join("tent")
+            .join("src"),
+    );
+}
+
+fn add_transport_build_out_dirs(profile_dir: &Path, dirs: &mut Vec<PathBuf>) {
+    let build_dir = profile_dir.join("build");
+    let Ok(entries) = fs::read_dir(build_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("mooncake-transport-sys-") {
+            continue;
+        }
+        push_unique_dir(dirs, &path.join("out"));
+    }
+}
+
+fn push_library_candidate(candidates: &mut Vec<PathBuf>, path: &Path, file_name: &str) {
+    if path.is_dir() {
+        if let Some(candidate) = search_library_in_dir(path, file_name) {
+            push_unique_path(candidates, candidate);
+        }
+        return;
+    }
+    if path.exists() {
+        push_unique_path(candidates, path.to_path_buf());
+    }
+}
+
+fn search_library_in_dir(library_dir: &Path, file_name: &str) -> Option<PathBuf> {
+    let direct = library_dir.join(file_name);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let prefix = file_name.strip_suffix(".so").unwrap_or(file_name);
+    let prefix = format!("{prefix}-");
+    let Ok(entries) = fs::read_dir(library_dir) else {
+        return None;
+    };
+    let mut hashed_matches = Vec::new();
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        let Some(name) = candidate.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.contains(".so") {
+            hashed_matches.push(candidate);
+        }
+    }
+    hashed_matches.sort();
+    hashed_matches.into_iter().next()
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, candidate: &Path) {
+    if !candidate.is_dir() {
+        return;
+    }
+    push_unique_path(dirs, candidate.to_path_buf());
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    let normalized = candidate.canonicalize().unwrap_or(candidate);
+    if !paths.iter().any(|path| path == &normalized) {
+        paths.push(normalized);
+    }
+}
+
+fn current_module_path() -> Option<PathBuf> {
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        let symbol = load_library as *const () as *const c_void;
+        if libc::dladdr(symbol, &mut info) == 0 || info.dli_fname.is_null() {
+            return None;
+        }
+        Some(PathBuf::from(
+            CStr::from_ptr(info.dli_fname)
+                .to_string_lossy()
+                .into_owned(),
+        ))
+    }
+}
+
 pub mod classic {
     #![allow(non_snake_case)]
 
     use super::{
-        c_char, c_int, c_void, load_library, load_symbol, DynamicLibrary, CLASSIC_SHIM_LIB_PATH,
-        CLASSIC_TE_LIB_PATH,
+        c_char, c_int, c_void, load_library_from_spec, load_symbol, DynamicLibrary,
+        CLASSIC_SHIM_LIBRARY, CLASSIC_TE_LIBRARY,
     };
     use std::ptr;
     use std::sync::OnceLock;
@@ -168,8 +359,8 @@ pub mod classic {
     }
 
     fn load_api() -> Option<ClassicApi> {
-        let transfer_engine = load_library(CLASSIC_TE_LIB_PATH)?;
-        let shim = load_library(CLASSIC_SHIM_LIB_PATH)?;
+        let transfer_engine = load_library_from_spec(CLASSIC_TE_LIBRARY)?;
+        let shim = load_library_from_spec(CLASSIC_SHIM_LIBRARY)?;
         Some(ClassicApi {
             create_transfer_engine: load_symbol(transfer_engine, "createTransferEngine")?,
             get_local_ip_and_port: load_symbol(transfer_engine, "getLocalIpAndPort")?,
@@ -387,8 +578,8 @@ pub mod tent {
     #![allow(non_snake_case)]
 
     use super::{
-        c_char, c_int, c_void, load_library, load_symbol, DynamicLibrary, TENT_SHARED_LIB_PATH,
-        TENT_SHIM_LIB_PATH,
+        c_char, c_int, c_void, load_library_from_spec, load_symbol, DynamicLibrary,
+        TENT_SHARED_LIBRARY, TENT_SHIM_LIBRARY,
     };
     use std::ptr;
     use std::sync::OnceLock;
@@ -498,8 +689,8 @@ pub mod tent {
     }
 
     fn load_api() -> Option<TentApi> {
-        let tent_shared = load_library(TENT_SHARED_LIB_PATH)?;
-        let shim = load_library(TENT_SHIM_LIB_PATH)?;
+        let tent_shared = load_library_from_spec(TENT_SHARED_LIBRARY)?;
+        let shim = load_library_from_spec(TENT_SHIM_LIBRARY)?;
         Some(TentApi {
             load_config_from_file: load_symbol(tent_shared, "tent_load_config_from_file")?,
             set_config: load_symbol(tent_shared, "tent_set_config")?,
@@ -679,5 +870,143 @@ pub mod tent {
         status: *mut TentStatus,
     ) -> c_int {
         api().map_or(-1, |api| (api.overall_status)(engine, batch_id, status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_base_search_dirs, search_library_in_dir};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mooncake-transport-sys-test-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("temp dir should create");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn search_library_in_dir_prefers_direct_match() {
+        let temp_dir = TempDir::new();
+        let direct = temp_dir.path().join("libtransfer_engine.so");
+        let hashed = temp_dir.path().join("libtransfer_engine-abcd1234.so");
+        fs::write(&direct, b"").expect("direct library should create");
+        fs::write(&hashed, b"").expect("hashed library should create");
+
+        let selected = search_library_in_dir(temp_dir.path(), "libtransfer_engine.so")
+            .expect("library should resolve");
+
+        assert_eq!(selected, direct);
+    }
+
+    #[test]
+    fn search_library_in_dir_accepts_hashed_wheel_libraries() {
+        let temp_dir = TempDir::new();
+        let hashed = temp_dir
+            .path()
+            .join("libmooncake_classic_shim-deadbeef.so.1");
+        fs::write(&hashed, b"").expect("hashed library should create");
+
+        let selected = search_library_in_dir(temp_dir.path(), "libmooncake_classic_shim.so")
+            .expect("hashed library should resolve");
+
+        assert_eq!(selected, hashed);
+    }
+
+    #[test]
+    fn add_base_search_dirs_includes_package_relative_dirs() {
+        let temp_dir = TempDir::new();
+        let site_packages = temp_dir.path().join("site-packages");
+        let package_dir = site_packages.join("mooncake");
+        let package_lib_dir = package_dir.join("lib");
+        let wheel_lib_dir = site_packages.join("mooncake.libs");
+        let compat_wheel_lib_dir = site_packages.join("mooncake_store_rs.libs");
+        fs::create_dir_all(&package_lib_dir).expect("package lib dir should create");
+        fs::create_dir_all(&wheel_lib_dir).expect("wheel lib dir should create");
+        fs::create_dir_all(&compat_wheel_lib_dir).expect("compat wheel lib dir should create");
+
+        let mut dirs = Vec::new();
+        add_base_search_dirs(&package_dir, &mut dirs);
+
+        assert!(dirs.contains(
+            &package_dir
+                .canonicalize()
+                .expect("package dir should resolve")
+        ));
+        assert!(dirs.contains(
+            &package_lib_dir
+                .canonicalize()
+                .expect("package lib dir should resolve")
+        ));
+        assert!(dirs.contains(
+            &wheel_lib_dir
+                .canonicalize()
+                .expect("wheel lib dir should resolve")
+        ));
+        assert!(dirs.contains(
+            &compat_wheel_lib_dir
+                .canonicalize()
+                .expect("compat wheel lib dir should resolve")
+        ));
+    }
+
+    #[test]
+    fn add_base_search_dirs_discovers_transport_build_out_from_deps() {
+        let temp_dir = TempDir::new();
+        let deps_dir = temp_dir.path().join("target").join("debug").join("deps");
+        let build_out_dir = temp_dir
+            .path()
+            .join("target")
+            .join("debug")
+            .join("build")
+            .join("mooncake-transport-sys-abc123")
+            .join("out");
+        fs::create_dir_all(&deps_dir).expect("deps dir should create");
+        fs::create_dir_all(&build_out_dir).expect("build out dir should create");
+
+        let mut dirs = Vec::new();
+        add_base_search_dirs(&deps_dir, &mut dirs);
+
+        assert!(dirs.contains(
+            &deps_dir
+                .canonicalize()
+                .expect("deps dir should canonicalize")
+        ));
+        assert!(dirs.contains(
+            &deps_dir
+                .parent()
+                .expect("deps dir should have parent")
+                .canonicalize()
+                .expect("profile dir should canonicalize")
+        ));
+        assert!(dirs.contains(
+            &build_out_dir
+                .canonicalize()
+                .expect("build out dir should canonicalize")
+        ));
     }
 }

@@ -8,7 +8,13 @@ import sys
 import tempfile
 
 _WHEEL_LIB_DIRS = ("mooncake.libs", "mooncake_store_rs.libs")
-_NATIVE_LIBRARIES = ("libasio.so", "libtransfer_engine.so", "libtent_shared.so")
+_NATIVE_LIBRARIES = (
+    "libasio.so",
+    "libtransfer_engine.so",
+    "libtent_shared.so",
+    "libmooncake_classic_shim.so",
+    "libmooncake_tent_shim.so",
+)
 
 
 def package_dir() -> pathlib.Path:
@@ -209,11 +215,9 @@ def execute_packaged_binary(binary_name: str, argv: list[str]) -> int:
 def invoked_binary_name() -> str:
     program_name = pathlib.Path(sys.argv[0]).name
     if program_name in {
-        "mooncake_master",
-        "mooncake_client",
         "transfer_engine_bench",
         "mooncake-store-client",
         "mooncake-store-admin",
     }:
         return program_name
-    return os.environ.get("MOONCAKE_CLI_TARGET", "mooncake_master")
+    return os.environ.get("MOONCAKE_CLI_TARGET", "mooncake-store-client")
