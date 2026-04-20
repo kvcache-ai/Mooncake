@@ -132,6 +132,11 @@ By default the script:
 - builds both wheels into `dist/wheels/`
 - copies the standalone `mooncake-store-client` and `mooncake-store-admin` artifacts into `dist/bin/`
 
+Repository packaging rule:
+
+- `scripts/build/build-wheel.sh` is the single owner of wheel asset injection and `auditwheel repair`
+- outer wrappers such as `abs_scripts/build.sh` only prepare the environment and collect the wheels already produced in `dist/wheels/`
+
 Common variants:
 
 ```bash
