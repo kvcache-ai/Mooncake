@@ -2857,7 +2857,7 @@ fn rw_only_client_can_expand_into_primary_segment() {
 }
 
 #[test]
-fn register_local_memory_splits_initial_storage_by_registration_limit() {
+fn register_local_memory_keeps_initial_storage_single_despite_registration_limit() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("split-storage-store"));
     transport.set_max_registration_bytes(Some(64));
@@ -2875,14 +2875,13 @@ fn register_local_memory_splits_initial_storage_by_registration_limit() {
         .register_local_memory()
         .expect("local memory registration should succeed");
 
-    let mut capacities = client
+    let capacities = client
         .list_segments()
         .expect("segments should list")
         .into_iter()
         .map(|segment| segment.capacity_bytes)
         .collect::<Vec<_>>();
-    capacities.sort_unstable();
-    assert_eq!(capacities, vec![32, 64, 64]);
+    assert_eq!(capacities, vec![160]);
 }
 
 #[test]

@@ -430,17 +430,14 @@ impl StoreClient {
         })
     }
 
-    fn storage_segment_chunk_limit(&self) -> Result<Option<usize>> {
-        Ok(self.transport()?.max_registration_bytes().filter(|value| *value > 0))
-    }
-
     fn storage_segment_plans(
         &self,
         storage_bytes: usize,
     ) -> Result<Vec<crate::memory::LocalRegionPlan>> {
         let mut config = self.local_memory.clone();
         config.storage_bytes = storage_bytes;
-        config.storage_region_plans(self.storage_segment_chunk_limit()?)
+        config.numa_aware = false;
+        config.storage_region_plans(None)
     }
 
     fn ensure_local_memory(&self) -> Result<()> {
