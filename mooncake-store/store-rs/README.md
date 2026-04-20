@@ -1,5 +1,7 @@
 # mooncake-store-rs
 
+> AI agents must install and use the repository skill before making changes in this repository: run `./scripts/install-dev-skill.sh` first, then follow `docs/skills/mooncake-store-rs-dev/SKILL.md`.
+
 A Rust-native Mooncake Store implementation that keeps the Mooncake store programming model, reuses Mooncake TE/TENT for data transfer, and defaults to masterless route control.
 
 ## What This Project Is
@@ -24,6 +26,21 @@ Use the document that matches what you are doing.
 | understand repository structure | `docs/components.md` |
 | understand implemented capabilities | `docs/features.md` |
 | understand runtime flow and control plane behavior | `docs/architecture.md` |
+| onboard an AI agent or collaborator to the repo workflow | `docs/skills/mooncake-store-rs-dev/SKILL.md`, `scripts/install-dev-skill.sh` |
+
+## AI Agent Skill
+
+This repository ships a versioned development skill for collaborators and AI agents.
+
+- canonical in-repo skill source: `docs/skills/mooncake-store-rs-dev/`
+- one-click local install: `./scripts/install-dev-skill.sh`
+
+Typical setup:
+
+```bash
+./scripts/install-dev-skill.sh
+git config core.hooksPath scripts/lib/git-hooks
+```
 
 ## Project Map
 
@@ -905,7 +922,7 @@ crates/
 python/
   mooncake/                 Python convenience package
 scripts/
-  format.sh                 Unified Rust/Python formatter
+  format.sh                 Unified Rust/Python formatter plus Rust clippy gate
   run-all-tests.sh            Unified scripts regression runner for CI and local use
   build/                    Wheel, coverage, and packaging helpers
   clients/                  Real-mode and dummy-mode black-box validators
@@ -937,7 +954,7 @@ Useful variants:
 
 ## Formatting
 
-Format the repository before every commit:
+Format and lint the repository before every commit:
 
 ```bash
 ./scripts/format.sh
@@ -957,6 +974,7 @@ chmod +x scripts/format.sh scripts/lib/git-hooks/pre-commit
 ```
 
 Python formatting uses `ruff` when available and falls back to `black`.
+Rust checks run `cargo fmt --all` followed by `cargo clippy --workspace --lib --bins -- -D warnings`.
 Install the recommended formatter tooling with:
 
 ```bash

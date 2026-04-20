@@ -127,7 +127,7 @@ enum RouteAuthorityObservation {
     #[default]
     Unobserved,
     Missing,
-    Present(ObjectRoute),
+    Present(Box<ObjectRoute>),
 }
 
 struct RouteCasAttempt {
@@ -477,10 +477,10 @@ impl EmbeddedWrhRouteDirectory {
             let Some(authority) = authorities.get(rank).cloned() else {
                 continue;
             };
-            if resolved[index].is_some() {
-                if repairs.is_none() || !self.authority_is_local(&authority) {
-                    continue;
-                }
+            if resolved[index].is_some()
+                && (repairs.is_none() || !self.authority_is_local(&authority))
+            {
+                continue;
             }
             groups
                 .entry(authority.runtime.stable_id.0.clone())
@@ -521,7 +521,7 @@ impl EmbeddedWrhRouteDirectory {
                                     Self::set_repair_observation(
                                         &mut states[index],
                                         rank,
-                                        RouteAuthorityObservation::Present(route.clone()),
+                                        RouteAuthorityObservation::Present(Box::new(route.clone())),
                                     );
                                 }
                                 Self::merge_fresher_route(
@@ -664,7 +664,7 @@ impl EmbeddedWrhRouteDirectory {
                 })
             }
             RouteAuthorityObservation::Present(current)
-                if current.version == best.version && current != best =>
+                if current.version == best.version && current.as_ref() != best =>
             {
                 record_route_repair_metric(ROUTE_REPAIR_DIVERGENT_AUTHORITY);
                 Some(RouteCasRequest {

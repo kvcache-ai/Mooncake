@@ -1637,7 +1637,7 @@ fn try_allocate_classic_numa_memory(
                 "classic numa_alloc_onnode failed for location {location} size={size}"
             )));
         }
-        return Ok(Some((addr, ClassicAllocationOwner::Numa)));
+        Ok(Some((addr, ClassicAllocationOwner::Numa)))
     }
     #[cfg(not(target_os = "linux"))]
     {

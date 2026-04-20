@@ -39,18 +39,18 @@ impl<'a> ObjectRef<'a> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NamespaceQuota {
     pub max_bytes: Option<u64>,
     pub max_objects: Option<usize>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecutionFairness {
     pub max_remote_batch_items_per_tenant: Option<usize>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BandwidthShaping {
     pub max_remote_batch_bytes: Option<usize>,
     pub max_remote_batch_burst_items: Option<usize>,

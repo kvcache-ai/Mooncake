@@ -4,7 +4,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # scripts/format.sh
 #
-# Unified repository formatter for Rust and Python sources.
+# Unified repository formatter for Rust and Python sources, plus Rust clippy.
 # Run this before every commit, or let the git pre-commit hook invoke it.
 # ---------------------------------------------------------------------------
 
@@ -21,7 +21,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/format.sh [options]
 
-Format tracked Rust and Python source files in this repository.
+Format tracked Rust and Python source files in this repository, and run Rust
+clippy checks.
 
 Options:
   --check         Verify formatting without modifying files
@@ -31,6 +32,7 @@ Options:
 
 Notes:
   - Rust formatting uses `cargo fmt --all`
+  - Rust lint uses `cargo clippy --workspace --lib --bins -- -D warnings`
   - Python formatting prefers `ruff format`, and falls back to `black`
   - Install Python formatter support with: `python3 -m pip install -e '.[dev]'`
 EOF
@@ -64,7 +66,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-run_rust_fmt() {
+run_rust_checks() {
   mc_scripts_require_command cargo "Rust formatting"
 
   echo "==> formatting Rust"
@@ -73,6 +75,9 @@ run_rust_fmt() {
   else
     cargo fmt --all
   fi
+
+  echo "==> linting Rust with clippy"
+  cargo clippy --workspace --lib --bins -- -D warnings
 }
 
 select_python_formatter() {
@@ -162,7 +167,7 @@ EOF
 cd "${REPO_ROOT}"
 
 if ((RUN_RUST)); then
-  run_rust_fmt
+  run_rust_checks
 fi
 
 if ((RUN_PYTHON)); then
