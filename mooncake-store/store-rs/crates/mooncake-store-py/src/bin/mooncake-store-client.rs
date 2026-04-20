@@ -77,6 +77,7 @@ impl TransportBackendArg {
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-client")]
 #[command(about = "Start a standalone Mooncake store-rs client runtime")]
+#[command(arg_required_else_help = true)]
 struct Args {
     #[arg(long)]
     local_hostname: String,
@@ -166,6 +167,7 @@ struct StatsArgs {
     json: bool,
 }
 
+#[derive(Debug)]
 enum Cli {
     Run(Args),
     Stats(StatsArgs),
@@ -187,7 +189,12 @@ impl ShutdownSignal {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    match parse_cli()? {
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    };
+
+    match cli {
         Cli::Run(args) => run_client(args),
         Cli::Stats(args) => run_stats_command(args),
     }
@@ -744,6 +751,7 @@ fn now_ms() -> u64 {
 mod tests {
     use std::time::Duration;
 
+    use clap::error::ErrorKind;
     use clap::Parser;
     use mooncake_store_client::{
         record_heartbeat_health, stable_phase_spread_ms, start_metrics_http_server,
@@ -956,6 +964,23 @@ mod tests {
             }
             Cli::Run(_) => panic!("expected stats subcommand"),
         }
+    }
+
+    #[test]
+    fn root_help_returns_display_help_error() {
+        let error = parse_cli_from(["mooncake-store-client", "--help"])
+            .expect_err("help should short-circuit clap parsing");
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn no_args_returns_help_instead_of_missing_required_flags() {
+        let error = parse_cli_from(["mooncake-store-client"])
+            .expect_err("empty argv should short-circuit to help");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     #[test]
