@@ -114,4 +114,12 @@ impl StoreClient {
         let state = self.state.lock();
         state.memory_ref()?.storage_address(&segment, 0)
     }
+
+    pub fn local_memory_registration_bytes(&self) -> u64 {
+        let total = self
+            .local_memory
+            .storage_bytes
+            .saturating_add(self.local_memory.scratch_bytes);
+        u64::try_from(total).unwrap_or(u64::MAX)
+    }
 }

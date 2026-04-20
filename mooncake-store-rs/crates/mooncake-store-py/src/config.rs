@@ -12,10 +12,10 @@ use url::Url;
 
 pub const DEFAULT_COMPAT_LEASE_TTL_MS: u64 = 30_000;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
-const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_DUMMY_RPC_TIMEOUT: Duration = Duration::from_secs(65);
+const STARTUP_TIMEOUT_BYTES_PER_SECOND: u64 = 1024 * 1024 * 1024;
 const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
 const STARTUP_TIMEOUT_ENV: &str = "MC_STORE_RS_STARTUP_TIMEOUT_MS";
 const HEARTBEAT_TIMEOUT_ENV: &str = "MC_STORE_RS_HEARTBEAT_TIMEOUT_MS";
@@ -35,7 +35,7 @@ pub struct CompatTimeoutCliOverrides {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompatTimeoutConfig {
     pub request_timeout: Duration,
-    pub startup_timeout: Duration,
+    pub startup_timeout_override: Option<Duration>,
     pub heartbeat_timeout: Duration,
     pub transfer_stall_timeout: Duration,
     pub dummy_rpc_timeout: Duration,
@@ -45,8 +45,7 @@ impl CompatTimeoutConfig {
     pub fn from_env() -> Self {
         let request_timeout =
             duration_from_env_ms(&[REQUEST_TIMEOUT_ENV]).unwrap_or(DEFAULT_REQUEST_TIMEOUT);
-        let startup_timeout =
-            duration_from_env_ms(&[STARTUP_TIMEOUT_ENV]).unwrap_or(DEFAULT_STARTUP_TIMEOUT);
+        let startup_timeout_override = duration_from_env_ms(&[STARTUP_TIMEOUT_ENV]);
         let heartbeat_timeout =
             duration_from_env_ms(&[HEARTBEAT_TIMEOUT_ENV]).unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT);
         let transfer_stall_timeout =
@@ -57,7 +56,7 @@ impl CompatTimeoutConfig {
             .unwrap_or(DEFAULT_DUMMY_RPC_TIMEOUT);
         Self {
             request_timeout,
-            startup_timeout,
+            startup_timeout_override,
             heartbeat_timeout,
             transfer_stall_timeout,
             dummy_rpc_timeout,
@@ -76,7 +75,8 @@ impl CompatTimeoutConfig {
             }
         }
         if let Some(timeout_ms) = overrides.startup_timeout_ms {
-            self.startup_timeout = parse_timeout_override("--startup-timeout-ms", timeout_ms)?;
+            self.startup_timeout_override =
+                Some(parse_timeout_override("--startup-timeout-ms", timeout_ms)?);
         }
         if let Some(timeout_ms) = overrides.heartbeat_timeout_ms {
             self.heartbeat_timeout = parse_timeout_override("--heartbeat-timeout-ms", timeout_ms)?;
@@ -97,7 +97,7 @@ impl CompatTimeoutConfig {
     }
 
     pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
-        self.startup_timeout = timeout.max(Duration::from_millis(1));
+        self.startup_timeout_override = Some(timeout.max(Duration::from_millis(1)));
         self
     }
 
@@ -105,6 +105,18 @@ impl CompatTimeoutConfig {
         self.heartbeat_timeout = timeout.max(Duration::from_millis(1));
         self
     }
+
+    pub fn startup_timeout_for_registration_bytes(&self, registration_bytes: u64) -> Duration {
+        self.startup_timeout_override
+            .unwrap_or_else(|| adaptive_startup_timeout(registration_bytes))
+    }
+}
+
+fn adaptive_startup_timeout(registration_bytes: u64) -> Duration {
+    let units = registration_bytes
+        .max(1)
+        .div_ceil(STARTUP_TIMEOUT_BYTES_PER_SECOND);
+    Duration::from_secs(units.max(1))
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -568,7 +580,7 @@ mod tests {
     fn sample_timeouts() -> CompatTimeoutConfig {
         CompatTimeoutConfig {
             request_timeout: Duration::from_millis(65_000),
-            startup_timeout: Duration::from_millis(300_000),
+            startup_timeout_override: None,
             heartbeat_timeout: Duration::from_millis(15_000),
             transfer_stall_timeout: Duration::from_millis(10_000),
             dummy_rpc_timeout: Duration::from_millis(65_000),
@@ -1028,7 +1040,7 @@ mod tests {
         std::env::remove_var(DUMMY_RPC_TIMEOUT_ENV);
         let timeouts = CompatTimeoutConfig::from_env();
         assert_eq!(timeouts.request_timeout, Duration::from_millis(42_000));
-        assert_eq!(timeouts.startup_timeout, Duration::from_millis(300_000));
+        assert_eq!(timeouts.startup_timeout_override, None);
         assert_eq!(timeouts.dummy_rpc_timeout, Duration::from_millis(42_000));
         std::env::remove_var(REQUEST_TIMEOUT_ENV);
     }
@@ -1038,7 +1050,10 @@ mod tests {
         let _guard = env_test_lock().lock();
         std::env::set_var(STARTUP_TIMEOUT_ENV, "91000");
         let timeouts = CompatTimeoutConfig::from_env();
-        assert_eq!(timeouts.startup_timeout, Duration::from_millis(91_000));
+        assert_eq!(
+            timeouts.startup_timeout_override,
+            Some(Duration::from_millis(91_000))
+        );
         std::env::remove_var(STARTUP_TIMEOUT_ENV);
     }
 
@@ -1054,12 +1069,37 @@ mod tests {
             })
             .expect("cli overrides should apply");
         assert_eq!(timeouts.request_timeout, Duration::from_millis(9_000));
-        assert_eq!(timeouts.startup_timeout, Duration::from_millis(120_000));
+        assert_eq!(
+            timeouts.startup_timeout_override,
+            Some(Duration::from_millis(120_000))
+        );
         assert_eq!(timeouts.heartbeat_timeout, Duration::from_millis(11_000));
         assert_eq!(
             timeouts.transfer_stall_timeout,
             Duration::from_millis(7_000)
         );
         assert_eq!(timeouts.dummy_rpc_timeout, Duration::from_millis(9_000));
+    }
+
+    #[test]
+    fn adaptive_startup_timeout_scales_with_registration_bytes() {
+        assert_eq!(
+            sample_timeouts().startup_timeout_for_registration_bytes(1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            sample_timeouts().startup_timeout_for_registration_bytes(1024 * 1024 * 1024),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            sample_timeouts().startup_timeout_for_registration_bytes(500 * 1024 * 1024 * 1024_u64),
+            Duration::from_secs(500)
+        );
+        assert_eq!(
+            sample_timeouts()
+                .with_startup_timeout(Duration::from_secs(7))
+                .startup_timeout_for_registration_bytes(500 * 1024 * 1024 * 1024_u64),
+            Duration::from_secs(7)
+        );
     }
 }

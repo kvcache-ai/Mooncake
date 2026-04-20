@@ -106,6 +106,8 @@ impl StoreDispatcher {
         _thread_name: impl Into<String>,
         timeouts: CompatTimeoutConfig,
     ) -> Result<Self, StoreError> {
+        let startup_timeout = timeouts
+            .startup_timeout_for_registration_bytes(client.local_memory_registration_bytes());
         let runtime = client.runtime_id().to_string();
         let health = Arc::new(client.health_channel());
         let hot_cache = LocalHotCache::from_env()?.map(Arc::new);
@@ -121,7 +123,7 @@ impl StoreDispatcher {
             health_inflight: Arc::new(AtomicBool::new(false)),
             heartbeat_loop: Arc::new(Mutex::new(None)),
             request_timeout: timeouts.request_timeout.max(Duration::from_millis(1)),
-            startup_timeout: timeouts.startup_timeout.max(Duration::from_millis(1)),
+            startup_timeout: startup_timeout.max(Duration::from_millis(1)),
             health_timeout: timeouts.heartbeat_timeout.max(Duration::from_millis(1)),
             runtime,
             heartbeat_health: Arc::new(Mutex::new(HeartbeatHealthState::default())),
@@ -617,6 +619,10 @@ impl StoreDispatcher {
     pub fn shutdown(&self) {
         self.stop_heartbeat_loop();
         self.closed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn startup_timeout(&self) -> Duration {
+        self.startup_timeout
     }
 
     async fn await_blocking_with_timeout<T, F>(
