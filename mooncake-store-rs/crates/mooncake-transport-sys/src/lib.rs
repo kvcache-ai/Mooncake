@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs;

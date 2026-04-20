@@ -205,7 +205,7 @@ impl StoreClient {
         self.flush_due_reclaims()?;
         let tenant = object_id.scope.tenant.as_str();
         let key = object_id.logical_key.as_str();
-        let scoped_key = ObjectKey::from_logical_id(&object_id);
+        let scoped_key = ObjectKey::from_logical_id(object_id);
         let mut object_ref = ObjectRef::new(key).tenant(tenant);
         if object_id.scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
             object_ref = object_ref.domain(object_id.scope.domain.as_str());
@@ -312,7 +312,7 @@ impl StoreClient {
                     })
                     .collect(),
             };
-            mooncake_store_core::apply_route_identity(&mut route, &object_id);
+            mooncake_store_core::apply_route_identity(&mut route, object_id);
             let cas_tracker = OperationTracker::new("put_stage_route_cas");
             let publish_started = Instant::now();
             let cas_result = self.route_directory.compare_and_swap_object_route(

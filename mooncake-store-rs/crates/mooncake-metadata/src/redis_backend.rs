@@ -679,12 +679,8 @@ impl RedisMetadataBackend {
         client: &redis::Client,
     ) -> std::result::Result<redis::Connection, redis::RedisError> {
         let connection = client.get_connection_with_timeout(redis_connect_timeout())?;
-        connection
-            .set_read_timeout(Some(redis_io_timeout()))
-            .map_err(redis::RedisError::from)?;
-        connection
-            .set_write_timeout(Some(redis_io_timeout()))
-            .map_err(redis::RedisError::from)?;
+        connection.set_read_timeout(Some(redis_io_timeout()))?;
+        connection.set_write_timeout(Some(redis_io_timeout()))?;
         Ok(connection)
     }
 

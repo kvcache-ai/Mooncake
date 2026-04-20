@@ -165,7 +165,7 @@ struct StatsArgs {
 #[derive(Subcommand, Debug)]
 enum Command {
     #[command(about = "Start a standalone Mooncake store-rs client runtime")]
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     #[command(about = "Fetch stats from a running Mooncake store-rs client")]
     Stats(StatsArgs),
 }
@@ -197,7 +197,7 @@ impl ShutdownSignal {
 fn main() -> Result<(), Box<dyn Error>> {
     match parse_cli() {
         Ok(cli) => match cli.command {
-            Command::Run(args) => run_client(args),
+            Command::Run(args) => run_client(*args),
             Command::Stats(args) => run_stats_command(args),
         },
         Err(error) => error.exit(),

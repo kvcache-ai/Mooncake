@@ -149,16 +149,11 @@ pub enum RouteControlMode {
     EmbeddedWrh,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum RoutePolicyDomain {
+    #[default]
     Default,
     Tenant(String),
-}
-
-impl Default for RoutePolicyDomain {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
