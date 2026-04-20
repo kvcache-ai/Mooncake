@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -18,10 +19,8 @@ use crate::shm::{
     DummyClientId, OwnedMappedRegion, ShmRegisterRequest,
 };
 
-static DUMMY_RUNTIME: LazyLock<Runtime> =
-    LazyLock::new(|| Runtime::new().expect("dummy runtime should initialize"));
-
 pub struct DummySession {
+    runtime: Arc<Runtime>,
     channel: Channel,
     server_addr: String,
     socket_path: PathBuf,
@@ -39,19 +38,36 @@ struct RegisteredRegion {
 }
 
 impl DummySession {
-    pub fn connect(server_addr: &str) -> Result<Self> {
+    pub fn connect(server_addr: &str, worker_scope: impl Into<String>) -> Result<Self> {
         let timeouts = CompatTimeoutConfig::from_env();
-        Self::connect_with_rpc_timeout(server_addr, timeouts.dummy_rpc_timeout)
+        Self::connect_with_rpc_timeout(server_addr, worker_scope, timeouts.dummy_rpc_timeout)
     }
 
-    pub fn connect_with_rpc_timeout(server_addr: &str, rpc_timeout: Duration) -> Result<Self> {
+    pub fn connect_with_rpc_timeout(
+        server_addr: &str,
+        worker_scope: impl Into<String>,
+        rpc_timeout: Duration,
+    ) -> Result<Self> {
+        let worker_scope = worker_scope.into();
         let endpoint_uri = format!("http://{server_addr}");
+        static NEXT_DUMMY_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+        let runtime_id = NEXT_DUMMY_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name(format!("dummy-session-{runtime_id}"))
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    StoreError::Transport(format!("dummy runtime should initialize: {error}"))
+                })?,
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         let channel = 'connect: loop {
             let endpoint = Endpoint::from_shared(endpoint_uri.clone()).map_err(|error| {
                 StoreError::Transport(format!("invalid dummy server endpoint: {error}"))
             })?;
-            match DUMMY_RUNTIME.block_on(endpoint.connect()) {
+            match runtime.block_on(endpoint.connect()) {
                 Ok(channel) => break 'connect channel,
                 Err(_) if Instant::now() < deadline => {
                     sleep(Duration::from_millis(25));
@@ -65,10 +81,11 @@ impl DummySession {
             }
         };
         let session = Self {
+            runtime,
             channel,
             server_addr: server_addr.to_string(),
-            socket_path: dummy_ipc_socket_path(server_addr),
-            hot_cache_socket_path: hot_cache_ipc_socket_path(server_addr),
+            socket_path: dummy_ipc_socket_path(server_addr, &worker_scope),
+            hot_cache_socket_path: hot_cache_ipc_socket_path(server_addr, &worker_scope),
             client_id: DummyClientId::new(),
             rpc_timeout,
             registered_regions: Mutex::new(BTreeMap::new()),
@@ -651,18 +668,17 @@ impl DummySession {
         F: FnOnce(pb::dummy_store_service_client::DummyStoreServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
-        DUMMY_RUNTIME
-            .block_on(async {
-                tokio::time::timeout(
-                    self.rpc_timeout,
-                    f(
-                        pb::dummy_store_service_client::DummyStoreServiceClient::new(
-                            self.channel.clone(),
-                        ),
+        self.runtime.block_on(async {
+            tokio::time::timeout(
+                self.rpc_timeout,
+                f(
+                    pb::dummy_store_service_client::DummyStoreServiceClient::new(
+                        self.channel.clone(),
                     ),
-                )
-                .await
-            })
+                ),
+            )
+            .await
+        })
             .map_err(|_| {
                 StoreError::Transport(format!(
                     "dummy rpc timed out after {}ms",

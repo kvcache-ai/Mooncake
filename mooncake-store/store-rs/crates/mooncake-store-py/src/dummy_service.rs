@@ -106,11 +106,13 @@ impl Drop for DummyStoreServerHandle {
 pub fn start_dummy_store_server(
     client: Arc<StoreDispatcher>,
     bind_addr: &str,
+    worker_scope: &str,
 ) -> Result<DummyStoreServerHandle, StoreError> {
-    let socket_path = dummy_ipc_socket_path(bind_addr);
+    let client = Arc::new(client.fork_with_scope(worker_scope.to_string())?);
+    let socket_path = dummy_ipc_socket_path(bind_addr, worker_scope);
     let hot_cache_socket_path = client
         .hot_cache_fd()?
-        .map(|_| hot_cache_ipc_socket_path(bind_addr));
+        .map(|_| hot_cache_ipc_socket_path(bind_addr, worker_scope));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let context = Arc::new(DummyStoreContext { client });
 
@@ -178,9 +180,7 @@ pub fn start_dummy_store_server(
         None
     };
 
-    let service = GrpcDummyStoreService {
-        context: context.clone(),
-    };
+    let grpc_context = context.clone();
     let address: SocketAddr = bind_addr
         .parse()
         .map_err(|error| StoreError::Transport(format!("invalid dummy server address: {error}")))?;
@@ -189,6 +189,9 @@ pub fn start_dummy_store_server(
         .name("mooncake-store-dummy-grpc".to_string())
         .spawn(move || {
             let runtime = Runtime::new().expect("dummy gRPC runtime should build");
+            let service = GrpcDummyStoreService {
+                context: grpc_context.clone(),
+            };
             runtime.block_on(async move {
                 let result = Server::builder()
                     .add_service(
@@ -202,6 +205,7 @@ pub fn start_dummy_store_server(
                     tracing::warn!(error = %error, "dummy gRPC server stopped with error");
                 }
             });
+            drop(grpc_context);
         })
         .map_err(|error| StoreError::Transport(format!("failed to spawn gRPC thread: {error}")))?;
 
