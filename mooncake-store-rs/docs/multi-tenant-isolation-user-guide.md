@@ -19,6 +19,7 @@ Store-RS multi-tenant isolation currently spans these areas:
 - QoS-related defaults such as fairness and shaping knobs
 - tenant namespace selection through `tenant`, `domain`, and `object_set`
 - strict quota admission backed by authoritative metadata rather than best-effort request-local checks
+- Python compatibility worker isolation through `keyspace` and `worker_scope`
 
 Current scope model:
 
@@ -37,6 +38,21 @@ Use this split of responsibilities:
 - `tenant` remains the default namespace selector used for startup policy lookup and request builders
 
 This keeps management explicit while avoiding control-plane policy decisions in the fast path.
+
+## Python Compatibility Isolation Model
+
+The Python compatibility layer has two separate isolation knobs and they should not be treated as synonyms:
+
+- `keyspace` isolates metadata-backed routing, policy lookup, and object visibility
+- `worker_scope` isolates compat-local worker state such as the Python dispatcher runtime, local hot cache domain, tracked-key registry, and dummy side-channel namespace
+
+Current defaulting behavior:
+
+- if `worker_scope` is set explicitly, that value is used
+- otherwise Python derives `worker_scope` from `keyspace` when `keyspace` is present
+- otherwise Python allocates a unique per-setup worker scope so separate setups do not silently share compat-local state
+
+This means two Python setups can intentionally share metadata namespace through the same `keyspace` while still keeping their compat-local caches and worker state isolated by different `worker_scope` values.
 
 ## Policy Precedence
 
@@ -125,6 +141,44 @@ Important points:
 - `tenant(...)` selects the default scope used for startup policy lookup and request builders
 - request-scoped APIs and per-request replication settings are still normal execution-time inputs
 - transport and memory setup remain runtime responsibilities even when route / quota policy is metadata-managed
+
+Python real-mode example:
+
+```python
+from mooncake import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    local_hostname="127.0.0.1",
+    metadata_url="redis://127.0.0.1:6380/0",
+    global_segment_size=256 * 1024 * 1024,
+    local_buffer_size=16 * 1024 * 1024,
+    protocol="tcp",
+    device_name="",
+    master_server_address="",
+    keyspace="tenant-a-prod",
+    worker_scope="py-worker-a",
+)
+```
+
+Use real mode when Python should participate directly in the same distributed runtime as Rust clients.
+
+Python dummy-mode example:
+
+```python
+from mooncake import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup_dummy(
+    256 * 1024 * 1024,
+    16 * 1024 * 1024,
+    "127.0.0.1:50051",
+    keyspace="tenant-a-prod",
+    worker_scope="dummy-worker-a",
+)
+```
+
+Use dummy mode when Python should attach to a standalone `mooncake-store-client` daemon. In dummy mode, clients only share shm-backed hot-cache hits and side channels when they intentionally use the same worker-scoped dummy server boundary.
 
 ## QoS and bandwidth policy notes
 
@@ -245,13 +299,17 @@ Backend behavior:
 
 If you want to validate the feature end-to-end:
 
-- `scripts/e2e/run-local-e2e.sh` covers multi-tenant behavior and strict tenant quota
-- `docs/strict-tenant-quota-e2e-test-guide.md` explains the focused strict quota validation path
+- `scripts/e2e/run-local-e2e.sh` covers multi-tenant behavior and strict tenant quota in the Rust e2e harness
+- `scripts/e2e/run-python-compat-e2e.sh` covers the Python compatibility API surface
+- `scripts/e2e/run-local-hot-cache-e2e.sh` validates real-mode local hot-cache reuse and dummy-mode shm-backed hot-cache reuse
+- `scripts/sglang/run-sglang-hicache-dummy-compat.sh` and `scripts/sglang/run-sglang-hicache-real-compat.sh` validate the two Python execution modes against the HiCache compatibility flows
 - `docs/deployment.md` describes the recommended operator workflow from policy authoring to local validation
+- `docs/python.md` documents the current Python `keyspace` / `worker_scope` behavior in more detail
 
 ## Related Documents
 
 - `docs/deployment.md` — runtime and operator deployment workflow
+- `docs/python.md` — Python real-mode and dummy-mode isolation semantics
 - `docs/configuration.md` — precedence and fallback behavior for tenant-scoped settings
 - `docs/multi-tenant-admin-control-plane-design.md` — control-plane design and admin command model
 - `docs/tenant-quota-consistency-design.md` — strict quota design and metadata protocol
