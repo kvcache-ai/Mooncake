@@ -57,11 +57,13 @@ class HAIntegrationTest : public ::testing::Test {
             /*route_cache_ttl_ms=*/5 * 60 * 1000,
             /*local_transfer_mode=*/"memcpy",
             /*local_memcpy_async_worker_num=*/32,
+            /*metrics_port=*/9003,
+            /*enable_metrics_http=*/true,
             /*labels=*/{}, async_sender_thread_count);
 
         auto client = std::make_shared<P2PClientService>(
             config.local_ip, config.te_port, config.metadata_connstring,
-            config.labels);
+            config.metrics_port, config.enable_metrics_http, config.labels);
 
         auto err = client->Init(config);
         EXPECT_EQ(err, ErrorCode::OK)

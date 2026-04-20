@@ -98,6 +98,15 @@ struct RealClientConfigBase {
     // The IPC socket path between dummy and real clients.
     // If use integrated deployment, this could be empty.
     std::string ipc_socket_path;
+
+    // Port for metrics HTTP server.
+    // Only used when enable_metrics_http is true.
+    uint16_t metrics_port = 9003;
+
+    // Whether to enable metrics HTTP server.
+    // The metrics server exposes /metrics, /metrics/summary, and /health
+    // endpoints.
+    bool enable_metrics_http = true;
 };
 
 /**
@@ -192,12 +201,13 @@ class ClientConfigBuilder {
         uint64_t global_segment_size = 0, uint64_t local_buffer_size = 0,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         const std::string& ipc_socket_path = "", bool enable_offload = false,
+        uint16_t metrics_port = 9003, bool enable_metrics_http = true,
         const std::map<std::string, std::string>& labels = {}) {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
-            ipc_socket_path, labels);
+            ipc_socket_path, metrics_port, enable_metrics_http, labels);
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
         return config;
@@ -218,7 +228,8 @@ class ClientConfigBuilder {
         size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
         uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
         const std::string& local_transfer_mode = "te",
-        size_t local_memcpy_async_worker_num = 32,
+        size_t local_memcpy_async_worker_num = 32, uint16_t metrics_port = 9003,
+        bool enable_metrics_http = true,
         const std::map<std::string, std::string>& labels = {},
         size_t async_sender_thread_count = 0,
         size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0) {
@@ -226,7 +237,7 @@ class ClientConfigBuilder {
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
-            ipc_socket_path, labels);
+            ipc_socket_path, metrics_port, enable_metrics_http, labels);
         config.client_rpc_port = client_rpc_port;
         config.rpc_thread_num = rpc_thread_num;
         config.lock_shard_count = lock_shard_count;
@@ -281,8 +292,9 @@ class ClientConfigBuilder {
         const std::optional<std::string>& rdma_devices,
         const std::string& master_server_entry, uint64_t local_buffer_size,
         const std::shared_ptr<TransferEngine>& transfer_engine,
-        const std::string& ipc_socket_path,
-        const std::map<std::string, std::string>& labels) {
+        const std::string& ipc_socket_path, uint16_t metrics_port = 9003,
+        bool enable_metrics_http = true,
+        const std::map<std::string, std::string>& labels = {}) {
         // Parse local_hostname into IP and optional port.
         // Only set te_port when the user explicitly provides a port;
         // otherwise keep the default value (0 = randomly assigned).
@@ -316,6 +328,8 @@ class ClientConfigBuilder {
         config.local_buffer_size = local_buffer_size;
         config.transfer_engine = transfer_engine;
         config.ipc_socket_path = ipc_socket_path;
+        config.metrics_port = metrics_port;
+        config.enable_metrics_http = enable_metrics_http;
         config.labels = labels;
     }
 

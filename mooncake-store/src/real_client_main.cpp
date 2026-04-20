@@ -105,7 +105,9 @@ int main(int argc, char* argv[]) {
                 string_to_byte_size(FLAGS_route_cache_max_memory),
                 FLAGS_route_cache_ttl_ms, FLAGS_p2p_local_transfer_mode,
                 static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
-                {},  // labels
+                9003,  // metrics_port
+                true,  // enable_metrics_http
+                {},    // labels
                 FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
                 FLAGS_async_route_queue_size);
         } else {
@@ -122,7 +124,9 @@ int main(int argc, char* argv[]) {
                 FLAGS_master_server_address, global_segment_size,
                 local_buffer_size, nullptr,
                 "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-                FLAGS_enable_offload);
+                FLAGS_enable_offload,
+                9003,   // metrics_port
+                true);  // enable_metrics_http
         }
     }();
 
