@@ -643,8 +643,8 @@ impl PyMooncakeDistributedStore {
                     .map(|(key, _, _)| key.clone())
                     .collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
-                dispatcher
-                    .run(move |client| {
+                py.allow_threads(move || {
+                    dispatcher.run(move |client| {
                         let requests = items
                             .iter()
                             .map(|(key, buffer_ptr, size)| {
@@ -664,7 +664,8 @@ impl PyMooncakeDistributedStore {
                             .collect::<Vec<_>>();
                         client.batch_put_from(&requests).map(|_| requests.len())
                     })
-                    .map_err(store_error_to_py)?;
+                })
+                .map_err(store_error_to_py)?;
                 dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(PyList::new(py, vec![0; item_count])?.into_any().unbind())
             }
@@ -1900,6 +1901,7 @@ mod tests {
         inner: InMemoryMetadataBackend,
         block_lease: Arc<AtomicBool>,
         block_state_update: Arc<AtomicBool>,
+        block_route_cas: Arc<AtomicBool>,
         release: Arc<AtomicBool>,
         entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     }
@@ -1914,6 +1916,7 @@ mod tests {
         fn new(
             block_lease: Arc<AtomicBool>,
             block_state_update: Arc<AtomicBool>,
+            block_route_cas: Arc<AtomicBool>,
             release: Arc<AtomicBool>,
             entered: std::sync::mpsc::Sender<()>,
         ) -> Self {
@@ -1921,6 +1924,7 @@ mod tests {
                 inner: InMemoryMetadataBackend::new(),
                 block_lease,
                 block_state_update,
+                block_route_cas,
                 release,
                 entered: std::sync::Mutex::new(Some(entered)),
             }
@@ -2047,6 +2051,7 @@ mod tests {
             expected: Option<RouteVersion>,
             next: Option<&ObjectRoute>,
         ) -> mooncake_store_core::Result<CasResult> {
+            self.maybe_block(&self.block_route_cas);
             self.inner
                 .compare_and_swap_object_route(key, expected, next)
         }
@@ -3205,6 +3210,104 @@ mod tests {
     }
 
     #[test]
+    fn real_batch_put_from_releases_gil_while_dispatcher_waits() {
+        init_python();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(BlockingHealthMetadata::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            release.clone(),
+            entered_tx,
+        ));
+        let dispatcher = StoreDispatcher::spawn(
+            build_client_with_metadata("py-batch-put-from-gil", metadata),
+            "dispatcher-py-batch-put-from-gil",
+        )
+        .expect("dispatcher should spawn");
+        dispatcher
+            .register_local_memory()
+            .expect("local memory should register");
+        let mut store = PyMooncakeDistributedStore::new();
+        store.replace_backend(StoreBackend::Real(dispatcher));
+
+        let source = b"gil-safe-batch-put-from".to_vec();
+        store
+            .register_buffer(source.as_ptr() as usize, source.len())
+            .expect("source buffer registration should succeed");
+
+        let put_thread = std::thread::spawn(move || {
+            Python::with_gil(|py| {
+                let statuses = store
+                    .batch_put_from(
+                        py,
+                        vec![(
+                            "gil-batch-put-from".to_string(),
+                            source.as_ptr() as usize,
+                            source.len(),
+                        )],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                        false,
+                    )
+                    .expect("batch_put_from should succeed");
+                assert_eq!(
+                    statuses
+                        .bind(py)
+                        .extract::<Vec<i32>>()
+                        .expect("batch_put_from should return status list"),
+                    vec![0]
+                );
+            });
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("batch_put_from should block in metadata CAS");
+
+        let release_gate = release.clone();
+        let release_thread = std::thread::spawn(move || {
+            sleep(Duration::from_millis(300));
+            release_gate.store(true, Ordering::SeqCst);
+        });
+
+        let (elapsed_tx, elapsed_rx) = std::sync::mpsc::channel();
+        let probe_thread = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            Python::with_gil(|_| {});
+            elapsed_tx
+                .send(start.elapsed())
+                .expect("probe elapsed should send");
+        });
+
+        let elapsed = elapsed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("probe thread should observe GIL acquisition");
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "batch_put_from should release the GIL while waiting, observed {:?}",
+            elapsed
+        );
+
+        probe_thread
+            .join()
+            .expect("probe thread should complete cleanly");
+        release_thread
+            .join()
+            .expect("release thread should complete cleanly");
+        put_thread
+            .join()
+            .expect("batch_put_from thread should complete cleanly");
+    }
+
+    #[test]
     fn dummy_store_exercises_dummy_rpc_and_shared_memory_paths() {
         init_python();
         let (mut store, server) = build_dummy_store("py-dummy");
@@ -3976,6 +4079,7 @@ mod tests {
         let metadata = Arc::new(BlockingHealthMetadata::new(
             block_enabled.clone(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             release.clone(),
             entered_tx,
         ));
@@ -4121,10 +4225,12 @@ mod tests {
     #[test]
     fn dispatcher_state_update_timeout_does_not_block_shared_requests() {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let block_enabled = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
         let metadata = Arc::new(BlockingHealthMetadata::new(
+            block_enabled.clone(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
             release.clone(),
             entered_tx,
         ));
@@ -4136,6 +4242,7 @@ mod tests {
             )
             .expect("dispatcher should spawn"),
         );
+        block_enabled.store(true, Ordering::SeqCst);
 
         let worker = std::thread::Builder::new()
             .name("dispatcher-state-update-timeout".to_string())
