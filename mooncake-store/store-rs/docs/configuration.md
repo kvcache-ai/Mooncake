@@ -378,8 +378,10 @@ Behavior notes:
 - values larger than `block_size` bypass the cache instead of being partially cached
 - successful read misses populate the cache from the fetched value
 - successful local writes and deletes invalidate the matching local cache entry on that daemon
+- Python compatibility runtimes partition local entries by effective metadata keyspace, so different keyspaces do not reuse the same cached value even inside one process
 - shm mode shares payload bytes with dummy clients connected to the same `mooncake-store-client`, while LRU metadata, generations, and pins remain private to the daemon
 - cache entries are daemon-local only and are never published to Redis or etcd
+- metadata keyspace remains the authoritative read/write isolation boundary; cache partitioning does not make objects visible across keyspaces
 
 ## Read-side Membership and Failure Semantics
 
@@ -409,7 +411,7 @@ The current repository uses these environment variables.
 | Variable | Used By | Meaning |
 |----------|---------|---------|
 | `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
-| `MC_STORE_RS_KEYSPACE` | Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace` |
+| `MC_STORE_RS_KEYSPACE` | Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace`; this also defines Python compatibility read/write visibility and local hot-cache partitioning |
 | `MC_STORE_RS_STABLE_ID` | Python wrapper setup fallback | stable client id used when SGLang cannot pass `stable_id` |
 | `MC_STORE_RS_INITIAL_STATE` | Python wrapper setup fallback | initial lifecycle state, for example `active`, `standby`, `draining`, or `offline` |
 | `MC_STORE_RS_TENANT` | Python wrapper setup fallback | default tenant used when SGLang cannot pass `tenant` |

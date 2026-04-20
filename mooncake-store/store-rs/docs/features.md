@@ -63,6 +63,7 @@ What it provides:
 - populate on successful read paths such as `get`, `get_into`, `batch_get`, `batch_get_into`, and multi-buffer reads
 - serve repeated reads from local memory without repeating the remote transfer
 - invalidate local entries after successful writes or deletes for the same key on that daemon
+- partition local entries by Python compatibility scope so different metadata keyspaces do not reuse the same cached value
 - optional shm-backed payload storage so multiple dummy clients attached to the same standalone daemon can reuse the cached bytes
 - bounded LRU eviction with pin protection while dummy readers hold an acquired handle
 
@@ -72,6 +73,7 @@ Design boundary:
 - it does not publish route state, replica state, or metadata
 - a miss falls back to the normal remote read path
 - values larger than the configured cache block size bypass the cache
+- metadata keyspace remains the authoritative read/write isolation boundary, and runtime coverage now includes a regression test that verifies the same object key can be written and read independently in separate keyspaces
 
 ## Routing
 
