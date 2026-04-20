@@ -1,4 +1,4 @@
-use serde::de::{Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -117,7 +117,7 @@ pub struct SegmentAnnouncement {
     pub state: SegmentLifecycleState,
     #[serde(default = "default_segment_alignment_bytes")]
     pub alignment_bytes: u64,
-    #[serde(default, deserialize_with = "deserialize_string_vec_or_empty_object")]
+    #[serde(default, deserialize_with = "deserialize_string_vec_or_object")]
     pub tags: Vec<String>,
 }
 
@@ -631,7 +631,7 @@ fn default_segment_alignment_bytes() -> u64 {
     1
 }
 
-fn deserialize_string_vec_or_empty_object<'de, D>(
+fn deserialize_string_vec_or_object<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<String>, D::Error>
 where
@@ -643,30 +643,29 @@ where
         type Value = Vec<String>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a string array or an empty object")
+            formatter.write_str("a string array or an object")
         }
 
         fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
         where
             A: SeqAccess<'de>,
         {
-            let mut tags = Vec::new();
-            while let Some(tag) = sequence.next_element()? {
-                tags.push(tag);
+            let mut items = Vec::new();
+            while let Some(item) = sequence.next_element()? {
+                items.push(item);
             }
-            Ok(tags)
+            Ok(items)
         }
 
         fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
         where
             A: MapAccess<'de>,
         {
-            if map.next_key::<String>()?.is_some() {
-                return Err(A::Error::custom(
-                    "tags object payload is only valid when empty",
-                ));
+            let mut items = Vec::new();
+            while let Some((_key, value)) = map.next_entry::<String, String>()? {
+                items.push(value);
             }
-            Ok(Vec::new())
+            Ok(items)
         }
     }
 

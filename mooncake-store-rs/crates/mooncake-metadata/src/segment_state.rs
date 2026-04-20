@@ -161,26 +161,32 @@ impl StoredSegmentState {
             offset_bytes,
             length_bytes,
         });
-        self.free_spans.sort_by_key(|entry| entry.offset_bytes);
-        let mut merged: Vec<FreeSpan> = Vec::with_capacity(self.free_spans.len());
-        for span in self.free_spans.drain(..) {
-            if let Some(previous) = merged.last_mut() {
-                let prev_end = previous.offset_bytes + previous.length_bytes;
-                if prev_end >= span.offset_bytes {
-                    let merged_end = prev_end.max(span.offset_bytes + span.length_bytes);
-                    previous.length_bytes = merged_end - previous.offset_bytes;
-                    continue;
-                }
-            }
-            merged.push(span);
-        }
-        self.free_spans = merged;
+        sort_and_merge_spans(&mut self.free_spans);
     }
 }
 
 fn align_up_u64(value: u64, alignment: u64) -> u64 {
     let mask = alignment.saturating_sub(1);
     value.saturating_add(mask) & !mask
+}
+
+/// Sort spans by offset and merge overlapping/adjacent entries,
+/// consistent with [`SegmentState::insert_free_span`].
+fn sort_and_merge_spans(spans: &mut Vec<FreeSpan>) {
+    spans.sort_by_key(|span| span.offset_bytes);
+    let mut merged: Vec<FreeSpan> = Vec::with_capacity(spans.len());
+    for span in spans.drain(..) {
+        if let Some(previous) = merged.last_mut() {
+            let prev_end = previous.offset_bytes + previous.length_bytes;
+            if prev_end >= span.offset_bytes {
+                let merged_end = prev_end.max(span.offset_bytes + span.length_bytes);
+                previous.length_bytes = merged_end - previous.offset_bytes;
+                continue;
+            }
+        }
+        merged.push(span);
+    }
+    *spans = merged;
 }
 
 fn deserialize_free_spans<'de, D>(deserializer: D) -> std::result::Result<Vec<FreeSpan>, D::Error>
@@ -204,6 +210,7 @@ where
             while let Some(span) = sequence.next_element()? {
                 spans.push(span);
             }
+            sort_and_merge_spans(&mut spans);
             Ok(spans)
         }
 
@@ -211,6 +218,8 @@ where
         where
             A: MapAccess<'de>,
         {
+            // Only accept empty objects (e.g. `{}` from Redis);
+            // non-empty object payloads are invalid for free_spans.
             if map.next_key::<String>()?.is_some() {
                 return Err(A::Error::custom(
                     "free_spans object payload is only valid when empty",
