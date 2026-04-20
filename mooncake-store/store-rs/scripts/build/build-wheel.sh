@@ -28,6 +28,8 @@ Environment:
   MOONCAKE_UPSTREAM_DIR      Mooncake upstream submodule path
   MOONCAKE_UPSTREAM_BUILD_DIR  Upstream build directory used for engine/CLI assets
   YALANTINGLIBS_PREFIX       Install prefix for bundled yalantinglibs
+  YALANTINGLIBS_PREBUILT_DIR Prebuilt yalantinglibs directory (if set, skip build and copy from here)
+  PYBIND11_PREBUILT_DIR      Prebuilt pybind11 directory (if set, use instead of submodule)
   BUILD_JOBS                 Parallel jobs for CMake builds
 
 Examples:
@@ -162,14 +164,32 @@ ensure_yalantinglibs() {
   local config_file="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs/yalantinglibsConfig.cmake"
   local header_file="${YALANTINGLIBS_PREFIX}/include/ylt/easylog.hpp"
 
+  # 如果已经安装，直接返回
   if [[ -f "${config_file}" && -f "${header_file}" ]]; then
     return 0
   fi
+
+  # 如果设置了预编译目录，直接从那里复制
+  if [[ -n "${YALANTINGLIBS_PREBUILT_DIR:-}" && -d "${YALANTINGLIBS_PREBUILT_DIR}" ]]; then
+    echo "Using prebuilt yalantinglibs from: ${YALANTINGLIBS_PREBUILT_DIR}"
+    mkdir -p "${YALANTINGLIBS_PREFIX}"
+    cp -r "${YALANTINGLIBS_PREBUILT_DIR}"/* "${YALANTINGLIBS_PREFIX}/"
+    # 验证复制是否成功
+    if [[ -f "${config_file}" && -f "${header_file}" ]]; then
+      echo "Successfully copied prebuilt yalantinglibs to: ${YALANTINGLIBS_PREFIX}"
+      return 0
+    else
+      echo "Warning: Prebuilt yalantinglibs copy failed, falling back to build from source"
+    fi
+  fi
+
+  # 从源码编译
   if [[ ! -d "${source_dir}" ]]; then
     echo "missing yalantinglibs source: ${source_dir}" >&2
     exit 1
   fi
 
+  echo "Building yalantinglibs from source..."
   cmake \
     -S "${source_dir}" \
     -B "${build_dir}" \
@@ -179,6 +199,35 @@ ensure_yalantinglibs() {
     -DBUILD_UNIT_TESTS=OFF
   cmake --build "${build_dir}" -j"${BUILD_JOBS}"
   cmake --install "${build_dir}"
+}
+
+ensure_pybind11() {
+  local pybind_dir="${UPSTREAM_DIR}/extern/pybind11"
+  local prebuilt_dir="${PYBIND11_PREBUILT_DIR:-}"
+
+  # 如果已经存在，直接返回
+  if [[ -d "${pybind_dir}" && -f "${pybind_dir}/CMakeLists.txt" ]]; then
+    return 0
+  fi
+
+  # 如果设置了预下载目录，复制到目标位置
+  if [[ -n "${prebuilt_dir}" && -d "${prebuilt_dir}" ]]; then
+    echo "Using prebuilt pybind11 from: ${prebuilt_dir}"
+    mkdir -p "$(dirname "${pybind_dir}")"
+    cp -r "${prebuilt_dir}" "${pybind_dir}"
+    if [[ -f "${pybind_dir}/CMakeLists.txt" ]]; then
+      echo "Successfully copied pybind11 to: ${pybind_dir}"
+      return 0
+    else
+      echo "Warning: Prebuilt pybind11 copy failed" >&2
+    fi
+  fi
+
+  # 检查 submodule 是否存在
+  if [[ ! -d "${pybind_dir}" ]]; then
+    echo "missing pybind11: ${pybind_dir} (run 'git submodule update --init --recursive')" >&2
+    exit 1
+  fi
 }
 
 mkdir -p "${WHEEL_DIR}" "${BIN_DIR}"
@@ -229,7 +278,11 @@ repair_runtime_wheel() {
   printf '%s\n' "${WHEEL_DIR}/$(basename "${repaired_wheel}")"
 }
 
-git -C "${REPO_ROOT}" submodule update --init --recursive
+# 如果设置了 SKIP_SUBMODULE_UPDATE，跳过 submodule 更新（CI 环境中 checkout 已处理）
+if [[ -z "${SKIP_SUBMODULE_UPDATE:-}" ]]; then
+  git -C "${REPO_ROOT}" submodule update --init --recursive
+fi
+ensure_pybind11
 ensure_yalantinglibs
 export CPATH="${YALANTINGLIBS_PREFIX}/include${CPATH:+:${CPATH}}"
 
