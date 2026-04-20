@@ -70,12 +70,21 @@ impl DummySession {
             socket_path: dummy_ipc_socket_path(server_addr),
             hot_cache_socket_path: hot_cache_ipc_socket_path(server_addr),
             client_id: DummyClientId::new(),
-            rpc_timeout: rpc_timeout.max(Duration::from_millis(1)),
+            rpc_timeout,
             registered_regions: Mutex::new(BTreeMap::new()),
             hot_cache_region: Mutex::new(None),
         };
         session.try_map_hot_cache();
         Ok(session)
+    }
+
+    pub fn with_rpc_timeout(mut self, timeout: Duration) -> Self {
+        if timeout.is_zero() {
+            self.rpc_timeout = Duration::from_millis(1);
+        } else {
+            self.rpc_timeout = timeout;
+        }
+        self
     }
 
     pub fn server_addr(&self) -> &str {
@@ -160,14 +169,21 @@ impl DummySession {
             registration.registered_len,
         );
         send_shm_register_request(&self.socket_path, &request, &registration.fd)?;
-        self.registered_regions.lock().insert(
-            buffer_ptr,
-            RegisteredRegion {
-                region_id: registration.region_id,
-                requested_len: registration.requested_len,
-            },
-        );
-        Ok(0)
+
+        let mut regions = self.registered_regions.lock();
+        use std::collections::btree_map::Entry;
+        match regions.entry(buffer_ptr) {
+            Entry::Occupied(_) => Err(StoreError::Allocator(format!(
+                "buffer {buffer_ptr:#x} is already registered"
+            ))),
+            Entry::Vacant(vacant) => {
+                vacant.insert(RegisteredRegion {
+                    region_id: registration.region_id,
+                    requested_len: registration.requested_len,
+                });
+                Ok(0)
+            }
+        }
     }
 
     pub fn unregister_buffer(&self, buffer_ptr: usize, size: Option<usize>) -> Result<i32> {
