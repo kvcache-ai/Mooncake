@@ -334,6 +334,8 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
+    bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
+
     int syncSegmentCache(const std::string& segment_name = "") {
         return metadata_->syncSegmentCache(segment_name);
     }

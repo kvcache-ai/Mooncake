@@ -461,6 +461,10 @@ Transport* MultiTransport::getTransport(const std::string& proto) {
     return transport_map_[proto].get();
 }
 
+bool MultiTransport::isTcpOnly() const {
+    return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
+}
+
 std::vector<Transport*> MultiTransport::listTransports() {
     std::vector<Transport*> transport_list;
     for (auto& entry : transport_map_)
