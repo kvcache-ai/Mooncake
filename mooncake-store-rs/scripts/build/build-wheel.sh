@@ -242,15 +242,16 @@ if [[ ! -x "${VENV_BIN}/python3" ]]; then
   ln -sf "${VENV_PYTHON}" "${VENV_BIN}/python3"
 fi
 
-"${VENV_PYTHON}" -m pip install --upgrade pip >/dev/null
+PIP_INDEX=${PIP_INDEX_URL:-"https://mirrors.aliyun.com/pypi/simple/"}
+"${VENV_PYTHON}" -m pip install --no-cache-dir --upgrade -i "${PIP_INDEX}" pip >/dev/null
 if ! "${VENV_PYTHON}" -m pip show maturin >/dev/null 2>&1; then
-  "${VENV_PYTHON}" -m pip install "maturin>=1.7,<2"
+  "${VENV_PYTHON}" -m pip install -i "${PIP_INDEX}" "maturin>=1.7,<2"
 fi
 if ! "${VENV_PYTHON}" -m pip show build >/dev/null 2>&1; then
-  "${VENV_PYTHON}" -m pip install "build>=1.2,<2"
+  "${VENV_PYTHON}" -m pip install -i "${PIP_INDEX}" "build>=1.2,<2"
 fi
 if ! "${VENV_PYTHON}" -m pip show auditwheel >/dev/null 2>&1; then
-  "${VENV_PYTHON}" -m pip install "auditwheel>=6,<7"
+  "${VENV_PYTHON}" -m pip install -i "${PIP_INDEX}" "auditwheel>=6,<7"
 fi
 
 repair_runtime_wheel() {
