@@ -704,17 +704,30 @@ mod tests {
             .expect("http response should contain a body");
         let value: serde_json::Value =
             serde_json::from_str(body).expect("stats endpoint should return valid json");
-        assert_eq!(
-            value["operations"][0]["operation"],
-            serde_json::Value::String("storage_owner_background_eviction".to_string())
+        let operations = value["operations"]
+            .as_array()
+            .expect("stats json should expose operations as an array");
+        assert!(
+            operations.iter().any(|operation| {
+                operation["operation"]
+                    == serde_json::Value::String("storage_owner_background_eviction".to_string())
+                    && operation["status"] == serde_json::Value::String("ok".to_string())
+                    && operation["bytes_in_total"] == serde_json::Value::from(32_u64)
+                    && operation["bytes_out_total"] == serde_json::Value::from(64_u64)
+            }),
+            "stats json should include the recorded eviction operation"
         );
-        assert_eq!(
-            value["runtimes"][0]["runtime"],
-            serde_json::Value::String(runtime.runtime.to_string())
-        );
-        assert_eq!(
-            value["runtimes"][0]["heartbeat_consecutive_failures"],
-            serde_json::Value::from(2_u64)
+
+        let runtimes = value["runtimes"]
+            .as_array()
+            .expect("stats json should expose runtimes as an array");
+        assert!(
+            runtimes.iter().any(|entry| {
+                entry["runtime"] == serde_json::Value::String(runtime.runtime.to_string())
+                    && entry["heartbeat_consecutive_failures"] == serde_json::Value::from(2_u64)
+                    && entry["heartbeat_last_success_ms"] == serde_json::Value::from(456_789_u64)
+            }),
+            "stats json should include heartbeat health for the recorded runtime"
         );
 
         stop_metrics_http_server().expect("metrics server should stop");
