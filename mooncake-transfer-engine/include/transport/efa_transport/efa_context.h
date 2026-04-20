@@ -134,6 +134,11 @@ class EfaContext {
    public:
     // EndPoint Management
     std::shared_ptr<EfaEndPoint> endpoint(const std::string& peer_nic_path);
+    // Non-creating lookup: returns the existing endpoint if already in the
+    // store (under the normalized key), or nullptr. Does NOT construct a new
+    // endpoint, does NOT call setPeerNicPath. Safe for idempotency checks.
+    std::shared_ptr<EfaEndPoint> peekEndpoint(
+        const std::string& peer_nic_path);
     int deleteEndpoint(const std::string& peer_nic_path);
     int disconnectAllEndpoints();
     size_t getTotalQPNumber() const;

@@ -513,6 +513,12 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     return ep;
 }
 
+std::shared_ptr<EfaEndPoint> EfaContext::peekEndpoint(
+    const std::string& peer_nic_path) {
+    if (!endpoint_store_) return nullptr;
+    return endpoint_store_->get(normalizeNicPath(peer_nic_path));
+}
+
 int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
     if (endpoint_store_) {
         endpoint_store_->remove(peer_nic_path);

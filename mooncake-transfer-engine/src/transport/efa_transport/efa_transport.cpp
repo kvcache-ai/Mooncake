@@ -698,14 +698,33 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
         peer_paths.emplace_back(segment_name + "@" + dev.name);
     }
 
+    auto t0 = std::chrono::steady_clock::now();
+    size_t n_pairs = context_list_.size() * peer_paths.size();
+
+    // Idempotent short-circuit: if every (local_ctx, peer_nic) pair already
+    // has a connected endpoint, skip the whole async dispatch. Matters for
+    // callers that invoke warmupSegment per request loop — without this the
+    // 256-thread fan-out runs every time even though there is no work to do.
+    size_t already_ready = 0;
+    for (auto& ctx : context_list_) {
+        for (const auto& path : peer_paths) {
+            auto ep = ctx->peekEndpoint(path);
+            if (ep && ep->connected()) ++already_ready;
+        }
+    }
+    if (already_ready == n_pairs) {
+        VLOG(1) << "EfaTransport::warmupSegment('" << segment_name
+                << "'): all " << n_pairs << " endpoints already connected, "
+                << "skipping";
+        return 0;
+    }
+
     // Warm up every (local_ctx, peer_nic) pair concurrently. Each
     // EfaContext::endpoint() + setupConnectionsByActive() is idempotent and
     // takes its own lock, so parallel calls across distinct peer_nic_paths
     // (and distinct contexts) are safe. We use std::async to get roughly
     // per-pair parallelism — the critical path is now max(handshake RTT) not
     // sum(handshake RTT).
-    auto t0 = std::chrono::steady_clock::now();
-    size_t n_pairs = context_list_.size() * peer_paths.size();
     std::vector<std::future<int>> futs;
     futs.reserve(n_pairs);
     for (auto& ctx : context_list_) {
