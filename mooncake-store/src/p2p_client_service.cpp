@@ -93,14 +93,51 @@ P2PClientService::~P2PClientService() {
 ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     client_rpc_port_ = config.client_rpc_port;
 
-    // 1. Connect to master
+    // 1. Try to connect to master (allow failure for degraded startup)
+    bool master_connected = false;
     ErrorCode err = ConnectToMaster(config.master_server_entry);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to connect to master in P2P mode";
-        return err;
+    if (err == ErrorCode::OK) {
+        master_connected = true;
+        LOG(INFO) << "Connected to master successfully";
+    } else {
+        LOG(WARNING)
+            << "Failed to connect to master, starting in DEGRADED mode: "
+            << err;
     }
 
-    // 2. Initialize transfer engine
+    // 2. Try to register with master (allow failure for degraded startup)
+    //    Note: RegisterClient before InitStorage sends empty segments.
+    //    Segment info will be updated via MountSegment during InitStorage
+    //    (if connected) or during recovery (if degraded).
+    bool client_registered = false;
+    if (master_connected) {
+        auto reg = RegisterClient();
+        if (reg) {
+            client_registered = true;
+            LOG(INFO) << "Registered with master successfully";
+        } else {
+            LOG(WARNING) << "Failed to register with master: " << reg.error()
+                         << ", starting in DEGRADED mode";
+        }
+    }
+
+    // 3. Initialize HA recovery manager with appropriate initial state.
+    //    FULL: master connected and client registered.
+    //    DEGRADED: connection or registration failed.
+    HAClientState initial_state =
+        client_registered ? HAClientState::FULL : HAClientState::DEGRADED;
+    ha_manager_ = std::make_unique<HARecoveryManager>(
+        client_id_, master_client_, data_manager_, async_route_notifier_,
+        view_version_);
+    ha_manager_->SetState(initial_state);
+    LOG(INFO) << "HA recovery manager initialized with state: "
+              << initial_state;
+
+    // 4. Start heartbeat immediately after registration so master does not
+    //    consider this client disconnected during a lengthy initialization.
+    StartHeartbeat(config.master_server_entry);
+
+    // 5. Initialize transfer engine (local operation, no master dependency)
     if (config.transfer_engine == nullptr) {
         transfer_engine_ = std::make_shared<TransferEngine>();
         err = InitTransferEngine(local_endpoint(), metadata_connstring_,
@@ -116,29 +153,15 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     }
     initTeEndpoint();
 
-    // 3. Register with master BEFORE InitStorage, because InitStorage
-    //    triggers TieredBackend::MountSegment which requires the client to
-    //    be already registered on the master side.
-    auto reg = RegisterClient();
-    if (!reg) {
-        LOG(ERROR) << "Failed to register P2P client with master";
-        return reg.error();
-    }
-
-    // 3.5. Start heartbeat immediately after registration so master does not
-    //      consider this client disconnected during a lengthy InitStorage.
-    //      build_heartbeat_request() and OnHAEvent() both guard against
-    //      uninitialized data_manager_ / ha_manager_, so this is safe.
-    StartHeartbeat(config.master_server_entry);
-
-    // 4. Initialize TieredBackend + DataManager
+    // 6. Initialize TieredBackend + DataManager.
+    //    SegmentSyncCallback will check degraded state and skip MountSegment.
     err = InitStorage(config);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize TieredBackend";
         return err;
     }
 
-    // 4.5. Initialize async route notifier if enabled
+    // 7. Initialize async route notifier if enabled
     if (config.async_sender_thread_count > 0) {
         // When async ADD is rejected by Master, delete the local replica
         // since Master won't track it.
@@ -165,7 +188,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                   << ", queue_size=" << config.async_route_queue_size;
     }
 
-    // 5. Start P2P client RPC service
+    // 8. Start P2P client RPC service
     client_rpc_service_.emplace(*data_manager_);
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         config.rpc_thread_num, client_rpc_port_);
@@ -185,12 +208,18 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     LOG(INFO) << "P2P RPC server started on port " << client_rpc_port_;
 
-    // 6. Initialize HA recovery manager
-    ha_manager_ = std::make_unique<HARecoveryManager>(
-        client_id_, master_client_, data_manager_, async_route_notifier_,
-        view_version_);
-    // First-time registration: no keys to sync, clear is_syncing_ on Master
-    ha_manager_->SetSyncCompleted();
+    // 9. If started in FULL state, notify master that sync is complete.
+    //    If in DEGRADED state, heartbeat will recover later.
+    if (!ha_manager_->IsDegraded()) {
+        ha_manager_->SetSyncCompleted();
+    } else {
+        LOG(INFO) << "P2P client started in DEGRADED mode, heartbeat will "
+                  << "establish master connection when available";
+    }
+
+    // 10. Mark service as ready for recovery. HA recovery thread can now
+    // proceed.
+    ha_manager_->SetReadyForRecovery();
 
     return ErrorCode::OK;
 }
@@ -367,6 +396,13 @@ SegmentSyncCallback P2PClientService::BuildSegmentSyncCallback() {
     return [this](const Segment& segment,
                   bool mount) -> tl::expected<void, ErrorCode> {
         if (mount) {
+            // Skip MountSegment in degraded mode (master not connected).
+            // Registration during heartbeat recovery will include segment info.
+            if (ha_manager_ && ha_manager_->IsDegraded()) {
+                LOG(INFO) << "Skipping MountSegment in DEGRADED mode: id="
+                          << segment.id << ", name=" << segment.name;
+                return {};
+            }
             LOG(INFO) << "Mounting segment with Master: id=" << segment.id
                       << ", name=" << segment.name << ", size=" << segment.size;
             auto result = master_client_.MountSegment(segment);

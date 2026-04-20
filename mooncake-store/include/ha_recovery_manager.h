@@ -40,7 +40,7 @@ class HARecoveryManager {
     HARecoveryManager(const UUID& client_id, P2PMasterClient& master_client,
                       std::optional<DataManager>& data_manager,
                       std::unique_ptr<AsyncMetadataNotifier>& notifier,
-                      ViewVersionId& view_version);
+                      std::atomic<ViewVersionId>& view_version);
     ~HARecoveryManager();
 
     HARecoveryManager(const HARecoveryManager&) = delete;
@@ -55,6 +55,24 @@ class HARecoveryManager {
 
     HAClientState GetState() const {
         return state_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * @brief Set HA state. Used for degraded startup when master is
+     * unavailable.
+     */
+    void SetState(HAClientState state) {
+        state_.store(state, std::memory_order_release);
+        LOG(INFO) << "HA state set to: " << state;
+    }
+
+    /**
+     * @brief Mark that P2PClientService::Init has completed. Called at the end
+     * of Init(). Recovery thread will wait for this before accessing
+     * data_manager_.
+     */
+    void SetReadyForRecovery() {
+        ready_for_recovery_.store(true, std::memory_order_release);
     }
 
     void HandleEvent(HAEvent event);
@@ -83,9 +101,11 @@ class HARecoveryManager {
     P2PMasterClient& master_client_;
     std::optional<DataManager>& data_manager_;
     std::unique_ptr<AsyncMetadataNotifier>& notifier_;
-    ViewVersionId& view_version_;
+    std::atomic<ViewVersionId>& view_version_;
 
     std::atomic<HAClientState> state_{HAClientState::FULL};
+    std::atomic<bool> ready_for_recovery_{
+        false};         // Set true when P2PClientService::Init completes
     std::mutex mutex_;  // protects transitions + recovery thread lifecycle
     std::thread recovery_thread_;
     AbortToken need_abort_;  // signals recovery thread to exit

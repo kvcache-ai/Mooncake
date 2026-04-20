@@ -314,7 +314,7 @@ class ClientService {
         return transfer_engine_->getLocalIpAndPort();
     }
     UUID GetClientID() const { return client_id_; }
-    ViewVersionId GetViewVersion() const { return view_version_; }
+    ViewVersionId GetViewVersion() const { return view_version_.load(); }
 
    public:
     /**
@@ -386,7 +386,8 @@ class ClientService {
     void StartHeartbeat(const std::string& master_server_entry);
 
     void HeartbeatThreadMain(bool is_ha_mode,
-                             std::string current_master_address);
+                             std::string current_master_address,
+                             const std::string& master_server_entry);
 
     /**
      * @brief Handles a successful heartbeat response.
@@ -411,8 +412,8 @@ class ClientService {
      * For non-HA mode, reconnects to the same address.
      * @return true if reconnect succeeded, false otherwise.
      */
-    bool ReconnectToMaster(bool is_ha_mode,
-                           std::string& current_master_address);
+    bool ReconnectToMaster(bool is_ha_mode, std::string& current_master_address,
+                           const std::string& master_server_entry);
 
     /**
      * @brief Waits for the next heartbeat interval using condition variable.
@@ -533,7 +534,9 @@ class ClientService {
     std::atomic<bool> heartbeat_running_{false};
     std::condition_variable heartbeat_cv_;
     std::mutex heartbeat_mtx_;
-    ViewVersionId view_version_{0};
+    /// View version from master. Updated by async registration thread,
+    /// read by heartbeat thread.
+    std::atomic<ViewVersionId> view_version_{0};
     /// True after MASTER_UNREACHABLE fires; cleared when MASTER_RECONNECTED
     /// fires. Only accessed from the heartbeat thread — no locking required.
     bool connection_interrupted_ = false;
