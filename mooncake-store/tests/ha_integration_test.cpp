@@ -92,6 +92,27 @@ class HAIntegrationTest : public ::testing::Test {
         return std::string(buf.data(), actual_size);
     }
 
+    // For cross-client reads immediately after a Put on another client, the
+    // async BatchSyncReplica notification may not have reached master yet.
+    // Retry on OBJECT_NOT_FOUND until master learns about the replica.
+    static tl::expected<std::string, ErrorCode> GetDataWithRetry(
+        std::shared_ptr<P2PClientService>& client, const std::string& key,
+        size_t buf_size,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        tl::expected<std::string, ErrorCode> result =
+            tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        do {
+            result = GetData(client, key, buf_size);
+            if (result.has_value() ||
+                result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                return result;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return result;
+    }
+
     static void ForceDegraded(std::shared_ptr<P2PClientService>& client) {
         ASSERT_NE(client->ha_manager_, nullptr);
         client->ha_manager_->HandleEvent(HAEvent::MASTER_UNREACHABLE);
@@ -267,8 +288,10 @@ TEST_F(HAIntegrationTest, DegradedModeRemoteOpsFail) {
     auto put = PutData(client2_, "a3_client2_key", "remote_val");
     ASSERT_TRUE(put.has_value());
 
-    // Verify data is accessible before degradation (client1 → master → client2)
-    auto get_before = GetData(client1_, "a3_client2_key", 10);
+    // Verify data is accessible before degradation (client1 → master →
+    // client2). Use retry: async BatchSyncReplica may not have reached master
+    // yet.
+    auto get_before = GetDataWithRetry(client1_, "a3_client2_key", 10);
     ASSERT_TRUE(get_before.has_value()) << "Pre-degradation get failed: "
                                         << static_cast<int>(get_before.error());
     EXPECT_EQ(get_before.value(), "remote_val");
@@ -295,8 +318,10 @@ TEST_F(HAIntegrationTest, RecoverFromDegradedRemoteGet) {
     auto put = PutData(client2_, "a4_client2_key", "recoverable");
     ASSERT_TRUE(put.has_value());
 
-    // Verify data is accessible before degradation (client1 → master → client2)
-    auto get_before = GetData(client1_, "a4_client2_key", 11);
+    // Verify data is accessible before degradation (client1 → master →
+    // client2). Use retry: async BatchSyncReplica may not have reached master
+    // yet.
+    auto get_before = GetDataWithRetry(client1_, "a4_client2_key", 11);
     ASSERT_TRUE(get_before.has_value()) << "Pre-degradation get failed: "
                                         << static_cast<int>(get_before.error());
     EXPECT_EQ(get_before.value(), "recoverable");
