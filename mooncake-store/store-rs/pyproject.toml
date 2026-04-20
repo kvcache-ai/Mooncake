@@ -34,8 +34,6 @@ dev = [
 ]
 
 [project.scripts]
-mooncake_master = "mooncake.cli:main"
-mooncake_client = "mooncake.cli:main"
 transfer_engine_bench = "mooncake.cli:main"
 mooncake-store-client = "mooncake.cli:main"
 mooncake-store-admin = "mooncake.cli:main"
