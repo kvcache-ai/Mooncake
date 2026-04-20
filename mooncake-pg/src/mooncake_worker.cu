@@ -138,6 +138,11 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
         // cudaEventSynchronize is not permitted while a stream is capturing.
         if (at::cuda::currentStreamCaptureStatus() !=
             c10::cuda::CaptureStatus::None) {
+            // We still need stream-level synchronization so that subsequent
+            // operations on the capture stream are ordered after the barrier
+            // task on the enqueue stream.
+            auto current_stream = at::cuda::getCurrentCUDAStream();
+            event_->block(current_stream);
             return true;
         }
 
