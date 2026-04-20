@@ -39,10 +39,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
         SupportsHMA)
-    _HAS_SUPPORTS_HMA = True
 except ImportError:  # pragma: no cover - older vLLM
     SupportsHMA = object  # type: ignore[assignment, misc]
-    _HAS_SUPPORTS_HMA = False
 from vllm.distributed.parallel_state import (get_tensor_model_parallel_rank,
                                              get_tp_group)
 from vllm.forward_context import ForwardContext
