@@ -161,9 +161,8 @@ int WorkerPool::submitPostSend(
         slice_queue_lock_[shard_id].unlock();
     }
 
-    submitted_slice_count_.fetch_add(submitted_slice_count,
-                                     std::memory_order_relaxed);
-    if (suspended_flag_.load(std::memory_order_relaxed)) {
+    submitted_slice_count_.fetch_add(submitted_slice_count);
+    if (suspended_flag_.load()) {
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
     }
@@ -398,7 +397,7 @@ void WorkerPool::transferWorker(int thread_id) {
                 // Double-check condition after acquiring lock to avoid lost
                 // wakeup
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
-                    submitted_slice_count_.load(std::memory_order_relaxed)) {
+                    submitted_slice_count_.load()) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
                 suspended_flag_.fetch_sub(1);
