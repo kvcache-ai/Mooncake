@@ -380,7 +380,105 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test environment issue"]
+    fn runtime_keyspace_isolates_read_and_write_access() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let metadata_url = format!("{}/{}", server.url().trim_end_matches("/0"), 0);
+
+        let mut writer_a = sample_args("tcp", &metadata_url);
+        writer_a.setup.stable_id = Some("runtime-scope-writer-a".to_string());
+        writer_a.setup.keyspace = Some("runtime/scope-a".to_string());
+        writer_a.local_segment_name = Some("runtime-scope-writer-a-segment".to_string());
+        writer_a.route_control = RouteControlMode::MetadataOnly;
+
+        let mut reader_a = sample_args("tcp", &metadata_url);
+        reader_a.setup.stable_id = Some("runtime-scope-reader-a".to_string());
+        reader_a.setup.keyspace = Some("runtime/scope-a".to_string());
+        reader_a.local_segment_name = Some("runtime-scope-reader-a-segment".to_string());
+        reader_a.route_control = RouteControlMode::MetadataOnly;
+
+        let mut writer_b = sample_args("tcp", &metadata_url);
+        writer_b.setup.stable_id = Some("runtime-scope-writer-b".to_string());
+        writer_b.setup.keyspace = Some("runtime/scope-b".to_string());
+        writer_b.local_segment_name = Some("runtime-scope-writer-b-segment".to_string());
+        writer_b.route_control = RouteControlMode::MetadataOnly;
+
+        let mut reader_b = sample_args("tcp", &metadata_url);
+        reader_b.setup.stable_id = Some("runtime-scope-reader-b".to_string());
+        reader_b.setup.keyspace = Some("runtime/scope-b".to_string());
+        reader_b.local_segment_name = Some("runtime-scope-reader-b-segment".to_string());
+        reader_b.route_control = RouteControlMode::MetadataOnly;
+
+        let writer_a = writer_a.build().expect("scope a writer should build");
+        let reader_a = reader_a.build().expect("scope a reader should build");
+        let writer_b = writer_b.build().expect("scope b writer should build");
+        let reader_b = reader_b.build().expect("scope b reader should build");
+
+        writer_a
+            .client
+            .register_local_memory()
+            .expect("scope a writer local memory should register");
+        reader_a
+            .client
+            .register_local_memory()
+            .expect("scope a reader local memory should register");
+        writer_b
+            .client
+            .register_local_memory()
+            .expect("scope b writer local memory should register");
+        reader_b
+            .client
+            .register_local_memory()
+            .expect("scope b reader local memory should register");
+
+        writer_a
+            .client
+            .put("alpha", b"scope-a")
+            .expect("scope a write should succeed");
+        writer_b
+            .client
+            .put("alpha", b"scope-b")
+            .expect("scope b write should succeed");
+
+        assert_eq!(
+            reader_a
+                .client
+                .get("alpha")
+                .expect("scope a read should succeed"),
+            b"scope-a"
+        );
+        assert_eq!(
+            reader_b
+                .client
+                .get("alpha")
+                .expect("scope b read should succeed"),
+            b"scope-b"
+        );
+
+        let scope_a_visible_from_b = reader_b
+            .client
+            .get("alpha")
+            .expect("scope b re-read should succeed");
+        assert_eq!(scope_a_visible_from_b, b"scope-b");
+
+        let route_a = writer_a
+            .client
+            .query_route("alpha")
+            .expect("scope a route query should succeed")
+            .expect("scope a route should exist");
+        let route_b = writer_b
+            .client
+            .query_route("alpha")
+            .expect("scope b route query should succeed")
+            .expect("scope b route should exist");
+        assert_eq!(route_a.replicas[0].owner.stable_id.0, writer_a.stable_id);
+        assert_eq!(route_b.replicas[0].owner.stable_id.0, writer_b.stable_id);
+        assert_ne!(route_a.replicas[0].owner.stable_id.0, route_b.replicas[0].owner.stable_id.0);
+    }
+
+    #[test]
     fn runtime_builds_http_transport_clients_and_moves_remote_bytes() {
         let _guard = env_test_lock().lock();
         let Some(server) = RedisTestServer::start() else {
