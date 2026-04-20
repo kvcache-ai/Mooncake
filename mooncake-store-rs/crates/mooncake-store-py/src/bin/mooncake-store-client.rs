@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::{
     atomic::{AtomicU8, Ordering},
     Arc,
@@ -151,6 +154,21 @@ struct Args {
     drain_on_exit: bool,
 }
 
+#[derive(Parser, Debug)]
+#[command(name = "mooncake-store-client stats")]
+#[command(about = "Fetch stats from a running Mooncake store-rs client")]
+struct StatsArgs {
+    #[arg(long)]
+    server: String,
+    #[arg(long, help = "Emit compact JSON instead of pretty JSON")]
+    json: bool,
+}
+
+enum Cli {
+    Run(Args),
+    Stats(StatsArgs),
+}
+
 #[derive(Clone)]
 struct ShutdownSignal {
     state: Arc<AtomicU8>,
@@ -167,7 +185,13 @@ impl ShutdownSignal {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+    match parse_cli()? {
+        Cli::Run(args) => run_client(args),
+        Cli::Stats(args) => run_stats_command(args),
+    }
+}
+
+fn run_client(args: Args) -> Result<(), Box<dyn Error>> {
     validate_args(&args)?;
     init_tracing(args.trace_filter.as_deref())?;
     emit_compat_warnings(&args);
@@ -267,6 +291,61 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     eprintln!("{}", stopped_message(&stable_id));
     Ok(())
+}
+
+fn parse_cli() -> Result<Cli, clap::Error> {
+    parse_cli_from(std::env::args_os())
+}
+
+fn parse_cli_from<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("stats") {
+        let mut stats_argv = Vec::with_capacity(argv.len().saturating_sub(1));
+        stats_argv.push(OsString::from("mooncake-store-client stats"));
+        stats_argv.extend_from_slice(&argv[2..]);
+        StatsArgs::try_parse_from(stats_argv).map(Cli::Stats)
+    } else {
+        Args::try_parse_from(argv).map(Cli::Run)
+    }
+}
+
+fn run_stats_command(args: StatsArgs) -> Result<(), Box<dyn Error>> {
+    let body = fetch_stats_body(&args.server)?;
+    if args.json {
+        println!("{body}");
+    } else {
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| format!("invalid stats json: {error}"))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|error| format!("failed to format stats json: {error}"))?
+        );
+    }
+    Ok(())
+}
+
+fn fetch_stats_body(server: &str) -> Result<String, Box<dyn Error>> {
+    let mut stream = TcpStream::connect(server)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let request = format!("GET /stats HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("invalid stats http response")?;
+    let status_line = headers.lines().next().ok_or("missing stats http status")?;
+    if !status_line.contains("200 OK") {
+        return Err(format!("stats request failed: {status_line}").into());
+    }
+    Ok(body.to_string())
 }
 
 fn graceful_shutdown(
@@ -660,18 +739,21 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use mooncake_store_client::{stable_phase_spread_ms, RouteControlMode};
+    use mooncake_store_client::{
+        record_heartbeat_health, stable_phase_spread_ms, start_metrics_http_server,
+        stop_metrics_http_server, OperationTracker, RouteControlMode,
+    };
     use mooncake_store_core::{ClientEpoch, ClientLifecycleState};
 
     use _store_rs::runtime::CompatTimeoutConfig;
 
     use super::{
         build_runtime_args, compat_warnings, drained_message, effective_heartbeat_interval,
-        emit_compat_warnings, heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms,
-        parse_hugepage_size_arg, parse_label, requested_initial_state, resolve_timeout_config,
-        should_activate_after_ready, start_metrics_if_needed, started_message,
-        startup_initial_state, stopped_message, validate_args, Args, HeartbeatLoopState,
-        InitialStateArg, RouteControlArg,
+        emit_compat_warnings, fetch_stats_body, heartbeat_retry_delay_ms,
+        initial_heartbeat_delay_ms, now_ms, parse_cli_from, parse_hugepage_size_arg, parse_label,
+        requested_initial_state, resolve_timeout_config, should_activate_after_ready,
+        start_metrics_if_needed, started_message, startup_initial_state, stopped_message,
+        validate_args, Args, Cli, HeartbeatLoopState, InitialStateArg, RouteControlArg,
     };
 
     fn sample_timeouts() -> CompatTimeoutConfig {
@@ -846,6 +928,26 @@ mod tests {
     }
 
     #[test]
+    fn stats_subcommand_parses_server_and_json_flag() {
+        let cli = parse_cli_from([
+            "mooncake-store-client",
+            "stats",
+            "--server",
+            "127.0.0.1:19090",
+            "--json",
+        ])
+        .expect("stats cli should parse");
+
+        match cli {
+            Cli::Stats(args) => {
+                assert_eq!(args.server, "127.0.0.1:19090");
+                assert!(args.json);
+            }
+            Cli::Run(_) => panic!("expected stats subcommand"),
+        }
+    }
+
+    #[test]
     fn hot_upgrade_startup_flags_flow_into_runtime_args() {
         let args = Args::try_parse_from([
             "mooncake-store-client",
@@ -1005,6 +1107,42 @@ mod tests {
         let first = now_ms();
         let second = now_ms();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn stats_command_fetches_json_from_metrics_server() {
+        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+        let result = Ok(());
+        OperationTracker::new("stats_helper_metric")
+            .input_bytes(8)
+            .finish(&result, 13);
+        record_heartbeat_health("runtime-stats-test:1", 3, 123_456);
+
+        let address = start_metrics_http_server("127.0.0.1:0")
+            .expect("metrics server should start on an ephemeral port");
+        let body = fetch_stats_body(&address).expect("stats body should fetch");
+        let value: serde_json::Value =
+            serde_json::from_str(&body).expect("stats body should be valid json");
+        assert_eq!(
+            value["operations"]
+                .as_array()
+                .expect("operations should be an array")
+                .iter()
+                .any(|entry| entry["operation"] == "stats_helper_metric"),
+            true
+        );
+        assert_eq!(
+            value["runtimes"]
+                .as_array()
+                .expect("runtimes should be an array")
+                .iter()
+                .any(|entry| {
+                    entry["runtime"] == "runtime-stats-test:1"
+                        && entry["heartbeat_consecutive_failures"] == 3
+                }),
+            true
+        );
+        stop_metrics_http_server().expect("metrics server should stop");
     }
 
     #[test]

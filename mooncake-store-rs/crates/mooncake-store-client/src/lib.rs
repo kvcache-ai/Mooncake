@@ -17,7 +17,7 @@ pub use mooncake_store_core::RouteControlMode;
 pub use mooncake_transport::{TransferBatchHints, TransferPacingMode};
 pub use observability::{
     init_tracing, init_tracing_from_env, metrics_http_server_addr, record_heartbeat_health,
-    record_tenant_quota_reconcile, render_prometheus_metrics, snapshot_metrics,
+    record_tenant_quota_reconcile, render_prometheus_metrics, render_stats_json, snapshot_metrics,
     start_metrics_http_server, start_metrics_http_server_from_env, stop_metrics_http_server,
     OperationMetricSnapshot, OperationTracker,
 };

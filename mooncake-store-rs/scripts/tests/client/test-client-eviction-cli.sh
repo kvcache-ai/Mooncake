@@ -15,8 +15,8 @@ usage() {
 Usage: scripts/tests/client/test-client-eviction-cli.sh
 
 Build and directly execute the standalone mooncake-store-client binary, then
-verify background storage-owner eviction through a real routed writer, Prometheus
-metrics, and tracing logs.
+verify background storage-owner eviction through a real routed writer, JSON
+stats, and tracing logs.
 
 Environment:
   MC_STORE_RS_REDIS_PORT      Redis port for the temporary metadata backend
@@ -28,7 +28,7 @@ Environment:
                               Time to wait for routed writes to trigger eviction
                               (default: 60)
   MC_STORE_RS_EVICTION_METRICS_TIMEOUT_SECONDS
-                              Time to wait for eviction metrics after the driver
+                              Time to wait for eviction stats after the driver
                               observes eviction (default: 45)
   MOONCAKE_UPSTREAM_DIR       Mooncake upstream submodule path
   MOONCAKE_UPSTREAM_BUILD_DIR Explicit upstream build directory override
@@ -143,6 +143,63 @@ raise SystemExit("eviction metrics did not reach the expected values")
 PY
 }
 
+wait_for_stats() {
+  local bin=$1
+  local server_addr=$2
+  local timeout_seconds=${3:-45}
+  python3 - "${bin}" "${server_addr}" "${timeout_seconds}" <<'PY'
+import json
+import subprocess
+import sys
+import time
+
+binary = sys.argv[1]
+server_addr = sys.argv[2]
+deadline = time.time() + float(sys.argv[3])
+last_text = ""
+
+def operation_value(document: dict, operation: str, status: str, field: str) -> int:
+    for entry in document.get("operations", []):
+        if entry.get("operation") == operation and entry.get("status") == status:
+            return int(entry.get(field, 0))
+    return 0
+
+while time.time() < deadline:
+    try:
+        last_text = subprocess.check_output(
+            [binary, "stats", "--server", server_addr, "--json"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        document = json.loads(last_text)
+    except Exception as exc:
+        last_text = f"# failed to fetch stats from {server_addr}: {exc}"
+        time.sleep(0.2)
+        continue
+
+    background_calls = operation_value(
+        document, "storage_owner_background_eviction", "ok", "calls_total"
+    )
+    background_evicted = operation_value(
+        document, "storage_owner_background_eviction", "ok", "bytes_out_total"
+    )
+    evict_one_calls = operation_value(
+        document, "storage_owner_evict_one", "ok", "calls_total"
+    )
+
+    if background_calls >= 1 and background_evicted >= 1 and evict_one_calls >= 1:
+        print(
+            f"stats ok: background_calls={background_calls} "
+            f"background_evicted={background_evicted} evict_one_calls={evict_one_calls}"
+        )
+        raise SystemExit(0)
+    time.sleep(0.2)
+
+print(last_text, file=sys.stderr)
+raise SystemExit("eviction stats did not reach the expected values")
+PY
+}
+
 capture_metrics_snapshot() {
   local metrics_addr=${METRICS_ADDR:-}
   local output_file=${METRICS_SNAPSHOT:-}
@@ -163,6 +220,16 @@ except Exception as exc:
 with open(output_file, "w", encoding="utf-8") as fout:
     fout.write(text)
 PY
+}
+
+capture_stats_snapshot() {
+  local bin=${BIN:-}
+  local metrics_addr=${METRICS_ADDR:-}
+  local output_file=${STATS_SNAPSHOT:-}
+  if [[ -z "${bin}" || -z "${metrics_addr}" || -z "${output_file}" || "${metrics_addr}" == "disabled" ]]; then
+    return 0
+  fi
+  "${bin}" stats --server "${metrics_addr}" --json >"${output_file}" 2>/dev/null || true
 }
 
 print_tail_if_exists() {
@@ -186,6 +253,10 @@ print_failure_context() {
     grep -E "mooncake_store_client_operation|mooncake_store_heartbeat|mooncake_store_runtime_lease|storage_owner" \
       "${METRICS_SNAPSHOT}" >&2 || cat "${METRICS_SNAPSHOT}" >&2
   fi
+  if [[ -f "${STATS_SNAPSHOT:-}" ]]; then
+    echo "--- stats snapshot: ${STATS_SNAPSHOT} ---" >&2
+    cat "${STATS_SNAPSHOT}" >&2
+  fi
 }
 
 TEMP_DIR=$(mktemp -d)
@@ -193,6 +264,7 @@ PIDS=()
 REDIS_STARTED=0
 METRICS_ADDR=""
 METRICS_SNAPSHOT="${TEMP_DIR}/metrics.final"
+STATS_SNAPSHOT="${TEMP_DIR}/stats.final.json"
 
 cleanup() {
   local status=$?
@@ -201,6 +273,7 @@ cleanup() {
 
   if [[ "${status}" != "0" ]]; then
     capture_metrics_snapshot
+    capture_stats_snapshot
   fi
 
   for pid in "${PIDS[@]:-}"; do
@@ -450,7 +523,7 @@ then
   exit 1
 fi
 
-echo "==> validating eviction metrics"
-wait_for_metrics "${METRICS_ADDR}" "${METRICS_TIMEOUT_SECONDS}"
+echo "==> validating eviction stats"
+wait_for_stats "${BIN}" "${METRICS_ADDR}" "${METRICS_TIMEOUT_SECONDS}"
 
 echo "CLI eviction binary test passed"
