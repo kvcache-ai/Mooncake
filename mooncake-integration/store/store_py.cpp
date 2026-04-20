@@ -1562,7 +1562,9 @@ PYBIND11_MODULE(store, m) {
                const std::string &protocol = "tcp",
                const std::string &rdma_devices = "",
                const std::string &master_server_addr = "127.0.0.1:50051",
-               const py::object &engine = py::none()) {
+               const py::object &engine = py::none(),
+               bool enable_ssd_offload = false,
+               const std::string &ssd_offload_path = "") {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1573,12 +1575,15 @@ PYBIND11_MODULE(store, m) {
                 return real_client->setup_real(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine, "");
+                    master_server_addr, transfer_engine, "", enable_ssd_offload,
+                    ssd_offload_path);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
-            py::arg("master_server_addr"), py::arg("engine") = py::none())
+            py::arg("master_server_addr"), py::arg("engine") = py::none(),
+            py::arg("enable_ssd_offload") = false,
+            py::arg("ssd_offload_path") = "")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -1606,7 +1611,10 @@ PYBIND11_MODULE(store, m) {
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
             "  master_server_addr: Master server address.\n"
-            "  ipc_socket_path: IPC socket path.")
+            "  ipc_socket_path: IPC socket path.\n"
+            "  enable_ssd_offload: Enable SSD offload (default false).\n"
+            "  ssd_offload_path: SSD storage directory path (overrides env "
+            "var).")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
@@ -2263,6 +2271,20 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->batch_get_replica_desc(keys);
             },
             py::arg("keys"))
+        .def(
+            "batch_replica_clear",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::string &segment_name) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<std::string>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_replica_clear(keys, segment_name);
+            },
+            py::arg("keys"), py::arg("segment_name") = "",
+            "Clear replicas for the given keys. Requires lease to be expired.")
         .def(
             "create_copy_task",
             [](MooncakeStorePyWrapper &self, const std::string &key,

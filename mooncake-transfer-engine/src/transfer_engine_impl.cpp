@@ -29,7 +29,9 @@
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
+#endif
 
 namespace mooncake {
 

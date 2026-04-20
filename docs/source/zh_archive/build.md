@@ -132,13 +132,17 @@
     make -j
     ```
 
-5. 若需编译沐曦 MetaX MACA 支持（如 C500），请安装 MACA SDK，使头文件与库位于 `MACA_HOME`（未设置时默认 `/opt/maca`）。不同安装包可能把库放在 `lib` 或 `lib64`；CMake 会同时搜索 `${MACA_HOME}/lib` 与 `${MACA_HOME}/lib64`，建议在环境变量中也同时加入两者，避免链接或运行时找不到共享库：
+5. 若需编译沐曦 MetaX MACA 支持（如 C500），请安装 MACA SDK，使头文件与库位于 `MACA_ROOT`（优先取 `MACA_HOME` 环境变量，未设置时默认 `/opt/maca`）。不同安装包可能把库放在 `lib` 或 `lib64`，建议在环境变量中同时加入两者，避免链接或运行时找不到共享库：
     ```bash
     export MACA_HOME=/opt/maca
     export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     ```
-    使用 `-DUSE_MACA=ON` 配置构建。如需覆盖默认链接的运行库，可在配置阶段传入 CMake 列表，例如 `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`（分号分隔）。该变量在 **`mooncake-transfer-engine/src/CMakeLists.txt`** 的 `if(USE_MACA)` 中用于 `target_link_libraries`，**不在** `mooncake-common/common.cmake` 中。
+    使用 `-DUSE_MACA=ON` 配置构建。可选覆盖项：
+    - `-DMACA_ROOT=/path/to/maca`
+    - `-DMACA_INCLUDE_DIR=/path/to/maca/include`
+    - `-DMACA_LIB_DIR=/path/to/maca/lib64`
+    - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`（分号分隔的 CMake 列表）
 
 6. 安装 yalantinglibs
     ```bash
@@ -167,7 +171,11 @@
 在执行 `cmake ..` 期间可以使用下列选项指定是否编译 Mooncake 的某些组件。
 - `-DUSE_CUDA=[ON|OFF]`: 启用 GPU Direct RDMA 及 NVMe-of 支持
 - `-DUSE_MUSA=[ON|OFF]`: 通过 MUSA 启用对摩尔线程 GPU 的支持
-- `-DUSE_MACA=[ON|OFF]`: 通过 MACA 启用对沐曦 MetaX GPU 的支持（`MACA_HOME` 指向 SDK 根目录，默认 `/opt/maca`；可选 `-DMACA_RUNTIME_LIBS` 覆盖 `transfer_engine` 默认链接库，见 `mooncake-transfer-engine/src/CMakeLists.txt`）
+- `-DUSE_MACA=[ON|OFF]`: 通过 MACA 启用对沐曦 MetaX GPU 的支持。
+- `-DMACA_ROOT=/path/to/maca`: 覆盖 MACA SDK 根路径（也支持 `MACA_HOME` 环境变量，默认 `/opt/maca`）。
+- `-DMACA_INCLUDE_DIR=/path/to/include`: 在 `-DUSE_MACA=ON` 时覆盖 MACA 头文件目录。
+- `-DMACA_LIB_DIR=/path/to/lib64`: 在 `-DUSE_MACA=ON` 时覆盖 MACA 库目录。
+- `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`: 覆盖 `transfer_engine` 链接的 MACA 运行时库列表。
 - `-DUSE_MLU=[ON|OFF]`: 通过 Neuware 启用寒武纪 MLU 显存支持。默认 OFF；支持 MLU 显存探测、拓扑发现及 Transfer Engine 的 RDMA 注册。
 - `-DNEUWARE_ROOT=/path/to/neuware`: 在 `-DUSE_MLU=ON` 时覆盖默认 Neuware SDK 根路径；未设置时使用 `NEUWARE_HOME` 或 `/usr/local/neuware`。
 - `-DMLU_INCLUDE_DIR=/path/to/include` / `-DMLU_LIB_DIR=/path/to/lib64`: 在 `-DUSE_MLU=ON` 时覆盖 Neuware 头文件与库目录。

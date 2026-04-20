@@ -52,82 +52,96 @@ class EfaTransport : public Transport {
 
     ~EfaTransport();
 
-    int install(std::string &local_server_name,
+    int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo) override;
 
-    const char *getName() const override { return "efa"; }
+    const char* getName() const override { return "efa"; }
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible,
+    int registerLocalMemory(void* addr, size_t length,
+                            const std::string& location, bool remote_accessible,
                             bool update_metadata) override;
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = true) override;
+    int unregisterLocalMemory(void* addr, bool update_metadata = true) override;
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
-                                 const std::string &location) override;
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
+                                 const std::string& location) override;
 
     int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) override;
+        const std::vector<void*>& addr_list) override;
+
+    // Eagerly establish EFA endpoints to every NIC of `segment_name`.
+    //
+    // Rationale: libfabric FI_EP_RDM endpoints resolve peer addresses lazily
+    // via fi_av_insert() on first send. With 16 local NICs × N peer NICs,
+    // the first submitTransfer() of a batch serializes ~N*16
+    // handshake+fi_av_insert round-trips, producing a single-digit-second
+    // stall (observed ~6 s on B300 for the first 100 × 0.5 MB batch). After
+    // this call returns, every (local_ctx, peer_nic) endpoint is CONNECTED
+    // and the first real submitTransfer() goes straight to fi_write/fi_read.
+    //
+    // Safe to call multiple times (idempotent: endpoint() + setup are both
+    // idempotent). Re-run after any openSegment() on a new peer.
+    int warmupSegment(const std::string& segment_name);
 
    private:
     // Internal version with force_sequential option to avoid nested parallelism
-    int registerLocalMemoryInternal(void *addr, size_t length,
-                                    const std::string &location,
+    int registerLocalMemoryInternal(void* addr, size_t length,
+                                    const std::string& location,
                                     bool remote_accessible,
                                     bool update_metadata,
                                     bool force_sequential);
 
-    int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
+    int unregisterLocalMemoryInternal(void* addr, bool update_metadata,
                                       bool force_sequential);
 
     // TRANSFER
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries) override;
+                          const std::vector<TransferRequest>& entries) override;
 
     Status submitTransferTask(
-        const std::vector<TransferTask *> &task_list) override;
+        const std::vector<TransferTask*>& task_list) override;
 
     Status getTransferStatus(BatchID batch_id,
-                             std::vector<TransferStatus> &status);
+                             std::vector<TransferStatus>& status);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status) override;
+                             TransferStatus& status) override;
 
-    SegmentID getSegmentID(const std::string &segment_name);
+    SegmentID getSegmentID(const std::string& segment_name);
 
    private:
     int allocateLocalSegmentID();
 
-    int preTouchMemory(void *addr, size_t length);
+    int preTouchMemory(void* addr, size_t length);
 
    public:
-    int onSetupEfaConnections(const HandShakeDesc &peer_desc,
-                              HandShakeDesc &local_desc);
+    int onSetupEfaConnections(const HandShakeDesc& peer_desc,
+                              HandShakeDesc& local_desc);
 
-    int sendHandshake(const std::string &peer_server_name,
-                      const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc) {
+    int sendHandshake(const std::string& peer_server_name,
+                      const HandShakeDesc& local_desc,
+                      HandShakeDesc& peer_desc) {
         return metadata_->sendHandshake(peer_server_name, local_desc,
                                         peer_desc);
     }
 
-    const std::string &local_server_name() const { return local_server_name_; }
+    const std::string& local_server_name() const { return local_server_name_; }
 
     std::shared_ptr<TransferMetadata> meta() { return metadata_; }
 
    private:
     int initializeEfaResources();
 
-    int startHandshakeDaemon(std::string &local_server_name);
+    int startHandshakeDaemon(std::string& local_server_name);
 
    public:
-    static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
-                            int &buffer_id, int &device_id, int retry_cnt = 0);
-    static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
-                            std::string_view hint, int &buffer_id,
-                            int &device_id, int retry_cnt = 0);
+    static int selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
+                            int& buffer_id, int& device_id, int retry_cnt = 0);
+    static int selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
+                            std::string_view hint, int& buffer_id,
+                            int& device_id, int retry_cnt = 0);
 
    private:
     // Start/stop CQ polling worker threads
@@ -138,6 +152,16 @@ class EfaTransport : public Transport {
    private:
     std::vector<std::shared_ptr<EfaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
+
+    // Track chunked MR registrations for per-NIC partitioned buffers.
+    // When a buffer exceeds max_mr_size, it is split into chunks, each
+    // registered on a disjoint subset of NICs (per-NIC partition).
+    struct ChunkRegistration {
+        uint64_t addr;
+        std::vector<size_t> nic_indices;
+    };
+    std::mutex chunk_map_mutex_;
+    std::unordered_map<uint64_t, std::vector<ChunkRegistration>> chunk_map_;
 
     // CQ polling worker threads
     std::atomic<bool> worker_running_{false};

@@ -137,13 +137,17 @@ pip install mooncake-transfer-engine-non-cuda
     make -j
     ```
 
-5. If you want to compile MetaX (Muxi) MACA support (e.g. C500), install the MACA SDK so headers and libraries are available under `MACA_HOME` (default `/opt/maca` if unset). SDK layouts vary; CMake adds both `${MACA_HOME}/lib` and `${MACA_HOME}/lib64` to the link search path, so include both in the environment when linking or running binaries:
+5. If you want to compile MetaX (Muxi) MACA support (e.g. C500), install the MACA SDK so headers and libraries are available under `MACA_ROOT` (defaults to `MACA_HOME` env var if set, otherwise `/opt/maca`). SDK layouts vary; include both `lib` and `lib64` in runtime paths when needed:
     ```bash
     export MACA_HOME=/opt/maca
     export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     ```
-    Build with `-DUSE_MACA=ON`. To override which libraries are linked to `transfer_engine`, pass a CMake list at configure time, e.g. `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated). This variable is read in `mooncake-transfer-engine/src/CMakeLists.txt` under `if(USE_MACA)`, not in `mooncake-common/common.cmake`.
+    Build with `-DUSE_MACA=ON`. Optional overrides:
+    - `-DMACA_ROOT=/path/to/maca`
+    - `-DMACA_INCLUDE_DIR=/path/to/maca/include`
+    - `-DMACA_LIB_DIR=/path/to/maca/lib64`
+    - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated CMake list)
 
 6. Install yalantinglibs
     ```bash
@@ -185,7 +189,11 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU memory support (GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport). **Default: OFF.** Required when transferring GPU memory (e.g., KV cache in vLLM disaggregated serving), even when using TCP protocol.
 - `-DUSE_MNNVL=[ON|OFF]`: Enable Multi-Node NVLink transport support, default is OFF. **Note:** `-DUSE_CUDA` is required when `-DUSE_MNNVL` is on (not used when building with `-DUSE_MUSA=ON`, `-DUSE_HIP=ON`, or `-DUSE_MACA=ON`).
 - `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
-- `-DUSE_MACA=[ON|OFF]`: Enable MetaX (Muxi) GPU support via MACA. Use `MACA_HOME` for the SDK root (default `/opt/maca`). Optional: `-DMACA_RUNTIME_LIBS` (CMake list) overrides default `mcruntime;mxc-runtime64;rt` for `transfer_engine` in `mooncake-transfer-engine/src/CMakeLists.txt`.
+- `-DUSE_MACA=[ON|OFF]`: Enable MetaX (Muxi) GPU support via MACA.
+- `-DMACA_ROOT=/path/to/maca`: Override the MACA SDK root (`MACA_HOME` env var is also honored; default `/opt/maca`).
+- `-DMACA_INCLUDE_DIR=/path/to/include`: Override MACA include directory when `-DUSE_MACA=ON`.
+- `-DMACA_LIB_DIR=/path/to/lib64`: Override MACA library directory when `-DUSE_MACA=ON`.
+- `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`: Override MACA runtime libraries linked by `transfer_engine`.
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
 - `-DUSE_MLU=[ON|OFF]`: Enable Cambricon MLU memory support via Neuware. **Default: OFF.** Supports MLU memory detection, topology discovery, and RDMA registration for Transfer Engine.
 - `-DNEUWARE_ROOT=/path/to/neuware`: Override the default Neuware SDK root used when `-DUSE_MLU=ON`. If unset, Mooncake uses `NEUWARE_HOME` or `/usr/local/neuware`.

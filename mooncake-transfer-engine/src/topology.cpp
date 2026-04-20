@@ -27,7 +27,6 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <libgen.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -35,7 +34,8 @@
 #include "memory_location.h"
 #include "topology.h"
 #ifdef USE_UB
-#include <ub/umdk/urma/urma_api.h>
+#include <libgen.h>
+#include <urma_api.h>
 #endif
 
 namespace mooncake {
@@ -208,9 +208,7 @@ static std::vector<UBDevice> listUBDevices(
     int num_devices = 0;
     std::vector<UBDevice> devices;
 
-    urma_init_attr_t init_attr = {
-        .uasid = 0,
-    };
+    urma_init_attr_t init_attr = {};
     if (urma_init(&init_attr) != URMA_SUCCESS) {
         LOG(WARNING) << "Failed to urma init";
         return {};
@@ -474,20 +472,19 @@ void Topology::clear() {
 
 int Topology::discover(const std::vector<std::string> &filter) {
     matrix_.clear();
-#ifdef USE_UB
-    auto all_hca = listUBDevices(filter);
-    for (auto &ent : discoverCpuTopology(all_hca)) {
-        matrix_[ent.name] = ent;
-    }
-#else
     auto all_hca = listInfiniBandDevices(filter);
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
-#endif
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_MLU) || defined(USE_MACA)
     for (auto &ent : discoverCudaTopology(all_hca)) {
+        matrix_[ent.name] = ent;
+    }
+#endif
+#ifdef USE_UB
+    auto ub_all_hca = listUBDevices(filter);
+    for (auto &ent : discoverCpuTopology(ub_all_hca)) {
         matrix_[ent.name] = ent;
     }
 #endif

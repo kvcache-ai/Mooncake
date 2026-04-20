@@ -125,17 +125,33 @@ class MooncakeBackend final : public ::c10d::Backend {
     }
 
     std::string getPreferredHca(std::string location) {
-        auto matrix = engine_->getLocalTopology()->getMatrix();
+        static std::once_flag topo_once;
+        static std::shared_ptr<Topology> topology;
+        static TopologyMatrix matrix;
+        std::call_once(topo_once, [this] {
+            // FIXME: getLocalTopology is deprecated in TENT
+            topology = engine_->getLocalTopology();
+            if (topology) {
+                matrix = topology->getMatrix();
+            }
+            if (!topology || matrix.empty()) {
+                topology = std::make_shared<Topology>();
+                topology->discover();
+                matrix = topology->getMatrix();
+            }
+        });
+
         auto it = matrix.find(location);
         if (it == matrix.end()) {
-            LOG(INFO) << "Topology is "
-                      << engine_->getLocalTopology()->toJson();
+            LOG(INFO) << "Topology is " << topology->toJson();
             LOG(ERROR) << "Topology entry not found for location: " << location;
-        } else if (it->second.preferred_hca.empty()) {
-            LOG(INFO) << "Topology is "
-                      << engine_->getLocalTopology()->toJson();
+            return "";
+        }
+        if (it->second.preferred_hca.empty()) {
+            LOG(INFO) << "Topology is " << topology->toJson();
             LOG(ERROR) << "Preferred HCA list is empty for location: "
                        << location;
+            return "";
         }
         return it->second.preferred_hca[0];
     }

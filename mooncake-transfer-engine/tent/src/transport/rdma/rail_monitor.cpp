@@ -226,6 +226,10 @@ Status RailMonitor::loadDefault() {
                 best_nic = cand;
             }
         }
+        if (best_nic < 0) {
+            direct_rails_[local_nic] = -1;
+            continue;
+        }
         remote_load[best_nic]++;
         direct_rails_[local_nic] = best_nic;
     }
@@ -241,16 +245,24 @@ void RailMonitor::updateBestMapping() {
     std::unordered_set<int> remote_nic_set;
     const int local_nic_count = (int)local_->getNicCount();
     const int remote_nic_count = (int)remote_->getNicCount();
+
+    // Helper: clamp negative numa_node (e.g. -1 for eRDMA devices that lack
+    // NUMA affinity) to 0 so it can be used safely as an array index.
+    auto safeNuma = [](int numa) -> size_t {
+        return (numa >= 0 && numa < (int)kMaxNuma) ? (size_t)numa : 0;
+    };
+
     for (int local_nic = 0; local_nic < local_nic_count; ++local_nic) {
         auto local_entry = local_->getNicEntry(local_nic);
         if (!local_entry || local_entry->type != Topology::NIC_RDMA) continue;
-        local_devices[local_entry->numa_node].push_back(local_nic);
+        local_devices[safeNuma(local_entry->numa_node)].push_back(local_nic);
         auto remote_nic = direct_rails_[local_nic];
         if (!remote_nic_set.count(remote_nic)) {
             auto remote_entry = remote_->getNicEntry(remote_nic);
             if (!remote_entry || remote_entry->type != Topology::NIC_RDMA)
                 continue;
-            remote_devices[remote_entry->numa_node].push_back(remote_nic);
+            remote_devices[safeNuma(remote_entry->numa_node)].push_back(
+                remote_nic);
             remote_nic_set.insert(remote_nic);
         }
     }
@@ -259,7 +271,8 @@ void RailMonitor::updateBestMapping() {
             auto remote_entry = remote_->getNicEntry(remote_nic);
             if (!remote_entry || remote_entry->type != Topology::NIC_RDMA)
                 continue;
-            remote_devices[remote_entry->numa_node].push_back(remote_nic);
+            remote_devices[safeNuma(remote_entry->numa_node)].push_back(
+                remote_nic);
         }
     }
 

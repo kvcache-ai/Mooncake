@@ -99,6 +99,9 @@ class RdmaContext {
     // EndPoint Management
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
 
+    std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr);
+
     int deleteEndpoint(const std::string &peer_nic_path);
 
     int disconnectAllEndpoints();

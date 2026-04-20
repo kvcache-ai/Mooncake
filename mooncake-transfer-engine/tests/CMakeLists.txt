@@ -63,11 +63,23 @@ if (USE_EFA)
     add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
     target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest gtest_main)
     add_test(NAME efa_transport_test COMMAND efa_transport_test)
+
+    add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
+    target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
+
+    add_executable(efa_single_nic_large_mr_test ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
+    target_link_libraries(efa_single_nic_large_mr_test PUBLIC transfer_engine gflags::gflags glog::glog)
+
+    add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
+    target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags glog::glog)
 endif()
 
+# UB transport test with URMA endpoint and mock support
 if (USE_UB)
     add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
-    target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main)
+    target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main glog::glog pthread)
+    target_include_directories(ub_transport_test PRIVATE ${urma_INCLUDE_DIR})
     add_test(NAME ub_transport_test COMMAND ub_transport_test)
 endif()
 

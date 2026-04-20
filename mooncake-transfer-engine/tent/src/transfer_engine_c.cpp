@@ -47,7 +47,8 @@ tent_engine_t tent_create_engine() {
                          << ", fallback to default config";
         }
     }
-    for (auto& attr : tl_settings.attrs) config->set(attr.first, attr.second);
+    for (auto& attr : tl_settings.attrs)
+        config->setFromString(attr.first, attr.second);
     auto engine = new mooncake::tent::TransferEngineImpl(config);
     return (tent_engine_t)engine;
 }

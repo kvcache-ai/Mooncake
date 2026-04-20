@@ -535,6 +535,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     ibv_send_wr* bad_wr = nullptr;
     int sge_idx = 0;
 
+    auto self = shared_from_this();
     for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
         auto current = slice_list[wr_idx];
         auto& wr = wr_list[wr_idx];
@@ -544,7 +545,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
             sge.length = current->length;
             sge.lkey = current->source_lkey;
         }
-        current->ep_weak_ptr = this;
+        current->ep_weak_ptr = self;
         current->qp_index = qp_index;
         current->failed = false;
         wr.wr_id = (uint64_t)current;

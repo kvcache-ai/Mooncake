@@ -79,7 +79,9 @@ option(USE_UB "option for using UB protocol transport" OFF)
 if (USE_UB)
   add_compile_definitions(USE_UB)
   message(STATUS "ub transport is enabled")
+  include(${CMAKE_CURRENT_LIST_DIR}/FindUrma.cmake)
 endif()
+
 if (USE_EFA)
   # Find libfabric headers and library; default to AWS EFA installer path
   find_path(LIBFABRIC_INCLUDE_DIR rdma/fabric.h
@@ -173,6 +175,26 @@ if (NOT DEFINED MLU_LIB_DIR OR MLU_LIB_DIR STREQUAL "")
   set(MLU_LIB_DIR "${NEUWARE_ROOT}/lib64")
 endif()
 
+if (NOT DEFINED MACA_ROOT OR MACA_ROOT STREQUAL "")
+  if (DEFINED ENV{MACA_HOME} AND NOT "$ENV{MACA_HOME}" STREQUAL "")
+    set(MACA_ROOT "$ENV{MACA_HOME}" CACHE PATH "Path to MACA SDK" FORCE)
+  else()
+    set(MACA_ROOT "/opt/maca" CACHE PATH "Path to MACA SDK" FORCE)
+  endif()
+endif()
+
+if (NOT DEFINED MACA_INCLUDE_DIR OR MACA_INCLUDE_DIR STREQUAL "")
+  set(MACA_INCLUDE_DIR "${MACA_ROOT}/include")
+endif()
+
+if (NOT DEFINED MACA_LIB_DIR OR MACA_LIB_DIR STREQUAL "")
+  if (EXISTS "${MACA_ROOT}/lib64")
+    set(MACA_LIB_DIR "${MACA_ROOT}/lib64")
+  else()
+    set(MACA_LIB_DIR "${MACA_ROOT}/lib")
+  endif()
+endif()
+
 if (USE_MLU)
   add_compile_definitions(USE_MLU)
   message(STATUS "MLU support is enabled")
@@ -183,20 +205,12 @@ if (USE_MLU)
 endif()
 
 if (USE_MACA)
-  # MACA toolchain is CUDA-compatible in first-stage porting.
-  # Reuse CUDA code paths to get a runnable baseline quickly.
   add_compile_definitions(USE_MACA)
   message(STATUS "MACA support is enabled")
-  if(DEFINED ENV{MACA_HOME})
-    set(MACA_HOME $ENV{MACA_HOME})
-  else()
-    set(MACA_HOME /opt/maca)
+  include_directories(${MACA_INCLUDE_DIR})
+  if (EXISTS "${MACA_LIB_DIR}")
+    link_directories(${MACA_LIB_DIR})
   endif()
-  include_directories(${MACA_HOME}/include)
-  link_directories(
-    ${MACA_HOME}/lib
-    ${MACA_HOME}/lib64
-  )
 endif()
 
 if (USE_MUSA)

@@ -5,12 +5,18 @@
 
 #include "aligned_client_buffer.hpp"
 #include "storage_backend.h"
+#include "client_metric.h"
 #include "utils.h"
+#include "gpu_staging_utils.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
 
 namespace mooncake {
+
+using gpu_staging::CopyDeviceToHost;
+using gpu_staging::IsDevicePointer;
+using gpu_staging::SetDevice;
 
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
@@ -145,10 +151,13 @@ bool FileStorageConfig::Validate() const {
 
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
-                         const std::string& local_rpc_addr)
+                         const std::string& local_rpc_addr,
+                         SsdMetric* ssd_metric)
     : config_(config),
       client_(client),
+      ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
+      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(
           AlignedClientBufferAllocator::create(config.local_buffer_size, "")) {
     if (!config.Validate()) {
@@ -369,8 +378,70 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         };
 
+        // D2H staging: replace device slices with host memory slices
+        // so that storage_backend (ConcatSlicesToString / BuildBucket /
+        // WriteBucket) always receives host pointers.
+        std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
+        std::vector<PinnedBufferPool::Buffer> staging_bufs;
+
+        for (auto& [obj_key, slices] : batch_object) {
+            std::vector<Slice> host_slices;
+            bool obj_success = true;
+            for (const auto& slice : slices) {
+                int device_id = -1;
+                if (IsDevicePointer(slice.ptr, &device_id)) {
+                    SetDevice(device_id);
+                    auto buf = pinned_buffer_pool_->Acquire(slice.size);
+                    if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                        LOG(ERROR) << "D2H staging failed for key: " << obj_key;
+                        pinned_buffer_pool_->Release(buf);
+                        obj_success = false;
+                        break;
+                    }
+                    host_slices.emplace_back(Slice{buf.data, slice.size});
+                    staging_bufs.push_back(buf);
+                } else {
+                    host_slices.push_back(slice);
+                }
+            }
+            if (obj_success) {
+                host_batch_object[obj_key] = std::move(host_slices);
+            }
+        }
+
+        auto offload_start = std::chrono::steady_clock::now();
+        auto bucket_complete_handler =
+            [this, offload_start, complete_handler](
+                const std::vector<std::string>& keys,
+                std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+            auto res = complete_handler(keys, metadatas);
+            if (res == ErrorCode::OK && ssd_metric_) {
+                auto elapsed_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - offload_start)
+                        .count();
+                int64_t total_bytes = 0;
+                for (const auto& metadata : metadatas) {
+                    total_bytes += metadata.data_size;
+                }
+                ssd_metric_->ssd_write_ops.inc(keys.size());
+                ssd_metric_->ssd_write_bytes.inc(total_bytes);
+                ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
+                ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
+                ssd_metric_->ssd_total_ops.inc(keys.size());
+                ssd_metric_->ssd_total_bytes.inc(total_bytes);
+                ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
+                ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
+            }
+            return res;
+        };
         auto offload_res = storage_backend_->BatchOffload(
-            batch_object, complete_handler, eviction_handler);
+            host_batch_object, bucket_complete_handler, eviction_handler);
+
+        // Release staging buffers back to pool (Buffer is POD, no destructor)
+        for (auto& buf : staging_bufs) {
+            pinned_buffer_pool_->Release(buf);
+        }
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
@@ -445,6 +516,19 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
             << "us,with keys count: " << batch_object.size();
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
+    } else if (ssd_metric_) {
+        int64_t total_bytes = 0;
+        for (const auto& [key, slice] : batch_object) {
+            total_bytes += slice.size;
+        }
+        ssd_metric_->ssd_read_ops.inc(batch_object.size());
+        ssd_metric_->ssd_read_bytes.inc(total_bytes);
+        ssd_metric_->ssd_read_latency_us.observe(elapsed_time);
+        ssd_metric_->ssd_read_latency_summary.observe(elapsed_time);
+        ssd_metric_->ssd_total_ops.inc(batch_object.size());
+        ssd_metric_->ssd_total_bytes.inc(total_bytes);
+        ssd_metric_->ssd_total_latency_us.observe(elapsed_time);
+        ssd_metric_->ssd_total_latency_summary.observe(elapsed_time);
     }
     return result;
 }

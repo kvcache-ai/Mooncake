@@ -27,7 +27,7 @@
 
 namespace mooncake {
 
-EfaEndPoint::EfaEndPoint(EfaContext &context)
+EfaEndPoint::EfaEndPoint(EfaContext& context)
     : context_(context),
       status_(INITIALIZING),
       ep_(nullptr),
@@ -39,14 +39,16 @@ EfaEndPoint::EfaEndPoint(EfaContext &context)
       max_wr_depth_(0),
       cq_outstanding_(nullptr),
       active_(true),
-      inactive_time_(0) {}
+      inactive_time_(0),
+      last_used_time_(getCurrentTimeInNano()) {}
 
 EfaEndPoint::~EfaEndPoint() {
     if (ep_) deconstruct();
 }
 
-int EfaEndPoint::construct(struct fid_cq *cq, size_t num_qp_list,
-                           size_t max_sge, size_t max_wr, size_t max_inline) {
+int EfaEndPoint::construct(struct fid_cq* cq, volatile int* cq_outstanding,
+                           size_t num_qp_list, size_t max_sge, size_t max_wr,
+                           size_t max_inline) {
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
         LOG(ERROR) << "EFA Endpoint has already been constructed";
         return ERR_ENDPOINT;
@@ -55,7 +57,7 @@ int EfaEndPoint::construct(struct fid_cq *cq, size_t num_qp_list,
     tx_cq_ = cq;
     rx_cq_ = cq;  // Use same CQ for TX and RX
     max_wr_depth_ = max_wr;
-    cq_outstanding_ = context_.cqOutstandingCount(0);
+    cq_outstanding_ = cq_outstanding;
 
     // Create endpoint
     int ret = fi_endpoint(context_.domain(), context_.info(), &ep_, nullptr);
@@ -126,10 +128,12 @@ int EfaEndPoint::deconstruct() {
 
 int EfaEndPoint::destroyQP() { return deconstruct(); }
 
-void EfaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
+void EfaEndPoint::setPeerNicPath(const std::string& peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
+    if (peer_nic_path_ == peer_nic_path) return;  // No change
     if (connected()) {
-        LOG(WARNING) << "Previous EFA connection will be discarded";
+        LOG(INFO) << "Peer reconnected with new address, re-establishing: "
+                  << peer_nic_path_ << " -> " << peer_nic_path;
         disconnectUnlocked();
     }
     peer_nic_path_ = peer_nic_path;
@@ -144,7 +148,7 @@ std::string EfaEndPoint::getLocalAddr() const {
     return oss.str();
 }
 
-int EfaEndPoint::insertPeerAddr(const std::string &peer_addr) {
+int EfaEndPoint::insertPeerAddr(const std::string& peer_addr) {
     // Convert hex string to binary address
     std::vector<uint8_t> addr_bin;
     addr_bin.reserve(peer_addr.size() / 2);
@@ -215,13 +219,14 @@ int EfaEndPoint::setupConnectionsByActive() {
     }
 
     status_.store(CONNECTED, std::memory_order_release);
+    touchLastUsed();
     VLOG(1) << "EFA connection established: " << toString()
             << " peer_fi_addr=" << peer_fi_addr_;
     return 0;
 }
 
-int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
-                                           HandShakeDesc &local_desc) {
+int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
+                                           HandShakeDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
         LOG(WARNING) << "Re-establish EFA connection: " << toString();
@@ -259,6 +264,7 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     // reply_msg should be empty on success
 
     status_.store(CONNECTED, std::memory_order_release);
+    touchLastUsed();
     VLOG(1) << "EFA connection established (passive): " << toString();
     return 0;
 }
@@ -269,8 +275,16 @@ void EfaEndPoint::disconnect() {
 }
 
 void EfaEndPoint::disconnectUnlocked() {
-    // For EFA RDM endpoints, we don't need to reset QP state
-    // Just remove peer from AV if needed and mark as disconnected
+    // Remove peer address from AV to free the slot for reuse.
+    // Without this, AV entries leak on every initiator disconnect,
+    // eventually exhausting the AV and causing fi_av_insert/fi_endpoint
+    // failures ("No data available") after 3-5 initiator runs.
+    if (peer_fi_addr_ != FI_ADDR_UNSPEC) {
+        int ret = fi_av_remove(context_.av(), &peer_fi_addr_, 1, 0);
+        if (ret) {
+            LOG(WARNING) << "fi_av_remove failed: " << fi_strerror(-ret);
+        }
+    }
     peer_fi_addr_ = FI_ADDR_UNSPEC;
     status_.store(UNCONNECTED, std::memory_order_release);
 }
@@ -281,8 +295,8 @@ const std::string EfaEndPoint::toString() const {
 
 bool EfaEndPoint::hasOutstandingSlice() const { return wr_depth_ > 0; }
 
-int EfaEndPoint::doSetupConnection(const std::string &peer_addr,
-                                   std::string *reply_msg) {
+int EfaEndPoint::doSetupConnection(const std::string& peer_addr,
+                                   std::string* reply_msg) {
     int ret = insertPeerAddr(peer_addr);
     if (ret != 0) {
         if (reply_msg) *reply_msg = "Failed to insert peer address into AV";
@@ -294,14 +308,14 @@ int EfaEndPoint::doSetupConnection(const std::string &peer_addr,
 }
 
 int EfaEndPoint::submitPostSend(
-    std::vector<Transport::Slice *> &slice_list,
-    std::vector<Transport::Slice *> &failed_slice_list) {
+    std::vector<Transport::Slice*>& slice_list,
+    std::vector<Transport::Slice*>& failed_slice_list) {
     if (!connected()) {
         // Try to establish connection first
         int ret = setupConnectionsByActive();
         if (ret != 0) {
             // Move all slices to failed list
-            for (auto *slice : slice_list) {
+            for (auto* slice : slice_list) {
                 failed_slice_list.push_back(slice);
             }
             slice_list.clear();
@@ -309,130 +323,174 @@ int EfaEndPoint::submitPostSend(
         }
     }
 
-    // Process slices - using fi_write for RDMA write operations.
-    // Use atomic reserve-before-post to prevent CQ overflow when multiple
-    // threads post to endpoints sharing the same CQ.  The CQ has a fixed
-    // capacity (max_cqe); if more completions arrive than it can hold, the
-    // provider silently drops them and those slices never complete (hang).
+    // Batched submission — mirrors RDMA's ibv_post_send approach:
+    // 1. Reserve N WR+CQ slots in bulk (single CAS each)
+    // 2. Prepare MR descriptors and op contexts outside the lock
+    // 3. Hold post_lock once for the entire batch of fi_write calls
+    // This reduces per-slice overhead from 2 CAS + 1 spinlock to amortized
+    // 2/N CAS + 1/N spinlock per slice.
     const int kMaxBackoffYields = 100000;
     const int cq_limit = static_cast<int>(globalConfig().max_cqe);
 
-    for (auto it = slice_list.begin(); it != slice_list.end();) {
-        // --- Atomically reserve CQ and WR capacity before posting ---
-        // This eliminates the TOCTOU race where multiple threads pass the
-        // capacity check simultaneously and collectively overflow the CQ.
+    struct BatchEntry {
+        Transport::Slice* slice;
+        void* local_desc;
+        EfaOpContext* op_ctx;
+    };
+
+    while (!slice_list.empty()) {
+        // --- Step 1: Atomically reserve a batch of WR+CQ slots ---
+        int batch_count = 0;
         int backoff = 0;
-        bool reserved = false;
-        while (!reserved) {
-            // Try to reserve one WR slot
+        bool timed_out = false;
+        while (batch_count == 0) {
             int cur_wr = wr_depth_;
-            if (cur_wr >= max_wr_depth_) {
-                if (++backoff > kMaxBackoffYields) goto timeout;
+            int wr_avail = max_wr_depth_ - cur_wr;
+            if (wr_avail <= 0) {
+                if (++backoff > kMaxBackoffYields) {
+                    timed_out = true;
+                    break;
+                }
                 std::this_thread::yield();
                 continue;
             }
-            if (!__sync_bool_compare_and_swap(&wr_depth_, cur_wr, cur_wr + 1)) {
-                continue;  // CAS failed, retry immediately
-            }
-            // WR slot reserved. Now try to reserve CQ slot.
+            int want = std::min(wr_avail, (int)slice_list.size());
             if (cq_outstanding_) {
                 int cur_cq = *cq_outstanding_;
-                while (cur_cq < cq_limit) {
-                    if (__sync_bool_compare_and_swap(cq_outstanding_, cur_cq,
-                                                     cur_cq + 1)) {
-                        reserved = true;
+                int cq_avail = cq_limit - cur_cq;
+                if (cq_avail <= 0) {
+                    if (++backoff > kMaxBackoffYields) {
+                        timed_out = true;
                         break;
                     }
-                    cur_cq = *cq_outstanding_;
-                }
-                if (!reserved) {
-                    // CQ full - release WR reservation and back off
-                    __sync_fetch_and_sub(&wr_depth_, 1);
-                    if (++backoff > kMaxBackoffYields) goto timeout;
                     std::this_thread::yield();
                     continue;
                 }
+                want = std::min(want, cq_avail);
+                if (!__sync_bool_compare_and_swap(&wr_depth_, cur_wr,
+                                                  cur_wr + want)) {
+                    continue;
+                }
+                cur_cq = *cq_outstanding_;
+                cq_avail = cq_limit - cur_cq;
+                if (cq_avail < want) {
+                    __sync_fetch_and_sub(&wr_depth_, want);
+                    continue;
+                }
+                if (!__sync_bool_compare_and_swap(cq_outstanding_, cur_cq,
+                                                  cur_cq + want)) {
+                    __sync_fetch_and_sub(&wr_depth_, want);
+                    continue;
+                }
             } else {
-                reserved = true;
+                if (!__sync_bool_compare_and_swap(&wr_depth_, cur_wr,
+                                                  cur_wr + want)) {
+                    continue;
+                }
             }
+            batch_count = want;
         }
 
-        {
-            Transport::Slice *slice = *it;
+        if (timed_out) {
+            LOG(WARNING) << "EFA submitPostSend: timed out waiting for CQ drain"
+                         << " (wr_depth=" << wr_depth_
+                         << ", max=" << max_wr_depth_ << ", cq_outstanding="
+                         << (cq_outstanding_ ? *cq_outstanding_ : -1)
+                         << ", max_cqe=" << cq_limit << ")";
+            for (auto* slice : slice_list) {
+                failed_slice_list.push_back(slice);
+            }
+            slice_list.clear();
+            return 0;
+        }
 
-            // Get memory region descriptor for the local buffer
-            void *local_desc = context_.mrDesc(slice->source_addr);
+        // --- Step 2: Prepare MR descriptors outside the lock ---
+        std::vector<BatchEntry> batch(batch_count);
+        int valid_count = 0;
+
+        for (int i = 0; i < batch_count; i++) {
+            Transport::Slice* slice = slice_list[i];
+            void* local_desc = context_.mrDesc(slice->source_addr);
             if (!local_desc) {
                 LOG(ERROR) << "No MR descriptor found for address "
                            << slice->source_addr;
-                // Release reservations
-                __sync_fetch_and_sub(&wr_depth_, 1);
-                if (cq_outstanding_) __sync_fetch_and_sub(cq_outstanding_, 1);
                 failed_slice_list.push_back(slice);
-                it = slice_list.erase(it);
                 continue;
             }
-
-            // Allocate operation context to track the slice for completion
-            // Note: This memory is freed after CQ completion in pollCq
-            EfaOpContext *op_ctx = new EfaOpContext();
+            EfaOpContext* op_ctx = new EfaOpContext();
             memset(op_ctx, 0, sizeof(EfaOpContext));
             op_ctx->slice = slice;
             op_ctx->wr_depth = &wr_depth_;
 
-            // Serialize fi_write per-endpoint: concurrent fi_write on the
-            // same RDM endpoint corrupts provider state.  Cross-endpoint
-            // safety is handled by the FI_THREAD_SAFE hint.
+            batch[valid_count++] = {slice, local_desc, op_ctx};
+        }
+
+        int mr_failures = batch_count - valid_count;
+        if (mr_failures > 0) {
+            __sync_fetch_and_sub(&wr_depth_, mr_failures);
+            if (cq_outstanding_)
+                __sync_fetch_and_sub(cq_outstanding_, mr_failures);
+        }
+
+        // --- Step 3: Post entire batch under a single lock hold ---
+        std::vector<Transport::Slice*> retry_slices;
+        if (valid_count > 0) {
             while (post_lock_.test_and_set(std::memory_order_acquire)) {
             }
-            ssize_t ret = fi_write(ep_,
-                                   (void *)slice->source_addr,  // local buffer
-                                   slice->length, local_desc, peer_fi_addr_,
-                                   slice->rdma.dest_addr,  // remote address
-                                   slice->rdma.dest_rkey,  // remote key
-                                   &op_ctx->fi_ctx);  // context for completion
-            post_lock_.clear(std::memory_order_release);
-
-            if (ret == 0) {
-                // Successfully posted - do NOT mark success here!
-                // Success is marked only after CQ completion in pollCq.
-                // WR and CQ reservations are already accounted for.
-                slice->status = Transport::Slice::PENDING;
-                it = slice_list.erase(it);
-            } else if (ret == -FI_EAGAIN) {
-                // Provider queue full - release reservations and retry
-                delete op_ctx;
-                __sync_fetch_and_sub(&wr_depth_, 1);
-                if (cq_outstanding_) __sync_fetch_and_sub(cq_outstanding_, 1);
-                std::this_thread::yield();
-                // Don't advance iterator - retry the same slice
-            } else {
-                // Hard error - release reservations
-                LOG(ERROR) << "fi_write failed: " << fi_strerror(-ret)
-                           << " (source=" << slice->source_addr
-                           << ", len=" << slice->length
-                           << ", dest=" << (void *)slice->rdma.dest_addr
-                           << ", rkey=" << slice->rdma.dest_rkey << ")";
-                delete op_ctx;
-                __sync_fetch_and_sub(&wr_depth_, 1);
-                if (cq_outstanding_) __sync_fetch_and_sub(cq_outstanding_, 1);
-                failed_slice_list.push_back(slice);
-                it = slice_list.erase(it);
+            for (int i = 0; i < valid_count; i++) {
+                auto& entry = batch[i];
+                ssize_t ret;
+                if (entry.slice->opcode == Transport::TransferRequest::READ) {
+                    ret = fi_read(ep_, (void*)entry.slice->source_addr,
+                                  entry.slice->length, entry.local_desc,
+                                  peer_fi_addr_, entry.slice->rdma.dest_addr,
+                                  entry.slice->rdma.dest_rkey,
+                                  &entry.op_ctx->fi_ctx);
+                } else {
+                    ret = fi_write(ep_, (void*)entry.slice->source_addr,
+                                   entry.slice->length, entry.local_desc,
+                                   peer_fi_addr_, entry.slice->rdma.dest_addr,
+                                   entry.slice->rdma.dest_rkey,
+                                   &entry.op_ctx->fi_ctx);
+                }
+                if (ret == 0) {
+                    entry.slice->status = Transport::Slice::PENDING;
+                } else if (ret == -FI_EAGAIN) {
+                    delete entry.op_ctx;
+                    int not_posted = valid_count - i;
+                    __sync_fetch_and_sub(&wr_depth_, not_posted);
+                    if (cq_outstanding_)
+                        __sync_fetch_and_sub(cq_outstanding_, not_posted);
+                    for (int j = i; j < valid_count; j++) {
+                        if (j > i) delete batch[j].op_ctx;
+                        retry_slices.push_back(batch[j].slice);
+                    }
+                    break;
+                } else {
+                    LOG(ERROR)
+                        << "fi_read/fi_write failed: " << fi_strerror(-ret)
+                        << " (source=" << entry.slice->source_addr
+                        << ", len=" << entry.slice->length
+                        << ", dest=" << (void*)entry.slice->rdma.dest_addr
+                        << ", rkey=" << entry.slice->rdma.dest_rkey << ")";
+                    delete entry.op_ctx;
+                    __sync_fetch_and_sub(&wr_depth_, 1);
+                    if (cq_outstanding_)
+                        __sync_fetch_and_sub(cq_outstanding_, 1);
+                    failed_slice_list.push_back(entry.slice);
+                }
             }
+            post_lock_.clear(std::memory_order_release);
+            touchLastUsed();
         }
-        continue;
 
-    timeout:
-        LOG(WARNING) << "EFA submitPostSend: timed out waiting for CQ drain"
-                     << " (wr_depth=" << wr_depth_ << ", max=" << max_wr_depth_
-                     << ", cq_outstanding="
-                     << (cq_outstanding_ ? *cq_outstanding_ : -1)
-                     << ", max_cqe=" << cq_limit << ")";
-        for (; it != slice_list.end(); ++it) {
-            failed_slice_list.push_back(*it);
+        // Remove consumed batch from slice_list, prepend any retry slices
+        slice_list.erase(slice_list.begin(), slice_list.begin() + batch_count);
+        if (!retry_slices.empty()) {
+            slice_list.insert(slice_list.begin(), retry_slices.begin(),
+                              retry_slices.end());
+            std::this_thread::yield();
         }
-        slice_list.clear();
-        return 0;
     }
 
     return 0;

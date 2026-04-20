@@ -202,9 +202,9 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
         auto& rail = worker.rails[desc->machine_id];
         rail.markFailed(slice->source_dev_id, slice->target_dev_id);
     }
-    if (slice->ep_weak_ptr) {
-        slice->ep_weak_ptr->acknowledge(slice, FAILED);
-        slice->ep_weak_ptr->reset();
+    if (auto ep = slice->ep_weak_ptr.lock()) {
+        ep->acknowledge(slice, FAILED);
+        ep->reset();
     }
 }
 
@@ -294,9 +294,15 @@ void Workers::asyncPollCq() {
     for (auto& slice : worker.inflight_slice_set) {
         if (slice->word != PENDING) continue;
         if (current_ts - slice->enqueue_ts > slice_timeout_ns_) {
-            auto ep = slice->ep_weak_ptr;
+            auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
+            if (!ep) {
+                updateSliceStatus(slice, TIMEOUT);
+                slice_to_remove.push_back(slice);
+                worker.inflight_slices.fetch_sub(1);
+                continue;
+            }
             auto num_slices = ep->acknowledge(slice, TIMEOUT);
             disableEndpoint(slice);
             worker.inflight_slices.fetch_sub(num_slices);
@@ -315,7 +321,7 @@ void Workers::asyncPollCq() {
         for (int i = 0; i < nr_poll; ++i) {
             auto slice = (RdmaSlice*)wc[i].wr_id;
             worker.inflight_slice_set.erase(slice);
-            auto ep = slice->ep_weak_ptr;
+            auto ep = slice->ep_weak_ptr.lock();
             double enqueue_lat =
                 (slice->submit_ts - slice->enqueue_ts) / 1000.0;
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
@@ -325,6 +331,11 @@ void Workers::asyncPollCq() {
                                        overall_lat_sec);
             }
             if (slice->word != PENDING) continue;
+            if (!ep) {
+                updateSliceStatus(slice, FAILED);
+                num_slices++;
+                continue;
+            }
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
                     // TE handles them automatically

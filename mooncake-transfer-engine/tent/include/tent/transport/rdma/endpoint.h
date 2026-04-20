@@ -15,6 +15,7 @@
 #ifndef TENT_ENDPOINT_H
 #define TENT_ENDPOINT_H
 
+#include <memory>
 #include <queue>
 #include <unordered_set>
 #include <vector>
@@ -23,7 +24,7 @@
 
 namespace mooncake {
 namespace tent {
-class RdmaEndPoint {
+class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     struct WrDepthBlock {
         volatile int value;
         uint64_t padding[7];

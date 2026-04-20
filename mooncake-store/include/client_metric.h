@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <iomanip>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -272,9 +274,171 @@ struct MasterClientMetric {
     }
 };
 
+// SSD latency bucket: microseconds, tuned for SSD/network storage
+// Range: 50us (high-end NVMe) to 30s (3fs/nfs large object batch writes)
+inline const std::vector<double> kSsdLatencyBucket = {
+    50,       100,     200,                      // <200us (high-end NVMe)
+    500,      1000,    2000,    5000,    10000,  // 500us - 10ms
+    20000,    50000,   100000,  200000,          // 10ms - 200ms
+    500000,   1000000, 2000000, 5000000,         // 500ms - 5s
+    10000000, 30000000                           // 10s - 30s (3fs/nfs)
+};
+
+struct SsdMetric {
+    SsdMetric(std::map<std::string, std::string> labels = {})
+        : ssd_read_bytes("mooncake_ssd_read_bytes_total",
+                         "Total bytes read from SSD", labels),
+          ssd_write_bytes("mooncake_ssd_write_bytes_total",
+                          "Total bytes written to SSD", labels),
+          ssd_read_ops("mooncake_ssd_read_ops_total",
+                       "Total number of SSD read operations (key count)",
+                       labels),
+          ssd_write_ops("mooncake_ssd_write_ops_total",
+                        "Total number of SSD write operations (key count)",
+                        labels),
+          ssd_read_latency_us("mooncake_ssd_read_latency_us",
+                              "SSD BatchLoad latency per batch (us)",
+                              kSsdLatencyBucket, labels),
+          ssd_write_latency_us("mooncake_ssd_write_latency_us",
+                               "SSD BatchOffload latency per batch (us)",
+                               kSsdLatencyBucket, labels),
+          ssd_total_bytes("mooncake_ssd_total_bytes_total",
+                          "Total bytes read and written to SSD", labels),
+          ssd_total_ops("mooncake_ssd_total_ops_total",
+                        "Total number of SSD operations (key count)", labels),
+          ssd_total_latency_us("mooncake_ssd_total_latency_us",
+                               "SSD total latency per batch (us)",
+                               kSsdLatencyBucket, labels),
+          ssd_read_latency_summary("mooncake_ssd_read_latency_summary_us",
+                                   "SSD read latency quantiles (us)",
+                                   {0.5, 0.9, 0.99}, labels),
+          ssd_write_latency_summary("mooncake_ssd_write_latency_summary_us",
+                                    "SSD write latency quantiles (us)",
+                                    {0.5, 0.9, 0.99}, labels),
+          ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
+                                    "SSD total latency quantiles (us)",
+                                    {0.5, 0.9, 0.99}, labels),
+          start_time_(std::chrono::steady_clock::now()) {}
+
+    ylt::metric::counter_t ssd_read_bytes;
+    ylt::metric::counter_t ssd_write_bytes;
+    ylt::metric::counter_t ssd_read_ops;
+    ylt::metric::counter_t ssd_write_ops;
+    ylt::metric::histogram_t ssd_read_latency_us;
+    ylt::metric::histogram_t ssd_write_latency_us;
+    ylt::metric::counter_t ssd_total_bytes;
+    ylt::metric::counter_t ssd_total_ops;
+    ylt::metric::histogram_t ssd_total_latency_us;
+    ylt::metric::summary_t ssd_read_latency_summary;
+    ylt::metric::summary_t ssd_write_latency_summary;
+    ylt::metric::summary_t ssd_total_latency_summary;
+    std::chrono::steady_clock::time_point start_time_;
+
+    void serialize(std::string& str) {
+        ssd_read_bytes.serialize(str);
+        ssd_write_bytes.serialize(str);
+        ssd_read_ops.serialize(str);
+        ssd_write_ops.serialize(str);
+        ssd_read_latency_us.serialize(str);
+        ssd_write_latency_us.serialize(str);
+        ssd_total_bytes.serialize(str);
+        ssd_total_ops.serialize(str);
+        ssd_total_latency_us.serialize(str);
+        ssd_read_latency_summary.serialize(str);
+        ssd_write_latency_summary.serialize(str);
+        ssd_total_latency_summary.serialize(str);
+    }
+
+    std::string summary_metrics() {
+        std::stringstream ss;
+        ss << "=== SSD Metrics Summary ===" << "\n";
+
+        auto read_bytes = ssd_read_bytes.value();
+        auto write_bytes = ssd_write_bytes.value();
+        auto read_ops = ssd_read_ops.value();
+        auto write_ops = ssd_write_ops.value();
+
+        auto elapsed_s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - start_time_)
+                             .count();
+
+        ss << "SSD Read: " << byte_size_to_string(read_bytes)
+           << ", ops=" << read_ops;
+        if (elapsed_s > 0 && read_bytes > 0) {
+            ss << ", throughput="
+               << byte_size_to_string(
+                      static_cast<int64_t>(read_bytes / elapsed_s))
+               << "/s";
+            ss << ", IOPS=" << std::fixed << std::setprecision(1)
+               << (read_ops / elapsed_s);
+        }
+        ss << "\n";
+
+        ss << "SSD Write: " << byte_size_to_string(write_bytes)
+           << ", ops=" << write_ops;
+        if (elapsed_s > 0 && write_bytes > 0) {
+            ss << ", throughput="
+               << byte_size_to_string(
+                      static_cast<int64_t>(write_bytes / elapsed_s))
+               << "/s";
+            ss << ", IOPS=" << std::fixed << std::setprecision(1)
+               << (write_ops / elapsed_s);
+        }
+        ss << "\n";
+
+        auto total_bytes = ssd_total_bytes.value();
+        auto total_ops = ssd_total_ops.value();
+        ss << "SSD Total: " << byte_size_to_string(total_bytes)
+           << ", ops=" << total_ops;
+        if (elapsed_s > 0 && total_bytes > 0) {
+            ss << ", throughput="
+               << byte_size_to_string(
+                      static_cast<int64_t>(total_bytes / elapsed_s))
+               << "/s";
+            ss << ", IOPS=" << std::fixed << std::setprecision(1)
+               << (total_ops / elapsed_s);
+        }
+        ss << "\n";
+
+        ss << "\n" << "=== SSD Latency Summary (microseconds) ===" << "\n";
+        ss << "Read: " << format_summary_percentiles(ssd_read_latency_summary)
+           << "\n";
+        ss << "Write: " << format_summary_percentiles(ssd_write_latency_summary)
+           << "\n";
+        ss << "Total: " << format_summary_percentiles(ssd_total_latency_summary)
+           << "\n";
+
+        return ss.str();
+    }
+
+   private:
+    std::string format_summary_percentiles(ylt::metric::summary_t& summary) {
+        double sum = 0;
+        uint64_t count = 0;
+        auto rates = summary.get_rates(sum, count);
+
+        if (count == 0) {
+            return "No data";
+        }
+
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(1);
+        ss << "count=" << count;
+        // rates order matches quantiles {0.5, 0.9, 0.99}
+        if (rates.size() >= 1) ss << ", p50=" << rates[0] << "us";
+        if (rates.size() >= 2) ss << ", p90=" << rates[1] << "us";
+        if (rates.size() >= 3) ss << ", p99=" << rates[2] << "us";
+        if (count > 0) {
+            ss << ", avg=" << (sum / count) << "us";
+        }
+        return ss.str();
+    }
+};
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
+    SsdMetric ssd_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables

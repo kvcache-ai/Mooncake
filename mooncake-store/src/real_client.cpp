@@ -418,6 +418,10 @@ RealClient::RealClient() {
 }
 
 RealClient::~RealClient() {
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+    }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
     tearDownAll_internal();
@@ -450,7 +454,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
-    bool enable_offload) {
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage = use_hugepage_ &&
@@ -595,10 +600,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
 
-        // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
-        // and distribute global_segment across them for full NIC utilization.
+        // For RDMA, auto-discover NUMA nodes with NICs and distribute
+        // global_segment across them for full NIC utilization.
         std::vector<int> seg_numa_nodes;
-        if (!ipc_socket_path_.empty() && protocol == "rdma") {
+        if (protocol == "rdma") {
             seg_numa_nodes = client_->GetNicNumaNodes();
             if (seg_numa_nodes.size() > 1) {
                 std::string nodes_str;
@@ -680,10 +685,43 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
     }
-    if (enable_offload) {
+    if (enable_ssd_offload && start_offload_rpc_server) {
+        // Start RPC server for offload operations (batch_get / release_buffer).
+        // Use port 0 to let the OS auto-allocate an available port.
+        offload_rpc_server_ =
+            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+        offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_->async_start();
+        auto err = offload_rpc_server_->get_errc();
+        if (err) {
+            LOG(ERROR) << "Failed to start offload RPC server: "
+                       << err.message();
+            offload_rpc_server_.reset();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        offload_rpc_port_ = offload_rpc_server_->port();
+        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
+
+        // Build local_rpc_addr from hostname + auto-allocated port
+        std::string rpc_host = this->local_hostname;
+        auto pos = rpc_host.find(':');
+        if (pos != std::string::npos) {
+            rpc_host = rpc_host.substr(0, pos);
+        }
+        this->local_rpc_addr =
+            rpc_host + ":" + std::to_string(offload_rpc_port_);
+    }
+    if (enable_ssd_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
+        if (!ssd_offload_path.empty()) {
+            file_storage_config.storage_filepath = ssd_offload_path;
+        }
         file_storage_ = std::make_shared<FileStorage>(
-            file_storage_config, client_, this->local_rpc_addr);
+            file_storage_config, client_, this->local_rpc_addr,
+            client_->GetSsdMetricPtr());
         auto init_result = file_storage_->Init();
         if (!init_result) {
             LOG(ERROR) << "file storage init failed with error: "
@@ -708,11 +746,12 @@ int RealClient::setup_real(
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path) {
-    return to_py_ret(setup_internal(local_hostname, metadata_server,
-                                    global_segment_size, local_buffer_size,
-                                    protocol, rdma_devices, master_server_addr,
-                                    transfer_engine, ipc_socket_path));
+    const std::string &ipc_socket_path, bool enable_ssd_offload,
+    const std::string &ssd_offload_path) {
+    return to_py_ret(setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path));
 }
 
 namespace {
@@ -803,9 +842,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    std::string ssd_offload_path = get_config(config, "ssd_offload_path");
+
+    std::string enable_ssd_offload_str =
+        get_config(config, "enable_ssd_offload", "false");
+    std::transform(enable_ssd_offload_str.begin(), enable_ssd_offload_str.end(),
+                   enable_ssd_offload_str.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    bool enable_ssd_offload =
+        (enable_ssd_offload_str == "true" || enable_ssd_offload_str == "1");
+
     return setup_internal(local_hostname, metadata_server, global_segment_size,
                           local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path);
+                          master_server_addr, nullptr, ipc_socket_path, 50052,
+                          enable_ssd_offload, true, ssd_offload_path);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -3847,6 +3897,21 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
         }
     }
     return replica_map;
+}
+
+std::vector<std::string> RealClient::batch_replica_clear(
+    const std::vector<std::string> &keys, const std::string &segment_name) {
+    if (!client_) {
+        LOG(ERROR) << "batch_replica_clear: client not initialized";
+        return {};
+    }
+    auto result =
+        client_->BatchReplicaClear(keys, client_->getClientId(), segment_name);
+    if (result) {
+        return result.value();
+    }
+    LOG(ERROR) << "batch_replica_clear failed: " << toString(result.error());
+    return {};
 }
 
 tl::expected<UUID, ErrorCode> RealClient::create_copy_task(

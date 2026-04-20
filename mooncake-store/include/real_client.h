@@ -18,6 +18,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include <ylt/coro_http/coro_http_server.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 namespace mooncake {
 
@@ -77,7 +78,9 @@ class RealClient : public PyClient {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
-        const std::string &ipc_socket_path = "");
+        const std::string &ipc_socket_path = "",
+        bool enable_ssd_offload = false,
+        const std::string &ssd_offload_path = "");
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -481,7 +484,8 @@ class RealClient : public PyClient {
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
-        bool enable_offload = false);
+        bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
+        const std::string &ssd_offload_path = "");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -635,6 +639,10 @@ class RealClient : public PyClient {
     batch_get_replica_desc(const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
+    std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") override;
+
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
@@ -696,6 +704,8 @@ class RealClient : public PyClient {
     std::string device_name;
     std::string local_hostname;
     std::string local_rpc_addr;
+    std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
+    int offload_rpc_port_ = 0;
     bool use_hugepage_ = false;
 
     struct MappedShm {

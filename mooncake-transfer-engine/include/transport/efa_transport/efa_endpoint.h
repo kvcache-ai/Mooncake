@@ -41,8 +41,8 @@ class EfaContext;
 // handling This struct MUST have fi_context as its first member
 struct EfaOpContext {
     struct fi_context fi_ctx;  // Must be first member
-    Transport::Slice *slice;   // Slice pointer for completion handling
-    volatile int *wr_depth;    // Pointer to endpoint's wr_depth_ for CQ
+    Transport::Slice* slice;   // Slice pointer for completion handling
+    volatile int* wr_depth;    // Pointer to endpoint's wr_depth_ for CQ
                                // completion decrement
 };
 
@@ -55,28 +55,29 @@ class EfaEndPoint {
 
     enum Status { INITIALIZING, UNCONNECTED, CONNECTED };
 
-    EfaEndPoint(EfaContext &context);
+    EfaEndPoint(EfaContext& context);
     ~EfaEndPoint();
 
     // Construct endpoint with specified completion queue
-    int construct(struct fid_cq *cq, size_t num_qp_list = 1, size_t max_sge = 4,
+    int construct(struct fid_cq* cq, volatile int* cq_outstanding,
+                  size_t num_qp_list = 1, size_t max_sge = 4,
                   size_t max_wr = 256, size_t max_inline = 64);
 
    private:
     int deconstruct();
 
    public:
-    void setPeerNicPath(const std::string &peer_nic_path);
+    void setPeerNicPath(const std::string& peer_nic_path);
 
     int setupConnectionsByActive();
 
-    int setupConnectionsByActive(const std::string &peer_nic_path) {
+    int setupConnectionsByActive(const std::string& peer_nic_path) {
         setPeerNicPath(peer_nic_path);
         return setupConnectionsByActive();
     }
 
-    int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
-                                  HandShakeDesc &local_desc);
+    int setupConnectionsByPassive(const HandShakeDesc& peer_desc,
+                                  HandShakeDesc& local_desc);
 
     bool hasOutstandingSlice() const;
 
@@ -91,6 +92,12 @@ class EfaEndPoint {
     double inactiveTime() {
         if (active_) return 0.0;
         return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
+    }
+
+    void touchLastUsed() { last_used_time_ = getCurrentTimeInNano(); }
+
+    double lastUsedAge() const {
+        return (getCurrentTimeInNano() - last_used_time_) / 1000000000.0;
     }
 
    public:
@@ -108,8 +115,8 @@ class EfaEndPoint {
     const std::string toString() const;
 
     // Submit RDMA write/read operations via libfabric
-    int submitPostSend(std::vector<Transport::Slice *> &slice_list,
-                       std::vector<Transport::Slice *> &failed_slice_list);
+    int submitPostSend(std::vector<Transport::Slice*>& slice_list,
+                       std::vector<Transport::Slice*>& failed_slice_list);
 
     // Get the number of endpoints (always 1 for EFA RDM)
     size_t getQPNumber() const { return 1; }
@@ -120,27 +127,27 @@ class EfaEndPoint {
     // Get peer's fi_addr
     fi_addr_t getPeerFiAddr() const { return peer_fi_addr_; }
 
-    EfaContext &context() { return context_; }
+    EfaContext& context() { return context_; }
 
    private:
     // Setup connection using peer's address from handshake
-    int doSetupConnection(const std::string &peer_addr,
-                          std::string *reply_msg = nullptr);
+    int doSetupConnection(const std::string& peer_addr,
+                          std::string* reply_msg = nullptr);
 
     // Insert peer address into address vector
-    int insertPeerAddr(const std::string &peer_addr);
+    int insertPeerAddr(const std::string& peer_addr);
 
    private:
-    EfaContext &context_;
+    EfaContext& context_;
     std::atomic<Status> status_;
 
     RWSpinlock lock_;
     std::string peer_nic_path_;
 
     // Libfabric endpoint
-    struct fid_ep *ep_;
-    struct fid_cq *tx_cq_;
-    struct fid_cq *rx_cq_;
+    struct fid_ep* ep_;
+    struct fid_cq* tx_cq_;
+    struct fid_cq* rx_cq_;
     fi_addr_t peer_fi_addr_;  // Peer's address in the AV
 
     // Local endpoint address (for handshake)
@@ -149,14 +156,15 @@ class EfaEndPoint {
 
     volatile int wr_depth_;
     int max_wr_depth_;
-    volatile int *cq_outstanding_;
+    volatile int* cq_outstanding_;
 
-    // Spinlock to serialize fi_write calls on this endpoint.
+    // Spinlock to serialize fi_write/fi_read calls on this endpoint.
     // libfabric RDM endpoints are not thread-safe by default.
     std::atomic_flag post_lock_ = ATOMIC_FLAG_INIT;
 
     volatile bool active_;
     volatile uint64_t inactive_time_;
+    volatile uint64_t last_used_time_;  // Updated on connection and I/O
 };
 
 }  // namespace mooncake

@@ -202,15 +202,62 @@ if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
 
-target_compile_options(mooncake_master PRIVATE -Os)
-target_link_options(mooncake_master PRIVATE -Os -s)
-
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
 target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
                                               asio_shared)
-target_compile_options(mooncake_client PRIVATE -Os)
-target_link_options(mooncake_client PRIVATE -Os -s)
 
+# Optimize binary sizes only in Release mode
+string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
+if (CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
+  target_compile_options(mooncake_master PRIVATE -Os)
+  target_link_options(mooncake_master PRIVATE -Os -s)
+  target_compile_options(mooncake_client PRIVATE -Os)
+  target_link_options(mooncake_client PRIVATE -Os -s)
+endif()
+
+
+# GPU runtime library for D2H staging in PutToLocalFile / OffloadObjects.
+# transfer_engine is PRIVATE-linked, so its CUDA/HIP/Ascend dependencies
+# are not propagated; we must detect and link them independently.
+#
+# Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags,
+# because USE_CUDA may be OFF even when GPU pointers are present
+# (e.g. WITH_NVIDIA_PEERMEM=ON uses nvidia-peermem for RDMA without cudart).
+# Each detected toolkit gets both link libraries AND compile definitions,
+# so that gpu_staging_utils.h / pinned_buffer_pool.h pick the correct backend.
+#
+# NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
+# Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
+# Go's build.sh already does this; CI workflows must do the same.
+
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
+    target_compile_definitions(mooncake_store PRIVATE USE_CUDA)
+    target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
+    target_include_directories(mooncake_store PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_include_directories(mooncake_client PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
+    target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
+endif()
+
+if(NOT CUDAToolkit_FOUND)
+    find_package(hip QUIET)
+    if(hip_FOUND)
+        message(STATUS "mooncake_store: HIP detected, enabling D2H staging")
+        target_compile_definitions(mooncake_store PRIVATE USE_HIP)
+        target_compile_definitions(mooncake_client PRIVATE USE_HIP)
+        target_link_libraries(mooncake_store PRIVATE hip::host)
+        target_link_libraries(mooncake_client PRIVATE hip::host)
+    endif()
+endif()
+
+if(USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
+    target_include_directories(mooncake_store PRIVATE $ENV{ASCEND_PATH}/include)
+    target_link_libraries(mooncake_store PRIVATE ascendcl)
+    target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
+    target_link_libraries(mooncake_client PRIVATE ascendcl)
+endif()
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
