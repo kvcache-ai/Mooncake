@@ -89,11 +89,22 @@ struct TestSegment {
 
 struct NoHotPathMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
+    deny_tenant_policy_list: bool,
 }
 
 impl NoHotPathMetadataBackend {
     fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            deny_tenant_policy_list: false,
+        }
+    }
+
+    fn with_tenant_policy_list_blocked(inner: Arc<InMemoryMetadataBackend>) -> Self {
+        Self {
+            inner,
+            deny_tenant_policy_list: true,
+        }
     }
 }
 
@@ -766,6 +777,11 @@ impl MetadataBackend for NoHotPathMetadataBackend {
     }
 
     fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        if self.deny_tenant_policy_list {
+            return Err(StoreError::Unsupported(
+                "tenant policy listing is disabled in this test".to_string(),
+            ));
+        }
         self.inner.list_tenant_policies()
     }
 
@@ -7975,6 +7991,70 @@ fn bootstrap_route_policy_falls_back_to_default_when_tenant_override_missing() {
         .expect("effective route policy should fall back to default");
     assert_eq!(effective.route_control, RouteControlMode::EmbeddedWrh);
     assert_eq!(effective.route_topk, 3);
+}
+
+#[test]
+fn builder_resolves_scoped_tenant_policy_without_listing_all_policies() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    inner
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: None,
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("root tenant policy should be stored");
+    inner
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", Some("default"), Some("default")),
+                spec: TenantPolicySpec {
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(4),
+                        route_control: None,
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 20,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("object-set tenant policy should be stored");
+
+    let metadata = Arc::new(NoHotPathMetadataBackend::with_tenant_policy_list_blocked(
+        inner.clone(),
+    ));
+    let client = StoreClientBuilder::new(metadata, "tenant-policy-scanless")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .route_topk(4)
+        .transport(Arc::new(TestTransport::new(
+            "tenant-policy-scanless-segment",
+        )))
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("builder should not need tenant policy list scans");
+
+    assert_eq!(client.route_control, RouteControlMode::MetadataOnly);
+    assert_eq!(client.route_topk, 4);
+
+    let effective = resolve_effective_route_policy(inner.as_ref(), "tenant-a")
+        .expect("effective route policy should resolve from exact scope lookups");
+    assert_eq!(effective.route_control, RouteControlMode::MetadataOnly);
+    assert_eq!(effective.route_topk, 4);
 }
 
 #[test]

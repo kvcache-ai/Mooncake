@@ -503,8 +503,13 @@ fn resolve_effective_tenant_policy(
     metadata: &dyn MetadataBackend,
     scope: &NamespaceScope,
 ) -> Result<TenantPolicySpec> {
-    let policies = metadata.list_tenant_policies()?;
-    Ok(TenantPolicySpec::resolve_for_scope(policies.iter(), scope))
+    let mut resolved = TenantPolicySpec::default();
+    for policy_scope in TenantPolicyScope::ancestors(scope) {
+        if let Some(policy) = metadata.get_tenant_policy(&policy_scope)? {
+            resolved = resolved.merged_with(&policy.spec);
+        }
+    }
+    Ok(resolved)
 }
 
 fn route_policy_from_tenant_spec(spec: &TenantPolicySpec) -> Option<RoutePolicy> {
