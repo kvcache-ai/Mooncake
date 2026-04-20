@@ -244,7 +244,7 @@ assert store.batch_remove(["put-batch-a", "put-batch-b"]) == [0, 0]
 assert store.batch_is_exist(["put-batch-a", "put-batch-b"]) == [0, 0]
 
 metrics = metrics_text()
-assert "mooncake_store_client_operation_total" in metrics
+assert "mooncake_store_operation_total" in metrics
 assert 'operation="put",status="ok"' in metrics
 assert 'operation="batch_get",status="ok"' in metrics
 
@@ -252,7 +252,7 @@ metrics_addr = store.start_metrics_server()
 assert metrics_server_address() == metrics_addr
 with urllib.request.urlopen(f"http://{metrics_addr}/metrics") as response:
     http_metrics = response.read().decode()
-assert "mooncake_store_client_operation_total" in http_metrics
+assert "mooncake_store_operation_total" in http_metrics
 assert 'operation="batch_get_into_multi_buffers",status="ok"' in http_metrics
 store.stop_metrics_server()
 assert metrics_server_address() is None

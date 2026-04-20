@@ -164,55 +164,55 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
 }
 
 fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
-    output.push_str("# HELP mooncake_store_client_operation_total Total StoreClient operations.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_total counter\n");
+    output.push_str("# HELP mooncake_store_operation_total Total store operations.\n");
+    output.push_str("# TYPE mooncake_store_operation_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_client_operation_total{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_total{{operation=\"{}\",status=\"{}\"}} {}\n",
             escape(sample.operation),
             escape(sample.status),
             sample.calls_total
         ));
     }
 
-    output.push_str("# HELP mooncake_store_client_operation_bytes_in_total Total input bytes by StoreClient operation.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_bytes_in_total counter\n");
+    output.push_str("# HELP mooncake_store_operation_bytes_in_total Total input bytes by store operation.\n");
+    output.push_str("# TYPE mooncake_store_operation_bytes_in_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_client_operation_bytes_in_total{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_bytes_in_total{{operation=\"{}\",status=\"{}\"}} {}\n",
             escape(sample.operation),
             escape(sample.status),
             sample.bytes_in_total
         ));
     }
 
-    output.push_str("# HELP mooncake_store_client_operation_bytes_out_total Total output bytes by StoreClient operation.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_bytes_out_total counter\n");
+    output.push_str("# HELP mooncake_store_operation_bytes_out_total Total output bytes by store operation.\n");
+    output.push_str("# TYPE mooncake_store_operation_bytes_out_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_client_operation_bytes_out_total{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_bytes_out_total{{operation=\"{}\",status=\"{}\"}} {}\n",
             escape(sample.operation),
             escape(sample.status),
             sample.bytes_out_total
         ));
     }
 
-    output.push_str("# HELP mooncake_store_client_operation_latency_microseconds_total Total latency in microseconds by StoreClient operation.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_latency_microseconds_total counter\n");
+    output.push_str("# HELP mooncake_store_operation_latency_microseconds_total Total latency in microseconds by store operation.\n");
+    output.push_str("# TYPE mooncake_store_operation_latency_microseconds_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_client_operation_latency_microseconds_total{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_latency_microseconds_total{{operation=\"{}\",status=\"{}\"}} {}\n",
             escape(sample.operation),
             escape(sample.status),
             sample.latency_total_us
         ));
     }
 
-    output.push_str("# HELP mooncake_store_client_operation_latency_microseconds_max Maximum latency in microseconds by StoreClient operation.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_latency_microseconds_max gauge\n");
+    output.push_str("# HELP mooncake_store_operation_latency_microseconds_max Maximum latency in microseconds by store operation.\n");
+    output.push_str("# TYPE mooncake_store_operation_latency_microseconds_max gauge\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_client_operation_latency_microseconds_max{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_latency_microseconds_max{{operation=\"{}\",status=\"{}\"}} {}\n",
             escape(sample.operation),
             escape(sample.status),
             sample.latency_max_us

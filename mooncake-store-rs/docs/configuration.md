@@ -472,13 +472,21 @@ The metrics HTTP server exposes:
 
 Exporter families:
 
+- `mooncake_store_operation_total`, `mooncake_store_operation_bytes_in_total`, `mooncake_store_operation_bytes_out_total`, `mooncake_store_operation_latency_microseconds_total`, `mooncake_store_operation_latency_microseconds_max`
 - `mooncake_store_request_total`, `mooncake_store_request_inflight`, `mooncake_store_request_bytes_total`
 - `mooncake_store_request_duration_seconds_bucket`
 - `mooncake_store_segment_capacity_bytes`, `mooncake_store_segment_used_bytes`
 - `mooncake_store_runtime_status`, `mooncake_store_runtime_lease_expires_at_ms`
 - `mooncake_store_route_cas_total`
 - `mooncake_store_segment_lifecycle_total`, `mooncake_store_eviction_total`, `mooncake_store_eviction_duration_seconds_bucket`
+- `mooncake_store_transport_bytes_total`, `mooncake_store_rebalance_routes_total`, `mooncake_store_rebalance_bytes_total`
+- `mooncake_store_tenant_quota_reservation_total`, `mooncake_store_tenant_quota_finalize_total`, `mooncake_store_tenant_quota_abort_total`, `mooncake_store_tenant_quota_reconcile_total`
+- `mooncake_store_heartbeat_consecutive_failures`, `mooncake_store_heartbeat_last_success_ms`
+- `mooncake_store_membership_refresh_total`, `mooncake_store_membership_refresh_duration_seconds`
+- `mooncake_store_checksum_validation_total`, `mooncake_store_replication_publish_duration_seconds`
 - `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`
+
+All metrics use the `mooncake_store_` prefix to reflect the store cluster perspective. Each runtime instance exports its own view through the `/metrics` endpoint regardless of its role (storage node or routed client).
 
 Recommended recording queries:
 
