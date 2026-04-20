@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn runtime_builds_real_tent_clients_and_moves_remote_bytes() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn runtime_builds_http_transport_clients_and_moves_remote_bytes() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn runtime_builds_real_tent_clients_with_password_protected_redis() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let Some(server) = RedisTestServer::start_with_password(Some("runtime-secret")) else {
             return;
         };
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn runtime_hot_upgrade_preserves_payload_on_successor() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let Some(server) = RedisTestServer::start() else {
             return;
         };
