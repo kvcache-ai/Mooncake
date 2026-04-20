@@ -24,6 +24,7 @@ const LEASE_MS: u64 = 600_000;
 const MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 const BENCH_HEARTBEAT_EVERY: usize = 32;
+const DEFAULT_BENCH_ITERS: usize = 64;
 
 #[derive(Clone, Debug)]
 struct RdmaMode {
@@ -51,7 +52,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let batch_bench_iters = env::var("MC_STORE_RS_BENCH_ITERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(128);
+        .unwrap_or(DEFAULT_BENCH_ITERS);
     let rdma_mode = detect_rdma_mode();
     println!(
         "rdma mode: requested={} supported={} enabled={} reason={}",

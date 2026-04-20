@@ -446,7 +446,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_REDIS_RETRY_ATTEMPTS` | Redis metadata backend | retry count for transient Redis reconnect / IO failures on readonly and idempotent metadata operations |
 | `MC_STORE_RS_REDIS_RETRY_DELAY_MS` | Redis metadata backend | delay between transient Redis retry attempts |
 | `MC_STORE_RS_VALUE_SIZE` | Rust e2e | payload size for validation and benchmark loops |
-| `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count |
+| `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count; default `64` |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |
 | `MC_STORE_RS_TENT_REDIS_URL` | Python compatibility layer | Redis URL used by TENT when store metadata is etcd |
 | `MC_STORE_USE_HUGEPAGE` | local memory and Python shm allocator | enable hugepage-backed allocation |
