@@ -105,6 +105,7 @@ AUDITWHEEL_EXCLUDES=(
   --exclude "libkeyutils.so*"
   --exclude "libresolv.so*"
   --exclude "libffi.so*"
+  --exclude "libgflags.so*"
   --exclude "libcuda.so*"
   --exclude "libcudart.so*"
   --exclude "libamdhip64.so*"
