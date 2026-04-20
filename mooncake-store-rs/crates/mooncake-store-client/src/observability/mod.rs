@@ -52,6 +52,7 @@ pub struct OperationTracker {
     scope: &'static str,
     start: Instant,
     bytes_in: u64,
+    registry: registry::SharedMetricsRegistry,
     _inflight: InflightGuard,
 }
 
@@ -63,13 +64,28 @@ impl OperationTracker {
             scope,
             start: Instant::now(),
             bytes_in: 0,
+            registry: registry::global_metrics_registry().clone(),
             _inflight: InflightGuard::enter(operation, scope),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_registry(operation: &'static str, registry: registry::SharedMetricsRegistry) -> Self {
+        let scope = default_scope(operation);
+        Self {
+            operation,
+            scope,
+            start: Instant::now(),
+            bytes_in: 0,
+            registry: registry.clone(),
+            _inflight: InflightGuard::enter_with_registry(operation, scope, registry),
         }
     }
 
     pub fn scope(mut self, scope: &'static str) -> Self {
         if self.scope != scope {
-            self._inflight = InflightGuard::enter(self.operation, scope);
+            self._inflight =
+                InflightGuard::enter_with_registry(self.operation, scope, self.registry.clone());
         }
         self.scope = scope;
         self
@@ -86,7 +102,8 @@ impl OperationTracker {
     }
 
     pub(crate) fn finish_with_result(&self, result: &'static str, bytes_out: u64) {
-        registry::record_request(
+        registry::record_request_with_registry(
+            &self.registry,
             self.operation,
             self.scope,
             result,
@@ -100,6 +117,7 @@ impl OperationTracker {
 pub struct InflightGuard {
     operation: &'static str,
     scope: &'static str,
+    registry: registry::SharedMetricsRegistry,
 }
 
 #[derive(Clone)]
@@ -136,14 +154,30 @@ impl Write for TraceFileWriter {
 
 impl InflightGuard {
     pub fn enter(operation: &'static str, scope: &'static str) -> Self {
-        registry::increment_inflight(operation, scope);
-        Self { operation, scope }
+        Self::enter_with_registry(
+            operation,
+            scope,
+            registry::global_metrics_registry().clone(),
+        )
+    }
+
+    fn enter_with_registry(
+        operation: &'static str,
+        scope: &'static str,
+        registry: registry::SharedMetricsRegistry,
+    ) -> Self {
+        registry::increment_inflight_with_registry(&registry, operation, scope);
+        Self {
+            operation,
+            scope,
+            registry,
+        }
     }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        registry::decrement_inflight(self.operation, self.scope);
+        registry::decrement_inflight_with_registry(&self.registry, self.operation, self.scope);
     }
 }
 
@@ -262,6 +296,19 @@ pub fn start_metrics_http_server(bind_addr: &str) -> Result<String> {
         return Ok(server.address.clone());
     }
 
+    let server_instance = spawn_metrics_http_server_for_registry(
+        bind_addr,
+        registry::global_metrics_registry().clone(),
+    )?;
+    let address = server_instance.address.clone();
+    *server = Some(server_instance);
+    Ok(address)
+}
+
+fn spawn_metrics_http_server_for_registry(
+    bind_addr: &str,
+    registry: registry::SharedMetricsRegistry,
+) -> Result<MetricsHttpServer> {
     let listener = TcpListener::bind(bind_addr).map_err(|error| {
         StoreError::InvalidState(format!(
             "metrics http server failed to bind {bind_addr}: {error}"
@@ -283,18 +330,17 @@ pub fn start_metrics_http_server(bind_addr: &str) -> Result<String> {
     let (shutdown, shutdown_rx) = mpsc::channel();
     let thread = thread::Builder::new()
         .name("mooncake-store-metrics".to_string())
-        .spawn(move || run_metrics_http_server(listener, shutdown_rx))
+        .spawn(move || run_metrics_http_server(listener, shutdown_rx, registry))
         .map_err(|error| {
             StoreError::InvalidState(format!(
                 "metrics http server failed to spawn worker thread: {error}"
             ))
         })?;
-    *server = Some(MetricsHttpServer {
+    Ok(MetricsHttpServer {
         address: address.clone(),
         shutdown,
         thread,
-    });
-    Ok(address)
+    })
 }
 
 pub fn start_metrics_http_server_from_env(addr_env: &str) -> Result<Option<String>> {
@@ -327,17 +373,29 @@ pub fn stop_metrics_http_server() -> Result<()> {
 }
 
 pub fn render_prometheus_metrics() -> String {
-    exporter::render_prometheus_metrics(&snapshot_metrics())
+    render_prometheus_metrics_with_registry(registry::global_metrics_registry())
 }
 
 pub fn render_stats_json() -> String {
-    let snapshot = snapshot_metrics();
+    render_stats_json_with_registry(registry::global_metrics_registry())
+}
+
+fn render_prometheus_metrics_with_registry(registry: &registry::SharedMetricsRegistry) -> String {
+    exporter::render_prometheus_metrics(&snapshot_metrics_with_registry(registry))
+}
+
+fn render_stats_json_with_registry(registry: &registry::SharedMetricsRegistry) -> String {
+    let snapshot = snapshot_metrics_with_registry(registry);
     serde_json::to_string(&StatsSnapshot::from_metrics(snapshot))
         .expect("stats snapshot serialization should succeed")
 }
 
 pub fn snapshot_metrics() -> MetricsSnapshot {
-    registry::snapshot_metrics(process::snapshot_process())
+    snapshot_metrics_with_registry(registry::global_metrics_registry())
+}
+
+fn snapshot_metrics_with_registry(registry: &registry::SharedMetricsRegistry) -> MetricsSnapshot {
+    registry::snapshot_metrics_with_registry(registry, process::snapshot_process())
 }
 
 pub fn record_heartbeat_health(runtime: &str, consecutive_failures: u64, last_success_ms: u64) {
@@ -367,10 +425,14 @@ fn metrics_http_server() -> &'static Mutex<Option<MetricsHttpServer>> {
     METRICS_HTTP_SERVER.get_or_init(|| Mutex::new(None))
 }
 
-fn run_metrics_http_server(listener: TcpListener, shutdown_rx: Receiver<()>) {
+fn run_metrics_http_server(
+    listener: TcpListener,
+    shutdown_rx: Receiver<()>,
+    registry: registry::SharedMetricsRegistry,
+) {
     loop {
         match listener.accept() {
-            Ok((stream, _)) => handle_metrics_http_connection(stream),
+            Ok((stream, _)) => handle_metrics_http_connection(stream, &registry),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if shutdown_rx.recv_timeout(HTTP_POLL_INTERVAL).is_ok() {
                     return;
@@ -381,7 +443,10 @@ fn run_metrics_http_server(listener: TcpListener, shutdown_rx: Receiver<()>) {
     }
 }
 
-fn handle_metrics_http_connection(mut stream: TcpStream) {
+fn handle_metrics_http_connection(
+    mut stream: TcpStream,
+    registry: &registry::SharedMetricsRegistry,
+) {
     if stream.set_read_timeout(Some(HTTP_READ_TIMEOUT)).is_err() {
         return;
     }
@@ -393,12 +458,12 @@ fn handle_metrics_http_connection(mut stream: TcpStream) {
         "/metrics" => (
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
-            render_prometheus_metrics(),
+            render_prometheus_metrics_with_registry(registry),
         ),
         "/stats" => (
             "200 OK",
             "application/json; charset=utf-8",
-            render_stats_json(),
+            render_stats_json_with_registry(registry),
         ),
         "/healthz" | "/livez" => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
         _ => (
@@ -601,38 +666,38 @@ mod tests {
     #[test]
     fn metrics_http_server_serves_prometheus_text() {
         let _guard = metrics_test_lock().lock();
-        reset_metrics();
-        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+        let registry = registry::new_metrics_registry();
 
         let result = Ok(());
-        OperationTracker::new("put")
+        OperationTracker::with_registry("put", registry.clone())
             .input_bytes(16)
             .finish(&result, 16);
 
-        let address = start_metrics_http_server("127.0.0.1:0")
+        let server = spawn_metrics_http_server_for_registry("127.0.0.1:0", registry)
             .expect("metrics server should start on an ephemeral port");
-        let response = http_get(&address, "/metrics");
+        let response = http_get(&server.address, "/metrics");
 
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.contains("mooncake_store_client_operation_total"));
         assert!(response.contains("operation=\"put\",status=\"ok\""));
-
-        stop_metrics_http_server().expect("metrics server should stop");
+        server
+            .shutdown()
+            .expect("metrics server should stop cleanly");
     }
 
     #[test]
     fn request_metrics_include_histogram_bytes_and_inflight() {
         let _guard = metrics_test_lock().lock();
-        reset_metrics();
+        let registry = registry::new_metrics_registry();
 
         let result: Result<()> = Ok(());
         {
-            let tracker = OperationTracker::new("put")
+            let tracker = OperationTracker::with_registry("put", registry.clone())
                 .scope("foreground")
                 .input_bytes(16);
             tracker.finish(&result, 8);
 
-            let active = render_prometheus_metrics();
+            let active = render_prometheus_metrics_with_registry(&registry);
             assert!(active.contains(
                 "mooncake_store_request_inflight{operation=\"put\",scope=\"foreground\"} 1"
             ));
@@ -650,7 +715,7 @@ mod tests {
             ));
         }
 
-        let idle = render_prometheus_metrics();
+        let idle = render_prometheus_metrics_with_registry(&registry);
         assert!(idle
             .contains("mooncake_store_request_inflight{operation=\"put\",scope=\"foreground\"} 0"));
     }
@@ -658,9 +723,9 @@ mod tests {
     #[test]
     fn process_metrics_are_rendered_with_request_snapshot() {
         let _guard = metrics_test_lock().lock();
-        reset_metrics();
+        let registry = registry::new_metrics_registry();
 
-        let metrics = render_prometheus_metrics();
+        let metrics = render_prometheus_metrics_with_registry(&registry);
 
         assert!(metrics.contains("# HELP process_cpu_seconds_total"));
         assert!(metrics.contains("# TYPE process_resident_memory_bytes gauge"));
@@ -669,32 +734,38 @@ mod tests {
     #[test]
     fn metrics_http_server_serves_health_probe() {
         let _guard = metrics_test_lock().lock();
-        stop_metrics_http_server().expect("metrics server cleanup should succeed");
-        let address = start_metrics_http_server("127.0.0.1:0")
-            .expect("metrics server should start on an ephemeral port");
-        let response = http_get(&address, "/healthz");
+        let server =
+            spawn_metrics_http_server_for_registry("127.0.0.1:0", registry::new_metrics_registry())
+                .expect("metrics server should start on an ephemeral port");
+        let response = http_get(&server.address, "/healthz");
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("ok\n"));
-        stop_metrics_http_server().expect("metrics server should stop");
+        server
+            .shutdown()
+            .expect("metrics server should stop cleanly");
     }
 
     #[test]
     fn metrics_http_server_serves_stats_json() {
         let _guard = metrics_test_lock().lock();
-        reset_metrics();
-        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+        let registry = registry::new_metrics_registry();
 
         let result = Ok(());
-        OperationTracker::new("storage_owner_background_eviction")
+        OperationTracker::with_registry("storage_owner_background_eviction", registry.clone())
             .input_bytes(32)
             .finish(&result, 64);
         let runtime = sample_runtime_lease("runtime-stats");
-        registry::record_runtime_leases(std::slice::from_ref(&runtime));
-        registry::record_heartbeat_health(&runtime.runtime.to_string(), 2, 456_789);
+        registry::record_runtime_leases_with_registry(&registry, std::slice::from_ref(&runtime));
+        registry::record_heartbeat_health_with_registry(
+            &registry,
+            &runtime.runtime.to_string(),
+            2,
+            456_789,
+        );
 
-        let address = start_metrics_http_server("127.0.0.1:0")
+        let server = spawn_metrics_http_server_for_registry("127.0.0.1:0", registry)
             .expect("metrics server should start on an ephemeral port");
-        let response = http_get(&address, "/stats");
+        let response = http_get(&server.address, "/stats");
 
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.contains("Content-Type: application/json; charset=utf-8"));
@@ -730,7 +801,9 @@ mod tests {
             "stats json should include heartbeat health for the recorded runtime"
         );
 
-        stop_metrics_http_server().expect("metrics server should stop");
+        server
+            .shutdown()
+            .expect("metrics server should stop cleanly");
     }
 
     #[test]
@@ -857,9 +930,10 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("listener should report local address");
+        let registry = registry::new_metrics_registry();
         let worker = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("test listener should accept");
-            handle_metrics_http_connection(stream);
+            handle_metrics_http_connection(stream, &registry);
         });
 
         TcpStream::connect(address).expect("probe client should connect and drop immediately");
@@ -904,12 +978,12 @@ mod tests {
     #[test]
     fn heartbeat_health_metrics_are_rendered() {
         let _guard = metrics_test_lock().lock();
-        reset_metrics();
+        let registry = registry::new_metrics_registry();
 
         let runtime = ClientRuntimeId::new("runtime-heartbeat", ClientEpoch(3)).to_string();
-        registry::record_heartbeat_health(&runtime, 2, 123_456);
+        registry::record_heartbeat_health_with_registry(&registry, &runtime, 2, 123_456);
 
-        let metrics = render_prometheus_metrics();
+        let metrics = render_prometheus_metrics_with_registry(&registry);
         assert!(metrics.contains(
             "mooncake_store_heartbeat_consecutive_failures{runtime=\"runtime-heartbeat:3\"} 2"
         ));
@@ -921,15 +995,14 @@ mod tests {
     #[test]
     fn metrics_http_server_exposes_heartbeat_health_metrics() {
         let _guard = metrics_test_lock().lock();
-        reset_metrics();
-        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+        let registry = registry::new_metrics_registry();
 
         let runtime = ClientRuntimeId::new("runtime-heartbeat-http", ClientEpoch(5)).to_string();
-        registry::record_heartbeat_health(&runtime, 4, 456_789);
+        registry::record_heartbeat_health_with_registry(&registry, &runtime, 4, 456_789);
 
-        let address = start_metrics_http_server("127.0.0.1:0")
+        let server = spawn_metrics_http_server_for_registry("127.0.0.1:0", registry)
             .expect("metrics server should start on an ephemeral port");
-        let response = http_get(&address, "/metrics");
+        let response = http_get(&server.address, "/metrics");
 
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.contains(
@@ -939,7 +1012,9 @@ mod tests {
             "mooncake_store_heartbeat_last_success_ms{runtime=\"runtime-heartbeat-http:5\"} 456789"
         ));
 
-        stop_metrics_http_server().expect("metrics server should stop");
+        server
+            .shutdown()
+            .expect("metrics server should stop cleanly");
     }
 
     fn http_get(address: &str, path: &str) -> String {
