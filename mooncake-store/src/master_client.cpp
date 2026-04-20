@@ -1,5 +1,6 @@
 #include "master_client.h"
 
+#include <coroutine>
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
@@ -165,6 +166,15 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
                              GetReplicaListResponse>(key, config);
     timer.LogResponseExpected(result);
     return result;
+}
+
+async_simple::coro::Lazy<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::AsyncGetReplicaList(const std::string& key,
+                                  const GetReplicaListRequestConfig& config) {
+    auto result =
+        co_await invoke_rpc_async<&WrappedMasterService::GetReplicaList,
+                                  GetReplicaListResponse>(key, config);
+    co_return result;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <coroutine>
 #include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
@@ -67,6 +68,12 @@ class MasterClient {
     GetReplicaList(const std::string& key,
                    const GetReplicaListRequestConfig& config =
                        GetReplicaListRequestConfig());
+
+    [[nodiscard]] async_simple::coro::Lazy<
+        tl::expected<GetReplicaListResponse, ErrorCode>>
+    AsyncGetReplicaList(const std::string& key,
+                        const GetReplicaListRequestConfig& config =
+                            GetReplicaListRequestConfig());
 
     /**
      * @brief Batch query read routes
@@ -192,8 +199,8 @@ class MasterClient {
      * @return The result of the RPC call
      */
     template <auto ServiceMethod, typename ReturnType, typename... Args>
-    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
-        Args&&... args) {
+    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
+    invoke_rpc_async(Args&&... args) {
         auto pool = client_accessor_.GetClientPool();
 
         // Increment RPC counter
@@ -202,34 +209,37 @@ class MasterClient {
         }
 
         auto start_time = std::chrono::steady_clock::now();
+        auto ret = co_await pool->send_request(
+            [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+                return client.send_request<ServiceMethod>(
+                    std::forward<Args>(args)...);
+            });
+        if (!ret.has_value()) {
+            LOG(ERROR) << "Client not available";
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        auto result = co_await std::move(ret.value());
+        if (!result) {
+            LOG(ERROR) << "RPC call failed: " << result.error().msg;
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        if (metrics_) {
+            auto end_time = std::chrono::steady_clock::now();
+            auto latency =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    end_time - start_time);
+            metrics_->rpc_latency.observe({RpcNameTraits<ServiceMethod>::value},
+                                          latency.count());
+        }
+        co_return result->result();
+    }
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
+        Args&&... args) {
         return async_simple::coro::syncAwait(
-            [&]() -> async_simple::coro::Lazy<
-                      tl::expected<ReturnType, ErrorCode>> {
-                auto ret = co_await pool->send_request(
-                    [&](coro_io::client_reuse_hint,
-                        coro_rpc::coro_rpc_client& client) {
-                        return client.send_request<ServiceMethod>(
-                            std::forward<Args>(args)...);
-                    });
-                if (!ret.has_value()) {
-                    LOG(ERROR) << "Client not available";
-                    co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-                }
-                auto result = co_await std::move(ret.value());
-                if (!result) {
-                    LOG(ERROR) << "RPC call failed: " << result.error().msg;
-                    co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-                }
-                if (metrics_) {
-                    auto end_time = std::chrono::steady_clock::now();
-                    auto latency =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time);
-                    metrics_->rpc_latency.observe(
-                        {RpcNameTraits<ServiceMethod>::value}, latency.count());
-                }
-                co_return result->result();
-            }());
+            invoke_rpc_async<ServiceMethod, ReturnType>(
+                std::forward<Args>(args)...));
     }
 
     /**

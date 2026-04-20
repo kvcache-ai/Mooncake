@@ -28,6 +28,7 @@ add_store_test(centralized_segment_manager_test centralized_segment_manager_test
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
+add_store_test(client_config_builder_test client_config_builder_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)

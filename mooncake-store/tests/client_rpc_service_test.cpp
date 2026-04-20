@@ -66,9 +66,14 @@ class ClientRpcServiceTest : public ::testing::Test {
             << "Expected 1 tier, got " << tier_views.size();
         saved_tier_id_ = tier_views[0].id;
 
-        // Create DataManager
+        // Create DataManager (MEMCPY mode: no TE endpoint available in unit
+        // tests)
+        LocalTransferConfig transfer_config;
+        transfer_config.mode = LocalTransferMode::MEMCPY;
+        transfer_config.local_memcpy_async_worker_num = 32;
         data_manager_ = std::make_unique<DataManager>(
-            std::move(tiered_backend_), transfer_engine_);
+            std::move(tiered_backend_), transfer_engine_,
+            /*lock_shard_count=*/1024, transfer_config);
 
         // Create ClientRpcService
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
@@ -124,8 +129,10 @@ TEST_F(ClientRpcServiceTest, ReadRemoteDataSuccess) {
     const std::string key = "test_read_key";
     const std::string test_data = "Hello, World!";
     auto buffer = StringToBuffer(test_data);
-    auto put_result = data_manager_->Put(key, {buffer.get(), test_data.size()});
+    std::vector<Slice> put_slices{{buffer.get(), test_data.size()}};
+    auto put_result = data_manager_->Put(key, put_slices);
     ASSERT_TRUE(put_result.has_value()) << "Put failed";
+    put_result.value()->Wait();
 
     // Create read request with valid buffers
     RemoteReadRequest request;

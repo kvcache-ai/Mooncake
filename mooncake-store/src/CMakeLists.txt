@@ -2,6 +2,7 @@
 add_subdirectory(cachelib_memory_allocator)
 
 set(MOONCAKE_STORE_SOURCES
+    async_memcpy_executor.cpp
     replica.cpp
     allocator.cpp
     master_service.cpp

@@ -128,14 +128,12 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
 
     for (const auto& entry : hot_stats.hot_keys) {
         if (aborted()) return;
+        auto size_result = data_manager_.value().QueryObjectSize(entry.key);
+        if (!size_result || size_result.value() == 0) continue;
+        size_t size = size_result.value();
         auto tier_ids = data_manager_.value().GetReplicaTierIds(entry.key);
         for (const auto& tier_id : tier_ids) {
-            auto handle = data_manager_.value().Get(entry.key, tier_id);
-            if (!handle) continue;
-            size_t size = handle.value()->loc.data.buffer
-                              ? handle.value()->loc.data.buffer->size()
-                              : 0;
-            if (notifier_ && size > 0) {
+            if (notifier_) {
                 // Hot keys go through normal (high-priority) queue
                 if (!EnqueueWithRetry(entry.key, tier_id, size,
                                       /*is_hot=*/true, need_abort)) {

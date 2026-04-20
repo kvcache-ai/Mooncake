@@ -38,6 +38,11 @@ DEFINE_uint64(async_max_batch_size, 2000,
 DEFINE_uint64(async_route_queue_size, 0,
               "Async route notifier queue size when async is enabled "
               "(min='async_max_batch_size * async_sender_thread_count').");
+DEFINE_string(p2p_local_transfer_mode, "te",
+              "Local transfer mode for P2P local Get/Put path: memcpy|te");
+DEFINE_uint64(local_memcpy_async_worker_num, 32,
+              "If set p2p_local_transfer_mode=memcpy, Worker number for async "
+              "local memcpy executor (P2P), 0 means forbid async memcpy");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -98,7 +103,9 @@ int main(int argc, char* argv[]) {
                 static_cast<uint32_t>(FLAGS_rpc_thread_num),
                 FLAGS_lock_shard_count,
                 string_to_byte_size(FLAGS_route_cache_max_memory),
-                FLAGS_route_cache_ttl_ms, {},  // labels
+                FLAGS_route_cache_ttl_ms, FLAGS_p2p_local_transfer_mode,
+                static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
+                {},  // labels
                 FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
                 FLAGS_async_route_queue_size);
         } else {

@@ -5,6 +5,9 @@
 #include <map>
 #include <memory>
 #include <cstdint>
+#include <algorithm>
+#include <cctype>
+#include <stdexcept>
 
 #include <glog/logging.h>
 #include <json/json.h>
@@ -110,6 +113,11 @@ struct CentralizedClientConfig : RealClientConfigBase {
     bool enable_offload = false;
 };
 
+enum class LocalTransferMode {
+    MEMCPY = 0,
+    TE = 1,
+};
+
 /**
  * @brief Configuration for a P2P real client.
  *
@@ -143,6 +151,15 @@ struct P2PClientConfig : RealClientConfigBase {
     size_t async_sender_thread_count = 0;
     size_t async_max_batch_size = 2000;
     size_t async_route_queue_size = 0;
+
+    // Local transfer mode for P2P local Get/Put path.
+    // - MEMCPY: copy through local CPU memory path
+    // - TE: transfer through local TransferEngine path
+    LocalTransferMode local_transfer_mode = LocalTransferMode::TE;
+
+    // When local_transfer_mode == MEMCPY, the following parameter is used:
+    // 0 means forbid async memcpy (fall back to synchronous).
+    size_t local_memcpy_async_worker_num = 32;
 };
 
 // ============================================================================
@@ -200,6 +217,8 @@ class ClientConfigBuilder {
         size_t lock_shard_count = 1024,
         size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
         uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
+        const std::string& local_transfer_mode = "te",
+        size_t local_memcpy_async_worker_num = 32,
         const std::map<std::string, std::string>& labels = {},
         size_t async_sender_thread_count = 0,
         size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0) {
@@ -213,6 +232,12 @@ class ClientConfigBuilder {
         config.lock_shard_count = lock_shard_count;
         config.route_cache_max_memory_bytes = route_cache_max_memory_bytes;
         config.route_cache_ttl_ms = route_cache_ttl_ms;
+        config.local_transfer_mode =
+            parse_p2p_local_transfer_mode(local_transfer_mode);
+        if (config.local_transfer_mode == LocalTransferMode::MEMCPY) {
+            config.local_memcpy_async_worker_num =
+                local_memcpy_async_worker_num;
+        }
         config.async_sender_thread_count = async_sender_thread_count;
         config.async_max_batch_size = async_max_batch_size;
         config.async_route_queue_size = async_route_queue_size;
@@ -292,6 +317,20 @@ class ClientConfigBuilder {
         config.transfer_engine = transfer_engine;
         config.ipc_socket_path = ipc_socket_path;
         config.labels = labels;
+    }
+
+    static LocalTransferMode parse_p2p_local_transfer_mode(std::string mode) {
+        std::transform(
+            mode.begin(), mode.end(), mode.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "memcpy") {
+            return LocalTransferMode::MEMCPY;
+        }
+        if (mode == "te") {
+            return LocalTransferMode::TE;
+        }
+        throw std::runtime_error(
+            "Invalid p2p local transfer mode. Expected 'memcpy' or 'te'.");
     }
 };
 

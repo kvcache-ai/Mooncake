@@ -25,6 +25,7 @@ DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 DEFINE_string(master_address, "localhost:50051", "Address of master server");
 DEFINE_int32(num_threads, 8, "Number of concurrent worker threads");
 DEFINE_int32(test_operation_nums, 100, "Number of operations per thread");
+DEFINE_int32(batch_size, 1, "Batch size for PUT/GET operations");
 
 // Client configurations
 DEFINE_string(client_type, "Centralized", "Type of client: Centralized | P2P");
@@ -38,22 +39,29 @@ DEFINE_int32(value_size, 1048576, "Size of values in bytes (default: 1MB)");
 // Memory configuration flags
 DEFINE_uint64(ram_buffer_size_gb, 15,
               "RAM buffer size in GB for segment allocation");
-DEFINE_uint64(client_buffer_allocator_size_mb, 256,
-              "Client buffer allocator size in MB");
 
 // Network configuration flags
 DEFINE_string(local_hostname, "localhost:12345", "Local hostname for client");
 DEFINE_string(metadata_connection_string, "P2PHANDSHAKE",
               "Metadata connection string");
-
+DEFINE_string(p2p_local_transfer_mode, "te",
+              "Local transfer mode for P2P local Get/Put path: memcpy|te");
+DEFINE_uint64(local_memcpy_async_worker_num, 32,
+              "If set p2p_local_transfer_mode=memcpy, Worker number for async "
+              "local memcpy executor (P2P)");
+DEFINE_uint64(route_cache_max_memory_mb, 300,
+              "Max memory for RouteCache in MB (P2P mode)");
+DEFINE_uint64(route_cache_ttl_ms, 300000,
+              "TTL for RouteCache entries in ms (P2P mode)");
 namespace mooncake {
 namespace benchmark {
 
 // Global client and allocator instances
 std::shared_ptr<ClientService> g_client = nullptr;
-std::unique_ptr<SimpleAllocator> g_client_buffer_allocator = nullptr;
 void* g_segment_ptr = nullptr;
 size_t g_ram_buffer_size = 0;
+void* g_worker_buffer_base = nullptr;
+size_t g_per_thread_buffer_stride = 0;  // write_buf + read_pool per thread
 
 // Synchronization primitives for coordinated start
 std::mutex g_sync_mutex;
@@ -128,10 +136,30 @@ bool initialize_client() {
     std::optional<std::shared_ptr<ClientService>> client_opt;
 
     if (FLAGS_client_type == "P2P") {
+        // Build tiered_backend_config from ram_buffer_size_gb so the P2P
+        // storage capacity is consistent with the Centralization segment size.
+        // FLAGS_tiered_backend_config can still override this if explicitly
+        // set.
+        std::string tiered_config = FLAGS_tiered_backend_config;
+        if (tiered_config.find("16106127360") != std::string::npos) {
+            // Default value is still 15GB placeholder — replace with actual
+            // flag
+            uint64_t capacity_bytes =
+                FLAGS_ram_buffer_size_gb * 1024ull * 1024 * 1024;
+            tiered_config =
+                "{\"tiers\": [{\"type\": \"DRAM\", \"capacity\": " +
+                std::to_string(capacity_bytes) +
+                ", \"priority\": 10, \"allocator_type\": \"OFFSET\"}]}";
+        }
         auto config = ClientConfigBuilder::build_p2p_real_client(
             FLAGS_local_hostname, FLAGS_metadata_connection_string,
-            FLAGS_protocol, device_names, FLAGS_master_address,
-            FLAGS_tiered_backend_config);
+            FLAGS_protocol, device_names, FLAGS_master_address, tiered_config,
+            0, nullptr, "", 12345,
+            /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
+            /*route_cache_max_memory_bytes=*/FLAGS_route_cache_max_memory_mb *
+                1024 * 1024,
+            /*route_cache_ttl_ms=*/FLAGS_route_cache_ttl_ms,
+            FLAGS_p2p_local_transfer_mode, FLAGS_local_memcpy_async_worker_num);
         client_opt = ClientService::Create(config);
     } else {
         auto config = ClientConfigBuilder::build_centralized_real_client(
@@ -149,34 +177,39 @@ bool initialize_client() {
 
     g_client = client_opt.value();
 
-    // Use gflags configuration for client buffer allocator size
-    auto client_buffer_allocator_size =
-        FLAGS_client_buffer_allocator_size_mb * 1024 * 1024;
-    g_client_buffer_allocator =
-        std::make_unique<SimpleAllocator>(client_buffer_allocator_size);
+    // Pre-allocate the worker buffer pool with exact sizing, bypassing the
+    // slab allocator (SimpleAllocator/CacheLib) to avoid fragmentation.
+    // Each thread gets: 1 write_buffer + num_read_slots read slots.
+    // Both P2P and Centralization BatchGet submit all transfers in parallel,
+    // so each key in a batch needs its own destination slot to avoid concurrent
+    // RDMA/memcpy writes targeting the same buffer region.
+    size_t per_thread_read_slots =
+        static_cast<size_t>(std::max(1, FLAGS_batch_size));
+    g_per_thread_buffer_stride =
+        static_cast<size_t>(FLAGS_value_size) * (1 + per_thread_read_slots);
+    size_t total_buffer_size = FLAGS_num_threads * g_per_thread_buffer_stride;
+
+    // Align to page boundary for RDMA registration.
+    g_worker_buffer_base = std::aligned_alloc(4096, total_buffer_size);
+    if (!g_worker_buffer_base) {
+        LOG(ERROR) << "Failed to allocate worker buffer pool of size "
+                   << total_buffer_size / (1024 * 1024) << "MB";
+        return false;
+    }
 
     auto result = g_client->RegisterLocalMemory(
-        g_client_buffer_allocator->getBase(), client_buffer_allocator_size,
-        "cpu:0", false, false);
+        g_worker_buffer_base, total_buffer_size, "cpu:0", false, false);
 
     if (!result.has_value()) {
+        std::free(g_worker_buffer_base);
+        g_worker_buffer_base = nullptr;
         LOG(ERROR) << "Failed to register local memory: "
                    << toString(result.error());
         return false;
     }
 
-    // Verify that the buffer allocator has enough space for all threads
-    size_t total_required_memory = FLAGS_num_threads * FLAGS_value_size;
-    if (total_required_memory > client_buffer_allocator_size) {
-        LOG(ERROR) << "Insufficient buffer allocator memory. Required: "
-                   << total_required_memory / (1024 * 1024)
-                   << "MB, Available: " << FLAGS_client_buffer_allocator_size_mb
-                   << "MB";
-        return false;
-    }
-
     LOG(INFO) << "Client initialized successfully with "
-              << FLAGS_client_buffer_allocator_size_mb << "MB buffer allocator";
+              << total_buffer_size / (1024 * 1024) << "MB worker buffer pool";
     return true;
 }
 
@@ -184,7 +217,10 @@ void cleanup_client() {
     if (g_client) {
         g_client.reset();
     }
-    g_client_buffer_allocator.reset();
+    if (g_worker_buffer_base) {
+        std::free(g_worker_buffer_base);
+        g_worker_buffer_base = nullptr;
+    }
 }
 
 std::string generate_key(int thread_id, uint64_t operation_id) {
@@ -197,11 +233,20 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     // Reserve memory for operations to avoid reallocations during benchmark
     stats.operations.reserve(FLAGS_test_operation_nums * 2);
 
-    // Allocate thread-local buffer
-    void* write_buffer = g_client_buffer_allocator->allocate(FLAGS_value_size);
-    if (!write_buffer) {
+    // Each thread gets a dedicated slice of the pre-registered worker buffer
+    // pool. The stride is computed once in initialize_client() so all threads
+    // use the same formula and regions never overlap.
+    // Layout per thread: [write_buffer | read_pool_slot_0 | ... | slot_N-1]
+    int num_read_slots = std::max(1, FLAGS_batch_size);
+    char* thread_base =
+        static_cast<char*>(g_worker_buffer_base) +
+        static_cast<size_t>(thread_id) * g_per_thread_buffer_stride;
+    void* write_buffer = thread_base;
+    void* read_pool = thread_base + FLAGS_value_size;
+
+    if (!g_worker_buffer_base || g_per_thread_buffer_stride == 0) {
         LOG(ERROR) << "Thread " << thread_id
-                   << ": Failed to allocate write buffer";
+                   << ": worker buffer pool not initialized";
         return;
     }
 
@@ -248,28 +293,43 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     }
 
     // Phase 1: Perform PUT operations
-    for (int i = 0; i < FLAGS_test_operation_nums && !stop_flag.load(); ++i) {
-        std::string key = generate_key(thread_id, i);
+    for (int i = 0; i < FLAGS_test_operation_nums && !stop_flag.load();
+         i += FLAGS_batch_size) {
+        int actual_batch =
+            std::min(FLAGS_batch_size, FLAGS_test_operation_nums - i);
+        std::vector<ObjectKey> batch_keys;
+        std::vector<std::vector<Slice>> batch_slices(actual_batch, slices);
+
+        for (int j = 0; j < actual_batch; ++j) {
+            batch_keys.push_back(generate_key(thread_id, i + j));
+        }
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        auto result = g_client->Put(key.data(), slices, config);
+        auto results = g_client->BatchPut(batch_keys, batch_slices, config);
         auto end_time = std::chrono::high_resolution_clock::now();
 
         auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
                               end_time - start_time)
                               .count();
 
-        bool success = result.has_value();
-        stats.operations.push_back(
-            {static_cast<double>(latency_us), true, success});
-
-        if (success) {
-            stored_keys.push_back(key);
-            stats.put_operations++;
-            stats.successful_operations++;
+        // Record metrics. Latency is divided across keys so that percentiles
+        // reflect per-key cost rather than batch completion time.
+        std::vector<bool> key_success(actual_batch, false);
+        for (size_t j = 0; j < results.size(); ++j) {
+            if (results[j].has_value()) {
+                key_success[j] = true;
+                stored_keys.push_back(batch_keys[j]);
+                stats.put_operations++;
+                stats.successful_operations++;
+            }
         }
-
-        stats.total_operations++;
+        double per_key_latency_us =
+            static_cast<double>(latency_us) / actual_batch;
+        for (int j = 0; j < actual_batch; ++j) {
+            stats.operations.push_back(
+                {per_key_latency_us, true, key_success[j]});
+        }
+        stats.total_operations += actual_batch;
     }
 
     // Completion signal of PUT phase and wait for threads to start GET phase
@@ -285,32 +345,51 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     // Phase 2: Perform GET operations on the stored keys
     for (int i = 0; i < FLAGS_test_operation_nums && !stop_flag.load() &&
                     !stored_keys.empty();
-         ++i) {
-        // Use modulo to cycle through stored keys deterministically
-        size_t key_index = i % stored_keys.size();
-        std::string key = stored_keys[key_index];
+         i += FLAGS_batch_size) {
+        int actual_batch =
+            std::min(FLAGS_batch_size, (int)stored_keys.size() - i);
+        if (actual_batch <= 0) break;
+
+        std::vector<std::string> batch_keys;
+        std::vector<std::vector<void*>> all_buffers(actual_batch);
+        std::vector<std::vector<size_t>> all_sizes(
+            actual_batch, {static_cast<size_t>(FLAGS_value_size)});
+
+        for (int j = 0; j < actual_batch; ++j) {
+            batch_keys.push_back(stored_keys[(i + j) % stored_keys.size()]);
+            // Each key uses a distinct slot so that concurrent async copies
+            // write to separate memory regions and do not race.
+            void* slot = static_cast<char*>(read_pool) +
+                         (j % num_read_slots) * FLAGS_value_size;
+            all_buffers[j] = {slot};
+        }
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        auto get_result = g_client->Get(
-            key, {write_buffer}, {static_cast<size_t>(FLAGS_value_size)});
-        bool success = get_result.has_value();
+        auto results = g_client->BatchGet(batch_keys, all_buffers, all_sizes);
         auto end_time = std::chrono::high_resolution_clock::now();
 
         auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
                               end_time - start_time)
                               .count();
-        stats.operations.push_back(
-            {static_cast<double>(latency_us), false, success});
 
-        if (success) {
-            stats.get_operations++;
-            stats.successful_operations++;
+        std::vector<bool> key_success(results.size(), false);
+        for (size_t j = 0; j < results.size(); ++j) {
+            if (results[j].has_value()) {
+                key_success[j] = true;
+                stats.get_operations++;
+                stats.successful_operations++;
+            }
         }
-
-        stats.total_operations++;
+        double per_key_latency_us =
+            static_cast<double>(latency_us) / actual_batch;
+        for (int j = 0; j < actual_batch; ++j) {
+            stats.operations.push_back(
+                {per_key_latency_us, false, key_success[j]});
+        }
+        stats.total_operations += actual_batch;
     }
 
-    g_client_buffer_allocator->deallocate(write_buffer, FLAGS_value_size);
+    // Buffers are fixed slices of g_worker_buffer_base; no deallocation needed.
 }
 
 void calculate_percentiles(std::vector<double>& latencies, double& p50,
@@ -395,6 +474,7 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
     LOG(INFO) << "Threads: " << FLAGS_num_threads;
     LOG(INFO) << "Key Size: 128 bytes";
     LOG(INFO) << "Value Size: " << FLAGS_value_size << " bytes";
+    LOG(INFO) << "Batch Size: " << FLAGS_batch_size;
     LOG(INFO) << "Operations per thread: " << FLAGS_test_operation_nums;
     LOG(INFO) << "";
     LOG(INFO) << "=== Operation Statistics ===";
@@ -445,8 +525,6 @@ int main(int argc, char** argv) {
     LOG(INFO) << "Metadata connection: " << FLAGS_metadata_connection_string;
     LOG(INFO) << "Operations per thread: " << FLAGS_test_operation_nums;
     LOG(INFO) << "RAM buffer size: " << FLAGS_ram_buffer_size_gb << "GB";
-    LOG(INFO) << "Client buffer allocator size: "
-              << FLAGS_client_buffer_allocator_size_mb << "MB";
 
     // Initialize client and segment
     if (!initialize_client()) {

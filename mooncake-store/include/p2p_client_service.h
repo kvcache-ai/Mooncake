@@ -1,9 +1,15 @@
 #pragma once
 
-#include <atomic>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <utility>
+#include <coroutine>
+#include <async_simple/Try.h>
+#include <async_simple/coro/Lazy.h>
 
 #include "async_metadata_notifier.h"
 #include "client_service.h"
@@ -13,6 +19,7 @@
 #include "peer_client.h"
 #include "p2p_master_client.h"
 #include "route_cache.h"
+#include "task_handle.h"
 
 namespace mooncake {
 
@@ -224,44 +231,76 @@ class P2PClientService final : public ClientService {
     HeartbeatRequest build_heartbeat_request() override;
 
    private:
-    // --- Internal helpers for P2P read/write modes ---
+    struct ResolvedRoute {
+        PeerClient* peer = nullptr;
+        uint64_t object_size = 0;
+        bool is_cached = false;
+        P2PProxyDescriptor proxy;  // for RemoveReplica on stale-cache eviction
+    };
 
-    /**
-     * @brief Put data to local TieredBackend via DataManager.
-     */
-    tl::expected<void, ErrorCode> PutLocal(const std::string& key,
-                                           std::vector<Slice>& slices);
+    // Yields ResolvedRoute candidates from cache first, then a one-shot lazy
+    // master fallback. Call Prime() to pre-load before accessing object_size().
+    class RouteIterator {
+       public:
+        using MasterFetch = std::function<
+            async_simple::coro::Lazy<std::vector<ResolvedRoute>>()>;
 
-    /**
-     * @brief Put data to a remote node via Master's write route.
-     * Gets write route from Master, then uses PeerClient to write.
-     */
-    tl::expected<void, ErrorCode> PutViaRoute(
+        RouteIterator(std::string key, std::vector<ResolvedRoute> initial,
+                      uint64_t object_size, RouteCache* route_cache,
+                      MasterFetch master_fetch);
+
+        uint64_t object_size() const { return object_size_; }
+        bool empty() const { return routes_.empty() && master_queried_; }
+
+        void Prime();
+        async_simple::coro::Lazy<std::optional<ResolvedRoute>> AsyncNext();
+        void Evict(const ResolvedRoute& route);
+
+       private:
+        void UpsertToCache(const std::vector<ResolvedRoute>& routes);
+
+        std::string key_;
+        std::vector<ResolvedRoute> routes_;
+        size_t idx_ = 0;
+        bool master_queried_ = false;
+        uint64_t object_size_ = 0;
+        RouteCache* route_cache_ = nullptr;
+        MasterFetch master_fetch_;
+    };
+
+    tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
+        const std::string& key, const ReadRouteConfig& config);
+
+    async_simple::coro::Lazy<std::vector<ResolvedRoute>>
+    AsyncResolveRoutesFromMaster(const std::string& key,
+                                 const ReadRouteConfig& config);
+
+    static async_simple::coro::Lazy<void> RunReadRetry(
+        RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
+        std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise);
+
+   private:
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> CreatePutHandle(
         const std::string& key, std::vector<Slice>& slices,
         const WriteRouteRequestConfig& config);
 
-    /**
-     * @brief Get data from local TieredBackend via DataManager.
-     */
-    tl::expected<size_t, ErrorCode> GetLocal(const std::string& key,
-                                             std::vector<Slice>& slices);
+    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator,
+        const ReadRouteConfig& config);
 
-    /**
-     * @brief Get data from a remote node via a list of proxy descriptors.
-     * Iterates through the list; stops, returns the slice of proxies from the
-     * successful one to the end.
-     */
-    tl::expected<void, ErrorCode> GetRemoteViaRoute(
+    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
         const std::string& key, std::vector<Slice>& slices,
-        const std::vector<P2PProxyDescriptor>& proxies, bool is_cached_proxies);
+        const ReadRouteConfig& config);
 
     /**
-     * @brief Query Master for replica list and calculate total object size.
-     * @return Pair of (replicas, total_size) on success.
+     * @brief Launch async reads driven by a RouteIterator.
+     *
+     * Creates a ReadRetryContinuation that fires the first RPC immediately
+     * and chains subsequent candidates on failure (no stack recursion).
      */
-    tl::expected<std::pair<std::vector<Replica::Descriptor>, uint64_t>,
-                 ErrorCode>
-    QueryReplicaSize(const std::string& key, const ReadRouteConfig& config);
+    tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
+        const std::string& key, std::vector<Slice>& slices, RouteIterator iter);
 
     /**
      * @brief Get or create a PeerClient for the given endpoint.
