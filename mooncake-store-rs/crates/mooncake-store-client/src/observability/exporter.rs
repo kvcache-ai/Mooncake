@@ -175,7 +175,9 @@ fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapsh
         ));
     }
 
-    output.push_str("# HELP mooncake_store_operation_bytes_in_total Total input bytes by store operation.\n");
+    output.push_str(
+        "# HELP mooncake_store_operation_bytes_in_total Total input bytes by store operation.\n",
+    );
     output.push_str("# TYPE mooncake_store_operation_bytes_in_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
@@ -186,7 +188,9 @@ fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapsh
         ));
     }
 
-    output.push_str("# HELP mooncake_store_operation_bytes_out_total Total output bytes by store operation.\n");
+    output.push_str(
+        "# HELP mooncake_store_operation_bytes_out_total Total output bytes by store operation.\n",
+    );
     output.push_str("# TYPE mooncake_store_operation_bytes_out_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
