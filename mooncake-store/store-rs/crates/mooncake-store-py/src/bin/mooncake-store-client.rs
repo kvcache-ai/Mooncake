@@ -234,6 +234,7 @@ fn run_client(args: Args) -> Result<(), Box<dyn Error>> {
             args.lease_ttl_ms,
             heartbeat_interval,
             timeouts,
+            client.startup_timeout(),
             metrics_addr.as_deref(),
             dummy_server.as_ref().map(|server| server.address()),
         )
@@ -530,6 +531,7 @@ fn started_message(
     lease_ttl_ms: u64,
     heartbeat_interval_ms: u64,
     timeouts: CompatTimeoutConfig,
+    startup_timeout: Duration,
     metrics_addr: Option<&str>,
     client_server_address: Option<&str>,
 ) -> String {
@@ -538,7 +540,7 @@ fn started_message(
         epoch.0,
         lifecycle_state_label(initial_state),
         timeouts.request_timeout.as_millis(),
-        timeouts.startup_timeout.as_millis(),
+        startup_timeout.as_millis(),
         timeouts.heartbeat_timeout.as_millis(),
         timeouts.transfer_stall_timeout.as_millis(),
         metrics_addr.unwrap_or("disabled"),
@@ -763,7 +765,7 @@ mod tests {
     fn sample_timeouts() -> CompatTimeoutConfig {
         CompatTimeoutConfig {
             request_timeout: Duration::from_millis(65_000),
-            startup_timeout: Duration::from_millis(300_000),
+            startup_timeout_override: None,
             heartbeat_timeout: Duration::from_millis(15_000),
             transfer_stall_timeout: Duration::from_millis(10_000),
             dummy_rpc_timeout: Duration::from_millis(65_000),
@@ -1055,7 +1057,10 @@ mod tests {
 
         let timeouts = resolve_timeout_config(&args).expect("timeout config should resolve");
         assert_eq!(timeouts.request_timeout, Duration::from_millis(44_000));
-        assert_eq!(timeouts.startup_timeout, Duration::from_millis(180_000));
+        assert_eq!(
+            timeouts.startup_timeout_override,
+            Some(Duration::from_millis(180_000))
+        );
         assert_eq!(timeouts.heartbeat_timeout, Duration::from_millis(11_000));
         assert_eq!(
             timeouts.transfer_stall_timeout,
@@ -1242,6 +1247,7 @@ mod tests {
             9_000,
             3_000,
             sample_timeouts(),
+            Duration::from_millis(300_000),
             Some("127.0.0.1:9090"),
             None,
         );

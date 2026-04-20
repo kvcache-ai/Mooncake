@@ -3567,7 +3567,7 @@ mod tests {
         ));
         let timeouts = CompatTimeoutConfig {
             request_timeout: Duration::from_millis(50),
-            startup_timeout: Duration::from_millis(400),
+            startup_timeout_override: Some(Duration::from_millis(400)),
             heartbeat_timeout: Duration::from_secs(1),
             transfer_stall_timeout: Duration::from_secs(1),
             dummy_rpc_timeout: Duration::from_millis(50),
@@ -3612,7 +3612,7 @@ mod tests {
         ));
         let timeouts = CompatTimeoutConfig {
             request_timeout: Duration::from_secs(5),
-            startup_timeout: Duration::from_millis(120),
+            startup_timeout_override: Some(Duration::from_millis(120)),
             heartbeat_timeout: Duration::from_secs(1),
             transfer_stall_timeout: Duration::from_secs(1),
             dummy_rpc_timeout: Duration::from_secs(5),
