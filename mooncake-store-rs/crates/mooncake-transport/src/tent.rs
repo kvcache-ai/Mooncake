@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +13,10 @@ use crate::{
     clamp_registration_size, rdma_device_max_registration_size, Opcode, TransferProgress,
     TransferRequest, TransferStatus,
 };
+
+const TENT_TCP_MAX_CONCURRENT_TASKS_KEY: &str = "transports/tcp/max_concurrent_tasks";
+const TENT_TCP_MAX_CONCURRENT_TASKS_ENV: &str = "MC_STORE_RS_TENT_TCP_MAX_CONCURRENT_TASKS";
+const TENT_TCP_SYNC_AWAIT_SAFE_DEFAULT: &str = "1";
 
 #[derive(Clone, Default)]
 pub struct TentEngineConfig {
@@ -58,6 +63,27 @@ impl TentEngineConfig {
             .is_some_and(|value| parse_config_bool(value))
     }
 
+    fn tcp_enabled(&self) -> bool {
+        self.overrides
+            .get("transports/tcp/enable")
+            .map(|value| parse_config_bool(value))
+            .unwrap_or(true)
+    }
+
+    fn tcp_sync_await_safe_task_limit(&self) -> Option<String> {
+        if self.config_path.is_some()
+            || self
+                .overrides
+                .contains_key(TENT_TCP_MAX_CONCURRENT_TASKS_KEY)
+            || !self.tcp_enabled()
+            || self.rdma_enabled()
+        {
+            return None;
+        }
+
+        Some(tent_tcp_max_concurrent_tasks())
+    }
+
     fn apply(&self) -> Result<()> {
         if let Some(path) = &self.config_path {
             let path = cstring_from_path(path)?;
@@ -66,6 +92,11 @@ impl TentEngineConfig {
         for (key, value) in &self.overrides {
             let key = to_cstring("key", key)?;
             let value = to_cstring("value", value)?;
+            unsafe { ffi::tent_set_config(key.as_ptr(), value.as_ptr()) };
+        }
+        if let Some(value) = self.tcp_sync_await_safe_task_limit() {
+            let key = to_cstring("key", TENT_TCP_MAX_CONCURRENT_TASKS_KEY)?;
+            let value = to_cstring("value", &value)?;
             unsafe { ffi::tent_set_config(key.as_ptr(), value.as_ptr()) };
         }
         Ok(())
@@ -410,6 +441,20 @@ fn parse_config_bool(value: &str) -> bool {
     )
 }
 
+fn tent_tcp_max_concurrent_tasks() -> String {
+    env::var(TENT_TCP_MAX_CONCURRENT_TASKS_ENV)
+        .ok()
+        .and_then(|value| {
+            let value = value.trim();
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|tasks| *tasks > 0)
+                .map(|_| value.to_string())
+        })
+        .unwrap_or_else(|| TENT_TCP_SYNC_AWAIT_SAFE_DEFAULT.to_string())
+}
+
 fn parse_max_registration_size(value: Option<&str>) -> Option<usize> {
     value
         .map(str::trim)
@@ -534,7 +579,8 @@ mod tests {
     use super::{
         check_zero, cstring_from_path, decode_status, encode_opcode, parse_config_bool,
         parse_max_registration_size, read_segment_buffers, read_string,
-        tent_rdma_registration_limit, to_cstring, TentEngineConfig,
+        tent_rdma_registration_limit, tent_tcp_max_concurrent_tasks, to_cstring, TentEngineConfig,
+        TENT_TCP_MAX_CONCURRENT_TASKS_ENV,
     };
     use crate::env::EnvOverrideGuard;
     use crate::{Opcode, TransferStatus};
@@ -569,12 +615,68 @@ mod tests {
         assert!(config.rdma_enabled());
         let tcp_only = TentEngineConfig::new().set("transports/rdma/enable", "false");
         assert!(!tcp_only.rdma_enabled());
+        assert!(tcp_only.tcp_enabled());
         assert!(parse_config_bool("ON"));
         assert!(!parse_config_bool("off"));
         assert_eq!(parse_max_registration_size(Some("4096")), Some(4096));
         assert_eq!(parse_max_registration_size(Some("0")), None);
         assert_eq!(parse_max_registration_size(Some("")), None);
         assert_eq!(parse_max_registration_size(Some("bad")), None);
+    }
+
+    #[test]
+    fn tent_tcp_only_defaults_to_single_sync_await_worker() {
+        let _lock = env_test_lock().lock().expect("env lock poisoned");
+        let mut env = EnvOverrideGuard::new();
+        env.set_optional(TENT_TCP_MAX_CONCURRENT_TASKS_ENV, None);
+
+        let tcp_only = TentEngineConfig::new()
+            .set("transports/tcp/enable", "true")
+            .set("transports/rdma/enable", "false");
+        assert_eq!(
+            tcp_only.tcp_sync_await_safe_task_limit().as_deref(),
+            Some("1")
+        );
+
+        env.set_optional(TENT_TCP_MAX_CONCURRENT_TASKS_ENV, Some("3"));
+        assert_eq!(tent_tcp_max_concurrent_tasks(), "3");
+        assert_eq!(
+            tcp_only.tcp_sync_await_safe_task_limit().as_deref(),
+            Some("3")
+        );
+
+        env.set_optional(TENT_TCP_MAX_CONCURRENT_TASKS_ENV, Some("bad"));
+        assert_eq!(tent_tcp_max_concurrent_tasks(), "1");
+        assert_eq!(
+            TentEngineConfig::new()
+                .set("transports/tcp/enable", "false")
+                .set("transports/rdma/enable", "false")
+                .tcp_sync_await_safe_task_limit(),
+            None
+        );
+        assert_eq!(
+            TentEngineConfig::new()
+                .set("transports/tcp/enable", "true")
+                .set("transports/rdma/enable", "true")
+                .tcp_sync_await_safe_task_limit(),
+            None
+        );
+        assert_eq!(
+            TentEngineConfig::new()
+                .set("transports/tcp/enable", "true")
+                .set("transports/rdma/enable", "false")
+                .set("transports/tcp/max_concurrent_tasks", "8")
+                .tcp_sync_await_safe_task_limit(),
+            None
+        );
+        assert_eq!(
+            TentEngineConfig::new()
+                .config_path("tent.toml")
+                .set("transports/tcp/enable", "true")
+                .set("transports/rdma/enable", "false")
+                .tcp_sync_await_safe_task_limit(),
+            None
+        );
     }
 
     #[test]
