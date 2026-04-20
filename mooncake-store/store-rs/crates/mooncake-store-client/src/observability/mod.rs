@@ -678,7 +678,7 @@ mod tests {
         let response = http_get(&server.address, "/metrics");
 
         assert!(response.contains("HTTP/1.1 200 OK"));
-        assert!(response.contains("mooncake_store_client_operation_total"));
+        assert!(response.contains("mooncake_store_operation_total"));
         assert!(response.contains("operation=\"put\",status=\"ok\""));
         server
             .shutdown()

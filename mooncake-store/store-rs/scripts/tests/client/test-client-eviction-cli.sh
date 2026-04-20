@@ -116,17 +116,17 @@ while time.time() < deadline:
 
     background_calls = metric_value(
         last_text,
-        "mooncake_store_client_operation_total",
+        "mooncake_store_operation_total",
         "storage_owner_background_eviction",
     )
     background_evicted = metric_value(
         last_text,
-        "mooncake_store_client_operation_bytes_out_total",
+        "mooncake_store_operation_bytes_out_total",
         "storage_owner_background_eviction",
     )
     evict_one_calls = metric_value(
         last_text,
-        "mooncake_store_client_operation_total",
+        "mooncake_store_operation_total",
         "storage_owner_evict_one",
     )
 
@@ -250,7 +250,7 @@ print_failure_context() {
   print_tail_if_exists "storage log" "${STORAGE_LOG:-}" 200
   if [[ -f "${METRICS_SNAPSHOT:-}" ]]; then
     echo "--- metrics snapshot: ${METRICS_SNAPSHOT} ---" >&2
-    grep -E "mooncake_store_client_operation|mooncake_store_heartbeat|mooncake_store_runtime_lease|storage_owner" \
+    grep -E "mooncake_store_operation|mooncake_store_heartbeat|mooncake_store_runtime_lease|storage_owner" \
       "${METRICS_SNAPSHOT}" >&2 || cat "${METRICS_SNAPSHOT}" >&2
   fi
   if [[ -f "${STATS_SNAPSHOT:-}" ]]; then

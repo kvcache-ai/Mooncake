@@ -2428,12 +2428,12 @@ fn observability_metrics_render_after_put_and_get() {
     assert_eq!(value, b"abcdefgh");
 
     let metrics = render_prometheus_metrics();
-    assert!(metrics.contains("mooncake_store_client_operation_total"));
+    assert!(metrics.contains("mooncake_store_operation_total"));
     assert!(metrics.contains("operation=\"put\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get\",status=\"ok\""));
     assert!(metrics.contains("operation=\"put_local_copy\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get_local_copy\",status=\"ok\""));
-    assert!(metrics.contains("mooncake_store_client_operation_bytes_out_total"));
+    assert!(metrics.contains("mooncake_store_operation_bytes_out_total"));
 }
 
 #[test]
@@ -7447,7 +7447,7 @@ fn helper_primitives_and_request_builders_cover_contracts() {
     record_success_metric("helper_metric", 12, 34);
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains("operation=\"helper_metric\",status=\"ok\""));
-    assert!(metrics.contains("mooncake_store_client_operation_bytes_in_total"));
+    assert!(metrics.contains("mooncake_store_operation_bytes_in_total"));
 
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     assert!(matches!(
