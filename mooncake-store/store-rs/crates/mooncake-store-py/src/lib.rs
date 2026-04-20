@@ -161,17 +161,16 @@ impl PyMooncakeDistributedStore {
         .map_err(store_error_to_py)?;
         let _ = master_server;
         let stable_id = runtime.stable_id.clone();
-        let dispatcher = StoreDispatcher::spawn(
-            runtime.client,
-            format!("mooncake-py-dispatcher-{stable_id}"),
-        )
+        let dispatcher = run_without_gil(move || {
+            let dispatcher = StoreDispatcher::spawn(
+                runtime.client,
+                format!("mooncake-py-dispatcher-{stable_id}"),
+            )?;
+            dispatcher.register_local_memory()?;
+            dispatcher.start_heartbeat_loop(runtime.lease_ttl_ms, None)?;
+            Ok(dispatcher)
+        })
         .map_err(store_error_to_py)?;
-        dispatcher
-            .register_local_memory()
-            .map_err(store_error_to_py)?;
-        dispatcher
-            .start_heartbeat_loop(runtime.lease_ttl_ms, None)
-            .map_err(store_error_to_py)?;
         self.replace_backend(StoreBackend::Real(dispatcher));
         Ok(0)
     }
@@ -243,8 +242,8 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_key = key.clone();
                 let cache_tenant = tenant.clone();
-                dispatcher
-                    .run(move |client| match (tenant.as_deref(), policy.as_ref()) {
+                run_without_gil(move || {
+                    dispatcher.run(move |client| match (tenant.as_deref(), policy.as_ref()) {
                         (Some(tenant), Some(policy)) => {
                             client.put_in_tenant_with_policy(tenant, &key, &value, policy)
                         }
@@ -252,7 +251,8 @@ impl PyMooncakeDistributedStore {
                         (Some(tenant), None) => client.put_in_tenant(tenant, &key, &value),
                         (None, None) => client.put(&key, &value),
                     })
-                    .map_err(store_error_to_py)?;
+                })
+                .map_err(store_error_to_py)?;
                 dispatcher.invalidate_key(cache_key, cache_tenant);
                 Ok(0)
             }
@@ -276,9 +276,10 @@ impl PyMooncakeDistributedStore {
                 }
                 value
             }
-            StoreBackend::Real(dispatcher) => dispatcher
-                .get_value(key.to_string(), tenant.map(str::to_string))
-                .map_err(store_error_to_py)?,
+            StoreBackend::Real(dispatcher) => run_without_gil(move || {
+                dispatcher.get_value(key.to_string(), tenant.map(str::to_string))
+            })
+            .map_err(store_error_to_py)?,
         };
         Ok(PyBytes::new(py, &value))
     }
@@ -295,12 +296,13 @@ impl PyMooncakeDistributedStore {
             StoreBackend::Real(dispatcher) => {
                 let key = key.to_string();
                 let tenant = tenant.map(str::to_string);
-                dispatcher
-                    .run(move |client| match tenant.as_deref() {
+                run_without_gil(move || {
+                    dispatcher.run(move |client| match tenant.as_deref() {
                         Some(tenant) => client.is_exist_in_tenant(tenant, &key),
                         None => client.is_exist(&key),
                     })
-                    .map_err(store_error_to_py)
+                })
+                .map_err(store_error_to_py)
             }
         }
     }
@@ -314,8 +316,8 @@ impl PyMooncakeDistributedStore {
             StoreBackend::Real(dispatcher) => {
                 let item_count = keys.len();
                 let tenant = tenant.map(str::to_string);
-                dispatcher
-                    .run(move |client| {
+                run_without_gil(move || {
+                    dispatcher.run(move |client| {
                         let objects = keys
                             .iter()
                             .map(|key| {
@@ -330,13 +332,14 @@ impl PyMooncakeDistributedStore {
                             .batch_is_exist(&objects)
                             .map(|items| items.into_iter().map(i32::from).collect())
                     })
-                    .or_else(|error| {
-                        if should_soft_miss_error(&error) {
-                            Ok(soft_miss_exists_result(item_count, &error))
-                        } else {
-                            Err(store_error_to_py(error))
-                        }
-                    })
+                })
+                .or_else(|error| {
+                    if should_soft_miss_error(&error) {
+                        Ok(soft_miss_exists_result(item_count, &error))
+                    } else {
+                        Err(store_error_to_py(error))
+                    }
+                })
             }
         }
     }
@@ -344,9 +347,10 @@ impl PyMooncakeDistributedStore {
     fn get_hostname(&self) -> PyResult<String> {
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => Ok(dummy.server_addr().to_string()),
-            StoreBackend::Real(dispatcher) => dispatcher
-                .run(|client| client.get_hostname())
-                .map_err(store_error_to_py),
+            StoreBackend::Real(dispatcher) => {
+                run_without_gil(move || dispatcher.run(|client| client.get_hostname()))
+                    .map_err(store_error_to_py)
+            }
         }
     }
 
@@ -363,12 +367,13 @@ impl PyMooncakeDistributedStore {
             StoreBackend::Real(dispatcher) => {
                 let key = key.to_string();
                 let tenant = tenant.map(str::to_string);
-                dispatcher
-                    .run(move |client| match tenant.as_deref() {
+                run_without_gil(move || {
+                    dispatcher.run(move |client| match tenant.as_deref() {
                         Some(tenant) => client.get_size_in_tenant(tenant, &key),
                         None => client.get_size(&key),
                     })
-                    .map_err(store_error_to_py)
+                })
+                .map_err(store_error_to_py)
             }
         }
     }
@@ -380,8 +385,7 @@ impl PyMooncakeDistributedStore {
                 .map_err(store_error_to_py),
             StoreBackend::Real(dispatcher) => {
                 let _ = pointer_from_usize(buffer_ptr)?;
-                dispatcher
-                    .register_buffer(buffer_ptr, size)
+                run_without_gil(move || dispatcher.register_buffer(buffer_ptr, size))
                     .map_err(store_error_to_py)?;
                 Ok(0)
             }
@@ -395,8 +399,7 @@ impl PyMooncakeDistributedStore {
                 .map_err(store_error_to_py),
             StoreBackend::Real(dispatcher) => {
                 let _ = pointer_from_usize(buffer_ptr)?;
-                dispatcher
-                    .unregister_buffer(buffer_ptr, size)
+                run_without_gil(move || dispatcher.unregister_buffer(buffer_ptr, size))
                     .map_err(store_error_to_py)?;
                 Ok(0)
             }
@@ -454,8 +457,8 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_key = key.clone();
                 let cache_tenant = tenant.clone();
-                dispatcher
-                    .run(move |client| {
+                run_without_gil(move || {
+                    dispatcher.run(move |client| {
                         let buffer = buffer_ptr as *const c_void;
                         match (tenant.as_deref(), policy.as_ref()) {
                             (Some(tenant), Some(policy)) => client
@@ -469,7 +472,8 @@ impl PyMooncakeDistributedStore {
                             (None, None) => client.put_from(&key, buffer, size),
                         }
                     })
-                    .map_err(store_error_to_py)?;
+                })
+                .map_err(store_error_to_py)?;
                 dispatcher.invalidate_key(cache_key, cache_tenant);
                 Ok(0)
             }
@@ -498,14 +502,15 @@ impl PyMooncakeDistributedStore {
             }
             StoreBackend::Real(dispatcher) => {
                 let _ = pointer_from_usize(buffer_ptr)?;
-                dispatcher
-                    .get_into_buffer(
+                run_without_gil(move || {
+                    dispatcher.get_into_buffer(
                         key.to_string(),
                         tenant.map(str::to_string),
                         buffer_ptr,
                         size,
                     )
-                    .map_err(store_error_to_py)
+                })
+                .map_err(store_error_to_py)
             }
         }
     }
@@ -563,8 +568,8 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
-                dispatcher
-                    .run(move |client| {
+                run_without_gil(move || {
+                    dispatcher.run(move |client| {
                         let requests = items
                             .iter()
                             .map(|(key, value)| {
@@ -580,7 +585,8 @@ impl PyMooncakeDistributedStore {
                             .collect::<Vec<_>>();
                         client.batch_put(&requests).map(|_| ())
                     })
-                    .map_err(store_error_to_py)?;
+                })
+                .map_err(store_error_to_py)?;
                 dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(0)
             }
@@ -643,7 +649,7 @@ impl PyMooncakeDistributedStore {
                     .map(|(key, _, _)| key.clone())
                     .collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
-                py.allow_threads(move || {
+                run_without_gil(move || {
                     dispatcher.run(move |client| {
                         let requests = items
                             .iter()
@@ -788,8 +794,8 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
-                dispatcher
-                    .run(move |client| {
+                run_without_gil(move || {
+                    dispatcher.run(move |client| {
                         let borrowed = items
                             .iter()
                             .map(|(_, buffers)| {
@@ -816,7 +822,8 @@ impl PyMooncakeDistributedStore {
                             .collect::<Vec<_>>();
                         client.batch_put_from_multi_buffers(&requests).map(|_| ())
                     })
-                    .map_err(store_error_to_py)?;
+                })
+                .map_err(store_error_to_py)?;
                 dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(0)
             }
@@ -910,8 +917,8 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = keys.clone();
                 let cache_tenant = tenant.clone();
-                dispatcher
-                    .run(move |client| {
+                run_without_gil(move || {
+                    dispatcher.run(move |client| {
                         let borrowed = all_buffer_ptrs
                             .iter()
                             .zip(all_sizes.iter())
@@ -942,7 +949,8 @@ impl PyMooncakeDistributedStore {
                             .collect::<Vec<_>>();
                         client.batch_put_from_multi_buffers(&requests).map(|_| ())
                     })
-                    .map_err(store_error_to_py)?;
+                })
+                .map_err(store_error_to_py)?;
                 dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(vec![0; key_count])
             }
@@ -956,12 +964,13 @@ impl PyMooncakeDistributedStore {
         let tenant = tenant.map(str::to_string);
         let cache_key = key.clone();
         let cache_tenant = tenant.clone();
-        dispatcher
-            .run(move |client| match tenant.as_deref() {
+        run_without_gil(move || {
+            dispatcher.run(move |client| match tenant.as_deref() {
                 Some(tenant) => client.remove_in_tenant(tenant, &key, force),
                 None => client.remove(&key, force),
             })
-            .map_err(store_error_to_py)?;
+        })
+        .map_err(store_error_to_py)?;
         dispatcher.invalidate_key(cache_key, cache_tenant);
         Ok(0)
     }
@@ -978,8 +987,8 @@ impl PyMooncakeDistributedStore {
         let tenant = tenant.map(str::to_string);
         let cache_keys = keys.clone();
         let cache_tenant = tenant.clone();
-        dispatcher
-            .run(move |client| {
+        run_without_gil(move || {
+            dispatcher.run(move |client| {
                 let objects = keys
                     .iter()
                     .map(|key| {
@@ -992,7 +1001,8 @@ impl PyMooncakeDistributedStore {
                     .collect::<Vec<_>>();
                 client.batch_remove(&objects, force).map(|_| ())
             })
-            .map_err(store_error_to_py)?;
+        })
+        .map_err(store_error_to_py)?;
         dispatcher.invalidate_keys(cache_keys, cache_tenant);
         Ok(vec![0; key_count])
     }
@@ -1005,9 +1015,9 @@ impl PyMooncakeDistributedStore {
         tenant: Option<&str>,
     ) -> PyResult<Vec<Py<PyBytes>>> {
         let dispatcher = self.real_dispatcher()?;
-        let values = dispatcher
-            .batch_get_values(keys, tenant.map(str::to_string))
-            .map_err(store_error_to_py)?;
+        let values =
+            run_without_gil(move || dispatcher.batch_get_values(keys, tenant.map(str::to_string)))
+                .map_err(store_error_to_py)?;
         Ok(values
             .into_iter()
             .map(|value| PyBytes::new(py, &value).unbind())
@@ -1039,15 +1049,16 @@ impl PyMooncakeDistributedStore {
                     let _ = pointer_from_usize(*buffer_ptr)?;
                 }
                 let item_count = items.len();
-                dispatcher
-                    .batch_get_into_buffers(items, tenant.map(str::to_string))
-                    .or_else(|error| {
-                        if should_soft_miss_error(&error) {
-                            Ok(soft_miss_length_result(item_count, &error))
-                        } else {
-                            Err(store_error_to_py(error))
-                        }
-                    })
+                run_without_gil(move || {
+                    dispatcher.batch_get_into_buffers(items, tenant.map(str::to_string))
+                })
+                .or_else(|error| {
+                    if should_soft_miss_error(&error) {
+                        Ok(soft_miss_length_result(item_count, &error))
+                    } else {
+                        Err(store_error_to_py(error))
+                    }
+                })
             }
         }
     }
@@ -1127,20 +1138,21 @@ impl PyMooncakeDistributedStore {
                     }
                 }
                 let item_count = keys.len();
-                dispatcher
-                    .batch_get_into_multi_buffers_raw(
+                run_without_gil(move || {
+                    dispatcher.batch_get_into_multi_buffers_raw(
                         keys,
                         all_buffer_ptrs,
                         all_sizes,
                         tenant.map(str::to_string),
                     )
-                    .or_else(|error| {
-                        if should_soft_miss_error(&error) {
-                            Ok(soft_miss_length_result(item_count, &error))
-                        } else {
-                            Err(store_error_to_py(error))
-                        }
-                    })
+                })
+                .or_else(|error| {
+                    if should_soft_miss_error(&error) {
+                        Ok(soft_miss_length_result(item_count, &error))
+                    } else {
+                        Err(store_error_to_py(error))
+                    }
+                })
             }
         }
     }
@@ -1151,37 +1163,37 @@ impl PyMooncakeDistributedStore {
         py: Python<'py>,
         storage_bytes: usize,
     ) -> PyResult<Py<PyAny>> {
-        let announcement = self
-            .real_dispatcher()?
-            .run(move |client| client.expand_local_memory(storage_bytes))
-            .map_err(store_error_to_py)?;
+        let dispatcher = self.real_dispatcher()?;
+        let announcement = run_without_gil(move || {
+            dispatcher.run(move |client| client.expand_local_memory(storage_bytes))
+        })
+        .map_err(store_error_to_py)?;
         segment_to_py(py, &announcement)
     }
 
     fn drain_segment(&self, segment_name: &str) -> PyResult<i32> {
         let segment_name = SegmentName::new(segment_name);
-        self.real_dispatcher()?
-            .run(move |client| client.drain_segment(&segment_name))
+        let dispatcher = self.real_dispatcher()?;
+        run_without_gil(move || dispatcher.run(move |client| client.drain_segment(&segment_name)))
             .map_err(store_error_to_py)?;
         Ok(0)
     }
 
     fn retire_segment(&self, segment_name: &str) -> PyResult<bool> {
         let segment_name = SegmentName::new(segment_name);
-        self.real_dispatcher()?
-            .run(move |client| client.retire_segment(&segment_name))
+        let dispatcher = self.real_dispatcher()?;
+        run_without_gil(move || dispatcher.run(move |client| client.retire_segment(&segment_name)))
             .map_err(store_error_to_py)
     }
 
     fn evacuate_owned_replicas(&mut self) -> PyResult<usize> {
-        self.real_dispatcher()?
-            .evacuate_owned_replicas()
-            .map_err(store_error_to_py)
+        let dispatcher = self.real_dispatcher()?;
+        run_without_gil(move || dispatcher.evacuate_owned_replicas()).map_err(store_error_to_py)
     }
 
     fn list_segments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyAny>>> {
-        self.real_dispatcher()?
-            .run(|client| client.list_segments())
+        let dispatcher = self.real_dispatcher()?;
+        run_without_gil(move || dispatcher.run(|client| client.list_segments()))
             .map_err(store_error_to_py)?
             .iter()
             .map(|segment| segment_to_py(py, segment))
@@ -1197,41 +1209,38 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<Option<Py<PyAny>>> {
         let key = key.to_string();
         let tenant = tenant.map(str::to_string);
-        let route = self
-            .real_dispatcher()?
-            .run(move |client| match tenant.as_deref() {
+        let dispatcher = self.real_dispatcher()?;
+        let route = run_without_gil(move || {
+            dispatcher.run(move |client| match tenant.as_deref() {
                 Some(tenant) => client.query_route_in_tenant(tenant, &key),
                 None => client.query_route(&key),
             })
-            .map_err(store_error_to_py)?;
+        })
+        .map_err(store_error_to_py)?;
         route.map(|route| route_to_py(py, &route)).transpose()
     }
 
     fn heartbeat(&mut self, expires_at_ms: u64) -> PyResult<i32> {
-        self.real_dispatcher()?
-            .heartbeat(expires_at_ms)
-            .map_err(store_error_to_py)?;
+        let dispatcher = self.real_dispatcher()?;
+        run_without_gil(move || dispatcher.heartbeat(expires_at_ms)).map_err(store_error_to_py)?;
         Ok(0)
     }
 
     fn activate(&mut self) -> PyResult<i32> {
-        self.real_dispatcher()?
-            .activate()
-            .map_err(store_error_to_py)?;
+        let dispatcher = self.real_dispatcher()?;
+        run_without_gil(move || dispatcher.activate()).map_err(store_error_to_py)?;
         Ok(0)
     }
 
     fn enter_standby(&mut self) -> PyResult<i32> {
-        self.real_dispatcher()?
-            .enter_standby()
-            .map_err(store_error_to_py)?;
+        let dispatcher = self.real_dispatcher()?;
+        run_without_gil(move || dispatcher.enter_standby()).map_err(store_error_to_py)?;
         Ok(0)
     }
 
     fn enter_draining(&mut self) -> PyResult<i32> {
-        self.real_dispatcher()?
-            .enter_draining()
-            .map_err(store_error_to_py)?;
+        let dispatcher = self.real_dispatcher()?;
+        run_without_gil(move || dispatcher.enter_draining()).map_err(store_error_to_py)?;
         Ok(0)
     }
 
@@ -1448,6 +1457,14 @@ fn pointer_from_usize(pointer: usize) -> PyResult<*mut c_void> {
         return Err(PyValueError::new_err("buffer pointer must not be null"));
     }
     Ok(pointer as *mut c_void)
+}
+
+fn run_without_gil<T, F>(f: F) -> Result<T, StoreError>
+where
+    T: pyo3::marker::Ungil + Send,
+    F: pyo3::marker::Ungil + FnOnce() -> Result<T, StoreError>,
+{
+    Python::with_gil(|py| py.allow_threads(f))
 }
 
 fn store_error_to_py(error: StoreError) -> PyErr {
@@ -1902,6 +1919,7 @@ mod tests {
         block_lease: Arc<AtomicBool>,
         block_state_update: Arc<AtomicBool>,
         block_route_cas: Arc<AtomicBool>,
+        block_route_lookup: Arc<AtomicBool>,
         release: Arc<AtomicBool>,
         entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     }
@@ -1920,11 +1938,30 @@ mod tests {
             release: Arc<AtomicBool>,
             entered: std::sync::mpsc::Sender<()>,
         ) -> Self {
+            Self::new_with_route_lookup(
+                block_lease,
+                block_state_update,
+                block_route_cas,
+                Arc::new(AtomicBool::new(false)),
+                release,
+                entered,
+            )
+        }
+
+        fn new_with_route_lookup(
+            block_lease: Arc<AtomicBool>,
+            block_state_update: Arc<AtomicBool>,
+            block_route_cas: Arc<AtomicBool>,
+            block_route_lookup: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+            entered: std::sync::mpsc::Sender<()>,
+        ) -> Self {
             Self {
                 inner: InMemoryMetadataBackend::new(),
                 block_lease,
                 block_state_update,
                 block_route_cas,
+                block_route_lookup,
                 release,
                 entered: std::sync::Mutex::new(Some(entered)),
             }
@@ -2038,6 +2075,7 @@ mod tests {
             &self,
             key: &ObjectKey,
         ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+            self.maybe_block(&self.block_route_lookup);
             self.inner.get_object_route(key)
         }
 
@@ -3305,6 +3343,176 @@ mod tests {
         put_thread
             .join()
             .expect("batch_put_from thread should complete cleanly");
+    }
+
+    #[test]
+    fn real_batch_put_from_multi_buffers_releases_gil_while_dispatcher_waits() {
+        init_python();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(BlockingHealthMetadata::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            release.clone(),
+            entered_tx,
+        ));
+        let dispatcher = StoreDispatcher::spawn(
+            build_client_with_metadata("py-batch-put-from-multi-gil", metadata),
+            "dispatcher-py-batch-put-from-multi-gil",
+        )
+        .expect("dispatcher should spawn");
+        dispatcher
+            .register_local_memory()
+            .expect("local memory should register");
+        let mut store = PyMooncakeDistributedStore::new();
+        store.replace_backend(StoreBackend::Real(dispatcher));
+
+        let put_thread = std::thread::spawn(move || {
+            Python::with_gil(|_| {
+                assert_eq!(
+                    store
+                        .batch_put_from_multi_buffers(
+                            vec![(
+                                "gil-batch-put-from-multi".to_string(),
+                                vec![b"gil".to_vec(), b"-safe".to_vec()],
+                            )],
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            true,
+                            false,
+                            false,
+                        )
+                        .expect("batch_put_from_multi_buffers should succeed"),
+                    0
+                );
+            });
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("batch_put_from_multi_buffers should block in metadata CAS");
+
+        let release_gate = release.clone();
+        let release_thread = std::thread::spawn(move || {
+            sleep(Duration::from_millis(300));
+            release_gate.store(true, Ordering::SeqCst);
+        });
+
+        let (elapsed_tx, elapsed_rx) = std::sync::mpsc::channel();
+        let probe_thread = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            Python::with_gil(|_| {});
+            elapsed_tx
+                .send(start.elapsed())
+                .expect("probe elapsed should send");
+        });
+
+        let elapsed = elapsed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("probe thread should observe GIL acquisition");
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "batch_put_from_multi_buffers should release the GIL while waiting, observed {:?}",
+            elapsed
+        );
+
+        probe_thread
+            .join()
+            .expect("probe thread should complete cleanly");
+        release_thread
+            .join()
+            .expect("release thread should complete cleanly");
+        put_thread
+            .join()
+            .expect("batch_put_from_multi_buffers thread should complete cleanly");
+    }
+
+    #[test]
+    fn real_batch_get_into_releases_gil_while_dispatcher_waits() {
+        init_python();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let block_route_lookup = Arc::new(AtomicBool::new(true));
+        let metadata = Arc::new(BlockingHealthMetadata::new_with_route_lookup(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            block_route_lookup,
+            release.clone(),
+            entered_tx,
+        ));
+        let dispatcher = StoreDispatcher::spawn(
+            build_client_with_metadata("py-batch-get-into-gil", metadata),
+            "dispatcher-py-batch-get-into-gil",
+        )
+        .expect("dispatcher should spawn");
+        dispatcher
+            .register_local_memory()
+            .expect("local memory should register");
+        let mut store = PyMooncakeDistributedStore::new();
+        store.replace_backend(StoreBackend::Real(dispatcher));
+
+        let get_thread = std::thread::spawn(move || {
+            let mut target = vec![0u8; 32];
+            Python::with_gil(|_| {
+                assert_eq!(
+                    store
+                        .batch_get_into(
+                            vec![(
+                                "gil-batch-get-into-missing".to_string(),
+                                target.as_mut_ptr() as usize,
+                                target.len(),
+                            )],
+                            None,
+                        )
+                        .expect("batch_get_into should return a soft miss"),
+                    vec![-1]
+                );
+            });
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("batch_get_into should block in route lookup");
+
+        let release_gate = release.clone();
+        let release_thread = std::thread::spawn(move || {
+            sleep(Duration::from_millis(300));
+            release_gate.store(true, Ordering::SeqCst);
+        });
+
+        let (elapsed_tx, elapsed_rx) = std::sync::mpsc::channel();
+        let probe_thread = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            Python::with_gil(|_| {});
+            elapsed_tx
+                .send(start.elapsed())
+                .expect("probe elapsed should send");
+        });
+
+        let elapsed = elapsed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("probe thread should observe GIL acquisition");
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "batch_get_into should release the GIL while waiting, observed {:?}",
+            elapsed
+        );
+
+        probe_thread
+            .join()
+            .expect("probe thread should complete cleanly");
+        release_thread
+            .join()
+            .expect("release thread should complete cleanly");
+        get_thread
+            .join()
+            .expect("batch_get_into thread should complete cleanly");
     }
 
     #[test]
