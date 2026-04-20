@@ -1,4 +1,6 @@
+use serde::de::{Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::compat::CompatibilityDescriptor;
 use crate::identity::{ClientEndpointSet, ClientRuntimeId, LogicalObjectId, NamespaceScope};
@@ -115,6 +117,7 @@ pub struct SegmentAnnouncement {
     pub state: SegmentLifecycleState,
     #[serde(default = "default_segment_alignment_bytes")]
     pub alignment_bytes: u64,
+    #[serde(default, deserialize_with = "deserialize_string_vec_or_empty_object")]
     pub tags: Vec<String>,
 }
 
@@ -633,6 +636,48 @@ fn default_segment_alignment_bytes() -> u64 {
     1
 }
 
+fn deserialize_string_vec_or_empty_object<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringVecVisitor;
+
+    impl<'de> Visitor<'de> for StringVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a string array or an empty object")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut tags = Vec::new();
+            while let Some(tag) = sequence.next_element()? {
+                tags.push(tag);
+            }
+            Ok(tags)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            if map.next_key::<String>()?.is_some() {
+                return Err(A::Error::custom(
+                    "tags object payload is only valid when empty",
+                ));
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    deserializer.deserialize_any(StringVecVisitor)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -690,6 +735,22 @@ mod tests {
             announcement.alignment_bytes,
             default_segment_alignment_bytes()
         );
+    }
+
+    #[test]
+    fn segment_announcement_deserializes_empty_object_tags_for_redis_compat() {
+        let announcement: SegmentAnnouncement = serde_json::from_value(json!({
+            "owner": {
+                "stable_id": "runtime-a",
+                "epoch": 1
+            },
+            "segment_name": "segment-a",
+            "capacity_bytes": 4096,
+            "used_bytes": 0,
+            "tags": {}
+        }))
+        .expect("announcement should deserialize");
+        assert!(announcement.tags.is_empty());
     }
 
     #[test]

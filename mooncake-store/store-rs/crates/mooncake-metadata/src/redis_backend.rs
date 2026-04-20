@@ -2333,6 +2333,52 @@ mod tests {
     }
 
     #[test]
+    fn redis_backend_list_segments_accepts_empty_tags_reencoded_by_lua() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-empty-tags")),
+        )
+        .expect("redis backend should initialize");
+
+        let mut segment = sample_segment(SegmentLifecycleState::Active);
+        segment.tags.clear();
+        segment.capacity_bytes = 1024;
+        segment.alignment_bytes = 16;
+        backend
+            .publish_segment(&segment)
+            .expect("segment publish should succeed");
+
+        let reservation = backend
+            .reserve_segment(&segment.owner, &segment.segment_name, 13)
+            .expect("segment reservation should succeed");
+        assert_eq!(reservation.offset_bytes, 0);
+
+        let reserved_segments = backend
+            .list_segments(Some(&segment.owner))
+            .expect("segment listing after reserve should succeed");
+        assert_eq!(reserved_segments.len(), 1);
+        assert!(reserved_segments[0].tags.is_empty());
+        assert_eq!(reserved_segments[0].used_bytes, 16);
+
+        backend
+            .release_segment(
+                &segment.owner,
+                &segment.segment_name,
+                reservation.offset_bytes,
+                reservation.length_bytes,
+            )
+            .expect("segment release should succeed");
+
+        let released_segments = backend
+            .list_segments(Some(&segment.owner))
+            .expect("segment listing after release should succeed");
+        assert_eq!(released_segments, vec![segment]);
+    }
+
+    #[test]
     fn redis_backend_backfills_and_prunes_client_index() {
         let Some(server) = RedisTestServer::start() else {
             return;
