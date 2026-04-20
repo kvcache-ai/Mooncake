@@ -65,6 +65,93 @@ require_command cmake
 require_command patchelf
 require_command "${PYTHON_BIN}"
 
+AUDITWHEEL_EXCLUDES=(
+  --exclude "libcurl.so*"
+  --exclude "libibverbs.so*"
+  --exclude "libmlx5.so*"
+  --exclude "libnuma.so*"
+  --exclude "libstdc++.so*"
+  --exclude "libgcc_s.so*"
+  --exclude "libc.so*"
+  --exclude "libnghttp2.so*"
+  --exclude "libidn2.so*"
+  --exclude "librtmp.so*"
+  --exclude "libssh.so*"
+  --exclude "libpsl.so*"
+  --exclude "libssl.so*"
+  --exclude "libcrypto.so*"
+  --exclude "libgssapi_krb5.so*"
+  --exclude "libldap.so*"
+  --exclude "liblber.so*"
+  --exclude "libbrotlidec.so*"
+  --exclude "libz.so*"
+  --exclude "libnl-route-3.so*"
+  --exclude "libnl-3.so*"
+  --exclude "libm.so*"
+  --exclude "liblzma.so*"
+  --exclude "libunistring.so*"
+  --exclude "libgnutls.so*"
+  --exclude "libhogweed.so*"
+  --exclude "libnettle.so*"
+  --exclude "libgmp.so*"
+  --exclude "libkrb5.so*"
+  --exclude "libk5crypto.so*"
+  --exclude "libcom_err.so*"
+  --exclude "libkrb5support.so*"
+  --exclude "libsasl2.so*"
+  --exclude "libbrotlicommon.so*"
+  --exclude "libp11-kit.so*"
+  --exclude "libtasn1.so*"
+  --exclude "libkeyutils.so*"
+  --exclude "libresolv.so*"
+  --exclude "libffi.so*"
+  --exclude "libcuda.so*"
+  --exclude "libcudart.so*"
+  --exclude "libamdhip64.so*"
+  --exclude "libhsa-runtime64.so*"
+  --exclude "librocprofiler-register.so*"
+  --exclude "libc10.so*"
+  --exclude "libc10_cuda.so*"
+  --exclude "libtorch.so*"
+  --exclude "libtorch_cpu.so*"
+  --exclude "libtorch_cuda.so*"
+  --exclude "libtorch_python.so*"
+  --exclude "libascendcl.so*"
+  --exclude "libhccl.so*"
+  --exclude "libmsprofiler.so*"
+  --exclude "libgert.so*"
+  --exclude "libascendcl_impl.so*"
+  --exclude "libge_executor.so*"
+  --exclude "libascend_dump.so*"
+  --exclude "libgraph.so*"
+  --exclude "libruntime.so*"
+  --exclude "libascend_watchdog.so*"
+  --exclude "libprofapi.so*"
+  --exclude "liberror_manager.so*"
+  --exclude "libascendalog.so*"
+  --exclude "libc_sec.so*"
+  --exclude "libhccl_alg.so*"
+  --exclude "libhccl_plf.so*"
+  --exclude "libascend_protobuf.so*"
+  --exclude "libhybrid_executor.so*"
+  --exclude "libdavinci_executor.so*"
+  --exclude "libge_common.so*"
+  --exclude "libge_common_base.so*"
+  --exclude "liblowering.so*"
+  --exclude "libregister.so*"
+  --exclude "libexe_graph.so*"
+  --exclude "libmmpa.so*"
+  --exclude "libplatform.so*"
+  --exclude "libgraph_base.so*"
+  --exclude "libruntime_common.so*"
+  --exclude "libqos_manager.so*"
+  --exclude "libascend_trace.so*"
+  --exclude "libmetadef*.so"
+  --exclude "libllm_datadist*.so"
+  --exclude "ascend_transport*.so"
+  --exclude "libaccl_barex.so*"
+)
+
 ensure_yalantinglibs() {
   local source_dir="${UPSTREAM_DIR}/extern/yalantinglibs"
   local build_dir="${UPSTREAM_BUILD_DIR}/yalantinglibs-build"
@@ -109,6 +196,34 @@ fi
 if ! "${VENV_PYTHON}" -m pip show build >/dev/null 2>&1; then
   "${VENV_PYTHON}" -m pip install "build>=1.2,<2"
 fi
+if ! "${VENV_PYTHON}" -m pip show auditwheel >/dev/null 2>&1; then
+  "${VENV_PYTHON}" -m pip install "auditwheel>=6,<7"
+fi
+
+repair_runtime_wheel() {
+  local wheel_path=$1
+  local repaired_dir="${WHEEL_DIR}/.auditwheel-repaired"
+  local repaired_wheel
+
+  rm -rf "${repaired_dir}"
+  mkdir -p "${repaired_dir}"
+
+  "${VENV_PYTHON}" -m auditwheel repair \
+    "${wheel_path}" \
+    "${AUDITWHEEL_EXCLUDES[@]}" \
+    -w "${repaired_dir}"
+
+  repaired_wheel=$(ls -1t "${repaired_dir}"/*.whl 2>/dev/null | head -n 1 || true)
+  if [[ -z "${repaired_wheel}" ]]; then
+    echo "auditwheel repair completed but produced no repaired wheel" >&2
+    exit 1
+  fi
+
+  rm -f "${wheel_path}"
+  mv "${repaired_wheel}" "${WHEEL_DIR}/"
+  rm -rf "${repaired_dir}"
+  printf '%s\n' "${WHEEL_DIR}/$(basename "${repaired_wheel}")"
+}
 
 git -C "${REPO_ROOT}" submodule update --init --recursive
 ensure_yalantinglibs
@@ -301,6 +416,8 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
             info.compress_type = zipfile.ZIP_DEFLATED
             target_wheel.writestr(info, path.read_bytes())
 PY
+
+LATEST_WHEEL=$(repair_runtime_wheel "${LATEST_WHEEL}")
 
 readarray -t VERSION_INFO < <("${VENV_PYTHON}" - <<'PY' "${REPO_ROOT}/pyproject.toml"
 import pathlib
