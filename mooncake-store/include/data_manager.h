@@ -268,7 +268,8 @@ class DataManager {
 
     // --- TE transfer helpers ---
     struct TeSubmitResult {
-        std::vector<std::tuple<BatchID, size_t, std::string>> transfer_batches;
+        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
+            transfer_batches;
         // Temp DRAM buffer used when source or destination is non-DRAM.
         // Non-null means a post-copy (for Write) or pre-copy (for Read) is
         // required.

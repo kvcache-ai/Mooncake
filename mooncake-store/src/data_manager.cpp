@@ -697,7 +697,8 @@ DataManager::SubmitTeTransferInternal(
         off += remote_buffers[i].size;
     }
 
-    std::vector<std::tuple<BatchID, size_t, std::string>> submitted_batches;
+    std::vector<std::tuple<Transport::BatchID, size_t, std::string>>
+        submitted_batches;
     for (const auto& [endpoint, indices] : segment_buffers) {
         SegmentHandle seg = transfer_engine_->openSegment(endpoint);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
@@ -875,7 +876,8 @@ DataManager::PrepareDRAMReceiveBuffer(void* dest_ptr, MemoryType dest_type,
 tl::expected<Transport::BatchID, ErrorCode> DataManager::SubmitTransferRequests(
     const std::string& segment_endpoint, Transport::SegmentHandle seg,
     const std::vector<Transport::TransferRequest>& requests) {
-    BatchID batch_id = transfer_engine_->allocateBatchID(requests.size());
+    Transport::BatchID batch_id =
+        transfer_engine_->allocateBatchID(requests.size());
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
