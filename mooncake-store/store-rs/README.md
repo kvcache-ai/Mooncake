@@ -494,7 +494,9 @@ python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
 pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 mooncake-store-client --help
+mooncake-store-client -v
 python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
+python -c "import mooncake; print(mooncake.__build_info__)"
 ```
 
 If the host OS is missing build dependencies, use the Ubuntu Docker wrapper:
@@ -792,7 +794,9 @@ python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
 pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
+python -c "import mooncake; print(mooncake.__build_info__)"
 mooncake-store-client --version
+mooncake-store-client -v
 ```
 
 For local wheelhouse installs, `scripts/build/install-pro-wheel.sh` wraps the same flow.

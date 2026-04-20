@@ -13,6 +13,9 @@ UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}
 UPSTREAM_BUILD_DIR=${MOONCAKE_UPSTREAM_BUILD_DIR:-"${UPSTREAM_DIR}/build-wheel-compat"}
 YALANTINGLIBS_PREFIX=${YALANTINGLIBS_PREFIX:-"${UPSTREAM_BUILD_DIR}/yalantinglibs-install"}
 BUILD_JOBS=${BUILD_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 8)}
+BUILD_GIT_BRANCH=${MC_BUILD_GIT_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}
+BUILD_GIT_COMMIT=${MC_BUILD_GIT_COMMIT:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}
+BUILD_TIME=${MC_BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 
 usage() {
   cat <<'EOF'
@@ -286,10 +289,14 @@ fi
   "${UPSTREAM_BUILD_DIR}" \
   "${REPO_ROOT}/target/release/build" \
   "${REPO_ROOT}/target/release/mooncake-store-client" \
-  "${REPO_ROOT}/target/release/mooncake-store-admin"
+  "${REPO_ROOT}/target/release/mooncake-store-admin" \
+  "${BUILD_GIT_BRANCH}" \
+  "${BUILD_GIT_COMMIT}" \
+  "${BUILD_TIME}"
 import base64
 import csv
 import hashlib
+import json
 import pathlib
 import shutil
 import stat
@@ -304,6 +311,9 @@ upstream_build_dir = pathlib.Path(sys.argv[3])
 transport_build_dir = pathlib.Path(sys.argv[4])
 store_client_path = pathlib.Path(sys.argv[5])
 store_admin_path = pathlib.Path(sys.argv[6])
+build_git_branch = sys.argv[7]
+build_git_commit = sys.argv[8]
+build_time = sys.argv[9]
 upstream_py_dir = repo_root / "third_party" / "Mooncake" / "mooncake-wheel" / "mooncake"
 transport_shim_out_dirs = sorted(transport_build_dir.glob("mooncake-transport-sys-*/out"))
 
@@ -390,6 +400,19 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
 
     for name in python_assets:
         shutil.copy2(upstream_py_dir / name, package_root / name)
+
+    (package_root / "build-info.json").write_text(
+        json.dumps(
+            {
+                "branch": build_git_branch,
+                "commit": build_git_commit,
+                "build_time": build_time,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     dist_info = next(root.glob("*.dist-info"))
     record_path = dist_info / "RECORD"

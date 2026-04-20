@@ -3,6 +3,8 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 
+from ._build_info import BUILD_INFO
+
 _STORE_EXPORTS = {
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
@@ -22,7 +24,22 @@ try:
 except PackageNotFoundError:
     __version__ = "1.0.0+pro.1"
 
-__all__ = sorted(_STORE_EXPORTS | {"__edition__", "__version__"})
+__build_branch__ = BUILD_INFO["branch"]
+__build_commit__ = BUILD_INFO["commit"]
+__build_time__ = BUILD_INFO["build_time"]
+__build_info__ = dict(BUILD_INFO)
+
+__all__ = sorted(
+    _STORE_EXPORTS
+    | {
+        "__build_branch__",
+        "__build_commit__",
+        "__build_info__",
+        "__build_time__",
+        "__edition__",
+        "__version__",
+    }
+)
 
 
 def __getattr__(name: str):
