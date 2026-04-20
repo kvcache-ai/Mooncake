@@ -101,6 +101,9 @@ struct CountingMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     list_live_clients_calls: AtomicUsize,
     get_object_route_calls: AtomicUsize,
+    upsert_client_lease_calls: AtomicUsize,
+    update_client_state_calls: AtomicUsize,
+    reject_state_patch: bool,
 }
 
 struct FinalizeFailureMetadataBackend {
@@ -205,10 +208,20 @@ struct RecoverableMetadataState {
 
 impl CountingMetadataBackend {
     fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
+        Self::with_reject_state_patch(inner, false)
+    }
+
+    fn with_reject_state_patch(
+        inner: Arc<InMemoryMetadataBackend>,
+        reject_state_patch: bool,
+    ) -> Self {
         Self {
             inner,
             list_live_clients_calls: AtomicUsize::new(0),
             get_object_route_calls: AtomicUsize::new(0),
+            upsert_client_lease_calls: AtomicUsize::new(0),
+            update_client_state_calls: AtomicUsize::new(0),
+            reject_state_patch,
         }
     }
 
@@ -218,6 +231,14 @@ impl CountingMetadataBackend {
 
     fn get_object_route_calls(&self) -> usize {
         self.get_object_route_calls.load(Ordering::Relaxed)
+    }
+
+    fn upsert_client_lease_calls(&self) -> usize {
+        self.upsert_client_lease_calls.load(Ordering::Relaxed)
+    }
+
+    fn update_client_state_calls(&self) -> usize {
+        self.update_client_state_calls.load(Ordering::Relaxed)
     }
 }
 
@@ -801,6 +822,8 @@ impl MetadataBackend for CountingMetadataBackend {
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+        self.upsert_client_lease_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.upsert_client_lease(lease)
     }
 
@@ -809,6 +832,11 @@ impl MetadataBackend for CountingMetadataBackend {
         runtime: &ClientRuntimeId,
         next: ClientLifecycleState,
     ) -> mooncake_store_core::Result<()> {
+        self.update_client_state_calls
+            .fetch_add(1, Ordering::Relaxed);
+        if self.reject_state_patch {
+            return Err(StoreError::NotFound(runtime.storage_key()));
+        }
         self.inner.update_client_state(runtime, next)
     }
 
@@ -7681,6 +7709,33 @@ fn builder_can_stage_active_until_local_memory_registration() {
 }
 
 #[test]
+fn staged_activation_republishes_lease_without_state_patch() {
+    let metadata = Arc::new(CountingMetadataBackend::with_reject_state_patch(
+        Arc::new(InMemoryMetadataBackend::new()),
+        true,
+    ));
+    let transport = Arc::new(TestTransport::new("staged-active-refresh-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "staged-active-refresh")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .activate_on_local_memory_registration()
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(storage_config_with_bytes(512))
+        .build(test_future_expiry_ms())
+        .expect("staged client should build");
+
+    let upserts_before = metadata.upsert_client_lease_calls();
+    client
+        .register_local_memory()
+        .expect("local memory registration should republish the active lease");
+
+    assert_eq!(client.lease().state, ClientLifecycleState::Active);
+    assert_eq!(metadata.update_client_state_calls(), 0);
+    assert!(metadata.upsert_client_lease_calls() > upserts_before);
+}
+
+#[test]
 fn heartbeat_keeps_staged_client_active_after_local_memory_registration() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("staged-heartbeat-segment"));
@@ -7708,6 +7763,32 @@ fn heartbeat_keeps_staged_client_active_after_local_memory_registration() {
         .find(|lease| lease.runtime == *client.runtime_id())
         .expect("heartbeat lease should exist");
     assert_eq!(lease.state, ClientLifecycleState::Active);
+}
+
+#[test]
+fn activate_republishes_lease_without_state_patch() {
+    let metadata = Arc::new(CountingMetadataBackend::with_reject_state_patch(
+        Arc::new(InMemoryMetadataBackend::new()),
+        true,
+    ));
+    let transport = Arc::new(TestTransport::new("activate-refresh-segment"));
+    let mut client = StoreClientBuilder::new(metadata.clone(), "activate-refresh")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Standby)
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(storage_config_with_bytes(512))
+        .build(test_future_expiry_ms())
+        .expect("standby client should build");
+
+    let upserts_before = metadata.upsert_client_lease_calls();
+    client
+        .activate()
+        .expect("activate should republish the lease instead of patching state");
+
+    assert_eq!(client.lease().state, ClientLifecycleState::Active);
+    assert_eq!(metadata.update_client_state_calls(), 0);
+    assert!(metadata.upsert_client_lease_calls() > upserts_before);
 }
 
 #[test]

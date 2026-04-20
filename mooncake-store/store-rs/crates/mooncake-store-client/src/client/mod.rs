@@ -80,6 +80,7 @@ pub struct StoreClient {
     allocator: Arc<Mutex<LocalAllocatorState>>,
     storage_owner: Arc<StorageOwnerState>,
     lease: ClientLease,
+    lease_ttl_ms: u64,
     live_client_cache: SharedLiveClientCache,
     suspect_runtime_cache: SharedSuspectRuntimeCache,
     membership_sync: MembershipSyncHandle,
@@ -113,6 +114,7 @@ enum HealthUpdateKind {
 pub struct HealthChannel {
     metadata: Arc<dyn MetadataBackend>,
     lease: Mutex<ClientLease>,
+    lease_ttl_ms: u64,
 }
 
 pub struct HealthUpdate {
@@ -243,10 +245,11 @@ impl StoreClient {
 }
 
 impl HealthChannel {
-    pub fn new(metadata: Arc<dyn MetadataBackend>, lease: ClientLease) -> Self {
+    pub fn new(metadata: Arc<dyn MetadataBackend>, lease: ClientLease, lease_ttl_ms: u64) -> Self {
         Self {
             metadata,
             lease: Mutex::new(lease),
+            lease_ttl_ms: lease_ttl_ms.max(1),
         }
     }
 
@@ -263,6 +266,9 @@ impl HealthChannel {
     ) -> HealthUpdate {
         let mut lease = self.lease.lock();
         lease.state = next_state;
+        lease.expires_at_ms = lease
+            .expires_at_ms
+            .max(now_ms().saturating_add(self.lease_ttl_ms));
         HealthUpdate::state_transition(self.metadata.clone(), lease.clone(), operation)
     }
 
@@ -324,7 +330,7 @@ impl HealthUpdate {
                 )
                 .entered();
                 let tracker = OperationTracker::new(operation);
-                let result = metadata.update_client_state(&lease.runtime, lease.state);
+                let result = metadata.upsert_client_lease(&lease);
                 tracker.finish(&result, 0);
                 result
             }

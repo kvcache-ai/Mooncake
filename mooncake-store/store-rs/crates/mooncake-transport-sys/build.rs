@@ -1,6 +1,8 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_DIR");
@@ -227,7 +229,11 @@ fn ensure_upstream_native_artifacts(
 
     let transfer_engine = build_dir.join("mooncake-transfer-engine/src/libtransfer_engine.so");
     let tent_shared = build_dir.join("mooncake-transfer-engine/tent/src/libtent_shared.so");
-    if transfer_engine.exists() && tent_shared.exists() {
+    if native_artifacts_are_fresh(
+        upstream_dir,
+        build_dir,
+        &[transfer_engine.as_path(), tent_shared.as_path()],
+    ) {
         return;
     }
 
@@ -321,6 +327,71 @@ fn ensure_upstream_native_artifacts(
             .arg("-j8"),
         "build upstream Mooncake TE/TENT",
     );
+}
+
+fn native_artifacts_are_fresh(upstream_dir: &Path, build_dir: &Path, artifacts: &[&Path]) -> bool {
+    if artifacts.iter().any(|artifact| !artifact.exists()) {
+        return false;
+    }
+
+    let Some(oldest_artifact_mtime) = artifacts
+        .iter()
+        .filter_map(|artifact| file_mtime(artifact))
+        .min()
+    else {
+        return false;
+    };
+
+    let Some(latest_source_mtime) = latest_source_mtime(upstream_dir, build_dir) else {
+        return false;
+    };
+
+    oldest_artifact_mtime >= latest_source_mtime
+}
+
+fn latest_source_mtime(upstream_dir: &Path, build_dir: &Path) -> Option<SystemTime> {
+    latest_tree_mtime(upstream_dir, build_dir).or_else(|| file_mtime(upstream_dir))
+}
+
+fn latest_tree_mtime(path: &Path, build_dir: &Path) -> Option<SystemTime> {
+    if ignore_source_path(path, build_dir) {
+        return None;
+    }
+
+    let metadata = fs::metadata(path).ok()?;
+    let mut latest = metadata.modified().ok();
+    if !metadata.is_dir() {
+        return latest;
+    }
+
+    let entries = fs::read_dir(path).ok()?;
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if ignore_source_path(&child, build_dir) {
+            continue;
+        }
+        if let Some(candidate) = latest_tree_mtime(&child, build_dir) {
+            latest = Some(match latest {
+                Some(current) if current >= candidate => current,
+                _ => candidate,
+            });
+        }
+    }
+    latest
+}
+
+fn ignore_source_path(path: &Path, build_dir: &Path) -> bool {
+    if path.starts_with(build_dir) {
+        return true;
+    }
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".git" | "build-rust" | "build-wheel-compat")
+    )
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
 }
 
 fn build_native_shims(upstream_dir: &Path, build_dir: &Path, out_dir: &Path) {

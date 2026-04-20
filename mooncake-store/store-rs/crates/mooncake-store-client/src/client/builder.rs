@@ -292,6 +292,7 @@ impl StoreClientBuilder {
                 "route_topk must be greater than or equal to 2".to_string(),
             ));
         }
+        let lease_ttl_ms = expires_at_ms.saturating_sub(now_ms()).max(1);
 
         let mut endpoints = self.endpoints;
         normalize_storage_label(&self.local_memory, &mut endpoints.labels)?;
@@ -446,6 +447,7 @@ impl StoreClientBuilder {
             allocator,
             storage_owner,
             lease,
+            lease_ttl_ms,
             live_client_cache,
             suspect_runtime_cache,
             membership_sync,
