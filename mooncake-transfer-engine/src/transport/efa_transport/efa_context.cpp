@@ -502,8 +502,27 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
         int ret = new_endpoint->construct(cq->cq, &cq->outstanding, 1, 4,
                                           globalConfig().max_wr, 64);
         if (ret != 0) {
-            LOG(ERROR) << "Failed to construct EFA endpoint";
-            return nullptr;
+            // fi_enable can return -FI_ENOMEM when the device is at its QP
+            // cap (768/device on p6-B300). Evict stale endpoints and retry
+            // once before giving up. This is a rare failure path (only hit
+            // on resource exhaustion), so the ~30 ms eviction scan is
+            // acceptable, and it lets callers that drift endpoint keys
+            // (e.g. keys carrying a timestamp) recover instead of failing
+            // permanently.
+            size_t evicted =
+                endpoint_store_ ? endpoint_store_->evictStale() : 0;
+            if (evicted > 0) {
+                LOG(INFO) << "EfaContext::endpoint: construct failed, "
+                          << "evicted " << evicted
+                          << " stale endpoints, retrying";
+                new_endpoint = std::make_shared<EfaEndPoint>(*this);
+                ret = new_endpoint->construct(cq->cq, &cq->outstanding, 1, 4,
+                                              globalConfig().max_wr, 64);
+            }
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to construct EFA endpoint";
+                return nullptr;
+            }
         }
     }
     // Still set the full peer_nic_path (with port) for handshake routing
@@ -625,11 +644,18 @@ int EfaContext::submitPostSend(
 
         // Submit to endpoint
         std::vector<Transport::Slice*> failed_slice_list;
-        ep->submitPostSend(peer_slices, failed_slice_list);
+        int rc = ep->submitPostSend(peer_slices, failed_slice_list);
 
         // Handle any slices that failed to post
         for (auto* slice : failed_slice_list) {
             slice->markFailed();
+        }
+
+        // If the endpoint is no longer connected after submit (e.g.
+        // setupConnectionsByActive failed inside submitPostSend), drop it
+        // so its QP is released instead of occupying an AV/QP slot forever.
+        if (rc != 0 && !ep->connected()) {
+            deleteEndpoint(normalizeNicPath(peer_nic_path));
         }
     }
 

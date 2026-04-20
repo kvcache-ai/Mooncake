@@ -739,7 +739,16 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
                         return -1;
                     }
                     if (ep->connected()) return 0;
-                    return ep->setupConnectionsByActive();
+                    int rc = ep->setupConnectionsByActive();
+                    if (rc != 0) {
+                        // Handshake failed: drop the endpoint so its fid_ep
+                        // is destroyed and the QP is released. Without this,
+                        // callers that retry with drifting keys (e.g. keys
+                        // carrying a timestamp) accumulate dead endpoints
+                        // until fi_enable returns ENOMEM at ~768 QP/device.
+                        ctx->deleteEndpoint(normalizeNicPath(path));
+                    }
+                    return rc;
                 }));
         }
     }
