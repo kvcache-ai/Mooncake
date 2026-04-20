@@ -3,6 +3,7 @@ mod process;
 pub(crate) mod registry;
 
 use is_terminal::IsTerminal;
+use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -329,6 +330,12 @@ pub fn render_prometheus_metrics() -> String {
     exporter::render_prometheus_metrics(&snapshot_metrics())
 }
 
+pub fn render_stats_json() -> String {
+    let snapshot = snapshot_metrics();
+    serde_json::to_string(&StatsSnapshot::from_metrics(snapshot))
+        .expect("stats snapshot serialization should succeed")
+}
+
 pub fn snapshot_metrics() -> MetricsSnapshot {
     registry::snapshot_metrics(process::snapshot_process())
 }
@@ -387,6 +394,11 @@ fn handle_metrics_http_connection(mut stream: TcpStream) {
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
             render_prometheus_metrics(),
+        ),
+        "/stats" => (
+            "200 OK",
+            "application/json; charset=utf-8",
+            render_stats_json(),
         ),
         "/healthz" | "/livez" => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
         _ => (
@@ -447,6 +459,133 @@ fn result_label<T>(result: &Result<T>) -> &'static str {
         Err(StoreError::Conflict(_)) => "conflict",
         Err(_) => "error",
     }
+}
+
+#[derive(Serialize)]
+struct StatsSnapshot {
+    process: StatsProcessSnapshot,
+    operations: Vec<StatsOperationSnapshot>,
+    runtimes: Vec<StatsRuntimeSnapshot>,
+    segments: Vec<StatsSegmentSnapshot>,
+}
+
+impl StatsSnapshot {
+    fn from_metrics(snapshot: MetricsSnapshot) -> Self {
+        let mut runtimes = std::collections::BTreeMap::<String, StatsRuntimeSnapshot>::new();
+        for sample in snapshot.runtime_status {
+            let runtime = sample.key.runtime;
+            let entry = runtimes
+                .entry(runtime.clone())
+                .or_insert_with(|| StatsRuntimeSnapshot::new(runtime));
+            if sample.value >= 0.5 {
+                entry.state = Some(sample.key.state.to_string());
+            }
+        }
+        for sample in snapshot.runtime_lease_expires_at_ms {
+            let runtime = sample.key.runtime;
+            let entry = runtimes
+                .entry(runtime.clone())
+                .or_insert_with(|| StatsRuntimeSnapshot::new(runtime));
+            entry.lease_expires_at_ms = Some(sample.value.max(0.0) as u64);
+        }
+        for sample in snapshot.heartbeat_consecutive_failures {
+            let runtime = sample.key.runtime;
+            let entry = runtimes
+                .entry(runtime.clone())
+                .or_insert_with(|| StatsRuntimeSnapshot::new(runtime));
+            entry.heartbeat_consecutive_failures = Some(sample.value.max(0.0) as u64);
+        }
+        for sample in snapshot.heartbeat_last_success_ms {
+            let runtime = sample.key.runtime;
+            let entry = runtimes
+                .entry(runtime.clone())
+                .or_insert_with(|| StatsRuntimeSnapshot::new(runtime));
+            entry.heartbeat_last_success_ms = Some(sample.value.max(0.0) as u64);
+        }
+
+        Self {
+            process: StatsProcessSnapshot {
+                cpu_seconds_total: snapshot.process.cpu_seconds_total,
+                resident_memory_bytes: snapshot.process.resident_memory_bytes,
+                open_fds: snapshot.process.open_fds,
+            },
+            operations: snapshot
+                .operations
+                .into_iter()
+                .map(|operation| StatsOperationSnapshot {
+                    operation: operation.operation,
+                    status: operation.status,
+                    calls_total: operation.calls_total,
+                    bytes_in_total: operation.bytes_in_total,
+                    bytes_out_total: operation.bytes_out_total,
+                    latency_total_us: operation.latency_total_us,
+                    latency_max_us: operation.latency_max_us,
+                })
+                .collect(),
+            runtimes: runtimes.into_values().collect(),
+            segments: snapshot
+                .segments
+                .into_iter()
+                .map(|segment| StatsSegmentSnapshot {
+                    runtime: segment.runtime,
+                    segment: segment.segment,
+                    state: segment.state,
+                    tier: segment.tier,
+                    capacity_bytes: segment.capacity_bytes,
+                    used_bytes: segment.used_bytes,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StatsProcessSnapshot {
+    cpu_seconds_total: f64,
+    resident_memory_bytes: u64,
+    open_fds: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct StatsOperationSnapshot {
+    operation: &'static str,
+    status: &'static str,
+    calls_total: u64,
+    bytes_in_total: u64,
+    bytes_out_total: u64,
+    latency_total_us: u64,
+    latency_max_us: u64,
+}
+
+#[derive(Serialize)]
+struct StatsRuntimeSnapshot {
+    runtime: String,
+    state: Option<String>,
+    lease_expires_at_ms: Option<u64>,
+    heartbeat_consecutive_failures: Option<u64>,
+    heartbeat_last_success_ms: Option<u64>,
+}
+
+impl StatsRuntimeSnapshot {
+    fn new(runtime: String) -> Self {
+        Self {
+            runtime,
+            state: None,
+            lease_expires_at_ms: None,
+            heartbeat_consecutive_failures: None,
+            heartbeat_last_success_ms: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StatsSegmentSnapshot {
+    runtime: String,
+    segment: String,
+    state: &'static str,
+    tier: &'static str,
+    capacity_bytes: u64,
+    used_bytes: u64,
 }
 
 #[cfg(test)]
@@ -536,6 +675,48 @@ mod tests {
         let response = http_get(&address, "/healthz");
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("ok\n"));
+        stop_metrics_http_server().expect("metrics server should stop");
+    }
+
+    #[test]
+    fn metrics_http_server_serves_stats_json() {
+        let _guard = metrics_test_lock().lock();
+        reset_metrics();
+        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+
+        let result = Ok(());
+        OperationTracker::new("storage_owner_background_eviction")
+            .input_bytes(32)
+            .finish(&result, 64);
+        let runtime = sample_runtime_lease("runtime-stats");
+        registry::record_runtime_leases(std::slice::from_ref(&runtime));
+        registry::record_heartbeat_health(&runtime.runtime.to_string(), 2, 456_789);
+
+        let address = start_metrics_http_server("127.0.0.1:0")
+            .expect("metrics server should start on an ephemeral port");
+        let response = http_get(&address, "/stats");
+
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("Content-Type: application/json; charset=utf-8"));
+        let body = response
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("http response should contain a body");
+        let value: serde_json::Value =
+            serde_json::from_str(body).expect("stats endpoint should return valid json");
+        assert_eq!(
+            value["operations"][0]["operation"],
+            serde_json::Value::String("storage_owner_background_eviction".to_string())
+        );
+        assert_eq!(
+            value["runtimes"][0]["runtime"],
+            serde_json::Value::String(runtime.runtime.to_string())
+        );
+        assert_eq!(
+            value["runtimes"][0]["heartbeat_consecutive_failures"],
+            serde_json::Value::from(2_u64)
+        );
+
         stop_metrics_http_server().expect("metrics server should stop");
     }
 
