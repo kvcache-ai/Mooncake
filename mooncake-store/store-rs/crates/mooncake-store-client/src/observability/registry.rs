@@ -39,6 +39,7 @@ pub(crate) const TENANT_QUOTA_RESERVATION_TOTAL: &str =
 pub(crate) const TENANT_QUOTA_FINALIZE_TOTAL: &str = "mooncake_store_tenant_quota_finalize_total";
 pub(crate) const TENANT_QUOTA_ABORT_TOTAL: &str = "mooncake_store_tenant_quota_abort_total";
 pub(crate) const TENANT_QUOTA_RECONCILE_TOTAL: &str = "mooncake_store_tenant_quota_reconcile_total";
+pub(crate) const TENANT_LOCAL_EVICTION_TOTAL: &str = "mooncake_store_tenant_local_eviction_total";
 pub(crate) const REBALANCE_ROUTES_TOTAL: &str = "mooncake_store_rebalance_routes_total";
 pub(crate) const REBALANCE_BYTES_TOTAL: &str = "mooncake_store_rebalance_bytes_total";
 pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecycle_total";
@@ -80,6 +81,7 @@ pub struct MetricsSnapshot {
     pub tenant_quota_finalize: Vec<CounterSample<ResultKey>>,
     pub tenant_quota_abort: Vec<CounterSample<ResultKey>>,
     pub tenant_quota_reconcile: Vec<CounterSample<ResultKey>>,
+    pub tenant_local_eviction: Vec<CounterSample<ResultKey>>,
     pub rebalance_routes: Vec<CounterSample<PhaseResultKey>>,
     pub rebalance_bytes: Vec<CounterSample<PhaseKey>>,
     pub segment_lifecycle: Vec<CounterSample<ActionResultKey>>,
@@ -348,6 +350,7 @@ struct MetricsRegistry {
     tenant_quota_finalize: CounterFamily<ResultKey>,
     tenant_quota_abort: CounterFamily<ResultKey>,
     tenant_quota_reconcile: CounterFamily<ResultKey>,
+    tenant_local_eviction: CounterFamily<ResultKey>,
     rebalance_routes: CounterFamily<PhaseResultKey>,
     rebalance_bytes: CounterFamily<PhaseKey>,
     segment_lifecycle: CounterFamily<ActionResultKey>,
@@ -456,6 +459,7 @@ impl MetricsRegistry {
             tenant_quota_finalize: self.tenant_quota_finalize.snapshot(),
             tenant_quota_abort: self.tenant_quota_abort.snapshot(),
             tenant_quota_reconcile: self.tenant_quota_reconcile.snapshot(),
+            tenant_local_eviction: self.tenant_local_eviction.snapshot(),
             rebalance_routes: self.rebalance_routes.snapshot(),
             rebalance_bytes: self.rebalance_bytes.snapshot(),
             segment_lifecycle: self.segment_lifecycle.snapshot(),
@@ -628,6 +632,14 @@ pub(crate) fn record_tenant_quota_reconcile(result: &'static str) {
     global_metrics_registry()
         .lock()
         .tenant_quota_reconcile
+        .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_tenant_local_eviction(result: &'static str) {
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .tenant_local_eviction
         .add(ResultKey { result }, 1);
 }
 

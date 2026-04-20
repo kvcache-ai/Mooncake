@@ -8,8 +8,8 @@ use super::registry::{
     REPLICA_DISTRIBUTION, REQUEST_BYTES, REQUEST_DURATION, REQUEST_DURATION_BUCKETS,
     REQUEST_INFLIGHT, REQUEST_TOTAL, ROUTE_CAS_TOTAL, RUNTIME_LEASE_EXPIRES_AT_MS, RUNTIME_STATUS,
     SEGMENT_CAPACITY_BYTES, SEGMENT_LIFECYCLE_TOTAL, SEGMENT_USED_BYTES, TENANT_QUOTA_ABORT_TOTAL,
-    TENANT_QUOTA_FINALIZE_TOTAL, TENANT_QUOTA_RECONCILE_TOTAL, TENANT_QUOTA_RESERVATION_TOTAL,
-    TRANSPORT_BYTES_TOTAL,
+    TENANT_LOCAL_EVICTION_TOTAL, TENANT_QUOTA_FINALIZE_TOTAL, TENANT_QUOTA_RECONCILE_TOTAL,
+    TENANT_QUOTA_RESERVATION_TOTAL, TRANSPORT_BYTES_TOTAL,
 };
 
 pub(crate) fn render_prometheus_metrics(snapshot: &MetricsSnapshot) -> String {
@@ -357,6 +357,17 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
         output,
         TENANT_QUOTA_RECONCILE_TOTAL,
         &snapshot.tenant_quota_reconcile,
+    );
+
+    counter_family(
+        output,
+        TENANT_LOCAL_EVICTION_TOTAL,
+        "Tenant-local quota eviction outcomes.",
+    );
+    for_result_counter(
+        output,
+        TENANT_LOCAL_EVICTION_TOTAL,
+        &snapshot.tenant_local_eviction,
     );
 }
 

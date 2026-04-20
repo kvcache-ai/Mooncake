@@ -1,3 +1,5 @@
+const MAX_TENANT_LOCAL_EVICTION_ATTEMPTS: usize = 8;
+
 impl StoreClient {
     fn expect_exactly_one_control_plane_result<T>(
         items: Vec<T>,
@@ -10,15 +12,31 @@ impl StoreClient {
             })
     }
 
-    fn tenant_quota_policy(&self) -> Option<TenantQuotaPolicy> {
-        self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
-            max_bytes: quota.max_bytes,
-            max_objects: quota.max_objects,
-        })
+    fn tenant_quota_policy_for_object(
+        &self,
+        object_id: &LogicalObjectId,
+    ) -> Result<Option<TenantQuotaPolicy>> {
+        let scope = TenantPolicyScope::new(object_id.scope.tenant.as_str(), None::<String>, None::<String>);
+        if let Some(policy) = self.metadata.get_tenant_policy(&scope)? {
+            if let Some(quota) = policy.spec.quota {
+                return Ok(Some(quota));
+            }
+        }
+        if object_id.scope.tenant == self.default_tenant() {
+            return Ok(self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
+                max_bytes: quota.max_bytes,
+                max_objects: quota.max_objects,
+            }));
+        }
+        Ok(None)
     }
 
     fn tenant_quota_scope(&self, object_id: &LogicalObjectId) -> TenantPolicyScope {
         TenantPolicyScope::new(object_id.scope.tenant.clone(), None::<String>, None::<String>)
+    }
+
+    fn tenant_quota_eviction_scope(&self, object_id: &LogicalObjectId) -> NamespaceScope {
+        NamespaceScope::with_defaults(Some(object_id.scope.tenant.as_str()), None, None)
     }
 
     fn route_committed_length(route: Option<&ObjectRoute>) -> u64 {
@@ -48,7 +66,7 @@ impl StoreClient {
         current: Option<&ObjectRoute>,
         value_len: usize,
     ) -> Result<Option<TenantQuotaReservationRequest>> {
-        let Some(limit) = self.tenant_quota_policy() else {
+        let Some(limit) = self.tenant_quota_policy_for_object(object_id)? else {
             return Ok(None);
         };
         let current_object = self.metadata.get_tenant_object_accounting(scoped_key)?;
@@ -59,7 +77,7 @@ impl StoreClient {
         let delta_bytes = value_len as i64 - previous_len as i64;
         let delta_objects = if previous_len == 0 { 1 } else { 0 };
         let created_at_ms = now_ms();
-        let request = TenantQuotaReservationRequest {
+        let mut request = TenantQuotaReservationRequest {
             reservation_id: self.next_tenant_quota_reservation_id(object_id),
             scope: self.tenant_quota_scope(object_id),
             key: scoped_key.clone(),
@@ -71,14 +89,74 @@ impl StoreClient {
             created_at_ms,
             writer_runtime: self.lease.runtime.clone(),
         };
-        let reserve_result = self.metadata.reserve_tenant_quota(&request);
-        registry::record_tenant_quota_reservation(match &reserve_result {
-            Ok(_) => "ok",
-            Err(StoreError::Conflict(_)) => "conflict",
-            Err(_) => "error",
+        for _ in 0..MAX_TENANT_LOCAL_EVICTION_ATTEMPTS {
+            let reserve_result = self.metadata.reserve_tenant_quota(&request);
+            registry::record_tenant_quota_reservation(match &reserve_result {
+                Ok(_) => "ok",
+                Err(StoreError::Conflict(_)) => "conflict",
+                Err(_) => "error",
+            });
+            match reserve_result {
+                Ok(_) => return Ok(Some(request)),
+                Err(StoreError::Conflict(message))
+                    if message.contains("tenant quota bytes exceeded")
+                        || message.contains("tenant quota objects exceeded") =>
+                {
+                    if !self.try_evict_one_object_in_tenant(object_id, scoped_key)? {
+                        registry::record_tenant_local_eviction("miss");
+                        return Err(StoreError::Conflict(message));
+                    }
+                    registry::record_tenant_local_eviction("ok");
+                    let refreshed = self.metadata.get_tenant_object_accounting(scoped_key)?;
+                    request.expected_object_version =
+                        refreshed.as_ref().map(|object| object.version);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(StoreError::Conflict(format!(
+            "tenant-local quota eviction exhausted retries for {}",
+            scoped_key.0
+        )))
+    }
+
+    fn try_evict_one_object_in_tenant(
+        &self,
+        object_id: &LogicalObjectId,
+        scoped_key: &ObjectKey,
+    ) -> Result<bool> {
+        let scope = self.tenant_quota_eviction_scope(object_id);
+        let mut routes = self
+            .list_routes_in_scope(&scope)?
+            .into_iter()
+            .filter(|route| route.key != *scoped_key && route.state == RouteState::Active)
+            .collect::<Vec<_>>();
+        routes.sort_by(|left, right| {
+            let left_len = Self::route_committed_length(Some(left));
+            let right_len = Self::route_committed_length(Some(right));
+            left
+                .version
+                .0
+                .cmp(&right.version.0)
+                .then_with(|| right_len.cmp(&left_len))
         });
-        reserve_result?;
-        Ok(Some(request))
+        for route in routes {
+            let victim = match mooncake_store_core::route_logical_object_id(&route) {
+                Ok(victim) => victim,
+                Err(_) => continue,
+            };
+            if victim.scope.tenant != object_id.scope.tenant {
+                continue;
+            }
+            if self
+                .remove_in_tenant(victim.scope.tenant.as_str(), victim.logical_key.as_str(), true)
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn reserve_tenant_quota_for_delete(
@@ -87,7 +165,7 @@ impl StoreClient {
         scoped_key: &ObjectKey,
         route: &ObjectRoute,
     ) -> Result<Option<TenantQuotaReservationRequest>> {
-        let Some(limit) = self.tenant_quota_policy() else {
+        let Some(limit) = self.tenant_quota_policy_for_object(object_id)? else {
             return Ok(None);
         };
         let current_object = self.metadata.get_tenant_object_accounting(scoped_key)?;

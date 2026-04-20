@@ -7673,7 +7673,9 @@ fn builder_resolves_scoped_tenant_policy_without_listing_all_policies() {
 }
 
 #[test]
-fn namespace_quota_rejects_over_limit_writes() {
+fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     metadata
         .put_tenant_policy(
@@ -7710,27 +7712,83 @@ fn namespace_quota_rejects_over_limit_writes() {
     client
         .put("small", b"1234")
         .expect("first put should fit quota");
-    let bytes_error = client
-        .put("big", b"123456")
-        .expect_err("second put should exceed byte quota");
-    assert!(matches!(
-        bytes_error,
-        StoreError::Conflict(_) | StoreError::Metadata(_)
-    ));
-    assert!(bytes_error
-        .to_string()
-        .contains("tenant quota bytes exceeded"));
+    client
+        .put("big", b"12345")
+        .expect("second put should evict the older object in the same tenant");
+
+    assert!(client
+        .query_route_in_tenant("tenant-a", "small")
+        .expect("small route lookup should succeed")
+        .is_none());
+    assert_eq!(
+        client
+            .get("big")
+            .expect("big should remain readable after tenant-local eviction"),
+        b"12345"
+    );
+
+    let metrics = snapshot_metrics();
+    let tenant_local_evictions = metrics
+        .tenant_local_eviction
+        .iter()
+        .find(|sample| sample.key.result == "ok")
+        .map(|sample| sample.value)
+        .unwrap_or(0);
+    let quota_ok = metrics
+        .tenant_quota_reservation
+        .iter()
+        .find(|sample| sample.key.result == "ok")
+        .map(|sample| sample.value)
+        .unwrap_or(0);
+    assert!(
+        tenant_local_evictions >= 1,
+        "quota exhaustion path should record at least one successful tenant-local eviction"
+    );
+    assert!(
+        quota_ok >= 2,
+        "successful writes should still record successful quota reservations"
+    );
+
+    let quota_after_success = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("quota state should load after successful eviction write")
+        .expect("quota state should exist after successful eviction write");
+    assert!(
+        quota_after_success.used_bytes <= 5,
+        "tenant usage must stay within byte quota after successful eviction write; used_bytes={}",
+        quota_after_success.used_bytes
+    );
+    assert!(
+        quota_after_success.used_objects <= 1,
+        "tenant usage must stay within object quota after successful eviction write; used_objects={} ",
+        quota_after_success.used_objects
+    );
+    assert_eq!(quota_after_success.pending_reserved_bytes, 0);
+    assert_eq!(quota_after_success.pending_reserved_objects, 0);
 
     let objects_error = client
-        .put("other", b"1")
-        .expect_err("second object should exceed object quota");
+        .put("other", b"123456")
+        .expect_err("oversized object should still be rejected when nothing can make room");
     assert!(matches!(
         objects_error,
         StoreError::Conflict(_) | StoreError::Metadata(_)
     ));
     assert!(objects_error
         .to_string()
-        .contains("tenant quota objects exceeded"));
+        .contains("tenant quota bytes exceeded"));
+
+    assert!(client
+        .query_route_in_tenant("tenant-a", "big")
+        .expect("big route lookup after oversized write should succeed")
+        .is_none());
+    assert!(client
+        .query_route_in_tenant("tenant-a", "other")
+        .expect("oversized route lookup should succeed")
+        .is_none());
 
     let quota = metadata
         .get_tenant_quota_state(&TenantPolicyScope::new(
@@ -7740,10 +7798,32 @@ fn namespace_quota_rejects_over_limit_writes() {
         ))
         .expect("quota state should load")
         .expect("quota state should exist");
-    assert_eq!(quota.used_bytes, 4);
-    assert_eq!(quota.used_objects, 1);
+    assert!(
+        quota.used_bytes <= 5,
+        "tenant usage must not exceed byte quota after failed oversized write; used_bytes={}",
+        quota.used_bytes
+    );
+    assert!(
+        quota.used_objects <= 1,
+        "tenant usage must not exceed object quota after failed oversized write; used_objects={}",
+        quota.used_objects
+    );
+    assert_eq!(quota.used_bytes, 0);
+    assert_eq!(quota.used_objects, 0);
     assert_eq!(quota.pending_reserved_bytes, 0);
     assert_eq!(quota.pending_reserved_objects, 0);
+
+    let metrics_after_failure = snapshot_metrics();
+    let tenant_local_eviction_misses = metrics_after_failure
+        .tenant_local_eviction
+        .iter()
+        .find(|sample| sample.key.result == "miss")
+        .map(|sample| sample.value)
+        .unwrap_or(0);
+    assert!(
+        tenant_local_eviction_misses >= 1,
+        "oversized follow-up write should record a tenant-local eviction miss when nothing else can be evicted"
+    );
 }
 
 #[test]
@@ -7951,6 +8031,129 @@ fn routed_batch_put_rejects_over_quota_all_or_nothing() {
     assert_eq!(quota.used_objects, 0);
     assert_eq!(quota.pending_reserved_bytes, 0);
     assert_eq!(quota.pending_reserved_objects, 0);
+}
+
+#[test]
+fn tenant_local_quota_eviction_does_not_touch_other_tenants() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    for tenant in ["tenant-a", "tenant-b"] {
+        metadata
+            .put_tenant_policy(
+                &TenantPolicy {
+                    scope: TenantPolicyScope::new(tenant, None::<String>, None::<String>),
+                    spec: TenantPolicySpec {
+                        quota: Some(TenantQuotaPolicy {
+                            max_bytes: Some(5),
+                            max_objects: Some(1),
+                        }),
+                        routing: Some(TenantRoutePolicy {
+                            route_topk: Some(2),
+                            route_control: Some(RouteControlMode::MetadataOnly),
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 10,
+                    updated_by: "admin".to_string(),
+                },
+                None,
+            )
+            .expect("tenant quota policy should store");
+    }
+    let transport = Arc::new(TestTransport::new("tenant-local-quota-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "tenant-local-quota-client")
+        .tenant("tenant-a")
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    client
+        .put_in_tenant("tenant-b", "stable", b"BBBB")
+        .expect("tenant-b seed write should succeed");
+    client
+        .put("old", b"AAAA")
+        .expect("tenant-a seed write should succeed");
+    client
+        .put("new", b"AAAAA")
+        .expect("tenant-a replacement write should succeed by evicting tenant-a only");
+
+    assert!(client
+        .query_route_in_tenant("tenant-a", "old")
+        .expect("tenant-a old route lookup should succeed")
+        .is_none());
+    assert_eq!(
+        client
+            .get("new")
+            .expect("tenant-a new value should remain readable after eviction"),
+        b"AAAAA"
+    );
+    assert!(client
+        .query_route_in_tenant("tenant-b", "stable")
+        .expect("tenant-b route lookup should succeed")
+        .is_some());
+
+    let metrics = snapshot_metrics();
+    let tenant_local_evictions = metrics
+        .tenant_local_eviction
+        .iter()
+        .find(|sample| sample.key.result == "ok")
+        .map(|sample| sample.value)
+        .unwrap_or(0);
+    assert!(
+        tenant_local_evictions >= 1,
+        "tenant-a quota pressure should record at least one successful tenant-local eviction"
+    );
+
+    let quota_a = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("tenant-a quota state should load")
+        .expect("tenant-a quota state should exist");
+    let quota_b = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-b",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("tenant-b quota state should load")
+        .expect("tenant-b quota state should exist");
+    assert_eq!(quota_a.used_bytes, 5);
+    assert_eq!(quota_a.used_objects, 1);
+    assert!(
+        quota_a.used_bytes <= 5,
+        "tenant-a usage must stay within byte quota after successful eviction write; used_bytes={}",
+        quota_a.used_bytes
+    );
+    assert!(
+        quota_a.used_objects <= 1,
+        "tenant-a usage must stay within object quota after successful eviction write; used_objects={}",
+        quota_a.used_objects
+    );
+    assert_eq!(quota_b.used_bytes, 4);
+    assert_eq!(quota_b.used_objects, 1);
+    assert!(
+        quota_b.used_bytes <= 5,
+        "tenant-b usage must stay within byte quota; used_bytes={}",
+        quota_b.used_bytes
+    );
+    assert!(
+        quota_b.used_objects <= 1,
+        "tenant-b usage must stay within object quota; used_objects={}",
+        quota_b.used_objects
+    );
+
+    let tenant_b_value = client
+        .get_in_tenant("tenant-b", "stable")
+        .expect("tenant-b value should remain readable");
+    assert_eq!(tenant_b_value, b"BBBB");
 }
 
 #[test]
