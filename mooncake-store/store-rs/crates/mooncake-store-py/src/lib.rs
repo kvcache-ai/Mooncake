@@ -36,10 +36,16 @@ enum StoreBackend {
 }
 
 fn resolve_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
-    if let Some(scope) = worker_scope.map(str::trim).filter(|scope| !scope.is_empty()) {
+    if let Some(scope) = worker_scope
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+    {
         return scope.to_string();
     }
-    if let Some(keyspace) = keyspace.map(str::trim).filter(|keyspace| !keyspace.is_empty()) {
+    if let Some(keyspace) = keyspace
+        .map(str::trim)
+        .filter(|keyspace| !keyspace.is_empty())
+    {
         return keyspace.to_string();
     }
     static NEXT_WORKER_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
@@ -196,7 +202,8 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<i32> {
         let _ = (mem_pool_size, local_buffer_size);
         let worker_scope = resolve_worker_scope(keyspace.as_deref(), worker_scope.as_deref());
-        let session = DummySession::connect(server_address, worker_scope).map_err(store_error_to_py)?;
+        let session =
+            DummySession::connect(server_address, worker_scope).map_err(store_error_to_py)?;
         self.replace_backend(StoreBackend::Dummy(session));
         Ok(0)
     }
@@ -3980,8 +3987,11 @@ mod tests {
         let _use_shm = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
 
         let dispatcher = Arc::new(
-            StoreDispatcher::spawn(build_client("dummy-hot-cache-isolated"), "dummy-hot-cache-isolated")
-                .expect("dispatcher should spawn"),
+            StoreDispatcher::spawn(
+                build_client("dummy-hot-cache-isolated"),
+                "dummy-hot-cache-isolated",
+            )
+            .expect("dispatcher should spawn"),
         );
         dispatcher
             .register_local_memory()
@@ -4005,9 +4015,7 @@ mod tests {
         dispatcher
             .run(|client| client.put("alpha", b"one"))
             .expect("put should succeed");
-        let (status, value) = dummy_a
-            .get("alpha", None)
-            .expect("scope a get should work");
+        let (status, value) = dummy_a.get("alpha", None).expect("scope a get should work");
         assert_eq!(status, 0);
         assert_eq!(value, b"one");
 

@@ -668,17 +668,18 @@ impl DummySession {
         F: FnOnce(pb::dummy_store_service_client::DummyStoreServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
-        self.runtime.block_on(async {
-            tokio::time::timeout(
-                self.rpc_timeout,
-                f(
-                    pb::dummy_store_service_client::DummyStoreServiceClient::new(
-                        self.channel.clone(),
+        self.runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    self.rpc_timeout,
+                    f(
+                        pb::dummy_store_service_client::DummyStoreServiceClient::new(
+                            self.channel.clone(),
+                        ),
                     ),
-                ),
-            )
-            .await
-        })
+                )
+                .await
+            })
             .map_err(|_| {
                 StoreError::Transport(format!(
                     "dummy rpc timed out after {}ms",
