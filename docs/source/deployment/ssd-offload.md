@@ -128,6 +128,11 @@ Best for: general-purpose use, large-scale deployments.
 
 Stores each object in an individual file. Simple and easy to inspect, but generates many small files at scale.
 
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` where objects are stored |
+| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enable disk eviction when the total size exceeds the quota |
+
 Best for: debugging or small-scale deployments.
 
 ### `offset_allocator_storage_backend`
