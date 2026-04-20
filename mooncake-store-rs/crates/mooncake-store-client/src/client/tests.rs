@@ -2262,6 +2262,64 @@ fn routed_batch_put_rejects_duplicate_scoped_keys() {
 }
 
 #[test]
+fn remove_force_true_skips_missing_key() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("client-segment"));
+    let client = StoreClientBuilder::new(metadata, "client-a")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+
+    client
+        .remove("missing-key", true)
+        .expect("force remove should ignore missing key");
+
+    let error = client
+        .remove("missing-key", false)
+        .expect_err("non-force remove should fail for missing key");
+    assert!(matches!(error, StoreError::NotFound(_)));
+}
+
+#[test]
+fn batch_remove_force_true_skips_missing_keys() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("client-segment"));
+    let client = StoreClientBuilder::new(metadata, "client-a")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+
+    client
+        .put("existing-key", b"data")
+        .expect("put should succeed");
+    let objects = [
+        ObjectRef::new("existing-key"),
+        ObjectRef::new("missing-key"),
+    ];
+
+    client
+        .batch_remove(&objects, true)
+        .expect("force batch remove should ignore missing keys");
+    assert!(client
+        .query_route("existing-key")
+        .expect("route query should succeed")
+        .is_none());
+    assert!(client
+        .query_route("missing-key")
+        .expect("route query should succeed")
+        .is_none());
+
+    let error = client
+        .batch_remove(&objects, false)
+        .expect_err("non-force batch remove should fail for missing key");
+    assert!(matches!(error, StoreError::NotFound(_)));
+}
+
+#[test]
 fn batch_get_into_multi_buffers_rejects_insufficient_capacity() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("client-segment"));

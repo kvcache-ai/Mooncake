@@ -620,14 +620,17 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("remove");
-        let _ = force;
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let object_key = ObjectKey::from_logical_id(&object_id);
         let Some(route) = self
             .route_directory
             .get_object_route(&self.lease, &object_key)?
         else {
-            let result = Err(StoreError::NotFound(format!("tenant={tenant} key={key}")));
+            let result = if force {
+                Ok(())
+            } else {
+                Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
+            };
             tracker.finish(&result, 0);
             return result;
         };
@@ -687,6 +690,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 .route_directory
                 .get_object_route(&self.lease, &object_key)?
             else {
+                if force {
+                    continue;
+                }
                 let result = Err(StoreError::NotFound(format!("tenant={tenant} key={}", object.key)));
                 tracker.finish(&result, 0);
                 return result;
