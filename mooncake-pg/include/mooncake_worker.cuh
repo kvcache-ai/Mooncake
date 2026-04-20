@@ -53,7 +53,7 @@ __global__ struct Task {
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
     int bufferOffset;
-    uint64_t submit_sequence = 0;
+    uint64_t submitSequence = 0;
     BatchID batchID;
     void* transferGroupMeta;
 };
