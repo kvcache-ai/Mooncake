@@ -16,19 +16,23 @@ impl StoreClient {
         &self,
         object_id: &LogicalObjectId,
     ) -> Result<Option<TenantQuotaPolicy>> {
-        let scope = TenantPolicyScope::new(object_id.scope.tenant.as_str(), None::<String>, None::<String>);
-        if let Some(policy) = self.metadata.get_tenant_policy(&scope)? {
-            if let Some(quota) = policy.spec.quota {
-                return Ok(Some(quota));
+        let scope = NamespaceScope::with_defaults(
+            Some(object_id.scope.tenant.as_str()),
+            Some(object_id.scope.domain.as_str()),
+            Some(object_id.scope.object_set.as_str()),
+        );
+        let mut resolved = TenantPolicySpec::default();
+        for policy_scope in TenantPolicyScope::ancestors(&scope) {
+            if let Some(policy) = self.metadata.get_tenant_policy(&policy_scope)? {
+                resolved = resolved.merged_with(&policy.spec);
             }
         }
-        if object_id.scope.tenant == self.default_tenant() {
-            return Ok(self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
+        Ok(resolved.quota.or_else(|| {
+            self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
                 max_bytes: quota.max_bytes,
                 max_objects: quota.max_objects,
-            }));
-        }
-        Ok(None)
+            })
+        }))
     }
 
     fn tenant_quota_scope(&self, object_id: &LogicalObjectId) -> TenantPolicyScope {
@@ -143,6 +147,9 @@ impl StoreClient {
                 Ok(victim) => victim,
                 Err(_) => continue,
             };
+            if victim.scope.tenant != object_id.scope.tenant {
+                continue;
+            }
             if self
                 .remove_in_tenant(victim.scope.tenant.as_str(), victim.logical_key.as_str(), true)
                 .is_ok()
