@@ -506,14 +506,8 @@ impl ClassicTeTransport {
         size: usize,
         location: &str,
     ) -> Result<()> {
-        for_each_registration_chunk(
-            addr,
-            size,
-            self.max_registration_bytes,
-            |chunk_addr, chunk_len| {
-                engine.register_local_memory(chunk_addr, chunk_len, location, true)
-            },
-        )
+        let chunks = registration_chunks(addr, size, self.max_registration_bytes)?;
+        engine.register_local_memory_batch(&chunks, location)
     }
 
     fn unregister_memory_with_engine(
@@ -522,9 +516,11 @@ impl ClassicTeTransport {
         addr: *mut c_void,
         size: usize,
     ) -> Result<()> {
-        for_each_registration_chunk(addr, size, self.max_registration_bytes, |chunk_addr, _| {
-            engine.unregister_local_memory(chunk_addr)
-        })
+        let addrs = registration_chunks(addr, size, self.max_registration_bytes)?
+            .into_iter()
+            .map(|(chunk_addr, _)| chunk_addr)
+            .collect::<Vec<_>>();
+        engine.unregister_local_memory_batch(&addrs)
     }
 
     fn buffer_location(&self, base: u64, length: u64) -> String {

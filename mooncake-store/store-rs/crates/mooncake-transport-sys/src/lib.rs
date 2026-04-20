@@ -290,6 +290,13 @@ pub mod classic {
         pub transferred_bytes: u64,
     }
 
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct BufferEntry {
+        pub addr: *mut c_void,
+        pub length: usize,
+    }
+
     struct ClassicApi {
         _transfer_engine: DynamicLibrary,
         _shim: DynamicLibrary,
@@ -315,7 +322,15 @@ pub mod classic {
             *const c_char,
             c_int,
         ) -> c_int,
+        register_local_memory_batch: unsafe extern "C" fn(
+            TransferEngineHandle,
+            *mut BufferEntry,
+            usize,
+            *const c_char,
+        ) -> c_int,
         unregister_local_memory: unsafe extern "C" fn(TransferEngineHandle, *mut c_void) -> c_int,
+        unregister_local_memory_batch:
+            unsafe extern "C" fn(TransferEngineHandle, *mut *mut c_void, usize) -> c_int,
         open_segment: unsafe extern "C" fn(TransferEngineHandle, *const c_char) -> SegmentId,
         open_segment_no_cache:
             unsafe extern "C" fn(TransferEngineHandle, *const c_char) -> SegmentId,
@@ -369,7 +384,12 @@ pub mod classic {
             install_transport: load_symbol(transfer_engine, "installTransport")?,
             destroy_transfer_engine: load_symbol(transfer_engine, "destroyTransferEngine")?,
             register_local_memory: load_symbol(transfer_engine, "registerLocalMemory")?,
+            register_local_memory_batch: load_symbol(transfer_engine, "registerLocalMemoryBatch")?,
             unregister_local_memory: load_symbol(transfer_engine, "unregisterLocalMemory")?,
+            unregister_local_memory_batch: load_symbol(
+                transfer_engine,
+                "unregisterLocalMemoryBatch",
+            )?,
             open_segment: load_symbol(transfer_engine, "openSegment")?,
             open_segment_no_cache: load_symbol(transfer_engine, "openSegmentNoCache")?,
             close_segment: load_symbol(transfer_engine, "closeSegment")?,
@@ -457,11 +477,32 @@ pub mod classic {
         })
     }
 
+    pub unsafe extern "C" fn registerLocalMemoryBatch(
+        engine: TransferEngineHandle,
+        entries: *mut BufferEntry,
+        entry_count: usize,
+        location: *const c_char,
+    ) -> c_int {
+        api().map_or(-1, |api| {
+            (api.register_local_memory_batch)(engine, entries, entry_count, location)
+        })
+    }
+
     pub unsafe extern "C" fn unregisterLocalMemory(
         engine: TransferEngineHandle,
         addr: *mut c_void,
     ) -> c_int {
         api().map_or(-1, |api| (api.unregister_local_memory)(engine, addr))
+    }
+
+    pub unsafe extern "C" fn unregisterLocalMemoryBatch(
+        engine: TransferEngineHandle,
+        addrs: *mut *mut c_void,
+        addr_count: usize,
+    ) -> c_int {
+        api().map_or(-1, |api| {
+            (api.unregister_local_memory_batch)(engine, addrs, addr_count)
+        })
     }
 
     pub unsafe extern "C" fn openSegment(

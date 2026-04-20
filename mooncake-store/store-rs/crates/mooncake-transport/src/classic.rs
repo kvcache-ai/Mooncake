@@ -173,9 +173,49 @@ impl ClassicTransferEngine {
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn register_local_memory_batch(
+        &self,
+        entries: &[(*mut c_void, usize)],
+        location: &str,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let location = to_cstring("location", location)?;
+        let mut native_entries = entries
+            .iter()
+            .map(|(addr, length)| ffi::BufferEntry {
+                addr: *addr,
+                length: *length,
+            })
+            .collect::<Vec<_>>();
+        let rc = unsafe {
+            ffi::registerLocalMemoryBatch(
+                self.raw,
+                native_entries.as_mut_ptr(),
+                native_entries.len(),
+                location.as_ptr(),
+            )
+        };
+        check_zero(rc, "registerLocalMemoryBatch")
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn unregister_local_memory(&self, addr: *mut c_void) -> Result<()> {
         let rc = unsafe { ffi::unregisterLocalMemory(self.raw, addr) };
         check_zero(rc, "unregisterLocalMemory")
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn unregister_local_memory_batch(&self, addrs: &[*mut c_void]) -> Result<()> {
+        if addrs.is_empty() {
+            return Ok(());
+        }
+        let mut native_addrs = addrs.to_vec();
+        let rc = unsafe {
+            ffi::unregisterLocalMemoryBatch(self.raw, native_addrs.as_mut_ptr(), native_addrs.len())
+        };
+        check_zero(rc, "unregisterLocalMemoryBatch")
     }
 
     pub fn open_segment(&self, segment_name: &str) -> Result<i32> {
