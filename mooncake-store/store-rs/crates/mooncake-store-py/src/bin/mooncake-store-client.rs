@@ -135,6 +135,8 @@ struct Args {
     #[arg(long)]
     request_timeout_ms: Option<u64>,
     #[arg(long)]
+    startup_timeout_ms: Option<u64>,
+    #[arg(long)]
     heartbeat_timeout_ms: Option<u64>,
     #[arg(long)]
     transfer_stall_timeout_ms: Option<u64>,
@@ -445,6 +447,7 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
 fn resolve_timeout_config(args: &Args) -> Result<CompatTimeoutConfig, Box<dyn Error>> {
     CompatTimeoutConfig::from_env_and_overrides(CompatTimeoutCliOverrides {
         request_timeout_ms: args.request_timeout_ms,
+        startup_timeout_ms: args.startup_timeout_ms,
         heartbeat_timeout_ms: args.heartbeat_timeout_ms,
         transfer_stall_timeout_ms: args.transfer_stall_timeout_ms,
         dummy_rpc_timeout_ms: None,
@@ -531,10 +534,11 @@ fn started_message(
     client_server_address: Option<&str>,
 ) -> String {
     format!(
-        "mooncake-store-client started stable_id={stable_id} epoch={} initial_state={} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} request_timeout_ms={} heartbeat_timeout_ms={} transfer_stall_timeout_ms={} metrics_addr={} client_server_address={} ",
+        "mooncake-store-client started stable_id={stable_id} epoch={} initial_state={} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} request_timeout_ms={} startup_timeout_ms={} heartbeat_timeout_ms={} transfer_stall_timeout_ms={} metrics_addr={} client_server_address={} ",
         epoch.0,
         lifecycle_state_label(initial_state),
         timeouts.request_timeout.as_millis(),
+        timeouts.startup_timeout.as_millis(),
         timeouts.heartbeat_timeout.as_millis(),
         timeouts.transfer_stall_timeout.as_millis(),
         metrics_addr.unwrap_or("disabled"),
@@ -759,6 +763,7 @@ mod tests {
     fn sample_timeouts() -> CompatTimeoutConfig {
         CompatTimeoutConfig {
             request_timeout: Duration::from_millis(65_000),
+            startup_timeout: Duration::from_millis(300_000),
             heartbeat_timeout: Duration::from_millis(15_000),
             transfer_stall_timeout: Duration::from_millis(10_000),
             dummy_rpc_timeout: Duration::from_millis(65_000),
@@ -789,6 +794,7 @@ mod tests {
             lease_ttl_ms: 10_000,
             heartbeat_interval_ms: 3_000,
             request_timeout_ms: None,
+            startup_timeout_ms: None,
             heartbeat_timeout_ms: None,
             transfer_stall_timeout_ms: None,
             metrics_addr: None,
@@ -887,6 +893,8 @@ mod tests {
             "2500",
             "--request-timeout-ms",
             "70000",
+            "--startup-timeout-ms",
+            "180000",
             "--heartbeat-timeout-ms",
             "20000",
             "--transfer-stall-timeout-ms",
@@ -914,6 +922,7 @@ mod tests {
         assert_eq!(args.keyspace.as_deref(), Some("ks-a"));
         assert_eq!(args.local_segment_name.as_deref(), Some("segment-a"));
         assert_eq!(args.request_timeout_ms, Some(70_000));
+        assert_eq!(args.startup_timeout_ms, Some(180_000));
         assert_eq!(args.heartbeat_timeout_ms, Some(20_000));
         assert_eq!(args.transfer_stall_timeout_ms, Some(12_000));
         assert_eq!(args.metrics_addr.as_deref(), Some("127.0.0.1:0"));
@@ -1040,11 +1049,13 @@ mod tests {
     fn timeout_config_prefers_cli_overrides() {
         let mut args = sample_args();
         args.request_timeout_ms = Some(44_000);
+        args.startup_timeout_ms = Some(180_000);
         args.heartbeat_timeout_ms = Some(11_000);
         args.transfer_stall_timeout_ms = Some(9_000);
 
         let timeouts = resolve_timeout_config(&args).expect("timeout config should resolve");
         assert_eq!(timeouts.request_timeout, Duration::from_millis(44_000));
+        assert_eq!(timeouts.startup_timeout, Duration::from_millis(180_000));
         assert_eq!(timeouts.heartbeat_timeout, Duration::from_millis(11_000));
         assert_eq!(
             timeouts.transfer_stall_timeout,
@@ -1239,6 +1250,7 @@ mod tests {
         assert!(started.contains("initial_state=standby"));
         assert!(started.contains("segment=segment-a"));
         assert!(started.contains("request_timeout_ms=65000"));
+        assert!(started.contains("startup_timeout_ms=300000"));
         assert!(started.contains("heartbeat_timeout_ms=15000"));
         assert!(started.contains("transfer_stall_timeout_ms=10000"));
         assert!(started.contains("metrics_addr=127.0.0.1:9090"));

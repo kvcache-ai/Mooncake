@@ -1603,6 +1603,7 @@ mod tests {
     use crate::dispatcher::StoreDispatcher;
     use crate::dummy_service::pb;
     use crate::dummy_service::{start_dummy_store_server, DummyStoreServerHandle};
+    use crate::runtime::CompatTimeoutConfig;
     use crate::test_support::env_test_lock;
 
     struct TestTransport {
@@ -1938,6 +1939,7 @@ mod tests {
         block_state_update: Arc<AtomicBool>,
         block_route_cas: Arc<AtomicBool>,
         block_route_lookup: Arc<AtomicBool>,
+        block_publish_segment: Arc<AtomicBool>,
         release: Arc<AtomicBool>,
         entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     }
@@ -1961,6 +1963,7 @@ mod tests {
                 block_state_update,
                 block_route_cas,
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
                 release,
                 entered,
             )
@@ -1971,6 +1974,7 @@ mod tests {
             block_state_update: Arc<AtomicBool>,
             block_route_cas: Arc<AtomicBool>,
             block_route_lookup: Arc<AtomicBool>,
+            block_publish_segment: Arc<AtomicBool>,
             release: Arc<AtomicBool>,
             entered: std::sync::mpsc::Sender<()>,
         ) -> Self {
@@ -1980,9 +1984,26 @@ mod tests {
                 block_state_update,
                 block_route_cas,
                 block_route_lookup,
+                block_publish_segment,
                 release,
                 entered: std::sync::Mutex::new(Some(entered)),
             }
+        }
+
+        fn new_with_publish_segment(
+            block_publish_segment: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+            entered: std::sync::mpsc::Sender<()>,
+        ) -> Self {
+            Self::new_with_route_lookup(
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                block_publish_segment,
+                release,
+                entered,
+            )
         }
 
         fn maybe_block(&self, enabled: &AtomicBool) {
@@ -2042,6 +2063,7 @@ mod tests {
             &self,
             segment: &SegmentAnnouncement,
         ) -> mooncake_store_core::Result<()> {
+            self.maybe_block(&self.block_publish_segment);
             self.inner.publish_segment(segment)
         }
 
@@ -3461,6 +3483,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             block_route_lookup,
+            Arc::new(AtomicBool::new(false)),
             release.clone(),
             entered_tx,
         ));
@@ -3531,6 +3554,98 @@ mod tests {
         get_thread
             .join()
             .expect("batch_get_into thread should complete cleanly");
+    }
+
+    #[test]
+    fn dispatcher_register_local_memory_uses_startup_timeout_not_request_timeout() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(BlockingHealthMetadata::new_with_publish_segment(
+            Arc::new(AtomicBool::new(true)),
+            release.clone(),
+            entered_tx,
+        ));
+        let timeouts = CompatTimeoutConfig {
+            request_timeout: Duration::from_millis(50),
+            startup_timeout: Duration::from_millis(400),
+            heartbeat_timeout: Duration::from_secs(1),
+            transfer_stall_timeout: Duration::from_secs(1),
+            dummy_rpc_timeout: Duration::from_millis(50),
+        };
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn_with_timeout_config(
+                build_client_with_metadata("dispatcher-startup-timeout-success", metadata),
+                "dispatcher-startup-timeout-success".to_string(),
+                timeouts,
+            )
+            .expect("dispatcher should spawn"),
+        );
+
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-startup-timeout-success".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || dispatcher.register_local_memory()
+            })
+            .expect("startup registration worker should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("startup registration should enter metadata publish");
+        sleep(Duration::from_millis(200));
+        release.store(true, Ordering::SeqCst);
+
+        worker
+            .join()
+            .expect("startup registration worker should join")
+            .expect("startup registration should outlive request timeout");
+    }
+
+    #[test]
+    fn dispatcher_register_local_memory_times_out_with_startup_budget() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(BlockingHealthMetadata::new_with_publish_segment(
+            Arc::new(AtomicBool::new(true)),
+            release.clone(),
+            entered_tx,
+        ));
+        let timeouts = CompatTimeoutConfig {
+            request_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_millis(120),
+            heartbeat_timeout: Duration::from_secs(1),
+            transfer_stall_timeout: Duration::from_secs(1),
+            dummy_rpc_timeout: Duration::from_secs(5),
+        };
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn_with_timeout_config(
+                build_client_with_metadata("dispatcher-startup-timeout-fail", metadata),
+                "dispatcher-startup-timeout-fail".to_string(),
+                timeouts,
+            )
+            .expect("dispatcher should spawn"),
+        );
+
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-startup-timeout-fail".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || dispatcher.register_local_memory()
+            })
+            .expect("startup registration worker should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("startup registration should enter metadata publish");
+        let error = worker
+            .join()
+            .expect("startup registration worker should join")
+            .expect_err("startup registration should time out");
+        assert!(
+            matches!(error, StoreError::Transport(ref message) if message.contains("startup registration timed out after 120ms")),
+            "unexpected error: {error}"
+        );
+        release.store(true, Ordering::SeqCst);
     }
 
     #[test]
