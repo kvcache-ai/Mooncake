@@ -15,7 +15,7 @@ use _store_rs::dummy_service::start_dummy_store_server;
 use _store_rs::runtime::{
     CompatRuntimeArgs, CompatSetupArgs, CompatTimeoutCliOverrides, CompatTimeoutConfig,
 };
-use clap::{Parser, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_store_client::{
     init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
     RouteControlMode,
@@ -74,11 +74,8 @@ impl TransportBackendArg {
     }
 }
 
-#[derive(Parser, Debug)]
-#[command(name = "mooncake-store-client")]
-#[command(about = "Start a standalone Mooncake store-rs client runtime")]
-#[command(arg_required_else_help = true)]
-struct Args {
+#[derive(ClapArgs, Debug)]
+struct RunArgs {
     #[arg(long)]
     local_hostname: String,
     #[arg(long)]
@@ -157,9 +154,7 @@ struct Args {
     drain_on_exit: bool,
 }
 
-#[derive(Parser, Debug)]
-#[command(name = "mooncake-store-client stats")]
-#[command(about = "Fetch stats from a running Mooncake store-rs client")]
+#[derive(ClapArgs, Debug)]
 struct StatsArgs {
     #[arg(long)]
     server: String,
@@ -167,10 +162,21 @@ struct StatsArgs {
     json: bool,
 }
 
-#[derive(Debug)]
-enum Cli {
-    Run(Args),
+#[derive(Subcommand, Debug)]
+enum Command {
+    #[command(about = "Start a standalone Mooncake store-rs client runtime")]
+    Run(RunArgs),
+    #[command(about = "Fetch stats from a running Mooncake store-rs client")]
     Stats(StatsArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "mooncake-store-client")]
+#[command(about = "Standalone Mooncake store-rs client commands")]
+#[command(arg_required_else_help = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
 #[derive(Clone)]
@@ -189,18 +195,16 @@ impl ShutdownSignal {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let cli = match parse_cli() {
-        Ok(cli) => cli,
+    match parse_cli() {
+        Ok(cli) => match cli.command {
+            Command::Run(args) => run_client(args),
+            Command::Stats(args) => run_stats_command(args),
+        },
         Err(error) => error.exit(),
-    };
-
-    match cli {
-        Cli::Run(args) => run_client(args),
-        Cli::Stats(args) => run_stats_command(args),
     }
 }
 
-fn run_client(args: Args) -> Result<(), Box<dyn Error>> {
+fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     validate_args(&args)?;
     init_tracing(args.trace_filter.as_deref())?;
     emit_compat_warnings(&args);
@@ -312,15 +316,22 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    if argv.get(1).and_then(|arg| arg.to_str()) == Some("stats") {
-        let mut stats_argv = Vec::with_capacity(argv.len().saturating_sub(1));
-        stats_argv.push(OsString::from("mooncake-store-client stats"));
-        stats_argv.extend_from_slice(&argv[2..]);
-        StatsArgs::try_parse_from(stats_argv).map(Cli::Stats)
-    } else {
-        Args::try_parse_from(argv).map(Cli::Run)
+    let mut argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let should_insert_run = argv
+        .get(1)
+        .and_then(|arg| arg.to_str())
+        .is_some_and(should_insert_legacy_run_subcommand);
+    if should_insert_run {
+        argv.insert(1, OsString::from("run"));
     }
+    Cli::try_parse_from(argv)
+}
+
+fn should_insert_legacy_run_subcommand(arg: &str) -> bool {
+    !matches!(
+        arg,
+        "run" | "stats" | "help" | "-h" | "--help" | "-V" | "--version"
+    )
 }
 
 fn run_stats_command(args: StatsArgs) -> Result<(), Box<dyn Error>> {
@@ -407,7 +418,7 @@ fn graceful_shutdown(
     ))
 }
 
-fn compat_warnings(args: &Args) -> Vec<&'static str> {
+fn compat_warnings(args: &RunArgs) -> Vec<&'static str> {
     let mut warnings = Vec::new();
     if args.route_topk != 2 {
         warnings.push(
@@ -422,13 +433,13 @@ fn compat_warnings(args: &Args) -> Vec<&'static str> {
     warnings
 }
 
-fn emit_compat_warnings(args: &Args) {
+fn emit_compat_warnings(args: &RunArgs) {
     for warning in compat_warnings(args) {
         eprintln!("{warning}");
     }
 }
 
-fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
+fn validate_args(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     if args.lease_ttl_ms == 0 {
         return Err("--lease-ttl-ms must be greater than zero".into());
     }
@@ -452,7 +463,7 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn resolve_timeout_config(args: &Args) -> Result<CompatTimeoutConfig, Box<dyn Error>> {
+fn resolve_timeout_config(args: &RunArgs) -> Result<CompatTimeoutConfig, Box<dyn Error>> {
     CompatTimeoutConfig::from_env_and_overrides(CompatTimeoutCliOverrides {
         request_timeout_ms: args.request_timeout_ms,
         startup_timeout_ms: args.startup_timeout_ms,
@@ -478,7 +489,7 @@ fn parse_hugepage_size_arg(input: &str) -> Result<usize, String> {
     parse_hugepage_size(input).map_err(|error| error.to_string())
 }
 
-fn build_runtime_args(args: &Args, timeouts: CompatTimeoutConfig) -> CompatRuntimeArgs {
+fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRuntimeArgs {
     CompatRuntimeArgs {
         setup: CompatSetupArgs {
             local_hostname: args.local_hostname.clone(),
@@ -511,7 +522,7 @@ fn build_runtime_args(args: &Args, timeouts: CompatTimeoutConfig) -> CompatRunti
     }
 }
 
-fn requested_initial_state(args: &Args) -> ClientLifecycleState {
+fn requested_initial_state(args: &RunArgs) -> ClientLifecycleState {
     args.initial_state.into()
 }
 
@@ -752,7 +763,6 @@ mod tests {
     use std::time::Duration;
 
     use clap::error::ErrorKind;
-    use clap::Parser;
     use mooncake_store_client::{
         record_heartbeat_health, stable_phase_spread_ms, start_metrics_http_server,
         stop_metrics_http_server, OperationTracker, RouteControlMode,
@@ -767,7 +777,7 @@ mod tests {
         initial_heartbeat_delay_ms, now_ms, parse_cli_from, parse_hugepage_size_arg, parse_label,
         requested_initial_state, resolve_timeout_config, should_activate_after_ready,
         start_metrics_if_needed, started_message, startup_initial_state, stopped_message,
-        validate_args, Args, Cli, HeartbeatLoopState, InitialStateArg, RouteControlArg,
+        validate_args, Command, HeartbeatLoopState, InitialStateArg, RouteControlArg, RunArgs,
     };
 
     fn sample_timeouts() -> CompatTimeoutConfig {
@@ -780,8 +790,8 @@ mod tests {
         }
     }
 
-    fn sample_args() -> Args {
-        Args {
+    fn sample_args() -> RunArgs {
+        RunArgs {
             local_hostname: "127.0.0.1".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
             transport_metadata_url: None,
@@ -831,7 +841,7 @@ mod tests {
 
     #[test]
     fn args_parser_accepts_core_flags() {
-        let args = Args::try_parse_from([
+        let cli = parse_cli_from([
             "mooncake-store-client",
             "--local-hostname",
             "127.0.0.1",
@@ -855,7 +865,10 @@ mod tests {
             "--route-control",
             "metadata-only",
         ])
-        .expect("args should parse");
+        .expect("legacy root run args should parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
         assert_eq!(args.local_hostname, "127.0.0.1");
         assert_eq!(args.metadata_url, "redis://127.0.0.1:6379/0");
         assert_eq!(args.storage_bytes, 2048);
@@ -875,7 +888,7 @@ mod tests {
 
     #[test]
     fn args_parser_accepts_extended_optional_flags() {
-        let args = Args::try_parse_from([
+        let cli = parse_cli_from([
             "mooncake-store-client",
             "--local-hostname",
             "10.0.0.1",
@@ -920,7 +933,10 @@ mod tests {
             "info",
             "--drain-on-exit",
         ])
-        .expect("extended args should parse");
+        .expect("extended legacy root run args should parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
         assert_eq!(
             args.transport_metadata_url.as_deref(),
             Some("redis://127.0.0.1:6379/9")
@@ -957,13 +973,32 @@ mod tests {
         ])
         .expect("stats cli should parse");
 
-        match cli {
-            Cli::Stats(args) => {
+        match cli.command {
+            Command::Stats(args) => {
                 assert_eq!(args.server, "127.0.0.1:19090");
                 assert!(args.json);
             }
-            Cli::Run(_) => panic!("expected stats subcommand"),
+            Command::Run(_) => panic!("expected stats subcommand"),
         }
+    }
+
+    #[test]
+    fn explicit_run_subcommand_parses_runtime_args() {
+        let cli = parse_cli_from([
+            "mooncake-store-client",
+            "run",
+            "--local-hostname",
+            "127.0.0.1",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+        ])
+        .expect("run subcommand should parse");
+
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.local_hostname, "127.0.0.1");
+        assert_eq!(args.metadata_url, "redis://127.0.0.1:6379/0");
     }
 
     #[test]
@@ -985,8 +1020,9 @@ mod tests {
 
     #[test]
     fn hot_upgrade_startup_flags_flow_into_runtime_args() {
-        let args = Args::try_parse_from([
+        let cli = parse_cli_from([
             "mooncake-store-client",
+            "run",
             "--local-hostname",
             "10.0.0.2",
             "--metadata-url",
@@ -1001,6 +1037,9 @@ mod tests {
             "store-a-next",
         ])
         .expect("hot-upgrade args should parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
 
         validate_args(&args).expect("hot-upgrade args should validate");
         let runtime_args = build_runtime_args(&args, sample_timeouts());
