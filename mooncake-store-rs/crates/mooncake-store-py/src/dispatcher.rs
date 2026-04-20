@@ -106,7 +106,12 @@ impl StoreDispatcher {
         _thread_name: impl Into<String>,
         timeouts: CompatTimeoutConfig,
     ) -> Result<Self, StoreError> {
-        Self::spawn_with_timeout_config_and_scope(client, _thread_name, timeouts, default_compat_scope())
+        Self::spawn_with_timeout_config_and_scope(
+            client,
+            _thread_name,
+            timeouts,
+            default_compat_scope(),
+        )
     }
 
     pub fn spawn_with_timeout_config_and_scope(
@@ -115,11 +120,7 @@ impl StoreDispatcher {
         timeouts: CompatTimeoutConfig,
         compat_scope: impl Into<String>,
     ) -> Result<Self, StoreError> {
-        Self::new_with_shared_client(
-            Arc::new(client),
-            timeouts,
-            compat_scope.into(),
-        )
+        Self::new_with_shared_client(Arc::new(client), timeouts, compat_scope.into())
     }
 
     pub(crate) fn fork_with_scope(
@@ -148,11 +149,9 @@ impl StoreDispatcher {
         let runtime = client.runtime_id().to_string();
         let health = Arc::new(client.health_channel());
         let hot_cache = LocalHotCache::from_env()?.map(Arc::new);
-        let executor = Arc::new(
-            Runtime::new().map_err(|error| {
-                StoreError::Transport(format!("dispatcher runtime should initialize: {error}"))
-            })?,
-        );
+        let executor = Arc::new(Runtime::new().map_err(|error| {
+            StoreError::Transport(format!("dispatcher runtime should initialize: {error}"))
+        })?);
         record_heartbeat_health(&runtime, 0, 0);
         Ok(Self {
             client,
@@ -351,7 +350,8 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
     {
-        self.executor.block_on(self.run_async_with_timeout(context, timeout, f))
+        self.executor
+            .block_on(self.run_async_with_timeout(context, timeout, f))
     }
 
     pub(crate) async fn run_async<T, F>(&self, f: F) -> Result<T, StoreError>

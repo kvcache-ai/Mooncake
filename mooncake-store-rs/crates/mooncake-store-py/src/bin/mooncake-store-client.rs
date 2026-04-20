@@ -226,7 +226,11 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     )?);
     client.register_local_memory()?;
     let dummy_server = match args.client_server_address.as_deref() {
-        Some(address) => Some(start_dummy_store_server(client.clone(), address, &stable_id)?),
+        Some(address) => Some(start_dummy_store_server(
+            client.clone(),
+            address,
+            &stable_id,
+        )?),
         None => None,
     };
     if should_activate_after_ready(requested_initial_state, startup_state) {

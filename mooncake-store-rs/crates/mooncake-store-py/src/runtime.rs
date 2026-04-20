@@ -475,7 +475,10 @@ mod tests {
             .expect("scope b route should exist");
         assert_eq!(route_a.replicas[0].owner.stable_id.0, writer_a.stable_id);
         assert_eq!(route_b.replicas[0].owner.stable_id.0, writer_b.stable_id);
-        assert_ne!(route_a.replicas[0].owner.stable_id.0, route_b.replicas[0].owner.stable_id.0);
+        assert_ne!(
+            route_a.replicas[0].owner.stable_id.0,
+            route_b.replicas[0].owner.stable_id.0
+        );
     }
 
     #[test]
