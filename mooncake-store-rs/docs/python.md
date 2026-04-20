@@ -166,7 +166,9 @@ After installation, both interfaces are available:
 
 - `python -c "import mooncake"` loads the native extension
 - `python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"` shows the active Pro runtime
+- `python -c "import mooncake; print(mooncake.__build_info__)"` shows the packaged build branch, commit, and build time without loading the native extension
 - `mooncake-store-client --help` runs the packaged standalone client command
+- `mooncake-store-client -v` prints the packaged Pro version plus wheel build branch, commit, and build time
 - `mooncake-store-admin --help` runs the packaged metadata maintenance and route-policy management command
 - if your environment still exposes the upstream compatibility alias, `mooncake_master --version` prints the same packaged Pro version banner
 
