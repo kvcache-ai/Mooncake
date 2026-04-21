@@ -728,6 +728,312 @@ impl StoreClient {
             .preferred_storage_owners(preferred))
     }
 
+    fn resolve_explicit_source_replica<'a>(
+        current: &'a ObjectRoute,
+        selector: &ReplicaReadSelector,
+    ) -> Result<&'a ReplicaRoute> {
+        match selector {
+            ReplicaReadSelector::Segment(segment_name) => current
+                .replicas
+                .iter()
+                .find(|replica| replica.segment_name == *segment_name)
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "source segment {} is not present in route {}",
+                        segment_name.0, current.key.0
+                    ))
+                }),
+            ReplicaReadSelector::OwnerAndSegment {
+                owner,
+                segment_name,
+            } => current
+                .replicas
+                .iter()
+                .find(|replica| replica.owner == *owner && replica.segment_name == *segment_name)
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "source replica {}:{} is not present in route {}",
+                        owner, segment_name.0, current.key.0
+                    ))
+                }),
+        }
+    }
+
+    fn explicit_migration_policy(plan: &ExplicitMigrationPlan) -> Result<ReplicationPolicy> {
+        if plan.target_segments.is_empty() {
+            return Err(StoreError::InvalidState(
+                "explicit migration requires at least one target segment".to_string(),
+            ));
+        }
+        if !plan.all_or_nothing {
+            return Err(StoreError::Unsupported(
+                "partial-success explicit migration is not implemented".to_string(),
+            ));
+        }
+        if matches!(plan.mode, ExplicitMigrationMode::Move) && plan.target_segments.len() != 1 {
+            return Err(StoreError::InvalidState(
+                "explicit move currently requires exactly one target segment".to_string(),
+            ));
+        }
+
+        Ok(ReplicationPolicy::new()
+            .replica_count(plan.target_segments.len())
+            .prefer_local(false)
+            .preferred_segments(
+                plan.target_segments
+                    .iter()
+                    .map(|segment| segment.0.clone())
+                    .collect::<Vec<_>>(),
+            ))
+    }
+
+    fn read_payload_from_explicit_source(
+        &self,
+        object_id: &LogicalObjectId,
+        route: &ObjectRoute,
+        source: &ReplicaRoute,
+    ) -> Result<Vec<u8>> {
+        self.ensure_local_memory()?;
+        let transport = self.transport()?;
+        let mut payload = vec![0u8; source.length as usize];
+        let resolved = ResolvedObject {
+            tenant: object_id.scope.tenant.clone(),
+            key: object_id.logical_key.clone(),
+            route: route.clone(),
+            replica: source.clone(),
+            fallback_replicas: VecDeque::new(),
+        };
+        let deadline = self.request_deadline_for_transfer(source.length, 1);
+        self.execute_selected_replica_direct(transport, &resolved, &mut payload, deadline)?;
+        Ok(payload)
+    }
+
+    fn explicit_migration_object_ref<'a>(
+        object_id: &'a LogicalObjectId,
+        qos_tier: Option<&'a str>,
+    ) -> ObjectRef<'a> {
+        let mut object_ref = ObjectRef::new(object_id.logical_key.as_str())
+            .tenant(object_id.scope.tenant.as_str());
+        if object_id.scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+            object_ref = object_ref.domain(object_id.scope.domain.as_str());
+        }
+        if object_id.scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+            object_ref = object_ref.object_set(object_id.scope.object_set.as_str());
+        }
+        if let Some(qos_tier) = qos_tier
+            .filter(|tier| *tier != mooncake_store_core::DEFAULT_QOS_TIER)
+        {
+            object_ref = object_ref.qos_tier(qos_tier);
+        }
+        object_ref
+    }
+
+    fn execute_explicit_route_migration(
+        &self,
+        object_id: &LogicalObjectId,
+        plan: &ExplicitMigrationPlan,
+    ) -> Result<ObjectRoute> {
+        self.ensure_local_memory()?;
+        self.flush_due_reclaims()?;
+
+        let current = self
+            .route_directory
+            .get_object_route(&self.lease, &ObjectKey::from_logical_id(object_id))?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "tenant={} key={} has no active route",
+                    object_id.scope.tenant, object_id.logical_key
+                ))
+            })?;
+        if current.state != RouteState::Active {
+            return Err(StoreError::NotFound(format!(
+                "tenant={} key={} is not active",
+                object_id.scope.tenant, object_id.logical_key
+            )));
+        }
+
+        let source = Self::resolve_explicit_source_replica(&current, &plan.source)?.clone();
+        let payload = self.read_payload_from_explicit_source(object_id, &current, &source)?;
+        let object_ref =
+            Self::explicit_migration_object_ref(object_id, current.qos_tier.as_deref());
+        let policy = self.resolve_replication_policy(Some(&Self::explicit_migration_policy(plan)?))?;
+        let (targets, reservations) =
+            self.reserve_replica_targets(&object_ref, payload.len(), &policy)?;
+        let offsets = match self.write_reserved_replicas(&targets, &reservations, &payload) {
+            Ok(offsets) => offsets,
+            Err(error) => {
+                let _ = self.release_reserved_allocations(&targets, &reservations);
+                self.note_remote_write_failure(&targets, &error, "explicit_migration_write_failed");
+                return Err(error);
+            }
+        };
+
+        let checksum = payload_checksum(&payload);
+        let explicit_targets = targets
+            .iter()
+            .zip(offsets.iter())
+            .enumerate()
+            .map(|(priority, (target, offset))| ReplicaRoute {
+                owner: target.storage_runtime.clone(),
+                segment_name: target.segment_name.clone(),
+                offset: *offset,
+                segment_offset: reservations[priority].offset_bytes,
+                length: payload.len() as u64,
+                checksum: Some(checksum),
+                tier: ReplicaTier::Dram,
+                priority: priority as u16,
+            })
+            .collect::<Vec<_>>();
+
+        let next_route = match plan.mode {
+            ExplicitMigrationMode::Copy => {
+                Self::build_explicit_copy_route_delta(&current, &source.segment_name, explicit_targets)?
+            }
+            ExplicitMigrationMode::Move => {
+                let target = explicit_targets
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "explicit move requires exactly one written target".to_string(),
+                        )
+                    })?;
+                Self::build_explicit_move_route_delta(&current, &source.segment_name, target)?
+            }
+        };
+
+        let cas = self.route_directory.compare_and_swap_object_route(
+            &self.lease,
+            &current.key,
+            Some(current.version),
+            Some(&next_route),
+        )?;
+        if !cas.applied {
+            let _ = self.release_reserved_allocations(&targets, &reservations);
+            return Err(StoreError::Conflict(format!(
+                "explicit migration lost route race for tenant={} key={}",
+                object_id.scope.tenant, object_id.logical_key
+            )));
+        }
+
+        self.storage_owner.track_route(&next_route);
+        self.track_remote_storage_owners_best_effort(std::slice::from_ref(&next_route));
+
+        if matches!(plan.mode, ExplicitMigrationMode::Move) {
+            let mut removed_source = current.clone();
+            removed_source.replicas = vec![source];
+            if let Err(error) = self.reclaim_route(&removed_source, ReclaimMode::Immediate) {
+                warn!(
+                    runtime = %self.lease.runtime,
+                    tenant = %object_id.scope.tenant,
+                    key = %object_id.logical_key,
+                    error = %error,
+                    "explicit move reclaim failed after authoritative publish"
+                );
+            }
+        }
+
+        Ok(next_route)
+    }
+
+    fn build_explicit_copy_route_delta(
+        current: &ObjectRoute,
+        source_segment: &SegmentName,
+        targets: Vec<ReplicaRoute>,
+    ) -> Result<ObjectRoute> {
+        if !current
+            .replicas
+            .iter()
+            .any(|replica| replica.segment_name == *source_segment)
+        {
+            return Err(StoreError::NotFound(format!(
+                "source segment {} is not present in route {}",
+                source_segment.0, current.key.0
+            )));
+        }
+        Self::validate_explicit_route_targets(current, source_segment, &targets, false)?;
+        let mut next = current.clone();
+        next.version = current.version.next();
+        next.replicas.extend(targets);
+        Self::normalize_route_replica_priorities(&mut next.replicas);
+        Ok(next)
+    }
+
+    fn build_explicit_move_route_delta(
+        current: &ObjectRoute,
+        source_segment: &SegmentName,
+        target: ReplicaRoute,
+    ) -> Result<ObjectRoute> {
+        if target.segment_name == *source_segment {
+            return Err(StoreError::Conflict(format!(
+                "move target segment {} cannot be the same as source",
+                source_segment.0
+            )));
+        }
+        let source_index = current
+            .replicas
+            .iter()
+            .position(|replica| replica.segment_name == *source_segment)
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "source segment {} is not present in route {}",
+                    source_segment.0, current.key.0
+                ))
+            })?;
+        Self::validate_explicit_route_targets(current, source_segment, std::slice::from_ref(&target), true)?;
+        let mut next = current.clone();
+        next.version = current.version.next();
+        next.replicas.remove(source_index);
+        next.replicas.push(target);
+        Self::normalize_route_replica_priorities(&mut next.replicas);
+        Ok(next)
+    }
+
+    fn validate_explicit_route_targets(
+        current: &ObjectRoute,
+        source_segment: &SegmentName,
+        targets: &[ReplicaRoute],
+        moving: bool,
+    ) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for target in targets {
+            if target.segment_name == *source_segment {
+                return Err(StoreError::Conflict(format!(
+                    "target segment {} conflicts with source segment",
+                    source_segment.0
+                )));
+            }
+            if !seen.insert(target.segment_name.clone()) {
+                return Err(StoreError::Conflict(format!(
+                    "duplicate target segment {} in explicit migration",
+                    target.segment_name.0
+                )));
+            }
+            let conflicts_with_current = current
+                .replicas
+                .iter()
+                .any(|replica| replica.segment_name == target.segment_name);
+            if conflicts_with_current {
+                let message = if moving {
+                    "move target segment already exists in route"
+                } else {
+                    "copy target segment already exists in route"
+                };
+                return Err(StoreError::Conflict(format!(
+                    "{message}: {}",
+                    target.segment_name.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn normalize_route_replica_priorities(replicas: &mut [ReplicaRoute]) {
+        for (priority, replica) in replicas.iter_mut().enumerate() {
+            replica.priority = priority as u16;
+        }
+    }
+
     fn migrate_owned_route_via_writer(
         &self,
         writer: &StoreClient,

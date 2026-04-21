@@ -169,6 +169,35 @@ pub(crate) trait EvictionService: Send + Sync {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct MigrationExecutionStatus {
+    pub state: pb::MigrationExecutionState,
+    pub attempts: u32,
+    pub last_error: String,
+}
+
+pub(crate) trait MigrationService: Send + Sync {
+    fn submit_task(&self, request: &pb::SubmitMigrationTaskRequest) -> Result<String>;
+
+    fn get_execution_status(&self, execution_id: &str) -> Result<MigrationExecutionStatus>;
+}
+
+struct UnsupportedMigrationService;
+
+impl MigrationService for UnsupportedMigrationService {
+    fn submit_task(&self, _request: &pb::SubmitMigrationTaskRequest) -> Result<String> {
+        Err(StoreError::Unsupported(
+            "migration task submission is not wired yet".to_string(),
+        ))
+    }
+
+    fn get_execution_status(&self, _execution_id: &str) -> Result<MigrationExecutionStatus> {
+        Err(StoreError::Unsupported(
+            "migration execution status is not wired yet".to_string(),
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ReserveSpecificOp {
     pub segment_name: SegmentName,
     pub length_bytes: u64,
@@ -186,6 +215,53 @@ pub(crate) struct ControlPlaneClient {
     channels: Mutex<BTreeMap<String, Channel>>,
     streams: Mutex<BTreeMap<String, Arc<ControlStreamSession>>>,
     request_timeout: Duration,
+}
+
+pub struct MigrationControlClient {
+    inner: ControlPlaneClient,
+}
+
+impl MigrationControlClient {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            inner: ControlPlaneClient::new()?,
+        })
+    }
+
+    pub fn submit_migration_task(
+        &self,
+        lease: &ClientLease,
+        request: pb::SubmitMigrationTaskRequest,
+    ) -> Result<String> {
+        self.inner.submit_migration_task(lease, request)
+    }
+
+    pub fn get_migration_execution_status(
+        &self,
+        lease: &ClientLease,
+        request: pb::GetMigrationExecutionStatusRequest,
+    ) -> Result<pb::MigrationExecutionState> {
+        self.inner.get_migration_execution_status(lease, request)
+    }
+
+    pub fn get_migration_execution_status_detail(
+        &self,
+        lease: &ClientLease,
+        request: pb::GetMigrationExecutionStatusRequest,
+    ) -> Result<pb::GetMigrationExecutionStatusReply> {
+        self.inner
+            .get_migration_execution_status_detail(lease, request)
+    }
+
+    pub fn get_route(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectRoute>> {
+        self.inner.get_route(lease, namespace, authority, key)
+    }
 }
 
 #[derive(Debug)]
@@ -228,6 +304,6 @@ use self::server::{handle_control_stream_request, GrpcControlPlaneService};
 #[cfg(test)]
 mod tests;
 
-pub(crate) mod pb {
+pub mod pb {
     tonic::include_proto!("mooncake.store.control");
 }

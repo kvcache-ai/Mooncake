@@ -15,6 +15,22 @@ impl ControlPlaneHandle {
         allocator: Arc<dyn AllocatorService>,
         eviction: Arc<dyn EvictionService>,
     ) -> Result<Self> {
+        Self::spawn_with_migration(
+            bind_host,
+            authority,
+            allocator,
+            eviction,
+            Arc::new(UnsupportedMigrationService),
+        )
+    }
+
+    pub(crate) fn spawn_with_migration(
+        bind_host: &str,
+        authority: Arc<dyn AuthorityService>,
+        allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
+        migration: Arc<dyn MigrationService>,
+    ) -> Result<Self> {
         let listener = std::net::TcpListener::bind((bind_host, 0)).map_err(|error| {
             StoreError::Transport(format!("control plane bind on {bind_host} failed: {error}"))
         })?;
@@ -44,6 +60,7 @@ impl ControlPlaneHandle {
                     authority,
                     allocator,
                     eviction,
+                    migration,
                 )
             })
             .map_err(|error| {
@@ -81,8 +98,10 @@ fn run_server(
     authority: Arc<dyn AuthorityService>,
     allocator: Arc<dyn AllocatorService>,
     eviction: Arc<dyn EvictionService>,
+    migration: Arc<dyn MigrationService>,
 ) {
-    let service = GrpcControlPlaneService::new(authority, allocator, eviction);
+    let service =
+        GrpcControlPlaneService::new_with_migration(authority, allocator, eviction, migration);
     let result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
             StoreError::Transport(format!("control plane listener conversion failed: {error}"))
@@ -107,6 +126,7 @@ pub(super) struct GrpcControlPlaneService {
     authority: Arc<dyn AuthorityService>,
     allocator: Arc<dyn AllocatorService>,
     eviction: Arc<dyn EvictionService>,
+    migration: Arc<dyn MigrationService>,
 }
 
 impl GrpcControlPlaneService {
@@ -115,10 +135,25 @@ impl GrpcControlPlaneService {
         allocator: Arc<dyn AllocatorService>,
         eviction: Arc<dyn EvictionService>,
     ) -> Self {
+        Self::new_with_migration(
+            authority,
+            allocator,
+            eviction,
+            Arc::new(UnsupportedMigrationService),
+        )
+    }
+
+    pub(super) fn new_with_migration(
+        authority: Arc<dyn AuthorityService>,
+        allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
+        migration: Arc<dyn MigrationService>,
+    ) -> Self {
         Self {
             authority,
             allocator,
             eviction,
+            migration,
         }
     }
 }
@@ -126,6 +161,64 @@ impl GrpcControlPlaneService {
 #[tonic::async_trait]
 impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneService {
     type ControlStreamStream = ReceiverStream<std::result::Result<pb::ControlStreamReply, Status>>;
+
+    async fn submit_migration_task(
+        &self,
+        request: Request<pb::SubmitMigrationTaskRequest>,
+    ) -> std::result::Result<Response<pb::SubmitMigrationTaskReply>, Status> {
+        let request = request.into_inner();
+        let reply = match validate_submit_migration_task_request(&request) {
+            Ok(()) => match self.migration.submit_task(&request) {
+                Ok(execution_id) => pb::SubmitMigrationTaskReply {
+                    execution_id,
+                    error: None,
+                },
+                Err(error) => pb::SubmitMigrationTaskReply {
+                    execution_id: String::new(),
+                    error: Some(pb_error(error)),
+                },
+            },
+            Err(error) => pb::SubmitMigrationTaskReply {
+                execution_id: String::new(),
+                error: Some(pb_error(error)),
+            },
+        };
+        Ok(Response::new(reply))
+    }
+
+    async fn get_migration_execution_status(
+        &self,
+        request: Request<pb::GetMigrationExecutionStatusRequest>,
+    ) -> std::result::Result<Response<pb::GetMigrationExecutionStatusReply>, Status> {
+        let request = request.into_inner();
+        let execution_id = request.execution_id.clone();
+        let reply = match validate_get_migration_execution_status_request(&request) {
+            Ok(()) => match self.migration.get_execution_status(&execution_id) {
+                Ok(status) => pb::GetMigrationExecutionStatusReply {
+                    execution_id,
+                    state: status.state as i32,
+                    attempts: status.attempts,
+                    last_error: status.last_error,
+                    error: None,
+                },
+                Err(error) => pb::GetMigrationExecutionStatusReply {
+                    execution_id,
+                    state: pb::MigrationExecutionState::Unspecified as i32,
+                    attempts: 0,
+                    last_error: String::new(),
+                    error: Some(pb_error(error)),
+                },
+            },
+            Err(error) => pb::GetMigrationExecutionStatusReply {
+                execution_id,
+                state: pb::MigrationExecutionState::Unspecified as i32,
+                attempts: 0,
+                last_error: String::new(),
+                error: Some(pb_error(error)),
+            },
+        };
+        Ok(Response::new(reply))
+    }
 
     async fn get_route(
         &self,
@@ -645,6 +738,89 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+fn validate_submit_migration_task_request(
+    request: &pb::SubmitMigrationTaskRequest,
+) -> mooncake_store_core::Result<()> {
+    if request.namespace.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane submit_migration_task request is missing namespace".to_string(),
+        ));
+    }
+    if request.authority.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane submit_migration_task request is missing authority".to_string(),
+        ));
+    }
+    if request.tenant.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane submit_migration_task request is missing tenant".to_string(),
+        ));
+    }
+    if request.key.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane submit_migration_task request is missing key".to_string(),
+        ));
+    }
+    if request.source_segment.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane submit_migration_task request is missing source_segment".to_string(),
+        ));
+    }
+    if request.task_executor.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane submit_migration_task request is missing task_executor".to_string(),
+        ));
+    }
+    match pb::MigrationMode::try_from(request.mode).unwrap_or(pb::MigrationMode::Unspecified) {
+        pb::MigrationMode::Copy => {
+            if request.target_segments.is_empty() {
+                return Err(StoreError::InvalidState(
+                    "control plane submit_migration_task request is missing target_segments"
+                        .to_string(),
+                ));
+            }
+        }
+        pb::MigrationMode::Move => {
+            if request.target_segments.len() != 1 {
+                return Err(StoreError::InvalidState(
+                    "control plane submit_migration_task move requests require exactly one target_segment"
+                        .to_string(),
+                ));
+            }
+        }
+        pb::MigrationMode::Unspecified => {
+            return Err(StoreError::InvalidState(
+                "control plane submit_migration_task request is missing mode".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_get_migration_execution_status_request(
+    request: &pb::GetMigrationExecutionStatusRequest,
+) -> mooncake_store_core::Result<()> {
+    if request.namespace.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane get_migration_execution_status request is missing namespace"
+                .to_string(),
+        ));
+    }
+    if request.authority.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane get_migration_execution_status request is missing authority"
+                .to_string(),
+        ));
+    }
+    if request.execution_id.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "control plane get_migration_execution_status request is missing execution_id"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn handle_control_stream_request(

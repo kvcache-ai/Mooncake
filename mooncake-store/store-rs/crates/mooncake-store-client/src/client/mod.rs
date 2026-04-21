@@ -26,8 +26,10 @@ use tracing::{debug, info, info_span, warn};
 
 use crate::control_plane::{
     control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
-    ControlPlaneHandle, EvictionService, ReleaseOp, ReserveSpecificOp,
+    ControlPlaneHandle, EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp,
+    ReserveSpecificOp,
 };
+use crate::control_plane::pb;
 use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, ScratchReservation, StorageExtentInfo,
     StorageSegmentSpec,

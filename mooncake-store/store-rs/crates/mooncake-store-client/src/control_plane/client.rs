@@ -466,6 +466,89 @@ impl ControlPlaneClient {
         result
     }
 
+    pub(crate) fn submit_migration_task(
+        &self,
+        lease: &ClientLease,
+        request: pb::SubmitMigrationTaskRequest,
+    ) -> Result<String> {
+        let tracker = OperationTracker::new("control_migration_submit");
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                |mut client| async move {
+                    client.submit_migration_task(Request::new(request)).await
+                },
+                channel,
+            )?;
+            decode_error(reply.error)?;
+            if reply.execution_id.trim().is_empty() {
+                return Err(StoreError::Transport(
+                    "control plane submit_migration_task reply is missing execution_id"
+                        .to_string(),
+                ));
+            }
+            Ok(reply.execution_id)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn get_migration_execution_status_detail(
+        &self,
+        lease: &ClientLease,
+        request: pb::GetMigrationExecutionStatusRequest,
+    ) -> Result<pb::GetMigrationExecutionStatusReply> {
+        let tracker = OperationTracker::new("control_migration_status_detail");
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                |mut client| async move {
+                    client
+                        .get_migration_execution_status(Request::new(request))
+                        .await
+                },
+                channel,
+            )?;
+            decode_error(reply.error.clone())?;
+            Ok(reply)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn get_migration_execution_status(
+        &self,
+        lease: &ClientLease,
+        request: pb::GetMigrationExecutionStatusRequest,
+    ) -> Result<pb::MigrationExecutionState> {
+        let tracker = OperationTracker::new("control_migration_status");
+        let result = self
+            .get_migration_execution_status_detail(lease, request)
+            .map(|reply| {
+                pb::MigrationExecutionState::try_from(reply.state)
+                    .unwrap_or(pb::MigrationExecutionState::Unspecified)
+            });
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn get_route(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectRoute>> {
+        let mut replies = self.batch_get_routes(lease, namespace, authority, std::slice::from_ref(key))?;
+        replies
+            .pop()
+            .ok_or_else(|| {
+                StoreError::Transport(
+                    "control plane get_route batch helper returned no replies".to_string(),
+                )
+            })?
+    }
+
     pub(crate) fn reserve_any(
         &self,
         lease: &ClientLease,

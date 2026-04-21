@@ -296,6 +296,20 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         self.inner.batch_track_replica_routes(request).await
     }
 
+    async fn submit_migration_task(
+        &self,
+        request: Request<pb::SubmitMigrationTaskRequest>,
+    ) -> std::result::Result<Response<pb::SubmitMigrationTaskReply>, Status> {
+        self.inner.submit_migration_task(request).await
+    }
+
+    async fn get_migration_execution_status(
+        &self,
+        request: Request<pb::GetMigrationExecutionStatusRequest>,
+    ) -> std::result::Result<Response<pb::GetMigrationExecutionStatusReply>, Status> {
+        self.inner.get_migration_execution_status(request).await
+    }
+
     async fn control_stream(
         &self,
         _request: Request<tonic::Streaming<pb::ControlStreamRequest>>,
@@ -502,6 +516,20 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
         request: Request<pb::BatchTrackReplicaRoutesRequest>,
     ) -> std::result::Result<Response<pb::BatchTrackReplicaRoutesReply>, Status> {
         self.inner.batch_track_replica_routes(request).await
+    }
+
+    async fn submit_migration_task(
+        &self,
+        request: Request<pb::SubmitMigrationTaskRequest>,
+    ) -> std::result::Result<Response<pb::SubmitMigrationTaskReply>, Status> {
+        self.inner.submit_migration_task(request).await
+    }
+
+    async fn get_migration_execution_status(
+        &self,
+        request: Request<pb::GetMigrationExecutionStatusRequest>,
+    ) -> std::result::Result<Response<pb::GetMigrationExecutionStatusReply>, Status> {
+        self.inner.get_migration_execution_status(request).await
     }
 
     async fn control_stream(
@@ -833,6 +861,53 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
 
     client.clear_channels();
     assert_eq!(client.active_stream_sessions(), 0);
+    drop(client);
+    handle.shutdown();
+}
+
+#[test]
+fn control_plane_migration_entrypoints_reject_invalid_requests() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("alpha", 1, &owner));
+
+    let mut handle = ControlPlaneHandle::spawn("127.0.0.1", authority, allocator, eviction)
+        .expect("control plane server should start");
+    let lease = sample_lease(handle.address());
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+
+    let submit_error = client
+        .submit_migration_task(
+            &lease,
+            pb::SubmitMigrationTaskRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                tenant: "tenant-a".to_string(),
+                key: "alpha".to_string(),
+                mode: pb::MigrationMode::Move as i32,
+                source_segment: "segment-a".to_string(),
+                target_segments: vec!["segment-b".to_string(), "segment-c".to_string()],
+                task_executor: "executor-a".to_string(),
+                max_retries: 3,
+            },
+        )
+        .expect_err("move migration with multiple targets should be rejected");
+    assert!(matches!(submit_error, StoreError::InvalidState(_)));
+
+    let status_error = client
+        .get_migration_execution_status(
+            &lease,
+            pb::GetMigrationExecutionStatusRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                execution_id: String::new(),
+            },
+        )
+        .expect_err("status lookup without execution_id should be rejected");
+    assert!(matches!(status_error, StoreError::InvalidState(_)));
+
     drop(client);
     handle.shutdown();
 }
