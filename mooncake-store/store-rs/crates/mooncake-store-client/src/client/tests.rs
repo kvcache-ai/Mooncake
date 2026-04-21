@@ -7789,6 +7789,44 @@ fn builder_rejects_stale_epoch_when_newer_runtime_is_reachable() {
 }
 
 #[test]
+fn builder_rejects_stale_epoch_against_metadata_hwm_even_without_live_peer() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    // Publish a newer epoch under an unreachable control address so the
+    // client-side duplicate guard yields to the server-side HWM fence.
+    let mut endpoints = ClientEndpointSet {
+        rpc_address: "127.0.0.1:1".to_string(),
+        segment_name: Some(SegmentName::new("hwm-fence-ghost")),
+        labels: BTreeMap::new(),
+    };
+    endpoints.labels.insert(
+        control_address_label().to_string(),
+        "127.0.0.1:1".to_string(),
+    );
+    metadata
+        .upsert_client_lease(&ClientLease {
+            runtime: ClientRuntimeId::new("hwm-fence", ClientEpoch(10)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints,
+            expires_at_ms: test_future_expiry_ms(),
+        })
+        .expect("newer lease should publish");
+
+    let error = match StoreClientBuilder::new(metadata, "hwm-fence")
+        .epoch(ClientEpoch(5))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7109")
+        .segment_name("hwm-fence-segment")
+        .build(test_future_expiry_ms())
+    {
+        Ok(_) => panic!("older epoch must be fenced by metadata HWM"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, StoreError::StaleEpoch(_)));
+}
+
+#[test]
 fn builder_rejects_live_segment_name_reuse_across_runtimes() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let _owner = StoreClientBuilder::new(metadata.clone(), "segment-owner-a")

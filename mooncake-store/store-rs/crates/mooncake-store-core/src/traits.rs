@@ -15,6 +15,15 @@ use crate::route::{
 pub trait MetadataBackend: Send + Sync {
     fn route_namespace(&self) -> String;
 
+    /// Publishes a client lease and atomically enforces per-stable-id epoch monotonicity.
+    ///
+    /// Implementations MUST reject writes whose `lease.runtime.epoch` is not strictly
+    /// greater than every epoch ever observed for the same `lease.runtime.stable_id`
+    /// (including both currently-live leases and the historical high-water mark).
+    /// Rejection returns `StoreError::StaleEpoch`.
+    ///
+    /// Re-publishing a lease with the same `(stable_id, epoch)` is a refresh and is
+    /// always permitted; this path is used by heartbeat and lifecycle-state updates.
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()>;
 
     fn update_client_state(

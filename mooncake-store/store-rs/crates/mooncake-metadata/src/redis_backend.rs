@@ -238,6 +238,51 @@ redis.call('SET', key, payload)
 return {1, payload}
 "#;
 
+const UPSERT_CLIENT_LEASE_STRICT_GREATER_SCRIPT: &str = r#"
+local lease_key = KEYS[1]
+local by_stable_index = KEYS[2]
+local hwm_key = KEYS[3]
+local global_index = KEYS[4]
+local new_epoch = tonumber(ARGV[1])
+local payload = ARGV[2]
+local ttl_ms = tonumber(ARGV[3])
+
+if redis.call('EXISTS', lease_key) == 1 then
+    redis.call('SET', lease_key, payload, 'PX', ttl_ms)
+    return {1, ''}
+end
+
+local active_max = 0
+local members = redis.call('SMEMBERS', by_stable_index)
+for _, member in ipairs(members) do
+    local candidate = tonumber(member)
+    if candidate and candidate > active_max then
+        active_max = candidate
+    end
+end
+
+local hwm_raw = redis.call('GET', hwm_key)
+local hwm_value = 0
+if hwm_raw then
+    hwm_value = tonumber(hwm_raw) or 0
+end
+
+local floor = active_max
+if hwm_value > floor then
+    floor = hwm_value
+end
+
+if new_epoch <= floor then
+    return {0, tostring(floor)}
+end
+
+redis.call('SET', lease_key, payload, 'PX', ttl_ms)
+redis.call('SADD', global_index, lease_key)
+redis.call('SADD', by_stable_index, tostring(new_epoch))
+redis.call('SET', hwm_key, tostring(new_epoch))
+return {1, ''}
+"#;
+
 const RESERVE_TENANT_QUOTA_SCRIPT: &str = r#"
 local quota_key = KEYS[1]
 local object_key = KEYS[2]
@@ -984,19 +1029,32 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
-        let key = self.keyspace.client(&lease.runtime);
+        let stable_id = lease.runtime.stable_id.clone();
+        let new_epoch = lease.runtime.epoch.0;
+        let lease_key = self.keyspace.client(&lease.runtime);
+        let by_stable_key = self.keyspace.client_by_stable_index(&stable_id);
+        let hwm_key = self.keyspace.client_epoch_hwm(&stable_id);
+        let global_index_key = self.keyspace.client_index();
         let payload = serde_json::to_string(lease).map_err(json_error)?;
-        self.query_idempotent_write("redis set client lease", |connection| {
+        let result = self.query_idempotent_write("redis upsert client lease", |connection| {
             let ttl_ms = lease.expires_at_ms.saturating_sub(now_ms()).max(1);
-            redis::cmd("SET")
-                .arg(&key)
+            Script::new(UPSERT_CLIENT_LEASE_STRICT_GREATER_SCRIPT)
+                .key(&lease_key)
+                .key(&by_stable_key)
+                .key(&hwm_key)
+                .key(&global_index_key)
+                .arg(new_epoch.to_string())
                 .arg(payload.as_str())
-                .arg("PX")
-                .arg(ttl_ms)
-                .query::<()>(connection)?;
-            connection.sadd::<_, _, ()>(self.keyspace.client_index(), key.as_str())?;
-            Ok(())
-        })
+                .arg(ttl_ms.to_string())
+                .invoke::<(i32, String)>(connection)
+        })?;
+        if result.0 == 1 {
+            return Ok(());
+        }
+        Err(StoreError::StaleEpoch(format!(
+            "lease rejected: proposed epoch {new_epoch} <= floor {} for stable_id {}",
+            result.1, stable_id.0
+        )))
     }
 
     fn update_client_state(
@@ -1048,8 +1106,11 @@ impl MetadataBackend for RedisMetadataBackend {
         })?;
         let now = now_ms();
         let mut stale = Vec::new();
+        let mut stale_by_stable: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         let mut leases = Vec::with_capacity(entries.len());
         for (key, payload) in entries {
+            let parsed = self.keyspace.parse_client_key(&key);
             match payload {
                 Some(payload) => {
                     let lease =
@@ -1057,17 +1118,44 @@ impl MetadataBackend for RedisMetadataBackend {
                     if lease.expires_at_ms >= now {
                         leases.push(lease);
                     } else {
+                        let by_stable_key = self
+                            .keyspace
+                            .client_by_stable_index(&lease.runtime.stable_id);
+                        stale_by_stable
+                            .entry(by_stable_key)
+                            .or_default()
+                            .push(lease.runtime.epoch.0.to_string());
                         stale.push(key);
                     }
                 }
-                None => stale.push(key),
+                None => {
+                    if let Some((stable_id, epoch)) = parsed {
+                        let by_stable_key = self
+                            .keyspace
+                            .client_by_stable_index(&ClientStableId::new(stable_id));
+                        stale_by_stable
+                            .entry(by_stable_key)
+                            .or_default()
+                            .push(epoch.to_string());
+                    }
+                    stale.push(key);
+                }
             }
         }
-        if !stale.is_empty() {
+        if !stale.is_empty() || !stale_by_stable.is_empty() {
             let mut connection = self.connection()?;
-            connection
-                .srem::<_, _, ()>(&index, stale)
-                .map_err(|error| metadata_error("redis srem stale client index", error))?;
+            if !stale.is_empty() {
+                connection
+                    .srem::<_, _, ()>(&index, stale)
+                    .map_err(|error| metadata_error("redis srem stale client index", error))?;
+            }
+            for (by_stable_key, epochs) in stale_by_stable {
+                connection
+                    .srem::<_, _, ()>(&by_stable_key, epochs)
+                    .map_err(|error| {
+                        metadata_error("redis srem stale by-stable client index", error)
+                    })?;
+            }
         }
         Ok(leases)
     }
@@ -2426,6 +2514,107 @@ mod tests {
             .smembers(&index_key)
             .expect("client index read after prune should succeed");
         assert!(indexed.is_empty());
+    }
+
+    #[test]
+    fn redis_backend_upsert_client_lease_rejects_stale_epoch() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-client-epoch-cas");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+
+        let make_lease = |epoch: u64| ClientLease {
+            runtime: ClientRuntimeId::new("client-cas", ClientEpoch(epoch)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms: super::now_ms() + 60_000,
+        };
+
+        backend
+            .upsert_client_lease(&make_lease(5))
+            .expect("first lease should publish");
+
+        let rejection = backend
+            .upsert_client_lease(&make_lease(3))
+            .expect_err("older epoch must be rejected");
+        assert!(matches!(rejection, StoreError::StaleEpoch(_)));
+
+        let equal = backend
+            .upsert_client_lease(&make_lease(5))
+            .expect("same (stable_id, epoch) is a refresh");
+        let _ = equal;
+
+        backend
+            .upsert_client_lease(&make_lease(6))
+            .expect("strictly greater epoch must succeed");
+
+        let client = redis::Client::open(server.url()).expect("redis client should open");
+        let mut connection = client
+            .get_connection()
+            .expect("redis connection should succeed");
+        let hwm: Option<String> = connection
+            .get(keyspace.client_epoch_hwm(&ClientStableId::new("client-cas")))
+            .expect("hwm read should succeed");
+        assert_eq!(hwm.as_deref(), Some("6"));
+        let members: Vec<String> = connection
+            .smembers(keyspace.client_by_stable_index(&ClientStableId::new("client-cas")))
+            .expect("by-stable index read should succeed");
+        let mut sorted = members.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["5".to_string(), "6".to_string()]);
+    }
+
+    #[test]
+    fn redis_backend_upsert_client_lease_cleans_by_stable_index_on_expiry() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-client-by-stable-prune");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+
+        let lease = ClientLease {
+            runtime: ClientRuntimeId::new("prune-me", ClientEpoch(2)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms: super::now_ms() + 60_000,
+        };
+        backend
+            .upsert_client_lease(&lease)
+            .expect("lease should publish");
+
+        let client = redis::Client::open(server.url()).expect("redis client should open");
+        let mut connection = client
+            .get_connection()
+            .expect("redis connection should succeed");
+        connection
+            .del::<_, ()>(keyspace.client(&lease.runtime))
+            .expect("simulate lease expiry by deleting key");
+
+        let listed = backend
+            .list_live_clients()
+            .expect("list should succeed with stale key");
+        assert!(listed.is_empty());
+
+        let members: Vec<String> = connection
+            .smembers(keyspace.client_by_stable_index(&ClientStableId::new("prune-me")))
+            .expect("by-stable index read should succeed");
+        assert!(
+            members.is_empty(),
+            "by-stable index should prune expired epoch"
+        );
+        let hwm: Option<String> = connection
+            .get(keyspace.client_epoch_hwm(&ClientStableId::new("prune-me")))
+            .expect("hwm read should succeed");
+        assert_eq!(hwm.as_deref(), Some("2"), "HWM must not regress on expiry");
     }
 
     #[test]
