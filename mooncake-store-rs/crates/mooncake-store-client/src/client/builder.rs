@@ -48,13 +48,11 @@ fn validate_runtime_conflicts(
             }
         }
 
-        if same_stable && remote.runtime.epoch > local.runtime.epoch {
-            return Err(StoreError::StaleEpoch(format!(
-                "runtime {} is fenced by newer live runtime {}",
-                local.runtime, remote.runtime
-            )));
-        }
-
+        // Epoch monotonicity (new epoch > all historical epochs) is enforced
+        // atomically by the metadata backend in upsert_client_lease. This guard
+        // only covers cases the backend cannot express in a single key: a reachable
+        // duplicate at the same (stable_id, epoch), and segment-name collisions
+        // across different runtimes.
         if same_stable && remote.runtime.epoch == local.runtime.epoch {
             return Err(StoreError::Conflict(format!(
                 "runtime {} is already live",

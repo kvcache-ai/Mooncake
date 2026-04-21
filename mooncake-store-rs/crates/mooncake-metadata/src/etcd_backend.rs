@@ -82,15 +82,101 @@ impl MetadataBackend for EtcdMetadataBackend {
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
-        let key = self.config.keyspace.client(&lease.runtime);
+        let stable_id = lease.runtime.stable_id.clone();
+        let new_epoch = lease.runtime.epoch.0;
+        let lease_key = self.config.keyspace.client(&lease.runtime);
+        let marker_key = self
+            .config
+            .keyspace
+            .client_by_stable_marker(&stable_id, new_epoch);
+        let marker_prefix = self
+            .config
+            .keyspace
+            .client_by_stable_marker_prefix(&stable_id);
+        let hwm_key = self.config.keyspace.client_epoch_hwm(&stable_id);
         let payload = serde_json::to_string(lease).map_err(json_error)?;
         self.block_on(async {
             let mut client = self.client().await?;
-            client
-                .put(key, payload, None)
-                .await
-                .map_err(etcd_error("etcd put client lease"))?;
-            Ok(())
+            loop {
+                let existing = client
+                    .get(lease_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get client lease"))?;
+                if !existing.kvs().is_empty() {
+                    client
+                        .put(lease_key.clone(), payload.clone(), None)
+                        .await
+                        .map_err(etcd_error("etcd refresh client lease"))?;
+                    return Ok(());
+                }
+
+                let active = client
+                    .get(marker_prefix.clone(), Some(GetOptions::new().with_prefix()))
+                    .await
+                    .map_err(etcd_error("etcd scan client by-stable markers"))?;
+                let active_max = active
+                    .kvs()
+                    .iter()
+                    .filter_map(|kv| {
+                        let key = std::str::from_utf8(kv.key()).ok()?;
+                        key.rsplit('/').next()?.parse::<u64>().ok()
+                    })
+                    .max()
+                    .unwrap_or(0);
+
+                let hwm_response = client
+                    .get(hwm_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get client epoch hwm"))?;
+                let (hwm_value, hwm_mod_rev) = hwm_response
+                    .kvs()
+                    .first()
+                    .and_then(|kv| {
+                        let value = std::str::from_utf8(kv.value()).ok()?;
+                        let parsed = value.parse::<u64>().ok()?;
+                        Some((parsed, kv.mod_revision()))
+                    })
+                    .unwrap_or((0, 0));
+
+                let floor = active_max.max(hwm_value);
+                if new_epoch <= floor {
+                    return Err(StoreError::StaleEpoch(format!(
+                        "lease rejected: proposed epoch {new_epoch} <= floor {floor} for stable_id {}",
+                        stable_id.0
+                    )));
+                }
+
+                let txn = Txn::new()
+                    .when(vec![
+                        Compare::mod_revision(
+                            lease_key.clone(),
+                            CompareOp::Equal,
+                            0,
+                        ),
+                        Compare::mod_revision(
+                            marker_key.clone(),
+                            CompareOp::Equal,
+                            0,
+                        ),
+                        Compare::mod_revision(
+                            hwm_key.clone(),
+                            CompareOp::Equal,
+                            hwm_mod_rev,
+                        ),
+                    ])
+                    .and_then(vec![
+                        TxnOp::put(lease_key.clone(), payload.clone(), None),
+                        TxnOp::put(marker_key.clone(), Vec::<u8>::new(), None),
+                        TxnOp::put(hwm_key.clone(), new_epoch.to_string(), None),
+                    ]);
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd upsert client lease"))?;
+                if txn_response.succeeded() {
+                    return Ok(());
+                }
+            }
         })
     }
 
@@ -128,6 +214,7 @@ impl MetadataBackend for EtcdMetadataBackend {
             .client_pattern()
             .trim_end_matches('*')
             .to_string();
+        let keyspace = self.config.keyspace.clone();
         self.block_on(async {
             let mut client = self.client().await?;
             let response = client
@@ -135,16 +222,28 @@ impl MetadataBackend for EtcdMetadataBackend {
                 .await
                 .map_err(etcd_error("etcd list client leases"))?;
             let now = now_ms();
-            response
-                .kvs()
-                .iter()
-                .map(|kv| serde_json::from_slice::<ClientLease>(kv.value()).map_err(json_error))
-                .filter_map(|lease| match lease {
-                    Ok(lease) if lease.expires_at_ms >= now => Some(Ok(lease)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .collect()
+            let mut live = Vec::with_capacity(response.kvs().len());
+            let mut stale_markers: Vec<String> = Vec::new();
+            for kv in response.kvs() {
+                let lease: ClientLease = serde_json::from_slice(kv.value()).map_err(json_error)?;
+                if lease.expires_at_ms >= now {
+                    live.push(lease);
+                } else {
+                    stale_markers.push(
+                        keyspace.client_by_stable_marker(
+                            &lease.runtime.stable_id,
+                            lease.runtime.epoch.0,
+                        ),
+                    );
+                }
+            }
+            for marker in stale_markers {
+                client
+                    .delete(marker, None)
+                    .await
+                    .map_err(etcd_error("etcd delete stale by-stable marker"))?;
+            }
+            Ok(live)
         })
     }
 

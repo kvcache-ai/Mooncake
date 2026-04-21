@@ -293,6 +293,8 @@ Metadata backends store four persistent categories of data:
 
 For membership specifically, metadata is the authoritative lease store, while the client runtime keeps a prewarmed and background-refreshed snapshot for request-path reads.
 
+Client-lease publication is gated by an atomic per-stable-id epoch invariant: every `upsert_client_lease` must carry an `epoch` strictly greater than both the set of currently-active epochs for that `stable_id` and a persistent high-water mark that never regresses. Republishing the same `(stable_id, epoch)` is a refresh and extends the lease TTL in place. The backends implement this invariant differently: the in-memory backend holds the active-epoch set and HWM under its write lock, Redis uses a dedicated Lua script over a `by-stable` set and an HWM key, and etcd uses a txn loop over per-epoch marker keys and the HWM key.
+
 For strict quota rollout, the metadata model now also includes tenant-root quota primitives:
 
 - `TenantQuotaState` for committed and pending usage

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
@@ -16,6 +16,8 @@ use crate::segment_state::StoredSegmentState;
 #[derive(Default)]
 struct InMemoryState {
     clients: BTreeMap<String, ClientLease>,
+    client_by_stable: BTreeMap<String, BTreeSet<u64>>,
+    client_epoch_hwm: BTreeMap<String, u64>,
     handoffs: BTreeMap<String, HandoffPlan>,
     objects: BTreeMap<String, ObjectRoute>,
     route_policies: BTreeMap<RoutePolicyDomain, RoutePolicy>,
@@ -117,10 +119,38 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
-        self.state
-            .write()
-            .clients
-            .insert(lease.runtime.storage_key(), lease.clone());
+        use std::collections::btree_map::Entry;
+
+        let storage_key = lease.runtime.storage_key();
+        let stable_id = lease.runtime.stable_id.0.clone();
+        let new_epoch = lease.runtime.epoch.0;
+        let mut state = self.state.write();
+
+        if let Entry::Occupied(mut entry) = state.clients.entry(storage_key.clone()) {
+            entry.insert(lease.clone());
+            return Ok(());
+        }
+
+        let active_max = state
+            .client_by_stable
+            .get(&stable_id)
+            .and_then(|set| set.iter().next_back().copied())
+            .unwrap_or(0);
+        let hwm = state.client_epoch_hwm.get(&stable_id).copied().unwrap_or(0);
+        let floor = active_max.max(hwm);
+        if new_epoch <= floor {
+            return Err(StoreError::StaleEpoch(format!(
+                "lease rejected: proposed epoch {new_epoch} <= floor {floor} for stable_id {stable_id}"
+            )));
+        }
+
+        state.clients.insert(storage_key, lease.clone());
+        state
+            .client_by_stable
+            .entry(stable_id.clone())
+            .or_default()
+            .insert(new_epoch);
+        state.client_epoch_hwm.insert(stable_id, new_epoch);
         Ok(())
     }
 
@@ -1305,5 +1335,69 @@ mod tests {
             .expect("quota state should exist");
         assert_eq!(quota.pending_reserved_bytes, 40);
         assert_eq!(quota.pending_reserved_objects, 1);
+    }
+
+    fn make_lease(stable_id: &str, epoch: u64) -> ClientLease {
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(epoch)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: Default::default(),
+            expires_at_ms: 10_000,
+        }
+    }
+
+    #[test]
+    fn upsert_client_lease_rejects_non_monotonic_epoch() {
+        let metadata = InMemoryMetadataBackend::new();
+        metadata
+            .upsert_client_lease(&make_lease("client-a", 5))
+            .expect("first lease should publish");
+
+        let stale = metadata
+            .upsert_client_lease(&make_lease("client-a", 3))
+            .expect_err("older epoch should be rejected");
+        assert!(matches!(stale, StoreError::StaleEpoch(_)));
+
+        let equal = metadata
+            .upsert_client_lease(&make_lease("client-a", 5))
+            .expect("same (stable_id, epoch) is a refresh and must succeed");
+        let _ = equal;
+
+        metadata
+            .upsert_client_lease(&make_lease("client-a", 6))
+            .expect("strictly greater epoch should succeed");
+    }
+
+    #[test]
+    fn upsert_client_lease_isolates_stable_ids() {
+        let metadata = InMemoryMetadataBackend::new();
+        metadata
+            .upsert_client_lease(&make_lease("client-a", 9))
+            .expect("client-a lease should publish");
+        metadata
+            .upsert_client_lease(&make_lease("client-b", 1))
+            .expect("distinct stable_id keeps its own monotonicity");
+    }
+
+    #[test]
+    fn upsert_client_lease_hwm_persists_across_concurrent_epochs() {
+        let metadata = InMemoryMetadataBackend::new();
+        metadata
+            .upsert_client_lease(&make_lease("client-a", 2))
+            .expect("publish epoch 2");
+        metadata
+            .upsert_client_lease(&make_lease("client-a", 3))
+            .expect("publish epoch 3 (handoff window)");
+
+        let stale = metadata
+            .upsert_client_lease(&make_lease("client-a", 3))
+            .expect("epoch 3 refresh under handoff must succeed");
+        let _ = stale;
+
+        let rejected = metadata
+            .upsert_client_lease(&make_lease("client-a", 1))
+            .expect_err("epoch behind active set must be rejected");
+        assert!(matches!(rejected, StoreError::StaleEpoch(_)));
     }
 }

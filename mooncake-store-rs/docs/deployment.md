@@ -637,7 +637,7 @@ The runtime also manages some labels internally, such as route capability and co
 ## Operational Conventions
 
 - keep `stable_id` stable across restarts and upgrades
-- increment `epoch` for successor processes during hot-upgrade flows
+- pick an `epoch` strictly greater than every prior epoch of the same `stable_id` for successor processes during hot-upgrade flows; the metadata backend rejects non-monotonic values with `StaleEpoch`
 - mount local memory before serving data traffic
 - keep `heartbeat_interval_ms` comfortably below the default `lease_ttl_ms=30000`
 - use a dedicated metadata keyspace per environment or test run

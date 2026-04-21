@@ -40,9 +40,12 @@ cp target/debug/mooncake-store-client target/debug/mooncake-store-client-v1
 Choose a node in the cluster (e.g., `client-a`) and note its `stable_id` and current `epoch`.
 
 ```bash
-# List active clients (the client index is stored in a Redis SET)
-# Key format: {keyspace}/indexes/clients
-# Values: {keyspace}/clients/{stable_id}:{epoch}
+# The per-stable-id high-water mark is the authoritative floor enforced by
+# the metadata backend; querying it gives the next valid epoch directly.
+redis-cli -p 6380 GET "${KEYSPACE}/state/client-epoch-hwm/client-a"
+
+# If you prefer to inspect the full live membership, the global client index
+# still lists every active lease key:
 redis-cli -p 6380 SMEMBERS "${KEYSPACE}/indexes/clients" | cat
 
 # Example output:
@@ -50,6 +53,11 @@ redis-cli -p 6380 SMEMBERS "${KEYSPACE}/indexes/clients" | cat
 # mc/store-rs/my-cluster/clients/client-b:1
 # Here client-a has stable_id=client-a, epoch=1
 ```
+
+The metadata backend rejects any `upsert_client_lease` whose proposed epoch
+is not strictly greater than the per-stable-id high-water mark with a
+`StaleEpoch` error, so the only way to pick a safe successor epoch is to
+read the HWM (or the live epoch) and publish with a strictly higher value.
 
 ### Step 2: Start the New Version Successor in Standby Mode
 

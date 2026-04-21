@@ -27,6 +27,37 @@ impl MetadataKeyspace {
         format!("{}/indexes/clients", self.prefix)
     }
 
+    pub fn client_by_stable_index(&self, stable_id: &ClientStableId) -> String {
+        format!("{}/indexes/clients/by-stable/{}", self.prefix, stable_id.0)
+    }
+
+    pub fn client_by_stable_index_prefix(&self) -> String {
+        format!("{}/indexes/clients/by-stable/", self.prefix)
+    }
+
+    pub fn client_epoch_hwm(&self, stable_id: &ClientStableId) -> String {
+        format!("{}/state/client-epoch-hwm/{}", self.prefix, stable_id.0)
+    }
+
+    pub fn parse_client_key(&self, key: &str) -> Option<(String, u64)> {
+        let prefix = format!("{}/clients/", self.prefix);
+        let rest = key.strip_prefix(&prefix)?;
+        let (stable_id, epoch_str) = rest.rsplit_once(':')?;
+        let epoch = epoch_str.parse::<u64>().ok()?;
+        Some((stable_id.to_string(), epoch))
+    }
+
+    pub fn client_by_stable_marker(&self, stable_id: &ClientStableId, epoch: u64) -> String {
+        format!(
+            "{}/indexes/clients/by-stable/{}/{}",
+            self.prefix, stable_id.0, epoch
+        )
+    }
+
+    pub fn client_by_stable_marker_prefix(&self, stable_id: &ClientStableId) -> String {
+        format!("{}/indexes/clients/by-stable/{}/", self.prefix, stable_id.0)
+    }
+
     pub fn segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> String {
         format!(
             "{}/segments/{}:{}",
@@ -292,6 +323,39 @@ mod tests {
         assert_eq!(keyspace.client(&runtime), "tenant-a/clients/writer:9");
         assert_eq!(keyspace.client_pattern(), "tenant-a/clients/*");
         assert_eq!(keyspace.client_index(), "tenant-a/indexes/clients");
+        assert_eq!(
+            keyspace.client_by_stable_index(&stable),
+            "tenant-a/indexes/clients/by-stable/writer"
+        );
+        assert_eq!(
+            keyspace.client_by_stable_index_prefix(),
+            "tenant-a/indexes/clients/by-stable/"
+        );
+        assert_eq!(
+            keyspace.client_epoch_hwm(&stable),
+            "tenant-a/state/client-epoch-hwm/writer"
+        );
+        assert_eq!(
+            keyspace.parse_client_key("tenant-a/clients/writer:9"),
+            Some(("writer".to_string(), 9))
+        );
+        assert_eq!(
+            keyspace.parse_client_key("tenant-a/clients/host:b:42"),
+            Some(("host:b".to_string(), 42))
+        );
+        assert_eq!(
+            keyspace.parse_client_key("tenant-a/clients/malformed"),
+            None
+        );
+        assert_eq!(keyspace.parse_client_key("other/clients/writer:9"), None);
+        assert_eq!(
+            keyspace.client_by_stable_marker(&stable, 9),
+            "tenant-a/indexes/clients/by-stable/writer/9"
+        );
+        assert_eq!(
+            keyspace.client_by_stable_marker_prefix(&stable),
+            "tenant-a/indexes/clients/by-stable/writer/"
+        );
         assert_eq!(
             keyspace.segment(&runtime, &segment),
             "tenant-a/segments/writer:9:seg-1"
