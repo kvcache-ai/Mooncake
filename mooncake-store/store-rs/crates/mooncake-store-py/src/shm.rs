@@ -268,6 +268,7 @@ fn sanitize_scope_component(value: &str) -> String {
         .chars()
         .map(|ch| match ch {
             'a'..='z' | 'A'..='Z' | '0'..='9' => ch,
+            '-' | '/' => '-',
             _ => '_',
         })
         .collect::<String>()

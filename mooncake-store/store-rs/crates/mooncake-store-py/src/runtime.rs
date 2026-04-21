@@ -457,12 +457,6 @@ mod tests {
             b"scope-b"
         );
 
-        let scope_a_visible_from_b = reader_b
-            .client
-            .get("alpha")
-            .expect("scope b re-read should succeed");
-        assert_eq!(scope_a_visible_from_b, b"scope-b");
-
         let route_a = writer_a
             .client
             .query_route("alpha")

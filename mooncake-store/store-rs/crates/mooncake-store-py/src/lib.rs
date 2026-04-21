@@ -28,7 +28,7 @@ use mooncake_store_core::{
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use runtime::CompatRuntimeArgs;
+use runtime::{CompatRuntimeArgs, CompatTimeoutConfig};
 
 enum StoreBackend {
     Real(StoreDispatcher),
