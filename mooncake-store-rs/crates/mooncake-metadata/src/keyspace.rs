@@ -19,6 +19,10 @@ impl MetadataKeyspace {
         format!("{}/clients/{}", self.prefix, runtime.storage_key())
     }
 
+    pub fn client_prefix_for_stable(&self, stable_id: &ClientStableId) -> String {
+        format!("{}/clients/{}:", self.prefix, stable_id.0)
+    }
+
     pub fn client_pattern(&self) -> String {
         format!("{}/clients/*", self.prefix)
     }
@@ -321,6 +325,10 @@ mod tests {
         let segment = SegmentName::new("seg-1");
 
         assert_eq!(keyspace.client(&runtime), "tenant-a/clients/writer:9");
+        assert_eq!(
+            keyspace.client_prefix_for_stable(&stable),
+            "tenant-a/clients/writer:"
+        );
         assert_eq!(keyspace.client_pattern(), "tenant-a/clients/*");
         assert_eq!(keyspace.client_index(), "tenant-a/indexes/clients");
         assert_eq!(

@@ -184,14 +184,14 @@ echo ""
 echo "=== PHASE 1: Start two V1 clients and verify read/write ==="
 
 "${BIN_V1}" "${BASE_ARGS[@]}" \
-  --stable-id client-a --epoch 1 --initial-state active \
+  --stable-id client-a --initial-state active \
   --local-segment-name "seg-a-v1-${RUN_ID}" \
   >"${TEMP_DIR}/client-a-v1.log" 2>&1 &
 CLIENT_A_V1_PID=$!
 PIDS+=("${CLIENT_A_V1_PID}")
 
 "${BIN_V1}" "${BASE_ARGS[@]}" \
-  --stable-id client-b --epoch 1 --initial-state active \
+  --stable-id client-b --initial-state active \
   --local-segment-name "seg-b-v1-${RUN_ID}" \
   >"${TEMP_DIR}/client-b-v1.log" 2>&1 &
 CLIENT_B_V1_PID=$!
@@ -235,7 +235,7 @@ echo ""
 echo "=== PHASE 2: Rolling upgrade client-a (V1 -> V2) ==="
 
 "${BIN_V2}" "${BASE_ARGS[@]}" \
-  --stable-id client-a --epoch 2 --initial-state standby \
+  --stable-id client-a --initial-state standby \
   --local-segment-name "seg-a-v2-${RUN_ID}" \
   >"${TEMP_DIR}/client-a-v2.log" 2>&1 &
 CLIENT_A_V2_PID=$!
@@ -309,7 +309,7 @@ echo "=== PHASE 3: Rollback client-a (V2 -> V1) using V1 binary ==="
 echo "  Starting client-a V1 rollback with epoch=3 (standby)..."
 
 "${BIN_V1}" "${BASE_ARGS[@]}" \
-  --stable-id client-a --epoch 3 --initial-state standby \
+  --stable-id client-a --initial-state standby \
   --local-segment-name "seg-a-rollback-${RUN_ID}" \
   >"${TEMP_DIR}/client-a-rollback.log" 2>&1 &
 CLIENT_A_ROLLBACK_PID=$!

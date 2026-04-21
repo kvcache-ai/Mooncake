@@ -151,7 +151,6 @@ echo "==> starting active predecessor binary"
 "${BIN}" \
   "${BASE_ARGS[@]}" \
   --stable-id "${STABLE_ID}" \
-  --epoch 1 \
   --initial-state active \
   --local-segment-name "${PREDECESSOR_SEGMENT}" \
   >"${PREDECESSOR_LOG}" 2>&1 &
@@ -163,7 +162,6 @@ echo "==> starting standby successor binary"
 "${BIN}" \
   "${BASE_ARGS[@]}" \
   --stable-id "${STABLE_ID}" \
-  --epoch 2 \
   --initial-state standby \
   --local-segment-name "${SUCCESSOR_SEGMENT}" \
   >"${SUCCESSOR_LOG}" 2>&1 &

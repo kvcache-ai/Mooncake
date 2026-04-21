@@ -92,7 +92,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut target_a = build_client(
         metadata.clone(),
         "store-a",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         target_a_bundle,
         memory.clone(),
@@ -102,7 +101,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut target_b = build_client(
         metadata.clone(),
         "store-b",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         target_b_bundle,
         memory.clone(),
@@ -116,7 +114,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut target_c = build_client(
         metadata.clone(),
         "store-c",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         target_c_bundle,
         memory.clone(),
@@ -130,7 +127,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut target_upgrade = build_client(
         metadata.clone(),
         "store-a",
-        ClientEpoch(2),
         ClientLifecycleState::Standby,
         upgrade_bundle,
         memory.clone(),
@@ -140,7 +136,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut reclaim_writer = build_client(
         metadata.clone(),
         "store-reclaim",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         reclaim_bundle,
         LocalMemoryConfig::new()
@@ -159,7 +154,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut router = build_routed_client(
         metadata.clone(),
         "router",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         router_bundle,
         LocalMemoryConfig::new()
@@ -176,7 +170,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut router_replica = build_routed_client(
         metadata.clone(),
         "router-replica",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         router_replica_bundle,
         LocalMemoryConfig::new()
@@ -201,7 +194,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut reader = build_client(
         metadata.clone(),
         "reader",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         reader_bundle,
         memory,
@@ -211,7 +203,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut elastic_target = build_client(
         metadata.clone(),
         "elastic-target",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         elastic_target_bundle,
         LocalMemoryConfig::new()
@@ -234,7 +225,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut elastic_router = build_routed_client(
         metadata.clone(),
         "elastic-router",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         elastic_router_bundle,
         LocalMemoryConfig::new()
@@ -427,7 +417,6 @@ fn build_tent_bundle(
 fn build_client(
     metadata: Arc<RedisMetadataBackend>,
     stable_id: &str,
-    epoch: ClientEpoch,
     state: ClientLifecycleState,
     transport: TentBundle,
     memory: LocalMemoryConfig,
@@ -435,7 +424,6 @@ fn build_client(
     labels: &[(&str, &str)],
 ) -> Result<StoreClient> {
     let mut builder = StoreClientBuilder::new(metadata, stable_id)
-        .epoch(epoch)
         .state(state)
         .activate_on_local_memory_registration()
         .tenant(tenant)
@@ -453,7 +441,6 @@ fn build_client(
 fn build_routed_client(
     metadata: Arc<RedisMetadataBackend>,
     stable_id: &str,
-    epoch: ClientEpoch,
     state: ClientLifecycleState,
     transport: TentBundle,
     memory: LocalMemoryConfig,
@@ -464,7 +451,6 @@ fn build_routed_client(
     bandwidth_shaping: Option<BandwidthShaping>,
 ) -> Result<StoreClient> {
     let mut builder = StoreClientBuilder::new(metadata, stable_id)
-        .epoch(epoch)
         .state(state)
         .activate_on_local_memory_registration()
         .tenant(tenant)
@@ -567,7 +553,6 @@ fn verify_strict_tenant_quota(
     let writer = build_client(
         metadata.clone(),
         "quota-e2e-writer",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         bundle,
         LocalMemoryConfig::new()
@@ -1457,7 +1442,6 @@ fn verify_rdma_bandwidth_isolation(
     let high = build_routed_client(
         metadata.clone(),
         "rdma-high-router",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         build_tent_bundle(redis_port, "rdma-high-router-segment", true)?,
         LocalMemoryConfig::new()
@@ -1478,7 +1462,6 @@ fn verify_rdma_bandwidth_isolation(
     let low = build_routed_client(
         metadata,
         "rdma-low-router",
-        ClientEpoch(1),
         ClientLifecycleState::Active,
         build_tent_bundle(redis_port, "rdma-low-router-segment", true)?,
         LocalMemoryConfig::new()

@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
-    TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
-    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
-    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
-    TenantQuotaReservationState, TenantQuotaState,
+    CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
+    HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    StoreError, TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy,
+    TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+    TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
+    TenantQuotaReservationRequest, TenantQuotaReservationState, TenantQuotaState,
 };
 use parking_lot::RwLock;
 
@@ -152,6 +152,33 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .insert(new_epoch);
         state.client_epoch_hwm.insert(stable_id, new_epoch);
         Ok(())
+    }
+
+    fn allocate_client_lease(&self, template: &ClientLease) -> Result<ClientRuntimeId> {
+        let stable_id = template.runtime.stable_id.0.clone();
+        let mut state = self.state.write();
+
+        let active_max = state
+            .client_by_stable
+            .get(&stable_id)
+            .and_then(|set| set.iter().next_back().copied())
+            .unwrap_or(0);
+        let hwm = state.client_epoch_hwm.get(&stable_id).copied().unwrap_or(0);
+        let new_epoch = active_max.max(hwm).saturating_add(1);
+
+        let mut lease = template.clone();
+        lease.runtime.epoch = ClientEpoch(new_epoch);
+        let storage_key = lease.runtime.storage_key();
+        let runtime = lease.runtime.clone();
+
+        state.clients.insert(storage_key, lease);
+        state
+            .client_by_stable
+            .entry(stable_id.clone())
+            .or_default()
+            .insert(new_epoch);
+        state.client_epoch_hwm.insert(stable_id, new_epoch);
+        Ok(runtime)
     }
 
     fn update_client_state(
@@ -1378,6 +1405,48 @@ mod tests {
         metadata
             .upsert_client_lease(&make_lease("client-b", 1))
             .expect("distinct stable_id keeps its own monotonicity");
+    }
+
+    #[test]
+    fn allocate_client_lease_returns_monotonic_epochs() {
+        let metadata = InMemoryMetadataBackend::new();
+        let first = metadata
+            .allocate_client_lease(&make_lease("client-alloc", 0))
+            .expect("first allocation should succeed");
+        let second = metadata
+            .allocate_client_lease(&make_lease("client-alloc", 999))
+            .expect("second allocation ignores template epoch");
+        let third = metadata
+            .allocate_client_lease(&make_lease("client-alloc", 0))
+            .expect("third allocation should succeed");
+        assert_eq!(first.epoch, ClientEpoch(1));
+        assert_eq!(second.epoch, ClientEpoch(2));
+        assert_eq!(third.epoch, ClientEpoch(3));
+    }
+
+    #[test]
+    fn allocate_client_lease_respects_hwm_after_upsert() {
+        let metadata = InMemoryMetadataBackend::new();
+        metadata
+            .upsert_client_lease(&make_lease("client-mixed", 7))
+            .expect("explicit lease at epoch 7 should publish");
+        let assigned = metadata
+            .allocate_client_lease(&make_lease("client-mixed", 0))
+            .expect("allocate should climb above prior explicit epoch");
+        assert_eq!(assigned.epoch, ClientEpoch(8));
+    }
+
+    #[test]
+    fn allocate_client_lease_isolates_stable_ids() {
+        let metadata = InMemoryMetadataBackend::new();
+        let a = metadata
+            .allocate_client_lease(&make_lease("stable-a", 0))
+            .expect("first stable_id allocation");
+        let b = metadata
+            .allocate_client_lease(&make_lease("stable-b", 0))
+            .expect("second stable_id allocation");
+        assert_eq!(a.epoch, ClientEpoch(1));
+        assert_eq!(b.epoch, ClientEpoch(1));
     }
 
     #[test]

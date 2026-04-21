@@ -667,7 +667,6 @@ class MooncakeDistributedStore:
             str(config.get("rdma_devices", "")),
             str(config.get("master_server_addr", config.get("master_server", ""))),
             stable_id=_coerce_optional_str(config.get("stable_id")),
-            epoch=_coerce_int(config.get("epoch"), 1),
             initial_state=initial_state,
             tenant=str(config.get("tenant", "default")),
             labels=_coerce_mapping(config.get("labels")),
@@ -823,7 +822,6 @@ def _warn_setup_policy_fallback(config: Mapping[str, object], *, source: str) ->
 
 _SETUP_ENV_DEFAULTS = {
     "stable_id": ("MC_STORE_RS_STABLE_ID", _coerce_optional_str),
-    "epoch": ("MC_STORE_RS_EPOCH", lambda value: _coerce_int(value, 1)),
     "initial_state": ("MC_STORE_RS_INITIAL_STATE", _coerce_optional_str),
     "tenant": ("MC_STORE_RS_TENANT", str),
     "routed_writes": (

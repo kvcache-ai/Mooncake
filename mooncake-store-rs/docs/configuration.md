@@ -43,8 +43,7 @@ Operational notes:
 
 | Method or Field | Default | Notes |
 |-----------------|---------|-------|
-| `new(metadata, stable_id)` | required | `stable_id` is the long-lived node identity |
-| `epoch(ClientEpoch(1))` | `1` | must be strictly greater than every prior epoch observed for the same `stable_id`; the metadata backend fences non-monotonic values with `StaleEpoch` |
+| `new(metadata, stable_id)` | required | `stable_id` is the long-lived node identity; the metadata backend assigns the epoch atomically on every `build(...)` |
 | `compatibility(...)` | `CompatibilityDescriptor::default()` | controls compatibility matching |
 | `rpc_address(...)` | empty | filled from transport when possible |
 | `segment_name(...)` | none | filled from transport when possible |
@@ -412,7 +411,6 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
 | `MC_STORE_RS_KEYSPACE` | Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace` |
 | `MC_STORE_RS_STABLE_ID` | Python wrapper setup fallback | stable client id used when SGLang cannot pass `stable_id` |
-| `MC_STORE_RS_EPOCH` | Python wrapper setup fallback | client epoch used when SGLang cannot pass `epoch`; must strictly exceed any prior epoch for the same `stable_id` or the metadata backend rejects the lease with `StaleEpoch` |
 | `MC_STORE_RS_INITIAL_STATE` | Python wrapper setup fallback | initial lifecycle state, for example `active`, `standby`, `draining`, or `offline` |
 | `MC_STORE_RS_TENANT` | Python wrapper setup fallback | default tenant used when SGLang cannot pass `tenant` |
 | `MC_STORE_RS_LABELS` | Python wrapper setup fallback | labels as JSON object or comma-separated `key=value` pairs |
@@ -517,5 +515,5 @@ For debugging:
 For upgrade and elasticity flows:
 
 - preserve `stable_id`
-- pick an `epoch` that is strictly greater than every prior epoch used by the same `stable_id`; the metadata backend enforces this with a `StaleEpoch` rejection
+- start the successor with the same `stable_id`; the metadata backend allocates the next epoch atomically
 - use `expand_local_memory`, `drain_segment`, `retire_segment`, and `evacuate_owned_replicas`

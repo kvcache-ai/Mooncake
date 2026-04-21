@@ -345,7 +345,7 @@ Python hot-upgrade argument and wrapper compatibility validation:
 
 This script verifies both layers:
 
-- PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
+- PyO3 native `setup(..., stable_id, initial_state)` argument parsing; the metadata backend assigns the epoch
 - Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
 
 ### Run the local hot-cache validation
@@ -595,7 +595,7 @@ Use these environment variables for SGLang real mode:
 - `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
 - `MC_STORE_RS_TRANSPORT_METADATA_URL`, `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
-- `MC_STORE_RS_EPOCH`, `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
+- `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
 - `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC capacity; default `2`
 

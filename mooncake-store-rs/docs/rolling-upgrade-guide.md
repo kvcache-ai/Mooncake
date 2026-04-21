@@ -35,36 +35,11 @@ ls -la target/debug/mooncake-store-client
 cp target/debug/mooncake-store-client target/debug/mooncake-store-client-v1
 ```
 
-### Step 1: Identify the Node to Upgrade
+### Step 1: Start the New Version Successor in Standby Mode
 
-Choose a node in the cluster (e.g., `client-a`) and note its `stable_id` and current `epoch`.
-
-```bash
-# The per-stable-id high-water mark is the authoritative floor enforced by
-# the metadata backend; querying it gives the next valid epoch directly.
-redis-cli -p 6380 GET "${KEYSPACE}/state/client-epoch-hwm/client-a"
-
-# If you prefer to inspect the full live membership, the global client index
-# still lists every active lease key:
-redis-cli -p 6380 SMEMBERS "${KEYSPACE}/indexes/clients" | cat
-
-# Example output:
-# mc/store-rs/my-cluster/clients/client-a:1
-# mc/store-rs/my-cluster/clients/client-b:1
-# Here client-a has stable_id=client-a, epoch=1
-```
-
-The metadata backend rejects any `upsert_client_lease` whose proposed epoch
-is not strictly greater than the per-stable-id high-water mark with a
-`StaleEpoch` error, so the only way to pick a safe successor epoch is to
-read the HWM (or the live epoch) and publish with a strictly higher value.
-
-### Step 2: Start the New Version Successor in Standby Mode
-
-Launch the new version binary with the **same `stable_id`** and a **higher `epoch`**:
+Launch the new version binary with the **same `stable_id`** as the predecessor. The metadata backend allocates the next epoch automatically.
 
 ```bash
-# Assuming client-a is currently at epoch=1, start a successor at epoch=2
 ./target/debug/mooncake-store-client \
   --local-hostname 127.0.0.1 \
   --metadata-url "redis://127.0.0.1:6380/0" \
@@ -80,7 +55,6 @@ Launch the new version binary with the **same `stable_id`** and a **higher `epoc
   --label route=false \
   --drain-on-exit \
   --stable-id client-a \
-  --epoch 2 \
   --initial-state standby \
   --local-segment-name "seg-a-v2"
 ```
@@ -90,24 +64,30 @@ Launch the new version binary with the **same `stable_id`** and a **higher `epoc
 | Parameter | Description |
 |-----------|-------------|
 | `--stable-id client-a` | Must match the predecessor |
-| `--epoch 2` | Must be higher than the predecessor's epoch |
 | `--initial-state standby` | Starts in Standby mode, waiting for handoff |
 | `--local-segment-name` | Must differ from the predecessor's segment name |
 | `--drain-on-exit` | Ensures future upgrades can also trigger hot-upgrade |
 
-Wait for the log to confirm successful startup:
+Wait for the log to confirm successful startup (the assigned epoch is printed in the line):
 
 ```
 mooncake-store-client started stable_id=client-a epoch=2 initial_state=standby
 ```
 
-### Step 3: Trigger Hot-Upgrade on the Predecessor
+If you need to observe the per-stable-id epoch high-water mark, query it directly:
+
+```bash
+redis-cli -p 6380 GET "${KEYSPACE}/state/client-epoch-hwm/client-a"
+```
+
+### Step 2: Trigger Hot-Upgrade on the Predecessor
 
 Send a SIGTERM signal to the old version predecessor:
 
 ```bash
-# Find the predecessor's PID
-pgrep -f "mooncake-store-client.*--stable-id client-a.*--epoch 1"
+# Find the predecessor's PID (match by stable_id and segment, not epoch, since
+# the epoch is server-assigned)
+pgrep -f "mooncake-store-client.*--stable-id client-a"
 
 # Send SIGTERM
 kill -TERM <predecessor_pid>
@@ -126,7 +106,7 @@ mooncake-store-client upgraded stable_id=client-a from_epoch=1 to_epoch=2
 mooncake-store-client promoted stable_id=client-a epoch=2 from_epoch=1 kind=HotUpgrade
 ```
 
-### Step 4: Verify Data Integrity
+### Step 3: Verify Data Integrity
 
 ```python
 import time
@@ -166,9 +146,9 @@ assert store.get("new-key") == b"new-value"
 store.close()
 ```
 
-### Step 5: Repeat Steps 2–4 for the Next Node
+### Step 4: Repeat Steps 1–3 for the Next Node
 
-Repeat Steps 2–4 for each node in the cluster until all nodes have been upgraded to the new version.
+Repeat Steps 1–3 for each node in the cluster until all nodes have been upgraded to the new version.
 
 ---
 
@@ -176,12 +156,13 @@ Repeat Steps 2–4 for each node in the cluster until all nodes have been upgrad
 
 If the new version encounters issues, you can roll back using the same mechanism:
 
-1. Start a successor with a higher epoch using the old version binary
+1. Start a successor using the old version binary with the same `stable_id`; the metadata backend assigns the next epoch automatically
 2. Send SIGTERM to the new version predecessor
 3. The old version successor takes over
 
 ```bash
-# Roll back client-a: start an epoch=3 successor using the V1 binary
+# Roll back client-a using the V1 binary — the successor gets the next epoch
+# from the metadata backend (epoch=3 in a 1 -> 2 -> 3 rollout sequence).
 ./target/debug/mooncake-store-client-v1 \
   --local-hostname 127.0.0.1 \
   --metadata-url "redis://127.0.0.1:6380/0" \
@@ -197,7 +178,6 @@ If the new version encounters issues, you can roll back using the same mechanism
   --label route=false \
   --drain-on-exit \
   --stable-id client-a \
-  --epoch 3 \
   --initial-state standby \
   --local-segment-name "seg-a-v1-rollback"
 
@@ -214,5 +194,5 @@ kill -TERM <v2_pid>
 2. **Upgrade one node at a time**: Avoid upgrading multiple nodes simultaneously; ensure each node's handoff completes before proceeding to the next
 3. **Confirm handoff completion**: After sending SIGTERM, wait for the predecessor log to show `upgraded` and the successor log to show `promoted` before moving on
 4. **Unique segment names**: Each successor must use a different `--local-segment-name` than its predecessor
-5. **Monotonically increasing epoch**: Each upgrade requires a higher epoch value
+5. **Epoch is server-assigned**: The metadata backend allocates the next epoch on every startup; operators do not pick it
 6. **Minor version upgrades only**: If the new version changes `store_api_version` (major), rolling upgrade is not supported — a full cluster restart is required

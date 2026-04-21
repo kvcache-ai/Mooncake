@@ -27,7 +27,7 @@ use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataCon
 use mooncake_store_client::{
     LocalMemoryConfig, MooncakeCompatibilityFacade, StoreClientBuilder, TentTransportFactory,
 };
-use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
+use mooncake_store_core::{ClientLifecycleState, CompatibilityDescriptor, Result};
 use mooncake_transport::{TentEngine, TentEngineConfig};
 
 fn now_ms() -> u64 {
@@ -61,7 +61,6 @@ fn main() -> Result<()> {
     let factory = Arc::new(TentTransportFactory::new(tent_config));
 
     let client = StoreClientBuilder::new(metadata, "demo-store")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .compatibility(CompatibilityDescriptor::default())
         .tenant("default")

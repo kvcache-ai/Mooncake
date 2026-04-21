@@ -144,7 +144,7 @@ Python hot-upgrade argument and wrapper compatibility validation:
 
 What the script verifies:
 
-- PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
+- PyO3 native `setup(..., stable_id, initial_state)` argument parsing; the metadata backend assigns the epoch
 - Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
 
 ### Eviction validation
@@ -261,7 +261,7 @@ These are compatibility bridges because current upstream SGLang does not forward
 - `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
 - `MC_STORE_RS_TRANSPORT_METADATA_URL`, `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
-- `MC_STORE_RS_EPOCH`, `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
+- `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
 - `MC_STORE_RS_TRACE_FILE=/path/to/real-client.log` to append real-client Rust logs to a dedicated file instead of the SGLang process stream
 - `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC capacity; default `2`
@@ -637,7 +637,7 @@ The runtime also manages some labels internally, such as route capability and co
 ## Operational Conventions
 
 - keep `stable_id` stable across restarts and upgrades
-- pick an `epoch` strictly greater than every prior epoch of the same `stable_id` for successor processes during hot-upgrade flows; the metadata backend rejects non-monotonic values with `StaleEpoch`
+- start successor processes with the same `stable_id` during hot-upgrade flows; the metadata backend allocates the next epoch and the runtime prints it as `epoch=<n>` on startup
 - mount local memory before serving data traffic
 - keep `heartbeat_interval_ms` comfortably below the default `lease_ttl_ms=30000`
 - use a dedicated metadata keyspace per environment or test run

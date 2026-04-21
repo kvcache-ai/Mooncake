@@ -5,13 +5,13 @@ use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
-    TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
-    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
-    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
-    TenantQuotaReservationState, TenantQuotaState,
+    CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
+    HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    StoreError, TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy,
+    TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+    TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
+    TenantQuotaReservationRequest, TenantQuotaReservationState, TenantQuotaState,
 };
 
 #[derive(Clone, Debug)]
@@ -175,6 +175,82 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .map_err(etcd_error("etcd upsert client lease"))?;
                 if txn_response.succeeded() {
                     return Ok(());
+                }
+            }
+        })
+    }
+
+    fn allocate_client_lease(&self, template: &ClientLease) -> Result<ClientRuntimeId> {
+        let stable_id = template.runtime.stable_id.clone();
+        let marker_prefix = self
+            .config
+            .keyspace
+            .client_by_stable_marker_prefix(&stable_id);
+        let hwm_key = self.config.keyspace.client_epoch_hwm(&stable_id);
+        let lease_key_prefix = self.config.keyspace.client_prefix_for_stable(&stable_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let active = client
+                    .get(marker_prefix.clone(), Some(GetOptions::new().with_prefix()))
+                    .await
+                    .map_err(etcd_error("etcd scan client by-stable markers"))?;
+                let active_max = active
+                    .kvs()
+                    .iter()
+                    .filter_map(|kv| {
+                        let key = std::str::from_utf8(kv.key()).ok()?;
+                        key.rsplit('/').next()?.parse::<u64>().ok()
+                    })
+                    .max()
+                    .unwrap_or(0);
+
+                let hwm_response = client
+                    .get(hwm_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get client epoch hwm"))?;
+                let (hwm_value, hwm_mod_rev) = hwm_response
+                    .kvs()
+                    .first()
+                    .and_then(|kv| {
+                        let value = std::str::from_utf8(kv.value()).ok()?;
+                        let parsed = value.parse::<u64>().ok()?;
+                        Some((parsed, kv.mod_revision()))
+                    })
+                    .unwrap_or((0, 0));
+
+                let floor = active_max.max(hwm_value);
+                let new_epoch = floor.saturating_add(1);
+                let lease_key = format!("{lease_key_prefix}{new_epoch}");
+                let marker_key = self
+                    .config
+                    .keyspace
+                    .client_by_stable_marker(&stable_id, new_epoch);
+
+                let mut lease = template.clone();
+                lease.runtime.epoch = ClientEpoch(new_epoch);
+                let payload = serde_json::to_string(&lease).map_err(json_error)?;
+
+                let txn = Txn::new()
+                    .when(vec![
+                        Compare::mod_revision(lease_key.clone(), CompareOp::Equal, 0),
+                        Compare::mod_revision(marker_key.clone(), CompareOp::Equal, 0),
+                        Compare::mod_revision(hwm_key.clone(), CompareOp::Equal, hwm_mod_rev),
+                    ])
+                    .and_then(vec![
+                        TxnOp::put(lease_key, payload, None),
+                        TxnOp::put(marker_key, Vec::<u8>::new(), None),
+                        TxnOp::put(hwm_key.clone(), new_epoch.to_string(), None),
+                    ]);
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd allocate client lease"))?;
+                if txn_response.succeeded() {
+                    return Ok(ClientRuntimeId {
+                        stable_id: stable_id.clone(),
+                        epoch: ClientEpoch(new_epoch),
+                    });
                 }
             }
         })

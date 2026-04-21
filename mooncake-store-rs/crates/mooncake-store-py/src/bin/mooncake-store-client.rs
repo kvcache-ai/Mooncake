@@ -100,8 +100,6 @@ struct RunArgs {
     transport_backend: Option<TransportBackendArg>,
     #[arg(long)]
     stable_id: Option<String>,
-    #[arg(long, default_value_t = 1)]
-    epoch: u64,
     #[arg(long, value_enum, default_value_t = InitialStateArg::Active)]
     initial_state: InitialStateArg,
     #[arg(
@@ -443,9 +441,6 @@ fn validate_args(args: &RunArgs) -> Result<(), Box<dyn Error>> {
     if args.lease_ttl_ms == 0 {
         return Err("--lease-ttl-ms must be greater than zero".into());
     }
-    if args.epoch == 0 {
-        return Err("--epoch must be greater than zero".into());
-    }
     if args.scratch_bytes == 0 {
         return Err("--scratch-bytes must be greater than zero".into());
     }
@@ -516,7 +511,6 @@ fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRu
             timeouts: Some(timeouts),
         },
         local_segment_name: args.local_segment_name.clone(),
-        epoch: ClientEpoch(args.epoch),
         initial_state: startup_initial_state(requested_initial_state(args)),
         route_control: args.route_control.into(),
     }
@@ -802,7 +796,6 @@ mod tests {
             transport_rpc_port: None,
             transport_backend: None,
             stable_id: Some("sample".to_string()),
-            epoch: 1,
             initial_state: InitialStateArg::Active,
             tenant: "default".to_string(),
             labels: vec![],
@@ -882,7 +875,6 @@ mod tests {
         assert_eq!(args.replica_count, 2);
         assert_eq!(args.route_topk, 4);
         assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
-        assert_eq!(args.epoch, 1);
         assert_eq!(args.initial_state, InitialStateArg::Active);
     }
 
@@ -900,8 +892,6 @@ mod tests {
             "node-a",
             "--transport-rpc-port",
             "17111",
-            "--epoch",
-            "2",
             "--initial-state",
             "standby",
             "--tenant",
@@ -943,7 +933,6 @@ mod tests {
         );
         assert_eq!(args.stable_id.as_deref(), Some("node-a"));
         assert_eq!(args.transport_rpc_port, Some(17111));
-        assert_eq!(args.epoch, 2);
         assert_eq!(args.initial_state, InitialStateArg::Standby);
         assert_eq!(args.keyspace.as_deref(), Some("ks-a"));
         assert_eq!(args.local_segment_name.as_deref(), Some("segment-a"));
@@ -1029,8 +1018,6 @@ mod tests {
             "redis://127.0.0.1:6379/0",
             "--stable-id",
             "store-a",
-            "--epoch",
-            "7",
             "--initial-state",
             "standby",
             "--local-segment-name",
@@ -1044,7 +1031,6 @@ mod tests {
         validate_args(&args).expect("hot-upgrade args should validate");
         let runtime_args = build_runtime_args(&args, sample_timeouts());
         assert_eq!(runtime_args.setup.stable_id.as_deref(), Some("store-a"));
-        assert_eq!(runtime_args.epoch, ClientEpoch(7));
         assert_eq!(runtime_args.initial_state, ClientLifecycleState::Standby);
         assert_eq!(
             runtime_args.local_segment_name.as_deref(),
@@ -1082,15 +1068,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_args_rejects_invalid_ttl_epoch_and_storage_role() {
+    fn validate_args_rejects_invalid_ttl_and_storage_role() {
         validate_args(&sample_args()).expect("baseline args should validate");
 
         let mut args = sample_args();
         args.lease_ttl_ms = 0;
-        assert!(validate_args(&args).is_err());
-
-        let mut args = sample_args();
-        args.epoch = 0;
         assert!(validate_args(&args).is_err());
 
         let mut args = sample_args();
@@ -1246,7 +1228,6 @@ mod tests {
         args.replica_count = 3;
         args.route_topk = 5;
         args.route_control = RouteControlArg::MetadataOnly;
-        args.epoch = 11;
         args.initial_state = InitialStateArg::Draining;
 
         let runtime_args = build_runtime_args(&args, sample_timeouts());
@@ -1275,7 +1256,6 @@ mod tests {
         assert_eq!(runtime_args.setup.route_topk, 5);
         assert!(runtime_args.setup.routed_writes);
         assert_eq!(runtime_args.route_control, RouteControlMode::MetadataOnly);
-        assert_eq!(runtime_args.epoch, ClientEpoch(11));
         assert_eq!(runtime_args.initial_state, ClientLifecycleState::Draining);
         assert_eq!(
             runtime_args.setup.labels.get("storage").map(String::as_str),

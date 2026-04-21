@@ -100,13 +100,12 @@ store.setup(
     1024,
     512,
     stable_id="py-store-a",
-    epoch=3,
     initial_state="standby",
 )
 name, args, kwargs = store._worker.calls.pop()
 assert name == "setup"
 assert kwargs["stable_id"] == "py-store-a"
-assert kwargs["epoch"] == 3
+assert "epoch" not in kwargs
 assert kwargs["initial_state"] == "standby"
 
 store.setup(
@@ -138,7 +137,6 @@ store.setup(
         "local_hostname": "127.0.0.1",
         "metadata_url": "redis://127.0.0.1:6379/0",
         "stable_id": "py-store-c",
-        "epoch": 4,
         "initial_state": "standby",
         "global_segment_size": 2048,
         "local_buffer_size": 1024,
@@ -147,7 +145,7 @@ store.setup(
 name, args, kwargs = store._worker.calls.pop()
 assert name == "setup"
 assert kwargs["stable_id"] == "py-store-c"
-assert kwargs["epoch"] == 4
+assert "epoch" not in kwargs
 assert kwargs["initial_state"] == "standby"
 
 store.setup(
@@ -160,7 +158,7 @@ store.setup(
 )
 name, args, kwargs = store._worker.calls.pop()
 assert kwargs["stable_id"] == "py-store-d"
-assert kwargs["epoch"] == 1
+assert "epoch" not in kwargs
 assert kwargs["initial_state"] == "offline"
 
 store.setup(
@@ -176,7 +174,6 @@ assert kwargs["transport_rpc_port"] == 17112
 
 setup_env_vars = [
     "MC_STORE_RS_STABLE_ID",
-    "MC_STORE_RS_EPOCH",
     "MC_STORE_RS_INITIAL_STATE",
     "MC_STORE_RS_TENANT",
     "MC_STORE_RS_ROUTED_WRITES",
@@ -201,7 +198,6 @@ try:
     os.environ.update(
         {
             "MC_STORE_RS_STABLE_ID": "env-store",
-            "MC_STORE_RS_EPOCH": "7",
             "MC_STORE_RS_INITIAL_STATE": "standby",
             "MC_STORE_RS_TENANT": "tenant-env",
             "MC_STORE_RS_ROUTED_WRITES": "1",
@@ -225,7 +221,7 @@ try:
     )
     name, args, kwargs = store._worker.calls.pop()
     assert kwargs["stable_id"] == "env-store"
-    assert kwargs["epoch"] == 7
+    assert "epoch" not in kwargs
     assert kwargs["initial_state"] == "standby"
     assert kwargs["tenant"] == "tenant-env"
     assert kwargs["routed_writes"] is True

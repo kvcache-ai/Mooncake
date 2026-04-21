@@ -15,16 +15,29 @@ use crate::route::{
 pub trait MetadataBackend: Send + Sync {
     fn route_namespace(&self) -> String;
 
-    /// Publishes a client lease and atomically enforces per-stable-id epoch monotonicity.
+    /// Republishes a client lease at an already-assigned `(stable_id, epoch)`.
     ///
-    /// Implementations MUST reject writes whose `lease.runtime.epoch` is not strictly
-    /// greater than every epoch ever observed for the same `lease.runtime.stable_id`
-    /// (including both currently-live leases and the historical high-water mark).
+    /// This path is for heartbeat refresh, lifecycle-state updates, and low-level
+    /// test setup. Implementations MUST reject writes whose `lease.runtime.epoch`
+    /// is not strictly greater than every epoch ever observed for the same
+    /// `lease.runtime.stable_id` unless the lease key already exists (refresh).
     /// Rejection returns `StoreError::StaleEpoch`.
     ///
-    /// Re-publishing a lease with the same `(stable_id, epoch)` is a refresh and is
-    /// always permitted; this path is used by heartbeat and lifecycle-state updates.
+    /// Normal registration goes through [`Self::allocate_client_lease`]; callers
+    /// SHOULD NOT invent new epoch values here.
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()>;
+
+    /// Atomically allocates the next epoch for `template.runtime.stable_id` and
+    /// publishes the lease under that epoch.
+    ///
+    /// The epoch field of `template.runtime` is ignored. Implementations compute
+    /// `new_epoch = max(active epochs for stable_id, historical HWM) + 1`, mutate
+    /// the serialized lease to carry `new_epoch`, and commit the lease key, the
+    /// per-stable-id active-epoch index, and the HWM in a single atomic step.
+    ///
+    /// Returns the assigned `ClientRuntimeId`. Callers should use the returned
+    /// runtime for subsequent [`Self::update_client_state`] and refresh calls.
+    fn allocate_client_lease(&self, template: &ClientLease) -> Result<ClientRuntimeId>;
 
     fn update_client_state(
         &self,

@@ -4,29 +4,22 @@ const DEFAULT_STARTUP_PREWARM_MAX_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_STARTUP_PREWARM_MAX_DELAY: Duration = Duration::ZERO;
 const STARTUP_PREWARM_SPREAD_ENV: &str = "MC_STORE_RS_STARTUP_PREWARM_SPREAD_MS";
 
-fn validate_startup_conflicts(
+fn validate_startup_segment_conflicts(
     metadata: &dyn MetadataBackend,
     control_client: &ControlPlaneClient,
-    local: &ClientLease,
-) -> Result<()> {
-    let Some(local_segment) = local.endpoints.segment_name.as_ref() else {
-        return validate_runtime_conflicts(metadata, control_client, local, None);
-    };
-    validate_runtime_conflicts(metadata, control_client, local, Some(local_segment))
-}
-
-fn validate_runtime_conflicts(
-    metadata: &dyn MetadataBackend,
-    control_client: &ControlPlaneClient,
-    local: &ClientLease,
+    local_stable_id: &ClientStableId,
     local_segment: Option<&SegmentName>,
 ) -> Result<()> {
+    let Some(local_segment) = local_segment else {
+        return Ok(());
+    };
     for remote in metadata.list_live_clients()? {
-        let same_stable = remote.runtime.stable_id == local.runtime.stable_id;
-        let same_segment = local_segment.is_some_and(|segment| {
-            remote.endpoints.segment_name.as_ref().is_some_and(|other| other == segment)
-        });
-        if !same_stable && !same_segment {
+        let same_segment = remote
+            .endpoints
+            .segment_name
+            .as_ref()
+            .is_some_and(|other| other == local_segment);
+        if !same_segment {
             continue;
         }
 
@@ -34,9 +27,9 @@ fn validate_runtime_conflicts(
             crate::control_plane::ControlPlaneReachability::Reachable => {}
             crate::control_plane::ControlPlaneReachability::Unreachable => {
                 debug!(
-                    local_runtime = %local.runtime,
+                    local_stable_id = %local_stable_id,
                     remote_runtime = %remote.runtime,
-                    "startup guard ignored unreachable live lease during takeover validation"
+                    "startup guard ignored unreachable live lease during segment validation"
                 );
                 continue;
             }
@@ -48,23 +41,14 @@ fn validate_runtime_conflicts(
             }
         }
 
-        // Epoch monotonicity (new epoch > all historical epochs) is enforced
-        // atomically by the metadata backend in upsert_client_lease. This guard
-        // only covers cases the backend cannot express in a single key: a reachable
-        // duplicate at the same (stable_id, epoch), and segment-name collisions
-        // across different runtimes.
-        if same_stable && remote.runtime.epoch == local.runtime.epoch {
-            return Err(StoreError::Conflict(format!(
-                "runtime {} is already live",
-                remote.runtime
-            )));
-        }
-
-        if same_segment && remote.runtime != local.runtime {
-            let segment = local_segment.expect("segment guard only runs with segment");
+        // Epoch allocation guarantees the new runtime receives an unused epoch,
+        // so a same-stable-id match here is an in-flight handoff rather than a
+        // collision. Only reject when a different stable_id already owns the
+        // segment name.
+        if remote.runtime.stable_id != *local_stable_id {
             return Err(StoreError::Conflict(format!(
                 "segment {} is already owned by live runtime {}",
-                segment.0, remote.runtime
+                local_segment.0, remote.runtime
             )));
         }
     }
@@ -101,7 +85,6 @@ fn normalize_route_label(local_memory: &LocalMemoryConfig, labels: &mut BTreeMap
 pub struct StoreClientBuilder {
     metadata: Arc<dyn MetadataBackend>,
     stable_id: ClientStableId,
-    epoch: ClientEpoch,
     compatibility: CompatibilityDescriptor,
     endpoints: ClientEndpointSet,
     initial_state: ClientLifecycleState,
@@ -127,7 +110,6 @@ impl StoreClientBuilder {
         Self {
             metadata,
             stable_id: ClientStableId::new(stable_id),
-            epoch: ClientEpoch(1),
             compatibility: CompatibilityDescriptor::default(),
             endpoints: ClientEndpointSet::default(),
             initial_state: ClientLifecycleState::Standby,
@@ -147,11 +129,6 @@ impl StoreClientBuilder {
             execution_fairness: None,
             bandwidth_shaping: None,
         }
-    }
-
-    pub fn epoch(mut self, epoch: ClientEpoch) -> Self {
-        self.epoch = epoch;
-        self
     }
 
     pub fn compatibility(mut self, compatibility: CompatibilityDescriptor) -> Self {
@@ -321,10 +298,6 @@ impl StoreClientBuilder {
                 && self.initial_state == ClientLifecycleState::Active
                 && published_initial_state != self.initial_state;
 
-        let runtime = ClientRuntimeId {
-            stable_id: self.stable_id,
-            epoch: self.epoch,
-        };
         let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
         let effective_tenant_policy =
             resolve_effective_tenant_policy(self.metadata.as_ref(), &default_scope)?;
@@ -347,18 +320,32 @@ impl StoreClientBuilder {
         let live_client_cache = shared_live_client_cache(&route_namespace);
         let suspect_runtime_cache = shared_suspect_runtime_cache(&route_namespace);
         let control_client = Arc::new(ControlPlaneClient::new()?);
-        let provisional_lease = ClientLease {
-            runtime: runtime.clone(),
+
+        validate_startup_segment_conflicts(
+            self.metadata.as_ref(),
+            control_client.as_ref(),
+            &self.stable_id,
+            endpoints.segment_name.as_ref(),
+        )?;
+
+        let template = ClientLease {
+            runtime: ClientRuntimeId {
+                stable_id: self.stable_id.clone(),
+                epoch: ClientEpoch::default(),
+            },
             state: published_initial_state,
             compatibility: self.compatibility,
             endpoints: endpoints.clone(),
             expires_at_ms,
         };
-        validate_startup_conflicts(
-            self.metadata.as_ref(),
-            control_client.as_ref(),
-            &provisional_lease,
-        )?;
+        let runtime = self.metadata.allocate_client_lease(&template)?;
+        let provisional_lease = ClientLease {
+            runtime: runtime.clone(),
+            state: template.state,
+            compatibility: template.compatibility.clone(),
+            endpoints: endpoints.clone(),
+            expires_at_ms,
+        };
         bootstrap_route_policy(
             self.metadata.as_ref(),
             &provisional_lease,
