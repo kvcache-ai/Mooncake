@@ -20,6 +20,7 @@ pub struct ClassicEngineConfig {
     redis_username: Option<String>,
     redis_password: Option<String>,
     redis_db_index: Option<String>,
+    gid_index: Option<String>,
 }
 
 impl ClassicEngineConfig {
@@ -33,6 +34,7 @@ impl ClassicEngineConfig {
             redis_username: None,
             redis_password: None,
             redis_db_index: None,
+            gid_index: None,
         }
     }
 
@@ -67,6 +69,11 @@ impl ClassicEngineConfig {
         self
     }
 
+    pub fn gid_index(mut self, gid_index: impl Into<String>) -> Self {
+        self.gid_index = Some(gid_index.into());
+        self
+    }
+
     pub fn metadata_uri(&self) -> &str {
         &self.metadata_uri
     }
@@ -97,6 +104,10 @@ impl ClassicEngineConfig {
 
     pub fn redis_db_index_value(&self) -> Option<&str> {
         self.redis_db_index.as_deref()
+    }
+
+    pub fn gid_index_value(&self) -> Option<&str> {
+        self.gid_index.as_deref()
     }
 }
 
@@ -394,6 +405,7 @@ impl ClassicCreateEnvGuard {
         env.set_optional("MC_REDIS_USERNAME", config.redis_username_value());
         env.set_optional("MC_REDIS_PASSWORD", config.redis_password_value());
         env.set_optional("MC_REDIS_DB_INDEX", config.redis_db_index_value());
+        env.set_optional("MC_GID_INDEX", config.gid_index_value());
         Self { _env: env }
     }
 }
@@ -537,7 +549,8 @@ mod tests {
             .rpc_port(17111)
             .redis_username("user")
             .redis_password("pass")
-            .redis_db_index("4");
+            .redis_db_index("4")
+            .gid_index("1");
         assert_eq!(config.metadata_uri(), "redis://127.0.0.1:6379/0");
         assert_eq!(config.rpc_bind_host(), "127.0.0.1");
         assert_eq!(config.rpc_port_value(), Some(17111));
@@ -545,6 +558,7 @@ mod tests {
         assert_eq!(config.redis_username_value(), Some("user"));
         assert_eq!(config.redis_password_value(), Some("pass"));
         assert_eq!(config.redis_db_index_value(), Some("4"));
+        assert_eq!(config.gid_index_value(), Some("1"));
     }
 
     #[test]
@@ -558,10 +572,12 @@ mod tests {
         std::env::set_var("MC_REDIS_USERNAME", "old-user");
         std::env::set_var("MC_REDIS_PASSWORD", "old-pass");
         std::env::set_var("MC_REDIS_DB_INDEX", "9");
+        std::env::set_var("MC_GID_INDEX", "7");
         let config = ClassicEngineConfig::new("redis://127.0.0.1:6379", "127.0.0.1")
             .redis_username("new-user")
             .redis_password("new-pass")
-            .redis_db_index("4");
+            .redis_db_index("4")
+            .gid_index("1");
         {
             let _guard = ClassicCreateEnvGuard::apply(&config);
             assert!(std::env::var("MC_USE_TENT").is_err());
@@ -579,6 +595,7 @@ mod tests {
                 Ok("new-pass")
             );
             assert_eq!(std::env::var("MC_REDIS_DB_INDEX").as_deref(), Ok("4"));
+            assert_eq!(std::env::var("MC_GID_INDEX").as_deref(), Ok("1"));
         }
         assert_eq!(std::env::var("MC_USE_TENT").as_deref(), Ok("1"));
         assert_eq!(std::env::var("MC_USE_TEV1").as_deref(), Ok("1"));
@@ -592,12 +609,14 @@ mod tests {
             Ok("old-pass")
         );
         assert_eq!(std::env::var("MC_REDIS_DB_INDEX").as_deref(), Ok("9"));
+        assert_eq!(std::env::var("MC_GID_INDEX").as_deref(), Ok("7"));
         std::env::remove_var("MC_USE_TENT");
         std::env::remove_var("MC_USE_TEV1");
         std::env::remove_var("MC_TCP_BIND_ADDRESS");
         std::env::remove_var("MC_REDIS_USERNAME");
         std::env::remove_var("MC_REDIS_PASSWORD");
         std::env::remove_var("MC_REDIS_DB_INDEX");
+        std::env::remove_var("MC_GID_INDEX");
     }
 
     #[test]

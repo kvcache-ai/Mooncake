@@ -218,6 +218,7 @@ def invoked_binary_name() -> str:
         "transfer_engine_bench",
         "mooncake-store-client",
         "mooncake-store-admin",
+        "mooncake-store-bench",
     }:
         return program_name
     return os.environ.get("MOONCAKE_CLI_TARGET", "mooncake-store-client")

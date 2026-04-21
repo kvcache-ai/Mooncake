@@ -164,6 +164,20 @@ The e2e binary validates:
 - dynamic membership and elastic segment changes
 - hot-upgrade handoff flows
 
+### `mooncake-store-bench`
+
+Purpose:
+
+- provide a standalone, production-grade benchmark and verification tool that ships inside the wheel
+
+The bench binary provides three subcommands:
+
+- `bench` — concurrent put/get/mixed throughput and latency measurement with p50/p90/p99/p999 percentiles, configurable concurrency, batch size, and duration
+- `verify` — sequential correctness checks including round-trip, batch put/get, get_into, is_exist, overwrite correctness, delete/reclaim, and tenant isolation
+- `soak` — long-duration stability test with per-operation fault injection (Redis jitter, metadata drop, transport delay, transport error) and optional read verification
+
+See `docs/bench.md` for full usage and design.
+
 ## Suggested Reading Order
 
 1. `README.md`

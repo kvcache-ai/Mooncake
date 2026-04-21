@@ -291,6 +291,30 @@ It covers:
 - delete reclaim and overwrite reclaim
 - dynamic expansion, true client shrink, and hot-upgrade
 
+## Benchmarking
+
+Use `mooncake-store-bench` for throughput measurement, correctness verification, and long-duration stability testing. It is built from `crates/mooncake-store-py/src/bin/mooncake_store_bench/` and ships in the wheel.
+
+Quick start:
+
+```bash
+# Correctness check
+mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 verify
+
+# 30-second mixed put/get benchmark, 8 concurrent workers
+# Start storage=true daemons first, and pass the same --keyspace they use
+# when you are not using the default `mc/store-rs/v1` namespace.
+mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 bench \
+  --keyspace mc/store-rs/bench-prod \
+  --mode mixed --concurrency 8 --duration 30
+
+# 1-hour soak test with Redis jitter fault injection
+mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 soak \
+  --duration 3600 --fault redis-jitter:5:50 --verify-reads
+```
+
+See `docs/bench.md` for the full CLI reference and architecture description.
+
 ## Next Reading
 
 - `docs/configuration.md` for defaults and knobs
