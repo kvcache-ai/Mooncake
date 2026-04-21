@@ -667,18 +667,26 @@ P2PClientService::CreatePutHandle(const std::string& key,
         return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
-    // 2. Try all local candidates synchronously
+    // 2. Generate a retry list based on the recommended order of master.
+    // If there is a local candidate among them, generate a local task handle.
     std::vector<P2PProxyDescriptor> remote_proxies;
     for (size_t i = 0; i < candidates.size(); ++i) {
         auto& proxy = candidates[i].replica;
 
         if (proxy.client_id == client_id_) {
+            // Defensive check: master should not return local candidates when
+            // allow_local=false, but if it does, just skip it.
+            if (!config.allow_local) {
+                LOG(WARNING) << "Master returned local candidate but "
+                                "allow_local=false, skipping";
+                continue;
+            }
             if (data_manager_.has_value()) {
                 auto local_handle = data_manager_->Put(key, slices);
                 if (local_handle) {
                     return std::move(local_handle.value());
                 } else if (IsAlreadyExistsError(local_handle.error())) {
-                    // The key is already exists. Currently, we think this is a
+                    // The key already exists. Currently, we think this is a
                     // normal case, just ignore the error and return success.
                     return ImmediateHandle<void>::Create();
                 } else {

@@ -1007,7 +1007,7 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
 // poll until all tasks reach a terminal state before calling freeBatchID.
 void DataManager::CancelBatchTETask(Transport::BatchID batch_id,
                                     size_t num_tasks) {
-    constexpr int64_t kDrainTimeoutSeconds = 30;
+    constexpr int64_t kDrainTimeoutSeconds = 10;
     auto start = std::chrono::steady_clock::now();
     while (true) {
         bool all_finished = true;
