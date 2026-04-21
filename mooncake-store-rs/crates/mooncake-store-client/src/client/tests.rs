@@ -6394,6 +6394,99 @@ fn routed_batch_put_emits_transport_pacing_hints() {
 }
 
 #[test]
+fn routed_batch_put_coalesces_remote_writes_by_tenant() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-batch-coalesce-segment"));
+    let remote_owner = publish_storage_node_with_capacity(
+        &metadata,
+        &transport,
+        "storage-batch-coalesce",
+        "seg-batch-coalesce",
+        "pool-a",
+        4096,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "writer-batch-coalesce")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(remote_owner.storage_key());
+    writer
+        .batch_put(&[
+            PutRequest::new("coalesce-a", b"aaaa")
+                .tenant("tenant-a")
+                .replication(policy.clone()),
+            PutRequest::new("coalesce-b", b"bbbb")
+                .tenant("tenant-a")
+                .replication(policy.clone()),
+            PutRequest::new("coalesce-c", b"cccc")
+                .tenant("tenant-a")
+                .replication(policy),
+        ])
+        .expect("remote batch put should succeed");
+
+    let submitted = transport.submitted_batch_sizes();
+    assert!(submitted.contains(&3), "submitted batches: {submitted:?}");
+}
+
+#[test]
+fn routed_batch_put_chunks_by_scratch_window() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-batch-scratch-segment"));
+    let remote_owner = publish_storage_node_with_capacity(
+        &metadata,
+        &transport,
+        "storage-batch-scratch",
+        "seg-batch-scratch",
+        "pool-a",
+        4096,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "writer-batch-scratch")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config_with_layout(4096, 8, 1))
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(remote_owner.storage_key());
+    writer
+        .batch_put(&[
+            PutRequest::new("scratch-a", b"aaaa")
+                .tenant("tenant-a")
+                .replication(policy.clone()),
+            PutRequest::new("scratch-b", b"bbbb")
+                .tenant("tenant-a")
+                .replication(policy.clone()),
+            PutRequest::new("scratch-c", b"cccc")
+                .tenant("tenant-a")
+                .replication(policy),
+        ])
+        .expect("remote batch put should chunk by scratch capacity");
+
+    let submitted = transport.submitted_batch_sizes();
+    assert!(
+        submitted.windows(2).any(|window| window == [2, 1]),
+        "submitted batches: {submitted:?}"
+    );
+}
+
+#[test]
 fn routed_put_shaping_caps_remote_batch_bytes() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-put-shaping-segment"));

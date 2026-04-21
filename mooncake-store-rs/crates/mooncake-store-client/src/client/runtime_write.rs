@@ -490,29 +490,6 @@ impl StoreClient {
                 let _ = self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
             }
         };
-        let remote_scratch = match prepared
-            .iter()
-            .filter(|entry| {
-                entry.targets.iter().any(|target| {
-                    !(target.storage_runtime == self.lease.runtime
-                        && self
-                            .state
-                            .lock()
-                            .memory_ref()
-                            .map(|memory| memory.has_storage_segment(&target.segment_name))
-                            .unwrap_or(false))
-                })
-            })
-            .map(|entry| entry.value.len())
-            .max()
-        {
-            Some(length) => {
-                let state = self.state.lock();
-                Some(state.memory_ref()?.plan_scratch(&[length])?)
-            }
-            None => None,
-        };
-
         let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
         let current_routes_result = self.route_directory.get_object_routes(
             &self.lease,
@@ -536,7 +513,15 @@ impl StoreClient {
                 .sum::<usize>() as u64,
         );
         let write_result = (|| {
+            struct RemoteBatchWrite<'a> {
+                tenant: &'a str,
+                value: &'a [u8],
+                requests: Vec<TransferRequest>,
+            }
+
             let mut routes = Vec::with_capacity(prepared.len());
+            let mut remote_writes = Vec::new();
+            let mut checked_runtimes = BTreeSet::new();
             for (entry, current) in prepared.iter().zip(current_routes.into_iter()) {
                 let checksum = payload_checksum(entry.value);
                 let mut replicas = Vec::with_capacity(entry.targets.len());
@@ -571,10 +556,14 @@ impl StoreClient {
                         }
                         addr as u64
                     } else {
-                        self.ensure_remote_runtime_reachable(
-                            &target.storage_runtime,
-                            &target.segment_name.0,
-                        )?;
+                        if target.storage_runtime != self.lease.runtime
+                            && checked_runtimes.insert(target.storage_runtime.clone())
+                        {
+                            self.ensure_remote_runtime_reachable(
+                                &target.storage_runtime,
+                                &target.segment_name.0,
+                            )?;
+                        }
                         let (handle, info) = {
                             let mut state = self.state.lock();
                             state.open_segment_with_info(transport, &target.segment_name.0)?
@@ -587,15 +576,7 @@ impl StoreClient {
                         )?;
                         remote_requests.push(TransferRequest {
                             opcode: Opcode::Write,
-                            source: remote_scratch
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    StoreError::InvalidState(
-                                        "remote write is missing a scratch slot".to_string(),
-                                    )
-                                })?
-                                [0]
-                                .addr,
+                            source: ptr::null_mut(),
                             target_id: handle,
                             target_offset,
                             length: entry.value.len() as u64,
@@ -614,41 +595,11 @@ impl StoreClient {
                     });
                 }
                 if !remote_requests.is_empty() {
-                    let request_deadline = self.request_deadline_for_transfer(
-                        remote_requests.iter().map(|request| request.length).sum(),
-                        1,
-                    );
-                    let scratch = remote_scratch.as_ref().ok_or_else(|| {
-                        StoreError::InvalidState(
-                            "remote write is missing a scratch slot".to_string(),
-                        )
-                    })?;
-                    copy_into_region(scratch[0], entry.value);
-                    let batch_id = transport.allocate_batch(remote_requests.len())?;
-                    let tenant = entry.value_tenant();
-                    let remote_bytes = remote_requests.iter().map(|request| request.length).sum();
-                    let hints = self.remote_batch_hints(
-                        tenant,
-                        remote_bytes,
-                        TransferPacingMode::ThroughputOptimized,
-                    );
-                    let submit_result =
-                        transport.submit_with_hints(batch_id, &remote_requests, &hints);
-                    if let Err(error) = submit_result {
-                        let _ = transport.free_batch(batch_id);
-                        return Err(error);
-                    }
-                    let wait_result = wait_for_batch_completion_detailed(
-                        transport,
-                        batch_id,
-                        self.transfer_stall_timeout,
-                        request_deadline.instant(),
-                    )
-                    .map_err(StoreError::from);
-                    let free_result = transport.free_batch(batch_id);
-                    wait_result?;
-                    free_result?;
-                    registry::record_transport_bytes("write", "storage", remote_bytes);
+                    remote_writes.push(RemoteBatchWrite {
+                        tenant: entry.value_tenant(),
+                        value: entry.value,
+                        requests: remote_requests,
+                    });
                 }
 
                 let expected_version = current.as_ref().map(|route| route.version);
@@ -682,6 +633,103 @@ impl StoreClient {
                     quota_reservation: entry.quota_reservation.clone(),
                     route,
                 });
+            }
+            let mut remote_order = (0..remote_writes.len()).collect::<Vec<_>>();
+            remote_order.sort_by(|left, right| {
+                remote_writes[*left].tenant.cmp(remote_writes[*right].tenant)
+            });
+            let mut cursor = 0usize;
+            while cursor < remote_order.len() {
+                let tenant = remote_writes[remote_order[cursor]].tenant;
+                let same_tenant_end = remote_order[cursor..]
+                    .iter()
+                    .position(|index| remote_writes[*index].tenant != tenant)
+                    .map(|offset| cursor + offset)
+                    .unwrap_or(remote_order.len());
+                let remaining_items = same_tenant_end - cursor;
+                let item_limit = self
+                    .fairness_max_remote_batch_items_per_tenant()
+                    .unwrap_or(remaining_items)
+                    .min(
+                        self.shaping_max_remote_batch_burst_items()
+                            .unwrap_or(remaining_items),
+                    )
+                    .max(1)
+                    .min(remaining_items);
+                let byte_limit = self.shaping_max_remote_batch_bytes();
+                let mut selected = Vec::new();
+                let mut scratch_lengths = Vec::new();
+                let mut remote_bytes = 0u64;
+                for index in &remote_order[cursor..same_tenant_end] {
+                    if selected.len() >= item_limit {
+                        break;
+                    }
+                    let write = &remote_writes[*index];
+                    let write_remote_bytes =
+                        write.requests.iter().map(|request| request.length).sum::<u64>();
+                    if let Some(max_bytes) = byte_limit {
+                        if !selected.is_empty()
+                            && remote_bytes.saturating_add(write_remote_bytes) > max_bytes as u64
+                        {
+                            break;
+                        }
+                    }
+                    scratch_lengths.push(write.value.len());
+                    let planned = {
+                        let state = self.state.lock();
+                        state.memory_ref()?.plan_scratch(&scratch_lengths)
+                    };
+                    match planned {
+                        Ok(scratch) => drop(scratch),
+                        Err(StoreError::Allocator(_)) if !selected.is_empty() => {
+                            scratch_lengths.pop();
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    selected.push(*index);
+                    remote_bytes = remote_bytes.saturating_add(write_remote_bytes);
+                }
+                let scratch = {
+                    let state = self.state.lock();
+                    state.memory_ref()?.plan_scratch(&scratch_lengths)?
+                };
+                let mut transfer_requests = Vec::new();
+                for (position, index) in selected.iter().enumerate() {
+                    let write = &remote_writes[*index];
+                    copy_into_region(scratch[position], write.value);
+                    transfer_requests.extend(write.requests.iter().map(|request| {
+                        let mut request = *request;
+                        request.source = scratch[position].addr;
+                        request
+                    }));
+                }
+                let batch_id = transport.allocate_batch(transfer_requests.len())?;
+                let request_deadline =
+                    self.request_deadline_for_transfer(remote_bytes, transfer_requests.len());
+                let hints = self.remote_batch_hints(
+                    tenant,
+                    remote_bytes,
+                    TransferPacingMode::ThroughputOptimized,
+                );
+                let submit_result =
+                    transport.submit_with_hints(batch_id, &transfer_requests, &hints);
+                if let Err(error) = submit_result {
+                    let _ = transport.free_batch(batch_id);
+                    return Err(error);
+                }
+                let wait_result = wait_for_batch_completion_detailed(
+                    transport,
+                    batch_id,
+                    self.transfer_stall_timeout,
+                    request_deadline.instant(),
+                )
+                .map_err(StoreError::from);
+                let free_result = transport.free_batch(batch_id);
+                wait_result?;
+                free_result?;
+                registry::record_transport_bytes("write", "storage", remote_bytes);
+                cursor += selected.len();
             }
             Ok(routes)
         })();
