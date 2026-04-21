@@ -2162,6 +2162,13 @@ mod tests {
             Err(StoreError::Unsupported("unused in test".to_string()))
         }
 
+        fn allocate_client_lease(
+            &self,
+            _template: &ClientLease,
+        ) -> Result<mooncake_store_core::ClientRuntimeId> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
         fn update_client_state(
             &self,
             _runtime: &mooncake_store_core::ClientRuntimeId,

@@ -369,7 +369,6 @@ echo "==> starting standalone storage client"
 "${BIN}" \
   "${BASE_ARGS[@]}" \
   --stable-id "${STABLE_ID}" \
-  --epoch 1 \
   --initial-state active \
   --local-segment-name "${SEGMENT_NAME}" \
   >"${STORAGE_LOG}" 2>&1 &

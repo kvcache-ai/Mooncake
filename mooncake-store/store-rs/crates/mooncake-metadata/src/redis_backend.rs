@@ -2,13 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
-    TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
-    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
-    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
-    TenantQuotaState,
+    CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
+    HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    StoreError, TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy,
+    TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+    TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
+    TenantQuotaReservationRequest, TenantQuotaState,
 };
 use redis::cmd;
 use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
@@ -236,6 +236,47 @@ end
 
 redis.call('SET', key, payload)
 return {1, payload}
+"#;
+
+const ALLOCATE_CLIENT_LEASE_SCRIPT: &str = r#"
+local lease_key_prefix = KEYS[1]
+local by_stable_index = KEYS[2]
+local hwm_key = KEYS[3]
+local global_index = KEYS[4]
+local payload_template = ARGV[1]
+local ttl_ms = tonumber(ARGV[2])
+
+local active_max = 0
+local members = redis.call('SMEMBERS', by_stable_index)
+for _, member in ipairs(members) do
+    local candidate = tonumber(member)
+    if candidate and candidate > active_max then
+        active_max = candidate
+    end
+end
+
+local hwm_raw = redis.call('GET', hwm_key)
+local hwm_value = 0
+if hwm_raw then
+    hwm_value = tonumber(hwm_raw) or 0
+end
+
+local floor = active_max
+if hwm_value > floor then
+    floor = hwm_value
+end
+local new_epoch = floor + 1
+
+local lease = cjson.decode(payload_template)
+lease['runtime']['epoch'] = new_epoch
+local payload = cjson.encode(lease)
+
+local lease_key = lease_key_prefix .. tostring(new_epoch)
+redis.call('SET', lease_key, payload, 'PX', ttl_ms)
+redis.call('SADD', global_index, lease_key)
+redis.call('SADD', by_stable_index, tostring(new_epoch))
+redis.call('SET', hwm_key, tostring(new_epoch))
+return tostring(new_epoch)
 "#;
 
 const UPSERT_CLIENT_LEASE_STRICT_GREATER_SCRIPT: &str = r#"
@@ -1055,6 +1096,36 @@ impl MetadataBackend for RedisMetadataBackend {
             "lease rejected: proposed epoch {new_epoch} <= floor {} for stable_id {}",
             result.1, stable_id.0
         )))
+    }
+
+    fn allocate_client_lease(&self, template: &ClientLease) -> Result<ClientRuntimeId> {
+        let stable_id = template.runtime.stable_id.clone();
+        let lease_key_prefix = self.keyspace.client_prefix_for_stable(&stable_id);
+        let by_stable_key = self.keyspace.client_by_stable_index(&stable_id);
+        let hwm_key = self.keyspace.client_epoch_hwm(&stable_id);
+        let global_index_key = self.keyspace.client_index();
+        let payload_template = serde_json::to_string(template).map_err(json_error)?;
+        let assigned_epoch: String =
+            self.query_idempotent_write("redis allocate client lease", |connection| {
+                let ttl_ms = template.expires_at_ms.saturating_sub(now_ms()).max(1);
+                Script::new(ALLOCATE_CLIENT_LEASE_SCRIPT)
+                    .key(&lease_key_prefix)
+                    .key(&by_stable_key)
+                    .key(&hwm_key)
+                    .key(&global_index_key)
+                    .arg(payload_template.as_str())
+                    .arg(ttl_ms.to_string())
+                    .invoke::<String>(connection)
+            })?;
+        let epoch = assigned_epoch.parse::<u64>().map_err(|error| {
+            StoreError::Metadata(format!(
+                "redis allocate client lease: invalid epoch payload {assigned_epoch:?}: {error}"
+            ))
+        })?;
+        Ok(ClientRuntimeId {
+            stable_id,
+            epoch: ClientEpoch(epoch),
+        })
     }
 
     fn update_client_state(
@@ -2567,6 +2638,61 @@ mod tests {
         let mut sorted = members.clone();
         sorted.sort();
         assert_eq!(sorted, vec!["5".to_string(), "6".to_string()]);
+    }
+
+    #[test]
+    fn redis_backend_allocate_client_lease_assigns_monotonic_epochs() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-client-allocate");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+
+        let template = |stable_id: &str| ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(0)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms: super::now_ms() + 60_000,
+        };
+
+        let first = backend
+            .allocate_client_lease(&template("client-alloc"))
+            .expect("first allocation should succeed");
+        let second = backend
+            .allocate_client_lease(&template("client-alloc"))
+            .expect("second allocation should succeed");
+        let isolated = backend
+            .allocate_client_lease(&template("client-other"))
+            .expect("independent stable_id gets its own counter");
+        assert_eq!(first.epoch, ClientEpoch(1));
+        assert_eq!(second.epoch, ClientEpoch(2));
+        assert_eq!(isolated.epoch, ClientEpoch(1));
+
+        let client = redis::Client::open(server.url()).expect("redis client should open");
+        let mut connection = client
+            .get_connection()
+            .expect("redis connection should succeed");
+        let hwm: Option<String> = connection
+            .get(keyspace.client_epoch_hwm(&ClientStableId::new("client-alloc")))
+            .expect("hwm read should succeed");
+        assert_eq!(hwm.as_deref(), Some("2"));
+
+        let listed = backend
+            .list_live_clients()
+            .expect("list live clients should succeed");
+        assert_eq!(listed.len(), 3);
+        let stored_epochs: Vec<ClientEpoch> = listed
+            .iter()
+            .filter(|lease| lease.runtime.stable_id.0 == "client-alloc")
+            .map(|lease| lease.runtime.epoch)
+            .collect();
+        let mut sorted = stored_epochs.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![ClientEpoch(1), ClientEpoch(2)]);
     }
 
     #[test]

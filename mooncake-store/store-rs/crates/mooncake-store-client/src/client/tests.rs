@@ -393,6 +393,13 @@ impl MetadataBackend for RecoverableMetadataBackend {
         self.inner.upsert_client_lease(lease)
     }
 
+    fn allocate_client_lease(
+        &self,
+        template: &ClientLease,
+    ) -> mooncake_store_core::Result<ClientRuntimeId> {
+        self.inner.allocate_client_lease(template)
+    }
+
     fn update_client_state(
         &self,
         runtime: &ClientRuntimeId,
@@ -647,6 +654,13 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         self.inner.upsert_client_lease(lease)
     }
 
+    fn allocate_client_lease(
+        &self,
+        template: &ClientLease,
+    ) -> mooncake_store_core::Result<ClientRuntimeId> {
+        self.inner.allocate_client_lease(template)
+    }
+
     fn update_client_state(
         &self,
         runtime: &ClientRuntimeId,
@@ -867,6 +881,13 @@ impl MetadataBackend for CountingMetadataBackend {
         self.upsert_client_lease_calls
             .fetch_add(1, Ordering::Relaxed);
         self.inner.upsert_client_lease(lease)
+    }
+
+    fn allocate_client_lease(
+        &self,
+        template: &ClientLease,
+    ) -> mooncake_store_core::Result<ClientRuntimeId> {
+        self.inner.allocate_client_lease(template)
     }
 
     fn update_client_state(
@@ -1093,6 +1114,13 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
         self.inner.upsert_client_lease(lease)
     }
 
+    fn allocate_client_lease(
+        &self,
+        template: &ClientLease,
+    ) -> mooncake_store_core::Result<ClientRuntimeId> {
+        self.inner.allocate_client_lease(template)
+    }
+
     fn update_client_state(
         &self,
         runtime: &ClientRuntimeId,
@@ -1306,6 +1334,13 @@ impl MetadataBackend for BlockingCasMetadataBackend {
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
         self.inner.upsert_client_lease(lease)
+    }
+
+    fn allocate_client_lease(
+        &self,
+        template: &ClientLease,
+    ) -> mooncake_store_core::Result<ClientRuntimeId> {
+        self.inner.allocate_client_lease(template)
     }
 
     fn update_client_state(
@@ -2179,7 +2214,6 @@ fn tc_replica2_payload(key: &str) -> Vec<u8> {
 fn hot_upgrade_handoff_is_published_after_draining() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let mut client = StoreClientBuilder::new(metadata.clone(), "client-a")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7001")
         .segment_name("client-a-segment")
@@ -2210,21 +2244,18 @@ fn hot_upgrade_handoff_is_published_after_draining() {
 fn hot_upgrade_successor_discovery_uses_same_stable_higher_epoch() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let predecessor = StoreClientBuilder::new(metadata.clone(), "upgrade-find")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7101")
         .segment_name("upgrade-find-old")
         .build(test_future_expiry_ms())
         .expect("predecessor build should succeed");
     let successor = StoreClientBuilder::new(metadata.clone(), "upgrade-find")
-        .epoch(ClientEpoch(2))
         .state(ClientLifecycleState::Standby)
         .rpc_address("127.0.0.1:7102")
         .segment_name("upgrade-find-new")
         .build(test_future_expiry_ms())
         .expect("successor build should succeed");
     let _other_stable = StoreClientBuilder::new(metadata, "upgrade-other")
-        .epoch(ClientEpoch(9))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7103")
         .segment_name("upgrade-other")
@@ -2242,14 +2273,12 @@ fn hot_upgrade_successor_discovery_uses_same_stable_higher_epoch() {
 fn targeted_hot_upgrade_handoff_promotes_standby_successor() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let mut predecessor = StoreClientBuilder::new(metadata.clone(), "upgrade-promote")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7111")
         .segment_name("upgrade-promote-old")
         .build(test_future_expiry_ms())
         .expect("predecessor build should succeed");
     let mut successor = StoreClientBuilder::new(metadata, "upgrade-promote")
-        .epoch(ClientEpoch(2))
         .state(ClientLifecycleState::Standby)
         .rpc_address("127.0.0.1:7112")
         .segment_name("upgrade-promote-new")
@@ -7708,129 +7737,29 @@ fn bootstrap_route_policy_bootstraps_once_and_rejects_mismatch() {
 }
 
 #[test]
-fn builder_rejects_duplicate_live_runtime_when_control_plane_is_reachable() {
+fn builder_auto_allocates_monotonic_epochs_for_same_stable_id() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let _live = StoreClientBuilder::new(metadata.clone(), "dup-runtime")
-        .epoch(ClientEpoch(1))
+    let first = StoreClientBuilder::new(metadata.clone(), "auto-alloc")
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7101")
-        .segment_name("dup-runtime-segment-a")
+        .segment_name("auto-alloc-segment-a")
         .build(test_future_expiry_ms())
-        .expect("initial runtime should build");
-
-    let error = match StoreClientBuilder::new(metadata, "dup-runtime")
-        .epoch(ClientEpoch(1))
+        .expect("first auto-allocated runtime should build");
+    let second = StoreClientBuilder::new(metadata, "auto-alloc")
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7102")
-        .segment_name("dup-runtime-segment-b")
+        .segment_name("auto-alloc-segment-b")
         .build(test_future_expiry_ms())
-    {
-        Ok(_) => panic!("duplicate live runtime should be rejected"),
-        Err(error) => error,
-    };
+        .expect("second auto-allocated runtime should build");
 
-    assert!(matches!(error, StoreError::Conflict(_)));
-}
-
-#[test]
-fn builder_allows_takeover_of_unreachable_duplicate_runtime() {
-    let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let mut endpoints = ClientEndpointSet {
-        rpc_address: "127.0.0.1:7103".to_string(),
-        segment_name: Some(SegmentName::new("takeover-segment")),
-        labels: BTreeMap::new(),
-    };
-    endpoints.labels.insert(
-        control_address_label().to_string(),
-        "127.0.0.1:1".to_string(),
-    );
-    metadata
-        .upsert_client_lease(&ClientLease {
-            runtime: ClientRuntimeId::new("takeover-runtime", ClientEpoch(1)),
-            state: ClientLifecycleState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            endpoints,
-            expires_at_ms: test_future_expiry_ms(),
-        })
-        .expect("stale runtime should publish");
-
-    StoreClientBuilder::new(metadata, "takeover-runtime")
-        .epoch(ClientEpoch(1))
-        .state(ClientLifecycleState::Active)
-        .rpc_address("127.0.0.1:7104")
-        .segment_name("takeover-segment")
-        .build(test_future_expiry_ms())
-        .expect("unreachable duplicate runtime should allow takeover");
-}
-
-#[test]
-fn builder_rejects_stale_epoch_when_newer_runtime_is_reachable() {
-    let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let _newer = StoreClientBuilder::new(metadata.clone(), "epoch-fence")
-        .epoch(ClientEpoch(2))
-        .state(ClientLifecycleState::Active)
-        .rpc_address("127.0.0.1:7105")
-        .segment_name("epoch-fence-newer")
-        .build(test_future_expiry_ms())
-        .expect("newer runtime should build");
-
-    let error = match StoreClientBuilder::new(metadata, "epoch-fence")
-        .epoch(ClientEpoch(1))
-        .state(ClientLifecycleState::Active)
-        .rpc_address("127.0.0.1:7106")
-        .segment_name("epoch-fence-older")
-        .build(test_future_expiry_ms())
-    {
-        Ok(_) => panic!("older runtime should be fenced by newer live epoch"),
-        Err(error) => error,
-    };
-
-    assert!(matches!(error, StoreError::StaleEpoch(_)));
-}
-
-#[test]
-fn builder_rejects_stale_epoch_against_metadata_hwm_even_without_live_peer() {
-    let metadata = Arc::new(InMemoryMetadataBackend::new());
-    // Publish a newer epoch under an unreachable control address so the
-    // client-side duplicate guard yields to the server-side HWM fence.
-    let mut endpoints = ClientEndpointSet {
-        rpc_address: "127.0.0.1:1".to_string(),
-        segment_name: Some(SegmentName::new("hwm-fence-ghost")),
-        labels: BTreeMap::new(),
-    };
-    endpoints.labels.insert(
-        control_address_label().to_string(),
-        "127.0.0.1:1".to_string(),
-    );
-    metadata
-        .upsert_client_lease(&ClientLease {
-            runtime: ClientRuntimeId::new("hwm-fence", ClientEpoch(10)),
-            state: ClientLifecycleState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            endpoints,
-            expires_at_ms: test_future_expiry_ms(),
-        })
-        .expect("newer lease should publish");
-
-    let error = match StoreClientBuilder::new(metadata, "hwm-fence")
-        .epoch(ClientEpoch(5))
-        .state(ClientLifecycleState::Active)
-        .rpc_address("127.0.0.1:7109")
-        .segment_name("hwm-fence-segment")
-        .build(test_future_expiry_ms())
-    {
-        Ok(_) => panic!("older epoch must be fenced by metadata HWM"),
-        Err(error) => error,
-    };
-
-    assert!(matches!(error, StoreError::StaleEpoch(_)));
+    assert_ne!(first.lease().runtime.epoch, second.lease().runtime.epoch);
+    assert!(second.lease().runtime.epoch > first.lease().runtime.epoch);
 }
 
 #[test]
 fn builder_rejects_live_segment_name_reuse_across_runtimes() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let _owner = StoreClientBuilder::new(metadata.clone(), "segment-owner-a")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7107")
         .segment_name("shared-startup-segment")
@@ -7838,7 +7767,6 @@ fn builder_rejects_live_segment_name_reuse_across_runtimes() {
         .expect("segment owner should build");
 
     let error = match StoreClientBuilder::new(metadata, "segment-owner-b")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7108")
         .segment_name("shared-startup-segment")
@@ -7856,7 +7784,6 @@ fn builder_can_stage_active_until_local_memory_registration() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("staged-active-segment"));
     let client = StoreClientBuilder::new(metadata.clone(), "staged-active")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .activate_on_local_memory_registration()
         .transport(transport.clone())
@@ -7896,7 +7823,6 @@ fn staged_activation_republishes_lease_without_state_patch() {
     ));
     let transport = Arc::new(TestTransport::new("staged-active-refresh-segment"));
     let client = StoreClientBuilder::new(metadata.clone(), "staged-active-refresh")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .activate_on_local_memory_registration()
         .transport(transport.clone())
@@ -7920,7 +7846,6 @@ fn heartbeat_keeps_staged_client_active_after_local_memory_registration() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("staged-heartbeat-segment"));
     let mut client = StoreClientBuilder::new(metadata.clone(), "staged-heartbeat")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .activate_on_local_memory_registration()
         .transport(transport.clone())
@@ -7953,7 +7878,6 @@ fn activate_republishes_lease_without_state_patch() {
     ));
     let transport = Arc::new(TestTransport::new("activate-refresh-segment"));
     let mut client = StoreClientBuilder::new(metadata.clone(), "activate-refresh")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Standby)
         .transport(transport.clone())
         .transport_factory(transport.factory())
@@ -10628,7 +10552,6 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
     let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
 
     let mut predecessor = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-store")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
@@ -10638,7 +10561,6 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
         .build(test_future_expiry_ms())
         .expect("predecessor build should succeed");
     let mut successor = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-store")
-        .epoch(ClientEpoch(2))
         .state(ClientLifecycleState::Standby)
         .label("pool", "pool-a")
         .label("storage", "true")
@@ -10753,7 +10675,6 @@ fn hot_upgrade_evacuation_refreshes_expired_predecessor_lease() {
     let predecessor_expiry = now_ms().saturating_add(60);
     let long_expiry = now_ms().saturating_add(10_000);
     let mut predecessor = StoreClientBuilder::new(metadata.clone(), "expiring-upgrade-store")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
@@ -10763,7 +10684,6 @@ fn hot_upgrade_evacuation_refreshes_expired_predecessor_lease() {
         .build(predecessor_expiry)
         .expect("predecessor build should succeed");
     let mut successor = StoreClientBuilder::new(metadata.clone(), "expiring-upgrade-store")
-        .epoch(ClientEpoch(2))
         .state(ClientLifecycleState::Standby)
         .label("pool", "pool-a")
         .label("storage", "true")

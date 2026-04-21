@@ -22,7 +22,7 @@ use mooncake_store_client::{
     RouteControlMode,
 };
 use mooncake_store_core::{
-    ClientEpoch, ClientLifecycleState, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
+    ClientLifecycleState, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
 };
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -81,7 +81,6 @@ impl PyMooncakeDistributedStore {
         master_server = "",
         *,
         stable_id = None,
-        epoch = 1,
         initial_state = "active",
         tenant = "default",
         labels = None,
@@ -97,7 +96,7 @@ impl PyMooncakeDistributedStore {
         use_hugepage = None,
         hugepage_size = None,
         route_control = "embedded_wrh"
-    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, epoch=1, initial_state='active', tenant='default', labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, route_control='embedded_wrh')")]
+    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, route_control='embedded_wrh')")]
     #[allow(clippy::too_many_arguments)]
     fn setup(
         &mut self,
@@ -109,7 +108,6 @@ impl PyMooncakeDistributedStore {
         rdma_devices: &str,
         master_server: &str,
         stable_id: Option<String>,
-        epoch: u64,
         initial_state: &str,
         tenant: &str,
         labels: Option<BTreeMap<String, String>>,
@@ -126,7 +124,6 @@ impl PyMooncakeDistributedStore {
         hugepage_size: Option<usize>,
         route_control: &str,
     ) -> PyResult<i32> {
-        let epoch = parse_client_epoch_arg(epoch)?;
         let initial_state = parse_initial_state_arg(initial_state)?;
         let route_control = parse_route_control_arg(route_control)?;
         let runtime = CompatRuntimeArgs {
@@ -153,7 +150,6 @@ impl PyMooncakeDistributedStore {
                 timeouts: None,
             },
             local_segment_name,
-            epoch,
             initial_state,
             route_control,
         }
@@ -1539,13 +1535,6 @@ fn parse_route_control_arg(value: &str) -> PyResult<RouteControlMode> {
     }
 }
 
-fn parse_client_epoch_arg(value: u64) -> PyResult<ClientEpoch> {
-    if value == 0 {
-        return Err(PyValueError::new_err("epoch must be greater than zero"));
-    }
-    Ok(ClientEpoch(value))
-}
-
 fn parse_initial_state_arg(value: &str) -> PyResult<ClientLifecycleState> {
     match value.trim().to_ascii_lowercase().as_str() {
         "standby" => Ok(ClientLifecycleState::Standby),
@@ -1595,10 +1584,10 @@ mod tests {
     use pyo3::{prepare_freethreaded_python, Python};
 
     use super::{
-        _store_rs, init_tracing, metrics_server_address, metrics_text, parse_client_epoch_arg,
-        parse_initial_state_arg, pointer_from_usize, replication_policy, route_to_py,
-        segment_to_py, start_metrics_server, stop_metrics_server, store_error_to_py, DummySession,
-        PyMooncakeDistributedStore, PyMooncakeHostMemAllocator, StoreBackend,
+        _store_rs, init_tracing, metrics_server_address, metrics_text, parse_initial_state_arg,
+        pointer_from_usize, replication_policy, route_to_py, segment_to_py, start_metrics_server,
+        stop_metrics_server, store_error_to_py, DummySession, PyMooncakeDistributedStore,
+        PyMooncakeHostMemAllocator, StoreBackend,
     };
     use crate::dispatcher::StoreDispatcher;
     use crate::dummy_service::pb;
@@ -1913,7 +1902,6 @@ mod tests {
     ) -> StoreClient {
         let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
         StoreClientBuilder::new(metadata, name)
-            .epoch(ClientEpoch(1))
             .state(state)
             .label("storage", "true")
             .live_client_sync_interval(Duration::from_millis(25))
@@ -2044,6 +2032,13 @@ mod tests {
         fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
             self.maybe_block(&self.block_lease);
             self.inner.upsert_client_lease(lease)
+        }
+
+        fn allocate_client_lease(
+            &self,
+            template: &ClientLease,
+        ) -> mooncake_store_core::Result<ClientRuntimeId> {
+            self.inner.allocate_client_lease(template)
         }
 
         fn update_client_state(
@@ -2264,6 +2259,13 @@ mod tests {
             }
             drop(remaining);
             self.inner.upsert_client_lease(lease)
+        }
+
+        fn allocate_client_lease(
+            &self,
+            template: &ClientLease,
+        ) -> mooncake_store_core::Result<ClientRuntimeId> {
+            self.inner.allocate_client_lease(template)
         }
 
         fn update_client_state(
@@ -2860,10 +2862,6 @@ mod tests {
     #[test]
     fn python_setup_parsers_accept_hot_upgrade_identity_flags() {
         assert_eq!(
-            parse_client_epoch_arg(7).expect("epoch parser should accept positive values"),
-            ClientEpoch(7)
-        );
-        assert_eq!(
             parse_initial_state_arg("standby").expect("state parser should accept standby"),
             ClientLifecycleState::Standby
         );
@@ -2877,9 +2875,6 @@ mod tests {
     fn python_setup_parsers_reject_invalid_hot_upgrade_identity_flags() {
         init_python();
         Python::with_gil(|py| {
-            assert!(parse_client_epoch_arg(0)
-                .expect_err("epoch zero must be rejected")
-                .is_instance_of::<PyValueError>(py));
             assert!(parse_initial_state_arg("promoting")
                 .expect_err("unknown lifecycle state must be rejected")
                 .is_instance_of::<PyValueError>(py));
@@ -4520,7 +4515,6 @@ mod tests {
         let metadata = Arc::new(RecoveryCountingMetadata::new());
         let transport = Arc::new(TestTransport::new("dispatcher-recovery-segment"));
         let client = match StoreClientBuilder::new(metadata.clone(), "dispatcher-recovery")
-            .epoch(ClientEpoch(1))
             .state(ClientLifecycleState::Active)
             .compatibility(CompatibilityDescriptor::default())
             .route_control(RouteControlMode::MetadataOnly)
