@@ -109,8 +109,7 @@ class EfaContext {
 
     // Non-creating lookup under the normalized key.  Returns nullptr if the
     // peer handle does not yet exist.  Safe for idempotency checks.
-    std::shared_ptr<EfaEndPoint> peekEndpoint(
-        const std::string& peer_nic_path);
+    std::shared_ptr<EfaEndPoint> peekEndpoint(const std::string& peer_nic_path);
 
     int deleteEndpoint(const std::string& peer_nic_path);
     int disconnectAllEndpoints();

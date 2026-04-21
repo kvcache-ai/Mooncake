@@ -24,9 +24,7 @@
 namespace mooncake {
 
 EfaEndPoint::EfaEndPoint(EfaContext& context)
-    : context_(context),
-      status_(INITIALIZING),
-      peer_fi_addr_(FI_ADDR_UNSPEC) {}
+    : context_(context), status_(INITIALIZING), peer_fi_addr_(FI_ADDR_UNSPEC) {}
 
 EfaEndPoint::~EfaEndPoint() { disconnect(); }
 
@@ -47,8 +45,8 @@ int EfaEndPoint::setupConnectionsByActive() {
 
     // Loopback: handshake against ourselves.
     if (context_.nicPath() == peer_nic_path_) {
-        int ret = context_.insertPeerAddr(context_.localEpAddr(),
-                                          peer_fi_addr_);
+        int ret =
+            context_.insertPeerAddr(context_.localEpAddr(), peer_fi_addr_);
         if (ret != 0) return ret;
         status_.store(CONNECTED, std::memory_order_release);
         LOG(INFO) << "EFA loopback connection established: " << toString();

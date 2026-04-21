@@ -711,8 +711,8 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
         }
     }
     if (already_ready == n_pairs) {
-        VLOG(1) << "EfaTransport::warmupSegment('" << segment_name
-                << "'): all " << n_pairs << " endpoints already connected, "
+        VLOG(1) << "EfaTransport::warmupSegment('" << segment_name << "'): all "
+                << n_pairs << " endpoints already connected, "
                 << "skipping";
         return 0;
     }

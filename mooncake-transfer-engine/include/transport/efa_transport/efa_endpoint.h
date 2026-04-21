@@ -113,9 +113,9 @@ class EfaEndPoint {
     EfaContext& context_;
     std::atomic<Status> status_;
 
-    RWSpinlock lock_;                 // protects peer_nic_path_ and status_
+    RWSpinlock lock_;  // protects peer_nic_path_ and status_
     std::string peer_nic_path_;
-    fi_addr_t peer_fi_addr_;          // slot in context_.av()
+    fi_addr_t peer_fi_addr_;  // slot in context_.av()
 };
 
 }  // namespace mooncake
