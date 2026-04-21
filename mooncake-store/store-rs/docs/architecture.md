@@ -104,6 +104,10 @@ The membership snapshot is runtime cache, not protocol configuration:
 
 A write is split into route resolution, allocation, transfer, and route publication.
 
+For routed batch writes, remote replica transfers are coalesced by tenant and scratch-window
+capacity before route publication. Large same-tenant batches therefore pay one transfer-completion
+wait per chunk instead of one wait per object.
+
 ```mermaid
 sequenceDiagram
     participant App
