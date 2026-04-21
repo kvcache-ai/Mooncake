@@ -14,6 +14,7 @@ use super::service::AdminService;
 
 const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 
 pub struct AdminHttpServerHandle {
     address: String,
@@ -96,11 +97,13 @@ fn handle_admin_http_connection(mut stream: TcpStream, service: &AdminService) {
     if stream.set_read_timeout(Some(HTTP_READ_TIMEOUT)).is_err() {
         return;
     }
-    let request = match read_http_request(&mut stream) {
-        Ok(request) => request,
-        Err(_) => return,
+    let response = match read_http_request(&mut stream) {
+        Ok(request) => route_request(service, request),
+        Err(HttpRequestReadError::ContentTooLarge) => {
+            http_error_response("413 Payload Too Large", "request content is too large")
+        }
+        Err(HttpRequestReadError::Io) => return,
     };
-    let response = route_request(service, request);
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
 }
@@ -110,6 +113,18 @@ struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum HttpRequestReadError {
+    Io,
+    ContentTooLarge,
+}
+
+impl From<std::io::Error> for HttpRequestReadError {
+    fn from(_: std::io::Error) -> Self {
+        Self::Io
+    }
 }
 
 fn route_request(service: &AdminService, request: HttpRequest) -> String {
@@ -487,7 +502,7 @@ fn parse_reservation_state_query(
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpRequestReadError> {
     let mut request = Vec::with_capacity(2048);
     let mut buffer = [0_u8; 1024];
     let mut header_end = None;
@@ -502,6 +517,9 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
             header_end = request.windows(4).position(|window| window == b"\r\n\r\n");
             if let Some(index) = header_end {
                 content_length = parse_content_length(&request[..index + 4]);
+                if content_length > MAX_HTTP_BODY_BYTES {
+                    return Err(HttpRequestReadError::ContentTooLarge);
+                }
                 let body_len = request.len().saturating_sub(index + 4);
                 if body_len >= content_length {
                     break;
@@ -513,7 +531,7 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
                 break;
             }
         }
-        if request.len() >= 1024 * 1024 {
+        if request.len() >= MAX_HTTP_BODY_BYTES {
             break;
         }
     }
@@ -660,6 +678,7 @@ mod tests {
     use super::{
         http_store_error, parse_policy_scope_path, parse_quota_abort_path, parse_quota_scope_path,
         percent_decode_component, query_flag, query_param, AdminHttpServerHandle, PolicyScopePath,
+        MAX_HTTP_BODY_BYTES,
     };
 
     fn http_request(address: &str, request: &str) -> String {
@@ -769,6 +788,26 @@ mod tests {
         );
         assert!(response.contains("HTTP/1.1 400 Bad Request"));
         assert!(response.contains("invalid JSON body"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_returns_413_for_oversized_payloads() {
+        let service = test_service();
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+        let body = "x".repeat(16);
+        let oversized_length = MAX_HTTP_BODY_BYTES + 1;
+        let response = http_request(
+            &address,
+            &format!(
+                "PUT /v1/tenant-policies/tenant-a HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {oversized_length}\r\nConnection: close\r\n\r\n{body}",
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 413 Payload Too Large"));
+        assert!(response.contains("request content is too large"));
 
         server.shutdown().expect("server shutdown");
     }
