@@ -24,6 +24,12 @@ var (
 	testConfig *rest.Config
 )
 
+type electionStateNoRelease struct {
+	cancel  context.CancelFunc
+	elected chan struct{}
+	lost    chan struct{}
+}
+
 func TestMain(m *testing.M) {
 	testEnv = &envtest.Environment{}
 
@@ -49,6 +55,55 @@ func TestMain(m *testing.M) {
 
 	testEnv.Stop()
 	os.Exit(code)
+}
+
+func runElectionWithoutRelease(namespace, leaseName, identity string,
+	leaseDurationSec, renewDeadlineSec, retryPeriodSec int) (*electionStateNoRelease, error) {
+	if err := ensureClientInitialized(); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	state := &electionStateNoRelease{
+		cancel:  cancel,
+		elected: make(chan struct{}),
+		lost:    make(chan struct{}),
+	}
+
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta: metav1.ObjectMeta{
+			Name:      leaseName,
+			Namespace: namespace,
+		},
+		Client: globalClient.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity: identity,
+		},
+	}
+
+	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+		Lock:            lock,
+		LeaseDuration:   time.Duration(leaseDurationSec) * time.Second,
+		RenewDeadline:   time.Duration(renewDeadlineSec) * time.Second,
+		RetryPeriod:     time.Duration(retryPeriodSec) * time.Second,
+		ReleaseOnCancel: false,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(ctx context.Context) {
+				close(state.elected)
+				<-ctx.Done()
+			},
+			OnStoppedLeading: func() {
+				close(state.lost)
+			},
+		},
+	})
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create leader elector: %w", err)
+	}
+
+	go le.Run(ctx)
+	return state, nil
 }
 
 // TestSingleLeaderElection verifies a single candidate becomes leader.
@@ -408,26 +463,21 @@ func TestGetHolderDuringElection(t *testing.T) {
 	<-state.lost
 }
 
-// TestGetHolderReturnsEmptyAfterLeaderDeath verifies that after a leader
-// cancels its election and the lease expires, getHolder returns an empty
-// holder. This is the integration-level counterpart to the unit test
-// TestGetHolderReturnsEmptyForExpiredLease and reproduces the real-cluster
-// scenario where a leader pod dies without releasing its lease.
+// TestGetHolderReturnsEmptyAfterLeaderDeath verifies that after a leader stops
+// renewing its lease without releasing it, getHolder returns an empty holder
+// once the lease expires. This is the integration-level counterpart to the
+// unit test TestGetHolderReturnsEmptyForExpiredLease.
 func TestGetHolderReturnsEmptyAfterLeaderDeath(t *testing.T) {
 	ns := "default"
 	lease := "expired-leader-test"
 	identity := "doomed-leader:8080"
 
-	// Acquire leadership.
-	err := runElection(ns, lease, identity, 5, 4, 1)
+	// Acquire leadership without ReleaseOnCancel so canceling simulates a dead
+	// leader that stops renewing and leaves the old holder until expiry.
+	state, err := runElectionWithoutRelease(ns, lease, identity, 5, 4, 1)
 	if err != nil {
 		t.Fatalf("runElection failed: %v", err)
 	}
-
-	key := electionKey(ns, lease)
-	electionMutex.Lock()
-	state := elections[key]
-	electionMutex.Unlock()
 
 	select {
 	case <-state.elected:
@@ -444,7 +494,7 @@ func TestGetHolderReturnsEmptyAfterLeaderDeath(t *testing.T) {
 		t.Fatalf("expected active holder %q, got %q", identity, holder)
 	}
 
-	// Simulate leader death: cancel election without explicit release.
+	// Simulate leader death: stop renewing without explicitly releasing.
 	state.cancel()
 	select {
 	case <-state.lost:
@@ -472,16 +522,12 @@ func TestFailoverAfterLeaderDeath(t *testing.T) {
 	ns := "default"
 	lease := "failover-test"
 
-	// First leader acquires.
-	err := runElection(ns, lease, "leader-1:8080", 5, 4, 1)
+	// First leader acquires without ReleaseOnCancel so canceling leaves the
+	// old holder in place until the lease naturally expires.
+	state1, err := runElectionWithoutRelease(ns, lease, "leader-1:8080", 5, 4, 1)
 	if err != nil {
 		t.Fatalf("first runElection failed: %v", err)
 	}
-
-	key := electionKey(ns, lease)
-	electionMutex.Lock()
-	state1 := elections[key]
-	electionMutex.Unlock()
 
 	select {
 	case <-state1.elected:
@@ -500,6 +546,7 @@ func TestFailoverAfterLeaderDeath(t *testing.T) {
 		t.Fatalf("second runElection failed: %v", err)
 	}
 
+	key := electionKey(ns, lease)
 	electionMutex.Lock()
 	state2 := elections[key]
 	electionMutex.Unlock()

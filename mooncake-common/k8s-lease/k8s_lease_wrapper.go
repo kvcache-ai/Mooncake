@@ -54,6 +54,7 @@ type watchState struct {
 var (
 	globalClient kubernetes.Interface
 	clientMutex  sync.Mutex
+	initClientFn = initClient
 
 	elections     = make(map[string]*electionState)
 	electionMutex sync.Mutex
@@ -64,6 +65,16 @@ var (
 
 func electionKey(namespace, leaseName string) string {
 	return namespace + "/" + leaseName
+}
+
+func ensureClientInitialized() error {
+	clientMutex.Lock()
+	initialized := globalClient != nil
+	clientMutex.Unlock()
+	if initialized {
+		return nil
+	}
+	return initClientFn()
 }
 
 // initClient creates the K8s clientset from in-cluster config or KUBECONFIG.
@@ -101,6 +112,9 @@ func initClient() error {
 // runElection starts a leader election goroutine for the given namespace/leaseName.
 func runElection(namespace, leaseName, identity string,
 	leaseDurationSec, renewDeadlineSec, retryPeriodSec int) error {
+	if err := ensureClientInitialized(); err != nil {
+		return err
+	}
 
 	key := electionKey(namespace, leaseName)
 
@@ -171,8 +185,8 @@ func runElection(namespace, leaseName, identity string,
 
 // getHolder reads the current Lease holder identity and transitions.
 func getHolder(namespace, leaseName string) (string, int64, error) {
-	if globalClient == nil {
-		return "", 0, fmt.Errorf("k8s client not initialized")
+	if err := ensureClientInitialized(); err != nil {
+		return "", 0, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -205,7 +219,7 @@ func getHolder(namespace, leaseName string) (string, int64, error) {
 
 //export K8sLeaseInit
 func K8sLeaseInit(errMsg **C.char) C.int {
-	if err := initClient(); err != nil {
+	if err := ensureClientInitialized(); err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
@@ -358,8 +372,8 @@ func K8sLeaseWatchHolder(
 		*errMsg = C.CString("callback function is nil")
 		return -1
 	}
-	if globalClient == nil {
-		*errMsg = C.CString("k8s client not initialized")
+	if err := ensureClientInitialized(); err != nil {
+		*errMsg = C.CString(err.Error())
 		return -1
 	}
 
