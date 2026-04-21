@@ -1140,9 +1140,7 @@ impl StoreClient {
         let filtered = route
             .replicas
             .iter()
-            .filter(|replica| {
-                replica.owner == self.lease.runtime || readable_runtimes.contains(&replica.owner)
-            })
+            .filter(|replica| readable_runtimes.contains(&replica.owner))
             .cloned()
             .collect::<Vec<_>>();
         if filtered.is_empty() || filtered.len() == route.replicas.len() {
@@ -2385,6 +2383,7 @@ impl StoreClient {
             {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    let failed_owner = resolved.replica.owner.clone();
                     let readable_runtimes = self.readable_runtime_set(true)?;
                     if !self.try_advance_resolved_replica(resolved, &readable_runtimes) {
                         if Self::should_refresh_route_after_read_error(&error) {
@@ -2413,7 +2412,9 @@ impl StoreClient {
                         }
                         return Err(error);
                     }
-                    self.maybe_prune_route_after_failover(resolved, &readable_runtimes);
+                    self.mark_runtime_suspect(&failed_owner, "route_read_replica_failed");
+                    let pruned_runtimes = self.readable_runtime_set(true)?;
+                    self.maybe_prune_route_after_failover(resolved, &pruned_runtimes);
                     debug!(
                         runtime = %self.lease.runtime,
                         tenant = %resolved.tenant,

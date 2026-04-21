@@ -7674,10 +7674,8 @@ fn builder_can_stage_active_until_local_memory_registration() {
 
     assert_eq!(client.lease().state, ClientLifecycleState::Standby);
     let before = metadata
-        .list_live_clients()
-        .expect("live clients should list")
-        .into_iter()
-        .find(|lease| lease.runtime == *client.runtime_id())
+        .get_client_lease(client.runtime_id())
+        .expect("staged lease lookup should succeed")
         .expect("staged lease should exist");
     assert_eq!(before.state, ClientLifecycleState::Standby);
 
