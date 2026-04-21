@@ -157,16 +157,16 @@ fn route_request(service: &AdminService, request: HttpRequest) -> String {
             http_json_response("200 OK", &service.list_route_migration_tasks())
         }
         ("POST", "/v1/route-migrations") => {
-            let payload = match serde_json::from_slice::<RouteMigrationTaskSubmitRequest>(&request.body)
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    return http_error_response(
-                        "400 Bad Request",
-                        &format!("invalid JSON body: {error}"),
-                    )
-                }
-            };
+            let payload =
+                match serde_json::from_slice::<RouteMigrationTaskSubmitRequest>(&request.body) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        return http_error_response(
+                            "400 Bad Request",
+                            &format!("invalid JSON body: {error}"),
+                        )
+                    }
+                };
             match service.submit_route_migration_task(payload) {
                 Ok(response) => http_json_response("200 OK", &response),
                 Err(error) => http_store_error(error),
@@ -721,7 +721,6 @@ mod tests {
 
     use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
     use mooncake_store_client::{control_plane_pb, RouteControlMode};
-    use parking_lot::Mutex;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute, ReplicaRoute,
@@ -729,6 +728,7 @@ mod tests {
         TenantObjectAccountingState, TenantPolicySpec, TenantQuotaPolicy,
         TenantQuotaReservationRequest, TenantRoutePolicy,
     };
+    use parking_lot::Mutex;
 
     use crate::admin::models::PolicyPatchInput;
     use crate::admin::service::{
@@ -833,7 +833,10 @@ mod tests {
                 rpc_address: format!("127.0.0.1:{}", 28_000 + epoch),
                 segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
                 labels: [
-                    ("control_addr".to_string(), format!("http://127.0.0.1:{}", 29_000 + epoch)),
+                    (
+                        "control_addr".to_string(),
+                        format!("http://127.0.0.1:{}", 29_000 + epoch),
+                    ),
                     ("route".to_string(), "true".to_string()),
                     ("storage".to_string(), "true".to_string()),
                 ]
@@ -844,11 +847,7 @@ mod tests {
         }
     }
 
-    fn wait_for_http_task_state(
-        address: &str,
-        task_id: &str,
-        expected: &str,
-    ) -> String {
+    fn wait_for_http_task_state(address: &str, task_id: &str, expected: &str) -> String {
         for _ in 0..200 {
             let response = http_request(
                 address,
@@ -1368,11 +1367,8 @@ mod tests {
             ),
         );
         assert!(listed.contains("\"count\":1"));
-        let status = wait_for_http_task_state(
-            &address,
-            "route-migration-1",
-            "\"state\":\"succeeded\"",
-        );
+        let status =
+            wait_for_http_task_state(&address, "route-migration-1", "\"state\":\"succeeded\"");
         assert!(status.contains("\"execution_id\":\"execution-1\""));
         assert!(status.contains("\"attempts\":1"));
 
@@ -1386,7 +1382,9 @@ mod tests {
             status_results: Arc::new(Mutex::new(
                 vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
             )),
-            route_results: Arc::new(Mutex::new(vec![Ok(Some(sample_completed_move_route()))].into())),
+            route_results: Arc::new(Mutex::new(
+                vec![Ok(Some(sample_completed_move_route()))].into(),
+            )),
         });
         let service = test_migration_service(rpc);
         let mut server =
@@ -1413,12 +1411,93 @@ mod tests {
         );
         assert!(submit.contains("HTTP/1.1 200 OK"));
 
-        let status = wait_for_http_task_state(
-            &address,
-            "route-migration-1",
-            "\"state\":\"succeeded\"",
-        );
+        let status =
+            wait_for_http_task_state(&address, "route-migration-1", "\"state\":\"succeeded\"");
         assert!(!status.contains("\"state\":\"failed\""));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_rejects_route_migration_with_zero_max_retries() {
+        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "move",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b"],
+            "task_executor": "executor-a",
+            "max_retries": 0
+        })
+        .to_string();
+        let submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(submit.contains("HTTP/1.1 400 Bad Request"));
+        assert!(submit.contains("max_retries"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_rejects_invalid_route_migration_target_shapes() {
+        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let copy_body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "copy",
+            "source_segment": "segment-a",
+            "target_segments": [],
+            "task_executor": "executor-a"
+        })
+        .to_string();
+        let copy_submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                copy_body.len(),
+                copy_body
+            ),
+        );
+        assert!(copy_submit.contains("HTTP/1.1 400 Bad Request"));
+        assert!(copy_submit.contains("target_segment"));
+
+        let move_body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "move",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b", "segment-c"],
+            "task_executor": "executor-a"
+        })
+        .to_string();
+        let move_submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                move_body.len(),
+                move_body
+            ),
+        );
+        assert!(move_submit.contains("HTTP/1.1 400 Bad Request"));
+        assert!(move_submit.contains("exactly one target_segment"));
 
         server.shutdown().expect("server shutdown");
     }

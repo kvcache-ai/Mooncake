@@ -87,6 +87,7 @@ Environment knobs:
 Notes:
 
 - these knobs are read by `mooncake-store-admin server` through `AdminService::from_config(...)`
+- the same defaults also apply when `mooncake-store-admin migrate ...` creates in-process tasks directly through `AdminService`
 - task state is not persisted in metadata, so these settings control a live in-memory queue rather than a durable scheduler
 
 ## `StoreClientBuilder`

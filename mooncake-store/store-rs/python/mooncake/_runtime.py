@@ -15,6 +15,12 @@ _NATIVE_LIBRARIES = (
     "libmooncake_classic_shim.so",
     "libmooncake_tent_shim.so",
 )
+_NATIVE_LIBRARY_ENV_VARS = {
+    "libtransfer_engine.so": "MOONCAKE_CLASSIC_TE_LIB_PATH",
+    "libtent_shared.so": "MOONCAKE_TENT_SHARED_LIB_PATH",
+    "libmooncake_classic_shim.so": "MOONCAKE_CLASSIC_SHIM_LIB_PATH",
+    "libmooncake_tent_shim.so": "MOONCAKE_TENT_SHIM_LIB_PATH",
+}
 
 
 def package_dir() -> pathlib.Path:
@@ -36,7 +42,43 @@ def resolve_first(candidates: list[pathlib.Path]) -> pathlib.Path | None:
 def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]:
     root = package_root if package_root is not None else package_dir()
     repository = repo_root(root)
-    candidates = [
+    env_candidates: list[pathlib.Path] = []
+    upstream_build = os.environ.get("MOONCAKE_UPSTREAM_BUILD_DIR")
+    if upstream_build:
+        env_candidates.extend(
+            [
+                pathlib.Path(upstream_build) / "mooncake-asio",
+                pathlib.Path(upstream_build) / "mooncake-transfer-engine" / "src",
+                pathlib.Path(upstream_build)
+                / "mooncake-transfer-engine"
+                / "tent"
+                / "src",
+            ]
+        )
+    upstream_root = os.environ.get("MOONCAKE_UPSTREAM_DIR")
+    if upstream_root:
+        env_candidates.extend(
+            [
+                pathlib.Path(upstream_root) / "build-wheel-compat" / "mooncake-asio",
+                pathlib.Path(upstream_root)
+                / "build-wheel-compat"
+                / "mooncake-transfer-engine"
+                / "src",
+                pathlib.Path(upstream_root)
+                / "build-wheel-compat"
+                / "mooncake-transfer-engine"
+                / "tent"
+                / "src",
+                pathlib.Path(upstream_root) / "build-rust" / "mooncake-asio",
+                pathlib.Path(upstream_root) / "build-rust" / "mooncake-transfer-engine" / "src",
+                pathlib.Path(upstream_root)
+                / "build-rust"
+                / "mooncake-transfer-engine"
+                / "tent"
+                / "src",
+            ]
+        )
+    candidates = env_candidates + [
         root,
         root / "lib",
         root.parent / "mooncake.libs",
@@ -100,6 +142,14 @@ def native_library_candidates(
 ) -> list[pathlib.Path]:
     selected: list[pathlib.Path] = []
     for library_name in _NATIVE_LIBRARIES:
+        env_override = _NATIVE_LIBRARY_ENV_VARS.get(library_name)
+        if env_override:
+            configured = os.environ.get(env_override)
+            if configured:
+                resolved = pathlib.Path(configured).expanduser().resolve()
+                if resolved.exists():
+                    selected.append(resolved)
+                    continue
         candidate_path: pathlib.Path | None = None
         for library_dir in library_dirs(package_root):
             if library_dir.name in _WHEEL_LIB_DIRS:
@@ -123,7 +173,13 @@ def preload_native_libraries(package_root: pathlib.Path | None = None) -> None:
     if any((root.parent / name).is_dir() for name in _WHEEL_LIB_DIRS):
         return
     for library in native_library_candidates(package_root):
-        ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+        try:
+            ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+        except OSError as exc:
+            print(
+                f"warning: failed to preload optional native library {library}: {exc}",
+                file=sys.stderr,
+            )
 
 
 def binary_path(

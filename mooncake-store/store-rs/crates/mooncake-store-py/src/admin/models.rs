@@ -184,6 +184,10 @@ pub enum RouteMigrationTaskState {
 pub struct RouteMigrationTaskSubmitRequest {
     pub authority: String,
     pub tenant: String,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub object_set: Option<String>,
     pub key: String,
     pub mode: RouteMigrationMode,
     pub source_segment: String,
@@ -198,6 +202,8 @@ pub struct RouteMigrationTaskStatusResponse {
     pub namespace: String,
     pub authority: String,
     pub tenant: String,
+    pub domain: Option<String>,
+    pub object_set: Option<String>,
     pub key: String,
     pub mode: RouteMigrationMode,
     pub source_segment: String,

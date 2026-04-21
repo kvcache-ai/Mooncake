@@ -110,8 +110,10 @@ The current implementation also exposes admin-driven explicit route migration ta
 What it provides:
 
 - explicit `source_segment -> target_segment(s)` selection
-- multi-target `copy`
+- namespace-aware `tenant/domain/object_set/key` selection
+- multi-target `copy`, including multiple explicit target segments on the same storage runtime
 - single-target `move`
+- admin HTTP queue plus `mooncake-store-admin migrate ...` operator commands
 - a task-executor model where admin submits control-plane RPC and the executor runtime performs the transfer
 - in-memory admin task queue with `pending`, `dispatching`, `running`, `retry_wait`, `succeeded`, and `failed` states
 - admin-side retry with configurable backoff and a default retry budget of `5`
@@ -120,6 +122,7 @@ What it provides:
 Design boundary:
 
 - the admin queue is runtime memory only and does not recover across admin restart
+- the CLI is only an HTTP client for this queue; `migrate ...` commands must talk to a long-lived `mooncake-store-admin-server`
 - the authoritative durable state remains the object route, not the admin task record
 - retry is for executor loss or transient RPC failure, not for preserving a persistent migration backlog
 
