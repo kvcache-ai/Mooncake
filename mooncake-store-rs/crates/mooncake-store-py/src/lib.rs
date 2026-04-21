@@ -2079,6 +2079,20 @@ mod tests {
             self.inner.update_client_state(runtime, next)
         }
 
+        fn get_client_lease(
+            &self,
+            runtime: &ClientRuntimeId,
+        ) -> mooncake_store_core::Result<Option<ClientLease>> {
+            self.inner.get_client_lease(runtime)
+        }
+
+        fn get_live_runtime_by_stable_id(
+            &self,
+            stable_id: &ClientStableId,
+        ) -> mooncake_store_core::Result<Option<ClientLease>> {
+            self.inner.get_live_runtime_by_stable_id(stable_id)
+        }
+
         fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
             self.inner.list_live_clients()
         }
@@ -2097,6 +2111,21 @@ mod tests {
             segment: &SegmentName,
         ) -> mooncake_store_core::Result<()> {
             self.inner.unpublish_segment(owner, segment)
+        }
+
+        fn get_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+        ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
+            self.inner.get_segment(owner, segment)
+        }
+
+        fn get_segment_owner(
+            &self,
+            segment: &SegmentName,
+        ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+            self.inner.get_segment_owner(segment)
         }
 
         fn list_segments(
@@ -2305,6 +2334,20 @@ mod tests {
             self.inner.update_client_state(runtime, next)
         }
 
+        fn get_client_lease(
+            &self,
+            runtime: &ClientRuntimeId,
+        ) -> mooncake_store_core::Result<Option<ClientLease>> {
+            self.inner.get_client_lease(runtime)
+        }
+
+        fn get_live_runtime_by_stable_id(
+            &self,
+            stable_id: &ClientStableId,
+        ) -> mooncake_store_core::Result<Option<ClientLease>> {
+            self.inner.get_live_runtime_by_stable_id(stable_id)
+        }
+
         fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
             self.inner.list_live_clients()
         }
@@ -2323,6 +2366,21 @@ mod tests {
             segment: &SegmentName,
         ) -> mooncake_store_core::Result<()> {
             self.inner.unpublish_segment(owner, segment)
+        }
+
+        fn get_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+        ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
+            self.inner.get_segment(owner, segment)
+        }
+
+        fn get_segment_owner(
+            &self,
+            segment: &SegmentName,
+        ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+            self.inner.get_segment_owner(segment)
         }
 
         fn list_segments(
