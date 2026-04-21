@@ -64,7 +64,6 @@ jobs:
           base="${base#${base%%[![:space:]]*}}"
           base="${base%${base##*[![:space:]]}}"
           [ -n "$base" ] || return 1
-          [ "$base" = "https://github.com" ] && base="https://github.com/"
           [ "$base" != "https://github.com/" ] && base="${base%/}/"
           printf '%s\n' "$base"
         }
@@ -108,22 +107,53 @@ jobs:
 
     - name: Configure CMake
       shell: bash
+      env:
+        ASCEND_GITHUB_MIRROR_URLS: ${{ vars.ASCEND_GITHUB_MIRROR_URLS }}
       run: |
         source /usr/local/Ascend/cann-9.0.0/set_env.sh
         pwd
-        if ! git submodule update --init --recursive; then
-            if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
-                echo "git submodule update failed, try to cp pybind11..."
-                if [ -d "../pybind11" ]; then
-                    cp -r ../pybind11 extern/
-                else
-                    echo "Error: ../pybind11 does not exist. Cannot copy pybind11."
-                    exit 1
-                fi
-            else
-                echo "Detected that extern/pybind11 already exists, continuing execution...."
+
+        submodule_updated=false
+        if git submodule update --init --recursive; then
+          submodule_updated=true
+        elif [ -n "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
+          normalize_base() {
+            local base="$1"
+            base="${base#${base%%[![:space:]]*}}"
+            base="${base%${base##*[![:space:]]}}"
+            [ -n "$base" ] || return 1
+            [ "$base" != "https://github.com/" ] && base="${base%/}/"
+            printf '%s\n' "$base"
+          }
+
+          while IFS= read -r raw; do
+            base="$(normalize_base "$raw" || true)"
+            [ -n "$base" ] || continue
+            [ "$base" = "https://github.com/" ] && continue
+
+            echo "Retrying submodule update with ${base}"
+            if git -c url."${base}https://github.com/".insteadOf=https://github.com/ \
+              submodule update --init --recursive; then
+              submodule_updated=true
+              break
             fi
+          done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
         fi
+
+        if [ "$submodule_updated" != true ]; then
+          if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
+            echo "git submodule update failed (mirrors also exhausted), trying to cp pybind11..."
+            if [ -d "../pybind11" ]; then
+              cp -r ../pybind11 extern/
+            else
+              echo "Error: ../pybind11 does not exist. Cannot copy pybind11."
+              exit 1
+            fi
+          else
+            echo "Detected that extern/pybind11 already exists, continuing execution...."
+          fi
+        fi
+
         bash scripts/ascend/dependencies_ascend_installation.sh
         echo "Configuring CMake..."
         rm -rf build

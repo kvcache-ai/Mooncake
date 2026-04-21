@@ -224,6 +224,30 @@ Earlier CPU-to-CPU tuning results (before EFA striping optimization, when `MC_SL
 
 </details>
 
+#### p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
+
+Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
+
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=2147483648`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| block=1MB, threads=16, batch=128 | 701 GB/s | **697 GB/s** |
+| **block=1MB, threads=32, batch=64** | **752 GB/s** | 713 GB/s |
+| block=1MB, threads=32, batch=32 | 751 GB/s | - |
+| block=1MB, threads=64, batch=32 | 728 GB/s | - |
+
+> **Peak: 752 GB/s write**, reaching ~94% of the 800 GB/s theoretical line rate (16×400 Gbps). GPUDirect RDMA bypasses DRAM entirely (HBM3e → PCIe switch → NIC), so performance is not bottlenecked by CPU memory bandwidth.
+
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| **block=1MB, threads=32, batch=128, buf=4GB** | **230 GB/s** | 180 GB/s |
+| block=16MB, threads=32, batch=8, buf=8GB (striping off) | 233 GB/s | - |
+
+> CPU-to-CPU is bounded by DRAM bandwidth (~250 GB/s/socket on Xeon 8559C). Per-NIC sampling shows NUMA-0 NICs at 90 Gbps and NUMA-1 NICs at 53 Gbps, confirming DRAM controller saturation rather than NIC limit.
+
 #### p5en.48xlarge (H200, 16 EFA × 200 Gbps)
 
 Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA devices) in the same AWS placement group.
@@ -253,8 +277,10 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 | Transport | Throughput | Notes |
 |-----------|-----------|-------|
+| **EFA GPU-to-GPU (B300)** | **752 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, ~94% line rate |
 | **EFA GPU-to-GPU (H200)** | **347 GB/s** | p5en.48xlarge, 16×200G, block=1MB |
 | **EFA GPU-to-GPU (B200)** | **313 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB |
+| **EFA CPU-to-CPU (B300)** | **230 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, DRAM-limited |
 | **EFA CPU-to-CPU (B200)** | **222 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB, DRAM-limited |
 | **EFA CPU-to-CPU (H200)** | **192 GB/s** | p5en.48xlarge, block=1MB, NUMA-split, DRAM-limited |
 | EFA (default params) | 69.47 GB/s | Default block=64KB |
@@ -272,6 +298,27 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 - Keep `--batch_size` such that `block_size * batch_size * threads <= buffer_size`
 - Allocate buffers on both NUMA nodes for balanced NIC utilization (the bench tool does this by default for CPU mode)
 - On 16-NIC instances (p5en), writes are NUMA-sensitive: 8 local-NUMA NICs reach 90 Gbps each, while 8 cross-NUMA NICs only reach ~20 Gbps without NUMA-split
+
+### Eager endpoint warmup (first-request latency)
+
+libfabric `FI_EP_RDM` endpoints resolve peer addresses lazily: `fi_av_insert()` and the metadata handshake fire on the first send to each `(local_ctx, peer_nic)` pair. On 16-NIC instances that gives `16 × N_peer_NICs` serial handshakes inside the first `submitTransfer`, which shows up as a single-digit-second first-batch stall (measured ~4 s on p6-B300 for a 100 × 0.5 MB batch; the first batch runs at <0.1 GB/s while the CQ drains, steady-state afterwards is unaffected).
+
+Mooncake exposes an explicit eager-warmup API to eliminate the stall:
+
+- C++: `EfaTransport::warmupSegment(const std::string& segment_name)`
+- C: `int warmupEfaSegment(transfer_engine_t engine, const char *segment_name)`
+- Rust: `TransferEngine::warmup_efa_segment(name: &str)`
+
+Call it once per peer segment, right after `openSegment` (or after any metadata change that adds a new peer). Every `(local_ctx, peer_nic)` endpoint is connected concurrently via `std::async`; the critical path becomes `max(handshake RTT)` instead of `sum(handshake RTT)`. The call is idempotent — safe to re-run.
+
+Measured on p6-B300 (16 local NICs × 16 peer NICs, dual-NUMA initiator, 100 × 0.5 MB batch):
+
+| | first-batch latency | steady-state |
+|---|---:|---:|
+| No warmup | 4,043 ms | 141 GB/s |
+| `warmup_efa_segment` (256 endpoints connected in 4.1 s) | **13.5 ms** (~300×) | 230 GB/s |
+
+The warmup call itself takes roughly the same wall time as the stall it replaces — the win is that it's a one-time setup cost decoupled from the critical path of the first real transfer, not paid inside your latency budget.
 
 ## Usage with vLLM
 

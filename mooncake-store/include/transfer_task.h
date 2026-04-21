@@ -174,7 +174,10 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
+        : engine_(engine),
+          batch_id_(batch_id),
+          batch_size_(batch_size),
+          start_ts_(getCurrentTimeInMilli()) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -199,6 +202,7 @@ class TransferEngineOperationState : public OperationState {
     TransferEngine& engine_;
     BatchID batch_id_;
     size_t batch_size_;
+    const int64_t start_ts_;
 };
 
 /**

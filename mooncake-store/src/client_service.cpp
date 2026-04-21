@@ -27,8 +27,13 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#include "gpu_staging_utils.h"
 
 namespace mooncake {
+
+using gpu_staging::CopyDeviceToHost;
+using gpu_staging::IsDevicePointer;
+using gpu_staging::SetDevice;
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
@@ -57,6 +62,7 @@ Client::Client(const std::string& local_hostname,
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
+      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
@@ -2495,19 +2501,34 @@ void Client::PutToLocalFile(const std::string& key,
     }
 
     std::string path = disk_descriptor.file_path;
-    // Currently, persistence is achieved through asynchronous writes, but
-    // before asynchronous writing in 3FS, significant performance degradation
-    // may occur due to data copying. Profiling reveals that the number of page
-    // faults triggered in this scenario is nearly double the normal count.
-    // Future plans include introducing a reuse buffer list to address this
-    // performance degradation issue.
 
+    // Synchronous D2H staging + copy into std::string.
+    // Done on the calling thread to guarantee GPU buffers are still valid
+    // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+
     for (const auto& slice : slices) {
-        value.append(static_cast<char*>(slice.ptr), slice.size);
+        int device_id = -1;
+        if (IsDevicePointer(slice.ptr, &device_id)) {
+            SetDevice(device_id);
+            auto buf = pinned_buffer_pool_->Acquire(slice.size);
+            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                LOG(ERROR) << "D2H copy failed for key: " << key
+                           << ", triggering PutRevoke for disk replica";
+                pinned_buffer_pool_->Release(buf);
+                // Must revoke to avoid phantom replica in master
+                master_client_.PutRevoke(key, ReplicaType::DISK);
+                return;
+            }
+            value.append(buf.data, slice.size);
+            pinned_buffer_pool_->Release(buf);
+        } else {
+            value.append(static_cast<char*>(slice.ptr), slice.size);
+        }
     }
 
+    // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
         // Store the object

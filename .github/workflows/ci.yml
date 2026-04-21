@@ -138,6 +138,8 @@ jobs:
         export CGO_ENABLED=1
         export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
         export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-asio -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov"
+        # Link cudart if CUDA is available (needed for D2H staging in mooncake_store)
+        if [ -d /usr/local/cuda/lib64 ]; then export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"; fi
         ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
         kill $MASTER_PID 2>/dev/null || true
       shell: bash

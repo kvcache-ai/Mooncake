@@ -164,6 +164,15 @@ int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                           int max_endpoints) {
     endpoint_store_ = std::make_shared<EfaEndpointStore>(max_endpoints);
 
+#if !defined(USE_CUDA) && !defined(USE_HIP)
+    // When built without GPU support, prevent libfabric's EFA provider from
+    // dlopen-ing libcudart/libcuda at fi_getinfo/fi_domain time. That
+    // initialization creates a CUDA primary context on GPU 0 and leaks
+    // ~616 MiB of device memory even when no GPU memory is ever registered.
+    // Only set if the user hasn't explicitly configured FI_HMEM.
+    setenv("FI_HMEM", "system", 0);
+#endif
+
     // Setup hints for EFA provider
     hints_ = fi_allocinfo();
     if (!hints_) {
@@ -181,8 +190,11 @@ int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     std::string domain_name = device_name_ + "-rdm";
     hints_->domain_attr->name = strdup(domain_name.c_str());
     hints_->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR |
-                                   FI_MR_ALLOCATED | FI_MR_PROV_KEY |
-                                   FI_MR_HMEM;
+                                   FI_MR_ALLOCATED | FI_MR_PROV_KEY
+#if defined(USE_CUDA) || defined(USE_HIP)
+                                   | FI_MR_HMEM
+#endif
+        ;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
     // Get fabric info
@@ -429,31 +441,35 @@ int EfaContext::preTouchMemory(void* addr, size_t length) {
 
 uint64_t EfaContext::rkey(void* addr) {
     RWSpinlock::ReadGuard guard(mr_lock_);
-    auto it = mr_map_.find((uint64_t)addr);
-    if (it != mr_map_.end() && it->second.mr) {
-        return it->second.key;
+    auto it = mr_map_.upper_bound((uint64_t)addr);
+    if (it != mr_map_.begin()) {
+        --it;
+        if ((uint64_t)addr < it->first + it->second.length && it->second.mr) {
+            return it->second.key;
+        }
     }
     return 0;
 }
 
 uint64_t EfaContext::lkey(void* addr) {
     RWSpinlock::ReadGuard guard(mr_lock_);
-    auto it = mr_map_.find((uint64_t)addr);
-    if (it != mr_map_.end() && it->second.mr) {
-        return fi_mr_key(it->second.mr);
+    auto it = mr_map_.upper_bound((uint64_t)addr);
+    if (it != mr_map_.begin()) {
+        --it;
+        if ((uint64_t)addr < it->first + it->second.length && it->second.mr) {
+            return fi_mr_key(it->second.mr);
+        }
     }
     return 0;
 }
 
 void* EfaContext::mrDesc(void* addr) {
     RWSpinlock::ReadGuard guard(mr_lock_);
-    // Find the MR that contains this address
-    for (auto& entry : mr_map_) {
-        if ((uint64_t)addr >= entry.first &&
-            (uint64_t)addr < entry.first + entry.second.length) {
-            if (entry.second.mr) {
-                return fi_mr_desc(entry.second.mr);
-            }
+    auto it = mr_map_.upper_bound((uint64_t)addr);
+    if (it != mr_map_.begin()) {
+        --it;
+        if ((uint64_t)addr < it->first + it->second.length && it->second.mr) {
+            return fi_mr_desc(it->second.mr);
         }
     }
     return nullptr;

@@ -31,6 +31,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <map>
 #include <unordered_map>
 
 #include "common.h"
@@ -206,7 +207,7 @@ class EfaContext {
     std::atomic<int> next_cq_index_{0};
 
     RWSpinlock mr_lock_;
-    std::unordered_map<uint64_t, EfaMemoryRegionMeta> mr_map_;
+    std::map<uint64_t, EfaMemoryRegionMeta> mr_map_;
 };
 
 }  // namespace mooncake

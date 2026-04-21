@@ -71,3 +71,9 @@ if(USE_SUNRISE)
   add_test(NAME tent_sunrise_link_transport_test
            COMMAND tent_sunrise_link_transport_test)
 endif()
+add_executable(tent_fault_proxy_test fault_proxy_test.cpp)
+target_link_libraries(tent_fault_proxy_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+target_include_directories(tent_fault_proxy_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_fault_proxy_test COMMAND tent_fault_proxy_test)

@@ -2272,6 +2272,20 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"))
         .def(
+            "batch_replica_clear",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::string &segment_name) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<std::string>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_replica_clear(keys, segment_name);
+            },
+            py::arg("keys"), py::arg("segment_name") = "",
+            "Clear replicas for the given keys. Requires lease to be expired.")
+        .def(
             "create_copy_task",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                const std::vector<std::string> &targets) -> py::tuple {

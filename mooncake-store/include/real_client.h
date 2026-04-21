@@ -639,6 +639,10 @@ class RealClient : public PyClient {
     batch_get_replica_desc(const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
+    std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") override;
+
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>

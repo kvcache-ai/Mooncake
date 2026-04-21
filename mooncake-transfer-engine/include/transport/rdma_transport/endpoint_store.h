@@ -38,6 +38,8 @@ class EndpointStore {
    public:
     virtual std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) = 0;
+    virtual std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr) = 0;
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) = 0;
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
@@ -58,6 +60,8 @@ class FIFOEndpointStore : public EndpointStore {
     FIFOEndpointStore(size_t max_size) : max_size_(max_size) {}
     std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) override;
+    std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
@@ -89,6 +93,8 @@ class SIEVEEndpointStore : public EndpointStore {
         : waiting_list_len_(0), max_size_(max_size) {}
     std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) override;
+    std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;

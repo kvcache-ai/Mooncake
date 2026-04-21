@@ -562,8 +562,14 @@ class MasterService {
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
+    // Helper to get a snapshot of alive clients (under client_mutex_ shared
+    // lock)
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    void ClearInvalidHandles(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -891,7 +897,10 @@ class MasterService {
     }
 
     // Helper to clean up stale handles pointing to unmounted segments
-    bool CleanupStaleHandles(ObjectMetadata& metadata);
+    // or local_disk replicas whose owner client is no longer alive.
+    bool CleanupStaleHandles(
+        ObjectMetadata& metadata,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -962,11 +971,21 @@ class MasterService {
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)),
               replication_task_it_(shard_guard_->replication_tasks.find(key)) {
-            // Automatically clean up invalid handles
+            // Automatically clean up invalid handles (memory replicas only).
+            // Note: We only check memory replicas here to avoid lock order
+            // violation (client_mutex_ must be acquired before metadata shard).
+            // local_disk replicas are cleaned up by ClearInvalidHandles() in
+            // ClientMonitorFunc.
             if (it_ != shard_guard_->metadata.end()) {
-                if (service_->CleanupStaleHandles(it_->second)) {
+                // Erase invalid memory replicas (those with unmounted
+                // segments). No client_mutex_ needed since we only check memory
+                // replicas.
+                it_->second.EraseReplicas([](const Replica& replica) {
+                    return replica.has_invalid_mem_handle();
+                });
+                // If no valid replicas remain, delete the whole object.
+                if (!it_->second.IsValid()) {
                     this->Erase();
-
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }

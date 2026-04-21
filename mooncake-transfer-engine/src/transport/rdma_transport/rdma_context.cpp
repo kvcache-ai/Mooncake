@@ -357,6 +357,11 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     return endpoint;
 }
 
+std::shared_ptr<RdmaEndPoint> RdmaContext::getEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr) {
+    return endpoint_store_->getEndpointByPtr(endpoint_ptr);
+}
+
 int RdmaContext::disconnectAllEndpoints() {
     return endpoint_store_->disconnectQPs();
 }

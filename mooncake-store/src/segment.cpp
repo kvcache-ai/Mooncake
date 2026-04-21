@@ -273,6 +273,15 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
     return ErrorCode::OK;
 }
 
+void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
+    auto it = segment_manager_->client_local_disk_segment_.find(client_id);
+    if (it != segment_manager_->client_local_disk_segment_.end()) {
+        segment_manager_->client_local_disk_segment_.erase(it);
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=unmount_local_disk_segment";
+    }
+}
+
 ErrorCode ScopedSegmentAccess::GetAllSegments(
     std::vector<std::string>& all_segments) {
     all_segments.clear();
