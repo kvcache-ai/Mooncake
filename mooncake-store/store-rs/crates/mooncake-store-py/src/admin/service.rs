@@ -244,14 +244,9 @@ impl AdminService {
     ) -> AdminResult<GetTenantPolicyResponse> {
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         if effective {
-            let policies = self.backend.list_tenant_policies()?;
             let namespace = NamespaceScope::with_defaults(Some(tenant), domain, object_set);
-            let matching = policies
-                .iter()
-                .filter(|policy| policy.scope.matches_namespace(&namespace))
-                .collect::<Vec<_>>();
-            let effective_spec = (!matching.is_empty())
-                .then(|| TenantPolicySpec::resolve_for_scope(matching, &namespace));
+            let effective_spec =
+                resolve_effective_tenant_policy(self.backend.as_ref(), &namespace)?;
             return Ok(GetTenantPolicyResponse {
                 scope,
                 effective: true,
@@ -687,6 +682,21 @@ pub fn format_route_policy_domain(domain: &RoutePolicyDomain) -> String {
     }
 }
 
+fn resolve_effective_tenant_policy(
+    backend: &dyn MetadataBackend,
+    scope: &NamespaceScope,
+) -> AdminResult<Option<TenantPolicySpec>> {
+    let mut resolved = TenantPolicySpec::default();
+    let mut found = false;
+    for policy_scope in TenantPolicyScope::ancestors(scope) {
+        if let Some(policy) = backend.get_tenant_policy(&policy_scope)? {
+            resolved = resolved.merged_with(&policy.spec);
+            found = true;
+        }
+    }
+    Ok(found.then_some(resolved))
+}
+
 pub fn tenant_policy_scope(
     tenant: &str,
     domain: Option<&str>,
@@ -887,13 +897,274 @@ mod tests {
     };
     use mooncake_store_core::{
         ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, MetadataBackend, ObjectRoute,
-        ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentAnnouncement,
-        SegmentLifecycleState, SegmentName, TenantObjectAccountingState, TenantPolicy,
-        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
-        TenantQuotaReservationState,
+        ReplicaRoute, ReplicaTier, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
+        SegmentAnnouncement, SegmentLifecycleState, SegmentName, TenantObjectAccounting,
+        TenantObjectAccountingState, TenantPolicy, TenantQuotaAbortOutcome,
+        TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
+        TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
+        TenantQuotaReservationState, TenantQuotaState,
     };
 
     use super::*;
+
+    struct NoTenantPolicyListBackend {
+        inner: Arc<InMemoryMetadataBackend>,
+    }
+
+    impl NoTenantPolicyListBackend {
+        fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl MetadataBackend for NoTenantPolicyListBackend {
+        fn route_namespace(&self) -> String {
+            self.inner.route_namespace()
+        }
+
+        fn upsert_client_lease(
+            &self,
+            lease: &mooncake_store_core::ClientLease,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.upsert_client_lease(lease)
+        }
+
+        fn update_client_state(
+            &self,
+            runtime: &ClientRuntimeId,
+            next: mooncake_store_core::ClientLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_client_state(runtime, next)
+        }
+
+        fn get_client_lease(
+            &self,
+            runtime: &ClientRuntimeId,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::ClientLease>> {
+            self.inner.get_client_lease(runtime)
+        }
+
+        fn get_live_runtime_by_stable_id(
+            &self,
+            stable_id: &mooncake_store_core::ClientStableId,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::ClientLease>> {
+            self.inner.get_live_runtime_by_stable_id(stable_id)
+        }
+
+        fn list_live_clients(
+            &self,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ClientLease>> {
+            self.inner.list_live_clients()
+        }
+
+        fn publish_segment(
+            &self,
+            segment: &mooncake_store_core::SegmentAnnouncement,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.publish_segment(segment)
+        }
+
+        fn unpublish_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &mooncake_store_core::SegmentName,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.unpublish_segment(owner, segment)
+        }
+
+        fn get_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &mooncake_store_core::SegmentName,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::SegmentAnnouncement>> {
+            self.inner.get_segment(owner, segment)
+        }
+
+        fn get_segment_owner(
+            &self,
+            segment: &mooncake_store_core::SegmentName,
+        ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+            self.inner.get_segment_owner(segment)
+        }
+
+        fn list_segments(
+            &self,
+            owner: Option<&ClientRuntimeId>,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::SegmentAnnouncement>> {
+            self.inner.list_segments(owner)
+        }
+
+        fn update_segment_state(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &mooncake_store_core::SegmentName,
+            next: mooncake_store_core::SegmentLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_segment_state(owner, segment, next)
+        }
+
+        fn reserve_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &mooncake_store_core::SegmentName,
+            length_bytes: u64,
+        ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+            self.inner.reserve_segment(owner, segment, length_bytes)
+        }
+
+        fn release_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &mooncake_store_core::SegmentName,
+            offset_bytes: u64,
+            length_bytes: u64,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner
+                .release_segment(owner, segment, offset_bytes, length_bytes)
+        }
+
+        fn get_object_route(
+            &self,
+            key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+            self.inner.get_object_route(key)
+        }
+
+        fn list_object_routes(&self) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+            self.inner.list_object_routes()
+        }
+
+        fn compare_and_swap_object_route(
+            &self,
+            key: &ObjectKey,
+            expected: Option<mooncake_store_core::RouteVersion>,
+            next: Option<&ObjectRoute>,
+        ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+            self.inner
+                .compare_and_swap_object_route(key, expected, next)
+        }
+
+        fn get_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+        ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+            self.inner.get_route_policy(domain)
+        }
+
+        fn put_route_policy_if_absent(
+            &self,
+            domain: &RoutePolicyDomain,
+            policy: &RoutePolicy,
+        ) -> mooncake_store_core::Result<bool> {
+            self.inner.put_route_policy_if_absent(domain, policy)
+        }
+
+        fn put_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+            policy: &RoutePolicy,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.put_route_policy(domain, policy)
+        }
+
+        fn delete_route_policy(
+            &self,
+            domain: &RoutePolicyDomain,
+        ) -> mooncake_store_core::Result<bool> {
+            self.inner.delete_route_policy(domain)
+        }
+
+        fn list_route_policies(
+            &self,
+        ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+            self.inner.list_route_policies()
+        }
+
+        fn get_tenant_policy(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+            self.inner.get_tenant_policy(scope)
+        }
+
+        fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+            Err(StoreError::Unsupported(
+                "tenant policy listing is disabled in this test".to_string(),
+            ))
+        }
+
+        fn put_tenant_policy(
+            &self,
+            policy: &TenantPolicy,
+            expected_version: Option<u64>,
+        ) -> mooncake_store_core::Result<TenantPolicy> {
+            self.inner.put_tenant_policy(policy, expected_version)
+        }
+
+        fn delete_tenant_policy(
+            &self,
+            scope: &TenantPolicyScope,
+            expected_version: Option<u64>,
+        ) -> mooncake_store_core::Result<bool> {
+            self.inner.delete_tenant_policy(scope, expected_version)
+        }
+
+        fn get_tenant_quota_state(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+            self.inner.get_tenant_quota_state(scope)
+        }
+
+        fn get_tenant_object_accounting(
+            &self,
+            key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+            self.inner.get_tenant_object_accounting(key)
+        }
+
+        fn list_tenant_quota_reservations(
+            &self,
+            scope: &TenantPolicyScope,
+        ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+            self.inner.list_tenant_quota_reservations(scope)
+        }
+
+        fn reserve_tenant_quota(
+            &self,
+            request: &TenantQuotaReservationRequest,
+        ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+            self.inner.reserve_tenant_quota(request)
+        }
+
+        fn finalize_tenant_quota(
+            &self,
+            request: &TenantQuotaFinalizeRequest,
+        ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+            self.inner.finalize_tenant_quota(request)
+        }
+
+        fn abort_tenant_quota(
+            &self,
+            reservation_id: &str,
+        ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+            self.inner.abort_tenant_quota(reservation_id)
+        }
+
+        fn put_handoff(
+            &self,
+            handoff: &mooncake_store_core::HandoffPlan,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.put_handoff(handoff)
+        }
+
+        fn get_handoff(
+            &self,
+            stable_id: &mooncake_store_core::ClientStableId,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
+            self.inner.get_handoff(stable_id)
+        }
+    }
 
     fn test_service() -> AdminService {
         let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
@@ -1106,6 +1377,67 @@ mod tests {
         assert_eq!(root.tenant, "tenant-a");
         assert!(root.domain.is_none());
         assert!(root.object_set.is_none());
+    }
+
+    #[test]
+    fn admin_service_resolves_effective_policy_without_listing_all_policies() {
+        let inner = Arc::new(InMemoryMetadataBackend::new());
+        inner
+            .put_tenant_policy(
+                &TenantPolicy {
+                    scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                    spec: TenantPolicySpec {
+                        routing: Some(TenantRoutePolicy {
+                            route_topk: None,
+                            route_control: Some(
+                                mooncake_store_client::RouteControlMode::MetadataOnly,
+                            ),
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 10,
+                    updated_by: "admin".to_string(),
+                },
+                None,
+            )
+            .expect("root tenant policy should be stored");
+        inner
+            .put_tenant_policy(
+                &TenantPolicy {
+                    scope: TenantPolicyScope::new("tenant-a", Some("default"), Some("default")),
+                    spec: TenantPolicySpec {
+                        routing: Some(TenantRoutePolicy {
+                            route_topk: Some(4),
+                            route_control: None,
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 20,
+                    updated_by: "admin".to_string(),
+                },
+                None,
+            )
+            .expect("object-set tenant policy should be stored");
+
+        let backend: Arc<dyn MetadataBackend> = Arc::new(NoTenantPolicyListBackend::new(inner));
+        let service = AdminService::new(backend, "memory://test", MetadataKeyspace::default());
+        let effective = service
+            .get_tenant_policy("tenant-a", None, None, true)
+            .expect("effective policy read should succeed without listing all policies");
+
+        assert!(effective.found);
+        assert_eq!(
+            effective
+                .effective_spec
+                .expect("effective spec should exist")
+                .routing,
+            Some(TenantRoutePolicy {
+                route_topk: Some(4),
+                route_control: Some(mooncake_store_client::RouteControlMode::MetadataOnly),
+            })
+        );
     }
 
     #[test]
