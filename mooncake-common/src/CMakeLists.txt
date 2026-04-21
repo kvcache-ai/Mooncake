@@ -45,7 +45,7 @@ set_target_properties(asio_shared PROPERTIES
     INSTALL_RPATH "$ORIGIN"
     BUILD_WITH_INSTALL_RPATH TRUE
     OUTPUT_NAME "asio"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mooncake-asio"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mooncake-common"
 )
 
 target_link_libraries(asio_shared PUBLIC pthread)

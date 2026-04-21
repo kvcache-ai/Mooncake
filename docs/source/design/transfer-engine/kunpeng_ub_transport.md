@@ -99,7 +99,7 @@ make -j$(nproc)
 # Copy built modules to wheel directory
 cp mooncake-integration/engine.cpython-*.so ../mooncake-wheel/mooncake/
 cp mooncake-integration/store.cpython-*.so ../mooncake-wheel/mooncake/
-cp mooncake-asio/libasio.so ../mooncake-wheel/mooncake/
+cp mooncake-common/libasio.so ../mooncake-wheel/mooncake/
 
 # Install with pip
 pip install -e ../mooncake-wheel --no-build-isolation
