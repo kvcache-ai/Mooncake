@@ -37,7 +37,11 @@ echo "python: ${PYTHON_BIN}"
 echo "wheel:  ${WHEEL_PATH}"
 echo "links:  ${WHEEL_DIR}"
 
+PIP_INDEX=${PIP_INDEX_URL:-"https://mirrors.aliyun.com/pypi/simple/"}
+
 "${PYTHON_BIN}" -m pip install \
+  --no-cache-dir \
+  -i "${PIP_INDEX}" \
   --force-reinstall \
   --find-links "${WHEEL_DIR}" \
   "${WHEEL_PATH}"
