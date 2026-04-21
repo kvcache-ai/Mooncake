@@ -1,0 +1,31 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+cc_test(
+    name = "test_rpc",
+    srcs =
+        [
+            "ServerTester.hpp",
+            "inject_action.hpp",
+            "main.cpp",
+            "rpc_api.hpp",
+            "rpc_api.cpp",
+            "test_connection.cpp",
+            "test_coro_rpc_client.cpp",
+            "test_coro_rpc_server.cpp",
+            "test_function_name.cpp",
+            "test_register_handler.cpp",
+            "test_router.cpp",
+            "test_variadic.cpp",
+        ],
+    copts = [
+        "-std=c++20",
+        "-Isrc/coro_rpc/tests",
+    ],
+    defines = [
+        "UNIT_TEST_INJECT",
+        "STRUCT_PACK_ENABLE_UNPORTABLE_TYPE",
+    ],
+    deps = [
+        "//:ylt"
+    ],
+)

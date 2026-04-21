@@ -1,0 +1,46 @@
+<mxfile host="65bd71144e">
+    <diagram id="oe2Vl5H5gF7YLMPssPNC" name="第 1 页">
+        <mxGraphModel dx="1335" dy="917" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" background="none" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="2" value="类型哈希" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="11" y="400" width="320" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="3" value="4 Bytes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="141" y="370" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="5" value="1 Bytes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="341" y="370" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="6" value="元信息头&lt;br&gt;（可选）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="331" y="400" width="80" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="7" value="完整类型信息&lt;br&gt;（可选）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="491" y="400" width="80" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="9" value="数据总长度&lt;br&gt;（可选）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="411" y="400" width="80" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="10" value="DATA_SIZE" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="421" y="370" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="11" value="已知字段负载" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="571" y="400" width="160" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="12" value="variable length" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="606" y="370" width="90" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="13" value="未知字段负载" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="731" y="400" width="80" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="16" value="variable length" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="486" y="370" width="90" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="17" value="variable length" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="726" y="370" width="90" height="30" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

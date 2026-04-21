@@ -1,0 +1,111 @@
+#
+# Copyright (c) 2024 Alibaba Group Holding Limited. All Rights Reserved.
+# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+#
+# This code is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License version 2 only, as
+# published by the Free Software Foundation. Alibaba designates this
+# particular file as subject to the "Classpath" exception as provided
+# by Oracle in the LICENSE file that accompanied this code.
+#
+# This code is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
+# version 2 for more details (a copy is included in the LICENSE file that
+# accompanied this code).
+#
+# You should have received a copy of the GNU General Public License version
+# 2 along with this work; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
+name: 'Coverage test'
+
+inputs:
+  reset-commit-id:
+    required: false
+    type: string
+outputs:
+  data:
+    value: ${{ steps.get-cov-report.outputs.data }}
+
+runs:
+  using: composite
+  steps:
+    - name: 'Checkout source code'
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 100
+
+    - name: 'Reset to specific commit'
+      run: |
+        echo "${{ inputs.reset-commit-id }}"
+        git reset --hard ${{ inputs.reset-commit-id }}
+      shell: bash
+      if: ${{ inputs.reset-commit-id }} != ""
+
+    - name: 'Install dependencies'
+      run: |
+          apt --help &>/dev/null
+          if [ $? -eq 0 ];then
+            sudo apt-get install -y openssl libssl-dev llvm jq
+          else
+            yum --help &>/dev/null
+            if [ $? -eq 0 ];then
+              sudo yum install -y openssl openssl-devel llvm jq
+            else
+              exit 1
+            fi
+          fi
+      shell: bash
+
+    - name: 'Install newer clang'
+      run: |
+        apt --help &>/dev/null
+        if [ $? -eq 0 ];then
+          sudo rm /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update -y
+        else
+          yum --help &>/dev/null
+          [ $? -eq 0 ] && sudo yum update -y
+        fi
+        wget https://apt.llvm.org/llvm.sh -O llvm.sh
+        chmod +x ./llvm.sh
+        sudo ./llvm.sh 17
+      shell: bash
+
+    - name: 'Build and test'
+      id: get-cov-report
+      run: |
+        cp -r src/coro_rpc/tests/openssl_files .
+        rm -rf build
+        mkdir -p build
+        cd build
+        CC=clang-17 CXX=clang++-17 cmake .. -DCOVERAGE_TEST=ON -DYLT_ENABLE_SSL=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF
+        make -j
+        export LLVM_PROFILE_FILE="test_ylt-%m.profraw"
+        cd output/tests
+        find . -maxdepth 1 -type f -executable | xargs -I {} sh -c '{}'
+        llvm-profdata merge -sparse test_ylt-*.profraw -o test_ylt.profdata
+        if [ -n "${{ inputs.reset-commit-id }}" ];then
+          report=base-ylt-cov-report
+        else
+          report=ylt-cov-report
+        fi
+        llvm-cov show $(find . -maxdepth 1 -type f -executable | awk '{print "-object " $0}' | xargs) -instr-profile=test_ylt.profdata -format=html -output-dir=$report -ignore-filename-regex='thirdparty|src|template_switch|concurrentqueue|dragonbox_to_chars|dragonbox|expected' -show-instantiations=false
+        echo "path=build/output/tests/$report" >> $GITHUB_OUTPUT
+        cov_data=$(grep -w '<pre>Totals</pre>' $report/index.html | awk -F 'Totals' '{print $NF}' | cut -d ')' -f 2 | awk -F '>' '{print $NF}' | awk -F '%' '{print $1}')
+        echo "coverage data: $cov_data"
+        echo "report=$report" >> $GITHUB_OUTPUT
+        echo "data=$cov_data" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: 'Upload coverage results'
+      uses: actions/upload-artifact@v4.3.6
+      with:
+        name: ${{ steps.get-cov-report.outputs.report }}
+        path: ${{ steps.get-cov-report.outputs.path }}
+
+    - name: 'Checkout source code'
+      uses: actions/checkout@v4
+      if: ${{ inputs.reset-commit-id }} != ""

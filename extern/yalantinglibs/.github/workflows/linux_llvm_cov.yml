@@ -1,0 +1,107 @@
+#
+# Copyright (c) 2024 Alibaba Group Holding Limited. All Rights Reserved.
+# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+#
+# This code is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License version 2 only, as
+# published by the Free Software Foundation. Alibaba designates this
+# particular file as subject to the "Classpath" exception as provided
+# by Oracle in the LICENSE file that accompanied this code.
+#
+# This code is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
+# version 2 for more details (a copy is included in the LICENSE file that
+# accompanied this code).
+#
+# You should have received a copy of the GNU General Public License version
+# 2 along with this work; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
+name: Ubuntu 22.04 (llvm cov)
+
+on:
+  pull_request:
+    branches:
+      - main
+      - fix_coverage_show
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prerequisites:
+    runs-on: ubuntu-22.04
+    permissions: write-all
+    outputs:
+      id: ${{ steps.get-base-commit.outputs.id }}
+    steps:
+      - name: 'Get Base Commit id'
+        id: get-base-commit
+        run: |
+          sudo apt install -y jq
+          base_commit_id=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} | jq -r .base.sha)
+          echo "::set-output name=id::$base_commit_id"
+        shell: bash
+      - name: 'Store Message'
+        run: |
+          mkdir -p ./msg
+          echo "action_id=${{github.run_id}}" >> ./msg/action_msg
+          echo "pr_id=${{github.event.pull_request.number}}" >> ./msg/action_msg
+        shell: bash
+      - name: 'Upload Action Message'
+        uses: actions/upload-artifact@v4
+        with:
+          name: action_msg
+          path: msg/
+
+  base-cov-test:
+    needs: prerequisites
+    runs-on: ubuntu-22.04
+    outputs:
+      data: ${{ steps.base-cov.outputs.data }}
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v4
+      - name: 'Base coverage test'
+        id: base-cov
+        uses: ./.github/actions/coverage
+        with:
+          reset-commit-id: ${{ needs.prerequisites.outputs.id }}
+
+  cov-test:
+    needs: prerequisites
+    runs-on: ubuntu-22.04
+    outputs:
+      data: ${{ steps.cov.outputs.data }}
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v4
+      - name: 'Coverage test'
+        id: cov
+        uses: ./.github/actions/coverage
+        with:
+          reset-commit-id: ""
+
+  compare-cov-data:
+    needs:
+      - base-cov-test
+      - cov-test
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 'Compare data'
+        run: |
+            sudo apt install -y bc
+            result=$(echo "${{ needs.cov-test.outputs.data }} > 70" | bc)
+            if [ "$result" -ne 1 ];then
+                echo "coverage cannot be lower than 70%!"
+                exit 1
+            fi
+            result=$(echo "${{ needs.cov-test.outputs.data }} > $(echo "${{ needs.base-cov-test.outputs.data}} * 0.97" | bc)" | bc)
+            if [ "$result" -ne 1 ];then
+                echo "coverage has decreased over 3%!"
+                exit 1
+            fi
+        shell: bash

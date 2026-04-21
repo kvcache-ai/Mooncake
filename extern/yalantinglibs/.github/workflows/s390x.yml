@@ -1,0 +1,37 @@
+name: IBM S390X
+
+on:
+  push:
+   branches: [ main, develop ]
+  pull_request:
+   branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-ubuntu-s390x:
+    name: Build Linux on s390x arch and run unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: uraimo/run-on-arch-action@v2
+        name: Test
+        id: runcmd
+        with:
+          arch: s390x
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update -q -y
+            apt-get -y install cmake
+            apt-get -y install make
+            apt-get -y install g++
+          run: |
+            lscpu | grep Endian
+            CXX=g++ CC=gcc 
+            cmake -B ${{github.workspace}}/build \
+                  -DCMAKE_BUILD_TYPE=Debug \
+                  -DBUILD_METRIC=OFF -DBUILD_CORO_HTTP=OFF -DBUILD_CORO_IO=OFF -DBUILD_CORO_RPC=OFF -DBUILD_EASYLOG=OFF -DBUILD_STRUCT_JSON=OFF -DBUILD_STRUCT_XML=OFF -DBUILD_STRUCT_YAML=OFF -DBUILD_UTIL=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF
+            cmake --build ${{github.workspace}}/build -j
+            cd ${{github.workspace}}/build/output/tests
+            ./struct_pack_test
+            ./struct_pack_test_with_optimize

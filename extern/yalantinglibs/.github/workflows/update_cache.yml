@@ -1,0 +1,19 @@
+name: CI Daily
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+  schedule:
+    - cron: '0 17 * * *' # 01:00 Chinese time is 17:00 UTC
+jobs:
+  ubuntu_clang:
+    uses: ./.github/workflows/ubuntu_clang.yml
+  ubuntu_gcc:
+    uses: ./.github/workflows/ubuntu_gcc.yml
+  mac:
+    uses: ./.github/workflows/mac.yml
+  windows:
+    uses: ./.github/workflows/windows.yml
+
+# run compile daily to make the cache in github update
+# run website to keep it follow main.

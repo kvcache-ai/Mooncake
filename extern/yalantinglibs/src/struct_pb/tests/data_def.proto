@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package mygame;
+
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+
+message Vec3 {
+    float x = 1;
+    float y = 2;
+    float z = 3;
+}
+
+message Weapon {
+    string name = 1;
+    int32 damage = 2;
+}
+
+message Monster {
+  Vec3 pos = 1;
+  int32 mana = 2;
+  int32 hp = 3;
+  string name = 4;
+  bytes inventory = 5;
+  enum Color {
+        Red = 0;
+        Green = 1;
+        Blue = 2;
+  }
+  Color color = 6;
+  repeated Weapon weapons = 7;
+  Weapon equipped = 8;
+  repeated Vec3 path = 9;
+}
+
+message Monsters {
+    repeated Monster monsters = 1;
+}
+
+message person {
+    int32 id = 1;
+    string name = 2;
+    int32 age = 3;
+    double salary = 4;
+}
+
+message persons {
+    repeated person person_list = 1;
+}
+
+message bench_int32 {
+    int32 a = 1;
+    int32 b = 2;
+    int32 c = 3;
+    int32 d = 4;
+}

@@ -1,0 +1,32 @@
+========================================================
+yaLanTingLibs
+Copyright (c) 2019-2022, Alibaba Group Holding Limited
+Licensed under the Apache License, Version 2.0
+===================================================================
+
+This product contains various third-party components under other open source licenses
+This section summarizes those components and their licenses.
+Apache Software Foundation License 2.0
+--------------------------------------
+
+ylt/struct_pack/texpr.hpp
+
+BSD 3-Clause "New" or "Revised" License
+--------------------------------------
+
+util/expected.hpp
+
+Creative Commons Zero v1.0 Universal License
+
+--------------------------------------
+
+test/doctest.h
+
+include/ylt/struct_pack/pp
+
+Distributed under the Boost Software License, Version 1.0. (See accompanying
+file LICENSE_1_0.txt or copy at <http://www.boost.org/LICENSE_1_0.txt>)
+
+===================================================================
+The reflection of a struct and data format borrow various ideas from zpp_bits, reflect-cpp and msgpack.
+coro_rpc borrow various ideas from rest_rpc.

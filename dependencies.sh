@@ -223,27 +223,6 @@ fi
 
 print_success "System packages installed successfully"
 
-# Initialize and update git submodules
-print_section "Initializing Git Submodules"
-
-# Check if .gitmodules exists
-if [ -f "${REPO_ROOT}/.gitmodules" ]; then
-    echo "Enter repository root: ${REPO_ROOT}"
-    cd "${REPO_ROOT}"
-    check_success "Failed to change to repository root directory"
-
-    echo "Initializing git submodules..."
-    git submodule sync --recursive
-    check_success "Failed to sync git submodules"
-    git submodule update --init --recursive
-    check_success "Failed to initialize git submodules"
-
-    print_success "Git submodules initialized and updated successfully"
-else
-    echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
-    exit 1
-fi
-
 # Build and install yalantinglibs from submodule
 print_section "Installing yalantinglibs"
 cd "${REPO_ROOT}/extern/yalantinglibs"

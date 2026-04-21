@@ -1,0 +1,32 @@
+PROJECT_NAME=yaLanTingLibs
+GENERATE_HTML=yes
+GENERATE_LATEX=no
+INPUT=docs/zh/coro_rpc/coro_rpc_doc.hpp \
+      docs/zh/coro_rpc/coro_rpc_introduction.md \
+      docs/zh/coro_rpc/coro_rpc_server.md \
+      docs/zh/coro_rpc/coro_rpc_client.md \
+      docs/en/coro_rpc/coro_rpc_rdma.md \
+      docs/zh/struct_pack/struct_pack_doc.hpp \
+      docs/zh/struct_pack/struct_pack_intro.md
+      
+MARKDOWN_SUPPORT = YES
+GENERATE_TREEVIEW      = YES # required!
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+HTML_EXTRA_STYLESHEET  = doxygen-awesome-css/doxygen-awesome.css \
+                         doxygen-awesome-css/doxygen-custom/custom.css \
+                         doxygen-awesome-css/doxygen-awesome-sidebar-only.css \
+                         doxygen-awesome-css/doxygen-awesome-sidebar-only-darkmode-toggle.css \
+                         doxygen-awesome-css/doxygen-custom/custom-alternative.css \
+
+HTML_EXTRA_FILES       = doxygen-awesome-css/doxygen-awesome-darkmode-toggle.js \
+                         doxygen-awesome-css/doxygen-awesome-fragment-copy-button.js \
+                         doxygen-awesome-css/doxygen-awesome-paragraph-link.js \
+                         doxygen-awesome-css/doxygen-custom/toggle-alternative-theme.js \
+                         doxygen-awesome-css/doxygen-awesome-interactive-toc.js
+HTML_HEADER            = doxy/header.html
+IMAGE_PATH             = docs/coro_rpc/images docs/struct_pack/images
+EXAMPLE_PATH           = ../src/coro_rpc/examples
+EXAMPLE_RECURSIVE      = YES
+OUTPUT_LANGUAGE        = Chinese
+OUTPUT_DIRECTORY       = dist/doxygen_cn

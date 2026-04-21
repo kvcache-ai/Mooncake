@@ -1,0 +1,101 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("//bazel:defs.bzl", "YA_BIN_COPT", "YA_LT_COPT")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "ylt",
+    srcs = glob([
+        "include/ylt/**/*.hpp",
+        "include/ylt/**/*.h",
+        "include/ylt/**/*.ipp",
+        "src/include/*.h",
+    ]),
+    copts = YA_LT_COPT,
+    includes = [
+        "include",
+        "include/ylt",
+        "include/ylt/thirdparty",
+        "include/ylt/standalone",
+        "src/include",
+    ],
+    linkopts = ["-lpthread"],
+    visibility = ["//visibility:public"],
+)
+
+# List one example for ylt tests.
+cc_test(
+    name = "easylog_test",
+    srcs = [
+        "src/easylog/tests/main.cpp",
+        "src/easylog/tests/test_easylog.cpp",
+    ],
+    copts = YA_BIN_COPT,
+    includes = [
+        "include",
+        "include/ylt/thirdparty",
+        "include/ylt/standalone",
+        "src/include",
+    ],
+    deps = [":ylt"],
+)
+
+cc_binary(
+    name = "easylog_benchmark",
+    srcs = [
+        "src/easylog/benchmark/main.cpp",
+    ],
+    copts = YA_BIN_COPT,
+    includes = [
+        "include",
+        "include/ylt/thirdparty",
+        "include/ylt/standalone",
+        "src/include",
+    ],
+    deps = [":ylt"],
+)
+
+cc_binary(
+    name = "coro_http_example",
+    srcs = ["src/coro_http/examples/example.cpp"],
+    copts = YA_BIN_COPT,
+    includes = [
+        "include",
+        "include/ylt",
+        "include/ylt/thirdparty",
+        "include/ylt/standalone",
+        "src/include",
+    ],
+    linkopts = ["-lpthread"],
+    deps = [":ylt"],
+)
+
+cc_binary(
+    name = "coro_http_load_balancer",
+    srcs = ["src/coro_http/examples/load_balancer.cpp"],
+    copts = YA_BIN_COPT,
+    includes = [
+        "include",
+        "include/ylt",
+        "include/ylt/thirdparty",
+        "include/ylt/standalone",
+        "src/include",
+    ],
+    linkopts = ["-lpthread"],
+    deps = [":ylt"],
+)
+
+cc_binary(
+    name = "coro_http_chat_room",
+    srcs = ["src/coro_http/examples/chat_room.cpp"],
+    copts = YA_BIN_COPT,
+    includes = [
+        "include",
+        "include/ylt",
+        "include/ylt/thirdparty",
+        "include/ylt/standalone",
+        "src/include",
+    ],
+    linkopts = ["-lpthread"],
+    deps = [":ylt"],
+)

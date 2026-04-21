@@ -1,0 +1,65 @@
+namespace myGame.fb;
+ 
+enum Color:byte { Red = 0, Green, Blue = 2 }
+ 
+union Equipment { Weapon } // Optionally add more tables.
+ 
+struct Vec3 {
+  x:float;
+  y:float;
+  z:float;
+}
+
+table Weapon {
+  name:string;
+  damage:int32;
+}
+ 
+table Monster {
+  pos:Vec3; // Struct.
+  mana:int32 = 150;
+  hp:int32 = 100;
+  name:string;
+  friendly:bool = false (deprecated);
+  inventory:[ubyte];  // Vector of scalars.
+  color:Color = Blue; // Enum.
+  weapons:[Weapon];   // Vector of tables.
+  equipped:Weapon;
+  path:[Vec3];        // Vector of structs.
+}
+
+root_type Monster;
+
+table Monsters {
+  monsters:[Monster];   // Vector of tables.
+}
+ 
+root_type Monsters;
+
+struct rect32 {
+    x:int32;
+    y:int32;
+    width:int32;
+    height:int32;
+}
+
+table rect32s {
+    rect32_list:[rect32];
+}
+
+root_type rect32s;
+
+table person {
+    age:int32;
+    name:string;
+    id:int32;
+    salary:double;
+}
+
+root_type person;
+
+table persons {
+    person_list:[person];
+}
+
+root_type persons;

@@ -1,0 +1,18 @@
+{
+  "name": "yalantinglibs",
+  "version": "1.0.0",
+  "description": "A collection of C++20 libraries, include async_simple, coro_rpc and struct_pack.",
+  "main": "index.js",
+  "repository": "https://github.com/alibaba/yalantinglibs.git",
+  "author": "alibaba",
+  "license": "MIT",
+  "devDependencies": {
+    "vitepress": "1.0.0-alpha.65",
+    "vue": "3.2.47"
+  },
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview"
+  }
+}

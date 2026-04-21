@@ -1,0 +1,46 @@
+name: Windows Server 2022
+
+on:
+  workflow_call:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  windows_msvc:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        mode: [ Release ] #[ Release, Debug ] #Debug not support ccache
+        #https://github.com/ccache/ccache/wiki/MS-Visual-Studio
+        #https://github.com/ccache/ccache/issues/1040
+        arch: [ amd64, x86 ] #[ amd64,x86 ]
+        ssl: [ OFF ] #[ ON, OFF ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Enable Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1.12.0
+        with:
+          arch: ${{ matrix.arch }}
+      - name: Install ninja-build tool
+        uses: seanmiddleditch/gha-setup-ninja@master
+        with:
+          version: 1.11.1
+      - name: latest ccache
+        run: choco install ccache
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.job }}-${{ matrix.mode}}-ssl( ${{ matrix.ssl}} )-arch-${{ matrix.arch}}
+      - name: Configure CMake
+        run: cmake -B ${{github.workspace}}\build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.mode }} -DYLT_ENABLE_SSL=${{matrix.ssl}} -DUSE_CCACHE=ON
+      - name: Build
+        run: cmake --build ${{github.workspace}}\build
+      - name: Test
+        working-directory: ${{github.workspace}}\build
+        run: ctest -C ${{matrix.mode}} -j 1 -V

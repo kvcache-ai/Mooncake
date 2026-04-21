@@ -1,0 +1,1 @@
+exports_files(["test_cross_platform.dat","test_cross_platform_without_debug_info.dat"])

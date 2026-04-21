@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package pb;
+
+option optimize_for = SPEED;
+
+enum Enum {
+  ZERO = 0;
+  FOO = 1;
+  BAR = 2;
+  BAZ = 123456;
+  NEG = -1;  // Intentionally negative.
+}
+
+message BaseTypeMsg {
+  int32 optional_int32 = 1;
+  int64 optional_int64 = 2;
+  uint32 optional_uint32 = 3;
+  uint64 optional_uint64 = 4;
+  float optional_float = 5;
+  double optional_double = 6;
+  bool optional_bool = 7;
+  string optional_string = 8;
+  Enum optional_enum = 9;
+}
+
+message RepeatBaseTypeMsg {
+  repeated uint32 repeated_uint32 = 1;
+  repeated uint64 repeated_uint64 = 2;
+  repeated int32 repeated_int32 = 3;
+  repeated int64 repeated_int64 = 4;
+  repeated float repeated_float = 5;
+  repeated double repeated_double = 6;
+  repeated string repeated_string = 7;
+  repeated Enum repeated_enum = 8;
+}
+
+message IguanaTypeMsg {
+  sint32 optional_sint32 = 1;
+  sint64 optional_sint64 = 2;
+  fixed32 optional_fixed32 = 3;
+  fixed64 optional_fixed64 = 4;
+  sfixed32 optional_sfixed32 = 5;
+  sfixed64 optional_sfixed64 = 6;
+}
+
+message RepeatIguanaTypeMsg {
+  repeated sfixed32 repeated_sint32 = 1;
+  repeated sfixed64 repeated_sint64 = 2;
+  repeated fixed32 repeated_fixed32 = 3;
+  repeated fixed64 repeated_fixed64 = 4;
+  repeated sfixed32 repeated_sfixed32 = 5;
+  repeated sfixed64 repeated_sfixed64 = 6;
+}
+
+message NestedMsg {
+  BaseTypeMsg base_msg = 1;
+  repeated BaseTypeMsg repeat_base_msg = 2;
+  IguanaTypeMsg iguana_type_msg = 3;
+  repeated IguanaTypeMsg repeat_iguna_msg = 4;
+  repeated RepeatBaseTypeMsg repeat_repeat_base_msg = 5;
+}
+
+message MapMsg {
+  map<sfixed64, string> sfix64_str_map = 1;
+  map<string, IguanaTypeMsg> str_iguana_type_msg_map = 2;
+  map<int32, RepeatBaseTypeMsg> int_repeat_base_msg_map = 3;
+  // Key in map fields cannot be float/double, bytes or message types.
+}
+
+message BaseOneofMsg {
+    int32 optional_int32 = 1;
+    oneof one_of {
+        double one_of_double = 2;
+        string one_of_string = 3;
+        BaseTypeMsg one_of_base_type_msg = 4;
+    }
+    double optional_double = 5;
+}
+
+message NestOneofMsg {
+    oneof nest_one_of_msg {
+        string base_one_of_string = 1;
+        BaseOneofMsg base_one_of_msg = 2;
+    }
+}
+
+message Simple {
+  int32 a = 1;
+  int32 b = 2;
+  int64 c = 3;
+  int64 d = 4;
+  string str = 5;
+}
+
+enum Color {
+  Red = 0;
+  Green = 1;
+  Blue = 2;
+}
+
+message Simple2 {
+  int32 a = 1;
+  int32 b = 2;
+  Color c = 3;
+  int64 d = 4;
+  string str = 5;
+}

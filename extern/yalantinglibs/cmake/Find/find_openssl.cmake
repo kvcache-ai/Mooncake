@@ -1,0 +1,7 @@
+check_library_exists(ssl SSL_new "" HAVE_SSL_LIB)
+if(HAVE_SSL_LIB)
+    message(STATUS "Found OpenSSL libraries")
+    set(YLT_ENABLE_SSL ON)
+else()
+    message(STATUS "OpenSSL libraries not found")
+endif()

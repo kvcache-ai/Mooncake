@@ -1,0 +1,58 @@
+<mxfile host="65bd71144e">
+    <diagram id="PnY9nsG2CH0tk8q1LWO9" name="第 1 页">
+        <mxGraphModel dx="977" dy="745" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="2" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="120" y="360" width="160" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="6" value="4 Bytes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="170" y="330" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="7" value="4 Bytes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="370" y="330" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="8" value="258 Bytes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="570" y="330" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="9" value="0x05 0x00&lt;br&gt;(长度)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="480" y="400" width="80" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="10" value="AAAAAA......AAAAA (字符串内容)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="560" y="400" width="200" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="11" value="256 Bytes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="630" y="450" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="12" value="2 Byte" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="490" y="450" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="13" value="person.name" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="480" y="360" width="280" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="15" value="0xc4 0xaf 0xa0 0x11" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="120" y="400" width="160" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="16" value="类型哈希" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="120" y="360" width="160" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="17" value="0x18 0x00 0x00 0x00" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="320" y="400" width="160" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="18" value="person.age" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="320" y="360" width="160" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="19" value="0x08" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" vertex="1" parent="1">
+                    <mxGeometry x="280" y="400" width="40" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="20" value="元信息头" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" vertex="1" parent="1">
+                    <mxGeometry x="280" y="360" width="40" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="21" value="1 Byte" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" vertex="1" parent="1">
+                    <mxGeometry x="270" y="330" width="60" height="30" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

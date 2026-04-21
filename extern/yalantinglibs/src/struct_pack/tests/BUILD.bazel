@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+load("//bazel:defs.bzl", "YA_BIN_COPT")
+
+cc_test(
+    name = "test_serialize",
+    srcs = glob(["*.cpp"]) + ["test_struct.hpp"] + ["test_derived.hpp"],
+    copts = YA_BIN_COPT,
+    data = [
+        "//src/struct_pack/tests/binary_data:test_cross_platform.dat",
+        "//src/struct_pack/tests/binary_data:test_cross_platform_without_debug_info.dat",
+    ],
+    defines = ["STRUCT_PACK_ENABLE_UNPORTABLE_TYPE"],
+    deps = [
+        "//:ylt",
+    ],
+)

@@ -1,0 +1,31 @@
+name: Bazel-Clang
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+  
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install newer Clang
+        run: |
+          sudo rm /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x ./llvm.sh
+          sudo ./llvm.sh 17
+
+      - name: Build
+        working-directory: ${{github.workspace}}
+        run: bazel build --config=clang-cl --action_env=CXX=clang++-17 --action_env=CC=clang-17 ...
+
+      - name: Test
+        working-directory: ${{github.workspace}}
+        run: bazel test --config=clang-cl --action_env=CXX=clang++-17 --action_env=CC=clang-17 --test_output=errors ...

@@ -1,0 +1,22 @@
+<mxfile host="65bd71144e">
+    <diagram id="oe2Vl5H5gF7YLMPssPNC" name="第 1 页">
+        <mxGraphModel dx="936" dy="917" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" background="none" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="30" value="类型哈希" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="11" y="160" width="319" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="31" value="4 Bytes" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="141" y="130" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="37" value="负载" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;" parent="1" vertex="1">
+                    <mxGeometry x="330" y="160" width="401" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="38" value="可变长度" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" parent="1" vertex="1">
+                    <mxGeometry x="485.5" y="130" width="90" height="30" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

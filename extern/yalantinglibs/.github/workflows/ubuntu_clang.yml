@@ -1,0 +1,188 @@
+name: Ubuntu (clang)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  ccache: ON
+
+jobs:
+  ubuntu_clang:
+    strategy:
+      matrix:
+        mode: [ Release, Debug ]
+        libcxx: [ OFF ]
+        ssl: [ ON, OFF ]
+
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: sudo apt-get install openssl libssl-dev
+
+      - name: Install ninja-build tool
+        uses: seanmiddleditch/gha-setup-ninja@master
+
+      - name: Install newer Clang
+        run: |
+          sudo rm /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x ./llvm.sh
+          sudo ./llvm.sh 17
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.job }}-${{ matrix.mode}}-ssl( ${{ matrix.ssl}} )-libcxx( ${{ matrix.libcxx}} )
+
+      - name: Configure
+        run: |
+          cmake -B ${{github.workspace}}/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=${{matrix.mode}} -DBUILD_WITH_LIBCXX=${{matrix.libcxx}} -DYLT_ENABLE_SSL=${{matrix.ssl}} \
+                -DUSE_CCACHE=${{env.ccache}} -DCMAKE_C_COMPILER=clang-17 -DCMAKE_CXX_COMPILER=clang++-17
+      - name: Build
+        run: cmake --build ${{github.workspace}}/build --config ${{matrix.mode}}
+
+      - name: Test
+        working-directory: ${{github.workspace}}/build
+        run: ctest -C ${{matrix.mode}} -j 1 -V
+
+  ubuntu_clang_tsan:
+    strategy:
+      matrix:
+        mode: [ Release, Debug ]
+        libcxx: [ OFF ]
+        ssl: [ ON ]
+
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get install openssl libssl-dev
+
+      - name: Install ninja-build tool
+        uses: seanmiddleditch/gha-setup-ninja@v3
+
+      - name: Install newer Clang
+        run: |
+          sudo rm /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x ./llvm.sh
+          sudo ./llvm.sh 17
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.job }}-${{ matrix.mode}}-ssl( ${{ matrix.ssl}} )-libcxx( ${{ matrix.libcxx}} )
+      - name: Configure
+        run: |
+          CXX=clang++ CC=clang 
+          cmake -B ${{github.workspace}}/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=${{matrix.mode}} -DBUILD_WITH_LIBCXX=${{matrix.libcxx}} -DYLT_ENABLE_SSL=${{matrix.ssl}} \
+                -DUSE_CCACHE=${{env.ccache}} -DCMAKE_C_COMPILER=clang-17 -DCMAKE_CXX_COMPILER=clang++-17\
+                -DENABLE_TSAN=ON
+      - name: Build
+        run: cmake --build ${{github.workspace}}/build --config ${{matrix.mode}}
+
+      - name: Test
+        working-directory: ${{github.workspace}}/build
+        run: ctest -C ${{matrix.mode}} -j 1 -V
+
+  ubuntu_clang_for_liburing:
+    strategy:
+      matrix:
+        mode: [ Release, Debug ]
+        libcxx: [ OFF ]
+        io_uring: [ ON ]
+
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install liburing
+        run: sudo apt-get install liburing-dev
+
+      - name: Install newer Clang
+        run: |
+          sudo rm /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x ./llvm.sh
+          sudo ./llvm.sh 17
+
+      - name: Install ninja-build tool
+        uses: seanmiddleditch/gha-setup-ninja@master
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.job }}-${{ matrix.mode}}-ssl( ${{ matrix.ssl}} )-libcxx( ${{ matrix.libcxx}} )
+
+      - name: Configure
+        run: |
+          CXX=clang++ CC=clang 
+          cmake -B ${{github.workspace}}/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=${{matrix.mode}} \
+                -DBUILD_WITH_LIBCXX=${{matrix.libcxx}} \
+                -DYLT_ENABLE_IO_URING=${{matrix.io_uring}} \
+                -DUSE_CCACHE=${{env.ccache}} -DCMAKE_C_COMPILER=clang-17 -DCMAKE_CXX_COMPILER=clang++-17\
+                -DBUILD_STRUCT_JSON=OFF -DBUILD_STRUCT_XML=OFF -DBUILD_STRUCT_PACK=OFF -DBUILD_STRUCT_YAML=OFF -DBUILD_UTIL=OFF
+
+      - name: Build
+        run: cmake --build ${{github.workspace}}/build --config ${{matrix.mode}}
+
+      - name: Test
+        working-directory: ${{github.workspace}}/build
+        run: ctest -C ${{matrix.mode}} -j 1 -V
+
+  ubuntu_clang10:
+    strategy:
+      matrix:
+        mode: [ Release, Debug ]
+
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ninja-build tool
+        uses: seanmiddleditch/gha-setup-ninja@master
+
+      - name: Install clang-11
+        run:  sudo apt-get install clang-11 clang++-11 
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.job }}-${{ matrix.mode}}
+
+      - name: Configure
+        run: |
+          CXX=clang++-11 CC=clang-11 
+          cmake -B ${{github.workspace}}/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=${{matrix.mode}} \
+                -DUSE_CCACHE=${{env.ccache}} -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build ${{github.workspace}}/build --config ${{matrix.mode}} 
+
+      - name: Test
+        working-directory: ${{github.workspace}}/build
+        run: ctest -C ${{matrix.mode}} -j 1 -V

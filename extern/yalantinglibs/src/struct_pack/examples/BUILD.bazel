@@ -1,0 +1,18 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("//bazel:defs.bzl", "YA_BIN_COPT", "YA_LT_COPT")
+
+cc_binary(
+    name = "serialize_example",
+    srcs = [
+        "basic_usage.cpp",
+        "derived_class.cpp",
+        "main.cpp",
+        "non_aggregated_type.cpp",
+        "serialize_config.cpp",
+        "user_defined_serialization.cpp",
+    ],
+    copts = YA_BIN_COPT,
+    deps = [
+        "//:ylt",
+    ],
+)

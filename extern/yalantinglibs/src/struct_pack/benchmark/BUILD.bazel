@@ -1,0 +1,36 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+cc_binary(
+    name = "struct_pack_benchmark",
+    srcs = [
+        "ScopedTimer.hpp",
+        "benchmark.cpp",
+        "config.hpp",
+        "data_def.hpp",
+        "no_op.cpp",
+        "no_op.h",
+        "sample.hpp",
+        "struct_pb_sample.hpp",
+        "struct_pack_sample.hpp",
+        "msgpack_sample.hpp"
+    ],
+    copts = ["-std=c++20"],
+    defines = ["STRUCT_PACK_OPTIMIZE","MSGPACK_NO_BOOST"],
+    deps = [
+        "//:ylt"
+    ],
+)
+
+cc_library(
+    name = "struct_pack_benchmark_config_header",
+    hdrs = [
+        "ScopedTimer.hpp",
+        "config.hpp",
+        "data_def.hpp",
+        "no_op.h",
+        "sample.hpp",
+        "struct_pb_sample.hpp",
+    ],
+    includes = ["src/struct_pack/benchmark"],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,56 @@
+
+# Enable Bzlmod for every Bazel command
+common --enable_bzlmod
+
+# Must be first. Enables build:windows, build:linux, build:macos, build:freebsd, build:openbsd
+build --enable_platform_specific_config
+###############################################################################
+# On       Windows, provide: BAZEL_SH, and BAZEL_LLVM (if using clang-cl)
+# On all platforms, provide: PYTHON3_BIN_PATH=python
+###############################################################################
+build --action_env=PATH
+# For --compilation_mode=dbg, consider enabling checks in the standard library as well (below).
+build --compilation_mode=opt
+# FIXME(lingxuan.zlx) TEST CASE:  test wide string crash since cxx abi off.
+build --cxxopt="-D_GLIBCXX_USE_CXX11_ABI=0"
+# Using C++ 20 on all platforms.
+build:linux --cxxopt="-std=c++20"
+build:macos --cxxopt="-std=c++20"
+build:clang-cl --cxxopt="-std=c++20"
+build:gcc-cl --cxxopt="-std=c++20"
+build:gcc-cl --cxxopt="-fcoroutines"
+build:msvc-cl --cxxopt="/std:c++20"
+build:windows --cxxopt="/std:c++20"
+# This workaround is needed to prevent Bazel from compiling the same file twice (once PIC and once not).
+build:linux --force_pic
+build:macos --force_pic
+build:msvc-cl --compiler=msvc-cl
+# `LC_ALL` and `LANG` is needed for cpp worker tests, because they will call "ray start".
+# If we don't add them, python's `click` library will raise an error.
+build --action_env=LC_ALL
+build --action_env=LANG
+# Allow C++ worker tests to execute "ray start" with the correct version of Python.
+build --action_env=VIRTUAL_ENV
+build --action_env=PYENV_VIRTUAL_ENV
+build --action_env=PYENV_VERSION
+build --action_env=PYENV_SHELL
+# This is needed for some core tests to run correctly
+build:windows --enable_runfiles
+build:linux    --per_file_copt="-\\.(asm|S)$@-Werror"
+build:macos    --per_file_copt="-\\.(asm|S)$@-Werror"
+build:clang-cl --per_file_copt="-\\.(asm|S)$@-Werror"
+build:gcc-cl --per_file_copt="-\\.(asm|S)$@-Werror"
+build:msvc-cl     --per_file_copt="-\\.(asm|S)$@-WX"
+# Ignore warnings for protobuf generated files and external projects.
+build --per_file_copt="\\.pb\\.cc$@-w"
+build --per_file_copt="-\\.(asm|S)$,external/.*@-w"
+#build --per_file_copt="external/.*@-Wno-unused-result"
+# Ignore minor warnings for host tools, which we generally can't control
+build:clang-cl --host_copt="-Wno-inconsistent-missing-override"
+build:clang-cl --host_copt="-Wno-microsoft-unqualified-friend"
+# Ignore wchar_t -> char conversion warning on MSVC
+build:msvc-cl --per_file_copt="external/boost/libs/regex/src/wc_regex_traits\\.cpp@-wd4244"
+build --http_timeout_scaling=5.0
+build --verbose_failures
+build --incompatible_enable_cc_toolchain_resolution
+

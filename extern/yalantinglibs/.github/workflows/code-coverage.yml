@@ -1,0 +1,40 @@
+name: Upload CodeCov Report
+
+on: [ push, pull_request ]
+
+jobs:
+  build:
+  
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 2
+    
+    - name: Install newer Clang
+      run: |
+        sudo rm /etc/apt/sources.list.d/microsoft-prod.list
+        sudo apt-get update
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x ./llvm.sh
+        sudo ./llvm.sh 17
+
+    - name: Configure
+      run: |
+        cmake -B ${{github.workspace}}/build \
+              -DCMAKE_BUILD_TYPE=${{matrix.mode}} -DBUILD_WITH_LIBCXX=OFF -DYLT_ENABLE_SSL=ON \
+              -DUSE_CCACHE=${{env.ccache}} -DCMAKE_C_COMPILER=clang-17 -DCMAKE_CXX_COMPILER=clang++-17
+
+    - name: Build with ${{ matrix.compiler }}
+      run:  cmake --build ${{github.workspace}}/build --config Debug -- -j
+      
+    - name: Test
+      working-directory: ${{github.workspace}}/build
+      env:
+        CTEST_OUTPUT_ON_FAILURE: 1
+      run: ctest -C ${{ matrix.configuration }} -j 1 -V
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v1
