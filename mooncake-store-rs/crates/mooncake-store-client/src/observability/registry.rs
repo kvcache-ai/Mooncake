@@ -636,9 +636,8 @@ pub(crate) fn record_tenant_quota_reconcile(result: &'static str) {
 }
 
 pub(crate) fn record_tenant_local_eviction(result: &'static str) {
-    metrics_registry()
+    global_metrics_registry()
         .lock()
-        .expect("metrics lock poisoned")
         .tenant_local_eviction
         .add(ResultKey { result }, 1);
 }
