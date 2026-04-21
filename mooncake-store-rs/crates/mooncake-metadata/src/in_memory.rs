@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
@@ -20,6 +21,7 @@ struct InMemoryState {
     clients: BTreeMap<String, ClientLease>,
     client_by_stable: BTreeMap<String, BTreeSet<u64>>,
     client_epoch_hwm: BTreeMap<String, u64>,
+    stable_runtimes: BTreeMap<ClientStableId, String>,
     handoffs: BTreeMap<String, HandoffPlan>,
     objects: BTreeMap<String, ObjectRoute>,
     route_policies: BTreeMap<RoutePolicyDomain, RoutePolicy>,
@@ -28,6 +30,8 @@ struct InMemoryState {
     tenant_object_accounting: BTreeMap<ObjectKey, TenantObjectAccounting>,
     tenant_quota_reservations: BTreeMap<String, TenantQuotaReservation>,
     segments: BTreeMap<String, StoredSegmentState>,
+    segment_owners: BTreeMap<SegmentName, ClientRuntimeId>,
+    lease_segment_owners: BTreeMap<SegmentName, ClientRuntimeId>,
 }
 
 pub struct InMemoryMetadataBackend {
@@ -52,6 +56,14 @@ impl InMemoryMetadataBackend {
 
     fn segment_key(owner: &ClientRuntimeId, segment: &SegmentName) -> String {
         format!("{}:{}", owner.storage_key(), segment.0)
+    }
+
+    fn is_present_lease(lease: &ClientLease) -> bool {
+        lease.expires_at_ms >= now_ms()
+    }
+
+    fn is_readable_lease(lease: &ClientLease) -> bool {
+        lease.state.serves_reads() && Self::is_present_lease(lease)
     }
 
     fn root_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
@@ -146,6 +158,13 @@ fn apply_signed_delta(base: u64, delta: i64, field: &str) -> Result<u64> {
     })
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 impl MetadataBackend for InMemoryMetadataBackend {
     fn route_namespace(&self) -> String {
         format!("inmemory://{}", self.namespace_id)
@@ -155,33 +174,64 @@ impl MetadataBackend for InMemoryMetadataBackend {
         use std::collections::btree_map::Entry;
 
         let storage_key = lease.runtime.storage_key();
-        let stable_id = lease.runtime.stable_id.0.clone();
+        let stable_id = lease.runtime.stable_id.clone();
+        let stable_id_key = stable_id.0.clone();
         let new_epoch = lease.runtime.epoch.0;
         let mut state = self.state.write();
 
         if let Entry::Occupied(mut entry) = state.clients.entry(storage_key.clone()) {
             entry.insert(lease.clone());
+            if lease.state == ClientLifecycleState::Active {
+                state
+                    .stable_runtimes
+                    .insert(stable_id.clone(), storage_key.clone());
+            } else if state.stable_runtimes.get(&stable_id) == Some(&storage_key) {
+                state.stable_runtimes.remove(&stable_id);
+            }
+            if let Some(segment_name) = lease.endpoints.segment_name.as_ref() {
+                if lease.state.serves_reads() {
+                    state
+                        .lease_segment_owners
+                        .insert(segment_name.clone(), lease.runtime.clone());
+                } else if state.lease_segment_owners.get(segment_name) == Some(&lease.runtime) {
+                    state.lease_segment_owners.remove(segment_name);
+                }
+            }
             return Ok(());
         }
 
-        let active_max = Self::prune_stale_epochs(&mut state, &stable_id);
-        let hwm = state.client_epoch_hwm.get(&stable_id).copied().unwrap_or(0);
+        let active_max = Self::prune_stale_epochs(&mut state, &stable_id_key);
+        let hwm = state.client_epoch_hwm.get(&stable_id_key).copied().unwrap_or(0);
         let floor = active_max.max(hwm);
         let allow_same_epoch_reclaim = new_epoch == hwm && new_epoch > active_max;
         if new_epoch <= floor && !allow_same_epoch_reclaim {
             return Err(StoreError::StaleEpoch(format!(
-                "lease rejected: proposed epoch {new_epoch} <= floor {floor} for stable_id {stable_id}"
+                "lease rejected: proposed epoch {new_epoch} <= floor {floor} for stable_id {stable_id_key}"
             )));
         }
 
+        if lease.state == ClientLifecycleState::Active {
+            state
+                .stable_runtimes
+                .insert(stable_id.clone(), storage_key.clone());
+        }
+        if let Some(segment_name) = lease.endpoints.segment_name.as_ref() {
+            if lease.state.serves_reads() {
+                state
+                    .lease_segment_owners
+                    .insert(segment_name.clone(), lease.runtime.clone());
+            } else if state.lease_segment_owners.get(segment_name) == Some(&lease.runtime) {
+                state.lease_segment_owners.remove(segment_name);
+            }
+        }
         state.clients.insert(storage_key, lease.clone());
         state
             .client_by_stable
-            .entry(stable_id.clone())
+            .entry(stable_id_key.clone())
             .or_default()
             .insert(new_epoch);
         if new_epoch > hwm {
-            state.client_epoch_hwm.insert(stable_id, new_epoch);
+            state.client_epoch_hwm.insert(stable_id_key, new_epoch);
         }
         Ok(())
     }
@@ -215,20 +265,81 @@ impl MetadataBackend for InMemoryMetadataBackend {
         next: ClientLifecycleState,
     ) -> Result<()> {
         let mut state = self.state.write();
-        let Some(lease) = state.clients.get_mut(&runtime.storage_key()) else {
-            return Err(StoreError::NotFound(runtime.storage_key()));
+        let (segment_name, serves_reads_now) = {
+            let Some(lease) = state.clients.get_mut(&runtime.storage_key()) else {
+                return Err(StoreError::NotFound(runtime.storage_key()));
+            };
+            lease.state = next;
+            (
+                lease.endpoints.segment_name.clone(),
+                lease.state.serves_reads(),
+            )
         };
-        lease.state = next;
+        if next != ClientLifecycleState::Active {
+            state.stable_runtimes.remove(&runtime.stable_id);
+        }
+        if let Some(segment_name) = segment_name.as_ref() {
+            if serves_reads_now {
+                state
+                    .lease_segment_owners
+                    .insert(segment_name.clone(), runtime.clone());
+            } else if state.lease_segment_owners.get(segment_name) == Some(runtime) {
+                state.lease_segment_owners.remove(segment_name);
+            }
+        }
         Ok(())
     }
 
+    fn get_client_lease(&self, runtime: &ClientRuntimeId) -> Result<Option<ClientLease>> {
+        Ok(self
+            .state
+            .read()
+            .clients
+            .get(&runtime.storage_key())
+            .filter(|lease| Self::is_present_lease(lease))
+            .cloned())
+    }
+
+    fn get_live_runtime_by_stable_id(
+        &self,
+        stable_id: &ClientStableId,
+    ) -> Result<Option<ClientLease>> {
+        let state = self.state.read();
+        let Some(runtime_key) = state.stable_runtimes.get(stable_id) else {
+            return Ok(None);
+        };
+        Ok(state
+            .clients
+            .get(runtime_key)
+            .filter(|lease| Self::is_readable_lease(lease))
+            .cloned())
+    }
+
     fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
-        Ok(self.state.read().clients.values().cloned().collect())
+        Ok(self
+            .state
+            .read()
+            .clients
+            .values()
+            .filter(|lease| Self::is_present_lease(lease))
+            .cloned()
+            .collect())
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
         let key = Self::segment_key(&segment.owner, &segment.segment_name);
         let mut state = self.state.write();
+        if let Some(existing_owner) = state.segment_owners.get(&segment.segment_name) {
+            if existing_owner != &segment.owner {
+                return Err(StoreError::Conflict(format!(
+                    "segment {} is already owned by live runtime {}",
+                    segment.segment_name.0, existing_owner
+                )));
+            }
+        }
+        state
+            .segment_owners
+            .insert(segment.segment_name.clone(), segment.owner.clone());
         match state.segments.get_mut(&key) {
             Some(current) => current.merge_announcement(segment),
             None => {
@@ -241,11 +352,34 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
-        self.state
-            .write()
-            .segments
-            .remove(&Self::segment_key(owner, segment));
+        let mut state = self.state.write();
+        state.segments.remove(&Self::segment_key(owner, segment));
+        if state.segment_owners.get(segment) == Some(owner) {
+            state.segment_owners.remove(segment);
+        }
         Ok(())
+    }
+
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> Result<Option<SegmentAnnouncement>> {
+        Ok(self
+            .state
+            .read()
+            .segments
+            .get(&Self::segment_key(owner, segment))
+            .map(|segment| segment.announcement.clone()))
+    }
+
+    fn get_segment_owner(&self, segment: &SegmentName) -> Result<Option<ClientRuntimeId>> {
+        let state = self.state.read();
+        Ok(state
+            .lease_segment_owners
+            .get(segment)
+            .cloned()
+            .or_else(|| state.segment_owners.get(segment).cloned()))
     }
 
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {

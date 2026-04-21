@@ -136,6 +136,14 @@ impl MetadataKeyspace {
         )
     }
 
+    pub fn stable_runtime(&self, stable_id: &ClientStableId) -> String {
+        format!(
+            "{}/indexes/stable-runtimes/{}",
+            self.prefix,
+            encode_key_component(&stable_id.0)
+        )
+    }
+
     pub fn segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> String {
         format!(
             "{}/segments/{}:{}",
@@ -169,6 +177,14 @@ impl MetadataKeyspace {
 
     pub fn segment_index_for_owner_key(&self, owner_storage_key: &str) -> String {
         format!("{}/indexes/segments/{}", self.slot_tag, owner_storage_key)
+    }
+
+    pub fn segment_owner(&self, segment: &SegmentName) -> String {
+        format!(
+            "{}/indexes/segment-owners/{}",
+            self.prefix,
+            encode_key_component(&segment.0)
+        )
     }
 
     pub fn object(&self, key: &ObjectKey) -> String {

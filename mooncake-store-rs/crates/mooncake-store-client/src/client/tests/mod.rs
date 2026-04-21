@@ -56,6 +56,8 @@ fn test_route_write_gate() -> Arc<Mutex<()>> {
 struct NoHotPathMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     deny_tenant_policy_list: bool,
+    deny_live_client_list: bool,
+    deny_segment_list: bool,
 }
 
 impl NoHotPathMetadataBackend {
@@ -63,6 +65,8 @@ impl NoHotPathMetadataBackend {
         Self {
             inner,
             deny_tenant_policy_list: false,
+            deny_live_client_list: false,
+            deny_segment_list: false,
         }
     }
 
@@ -70,6 +74,17 @@ impl NoHotPathMetadataBackend {
         Self {
             inner,
             deny_tenant_policy_list: true,
+            deny_live_client_list: false,
+            deny_segment_list: false,
+        }
+    }
+
+    fn with_metadata_lists_blocked(inner: Arc<InMemoryMetadataBackend>) -> Self {
+        Self {
+            inner,
+            deny_tenant_policy_list: false,
+            deny_live_client_list: true,
+            deny_segment_list: true,
         }
     }
 }
@@ -374,6 +389,34 @@ impl MetadataBackend for RecoverableMetadataBackend {
         self.inner.update_client_state(runtime, next)
     }
 
+    fn get_client_lease(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> mooncake_store_core::Result<Option<ClientLease>> {
+        let hidden = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hidden_clients
+            .clone();
+        let lease = self.inner.get_client_lease(runtime)?;
+        Ok(lease.filter(|lease| !hidden.contains(&lease.runtime.storage_key())))
+    }
+
+    fn get_live_runtime_by_stable_id(
+        &self,
+        stable_id: &ClientStableId,
+    ) -> mooncake_store_core::Result<Option<ClientLease>> {
+        let hidden = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hidden_clients
+            .clone();
+        let lease = self.inner.get_live_runtime_by_stable_id(stable_id)?;
+        Ok(lease.filter(|lease| !hidden.contains(&lease.runtime.storage_key())))
+    }
+
     fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
         let hidden = self
             .state
@@ -404,6 +447,37 @@ impl MetadataBackend for RecoverableMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<()> {
         self.inner.unpublish_segment(owner, segment)
+    }
+
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
+        let hidden = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hidden_segments
+            .clone();
+        let segment = self.inner.get_segment(owner, segment)?;
+        Ok(segment.filter(|segment| {
+            !hidden.contains(&Self::segment_key(&segment.owner, &segment.segment_name))
+        }))
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        let hidden = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hidden_segments
+            .clone();
+        let owner = self.inner.get_segment_owner(segment)?;
+        Ok(owner.filter(|owner| !hidden.contains(&Self::segment_key(owner, segment))))
     }
 
     fn list_segments(
@@ -635,7 +709,26 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         self.inner.update_client_state(runtime, next)
     }
 
+    fn get_client_lease(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> mooncake_store_core::Result<Option<ClientLease>> {
+        self.inner.get_client_lease(runtime)
+    }
+
+    fn get_live_runtime_by_stable_id(
+        &self,
+        stable_id: &ClientStableId,
+    ) -> mooncake_store_core::Result<Option<ClientLease>> {
+        self.inner.get_live_runtime_by_stable_id(stable_id)
+    }
+
     fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+        if self.deny_live_client_list {
+            return Err(StoreError::Unsupported(
+                "live client listing is disabled in this test".to_string(),
+            ));
+        }
         self.inner.list_live_clients()
     }
 
@@ -651,10 +744,30 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         self.inner.unpublish_segment(owner, segment)
     }
 
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
+        self.inner.get_segment(owner, segment)
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        self.inner.get_segment_owner(segment)
+    }
+
     fn list_segments(
         &self,
         owner: Option<&ClientRuntimeId>,
     ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+        if self.deny_segment_list {
+            return Err(StoreError::Unsupported(
+                "segment listing is disabled in this test".to_string(),
+            ));
+        }
         self.inner.list_segments(owner)
     }
 
@@ -894,6 +1007,21 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.unpublish_segment(owner, segment)
     }
 
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
+        self.inner.get_segment(owner, segment)
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        self.inner.get_segment_owner(segment)
+    }
+
     fn list_segments(
         &self,
         owner: Option<&ClientRuntimeId>,
@@ -1095,6 +1223,20 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
         self.inner.update_client_state(runtime, next)
     }
 
+    fn get_client_lease(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> mooncake_store_core::Result<Option<ClientLease>> {
+        self.inner.get_client_lease(runtime)
+    }
+
+    fn get_live_runtime_by_stable_id(
+        &self,
+        stable_id: &ClientStableId,
+    ) -> mooncake_store_core::Result<Option<ClientLease>> {
+        self.inner.get_live_runtime_by_stable_id(stable_id)
+    }
+
     fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
         self.inner.list_live_clients()
     }
@@ -1109,6 +1251,21 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<()> {
         self.inner.unpublish_segment(owner, segment)
+    }
+
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
+        self.inner.get_segment(owner, segment)
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -1317,6 +1474,20 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         self.inner.update_client_state(runtime, next)
     }
 
+    fn get_client_lease(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> mooncake_store_core::Result<Option<ClientLease>> {
+        self.inner.get_client_lease(runtime)
+    }
+
+    fn get_live_runtime_by_stable_id(
+        &self,
+        stable_id: &ClientStableId,
+    ) -> mooncake_store_core::Result<Option<ClientLease>> {
+        self.inner.get_live_runtime_by_stable_id(stable_id)
+    }
+
     fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
         self.inner.list_live_clients()
     }
@@ -1331,6 +1502,21 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<()> {
         self.inner.unpublish_segment(owner, segment)
+    }
+
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
+        self.inner.get_segment(owner, segment)
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -7367,8 +7553,68 @@ fn builder_auto_allocates_monotonic_epochs_for_same_stable_id() {
 }
 
 #[test]
-fn builder_rejects_live_segment_name_reuse_across_runtimes() {
+fn builder_allows_takeover_of_unreachable_duplicate_runtime() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut endpoints = ClientEndpointSet {
+        rpc_address: "127.0.0.1:7103".to_string(),
+        segment_name: Some(SegmentName::new("takeover-segment")),
+        labels: BTreeMap::new(),
+    };
+    endpoints.labels.insert(
+        control_address_label().to_string(),
+        "127.0.0.1:1".to_string(),
+    );
+    metadata
+        .upsert_client_lease(&ClientLease {
+            runtime: ClientRuntimeId::new("takeover-runtime", ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints,
+            expires_at_ms: test_future_expiry_ms(),
+        })
+        .expect("stale runtime should publish");
+
+    StoreClientBuilder::new(metadata, "takeover-runtime")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7104")
+        .segment_name("takeover-segment")
+        .build(test_future_expiry_ms())
+        .expect("unreachable duplicate runtime should allow takeover");
+}
+
+#[test]
+fn builder_rejects_stale_epoch_when_newer_runtime_is_reachable() {
+    let metadata = Arc::new(NoHotPathMetadataBackend::with_metadata_lists_blocked(
+        Arc::new(InMemoryMetadataBackend::new()),
+    ));
+    let _newer = StoreClientBuilder::new(metadata.clone(), "epoch-fence")
+        .epoch(ClientEpoch(2))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7105")
+        .segment_name("epoch-fence-newer")
+        .build(test_future_expiry_ms())
+        .expect("newer runtime should build");
+
+    let error = match StoreClientBuilder::new(metadata, "epoch-fence")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7106")
+        .segment_name("epoch-fence-older")
+        .build(test_future_expiry_ms())
+    {
+        Ok(_) => panic!("older runtime should be fenced by newer live epoch"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, StoreError::StaleEpoch(_)));
+}
+
+#[test]
+fn builder_rejects_live_segment_name_reuse_across_runtimes() {
+    let metadata = Arc::new(NoHotPathMetadataBackend::with_metadata_lists_blocked(
+        Arc::new(InMemoryMetadataBackend::new()),
+    ));
     let _owner = StoreClientBuilder::new(metadata.clone(), "segment-owner-a")
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7107")
@@ -7387,6 +7633,30 @@ fn builder_rejects_live_segment_name_reuse_across_runtimes() {
     };
 
     assert!(matches!(error, StoreError::Conflict(_)));
+}
+
+#[test]
+fn builder_ignores_stale_segment_owner_index_without_live_lease() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let owner = StoreClientBuilder::new(inner.clone(), "stale-owner")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7110")
+        .segment_name("stale-shared-segment")
+        .build(test_future_expiry_ms())
+        .expect("segment owner should build");
+    inner
+        .update_client_state(owner.runtime_id(), ClientLifecycleState::Draining)
+        .expect("owner should be marked non-active");
+
+    let metadata = Arc::new(NoHotPathMetadataBackend::with_metadata_lists_blocked(inner));
+    let _replacement = StoreClientBuilder::new(metadata, "replacement-owner")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7111")
+        .segment_name("stale-shared-segment")
+        .build(test_future_expiry_ms())
+        .expect("stale owner index without live lease should not block startup");
 }
 
 #[test]

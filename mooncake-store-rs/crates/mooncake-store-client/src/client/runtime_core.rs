@@ -998,13 +998,16 @@ impl StoreClient {
     }
 
     fn lookup_preferred_segment(&self, segment_name: &SegmentName) -> Result<SegmentAnnouncement> {
-        let segments = self.metadata.list_segments(None)?;
-        let segment = segments
-            .into_iter()
-            .find(|segment| {
-                segment.segment_name == *segment_name
-                    && segment.state == SegmentLifecycleState::Active
-            })
+        let owner = self
+            .metadata
+            .get_segment_owner(segment_name)?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("preferred segment {} not found", segment_name.0))
+            })?;
+        let segment = self
+            .metadata
+            .get_segment(&owner, segment_name)?
+            .filter(|segment| segment.state == SegmentLifecycleState::Active)
             .ok_or_else(|| {
                 StoreError::NotFound(format!("preferred segment {} not found", segment_name.0))
             })?;

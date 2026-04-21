@@ -397,6 +397,7 @@ impl MetadataBackend for EtcdMetadataBackend {
             .keyspace
             .client_by_stable_marker(&stable_id, new_epoch);
         let hwm_key = self.config.keyspace.client_epoch_hwm(&stable_id);
+        let stable_key = self.config.keyspace.stable_runtime(&stable_id);
         let expiry_state_key = self
             .config
             .keyspace
@@ -406,6 +407,7 @@ impl MetadataBackend for EtcdMetadataBackend {
             .keyspace
             .client_lease_expiry_time(lease.expires_at_ms, &lease.runtime);
         let payload = serde_json::to_string(lease).map_err(json_error)?;
+        let runtime_key = lease.runtime.storage_key();
         self.block_on(async {
             let mut client = self.client().await?;
             loop {
@@ -426,6 +428,11 @@ impl MetadataBackend for EtcdMetadataBackend {
                         TxnOp::put(expiry_state_key.clone(), expiry_entry_key.clone(), None),
                         TxnOp::put(expiry_entry_key.clone(), lease_key.clone(), None),
                     ];
+                    if lease.state == ClientLifecycleState::Active {
+                        ops.push(TxnOp::put(stable_key.clone(), runtime_key.clone(), None));
+                    } else {
+                        ops.push(TxnOp::delete(stable_key.clone(), None));
+                    }
                     if let Some(current_expiry_entry) =
                         current_expiry_entry.filter(|value| value != &expiry_entry_key)
                     {
@@ -491,11 +498,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .when(vec![
                         Compare::mod_revision(lease_key.clone(), CompareOp::Equal, 0),
                         Compare::mod_revision(marker_key.clone(), CompareOp::Equal, 0),
-                        Compare::mod_revision(
-                            hwm_key.clone(),
-                            CompareOp::Equal,
-                            hwm_mod_rev,
-                        ),
+                        Compare::mod_revision(hwm_key.clone(), CompareOp::Equal, hwm_mod_rev),
                         Compare::mod_revision(
                             expiry_state_key.clone(),
                             CompareOp::Equal,
@@ -504,16 +507,21 @@ impl MetadataBackend for EtcdMetadataBackend {
                     ])
                     .and_then({
                         let mut ops = vec![
-                        TxnOp::put(lease_key.clone(), payload.clone(), None),
-                        TxnOp::put(marker_key.clone(), Vec::<u8>::new(), None),
-                        TxnOp::put(
-                            hwm_key.clone(),
-                            hwm_value.max(new_epoch).to_string(),
-                            None,
-                        ),
-                        TxnOp::put(expiry_state_key.clone(), expiry_entry_key.clone(), None),
-                        TxnOp::put(expiry_entry_key.clone(), lease_key.clone(), None),
+                            TxnOp::put(lease_key.clone(), payload.clone(), None),
+                            TxnOp::put(marker_key.clone(), Vec::<u8>::new(), None),
+                            TxnOp::put(
+                                hwm_key.clone(),
+                                hwm_value.max(new_epoch).to_string(),
+                                None,
+                            ),
+                            TxnOp::put(expiry_state_key.clone(), expiry_entry_key.clone(), None),
+                            TxnOp::put(expiry_entry_key.clone(), lease_key.clone(), None),
                         ];
+                        if lease.state == ClientLifecycleState::Active {
+                            ops.push(TxnOp::put(stable_key.clone(), runtime_key.clone(), None));
+                        } else {
+                            ops.push(TxnOp::delete(stable_key.clone(), None));
+                        }
                         if let Some(current_expiry_entry) =
                             current_expiry_entry.filter(|value| value != &expiry_entry_key)
                         {
@@ -536,6 +544,7 @@ impl MetadataBackend for EtcdMetadataBackend {
         let stable_id = template.runtime.stable_id.clone();
         let hwm_key = self.config.keyspace.client_epoch_hwm(&stable_id);
         let lease_key_prefix = self.config.keyspace.client_prefix_for_stable(&stable_id);
+        let stable_key = self.config.keyspace.stable_runtime(&stable_id);
         self.block_on(async {
             let mut client = self.client().await?;
             loop {
@@ -602,6 +611,15 @@ impl MetadataBackend for EtcdMetadataBackend {
                             TxnOp::put(expiry_state_key.clone(), expiry_entry_key.clone(), None),
                             TxnOp::put(expiry_entry_key.clone(), lease_key.clone(), None),
                         ];
+                        if lease.state == ClientLifecycleState::Active {
+                            ops.push(TxnOp::put(
+                                stable_key.clone(),
+                                lease.runtime.storage_key(),
+                                None,
+                            ));
+                        } else {
+                            ops.push(TxnOp::delete(stable_key.clone(), None));
+                        }
                         if let Some(current_expiry_entry) =
                             current_expiry_entry.filter(|value| value != &expiry_entry_key)
                         {
@@ -626,24 +644,98 @@ impl MetadataBackend for EtcdMetadataBackend {
         next: ClientLifecycleState,
     ) -> Result<()> {
         let key = self.config.keyspace.client(runtime);
+        let stable_key = self.config.keyspace.stable_runtime(&runtime.stable_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let response = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get client lease"))?;
+                let kv = response
+                    .kvs()
+                    .first()
+                    .ok_or_else(|| StoreError::NotFound(key.clone()))?;
+                let mut lease: ClientLease =
+                    serde_json::from_slice(kv.value()).map_err(json_error)?;
+                lease.state = next;
+                let payload = serde_json::to_string(&lease).map_err(json_error)?;
+                let mut ops = vec![TxnOp::put(key.clone(), payload, None)];
+                if next == ClientLifecycleState::Active {
+                    ops.push(TxnOp::put(stable_key.clone(), runtime.storage_key(), None));
+                } else {
+                    ops.push(TxnOp::delete(stable_key.clone(), None));
+                }
+                let txn = Txn::new()
+                    .when([Compare::mod_revision(
+                        key.clone(),
+                        CompareOp::Equal,
+                        kv.mod_revision(),
+                    )])
+                    .and_then(ops);
+                let response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd update client lease"))?;
+                if response.succeeded() {
+                    return Ok(());
+                }
+            }
+        })
+    }
+
+    fn get_client_lease(&self, runtime: &ClientRuntimeId) -> Result<Option<ClientLease>> {
+        let key = self.config.keyspace.client(runtime);
         self.block_on(async {
             let mut client = self.client().await?;
             let response = client
-                .get(key.clone(), None)
+                .get(key, None)
                 .await
-                .map_err(etcd_error("etcd get client lease"))?;
-            let kv = response
+                .map_err(etcd_error("etcd get client lease by runtime"))?;
+            let lease = response
                 .kvs()
                 .first()
-                .ok_or_else(|| StoreError::NotFound(key.clone()))?;
-            let mut lease: ClientLease = serde_json::from_slice(kv.value()).map_err(json_error)?;
-            lease.state = next;
-            let payload = serde_json::to_string(&lease).map_err(json_error)?;
-            client
-                .put(key, payload, None)
+                .map(|kv| serde_json::from_slice::<ClientLease>(kv.value()).map_err(json_error))
+                .transpose()?;
+            Ok(lease.filter(|lease| lease.expires_at_ms >= now_ms()))
+        })
+    }
+
+    fn get_live_runtime_by_stable_id(
+        &self,
+        stable_id: &ClientStableId,
+    ) -> Result<Option<ClientLease>> {
+        let stable_key = self.config.keyspace.stable_runtime(stable_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(stable_key, None)
                 .await
-                .map_err(etcd_error("etcd update client lease"))?;
-            Ok(())
+                .map_err(etcd_error("etcd get stable runtime index"))?;
+            let Some(kv) = response.kvs().first() else {
+                return Ok(None);
+            };
+            let runtime_key = std::str::from_utf8(kv.value()).map_err(|error| {
+                StoreError::Metadata(format!("invalid stable runtime index: {error}"))
+            })?;
+            let Some(runtime) = ClientRuntimeId::from_storage_key(runtime_key) else {
+                return Err(StoreError::Metadata(format!(
+                    "invalid runtime storage key in stable runtime index: {runtime_key}"
+                )));
+            };
+            let lease_key = self.config.keyspace.client(&runtime);
+            let response = client
+                .get(lease_key, None)
+                .await
+                .map_err(etcd_error("etcd get client lease by stable runtime"))?;
+            let lease = response
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice::<ClientLease>(kv.value()).map_err(json_error))
+                .transpose()?;
+            Ok(lease.filter(|lease| {
+                lease.state == ClientLifecycleState::Active && lease.expires_at_ms >= now_ms()
+            }))
         })
     }
 
@@ -666,16 +758,16 @@ impl MetadataBackend for EtcdMetadataBackend {
             let mut stale_markers: Vec<String> = Vec::new();
             for kv in response.kvs() {
                 let lease: ClientLease = serde_json::from_slice(kv.value()).map_err(json_error)?;
-                if lease.expires_at_ms >= now {
-                    live.push(lease);
-                } else {
+                if lease.expires_at_ms < now {
                     stale_markers.push(
                         keyspace.client_by_stable_marker(
                             &lease.runtime.stable_id,
                             lease.runtime.epoch.0,
                         ),
                     );
+                    continue;
                 }
+                live.push(lease);
             }
             for marker in stale_markers {
                 client
@@ -692,39 +784,168 @@ impl MetadataBackend for EtcdMetadataBackend {
             .config
             .keyspace
             .segment(&segment.owner, &segment.segment_name);
+        let owner_key = self.config.keyspace.segment_owner(&segment.segment_name);
         self.block_on(async {
             let mut client = self.client().await?;
-            let current = client
-                .get(key.clone(), None)
-                .await
-                .map_err(etcd_error("etcd get segment before publish"))?;
-            let mut state = current
-                .kvs()
-                .first()
-                .map(|kv| {
-                    serde_json::from_slice::<StoredSegmentState>(kv.value()).map_err(json_error)
-                })
-                .transpose()?
-                .unwrap_or_else(|| StoredSegmentState::new(segment.clone()));
-            state.merge_announcement(segment);
-            let payload = serde_json::to_string(&state).map_err(json_error)?;
-            client
-                .put(key, payload, None)
-                .await
-                .map_err(etcd_error("etcd publish segment"))?;
-            Ok(())
+            loop {
+                let owner_response = client
+                    .get(owner_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get segment owner index"))?;
+                if let Some(kv) = owner_response.kvs().first() {
+                    let owner_storage_key = std::str::from_utf8(kv.value()).map_err(|error| {
+                        StoreError::Metadata(format!("invalid segment owner index payload: {error}"))
+                    })?;
+                    let Some(owner) = ClientRuntimeId::from_storage_key(owner_storage_key) else {
+                        return Err(StoreError::Metadata(format!(
+                            "invalid runtime storage key in segment owner index: {owner_storage_key}"
+                        )));
+                    };
+                    if owner != segment.owner {
+                        return Err(StoreError::Conflict(format!(
+                            "segment {} is already owned by live runtime {}",
+                            segment.segment_name.0, owner
+                        )));
+                    }
+                }
+                let current = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get segment before publish"))?;
+                let mut state = current
+                    .kvs()
+                    .first()
+                    .map(|kv| {
+                        serde_json::from_slice::<StoredSegmentState>(kv.value()).map_err(json_error)
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| StoredSegmentState::new(segment.clone()));
+                state.merge_announcement(segment);
+                let payload = serde_json::to_string(&state).map_err(json_error)?;
+                let owner_compare = if let Some(kv) = owner_response.kvs().first() {
+                    Compare::mod_revision(owner_key.clone(), CompareOp::Equal, kv.mod_revision())
+                } else {
+                    Compare::version(owner_key.clone(), CompareOp::Equal, 0)
+                };
+                let segment_compare = if let Some(kv) = current.kvs().first() {
+                    Compare::mod_revision(key.clone(), CompareOp::Equal, kv.mod_revision())
+                } else {
+                    Compare::version(key.clone(), CompareOp::Equal, 0)
+                };
+                let txn = Txn::new()
+                    .when([owner_compare, segment_compare])
+                    .and_then([
+                        TxnOp::put(key.clone(), payload, None),
+                        TxnOp::put(owner_key.clone(), segment.owner.storage_key(), None),
+                    ]);
+                let response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd publish segment"))?;
+                if response.succeeded() {
+                    return Ok(());
+                }
+            }
         })
     }
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
         let key = self.config.keyspace.segment(owner, segment);
+        let owner_key = self.config.keyspace.segment_owner(segment);
         self.block_on(async {
             let mut client = self.client().await?;
-            client
-                .delete(key, None)
+            loop {
+                let segment_response = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get segment before delete"))?;
+                let Some(segment_kv) = segment_response.kvs().first() else {
+                    return Ok(());
+                };
+                let owner_response = client
+                    .get(owner_key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get segment owner index before delete"))?;
+                let mut compares = vec![Compare::mod_revision(
+                    key.clone(),
+                    CompareOp::Equal,
+                    segment_kv.mod_revision(),
+                )];
+                let mut ops = vec![TxnOp::delete(key.clone(), None)];
+                if let Some(owner_kv) = owner_response.kvs().first() {
+                    let owner_storage_key = std::str::from_utf8(owner_kv.value()).map_err(|error| {
+                        StoreError::Metadata(format!("invalid segment owner index payload: {error}"))
+                    })?;
+                    let Some(index_owner) = ClientRuntimeId::from_storage_key(owner_storage_key) else {
+                        return Err(StoreError::Metadata(format!(
+                            "invalid runtime storage key in segment owner index: {owner_storage_key}"
+                        )));
+                    };
+                    compares.push(Compare::mod_revision(
+                        owner_key.clone(),
+                        CompareOp::Equal,
+                        owner_kv.mod_revision(),
+                    ));
+                    if index_owner == *owner {
+                        ops.push(TxnOp::delete(owner_key.clone(), None));
+                    }
+                }
+                let txn = Txn::new().when(compares).and_then(ops);
+                let response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd delete segment"))?;
+                if response.succeeded() {
+                    return Ok(());
+                }
+            }
+        })
+    }
+
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> Result<Option<SegmentAnnouncement>> {
+        let key = self.config.keyspace.segment(owner, segment);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key, None)
                 .await
-                .map_err(etcd_error("etcd delete segment"))?;
-            Ok(())
+                .map_err(etcd_error("etcd get segment by owner and name"))?;
+            response
+                .kvs()
+                .first()
+                .map(|kv| {
+                    serde_json::from_slice::<StoredSegmentState>(kv.value())
+                        .map(|state| state.announcement)
+                        .map_err(json_error)
+                })
+                .transpose()
+        })
+    }
+
+    fn get_segment_owner(&self, segment: &SegmentName) -> Result<Option<ClientRuntimeId>> {
+        let key = self.config.keyspace.segment_owner(segment);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key, None)
+                .await
+                .map_err(etcd_error("etcd get segment owner"))?;
+            let Some(kv) = response.kvs().first() else {
+                return Ok(None);
+            };
+            let owner_storage_key = std::str::from_utf8(kv.value()).map_err(|error| {
+                StoreError::Metadata(format!("invalid segment owner index: {error}"))
+            })?;
+            let Some(owner) = ClientRuntimeId::from_storage_key(owner_storage_key) else {
+                return Err(StoreError::Metadata(format!(
+                    "invalid runtime storage key in segment owner index: {owner_storage_key}"
+                )));
+            };
+            Ok(Some(owner))
         })
     }
 
@@ -2221,8 +2442,7 @@ mod tests {
         let live_clients = backend
             .list_live_clients()
             .expect("listing live clients should succeed");
-        assert_eq!(live_clients.len(), 1);
-        assert_eq!(live_clients[0].state, ClientLifecycleState::Draining);
+        assert!(live_clients.is_empty());
         assert!(matches!(
             backend.update_client_state(
                 &ClientRuntimeId::new("missing", ClientEpoch(1)),
@@ -2417,6 +2637,59 @@ mod tests {
     }
 
     #[test]
+    fn etcd_backend_point_lookups_keep_present_lease_visibility_and_live_stable_filtering() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-live-point-lookups")),
+        )
+        .expect("etcd backend should initialize");
+
+        let active = sample_lease(ClientLifecycleState::Active);
+        backend
+            .upsert_client_lease(&active)
+            .expect("active lease should upsert");
+        assert_eq!(
+            backend
+                .get_client_lease(&active.runtime)
+                .expect("active lease lookup should succeed"),
+            Some(active.clone())
+        );
+        assert_eq!(
+            backend
+                .get_live_runtime_by_stable_id(&active.runtime.stable_id)
+                .expect("active stable lookup should succeed"),
+            Some(active.clone())
+        );
+
+        backend
+            .update_client_state(&active.runtime, ClientLifecycleState::Draining)
+            .expect("client state update should succeed");
+        let mut draining = active.clone();
+        draining.state = ClientLifecycleState::Draining;
+        assert_eq!(
+            backend
+                .get_client_lease(&active.runtime)
+                .expect("draining lease lookup should succeed"),
+            Some(draining.clone())
+        );
+        assert_eq!(
+            backend
+                .get_live_runtime_by_stable_id(&active.runtime.stable_id)
+                .expect("draining stable lookup should succeed"),
+            Some(draining.clone())
+        );
+        assert_eq!(
+            backend
+                .list_live_clients()
+                .expect("live client listing should succeed"),
+            vec![draining]
+        );
+    }
+
+    #[test]
     fn etcd_backend_cleanup_stale_segments_for_owner_is_scoped() {
         let Some(server) = EtcdTestServer::start() else {
             return;
@@ -2464,6 +2737,63 @@ mod tests {
                 .expect("segment listing should succeed"),
             vec![live_segment]
         );
+    }
+
+    #[test]
+    fn etcd_backend_rejects_stale_segment_owner_index_on_publish() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/etcd-stale-segment-owner");
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()]).keyspace(keyspace.clone()),
+        )
+        .expect("etcd backend should initialize");
+
+        let owner_a = ClientRuntimeId::new("writer-a", ClientEpoch(1));
+        let owner_b = ClientRuntimeId::new("writer-b", ClientEpoch(1));
+        let segment_name = SegmentName::new("shared-segment");
+        let segment_a = SegmentAnnouncement {
+            owner: owner_a.clone(),
+            segment_name: segment_name.clone(),
+            capacity_bytes: 128,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 16,
+            tags: vec![],
+        };
+        backend
+            .publish_segment(&segment_a)
+            .expect("first owner should publish");
+        backend
+            .unpublish_segment(&owner_a, &segment_name)
+            .expect("first owner should unpublish");
+
+        let owner_key = keyspace.segment_owner(&segment_name);
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let mut client = etcd_client::Client::connect([server.endpoint().to_string()], None)
+                .await
+                .expect("etcd client should connect");
+            client
+                .put(owner_key, owner_a.storage_key(), None)
+                .await
+                .expect("stale owner index should write");
+        });
+
+        let segment_b = SegmentAnnouncement {
+            owner: owner_b,
+            segment_name,
+            capacity_bytes: 128,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 16,
+            tags: vec![],
+        };
+        let error = backend
+            .publish_segment(&segment_b)
+            .expect_err("stale owner index should still block publish today");
+        assert!(matches!(error, StoreError::Conflict(_)));
     }
 
     #[test]

@@ -53,6 +53,12 @@ impl ClientRuntimeId {
     pub fn storage_key(&self) -> String {
         format!("{}:{}", self.stable_id, self.epoch.0)
     }
+
+    pub fn from_storage_key(value: &str) -> Option<Self> {
+        let (stable_id, epoch) = value.rsplit_once(':')?;
+        let epoch = epoch.parse::<u64>().ok()?;
+        Some(Self::new(stable_id, ClientEpoch(epoch)))
+    }
 }
 
 impl Display for ClientRuntimeId {

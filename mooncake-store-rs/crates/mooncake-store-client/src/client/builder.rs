@@ -4,56 +4,110 @@ const DEFAULT_STARTUP_PREWARM_MAX_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_STARTUP_PREWARM_MAX_DELAY: Duration = Duration::ZERO;
 const STARTUP_PREWARM_SPREAD_ENV: &str = "MC_STORE_RS_STARTUP_PREWARM_SPREAD_MS";
 
-fn validate_startup_segment_conflicts(
+fn validate_startup_conflicts(
     metadata: &dyn MetadataBackend,
     control_client: &ControlPlaneClient,
-    local_stable_id: &ClientStableId,
+    local: &ClientLease,
+) -> Result<()> {
+    let Some(local_segment) = local.endpoints.segment_name.as_ref() else {
+        return validate_runtime_conflicts(metadata, control_client, local, None);
+    };
+    validate_runtime_conflicts(metadata, control_client, local, Some(local_segment))
+}
+
+fn validate_runtime_conflicts(
+    metadata: &dyn MetadataBackend,
+    control_client: &ControlPlaneClient,
+    local: &ClientLease,
     local_segment: Option<&SegmentName>,
 ) -> Result<()> {
-    let Some(local_segment) = local_segment else {
+    if let Some(remote) = metadata.get_live_runtime_by_stable_id(&local.runtime.stable_id)? {
+        validate_stable_id_conflict(control_client, local, &remote)?;
+    }
+    if let Some(segment) = local_segment {
+        validate_segment_owner_conflict(metadata, control_client, local, segment)?;
+    }
+    Ok(())
+}
+
+fn validate_stable_id_conflict(
+    control_client: &ControlPlaneClient,
+    local: &ClientLease,
+    remote: &ClientLease,
+) -> Result<()> {
+    if !validate_reachable_runtime(control_client, local, remote)? {
         return Ok(());
-    };
-    for remote in metadata.list_live_clients()? {
-        let same_segment = remote
-            .endpoints
-            .segment_name
-            .as_ref()
-            .is_some_and(|other| other == local_segment);
-        if !same_segment {
-            continue;
-        }
+    }
 
-        match control_client.probe_reachability(&remote) {
-            crate::control_plane::ControlPlaneReachability::Reachable => {}
-            crate::control_plane::ControlPlaneReachability::Unreachable => {
-                debug!(
-                    local_stable_id = %local_stable_id,
-                    remote_runtime = %remote.runtime,
-                    "startup guard ignored unreachable live lease during segment validation"
-                );
-                continue;
-            }
-            crate::control_plane::ControlPlaneReachability::Unknown(error) => {
-                return Err(StoreError::Conflict(format!(
-                    "startup guard cannot validate existing runtime {}: {error}",
-                    remote.runtime
-                )));
-            }
-        }
+    if remote.runtime.epoch > local.runtime.epoch {
+        return Err(StoreError::StaleEpoch(format!(
+            "runtime {} is fenced by newer live runtime {}",
+            local.runtime, remote.runtime
+        )));
+    }
 
-        // Epoch allocation guarantees the new runtime receives an unused epoch,
-        // so a same-stable-id match here is an in-flight handoff rather than a
-        // collision. Only reject when a different stable_id already owns the
-        // segment name.
-        if remote.runtime.stable_id != *local_stable_id {
-            return Err(StoreError::Conflict(format!(
-                "segment {} is already owned by live runtime {}",
-                local_segment.0, remote.runtime
-            )));
-        }
+    if remote.runtime.epoch == local.runtime.epoch {
+        return Err(StoreError::Conflict(format!(
+            "runtime {} is already live",
+            remote.runtime
+        )));
     }
 
     Ok(())
+}
+
+fn validate_segment_owner_conflict(
+    metadata: &dyn MetadataBackend,
+    control_client: &ControlPlaneClient,
+    local: &ClientLease,
+    segment: &SegmentName,
+) -> Result<()> {
+    let Some(owner) = metadata.get_segment_owner(segment)? else {
+        return Ok(());
+    };
+    if owner == local.runtime {
+        return Ok(());
+    }
+    let Some(remote) = metadata.get_client_lease(&owner)? else {
+        debug!(
+            local_runtime = %local.runtime,
+            remote_runtime = %owner,
+            segment = %segment.0,
+            "startup guard ignored stale segment-owner index without live lease"
+        );
+        return Ok(());
+    };
+    if !validate_reachable_runtime(control_client, local, &remote)? {
+        return Ok(());
+    }
+    Err(StoreError::Conflict(format!(
+        "segment {} is already owned by live runtime {}",
+        segment.0, remote.runtime
+    )))
+}
+
+fn validate_reachable_runtime(
+    control_client: &ControlPlaneClient,
+    local: &ClientLease,
+    remote: &ClientLease,
+) -> Result<bool> {
+    match control_client.probe_reachability(remote) {
+        crate::control_plane::ControlPlaneReachability::Reachable => Ok(true),
+        crate::control_plane::ControlPlaneReachability::Unreachable => {
+            debug!(
+                local_runtime = %local.runtime,
+                remote_runtime = %remote.runtime,
+                "startup guard ignored unreachable live lease during takeover validation"
+            );
+            Ok(false)
+        }
+        crate::control_plane::ControlPlaneReachability::Unknown(error) => Err(StoreError::Conflict(
+            format!(
+                "startup guard cannot validate existing runtime {}: {error}",
+                remote.runtime
+            ),
+        )),
+    }
 }
 
 fn normalize_storage_label(
