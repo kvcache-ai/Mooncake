@@ -53,8 +53,7 @@ BatchGetWriteRouteResponse WrappedP2PMasterService::BatchGetWriteRoute(
     for (size_t i = 0; i < response.error_codes.size(); ++i) {
         if (response.error_codes[i] != ErrorCode::OK) {
             failure_count++;
-            LOG(ERROR) << "BatchGetWriteRoute failed for key '"
-                       << req.keys[i]
+            LOG(ERROR) << "BatchGetWriteRoute failed for key '" << req.keys[i]
                        << "': " << toString(response.error_codes[i]);
         }
     }

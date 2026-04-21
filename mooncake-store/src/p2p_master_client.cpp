@@ -57,9 +57,8 @@ P2PMasterClient::BatchGetWriteRoute(const BatchGetWriteRouteRequest& req) {
     ScopedVLogTimer timer(1, "P2PMasterClient::BatchGetWriteRoute");
     timer.LogRequest("key_count=", req.keys.size());
 
-    auto result =
-        invoke_rpc<&WrappedP2PMasterService::BatchGetWriteRoute,
-                   BatchGetWriteRouteResponse>(req);
+    auto result = invoke_rpc<&WrappedP2PMasterService::BatchGetWriteRoute,
+                             BatchGetWriteRouteResponse>(req);
     timer.LogResponseExpected(result);
     return result;
 }

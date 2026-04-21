@@ -54,7 +54,8 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
         // 1.2 priority filter
         auto priority_opt = replica.get_p2p_priority();
         if (!priority_opt) {
-            LOG(ERROR) << "invalid priority" << ", replica: " << replica;
+            LOG(ERROR) << "invalid priority"
+                       << ", replica: " << replica;
             continue;
         }
         if (*priority_opt < p2p_config.priority_limit) continue;
@@ -98,8 +99,8 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
             auto& metadata = accessor->Get();
             if (metadata.replicas_.size() >= max_replicas_per_key_) {
                 LOG(WARNING)
-                    << "replica num exceeded" << ", key: " << req.key
-                    << ", client_id: " << req.client_id
+                    << "replica num exceeded"
+                    << ", key: " << req.key << ", client_id: " << req.client_id
                     << ", current replica num:" << metadata.replicas_.size()
                     << ", max replica num: " << max_replicas_per_key_;
                 return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
@@ -157,9 +158,9 @@ auto P2PMasterService::BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
 
     WriteRouteRequest single_req;
     single_req.client_id = req.client_id;
-    single_req.config    = req.config;
+    single_req.config = req.config;
     for (size_t i = 0; i < n; ++i) {
-        single_req.key  = req.keys[i];
+        single_req.key = req.keys[i];
         single_req.size = req.sizes[i];
         auto result = GetWriteRoute(single_req);
         if (result.has_value()) {
@@ -205,15 +206,16 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
         auto& metadata = *it->second;
         if (max_replicas_per_key_ > 0 &&
             metadata.replicas_.size() >= max_replicas_per_key_) {
-            LOG(WARNING) << "replica num exceeded" << ", key: " << key
-                         << ", client_id: " << client_id
+            LOG(WARNING) << "replica num exceeded"
+                         << ", key: " << key << ", client_id: " << client_id
                          << ", segment_id: " << segment_id
                          << ", current replica num:" << max_replicas_per_key_;
             return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
         }
         for (const auto& replica : metadata.replicas_) {
             if (!replica.is_p2p_proxy_replica()) {
-                LOG(ERROR) << "unexpected replica type" << ", key: " << key
+                LOG(ERROR) << "unexpected replica type"
+                           << ", key: " << key
                            << ", request client_id: " << client_id
                            << ", request segment_id: " << segment_id
                            << ", replica:" << replica;
@@ -223,8 +225,8 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
             auto cli_id = replica.get_p2p_client_id();
             if (cli_id && seg_id && cli_id == client_id &&
                 *seg_id == segment_id) {
-                LOG(WARNING) << "replica has existed" << ", key: " << key
-                             << ", client_id: " << client_id
+                LOG(WARNING) << "replica has existed"
+                             << ", key: " << key << ", client_id: " << client_id
                              << ", segment_id: " << segment_id;
                 return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
             }
@@ -258,8 +260,8 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
     const UUID& segment_id) {
     auto it = shard.metadata.find(key);
     if (it == shard.metadata.end()) {
-        LOG(WARNING) << "object not found" << ", key: " << key
-                     << ", client_id: " << client_id
+        LOG(WARNING) << "object not found"
+                     << ", key: " << key << ", client_id: " << client_id
                      << ", segment_id: " << segment_id;
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -268,8 +270,8 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
     for (auto rit = metadata.replicas_.begin(); rit != metadata.replicas_.end();
          ++rit) {
         if (!rit->is_p2p_proxy_replica()) {
-            LOG(ERROR) << "unexpected replica type" << ", key: " << key
-                       << ", client_id: " << client_id
+            LOG(ERROR) << "unexpected replica type"
+                       << ", key: " << key << ", client_id: " << client_id
                        << ", segment_id: " << segment_id
                        << ", replica: " << *rit;
             return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
@@ -288,8 +290,8 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
         }
     }
 
-    LOG(WARNING) << "replica not found" << ", key: " << key
-                 << ", client_id: " << client_id
+    LOG(WARNING) << "replica not found"
+                 << ", key: " << key << ", client_id: " << client_id
                  << ", segment_id: " << segment_id;
     return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
 }
@@ -321,7 +323,8 @@ auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
                           << ", segment_id: " << segment_id;
                 results.push_back({});
             } else {
-                LOG(ERROR) << "failed to remove replica" << ", key: " << req.key
+                LOG(ERROR) << "failed to remove replica"
+                           << ", key: " << req.key
                            << ", client_id: " << req.client_id
                            << ", segment_id: " << segment_id
                            << ", error: " << toString(result.error());
