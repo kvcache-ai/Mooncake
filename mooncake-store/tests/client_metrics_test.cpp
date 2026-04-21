@@ -267,4 +267,154 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
     }
 }
 
+TEST_F(ClientMetricsTest, LocalStorageMetricBasicTest) {
+    LocalStorageMetric metrics;
+
+    // Test empty metrics
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Local Put: 0 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Local Get: 0 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("0 misses") != std::string::npos);
+
+    // Add put data
+    metrics.put_requests.inc();
+    metrics.put_requests.inc();
+    metrics.put_failures.inc();
+    metrics.put_bytes.inc(1024 * 1024);  // 1 MB
+    metrics.put_latency_us.observe(200);
+    metrics.put_latency_us.observe(300);
+
+    // Add get data
+    metrics.get_requests.inc();
+    metrics.get_requests.inc();
+    metrics.get_requests.inc();
+    metrics.get_failures.inc();
+    metrics.get_misses.inc();
+    metrics.get_bytes.inc(2 * 1024 * 1024);  // 2 MB
+    metrics.get_latency_us.observe(100);
+    metrics.get_latency_us.observe(150);
+
+    summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Local Put: 2 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("1.00 MB written") != std::string::npos);
+    EXPECT_TRUE(summary.find("Local Get: 3 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("2.00 MB read") != std::string::npos);
+    EXPECT_TRUE(summary.find("1 misses") != std::string::npos);
+
+    std::cout << "Local Storage Metrics Summary:\n" << summary << std::endl;
+}
+
+TEST_F(ClientMetricsTest, LocalStorageMetricSerializeTest) {
+    LocalStorageMetric metrics;
+
+    // Add some data
+    metrics.put_requests.inc(100);
+    metrics.put_bytes.inc(50 * 1024 * 1024);  // 50 MB
+    metrics.get_requests.inc(500);
+    metrics.get_misses.inc(20);
+    metrics.get_bytes.inc(100 * 1024 * 1024);  // 100 MB
+
+    // Add latency data to test histogram output
+    metrics.put_latency_us.observe(200);
+    metrics.put_latency_us.observe(300);
+    metrics.get_latency_us.observe(100);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    // Verify Prometheus format output
+    EXPECT_TRUE(
+        serialized.find("mooncake_client_local_put_requests_total 100") !=
+        std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_client_local_put_bytes_total 52428800") !=
+        std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_client_local_get_requests_total 500") !=
+        std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_client_local_get_misses_total 20") !=
+                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_client_local_get_bytes_total 104857600") !=
+        std::string::npos);
+
+    // Verify HELP and TYPE annotations for counter metrics
+    EXPECT_TRUE(
+        serialized.find("# HELP mooncake_client_local_put_requests_total") !=
+        std::string::npos);
+    EXPECT_TRUE(
+        serialized.find(
+            "# TYPE mooncake_client_local_put_requests_total counter") !=
+        std::string::npos);
+
+    // Verify histogram metrics are present (only output when data exists)
+    EXPECT_TRUE(serialized.find("mooncake_client_local_put_latency_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_client_local_get_latency_us") !=
+                std::string::npos);
+
+    std::cout << "Local Storage Serialized Metrics:\n"
+              << serialized << std::endl;
+}
+
+TEST_F(ClientMetricsTest, LocalStorageMetricWithLabelsTest) {
+    std::map<std::string, std::string> labels = {
+        {"instance_id", "test-instance"}, {"deployment_mode", "p2p"}};
+
+    LocalStorageMetric metrics(labels);
+    metrics.put_requests.inc();
+    metrics.get_requests.inc();
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    // Verify labels are present in output
+    EXPECT_TRUE(serialized.find("instance_id=\"test-instance\"") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("deployment_mode=\"p2p\"") !=
+                std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, ClientMetricWithLocalStorageTest) {
+    ClientMetric metrics;
+
+    // Add data to all metric types
+    metrics.transfer_metric.total_read_bytes.inc(1024);
+    metrics.master_client_metric.rpc_count.inc({"GetReplicaList"});
+    metrics.local_storage_metric.put_requests.inc(10);
+    metrics.local_storage_metric.get_requests.inc(20);
+    metrics.local_storage_metric.get_misses.inc(5);
+
+    std::string summary = metrics.summary_metrics();
+
+    // Verify all sections are present
+    EXPECT_TRUE(summary.find("Transfer Metrics Summary") != std::string::npos);
+    EXPECT_TRUE(summary.find("RPC Metrics Summary") != std::string::npos);
+    EXPECT_TRUE(summary.find("Local Storage Metrics Summary") !=
+                std::string::npos);
+
+    // Verify local storage data
+    EXPECT_TRUE(summary.find("Local Put: 10 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Local Get: 20 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("5 misses") != std::string::npos);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    // Verify all metric types in serialized output
+    EXPECT_TRUE(serialized.find("mooncake_transfer_read_bytes") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_client_rpc_count") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_client_local_put_requests_total") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_client_local_get_requests_total") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_client_local_get_misses_total") !=
+                std::string::npos);
+
+    std::cout << "Client Metric Summary with Local Storage:\n"
+              << summary << std::endl;
+}
+
 }  // namespace mooncake::test

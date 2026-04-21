@@ -248,6 +248,10 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 
     data_manager_ = DataManager(std::move(tiered_backend), transfer_engine_,
                                 config.lock_shard_count, local_transfer_config);
+    // Set metrics for DataManager to record local storage operations
+    if (metrics_) {
+        data_manager_->SetMetrics(&metrics_->local_storage_metric);
+    }
     // Set rectify callback on DataManager to remove stale replicas from master
     data_manager_->SetRectifyCallback([this](const std::string& key,
                                              std::optional<UUID> tier_id) {

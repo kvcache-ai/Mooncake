@@ -272,9 +272,73 @@ struct MasterClientMetric {
     }
 };
 
+// P2P Local Storage Metrics
+// Tracks local Put/Get operations on DataManager
+struct LocalStorageMetric {
+    LocalStorageMetric(std::map<std::string, std::string> labels = {})
+        : put_requests("mooncake_client_local_put_requests_total",
+                       "Total number of local Put requests", labels),
+          put_failures("mooncake_client_local_put_failures_total",
+                       "Total number of failed local Put requests", labels),
+          put_bytes("mooncake_client_local_put_bytes_total",
+                    "Total bytes written by local Put", labels),
+          put_latency_us("mooncake_client_local_put_latency_us",
+                         "Local Put latency (us)", kLatencyBucket, labels),
+          get_requests("mooncake_client_local_get_requests_total",
+                       "Total number of local Get requests", labels),
+          get_failures("mooncake_client_local_get_failures_total",
+                       "Total number of failed local Get requests", labels),
+          get_misses("mooncake_client_local_get_misses_total",
+                     "Total number of local Get misses (key not found)",
+                     labels),
+          get_bytes("mooncake_client_local_get_bytes_total",
+                    "Total bytes read by local Get", labels),
+          get_latency_us("mooncake_client_local_get_latency_us",
+                         "Local Get latency (us)", kLatencyBucket, labels) {}
+
+    ylt::metric::counter_t put_requests;
+    ylt::metric::counter_t put_failures;
+    ylt::metric::counter_t put_bytes;
+    ylt::metric::histogram_t put_latency_us;
+
+    ylt::metric::counter_t get_requests;
+    ylt::metric::counter_t get_failures;
+    ylt::metric::counter_t get_misses;
+    ylt::metric::counter_t get_bytes;
+    ylt::metric::histogram_t get_latency_us;
+
+    void serialize(std::string& str) {
+        put_requests.serialize(str);
+        put_failures.serialize(str);
+        put_bytes.serialize(str);
+        put_latency_us.serialize(str);
+        get_requests.serialize(str);
+        get_failures.serialize(str);
+        get_misses.serialize(str);
+        get_bytes.serialize(str);
+        get_latency_us.serialize(str);
+    }
+
+    std::string summary_metrics() {
+        std::stringstream ss;
+        ss << "=== Local Storage Metrics Summary ===\n";
+
+        auto put_count = put_requests.value();
+        auto get_count = get_requests.value();
+        ss << "Local Put: " << put_count << " requests, "
+           << byte_size_to_string(put_bytes.value()) << " written\n";
+        ss << "Local Get: " << get_count << " requests, "
+           << byte_size_to_string(get_bytes.value()) << " read, "
+           << get_misses.value() << " misses\n";
+
+        return ss.str();
+    }
+};
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
+    LocalStorageMetric local_storage_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables
