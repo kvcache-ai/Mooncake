@@ -523,7 +523,7 @@ env \
   --outdir "${WHEEL_DIR}" \
   "${REPO_ROOT}/packages/mooncake-pro"
 
-LATEST_META_WHEEL=$(ls -1t "${WHEEL_DIR}"/mooncake_pro-*.whl 2>/dev/null | head -n 1 || true)
+LATEST_META_WHEEL=$(ls -1t "${WHEEL_DIR}"/mooncake-*.whl 2>/dev/null | head -n 1 || true)
 
 cat <<EOF
 wheel:  ${LATEST_WHEEL}
