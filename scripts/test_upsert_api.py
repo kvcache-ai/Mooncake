@@ -34,6 +34,7 @@ import unittest
 
 import torch
 import numpy as np
+import mooncake.store as mooncake_store
 
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
@@ -42,8 +43,8 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 # ==========================================
 
 # Must match current C++ TensorMetadata layout.
-# TensorObjectHeader (40) + TensorLayoutMetadata (224) = 264 bytes.
-TENSOR_METADATA_SIZE = 264
+# TensorObjectHeader (40) + TensorLayoutMetadata (264) = 304 bytes.
+TENSOR_METADATA_SIZE = 304
 
 
 def serialized_tensor_size(tensor):
@@ -93,6 +94,33 @@ def tearDownModule():
     if GLOBAL_STORE:
         GLOBAL_STORE.close()
         GLOBAL_STORE = None
+
+
+def require_unified_parallelism_api(test_case):
+    missing = [
+        name for name in ["ParallelAxis", "TensorParallelism", "ReadTarget"]
+        if not hasattr(mooncake_store, name)
+    ]
+    if missing:
+        test_case.skipTest(
+            "Unified parallelism Python bindings are not available in the installed extension: "
+            + ", ".join(missing)
+        )
+
+
+def make_parallel_axis(kind, rank, size, split_dim=None):
+    axis = mooncake_store.ParallelAxis()
+    axis.kind = kind
+    axis.rank = rank
+    axis.size = size
+    axis.split_dim = split_dim
+    return axis
+
+
+def make_tensor_parallelism(axes):
+    parallelism = mooncake_store.TensorParallelism()
+    parallelism.axes = axes
+    return parallelism
 
 
 class UpsertTestBase(unittest.TestCase):
@@ -465,6 +493,70 @@ class TestUpsertPubTensor(UpsertTestBase):
         self.assertEqual(rc, 0)
         got = self.store.get_tensor("pub_ow")
         self.assertTrue(torch.equal(t2, got))
+
+
+class TestUnifiedParallelismUpsert(UpsertTestBase):
+    def test_upsert_tensor_with_parallelism_multi_axis(self):
+        require_unified_parallelism_api(self)
+        key = "unified_multi_axis_upsert"
+        original = torch.arange(24, dtype=torch.float32).view(4, 6).contiguous()
+        updated = (original + 50).contiguous()
+
+        dp_axis = make_parallel_axis("dp", rank=1, size=2)
+        tp_axis = make_parallel_axis("tp", rank=0, size=3, split_dim=1)
+        parallelism = make_tensor_parallelism([dp_axis, tp_axis])
+
+        self.assertEqual(
+            self.store.put_tensor_with_parallelism(key, original, parallelism),
+            0,
+        )
+        self.assertEqual(
+            self.store.upsert_tensor_with_parallelism(key, updated, parallelism),
+            0,
+        )
+
+        target = mooncake_store.ReadTarget()
+        target.mode = "shard"
+        target.parallelism = parallelism
+        got = self.store.get_tensor_with_parallelism(key, target)
+        self.assertIsNotNone(got)
+        self.assertTrue(torch.equal(got, updated.chunk(3, 1)[0]))
+
+    def test_upsert_tensor_with_parallelism_from_multi_axis(self):
+        require_unified_parallelism_api(self)
+        key = "unified_multi_axis_upsert_from"
+        seed_key = "unified_multi_axis_upsert_from_seed"
+        tensor = torch.arange(24, dtype=torch.float32).view(4, 6).contiguous()
+        updated = (tensor + 77).contiguous()
+
+        self.assertEqual(self.store.put_tensor(seed_key, updated), 0)
+        buffer_size = serialized_tensor_size(updated)
+        buf = ctypes.create_string_buffer(buffer_size)
+        ptr = ctypes.addressof(buf)
+        self.assertEqual(self.store.register_buffer(ptr, buffer_size), 0)
+        try:
+            got = self.store.get_tensor_into(seed_key, ptr, buffer_size)
+            self.assertIsNotNone(got)
+
+            dp_axis = make_parallel_axis("dp", rank=0, size=2)
+            tp_axis = make_parallel_axis("tp", rank=1, size=3, split_dim=1)
+            parallelism = make_tensor_parallelism([dp_axis, tp_axis])
+
+            self.assertEqual(
+                self.store.upsert_tensor_with_parallelism_from(
+                    key, ptr, buffer_size, parallelism
+                ),
+                0,
+            )
+
+            target = mooncake_store.ReadTarget()
+            target.mode = "shard"
+            target.parallelism = parallelism
+            result = self.store.get_tensor_with_parallelism(key, target)
+            self.assertIsNotNone(result)
+            self.assertTrue(torch.equal(result, updated.chunk(3, 1)[1]))
+        finally:
+            self.store.unregister_buffer(ptr)
 
 
 class TestUpsertTpTensor(UpsertTestBase):

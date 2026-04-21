@@ -5,6 +5,7 @@
 #include <functional>
 #include <numeric>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "pyclient.h"
 #include "dummy_client.h"
@@ -53,6 +54,47 @@ std::vector<int64_t> tensor_shape_to_vector(const py::handle &tensor) {
     return shape;
 }
 
+enum class ReadTargetMode {
+    AS_STORED,
+    SHARD,
+    FULL,
+};
+
+struct ParallelAxisSpec {
+    std::string kind;
+    int rank{0};
+    int size{1};
+    std::optional<int> split_dim;
+    std::optional<int> expert_id;
+    std::optional<int> stage_id;
+};
+
+struct TensorParallelismSpec {
+    std::vector<ParallelAxisSpec> axes;
+};
+
+struct ReadTargetSpec {
+    ReadTargetMode mode{ReadTargetMode::AS_STORED};
+    std::optional<TensorParallelismSpec> parallelism;
+};
+
+struct TensorIntoFragment {
+    std::string read_key;
+    size_t dst_offset{0};
+    size_t src_offset{0};
+    size_t size{0};
+};
+
+struct TensorIntoPlan {
+    uintptr_t user_buffer_ptr{0};
+    uintptr_t registered_buffer_ptr{0};
+    size_t registered_buffer_size{0};
+    size_t total_length{0};
+    std::vector<TensorIntoFragment> fragments;
+};
+
+std::optional<LayoutAxisKind> parse_layout_axis_kind(const std::string &kind);
+
 TensorMetadata build_full_tensor_metadata(const py::handle &tensor,
                                           TensorDtype dtype_enum,
                                           size_t tensor_size) {
@@ -63,31 +105,121 @@ TensorMetadata build_full_tensor_metadata(const py::handle &tensor,
     return metadata;
 }
 
+std::optional<LayoutAxis> build_layout_axis_from_spec(
+    const ParallelAxisSpec &axis_spec, size_t axis_index,
+    int64_t local_split_extent = -1) {
+    auto kind = parse_layout_axis_kind(axis_spec.kind);
+    if (!kind.has_value()) {
+        return std::nullopt;
+    }
+
+    LayoutAxis axis{};
+    axis.kind = static_cast<int32_t>(*kind);
+    axis.axis_index = static_cast<int32_t>(axis_index);
+    axis.shard_rank = axis_spec.rank;
+    axis.shard_count = axis_spec.size;
+    axis.split_dim = axis_spec.split_dim.value_or(-1);
+    axis.reserved0 = 0;
+    axis.reserved1 = 0;
+
+    if (*kind == LayoutAxisKind::EP && axis_spec.expert_id.has_value()) {
+        axis.reserved0 = axis_spec.expert_id.value();
+    }
+    if (*kind == LayoutAxisKind::PP && axis_spec.stage_id.has_value()) {
+        axis.reserved0 = axis_spec.stage_id.value();
+    }
+    if (local_split_extent >= 0) {
+        axis.reserved1 = local_split_extent;
+    }
+    return axis;
+}
+
+std::optional<TensorMetadata> build_shard_metadata_from_parallelism(
+    const py::handle &full_tensor, const py::handle &shard_tensor,
+    TensorDtype dtype_enum, const std::vector<ParallelAxisSpec> &axes,
+    size_t tensor_size) {
+    if (axes.empty() || axes.size() > kMaxLayoutAxes) {
+        return std::nullopt;
+    }
+
+    auto global_shape = tensor_shape_to_vector(full_tensor);
+    auto local_shape = tensor_shape_to_vector(shard_tensor);
+    std::vector<LayoutAxis> layout_axes;
+    layout_axes.reserve(axes.size());
+    for (size_t i = 0; i < axes.size(); ++i) {
+        int64_t local_split_extent = -1;
+        if (axes[i].split_dim.has_value()) {
+            int split_dim = axes[i].split_dim.value();
+            if (split_dim < 0 || split_dim >= static_cast<int>(local_shape.size())) {
+                return std::nullopt;
+            }
+            local_split_extent = local_shape[split_dim];
+        }
+        auto layout_axis =
+            build_layout_axis_from_spec(axes[i], i, local_split_extent);
+        if (!layout_axis.has_value()) {
+            return std::nullopt;
+        }
+        layout_axes.push_back(*layout_axis);
+    }
+
+    TensorMetadata metadata = BuildTensorMetadata(
+        static_cast<int32_t>(dtype_enum), global_shape, local_shape,
+        TensorLayoutKind::SHARD,
+        std::span<const LayoutAxis>(layout_axes.data(), layout_axes.size()));
+    metadata.header.data_bytes = tensor_size;
+    return metadata;
+}
+
 TensorMetadata build_tp_shard_metadata(const py::handle &full_tensor,
                                        const py::handle &shard_tensor,
                                        TensorDtype dtype_enum, int tp_rank,
                                        int tp_size, int split_dim,
                                        size_t tensor_size) {
-    auto global_shape = tensor_shape_to_vector(full_tensor);
-    auto local_shape = tensor_shape_to_vector(shard_tensor);
-    LayoutAxis axis{};
-    axis.kind = static_cast<int32_t>(LayoutAxisKind::TP);
-    axis.axis_index = 0;
-    axis.shard_rank = tp_rank;
-    axis.shard_count = tp_size;
-    axis.split_dim = split_dim;
-    axis.reserved0 = 0;
-    axis.reserved1 = 0;
-    TensorMetadata metadata = BuildTensorMetadata(
-        static_cast<int32_t>(dtype_enum), global_shape, local_shape,
-        TensorLayoutKind::SHARD, std::span<const LayoutAxis>(&axis, 1));
-    metadata.header.data_bytes = tensor_size;
-    return metadata;
+    ParallelAxisSpec axis_spec{"tp", tp_rank, tp_size, split_dim, std::nullopt,
+                               std::nullopt};
+    auto metadata = build_shard_metadata_from_parallelism(
+        full_tensor, shard_tensor, dtype_enum, {axis_spec}, tensor_size);
+    return metadata.value_or(TensorMetadata{});
+}
+
+std::optional<size_t> find_tp_axis_index(
+    const std::vector<ParallelAxisSpec> &axes) {
+    for (size_t i = 0; i < axes.size(); ++i) {
+        auto kind = parse_layout_axis_kind(axes[i].kind);
+        if (kind == std::optional<LayoutAxisKind>(LayoutAxisKind::TP)) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<PyTensorInfo> build_non_tp_shard_info(
+    const py::handle &tensor, const std::vector<ParallelAxisSpec> &axes,
+    const std::string &key_name) {
+    TensorDtype dtype_enum = get_tensor_dtype(tensor.attr("dtype"));
+    if (dtype_enum == TensorDtype::UNKNOWN) {
+        return std::nullopt;
+    }
+
+    auto info = extract_tensor_info(py::reinterpret_borrow<py::object>(tensor),
+                                    key_name);
+    auto metadata = build_shard_metadata_from_parallelism(
+        tensor, tensor, dtype_enum, axes, info.tensor_size);
+    if (!metadata.has_value()) {
+        return std::nullopt;
+    }
+    info.metadata = *metadata;
+    if (!info.valid()) {
+        return std::nullopt;
+    }
+    return info;
 }
 
 std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
     const py::handle &tensor, int tp_size, int split_dim,
-    const std::function<std::string(int)> &key_for_rank) {
+    const std::function<std::string(int)> &key_for_rank,
+    const std::vector<ParallelAxisSpec> &axes = {}) {
     TensorDtype dtype_enum = get_tensor_dtype(tensor.attr("dtype"));
     if (dtype_enum == TensorDtype::UNKNOWN) {
         return std::nullopt;
@@ -99,6 +231,7 @@ std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
         return std::nullopt;
     }
 
+    auto tp_axis_index = find_tp_axis_index(axes);
     auto torch = torch_module();
     py::object torch_tensor = py::reinterpret_borrow<py::object>(tensor);
     std::vector<PyTensorInfo> infos;
@@ -123,9 +256,23 @@ std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
         }
 
         auto info = extract_tensor_info(chunk, key_for_rank(rank));
-        info.metadata =
-            build_tp_shard_metadata(tensor, chunk, dtype_enum, rank, tp_size,
-                                    split_dim, info.tensor_size);
+        if (axes.empty()) {
+            info.metadata =
+                build_tp_shard_metadata(tensor, chunk, dtype_enum, rank, tp_size,
+                                        split_dim, info.tensor_size);
+        } else {
+            auto shard_axes = axes;
+            if (!tp_axis_index.has_value()) {
+                return std::nullopt;
+            }
+            shard_axes[*tp_axis_index].rank = rank;
+            auto metadata = build_shard_metadata_from_parallelism(
+                tensor, chunk, dtype_enum, shard_axes, info.tensor_size);
+            if (!metadata.has_value()) {
+                return std::nullopt;
+            }
+            info.metadata = *metadata;
+        }
         if (!info.valid()) {
             return std::nullopt;
         }
@@ -206,45 +353,6 @@ const LayoutAxis *find_layout_axis(const TensorMetadata &metadata,
     return nullptr;
 }
 
-enum class ReadTargetMode {
-    AS_STORED,
-    SHARD,
-    FULL,
-};
-
-struct ParallelAxisSpec {
-    std::string kind;
-    int rank{0};
-    int size{1};
-    std::optional<int> split_dim;
-    std::optional<int> expert_id;
-    std::optional<int> stage_id;
-};
-
-struct TensorParallelismSpec {
-    std::vector<ParallelAxisSpec> axes;
-};
-
-struct ReadTargetSpec {
-    ReadTargetMode mode{ReadTargetMode::AS_STORED};
-    std::optional<TensorParallelismSpec> parallelism;
-};
-
-struct TensorIntoFragment {
-    std::string read_key;
-    size_t dst_offset{0};
-    size_t src_offset{0};
-    size_t size{0};
-};
-
-struct TensorIntoPlan {
-    uintptr_t user_buffer_ptr{0};
-    uintptr_t registered_buffer_ptr{0};
-    size_t registered_buffer_size{0};
-    size_t total_length{0};
-    std::vector<TensorIntoFragment> fragments;
-};
-
 std::optional<LayoutAxisKind> parse_layout_axis_kind(const std::string &kind) {
     std::string normalized = kind;
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
@@ -261,6 +369,15 @@ bool is_tp_parallelism(const TensorParallelismSpec &parallelism) {
     return parallelism.axes.size() == 1 &&
            parse_layout_axis_kind(parallelism.axes[0].kind) ==
                std::optional<LayoutAxisKind>(LayoutAxisKind::TP);
+}
+
+bool axis_specs_equal(const ParallelAxisSpec &lhs, const ParallelAxisSpec &rhs) {
+    auto lhs_kind = parse_layout_axis_kind(lhs.kind);
+    auto rhs_kind = parse_layout_axis_kind(rhs.kind);
+    return lhs_kind.has_value() && rhs_kind.has_value() && lhs_kind == rhs_kind &&
+           lhs.rank == rhs.rank && lhs.size == rhs.size &&
+           lhs.split_dim == rhs.split_dim && lhs.expert_id == rhs.expert_id &&
+           lhs.stage_id == rhs.stage_id;
 }
 
 bool is_default_replicate_config(const ReplicateConfig &config) {
@@ -367,6 +484,190 @@ std::optional<ParallelAxisSpec> get_single_tp_axis(
         return std::nullopt;
     }
     return parallelism->axes[0];
+}
+
+std::optional<TensorParallelismSpec> validate_parallelism_spec(
+    const std::optional<TensorParallelismSpec> &parallelism,
+    const std::string &error_context, bool allow_empty = false) {
+    if (!parallelism.has_value()) {
+        if (allow_empty) {
+            return parallelism;
+        }
+        LOG(ERROR) << error_context << ": parallelism is required";
+        return std::nullopt;
+    }
+
+    if (parallelism->axes.empty()) {
+        if (allow_empty) {
+            return parallelism;
+        }
+        LOG(ERROR) << error_context << ": parallelism axes cannot be empty";
+        return std::nullopt;
+    }
+    if (parallelism->axes.size() > kMaxLayoutAxes) {
+        LOG(ERROR) << error_context << ": axis count exceeds max supported axes";
+        return std::nullopt;
+    }
+
+    std::unordered_set<int> seen_kinds;
+    for (const auto &axis : parallelism->axes) {
+        auto kind = parse_layout_axis_kind(axis.kind);
+        if (!kind.has_value()) {
+            LOG(ERROR) << error_context << ": unsupported axis kind "
+                       << axis.kind;
+            return std::nullopt;
+        }
+        if (axis.size <= 0 || axis.rank < 0 || axis.rank >= axis.size) {
+            LOG(ERROR) << error_context << ": invalid rank/size for axis "
+                       << axis.kind;
+            return std::nullopt;
+        }
+        if (!seen_kinds.insert(static_cast<int>(*kind)).second) {
+            LOG(ERROR) << error_context
+                       << ": duplicate axis kinds are not supported";
+            return std::nullopt;
+        }
+
+        switch (*kind) {
+            case LayoutAxisKind::TP:
+                if (!axis.split_dim.has_value()) {
+                    LOG(ERROR) << error_context
+                               << ": TP axis requires split_dim";
+                    return std::nullopt;
+                }
+                break;
+            case LayoutAxisKind::DP:
+                if (axis.split_dim.has_value()) {
+                    LOG(ERROR) << error_context
+                               << ": DP axis must not provide split_dim";
+                    return std::nullopt;
+                }
+                break;
+            case LayoutAxisKind::EP:
+                if (!axis.expert_id.has_value()) {
+                    LOG(ERROR) << error_context
+                               << ": EP axis requires expert_id";
+                    return std::nullopt;
+                }
+                if (axis.split_dim.has_value()) {
+                    LOG(ERROR) << error_context
+                               << ": EP axis must not provide split_dim in this phase";
+                    return std::nullopt;
+                }
+                break;
+            case LayoutAxisKind::PP:
+                if (!axis.stage_id.has_value()) {
+                    LOG(ERROR) << error_context
+                               << ": PP axis requires stage_id";
+                    return std::nullopt;
+                }
+                if (axis.split_dim.has_value()) {
+                    LOG(ERROR) << error_context
+                               << ": PP axis must not provide split_dim";
+                    return std::nullopt;
+                }
+                break;
+            default:
+                LOG(ERROR) << error_context << ": unsupported axis kind";
+                return std::nullopt;
+        }
+    }
+
+    return parallelism;
+}
+
+std::string normalize_axis_kind_string(LayoutAxisKind kind) {
+    switch (kind) {
+        case LayoutAxisKind::TP:
+            return "tp";
+        case LayoutAxisKind::DP:
+            return "dp";
+        case LayoutAxisKind::EP:
+            return "ep";
+        case LayoutAxisKind::PP:
+            return "pp";
+        default:
+            return "unknown";
+    }
+}
+
+std::string encode_axis_key_suffix(const ParallelAxisSpec &axis) {
+    auto kind = parse_layout_axis_kind(axis.kind);
+    if (!kind.has_value()) {
+        return "invalid";
+    }
+
+    std::string suffix = normalize_axis_kind_string(*kind) + "_" +
+                         std::to_string(axis.rank) + "of" +
+                         std::to_string(axis.size);
+    if (axis.split_dim.has_value()) {
+        suffix += "_sd" + std::to_string(axis.split_dim.value());
+    }
+    if (axis.expert_id.has_value()) {
+        suffix += "_eid" + std::to_string(axis.expert_id.value());
+    }
+    if (axis.stage_id.has_value()) {
+        suffix += "_sid" + std::to_string(axis.stage_id.value());
+    }
+    return suffix;
+}
+
+std::string get_parallelism_key_name(const std::string &base_key,
+                                     const TensorParallelismSpec &parallelism) {
+    if (is_tp_parallelism(parallelism)) {
+        return base_key + "_tp_" + std::to_string(parallelism.axes[0].rank);
+    }
+
+    std::string key = base_key;
+    for (const auto &axis : parallelism.axes) {
+        key += "__" + encode_axis_key_suffix(axis);
+    }
+    return key;
+}
+
+std::optional<TensorParallelismSpec> parallelism_from_metadata(
+    const TensorMetadata &metadata) {
+    if (!is_shard_tensor_metadata(metadata)) {
+        return std::nullopt;
+    }
+
+    TensorParallelismSpec parallelism;
+    parallelism.axes.reserve(metadata.layout.axis_count);
+    for (size_t i = 0; i < metadata.layout.axis_count; ++i) {
+        const auto &stored_axis = metadata.layout.axes[i];
+        auto kind = static_cast<LayoutAxisKind>(stored_axis.kind);
+        ParallelAxisSpec axis;
+        axis.kind = normalize_axis_kind_string(kind);
+        axis.rank = stored_axis.shard_rank;
+        axis.size = stored_axis.shard_count;
+        if (stored_axis.split_dim >= 0) {
+            axis.split_dim = stored_axis.split_dim;
+        }
+        if (kind == LayoutAxisKind::EP) {
+            axis.expert_id = stored_axis.reserved0;
+        }
+        if (kind == LayoutAxisKind::PP) {
+            axis.stage_id = stored_axis.reserved0;
+        }
+        parallelism.axes.push_back(axis);
+    }
+    return parallelism;
+}
+
+bool parallelism_matches_metadata(const TensorParallelismSpec &parallelism,
+                                  const TensorMetadata &metadata) {
+    auto stored_parallelism = parallelism_from_metadata(metadata);
+    if (!stored_parallelism.has_value() ||
+        stored_parallelism->axes.size() != parallelism.axes.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < parallelism.axes.size(); ++i) {
+        if (!axis_specs_equal(parallelism.axes[i], stored_parallelism->axes[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
@@ -659,9 +960,14 @@ class MooncakeStorePyWrapper {
             return get_tensor(key);
         }
         if (parsed_target->mode == ReadTargetMode::FULL) {
-            auto axis = get_single_tp_axis(parsed_target->parallelism,
-                                           "ReadTarget(mode=full)");
+            auto parallelism = validate_parallelism_spec(
+                parsed_target->parallelism, "ReadTarget(mode=full)");
+            if (!parallelism.has_value()) {
+                return pybind11::none();
+            }
+            auto axis = get_single_tp_axis(parallelism, "ReadTarget(mode=full)");
             if (!axis.has_value()) {
+                LOG(ERROR) << "ReadTarget(mode=full): multi-axis full reconstruction is not supported yet";
                 return pybind11::none();
             }
             return get_tensor_with_tp_full(key, axis->rank, axis->size,
@@ -669,13 +975,21 @@ class MooncakeStorePyWrapper {
                                            "get_tensor_with_parallelism");
         }
         if (parsed_target->mode == ReadTargetMode::SHARD) {
-            auto axis = get_single_tp_axis(parsed_target->parallelism,
-                                           "ReadTarget(mode=shard)");
-            if (!axis.has_value()) {
+            auto parallelism = validate_parallelism_spec(
+                parsed_target->parallelism, "ReadTarget(mode=shard)");
+            if (!parallelism.has_value()) {
                 return pybind11::none();
             }
-            return get_tensor_with_tp(key, axis->rank, axis->size,
-                                      axis->split_dim.value_or(0));
+            std::string read_key = get_parallelism_key_name(key, *parallelism);
+            auto metadata = get_tensor_metadata(read_key);
+            if (!metadata.has_value()) {
+                return pybind11::none();
+            }
+            if (!parallelism_matches_metadata(*parallelism, metadata->metadata)) {
+                LOG(ERROR) << "Parallelism metadata mismatch for key " << read_key;
+                return pybind11::none();
+            }
+            return get_tensor(read_key);
         }
         LOG(ERROR) << "Unsupported ReadTarget mode";
         return pybind11::none();
@@ -746,24 +1060,21 @@ class MooncakeStorePyWrapper {
             return build_tensor_into_plan(key, buffer_ptr, size, context);
         }
 
-        auto axis = get_single_tp_axis(parsed_target->parallelism, context);
-        if (!axis.has_value()) {
+        auto parallelism = validate_parallelism_spec(parsed_target->parallelism,
+                                                     context);
+        if (!parallelism.has_value()) {
             return std::nullopt;
         }
 
         if (parsed_target->mode == ReadTargetMode::SHARD) {
-            std::string read_key =
-                resolve_tp_read_key(key, axis->rank, axis->size);
+            std::string read_key = get_parallelism_key_name(key, *parallelism);
             auto metadata = get_tensor_metadata(read_key);
             if (!metadata.has_value()) {
                 return std::nullopt;
             }
-            const LayoutAxis *tp_axis =
-                find_layout_axis(metadata->metadata, LayoutAxisKind::TP);
-            if (axis->size > 1 &&
-                (!is_shard_tensor_metadata(metadata->metadata) || !tp_axis ||
-                 tp_axis->shard_rank != axis->rank)) {
-                LOG(ERROR) << "TP metadata mismatch for key " << read_key;
+            if (!parallelism_matches_metadata(*parallelism, metadata->metadata)) {
+                LOG(ERROR) << context << ": parallelism metadata mismatch for key "
+                           << read_key;
                 return std::nullopt;
             }
             return build_tensor_into_plan(read_key, buffer_ptr, size, context,
@@ -771,6 +1082,12 @@ class MooncakeStorePyWrapper {
         }
 
         if (parsed_target->mode == ReadTargetMode::FULL) {
+            auto axis = get_single_tp_axis(parallelism, context);
+            if (!axis.has_value()) {
+                LOG(ERROR) << context
+                           << ": multi-axis full reconstruction is not supported yet";
+                return std::nullopt;
+            }
             return build_tp_full_tensor_into_plan(key, buffer_ptr, size, *axis,
                                                   context);
         }
@@ -1637,19 +1954,39 @@ class MooncakeStorePyWrapper {
     int put_tensor_with_tp_impl(
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
-        int tp_size = 1, int split_dim = 0) {
+        int tp_size = 1, int split_dim = 0,
+        const std::vector<ParallelAxisSpec> &axes = {}) {
         try {
             auto shard_infos = build_tp_shard_infos(
                 tensor, tp_size, split_dim,
-                [&](int rank) { return get_tp_key_name(key, rank); });
+                [&](int rank) {
+                    if (axes.empty()) {
+                        return get_tp_key_name(key, rank);
+                    }
+                    auto shard_axes = axes;
+                    auto tp_axis_index = find_tp_axis_index(shard_axes);
+                    shard_axes[*tp_axis_index].rank = rank;
+                    return get_parallelism_key_name(key,
+                                                    TensorParallelismSpec{shard_axes});
+                },
+                axes);
             if (!shard_infos.has_value()) {
                 LOG(ERROR) << "Failed to build TP shard plan";
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             for (int rank = 0; rank < tp_size; ++rank) {
-                int ret = put_tensor_impl(get_tp_key_name(key, rank),
-                                          (*shard_infos)[rank], config);
+                std::string shard_key;
+                if (axes.empty()) {
+                    shard_key = get_tp_key_name(key, rank);
+                } else {
+                    auto shard_axes = axes;
+                    auto tp_axis_index = find_tp_axis_index(shard_axes);
+                    shard_axes[*tp_axis_index].rank = rank;
+                    shard_key =
+                        get_parallelism_key_name(key, TensorParallelismSpec{shard_axes});
+                }
+                int ret = put_tensor_impl(shard_key, (*shard_infos)[rank], config);
                 if (ret != 0) return ret;
             }
             return 0;
@@ -1679,20 +2016,33 @@ class MooncakeStorePyWrapper {
         const py::object &parallelism = py::none(),
         const ReplicateConfig &config = ReplicateConfig{}) {
         if (!parallelism.is_none()) {
-            auto parsed_parallelism =
-                parse_tensor_parallelism_spec(parallelism);
+            auto parsed_parallelism = validate_parallelism_spec(
+                parse_tensor_parallelism_spec(parallelism),
+                "put_tensor_with_parallelism");
             if (!parsed_parallelism.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            if (!is_tp_parallelism(*parsed_parallelism)) {
-                LOG(ERROR) << "Only single-axis TP parallelism is supported in "
-                              "this phase";
+            if (is_tp_parallelism(*parsed_parallelism)) {
+                const auto &axis = parsed_parallelism->axes[0];
+                return put_tensor_with_tp_impl(key, tensor, config, axis.rank,
+                                               axis.size,
+                                               axis.split_dim.value_or(0));
+            }
+            auto tp_axis_index = find_tp_axis_index(parsed_parallelism->axes);
+            if (tp_axis_index.has_value()) {
+                const auto &axis = parsed_parallelism->axes[*tp_axis_index];
+                return put_tensor_with_tp_impl(key, tensor, config, axis.rank,
+                                               axis.size,
+                                               axis.split_dim.value_or(0),
+                                               parsed_parallelism->axes);
+            }
+            auto info = build_non_tp_shard_info(tensor, parsed_parallelism->axes,
+                                                key);
+            if (!info.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            const auto &axis = parsed_parallelism->axes[0];
-            return put_tensor_with_tp_impl(key, tensor, config, axis.rank,
-                                           axis.size,
-                                           axis.split_dim.value_or(0));
+            return put_tensor_impl(get_parallelism_key_name(key, *parsed_parallelism),
+                                   *info, config);
         }
 
         if (!is_client_initialized() || use_dummy_client_) {
@@ -2050,27 +2400,21 @@ class MooncakeStorePyWrapper {
             return put_tensor_from(key, buffer_ptr, size);
         }
 
-        auto axis =
-            get_single_tp_axis(parse_tensor_parallelism_spec(parallelism),
-                               "put_tensor_with_parallelism_from");
-        if (!axis.has_value()) {
+        auto parsed_parallelism = validate_parallelism_spec(
+            parse_tensor_parallelism_spec(parallelism),
+            "put_tensor_with_parallelism_from");
+        if (!parsed_parallelism.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (!is_default_replicate_config(config)) {
-            pybind11::object tensor =
-                buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
-                                 static_cast<int64_t>(size));
-            if (tensor.is_none()) {
-                LOG(ERROR) << "Failed to decode tensor buffer for "
-                              "put_tensor_with_parallelism_from";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-            return put_tensor_with_tp_impl(key, tensor, config, axis->rank,
-                                           axis->size,
-                                           axis->split_dim.value_or(0));
+        pybind11::object tensor =
+            buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
+                             static_cast<int64_t>(size));
+        if (tensor.is_none()) {
+            LOG(ERROR) << "Failed to decode tensor buffer for "
+                          "put_tensor_with_parallelism_from";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return put_tensor_with_tp_from(key, buffer_ptr, size, axis->rank,
-                                       axis->size, axis->split_dim.value_or(0));
+        return put_tensor_with_parallelism(key, tensor, parallelism, config);
     }
 
     std::vector<int> batch_put_tensor_with_tp_from(
@@ -2248,19 +2592,39 @@ class MooncakeStorePyWrapper {
     int upsert_tensor_with_tp_impl(
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
-        int tp_size = 1, int split_dim = 0) {
+        int tp_size = 1, int split_dim = 0,
+        const std::vector<ParallelAxisSpec> &axes = {}) {
         try {
             auto shard_infos = build_tp_shard_infos(
                 tensor, tp_size, split_dim,
-                [&](int rank) { return get_tp_key_name(key, rank); });
+                [&](int rank) {
+                    if (axes.empty()) {
+                        return get_tp_key_name(key, rank);
+                    }
+                    auto shard_axes = axes;
+                    auto tp_axis_index = find_tp_axis_index(shard_axes);
+                    shard_axes[*tp_axis_index].rank = rank;
+                    return get_parallelism_key_name(key,
+                                                    TensorParallelismSpec{shard_axes});
+                },
+                axes);
             if (!shard_infos.has_value()) {
                 LOG(ERROR) << "Failed to build TP upsert shard plan";
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             for (int rank = 0; rank < tp_size; ++rank) {
-                int ret = upsert_tensor_impl(get_tp_key_name(key, rank),
-                                             (*shard_infos)[rank], config);
+                std::string shard_key;
+                if (axes.empty()) {
+                    shard_key = get_tp_key_name(key, rank);
+                } else {
+                    auto shard_axes = axes;
+                    auto tp_axis_index = find_tp_axis_index(shard_axes);
+                    shard_axes[*tp_axis_index].rank = rank;
+                    shard_key =
+                        get_parallelism_key_name(key, TensorParallelismSpec{shard_axes});
+                }
+                int ret = upsert_tensor_impl(shard_key, (*shard_infos)[rank], config);
                 if (ret != 0) return ret;
             }
             return 0;
@@ -2289,20 +2653,33 @@ class MooncakeStorePyWrapper {
         const py::object &parallelism = py::none(),
         const ReplicateConfig &config = ReplicateConfig{}) {
         if (!parallelism.is_none()) {
-            auto parsed_parallelism =
-                parse_tensor_parallelism_spec(parallelism);
+            auto parsed_parallelism = validate_parallelism_spec(
+                parse_tensor_parallelism_spec(parallelism),
+                "upsert_tensor_with_parallelism");
             if (!parsed_parallelism.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            if (!is_tp_parallelism(*parsed_parallelism)) {
-                LOG(ERROR) << "Only single-axis TP parallelism is supported in "
-                              "this phase";
+            if (is_tp_parallelism(*parsed_parallelism)) {
+                const auto &axis = parsed_parallelism->axes[0];
+                return upsert_tensor_with_tp_impl(key, tensor, config, axis.rank,
+                                                  axis.size,
+                                                  axis.split_dim.value_or(0));
+            }
+            auto tp_axis_index = find_tp_axis_index(parsed_parallelism->axes);
+            if (tp_axis_index.has_value()) {
+                const auto &axis = parsed_parallelism->axes[*tp_axis_index];
+                return upsert_tensor_with_tp_impl(key, tensor, config, axis.rank,
+                                                  axis.size,
+                                                  axis.split_dim.value_or(0),
+                                                  parsed_parallelism->axes);
+            }
+            auto info = build_non_tp_shard_info(tensor, parsed_parallelism->axes,
+                                                key);
+            if (!info.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            const auto &axis = parsed_parallelism->axes[0];
-            return upsert_tensor_with_tp_impl(key, tensor, config, axis.rank,
-                                              axis.size,
-                                              axis.split_dim.value_or(0));
+            return upsert_tensor_impl(
+                get_parallelism_key_name(key, *parsed_parallelism), *info, config);
         }
 
         if (!is_client_initialized() || use_dummy_client_) {
@@ -2364,10 +2741,10 @@ class MooncakeStorePyWrapper {
             return upsert_tensor_from(key, buffer_ptr, size);
         }
 
-        auto axis =
-            get_single_tp_axis(parse_tensor_parallelism_spec(parallelism),
-                               "upsert_tensor_with_parallelism_from");
-        if (!axis.has_value()) {
+        auto parsed_parallelism = validate_parallelism_spec(
+            parse_tensor_parallelism_spec(parallelism),
+            "upsert_tensor_with_parallelism_from");
+        if (!parsed_parallelism.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         pybind11::object tensor =
@@ -2378,9 +2755,7 @@ class MooncakeStorePyWrapper {
                           "upsert_tensor_with_parallelism_from";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return upsert_tensor_with_tp_impl(key, tensor, config, axis->rank,
-                                          axis->size,
-                                          axis->split_dim.value_or(0));
+        return upsert_tensor_with_parallelism(key, tensor, parallelism, config);
     }
 
     std::vector<int> batch_upsert_tensor_from(
