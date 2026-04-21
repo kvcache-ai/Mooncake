@@ -128,10 +128,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         client_registered ? HAClientState::FULL : HAClientState::DEGRADED;
     ha_manager_ = std::make_unique<HARecoveryManager>(
         client_id_, master_client_, data_manager_, async_route_notifier_,
-        view_version_);
-    ha_manager_->SetState(initial_state);
-    LOG(INFO) << "HA recovery manager initialized with state: "
-              << initial_state;
+        view_version_, initial_state);
 
     // 4. Start heartbeat immediately after registration so master does not
     //    consider this client disconnected during a lengthy initialization.

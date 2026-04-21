@@ -409,11 +409,14 @@ class ClientService {
     /**
      * @brief Attempts to reconnect to master after heartbeat failures.
      * For HA mode, fetches the latest master address from etcd.
-     * For non-HA mode, reconnects to the same address.
+     * For non-HA mode, reconnects to the current_master_address.
+     * @param is_ha_mode Whether HA mode is enabled.
+     * @param current_master_address Current master address, may be updated
+     * after successful reconnection in HA mode.
      * @return true if reconnect succeeded, false otherwise.
      */
-    bool ReconnectToMaster(bool is_ha_mode, std::string& current_master_address,
-                           const std::string& master_server_entry);
+    bool ReconnectToMaster(bool is_ha_mode,
+                           std::string& current_master_address);
 
     /**
      * @brief Waits for the next heartbeat interval using condition variable.

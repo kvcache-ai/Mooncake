@@ -508,8 +508,7 @@ void ClientService::HeartbeatThreadMain(
                     connection_interrupted_ = true;
                 }
                 // Attempt reconnect
-                if (ReconnectToMaster(is_ha_mode, current_master_address,
-                                      master_server_entry)) {
+                if (ReconnectToMaster(is_ha_mode, current_master_address)) {
                     heartbeat_fail_count = 0;
                     // Do NOT sleep here, immediately loop back to send
                     // heartbeat so the client can discover UNDEFINED status and
@@ -585,8 +584,7 @@ void ClientService::HandleHeartbeatTaskResult(
 }
 
 bool ClientService::ReconnectToMaster(bool is_ha_mode,
-                                      std::string& current_master_address,
-                                      const std::string& master_server_entry) {
+                                      std::string& current_master_address) {
     if (is_ha_mode) {
         LOG(ERROR) << "Heartbeat failure threshold exceeded;"
                    << " fetching latest master view and reconnecting";
