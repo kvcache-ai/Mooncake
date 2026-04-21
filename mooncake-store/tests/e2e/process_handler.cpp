@@ -13,16 +13,17 @@
 #include <sstream>
 #include <vector>
 
+#include "master_config.h"
+
 namespace mooncake {
 namespace testing {
 
 namespace {
 
 std::string ResolveMasterBackendConnstring(const MasterRunnerConfig& config) {
-    if (!config.ha_backend_connstring.empty()) {
-        return config.ha_backend_connstring;
-    }
-    return config.etcd_endpoints;
+    return ResolveConfiguredHABackendConnstring(
+        config.ha_backend_type, config.ha_backend_connstring,
+        config.etcd_endpoints);
 }
 
 }  // namespace

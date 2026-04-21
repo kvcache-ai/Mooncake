@@ -3,6 +3,8 @@
 #include <gflags/gflags.h>
 #include <string>
 
+#include "master_config.h"
+
 DECLARE_string(etcd_endpoints);
 DECLARE_string(ha_backend_type);
 DECLARE_string(ha_backend_connstring);
@@ -31,8 +33,8 @@ namespace testing {
                   "HA backend type for tests: etcd | redis | k8s");
 #define FLAG_ha_backend_connstring                                          \
     DEFINE_string(ha_backend_connstring, "",                                \
-                  "HA backend connection string for tests; if unset, fall " \
-                  "back to etcd_endpoints");
+                  "HA backend connection string for tests; if unset, only "  \
+                  "backend_type=etcd falls back to etcd_endpoints");
 #define FLAG_master_path                                               \
     DEFINE_string(master_path, "./mooncake-store/src/mooncake_master", \
                   "Path to the master executable");
@@ -48,10 +50,9 @@ namespace testing {
                  "Random seed, 0 means use current time as seed");
 
 inline std::string ResolveTestHABackendConnstring() {
-    if (!::FLAGS_ha_backend_connstring.empty()) {
-        return ::FLAGS_ha_backend_connstring;
-    }
-    return ::FLAGS_etcd_endpoints;
+    return ResolveConfiguredHABackendConnstring(
+        ::FLAGS_ha_backend_type, ::FLAGS_ha_backend_connstring,
+        ::FLAGS_etcd_endpoints);
 }
 
 inline std::string NormalizeConnstringScheme(const std::string& connstring) {

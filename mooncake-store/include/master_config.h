@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 
 #include <glog/logging.h>
 
@@ -9,6 +10,18 @@
 #include "types.h"
 
 namespace mooncake {
+
+inline std::string ResolveConfiguredHABackendConnstring(
+    std::string_view ha_backend_type, std::string_view ha_backend_connstring,
+    std::string_view etcd_endpoints) {
+    if (!ha_backend_connstring.empty()) {
+        return std::string(ha_backend_connstring);
+    }
+    if (ha_backend_type == "etcd") {
+        return std::string(etcd_endpoints);
+    }
+    return {};
+}
 
 // The configuration for the master server
 struct MasterConfig {
@@ -180,11 +193,9 @@ class MasterServiceSupervisorConfig {
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
         ha_backend_type = config.ha_backend_type;
-        ha_backend_connstring = config.ha_backend_connstring;
         etcd_endpoints = config.etcd_endpoints;
-        if (ha_backend_connstring.empty()) {
-            ha_backend_connstring = etcd_endpoints;
-        }
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -346,10 +357,9 @@ class WrappedMasterServiceConfig {
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         ha_backend_type = config.ha_backend_type;
-        ha_backend_connstring = config.ha_backend_connstring;
-        if (ha_backend_connstring.empty()) {
-            ha_backend_connstring = config.etcd_endpoints;
-        }
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring,
+            config.etcd_endpoints);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -426,10 +436,9 @@ class WrappedMasterServiceConfig {
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
         ha_backend_type = config.ha_backend_type;
-        ha_backend_connstring = config.ha_backend_connstring;
-        if (ha_backend_connstring.empty()) {
-            ha_backend_connstring = config.etcd_endpoints;
-        }
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring,
+            config.etcd_endpoints);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;

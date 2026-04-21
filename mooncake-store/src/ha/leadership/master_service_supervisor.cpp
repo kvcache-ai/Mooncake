@@ -55,10 +55,9 @@ void TryClearLeaderLabel(const MasterServiceSupervisorConfig& config) {
 
 std::string ResolveHABackendConnstring(
     const MasterServiceSupervisorConfig& config) {
-    if (!config.ha_backend_connstring.empty()) {
-        return config.ha_backend_connstring;
-    }
-    return config.etcd_endpoints;
+    return ResolveConfiguredHABackendConnstring(config.ha_backend_type,
+                                                config.ha_backend_connstring,
+                                                config.etcd_endpoints);
 }
 
 tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
