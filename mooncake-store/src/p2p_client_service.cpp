@@ -466,6 +466,13 @@ void P2PClientService::OnHAEvent(HAEvent event) {
     if (ha_manager_) ha_manager_->HandleEvent(event);
 }
 
+std::string P2PClientService::GetHealthStatus() const {
+    if (ha_manager_) {
+        return toString(ha_manager_->GetState());
+    }
+    return "OK";
+}
+
 // ============================================================================
 // Put Operations
 // ============================================================================

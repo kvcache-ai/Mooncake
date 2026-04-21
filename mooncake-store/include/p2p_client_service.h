@@ -171,6 +171,8 @@ class P2PClientService final : public ClientService {
 
     MasterClient& GetMasterClient() override { return master_client_; }
 
+    std::string GetHealthStatus() const override;
+
    private:
     /**
      * @brief init TieredBackend and DataManager

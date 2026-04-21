@@ -318,6 +318,12 @@ class ClientService {
      */
     bool IsMetricsHttpEnabled() const { return enable_metrics_http_; }
 
+    /**
+     * @brief Gets the health status for the /health endpoint.
+     * @return A string representing the health status.
+     */
+    virtual std::string GetHealthStatus() const { return "OK"; }
+
    public:
     /**
      * @brief Gets the local transport endpoint (IP and port).
