@@ -41,12 +41,13 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 #  Constants
 # ==========================================
 
-# Must match C++ TensorMetadata layout
-TENSOR_METADATA_SIZE = 4 + 4 + 8 * 4  # 40 bytes
+# Must match current C++ TensorMetadata layout.
+# TensorObjectHeader (40) + TensorLayoutMetadata (224) = 264 bytes.
+TENSOR_METADATA_SIZE = 264
 
 
 def serialized_tensor_size(tensor):
-    """Size of [TensorMetadata][tensor data] as stored by get_tensor_into."""
+    """Size of [TensorObjectHeader+layout metadata][tensor data]."""
     return TENSOR_METADATA_SIZE + tensor.numel() * tensor.element_size()
 
 
@@ -466,6 +467,125 @@ class TestUpsertPubTensor(UpsertTestBase):
         self.assertTrue(torch.equal(t2, got))
 
 
+class TestUpsertTpTensor(UpsertTestBase):
+    """TP variants for tensor upsert / pub upsert."""
+
+    def test_upsert_tensor_with_tp(self):
+        tp_size = 2
+        split_dim = 1
+        key = "tp_upsert_single"
+        original = torch.arange(24, dtype=torch.float32).view(4, 6).contiguous()
+        updated = (original + 100).contiguous()
+
+        self.assertEqual(
+            self.store.put_tensor_with_tp(key, original, tp_size=tp_size,
+                                          split_dim=split_dim),
+            0,
+        )
+        self.assertEqual(
+            self.store.upsert_tensor_with_tp(key, updated, tp_size=tp_size,
+                                             split_dim=split_dim),
+            0,
+        )
+
+        expected_chunks = updated.chunk(tp_size, split_dim)
+        for rank in range(tp_size):
+            got = self.store.get_tensor_with_tp(key, tp_rank=rank,
+                                                tp_size=tp_size,
+                                                split_dim=split_dim)
+            self.assertTrue(torch.equal(got, expected_chunks[rank]))
+
+    def test_batch_upsert_tensor_with_tp(self):
+        tp_size = 2
+        split_dim = 0
+        keys = ["tp_batch_upsert_0", "tp_batch_upsert_1"]
+        originals = [torch.arange(16, dtype=torch.float32).view(4, 4).contiguous(),
+                     torch.arange(16, 32, dtype=torch.float32).view(4, 4).contiguous()]
+        updates = [(t + 1000).contiguous() for t in originals]
+
+        self.assertEqual(
+            list(self.store.batch_put_tensor_with_tp(keys, originals,
+                                                     tp_size=tp_size,
+                                                     split_dim=split_dim)),
+            [0, 0],
+        )
+        self.assertEqual(
+            list(self.store.batch_upsert_tensor_with_tp(keys, updates,
+                                                        tp_size=tp_size,
+                                                        split_dim=split_dim)),
+            [0, 0],
+        )
+
+        for rank in range(tp_size):
+            got_shards = self.store.batch_get_tensor_with_tp(
+                keys, tp_rank=rank, tp_size=tp_size)
+            expected_shards = [tensor.chunk(tp_size, split_dim)[rank]
+                               for tensor in updates]
+            for got, expected in zip(got_shards, expected_shards):
+                self.assertTrue(torch.equal(got, expected))
+
+    def test_upsert_pub_tensor_with_tp(self):
+        tp_size = 2
+        split_dim = 1
+        key = "tp_upsert_pub_single"
+        config = ReplicateConfig()
+        config.replica_num = 1
+        base = torch.ones(4, 6, dtype=torch.float32).contiguous()
+        updated = torch.full((4, 6), 7.0, dtype=torch.float32).contiguous()
+
+        self.assertEqual(
+            self.store.pub_tensor_with_tp(key, base, config=config,
+                                          tp_size=tp_size,
+                                          split_dim=split_dim),
+            0,
+        )
+        self.assertEqual(
+            self.store.upsert_pub_tensor_with_tp(key, updated, config=config,
+                                                 tp_size=tp_size,
+                                                 split_dim=split_dim),
+            0,
+        )
+
+        expected_chunks = updated.chunk(tp_size, split_dim)
+        for rank in range(tp_size):
+            got = self.store.get_tensor_with_tp(key, tp_rank=rank,
+                                                tp_size=tp_size,
+                                                split_dim=split_dim)
+            self.assertTrue(torch.equal(got, expected_chunks[rank]))
+
+    def test_batch_upsert_pub_tensor_with_tp(self):
+        tp_size = 2
+        split_dim = 0
+        config = ReplicateConfig()
+        config.replica_num = 1
+        keys = ["tp_upsert_pub_batch_0", "tp_upsert_pub_batch_1"]
+        base = [torch.ones(4, 4, dtype=torch.float32).contiguous(),
+                torch.full((4, 4), 2.0, dtype=torch.float32).contiguous()]
+        updates = [torch.full((4, 4), 9.0, dtype=torch.float32).contiguous(),
+                   torch.full((4, 4), 11.0, dtype=torch.float32).contiguous()]
+
+        self.assertEqual(
+            list(self.store.batch_pub_tensor_with_tp(keys, base, config=config,
+                                                     tp_size=tp_size,
+                                                     split_dim=split_dim)),
+            [0, 0],
+        )
+        self.assertEqual(
+            list(self.store.batch_upsert_pub_tensor_with_tp(
+                keys, updates, config=config, tp_size=tp_size,
+                split_dim=split_dim)),
+            [0, 0],
+        )
+
+        for rank in range(tp_size):
+            got_shards = self.store.batch_get_tensor_with_tp(
+                keys, tp_rank=rank, tp_size=tp_size)
+            expected_shards = [tensor.chunk(tp_size, split_dim)[rank]
+                               for tensor in updates]
+            for got, expected in zip(got_shards, expected_shards):
+                self.assertTrue(torch.equal(got, expected))
+
+
 # ==========================================
 #  6. Mixed Scenarios
 # ==========================================
@@ -522,7 +642,10 @@ if __name__ == "__main__":
     print("   Raw bytes:  upsert, upsert_parts, upsert_batch,")
     print("               upsert_from, batch_upsert_from")
     print("   Tensor:     upsert_tensor, batch_upsert_tensor,")
-    print("               upsert_tensor_from, batch_upsert_tensor_from")
-    print("   Pub tensor: upsert_pub_tensor, batch_upsert_pub_tensor")
+    print("               upsert_tensor_from, batch_upsert_tensor_from,")
+    print("               upsert_tensor_with_tp, batch_upsert_tensor_with_tp")
+    print("   Pub tensor: upsert_pub_tensor, batch_upsert_pub_tensor,")
+    print("               upsert_pub_tensor_with_tp,")
+    print("               batch_upsert_pub_tensor_with_tp")
     print("   Mixed:      cross-interface, sequential, size changes")
     unittest.main(verbosity=2)

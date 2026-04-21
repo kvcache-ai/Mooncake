@@ -1824,7 +1824,7 @@ def upsert_tensor(self, key: str, tensor: torch.Tensor) -> int
 #### upsert_tensor_from()
 
 Upsert a tensor directly from a pre-allocated buffer. The buffer layout must be
-`[TensorMetadata][tensor data]`, matching the layout used by
+`[TensorObjectHeader+layout metadata][tensor data]`, matching the layout used by
 `get_tensor_into()`.
 
 ```python
@@ -1844,7 +1844,7 @@ def upsert_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
 #### batch_upsert_tensor_from()
 
 Upsert multiple tensors directly from pre-allocated buffers. Each buffer must
-use layout `[TensorMetadata][tensor data]`.
+use layout `[TensorObjectHeader+layout metadata][tensor data]`.
 
 ```python
 def batch_upsert_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]
@@ -1857,6 +1857,25 @@ def batch_upsert_tensor_from(self, keys: List[str], buffer_ptrs: List[int], size
 
 **Returns:**
 - `List[int]`: List of status codes for each tensor upsert
+
+#### upsert_tensor_with_tp()
+
+Upsert a full PyTorch tensor into the store, splitting it into TP shards stored
+under `key_tp_<rank>`.
+
+```python
+def upsert_tensor_with_tp(self, key: str, tensor: torch.Tensor, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> int
+```
+
+**Parameters:**
+- `key` (str): Base object identifier
+- `tensor` (torch.Tensor): Full tensor to shard and upsert
+- `tp_rank` (int): Compatibility parameter retained by the API
+- `tp_size` (int): Total tensor parallel size
+- `split_dim` (int): The dimension used for chunking
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
 
 #### batch_upsert_tensor()
 
@@ -1909,6 +1928,26 @@ if result == 0:
     print("Tensor upserted successfully")
 ```
 
+#### upsert_pub_tensor_with_tp()
+
+Upsert a full PyTorch tensor with replication settings, splitting it into TP
+shards stored under `key_tp_<rank>`.
+
+```python
+def upsert_pub_tensor_with_tp(self, key: str, tensor: torch.Tensor, config: ReplicateConfig = None, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> int
+```
+
+**Parameters:**
+- `key` (str): Base object identifier
+- `tensor` (torch.Tensor): Full tensor to shard and upsert
+- `config` (ReplicateConfig, optional): Replication configuration
+- `tp_rank` (int): Compatibility parameter retained by the API
+- `tp_size` (int): Total tensor parallel size
+- `split_dim` (int): The dimension used for chunking
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
 #### batch_upsert_pub_tensor()
 
 Batch upsert PyTorch tensors with configurable replication settings (insert or update).
@@ -1926,6 +1965,45 @@ def batch_upsert_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tens
 - `List[int]`: List of status codes for each tensor operation.
 
 **Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+
+#### batch_upsert_tensor_with_tp()
+
+Upsert a batch of full PyTorch tensors, splitting each one into TP shards stored
+under `base_key_tp_<rank>`.
+
+```python
+def batch_upsert_tensor_with_tp(self, base_keys: List[str], tensors_list: List[torch.Tensor], tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> List[int]
+```
+
+**Parameters:**
+- `base_keys` (List[str]): Base object identifiers
+- `tensors_list` (List[torch.Tensor]): Full tensors to shard and upsert
+- `tp_rank` (int): Compatibility parameter retained by the API
+- `tp_size` (int): Total tensor parallel size
+- `split_dim` (int): The dimension used for chunking
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor operation.
+
+#### batch_upsert_pub_tensor_with_tp()
+
+Upsert a batch of full PyTorch tensors with replication settings, splitting each
+one into TP shards stored under `base_key_tp_<rank>`.
+
+```python
+def batch_upsert_pub_tensor_with_tp(self, base_keys: List[str], tensors_list: List[torch.Tensor], config: ReplicateConfig = None, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> List[int]
+```
+
+**Parameters:**
+- `base_keys` (List[str]): Base object identifiers
+- `tensors_list` (List[torch.Tensor]): Full tensors to shard and upsert
+- `config` (ReplicateConfig, optional): Replication configuration
+- `tp_rank` (int): Compatibility parameter retained by the API
+- `tp_size` (int): Total tensor parallel size
+- `split_dim` (int): The dimension used for chunking
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor operation.
 
 ---
 
@@ -1997,7 +2075,7 @@ def get_tensor_with_tp_into(self, key: str, buffer_ptr: int, size: int, tp_rank:
 Get a batch of PyTorch tensor shards from the store for a given Tensor Parallel rank, directly into the pre-allocated buffer.
 
 ```python
-def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1) -> List[torch.Tensor]
+def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> List[torch.Tensor]
 ```
 
 **Parameters:**

@@ -29,12 +29,13 @@ DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024    # 8 GB
 DEFAULT_MASTER_METRICS_PORT = 9003
 DEFAULT_CHECK_SERVER = False
 
-# Must match C++ TensorMetadata: int32_t dtype + int32_t ndim + int64_t shape[4]
-TENSOR_METADATA_SIZE = 4 + 4 + 8 * 4  # 40 bytes
+# Must match current C++ TensorMetadata layout.
+# TensorObjectHeader (40) + TensorLayoutMetadata (224) = 264 bytes.
+TENSOR_METADATA_SIZE = 264
 
 
 def serialized_tensor_size(tensor):
-    """Size in bytes of [TensorMetadata][tensor data] as stored by get_tensor_into."""
+    """Size in bytes of [TensorObjectHeader+layout metadata][tensor data]."""
     return TENSOR_METADATA_SIZE + tensor.numel() * tensor.element_size()
 
 def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
