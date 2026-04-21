@@ -18,6 +18,9 @@ class WrappedP2PMasterService final : public WrappedMasterService {
     tl::expected<WriteRouteResponse, ErrorCode> GetWriteRoute(
         const WriteRouteRequest& req);
 
+    BatchGetWriteRouteResponse BatchGetWriteRoute(
+        const BatchGetWriteRouteRequest& req);
+
     tl::expected<void, ErrorCode> AddReplica(const AddReplicaRequest& req);
 
     tl::expected<void, ErrorCode> RemoveReplica(

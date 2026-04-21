@@ -23,6 +23,13 @@ class P2PMasterService : public MasterService {
         -> tl::expected<WriteRouteResponse, ErrorCode>;
 
     /**
+     * @brief Batch get write routes for multiple keys.
+     *        Reuses GetWriteRoute logic per key.
+     */
+    auto BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
+        -> BatchGetWriteRouteResponse;
+
+    /**
      * @brief Add a route replica to master
      */
     auto AddReplica(const AddReplicaRequest& req)

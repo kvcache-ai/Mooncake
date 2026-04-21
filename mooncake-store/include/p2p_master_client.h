@@ -24,6 +24,12 @@ class P2PMasterClient final : public MasterClient {
         const WriteRouteRequest& req);
 
     /**
+     * @brief Batch gets write candidate routes for multiple keys in one RPC
+     */
+    [[nodiscard]] tl::expected<BatchGetWriteRouteResponse, ErrorCode>
+    BatchGetWriteRoute(const BatchGetWriteRouteRequest& req);
+
+    /**
      * @brief Adds a replica to master
      */
     [[nodiscard]] tl::expected<void, ErrorCode> AddReplica(

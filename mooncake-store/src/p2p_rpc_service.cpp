@@ -13,6 +13,9 @@ void RegisterP2PRpcService(
     RegisterRpcService(server, wrapped_master_service);
     server.register_handler<&mooncake::WrappedP2PMasterService::GetWriteRoute>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedP2PMasterService::BatchGetWriteRoute>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedP2PMasterService::AddReplica>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedP2PMasterService::RemoveReplica>(
@@ -35,6 +38,35 @@ WrappedP2PMasterService::GetWriteRoute(const WriteRouteRequest& req) {
         [&](auto& timer) { timer.LogRequest("key=", req.key); },
         [] { MasterMetricManager::instance().inc_get_write_route_requests(); },
         [] { MasterMetricManager::instance().inc_get_write_route_failures(); });
+}
+
+BatchGetWriteRouteResponse WrappedP2PMasterService::BatchGetWriteRoute(
+    const BatchGetWriteRouteRequest& req) {
+    ScopedVLogTimer timer(1, "BatchGetWriteRoute");
+    const size_t total = req.keys.size();
+    timer.LogRequest("client_id=", req.client_id, ", key_count=", total);
+    MasterMetricManager::instance().inc_batch_get_write_route_requests(total);
+
+    auto response = master_service_.BatchGetWriteRoute(req);
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < response.error_codes.size(); ++i) {
+        if (response.error_codes[i] != ErrorCode::OK) {
+            failure_count++;
+            LOG(ERROR) << "BatchGetWriteRoute failed for key '" << req.keys[i]
+                       << "': " << toString(response.error_codes[i]);
+        }
+    }
+    if (failure_count == total && total > 0) {
+        MasterMetricManager::instance().inc_batch_get_write_route_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance()
+            .inc_batch_get_write_route_partial_success(failure_count);
+    }
+    timer.LogResponse("total=", total, ", success=", total - failure_count,
+                      ", failures=", failure_count);
+    return response;
 }
 
 tl::expected<void, ErrorCode> WrappedP2PMasterService::AddReplica(

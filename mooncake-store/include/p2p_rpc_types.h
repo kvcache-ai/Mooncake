@@ -72,6 +72,27 @@ struct WriteRouteResponse {
 YLT_REFL(WriteRouteResponse, candidates);
 
 /**
+ * @brief Request for batch write route lookup.
+ */
+struct BatchGetWriteRouteRequest {
+    UUID client_id;
+    std::vector<std::string> keys;
+    std::vector<size_t> sizes;
+    WriteRouteRequestConfig config;  // shared config for all keys
+};
+YLT_REFL(BatchGetWriteRouteRequest, client_id, keys, sizes, config);
+
+/**
+ * @brief Response for batch write route lookup.
+ *        responses[i] and error_codes[i] correspond to keys[i] in the request.
+ */
+struct BatchGetWriteRouteResponse {
+    std::vector<WriteRouteResponse> responses;  // valid when error_codes[i]==OK
+    std::vector<ErrorCode> error_codes;
+};
+YLT_REFL(BatchGetWriteRouteResponse, responses, error_codes);
+
+/**
  * @brief Request to add a replica.
  *        Master resolves ip_address/rpc_port from registered client info.
  */

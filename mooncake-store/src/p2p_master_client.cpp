@@ -11,6 +11,11 @@ struct RpcNameTraits<&WrappedP2PMasterService::GetWriteRoute> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedP2PMasterService::BatchGetWriteRoute> {
+    static constexpr const char* value = "BatchGetWriteRoute";
+};
+
+template <>
 struct RpcNameTraits<&WrappedP2PMasterService::AddReplica> {
     static constexpr const char* value = "AddReplica";
 };
@@ -43,6 +48,17 @@ tl::expected<WriteRouteResponse, ErrorCode> P2PMasterClient::GetWriteRoute(
     auto result =
         invoke_rpc<&WrappedP2PMasterService::GetWriteRoute, WriteRouteResponse>(
             req);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<BatchGetWriteRouteResponse, ErrorCode>
+P2PMasterClient::BatchGetWriteRoute(const BatchGetWriteRouteRequest& req) {
+    ScopedVLogTimer timer(1, "P2PMasterClient::BatchGetWriteRoute");
+    timer.LogRequest("key_count=", req.keys.size());
+
+    auto result = invoke_rpc<&WrappedP2PMasterService::BatchGetWriteRoute,
+                             BatchGetWriteRouteResponse>(req);
     timer.LogResponseExpected(result);
     return result;
 }
