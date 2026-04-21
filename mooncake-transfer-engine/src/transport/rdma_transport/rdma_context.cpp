@@ -365,6 +365,8 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }
 
+void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
+
 size_t RdmaContext::getTotalQPNumber() const {
     return endpoint_store_->getTotalQPNumber();
 }
