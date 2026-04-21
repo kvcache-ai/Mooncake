@@ -7798,16 +7798,6 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
         ))
         .expect("quota state should load")
         .expect("quota state should exist");
-    assert!(
-        quota.used_bytes <= 5,
-        "tenant usage must not exceed byte quota after failed oversized write; used_bytes={}",
-        quota.used_bytes
-    );
-    assert!(
-        quota.used_objects <= 1,
-        "tenant usage must not exceed object quota after failed oversized write; used_objects={}",
-        quota.used_objects
-    );
     assert_eq!(quota.used_bytes, 0);
     assert_eq!(quota.used_objects, 0);
     assert_eq!(quota.pending_reserved_bytes, 0);
@@ -8127,28 +8117,8 @@ fn tenant_local_quota_eviction_does_not_touch_other_tenants() {
         .expect("tenant-b quota state should exist");
     assert_eq!(quota_a.used_bytes, 5);
     assert_eq!(quota_a.used_objects, 1);
-    assert!(
-        quota_a.used_bytes <= 5,
-        "tenant-a usage must stay within byte quota after successful eviction write; used_bytes={}",
-        quota_a.used_bytes
-    );
-    assert!(
-        quota_a.used_objects <= 1,
-        "tenant-a usage must stay within object quota after successful eviction write; used_objects={}",
-        quota_a.used_objects
-    );
     assert_eq!(quota_b.used_bytes, 4);
     assert_eq!(quota_b.used_objects, 1);
-    assert!(
-        quota_b.used_bytes <= 5,
-        "tenant-b usage must stay within byte quota; used_bytes={}",
-        quota_b.used_bytes
-    );
-    assert!(
-        quota_b.used_objects <= 1,
-        "tenant-b usage must stay within object quota; used_objects={}",
-        quota_b.used_objects
-    );
 
     let tenant_b_value = client
         .get_in_tenant("tenant-b", "stable")
