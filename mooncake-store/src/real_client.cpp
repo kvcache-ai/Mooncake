@@ -4204,8 +4204,8 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
     // Run SSD I/O on a dedicated thread pool
     // so the coro_rpc IO thread is free to handle ping and other RPCs.
-    auto try_result = co_await coro_io::post(
-        [file_storage = file_storage_, &keys, &sizes]() {
+    auto try_result =
+        co_await coro_io::post([file_storage = file_storage_, &keys, &sizes]() {
             return file_storage->BatchGet(keys, sizes);
         });
     auto result = try_result.value();
