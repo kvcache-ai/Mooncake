@@ -7,6 +7,7 @@ import (
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -19,6 +20,14 @@ func swapClient(newClient kubernetes.Interface) kubernetes.Interface {
 	defer clientMutex.Unlock()
 	old := globalClient
 	globalClient = newClient
+	return old
+}
+
+func swapInitClientFn(newFn func() error) func() error {
+	clientMutex.Lock()
+	defer clientMutex.Unlock()
+	old := initClientFn
+	initClientFn = newFn
 	return old
 }
 
@@ -50,6 +59,61 @@ func TestGetHolderWithFakeClient(t *testing.T) {
 	}
 	if trans != int64(transitions) {
 		t.Errorf("expected transitions %d, got %d", transitions, trans)
+	}
+}
+
+func TestPatchPodLabelAutoInitializesClient(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+	})
+
+	oldClient := swapClient(nil)
+	defer swapClient(oldClient)
+
+	initCalls := 0
+	oldInitFn := swapInitClientFn(func() error {
+		initCalls++
+		clientMutex.Lock()
+		globalClient = fakeClient
+		clientMutex.Unlock()
+		return nil
+	})
+	defer swapInitClientFn(oldInitFn)
+
+	const labelKey = "mooncake.io/store-role"
+	if err := patchPodLabel("default", "test-pod", labelKey, "leader"); err != nil {
+		t.Fatalf("patchPodLabel(set) failed: %v", err)
+	}
+	if initCalls != 1 {
+		t.Fatalf("initClientFn calls = %d, want 1", initCalls)
+	}
+
+	pod, err := fakeClient.CoreV1().Pods("default").Get(
+		context.Background(), "test-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod after label set failed: %v", err)
+	}
+	if got := pod.Labels[labelKey]; got != "leader" {
+		t.Fatalf("label %q = %q, want %q", labelKey, got, "leader")
+	}
+
+	if err := patchPodLabel("default", "test-pod", labelKey, nil); err != nil {
+		t.Fatalf("patchPodLabel(remove) failed: %v", err)
+	}
+	if initCalls != 1 {
+		t.Fatalf("initClientFn calls after second patch = %d, want 1", initCalls)
+	}
+
+	pod, err = fakeClient.CoreV1().Pods("default").Get(
+		context.Background(), "test-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod after label removal failed: %v", err)
+	}
+	if _, exists := pod.Labels[labelKey]; exists {
+		t.Fatalf("label %q still present after removal", labelKey)
 	}
 }
 

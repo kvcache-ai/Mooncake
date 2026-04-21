@@ -374,8 +374,8 @@ func K8sLeaseWatchHolder(
 		*errMsg = C.CString("callback function is nil")
 		return -1
 	}
-	if globalClient == nil {
-		*errMsg = C.CString("k8s client not initialized")
+	if err := ensureClientInitialized(); err != nil {
+		*errMsg = C.CString(err.Error())
 		return -1
 	}
 
@@ -491,8 +491,8 @@ func K8sLeaseCancelWatch(
 // patchPodLabel sets or removes a label on a pod using a JSON merge patch.
 // If value is non-nil, the label is set; if nil, the label is removed.
 func patchPodLabel(namespace, podName, labelKey string, value interface{}) error {
-	if globalClient == nil {
-		return fmt.Errorf("k8s client not initialized")
+	if err := ensureClientInitialized(); err != nil {
+		return err
 	}
 
 	patch := map[string]interface{}{
