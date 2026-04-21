@@ -694,7 +694,7 @@ uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
     } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to start client metrics HTTP server: "
                    << e.what();
-        return -1;
+        return 0;
     }
 }
 

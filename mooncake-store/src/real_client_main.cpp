@@ -43,6 +43,8 @@ DEFINE_string(p2p_local_transfer_mode, "te",
 DEFINE_uint64(local_memcpy_async_worker_num, 32,
               "If set p2p_local_transfer_mode=memcpy, Worker number for async "
               "local memcpy executor (P2P), 0 means forbid async memcpy");
+DEFINE_uint32(metrics_port, 9003, "Port for HTTP metrics server");
+DEFINE_bool(enable_metrics_http, true, "Enable HTTP metrics endpoint");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -105,9 +107,8 @@ int main(int argc, char* argv[]) {
                 string_to_byte_size(FLAGS_route_cache_max_memory),
                 FLAGS_route_cache_ttl_ms, FLAGS_p2p_local_transfer_mode,
                 static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
-                9003,  // metrics_port
-                true,  // enable_metrics_http
-                {},    // labels
+                static_cast<uint16_t>(FLAGS_metrics_port),
+                FLAGS_enable_metrics_http, {},  // labels
                 FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
                 FLAGS_async_route_queue_size);
         } else {
@@ -124,9 +125,8 @@ int main(int argc, char* argv[]) {
                 FLAGS_master_server_address, global_segment_size,
                 local_buffer_size, nullptr,
                 "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-                FLAGS_enable_offload,
-                9003,   // metrics_port
-                true);  // enable_metrics_http
+                FLAGS_enable_offload, static_cast<uint16_t>(FLAGS_metrics_port),
+                FLAGS_enable_metrics_http);
         }
     }();
 
