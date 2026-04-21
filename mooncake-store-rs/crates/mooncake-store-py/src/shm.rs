@@ -268,7 +268,7 @@ fn sanitize_scope_component(value: &str) -> String {
         .chars()
         .map(|ch| match ch {
             'a'..='z' | 'A'..='Z' | '0'..='9' => ch,
-            '-' | '/' => '-',
+            '-' => '-',
             _ => '_',
         })
         .collect::<String>()
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn shared_region_helpers_report_kernel_and_range_errors() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = test_lock().lock();
         let sanitized = dummy_ipc_socket_path("tcp://127.0.0.1:7000?slot=1", "scope/a");
         let rendered = sanitized.to_string_lossy();
         assert!(rendered.contains("tcp___127_0_0_1_7000_slot_1"));

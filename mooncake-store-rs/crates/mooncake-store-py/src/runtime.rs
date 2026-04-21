@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn runtime_keyspace_isolates_read_and_write_access() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let Some(server) = RedisTestServer::start() else {
             return;
         };

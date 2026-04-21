@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
@@ -28,14 +29,24 @@ struct InMemoryState {
     segments: BTreeMap<String, StoredSegmentState>,
 }
 
-#[derive(Default)]
 pub struct InMemoryMetadataBackend {
     state: RwLock<InMemoryState>,
+    namespace_id: u64,
+}
+
+impl Default for InMemoryMetadataBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryMetadataBackend {
     pub fn new() -> Self {
-        Self::default()
+        static NEXT_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            state: RwLock::new(InMemoryState::default()),
+            namespace_id: NEXT_NAMESPACE_ID.fetch_add(1, Ordering::Relaxed),
+        }
     }
 
     fn segment_key(owner: &ClientRuntimeId, segment: &SegmentName) -> String {
@@ -115,7 +126,7 @@ fn apply_signed_delta(base: u64, delta: i64, field: &str) -> Result<u64> {
 
 impl MetadataBackend for InMemoryMetadataBackend {
     fn route_namespace(&self) -> String {
-        format!("inmemory://{:p}", self)
+        format!("inmemory://{}", self.namespace_id)
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {

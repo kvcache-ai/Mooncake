@@ -2494,8 +2494,25 @@ mod tests {
     }
 
     fn build_real_store(name: &str) -> PyMooncakeDistributedStore {
-        let dispatcher = StoreDispatcher::spawn(build_client(name), format!("dispatcher-{name}"))
-            .expect("dispatcher should spawn");
+        build_real_store_with_dispatcher_scope_and_metadata(
+            name,
+            "default",
+            Arc::new(InMemoryMetadataBackend::new()),
+        )
+    }
+
+    fn build_real_store_with_dispatcher_scope_and_metadata(
+        name: &str,
+        compat_scope: &str,
+        metadata: Arc<dyn MetadataBackend>,
+    ) -> PyMooncakeDistributedStore {
+        let dispatcher = StoreDispatcher::spawn_with_timeout_config_and_scope(
+            build_client_with_metadata(name, metadata),
+            format!("dispatcher-{name}"),
+            CompatTimeoutConfig::from_env(),
+            compat_scope,
+        )
+        .expect("dispatcher should spawn");
         dispatcher
             .register_local_memory()
             .expect("local memory should register");
@@ -3982,7 +3999,7 @@ mod tests {
 
     #[test]
     fn dummy_worker_scope_isolates_hot_cache_shm_hits() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let _cache_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
         let _block_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "1024");
         let _use_shm = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
@@ -4041,7 +4058,7 @@ mod tests {
 
     #[test]
     fn real_hot_cache_isolated_by_compat_scope() {
-        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock();
         let _cache_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
         let _block_size = EnvVarGuard::set("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "1024");
         let _use_shm = EnvVarGuard::unset("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
@@ -4154,24 +4171,29 @@ mod tests {
 
     #[test]
     fn dispatcher_async_wait_returns_timeout_instead_of_hanging() {
-        let dispatcher = StoreDispatcher::spawn_with_timeouts(
-            build_client("dispatcher-timeout"),
-            "dispatcher-timeout".to_string(),
-            Duration::from_millis(200),
-            Duration::from_secs(15),
-        )
-        .expect("dispatcher should spawn");
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn_with_timeouts(
+                build_client("dispatcher-timeout"),
+                "dispatcher-timeout".to_string(),
+                Duration::from_millis(200),
+                Duration::from_secs(15),
+            )
+            .expect("dispatcher should spawn"),
+        );
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let started = std::time::Instant::now();
         let worker = std::thread::Builder::new()
             .name("dispatcher-timeout-test".to_string())
-            .spawn(move || {
-                dispatcher.run(move |_client| {
-                    let _ = entered_tx.send(());
-                    let _ = release_rx.recv();
-                    Ok::<_, StoreError>(())
-                })
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || {
+                    dispatcher.run(move |_client| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok::<_, StoreError>(())
+                    })
+                }
             })
             .expect("dispatcher timeout worker should spawn");
         entered_rx
