@@ -39,6 +39,8 @@ class TestMooncakeBackend(CustomTestCase):
                     "mooncake",
                     "--mooncake-ib-device",
                     ib_devices,
+                    "--moe-a2a-backend",
+                    "mooncake",
                     "--mem-fraction-static",
                     "0.8",
                 ],
