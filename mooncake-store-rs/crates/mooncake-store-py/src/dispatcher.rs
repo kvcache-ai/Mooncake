@@ -17,7 +17,6 @@ use mooncake_store_core::{
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::config::CompatTimeoutConfig;
@@ -106,12 +105,7 @@ impl StoreDispatcher {
         _thread_name: impl Into<String>,
         timeouts: CompatTimeoutConfig,
     ) -> Result<Self, StoreError> {
-        Self::spawn_with_timeout_config_and_scope(
-            client,
-            _thread_name,
-            timeouts,
-            default_compat_scope(),
-        )
+        Self::spawn_with_timeout_config_and_scope(client, _thread_name, timeouts, "default")
     }
 
     pub fn spawn_with_timeout_config_and_scope(
@@ -131,6 +125,7 @@ impl StoreDispatcher {
             self.client.clone(),
             CompatTimeoutConfig {
                 request_timeout: self.request_timeout,
+                startup_timeout_override: Some(self.startup_timeout),
                 heartbeat_timeout: self.health_timeout,
                 transfer_stall_timeout: CompatTimeoutConfig::from_env().transfer_stall_timeout,
                 dummy_rpc_timeout: self.request_timeout,
