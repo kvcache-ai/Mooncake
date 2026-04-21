@@ -181,9 +181,10 @@ impl PyMooncakeDistributedStore {
         .map_err(store_error_to_py)?;
         let _ = master_server;
         let stable_id = runtime.stable_id.clone();
-        let dispatcher = StoreDispatcher::spawn_with_scope(
+        let dispatcher = StoreDispatcher::spawn_with_timeout_config_and_scope(
             runtime.client,
             format!("mooncake-py-dispatcher-{stable_id}-{worker_scope}"),
+            CompatTimeoutConfig::from_env(),
             compat_scope,
         )
         .map_err(store_error_to_py)?;
