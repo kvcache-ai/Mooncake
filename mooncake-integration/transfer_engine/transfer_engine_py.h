@@ -201,4 +201,5 @@ class TransferEnginePy {
     bool auto_discovery_;
 
     uint64_t transfer_timeout_nsec_;
+    double transfer_slow_threshold_gbps_;
 };
