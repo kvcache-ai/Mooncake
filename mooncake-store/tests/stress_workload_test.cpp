@@ -24,7 +24,7 @@ DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 DEFINE_string(master_address, "localhost:50051", "Address of master server");
 DEFINE_int32(num_threads, 8, "Number of concurrent worker threads");
-DEFINE_int32(test_operation_nums, 100, "Number of operations per thread");
+DEFINE_int32(test_operation_nums, 100, "Number of batch operations per thread");
 DEFINE_int32(batch_size, 1, "Batch size for PUT/GET operations");
 
 // Client configurations
@@ -62,6 +62,22 @@ void* g_segment_ptr = nullptr;
 size_t g_ram_buffer_size = 0;
 void* g_worker_buffer_base = nullptr;
 size_t g_per_thread_buffer_stride = 0;  // write_buf + read_pool per thread
+int g_read_slot_pool_size = 0;  // number of reusable read slots / thread
+
+// Per-thread read-pool memory budget. Caps RDMA pinned memory when batch and
+// value are both large (e.g. batch=2000, value=1MB would otherwise require
+// 2GB/thread and fail to pin). At typical 2+ threads, 256MiB * threads far
+// exceeds L3 (32~96MiB), keeping measurements DRAM-realistic rather than
+// cache-resident.
+constexpr size_t kPerThreadReadPoolBudget = 256ull * 1024 * 1024;
+
+int DeriveReadSlotPoolSize(int batch_size, size_t value_size) {
+    if (batch_size <= 0 || value_size == 0) return 1;
+    size_t by_budget =
+        std::max<size_t>(1, kPerThreadReadPoolBudget / value_size);
+    return static_cast<int>(
+        std::min<size_t>(by_budget, static_cast<size_t>(batch_size)));
+}
 
 // Synchronization primitives for coordinated start
 std::mutex g_sync_mutex;
@@ -79,12 +95,16 @@ struct OperationResult {
     bool success;       // Operation success status
 };
 
-struct ThreadStats {
+struct alignas(64) ThreadStats {
     std::vector<OperationResult> operations;
+    std::vector<double> batch_put_latency_us;  // per-batch completion latency
+    std::vector<double> batch_get_latency_us;  // per-batch completion latency
     uint64_t total_operations = 0;
     uint64_t successful_operations = 0;
     uint64_t put_operations = 0;
     uint64_t get_operations = 0;
+    uint64_t put_failures = 0;
+    uint64_t get_failures = 0;
 };
 
 bool initialize_segment() {
@@ -179,15 +199,31 @@ bool initialize_client() {
 
     // Pre-allocate the worker buffer pool with exact sizing, bypassing the
     // slab allocator (SimpleAllocator/CacheLib) to avoid fragmentation.
-    // Each thread gets: 1 write_buffer + num_read_slots read slots.
-    // Both P2P and Centralization BatchGet submit all transfers in parallel,
-    // so each key in a batch needs its own destination slot to avoid concurrent
-    // RDMA/memcpy writes targeting the same buffer region.
-    size_t per_thread_read_slots =
-        static_cast<size_t>(std::max(1, FLAGS_batch_size));
+    // Each thread gets: 1 write_buffer + g_read_slot_pool_size read slots.
+    //
+    // pool = min(batch, kPerThreadReadPoolBudget / value_size)
+    // - Capping at 256MiB/thread prevents RDMA pinning OOM on large batch size
+    //   or large value size.
+    g_read_slot_pool_size =
+        DeriveReadSlotPoolSize(FLAGS_batch_size, FLAGS_value_size);
     g_per_thread_buffer_stride =
-        static_cast<size_t>(FLAGS_value_size) * (1 + per_thread_read_slots);
+        static_cast<size_t>(FLAGS_value_size) * (1 + g_read_slot_pool_size);
     size_t total_buffer_size = FLAGS_num_threads * g_per_thread_buffer_stride;
+
+    size_t read_working_set = static_cast<size_t>(FLAGS_num_threads) *
+                              static_cast<size_t>(g_read_slot_pool_size) *
+                              static_cast<size_t>(FLAGS_value_size);
+    LOG(INFO) << "Read slot pool per thread: " << g_read_slot_pool_size
+              << " (batch=" << FLAGS_batch_size
+              << ", value=" << FLAGS_value_size << "), total read working set: "
+              << read_working_set / (1024 * 1024) << " MiB";
+    if (read_working_set < 128ull * 1024 * 1024) {
+        LOG(WARNING) << "Read working set is " << read_working_set / 1024
+                     << " KiB (< 128 MiB); may fit in L3 and bias memcpy read "
+                        "latency/throughput optimistically. Increase "
+                        "num_threads, batch_size, or value_size for "
+                        "DRAM-realistic numbers.";
+    }
 
     // Align to page boundary for RDMA registration.
     g_worker_buffer_base = std::aligned_alloc(4096, total_buffer_size);
@@ -230,14 +266,18 @@ std::string generate_key(int thread_id, uint64_t operation_id) {
 
 void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
                    ThreadStats& stats) {
-    // Reserve memory for operations to avoid reallocations during benchmark
-    stats.operations.reserve(FLAGS_test_operation_nums * 2);
+    int total_keys = FLAGS_test_operation_nums * FLAGS_batch_size;
+    stats.operations.reserve(total_keys * 2);  // 2 for PUT and GET
+    stats.batch_put_latency_us.reserve(FLAGS_test_operation_nums);
+    stats.batch_get_latency_us.reserve(FLAGS_test_operation_nums);
 
     // Each thread gets a dedicated slice of the pre-registered worker buffer
     // pool. The stride is computed once in initialize_client() so all threads
     // use the same formula and regions never overlap.
-    // Layout per thread: [write_buffer | read_pool_slot_0 | ... | slot_N-1]
-    int num_read_slots = std::max(1, FLAGS_batch_size);
+    // Layout per thread: [write_buffer | read_pool_slot_0 | ... | slot_K-1]
+    // where K = g_read_slot_pool_size <= batch_size, reused across iterations
+    // via `j % num_read_slots` indexing below.
+    int num_read_slots = g_read_slot_pool_size;
     char* thread_base =
         static_cast<char*>(g_worker_buffer_base) +
         static_cast<size_t>(thread_id) * g_per_thread_buffer_stride;
@@ -270,17 +310,33 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     }();
 
     std::vector<std::string> stored_keys;  // Track keys for GET operations
+    stored_keys.reserve(total_keys);
 
     // Warmup phase: Establish RPC/RDMA connections before measuring latency
-    std::string warmup_key = "warmup_" + std::to_string(thread_id);
+    constexpr int kWarmupBatches = 10;
+    int warmup_successes = 0;
     auto warmup_start = std::chrono::high_resolution_clock::now();
-    auto warmup_res = g_client->Put(warmup_key.data(), slices, config);
+    for (int w = 0; w < kWarmupBatches; ++w) {
+        int warmup_batch = std::max(1, FLAGS_batch_size);
+        std::vector<ObjectKey> wkeys;
+        wkeys.reserve(warmup_batch);
+        std::vector<std::vector<Slice>> wslices(warmup_batch, slices);
+        for (int j = 0; j < warmup_batch; ++j) {
+            wkeys.push_back("warmup_" + std::to_string(thread_id) + "_" +
+                            std::to_string(w) + "_" + std::to_string(j));
+        }
+        auto wres = g_client->BatchPut(wkeys, wslices, config);
+        for (auto& r : wres) {
+            if (r.has_value()) ++warmup_successes;
+        }
+    }
     auto warmup_end = std::chrono::high_resolution_clock::now();
-    LOG(INFO) << "Thread " << thread_id << " warmup put completed in "
+    LOG(INFO) << "Thread " << thread_id << " warmup: " << kWarmupBatches
+              << " batches, " << warmup_successes << " successful puts, "
               << std::chrono::duration_cast<std::chrono::microseconds>(
                      warmup_end - warmup_start)
                      .count()
-              << " us. Success: " << warmup_res.has_value();
+              << " us total";
 
     // Signal ready and wait for all threads
     {
@@ -293,15 +349,12 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     }
 
     // Phase 1: Perform PUT operations
-    for (int i = 0; i < FLAGS_test_operation_nums && !stop_flag.load();
-         i += FLAGS_batch_size) {
-        int actual_batch =
-            std::min(FLAGS_batch_size, FLAGS_test_operation_nums - i);
+    for (int i = 0; i < FLAGS_test_operation_nums && !stop_flag.load(); ++i) {
         std::vector<ObjectKey> batch_keys;
-        std::vector<std::vector<Slice>> batch_slices(actual_batch, slices);
-
-        for (int j = 0; j < actual_batch; ++j) {
-            batch_keys.push_back(generate_key(thread_id, i + j));
+        std::vector<std::vector<Slice>> batch_slices(FLAGS_batch_size, slices);
+        for (int j = 0; j < FLAGS_batch_size; ++j) {
+            batch_keys.push_back(
+                generate_key(thread_id, i * FLAGS_batch_size + j));
         }
 
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -312,24 +365,25 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
                               end_time - start_time)
                               .count();
 
-        // Record metrics. Latency is divided across keys so that percentiles
-        // reflect per-key cost rather than batch completion time.
-        std::vector<bool> key_success(actual_batch, false);
+        std::vector<bool> key_success(FLAGS_batch_size, false);
         for (size_t j = 0; j < results.size(); ++j) {
             if (results[j].has_value()) {
                 key_success[j] = true;
                 stored_keys.push_back(batch_keys[j]);
                 stats.put_operations++;
                 stats.successful_operations++;
+            } else {
+                stats.put_failures++;
             }
         }
         double per_key_latency_us =
-            static_cast<double>(latency_us) / actual_batch;
-        for (int j = 0; j < actual_batch; ++j) {
+            static_cast<double>(latency_us) / FLAGS_batch_size;
+        for (int j = 0; j < FLAGS_batch_size; ++j) {
             stats.operations.push_back(
                 {per_key_latency_us, true, key_success[j]});
         }
-        stats.total_operations += actual_batch;
+        stats.batch_put_latency_us.push_back(static_cast<double>(latency_us));
+        stats.total_operations += FLAGS_batch_size;
     }
 
     // Completion signal of PUT phase and wait for threads to start GET phase
@@ -342,23 +396,18 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         g_put_sync_cv.wait(lock, [] { return g_get_start_signal_flag; });
     }
 
-    // Phase 2: Perform GET operations on the stored keys
+    // Phase 2: Perform GET operations
     for (int i = 0; i < FLAGS_test_operation_nums && !stop_flag.load() &&
                     !stored_keys.empty();
-         i += FLAGS_batch_size) {
-        int actual_batch =
-            std::min(FLAGS_batch_size, (int)stored_keys.size() - i);
-        if (actual_batch <= 0) break;
-
+         ++i) {
         std::vector<std::string> batch_keys;
-        std::vector<std::vector<void*>> all_buffers(actual_batch);
+        std::vector<std::vector<void*>> all_buffers(FLAGS_batch_size);
         std::vector<std::vector<size_t>> all_sizes(
-            actual_batch, {static_cast<size_t>(FLAGS_value_size)});
+            FLAGS_batch_size, {static_cast<size_t>(FLAGS_value_size)});
 
-        for (int j = 0; j < actual_batch; ++j) {
-            batch_keys.push_back(stored_keys[(i + j) % stored_keys.size()]);
-            // Each key uses a distinct slot so that concurrent async copies
-            // write to separate memory regions and do not race.
+        for (int j = 0; j < FLAGS_batch_size; ++j) {
+            batch_keys.push_back(
+                stored_keys[(i * FLAGS_batch_size + j) % stored_keys.size()]);
             void* slot = static_cast<char*>(read_pool) +
                          (j % num_read_slots) * FLAGS_value_size;
             all_buffers[j] = {slot};
@@ -378,15 +427,18 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
                 key_success[j] = true;
                 stats.get_operations++;
                 stats.successful_operations++;
+            } else {
+                stats.get_failures++;
             }
         }
         double per_key_latency_us =
-            static_cast<double>(latency_us) / actual_batch;
-        for (int j = 0; j < actual_batch; ++j) {
+            static_cast<double>(latency_us) / FLAGS_batch_size;
+        for (int j = 0; j < FLAGS_batch_size; ++j) {
             stats.operations.push_back(
                 {per_key_latency_us, false, key_success[j]});
         }
-        stats.total_operations += actual_batch;
+        stats.batch_get_latency_us.push_back(static_cast<double>(latency_us));
+        stats.total_operations += FLAGS_batch_size;
     }
 
     // Buffers are fixed slices of g_worker_buffer_base; no deallocation needed.
@@ -415,25 +467,28 @@ void calculate_percentiles(std::vector<double>& latencies, double& p50,
 void print_results(const std::vector<ThreadStats>& thread_stats,
                    double put_duration_s, double get_duration_s) {
     double total_duration_s = put_duration_s + get_duration_s;
-    // Aggregate statistics
     uint64_t total_ops = 0;
     uint64_t successful_ops = 0;
     uint64_t total_put_ops = 0;
     uint64_t total_get_ops = 0;
+    uint64_t total_put_failures = 0;
+    uint64_t total_get_failures = 0;
 
-    std::vector<double> all_latencies;
     std::vector<double> put_latencies;
     std::vector<double> get_latencies;
+    std::vector<double> put_batch_latencies;
+    std::vector<double> get_batch_latencies;
 
     for (const auto& stats : thread_stats) {
         total_ops += stats.total_operations;
         successful_ops += stats.successful_operations;
         total_put_ops += stats.put_operations;
         total_get_ops += stats.get_operations;
+        total_put_failures += stats.put_failures;
+        total_get_failures += stats.get_failures;
 
         for (const auto& op : stats.operations) {
             if (op.success) {
-                all_latencies.push_back(op.latency_us);
                 if (op.is_put) {
                     put_latencies.push_back(op.latency_us);
                 } else {
@@ -441,32 +496,65 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
                 }
             }
         }
+        put_batch_latencies.insert(put_batch_latencies.end(),
+                                   stats.batch_put_latency_us.begin(),
+                                   stats.batch_put_latency_us.end());
+        get_batch_latencies.insert(get_batch_latencies.end(),
+                                   stats.batch_get_latency_us.begin(),
+                                   stats.batch_get_latency_us.end());
     }
 
-    // Calculate percentiles
-    double all_p50, all_p70, all_p90, all_p95, all_p99;
+    // Calculate percentiles: per-key (latency of individual op, batch time
+    // divided by batch_size) and per-batch (whole-batch completion latency).
     double put_p50, put_p70, put_p90, put_p95, put_p99;
     double get_p50, get_p70, get_p90, get_p95, get_p99;
+    double putb_p50, putb_p70, putb_p90, putb_p95, putb_p99;
+    double getb_p50, getb_p70, getb_p90, getb_p95, getb_p99;
 
-    calculate_percentiles(all_latencies, all_p50, all_p70, all_p90, all_p95,
-                          all_p99);
     calculate_percentiles(put_latencies, put_p50, put_p70, put_p90, put_p95,
                           put_p99);
     calculate_percentiles(get_latencies, get_p50, get_p70, get_p90, get_p95,
                           get_p99);
+    calculate_percentiles(put_batch_latencies, putb_p50, putb_p70, putb_p90,
+                          putb_p95, putb_p99);
+    calculate_percentiles(get_batch_latencies, getb_p50, getb_p70, getb_p90,
+                          getb_p95, getb_p99);
 
-    // Calculate throughput using phase-specific durations
-    double put_ops_per_second = total_put_ops / put_duration_s;
-    double get_ops_per_second = total_get_ops / get_duration_s;
-    double total_ops_per_second = successful_ops / total_duration_s;
+    double put_ops_per_second =
+        put_duration_s > 0 ? total_put_ops / put_duration_s : 0.0;
+    double get_ops_per_second =
+        get_duration_s > 0 ? total_get_ops / get_duration_s : 0.0;
 
-    // Calculate data throughput separately for PUT and GET operations
     double put_data_throughput_mb_s =
-        (total_put_ops * FLAGS_value_size) / (put_duration_s * 1024 * 1024);
+        put_duration_s > 0 ? (total_put_ops * FLAGS_value_size) /
+                                 (put_duration_s * 1024.0 * 1024.0)
+                           : 0.0;
     double get_data_throughput_mb_s =
-        (total_get_ops * FLAGS_value_size) / (get_duration_s * 1024 * 1024);
+        get_duration_s > 0 ? (total_get_ops * FLAGS_value_size) /
+                                 (get_duration_s * 1024.0 * 1024.0)
+                           : 0.0;
 
-    // Print results
+    // Report PUT and GET success rates separately. A single combined rate
+    // hid cases where one phase was healthy and the other was failing.
+    uint64_t put_attempts = total_put_ops + total_put_failures;
+    uint64_t get_attempts = total_get_ops + total_get_failures;
+    double put_success_rate =
+        put_attempts > 0 ? 100.0 * total_put_ops / put_attempts : 0.0;
+    double get_success_rate =
+        get_attempts > 0 ? 100.0 * total_get_ops / get_attempts : 0.0;
+
+    // Machine-readable failure markers for the runner. Anything less than
+    // 100% success means the config is not comparable to a clean run and
+    // should be excluded from averaging.
+    if (put_success_rate < 100.0) {
+        LOG(WARNING) << "!! WARN: PUT_SUCCESS_RATE_NOT_FULL rate="
+                     << put_success_rate << " failures=" << total_put_failures;
+    }
+    if (get_success_rate < 100.0) {
+        LOG(WARNING) << "!! WARN: GET_SUCCESS_RATE_NOT_FULL rate="
+                     << get_success_rate << " failures=" << total_get_failures;
+    }
+
     LOG(INFO) << "=== Benchmark Results ===";
     LOG(INFO) << "Total Test Duration: " << total_duration_s << " seconds";
     LOG(INFO) << "PUT Duration: " << put_duration_s << " seconds";
@@ -475,18 +563,20 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
     LOG(INFO) << "Key Size: 128 bytes";
     LOG(INFO) << "Value Size: " << FLAGS_value_size << " bytes";
     LOG(INFO) << "Batch Size: " << FLAGS_batch_size;
-    LOG(INFO) << "Operations per thread: " << FLAGS_test_operation_nums;
+    LOG(INFO) << "Read Slot Pool Size: " << g_read_slot_pool_size;
+    LOG(INFO) << "Batches per thread: " << FLAGS_test_operation_nums;
     LOG(INFO) << "";
     LOG(INFO) << "=== Operation Statistics ===";
     LOG(INFO) << "Total Operations: " << total_ops;
     LOG(INFO) << "Successful Operations: " << successful_ops;
-    LOG(INFO) << "PUT Operations: " << total_put_ops;
-    LOG(INFO) << "GET Operations: " << total_get_ops;
-    LOG(INFO) << "Success Rate: " << (100.0 * successful_ops / total_ops)
-              << "%";
+    LOG(INFO) << "PUT Operations: " << total_put_ops
+              << " (failures=" << total_put_failures << ")";
+    LOG(INFO) << "GET Operations: " << total_get_ops
+              << " (failures=" << total_get_failures << ")";
+    LOG(INFO) << "PUT Success Rate: " << put_success_rate << "%";
+    LOG(INFO) << "GET Success Rate: " << get_success_rate << "%";
     LOG(INFO) << "";
     LOG(INFO) << "=== Throughput ===";
-    LOG(INFO) << "Total Operations/sec: " << total_ops_per_second;
     LOG(INFO) << "PUT Operations/sec: " << put_ops_per_second;
     LOG(INFO) << "GET Operations/sec: " << get_ops_per_second;
     LOG(INFO) << "PUT Data Throughput (MB/s): " << put_data_throughput_mb_s;
@@ -494,6 +584,7 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
     LOG(INFO) << "";
     LOG(INFO) << "=== Latency (microseconds) ===";
 
+    // Per-key latency
     if (!put_latencies.empty()) {
         LOG(INFO) << "PUT Operations - P50: " << put_p50 << ", P70: " << put_p70
                   << ", P90: " << put_p90 << ", P95: " << put_p95
@@ -504,6 +595,19 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
         LOG(INFO) << "GET Operations - P50: " << get_p50 << ", P70: " << get_p70
                   << ", P90: " << get_p90 << ", P95: " << get_p95
                   << ", P99: " << get_p99;
+    }
+
+    // Batch-level latency
+    if (!put_batch_latencies.empty()) {
+        LOG(INFO) << "PUT Batch - P50: " << putb_p50 << ", P70: " << putb_p70
+                  << ", P90: " << putb_p90 << ", P95: " << putb_p95
+                  << ", P99: " << putb_p99;
+    }
+
+    if (!get_batch_latencies.empty()) {
+        LOG(INFO) << "GET Batch - P50: " << getb_p50 << ", P70: " << getb_p70
+                  << ", P90: " << getb_p90 << ", P95: " << getb_p95
+                  << ", P99: " << getb_p99;
     }
 }
 
@@ -523,8 +627,36 @@ int main(int argc, char** argv) {
               << ", Device: " << FLAGS_device_name;
     LOG(INFO) << "Local hostname: " << FLAGS_local_hostname;
     LOG(INFO) << "Metadata connection: " << FLAGS_metadata_connection_string;
-    LOG(INFO) << "Operations per thread: " << FLAGS_test_operation_nums;
+    LOG(INFO) << "Batches per thread: " << FLAGS_test_operation_nums;
     LOG(INFO) << "RAM buffer size: " << FLAGS_ram_buffer_size_gb << "GB";
+
+    // Capacity precheck: PUT phase writes num_threads * ops unique keys at
+    // value_size bytes each. If this exceeds the mounted segment, PUTs start
+    // failing mid-run, making that config's results incomparable with
+    // successful configs. Refuse to start instead of failing silently.
+    // Skip for P2P mode where the segment is provisioned internally by tiered
+    // backend config, not by ram_buffer_size_gb alone.
+    if (FLAGS_client_type != "P2P") {
+        uint64_t put_working_set =
+            static_cast<uint64_t>(FLAGS_num_threads) *
+            FLAGS_test_operation_nums *
+            static_cast<uint64_t>(std::max(1, FLAGS_batch_size)) *
+            static_cast<uint64_t>(FLAGS_value_size);
+        uint64_t segment_cap = static_cast<uint64_t>(FLAGS_ram_buffer_size_gb) *
+                               1024 * 1024 * 1024;
+        uint64_t usable_cap = segment_cap;
+        if (put_working_set > usable_cap) {
+            LOG(FATAL) << "PUT working set " << put_working_set / (1024 * 1024)
+                       << " MiB (num_threads=" << FLAGS_num_threads
+                       << " * batches=" << FLAGS_test_operation_nums
+                       << " * batch_size=" << FLAGS_batch_size
+                       << " * value=" << FLAGS_value_size
+                       << ") exceeds 90% of ram_buffer_size_gb="
+                       << FLAGS_ram_buffer_size_gb
+                       << "GB. Increase --ram_buffer_size_gb or reduce "
+                          "batches/threads/batch_size/value_size.";
+        }
+    }
 
     // Initialize client and segment
     if (!initialize_client()) {
