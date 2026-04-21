@@ -52,11 +52,71 @@ pub trait MetadataBackend: Send + Sync {
         next: ClientLifecycleState,
     ) -> Result<()>;
 
+    /// Looks up a live client lease by runtime id.
+    ///
+    /// # Performance
+    /// The default implementation scans `list_live_clients()` in memory and is
+    /// intended for tests or small datasets. Production backends should provide
+    /// an indexed implementation.
+    fn get_client_lease(&self, runtime: &ClientRuntimeId) -> Result<Option<ClientLease>> {
+        Ok(self
+            .list_live_clients()?
+            .into_iter()
+            .find(|lease| lease.runtime == *runtime))
+    }
+
+    /// Looks up a live client lease by stable id.
+    ///
+    /// # Performance
+    /// The default implementation scans `list_live_clients()` in memory and is
+    /// intended for tests or small datasets. Production backends should provide
+    /// an indexed implementation.
+    fn get_live_runtime_by_stable_id(
+        &self,
+        stable_id: &ClientStableId,
+    ) -> Result<Option<ClientLease>> {
+        Ok(self
+            .list_live_clients()?
+            .into_iter()
+            .find(|lease| lease.runtime.stable_id == *stable_id))
+    }
+
     fn list_live_clients(&self) -> Result<Vec<ClientLease>>;
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()>;
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()>;
+
+    /// Looks up a segment by owner and segment name.
+    ///
+    /// # Performance
+    /// The default implementation scans `list_segments()` in memory and is
+    /// intended for tests or small datasets. Production backends should provide
+    /// an indexed implementation.
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> Result<Option<SegmentAnnouncement>> {
+        Ok(self
+            .list_segments(Some(owner))?
+            .into_iter()
+            .find(|entry| entry.segment_name == *segment))
+    }
+
+    /// Looks up the owner runtime for a segment name.
+    ///
+    /// # Performance
+    /// The default implementation scans `list_segments()` in memory and is
+    /// intended for tests or small datasets. Production backends should provide
+    /// an indexed implementation.
+    fn get_segment_owner(&self, segment: &SegmentName) -> Result<Option<ClientRuntimeId>> {
+        Ok(self
+            .list_segments(None)?
+            .into_iter()
+            .find(|entry| entry.segment_name == *segment)
+            .map(|entry| entry.owner))
+    }
 
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>>;
 
