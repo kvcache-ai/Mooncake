@@ -2316,6 +2316,27 @@ int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
+std::optional<RealClient::RegisteredBufferRegion>
+RealClient::resolve_registered_buffer(void *buffer) const {
+    std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    const auto target = reinterpret_cast<uintptr_t>(buffer);
+    for (const auto &[registered_buffer, registered_size] : registered_buffer_sizes_) {
+        const auto base = reinterpret_cast<uintptr_t>(registered_buffer);
+        if (target < base) {
+            continue;
+        }
+        const auto offset = target - base;
+        if (offset < registered_size) {
+            return RegisteredBufferRegion{
+                .base = registered_buffer,
+                .size = registered_size,
+                .offset = static_cast<size_t>(offset),
+            };
+        }
+    }
+    return std::nullopt;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(const std::string &key) {
     if (!client_) {

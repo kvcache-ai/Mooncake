@@ -101,6 +101,15 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
+    struct RegisteredBufferRegion {
+        void *base{nullptr};
+        size_t size{0};
+        size_t offset{0};
+    };
+
+    std::optional<RegisteredBufferRegion> resolve_registered_buffer(
+        void *buffer) const;
+
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get

@@ -204,6 +204,15 @@ struct ReadTargetSpec {
     std::optional<TensorParallelismSpec> parallelism;
 };
 
+struct TensorIntoPlan {
+    std::string read_key;
+    uintptr_t user_buffer_ptr;
+    uintptr_t registered_buffer_ptr;
+    size_t registered_buffer_size;
+    size_t dst_offset;
+    size_t total_length;
+};
+
 std::optional<LayoutAxisKind> parse_layout_axis_kind(const std::string &kind) {
     std::string normalized = kind;
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
@@ -674,25 +683,52 @@ class MooncakeStorePyWrapper {
         return results;
     }
 
-    pybind11::object get_tensor_with_parallelism_into(
+    std::optional<TensorIntoPlan> build_tensor_into_plan_for_target(
         const std::string &key, uintptr_t buffer_ptr, size_t size,
-        const py::object &target = py::none()) {
+        const py::object &target, const std::string &context) {
         auto parsed_target = parse_read_target_spec(target);
         if (!parsed_target.has_value()) {
-            return pybind11::none();
+            return std::nullopt;
         }
         if (parsed_target->mode == ReadTargetMode::AS_STORED &&
             !parsed_target->parallelism.has_value()) {
-            return get_tensor_into(key, buffer_ptr, size);
+            return build_tensor_into_plan(key, buffer_ptr, size, context);
         }
-        auto axis = get_single_tp_axis(parsed_target->parallelism,
-                                       "get_tensor_with_parallelism_into");
+
+        auto axis = get_single_tp_axis(parsed_target->parallelism, context);
         if (!axis.has_value()) {
+            return std::nullopt;
+        }
+
+        std::string read_key = resolve_tp_read_key(key, axis->rank, axis->size);
+        auto metadata = get_tensor_metadata(read_key);
+        if (!metadata.has_value()) {
+            return std::nullopt;
+        }
+        const LayoutAxis *tp_axis =
+            find_layout_axis(metadata->metadata, LayoutAxisKind::TP);
+        if (axis->size > 1 && (!is_shard_tensor_metadata(metadata->metadata) ||
+                               !tp_axis || tp_axis->shard_rank != axis->rank)) {
+            LOG(ERROR) << "TP metadata mismatch for key " << read_key;
+            return std::nullopt;
+        }
+        return build_tensor_into_plan(read_key, buffer_ptr, size, context,
+                                      metadata);
+    }
+
+    pybind11::object get_tensor_with_parallelism_into(
+        const std::string &key, uintptr_t buffer_ptr, size_t size,
+        const py::object &target = py::none()) {
+        auto plan = build_tensor_into_plan_for_target(
+            key, buffer_ptr, size, target, "get_tensor_with_parallelism_into");
+        if (!plan.has_value()) {
             return pybind11::none();
         }
-        return get_tensor_with_tp_into(key, buffer_ptr, size, axis->rank,
-                                       axis->size,
-                                       axis->split_dim.value_or(0));
+        py::list results = execute_tensor_into_plans({*plan});
+        if (results.empty()) {
+            return py::none();
+        }
+        return py::reinterpret_borrow<py::object>(results[0]);
     }
 
     pybind11::list batch_get_tensor_with_parallelism_into(
@@ -719,10 +755,26 @@ class MooncakeStorePyWrapper {
             return empty;
         }
 
+        std::vector<TensorIntoPlan> valid_plans;
+        std::vector<size_t> valid_indices;
+        valid_plans.reserve(keys.size());
+        valid_indices.reserve(keys.size());
         py::list results;
         for (size_t i = 0; i < keys.size(); ++i) {
-            results.append(get_tensor_with_parallelism_into(
-                keys[i], buffer_ptrs[i], sizes[i], target_list[i]));
+            results.append(py::none());
+            auto plan = build_tensor_into_plan_for_target(
+                keys[i], buffer_ptrs[i], sizes[i], target_list[i],
+                "batch_get_tensor_with_parallelism_into");
+            if (!plan.has_value()) {
+                continue;
+            }
+            valid_indices.push_back(i);
+            valid_plans.push_back(*plan);
+        }
+
+        py::list valid_results = execute_tensor_into_plans(valid_plans);
+        for (size_t i = 0; i < valid_indices.size() && i < valid_results.size(); ++i) {
+            results[valid_indices[i]] = valid_results[i];
         }
         return results;
     }
@@ -739,6 +791,36 @@ class MooncakeStorePyWrapper {
             buffer_handle = store_->get_buffer(key);
         }
         return buffer_to_tensor(buffer_handle.get(), NULL, 0);
+    }
+
+    std::shared_ptr<RealClient> get_real_client() const {
+        if (use_dummy_client_) {
+            return nullptr;
+        }
+        return std::dynamic_pointer_cast<RealClient>(store_);
+    }
+
+    std::optional<RealClient::RegisteredBufferRegion> resolve_registered_buffer_region(
+        uintptr_t buffer_ptr, size_t size, const std::string &context) const {
+        auto real_client = get_real_client();
+        if (!real_client) {
+            LOG(ERROR) << context << ": real client is not available";
+            return std::nullopt;
+        }
+
+        auto region =
+            real_client->resolve_registered_buffer(reinterpret_cast<void *>(buffer_ptr));
+        if (!region.has_value()) {
+            LOG(ERROR) << context << ": buffer is not registered";
+            return std::nullopt;
+        }
+
+        if (region->offset + size > region->size) {
+            LOG(ERROR) << context << ": buffer range exceeds registered region";
+            return std::nullopt;
+        }
+
+        return region;
     }
 
     std::optional<ParsedTensorMetadata> get_tensor_metadata(
@@ -864,6 +946,95 @@ class MooncakeStorePyWrapper {
         return results_list;
     }
 
+    std::optional<TensorIntoPlan> build_tensor_into_plan(
+        const std::string &read_key, uintptr_t buffer_ptr, size_t size,
+        const std::string &context,
+        const std::optional<ParsedTensorMetadata> &metadata = std::nullopt) {
+        std::optional<ParsedTensorMetadata> resolved_metadata = metadata;
+        if (!resolved_metadata.has_value()) {
+            resolved_metadata = get_tensor_metadata(read_key);
+        }
+        if (!resolved_metadata.has_value()) {
+            return std::nullopt;
+        }
+
+        const auto total_length = resolved_metadata->data_offset + resolved_metadata->data_bytes;
+        if (total_length > size) {
+            LOG(ERROR) << context << ": buffer too small for key " << read_key;
+            return std::nullopt;
+        }
+
+        auto region =
+            resolve_registered_buffer_region(buffer_ptr, size, context);
+        if (!region.has_value()) {
+            return std::nullopt;
+        }
+        if (region->offset + total_length > region->size) {
+            LOG(ERROR) << context
+                       << ": resolved destination range exceeds registered region";
+            return std::nullopt;
+        }
+
+        return TensorIntoPlan{
+            .read_key = read_key,
+            .user_buffer_ptr = buffer_ptr,
+            .registered_buffer_ptr =
+                reinterpret_cast<uintptr_t>(region->base),
+            .registered_buffer_size = region->size,
+            .dst_offset = region->offset,
+            .total_length = total_length,
+        };
+    }
+
+    py::list execute_tensor_into_plans(const std::vector<TensorIntoPlan> &plans) {
+        py::list results;
+        for (size_t i = 0; i < plans.size(); ++i) {
+            results.append(py::none());
+        }
+        if (plans.empty()) {
+            return results;
+        }
+
+        std::vector<void *> buffers;
+        std::vector<std::vector<std::string>> all_keys;
+        std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+        std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+        std::vector<std::vector<std::vector<size_t>>> all_sizes;
+        buffers.reserve(plans.size());
+        all_keys.reserve(plans.size());
+        all_dst_offsets.reserve(plans.size());
+        all_src_offsets.reserve(plans.size());
+        all_sizes.reserve(plans.size());
+
+        for (const auto &plan : plans) {
+            buffers.push_back(reinterpret_cast<void *>(plan.registered_buffer_ptr));
+            all_keys.push_back({plan.read_key});
+            all_dst_offsets.push_back({{plan.dst_offset}});
+            all_src_offsets.push_back({{0}});
+            all_sizes.push_back({{plan.total_length}});
+        }
+
+        std::vector<std::vector<std::vector<int64_t>>> range_results;
+        {
+            py::gil_scoped_release release_gil;
+            range_results = store_->get_into_ranges(buffers, all_keys,
+                                                    all_dst_offsets,
+                                                    all_src_offsets, all_sizes);
+        }
+
+        for (size_t i = 0; i < plans.size(); ++i) {
+            if (i >= range_results.size() || range_results[i].empty() ||
+                range_results[i][0].empty() ||
+                range_results[i][0][0] != static_cast<int64_t>(plans[i].total_length)) {
+                continue;
+            }
+            results[i] = buffer_to_tensor(
+                NULL, reinterpret_cast<char *>(plans[i].user_buffer_ptr),
+                static_cast<int64_t>(plans[i].total_length));
+        }
+        return results;
+    }
+
     pybind11::object get_tensor_with_tp_into(const std::string &key,
                                              uintptr_t buffer_ptr, size_t size,
                                              int tp_rank = 0, int tp_size = 1,
@@ -892,7 +1063,16 @@ class MooncakeStorePyWrapper {
             return pybind11::none();
         }
 
-        return get_tensor_into(read_key, buffer_ptr, size);
+        auto plan = build_tensor_into_plan(read_key, buffer_ptr, size,
+                                           "get_tensor_with_tp_into");
+        if (!plan.has_value()) {
+            return pybind11::none();
+        }
+        py::list results = execute_tensor_into_plans({*plan});
+        if (results.empty()) {
+            return py::none();
+        }
+        return py::reinterpret_borrow<py::object>(results[0]);
     }
 
     pybind11::list batch_get_tensor_with_tp_into(
@@ -931,11 +1111,45 @@ class MooncakeStorePyWrapper {
         }
 
         auto read_keys = resolve_tp_read_keys(base_keys, tp_rank, tp_size);
-        py::list results;
+        std::vector<TensorIntoPlan> plans;
+        plans.reserve(read_keys.size());
         for (size_t i = 0; i < read_keys.size(); ++i) {
-            results.append(get_tensor_with_tp_into(base_keys[i], buffer_ptrs[i],
-                                                   sizes[i], tp_rank,
-                                                   tp_size, split_dim));
+            auto metadata = get_tensor_metadata(read_keys[i]);
+            if (!metadata.has_value()) {
+                plans.push_back({});
+                continue;
+            }
+            const LayoutAxis *tp_axis =
+                find_layout_axis(metadata->metadata, LayoutAxisKind::TP);
+            if (tp_size > 1 && (!is_shard_tensor_metadata(metadata->metadata) ||
+                                !tp_axis || tp_axis->shard_rank != tp_rank)) {
+                LOG(ERROR) << "TP metadata mismatch for key " << read_keys[i];
+                plans.push_back({});
+                continue;
+            }
+            auto plan = build_tensor_into_plan(read_keys[i], buffer_ptrs[i],
+                                               sizes[i],
+                                               "batch_get_tensor_with_tp_into");
+            plans.push_back(plan.value_or(TensorIntoPlan{}));
+        }
+
+        std::vector<TensorIntoPlan> valid_plans;
+        std::vector<size_t> valid_indices;
+        valid_plans.reserve(plans.size());
+        valid_indices.reserve(plans.size());
+        py::list results;
+        for (size_t i = 0; i < plans.size(); ++i) {
+            results.append(py::none());
+            if (plans[i].read_key.empty()) {
+                continue;
+            }
+            valid_indices.push_back(i);
+            valid_plans.push_back(plans[i]);
+        }
+
+        py::list valid_results = execute_tensor_into_plans(valid_plans);
+        for (size_t i = 0; i < valid_indices.size() && i < valid_results.size(); ++i) {
+            results[valid_indices[i]] = valid_results[i];
         }
         return results;
     }
