@@ -20,6 +20,7 @@ struct PyTensorInfo {
     uintptr_t data_ptr;
     size_t tensor_size;
     TensorMetadata metadata;
+    py::object owner;
 
     bool valid() const {
         if (tensor_size == 0 || data_ptr == 0) {
@@ -34,7 +35,7 @@ struct PyTensorInfo {
 };
 
 PyTensorInfo extract_tensor_info(const py::object &tensor,
-                                 const std::string &key_name = "");
+                                 const std::string &key_name);
 
 std::vector<int64_t> tensor_shape_to_vector(const py::handle &tensor) {
     py::tuple shape_tuple = py::cast<py::tuple>(tensor.attr("shape"));
@@ -114,6 +115,7 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
         0,
         0,
         {},
+        py::none(),
     };
 
     if (!(tensor.attr("__class__")
@@ -126,9 +128,11 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
     }
 
     try {
-        info.data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
-        size_t numel = tensor.attr("numel")().cast<size_t>();
-        size_t element_size = tensor.attr("element_size")().cast<size_t>();
+        py::object contiguous_tensor = tensor.attr("contiguous")();
+        info.owner = contiguous_tensor;
+        info.data_ptr = contiguous_tensor.attr("data_ptr")().cast<uintptr_t>();
+        size_t numel = contiguous_tensor.attr("numel")().cast<size_t>();
+        size_t element_size = contiguous_tensor.attr("element_size")().cast<size_t>();
         info.tensor_size = numel * element_size;
 
         pybind11::object shape_obj = tensor.attr("shape");
@@ -138,7 +142,7 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
         if (dtype_enum == TensorDtype::UNKNOWN) {
             LOG(ERROR) << "Unsupported tensor dtype"
                        << (key_name.empty() ? "" : " for " + key_name);
-            return {0, 0, {}};
+            return {0, 0, {}, py::none()};
         }
 
         pybind11::tuple shape_tuple =
@@ -148,22 +152,17 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
         if (ndim > static_cast<int32_t>(kMaxTensorDims)) {
             LOG(ERROR) << "Tensor has more than " << kMaxTensorDims
                        << " dimensions: " << ndim;
-            return {0, 0, {}};
+            return {0, 0, {}, py::none()};
         }
 
         info.metadata =
             build_full_tensor_metadata(tensor, dtype_enum, info.tensor_size);
     } catch (const std::exception &e) {
         LOG(ERROR) << "Error extracting tensor info: " << e.what();
-        return {0, 0, {}};
+        return {0, 0, {}, py::none()};
     }
 
     return info;
-}
-
-bool is_full_tensor_metadata(const TensorMetadata &metadata) {
-    return metadata.header.layout_kind ==
-           static_cast<uint32_t>(TensorLayoutKind::FULL);
 }
 
 bool is_shard_tensor_metadata(const TensorMetadata &metadata) {
@@ -181,123 +180,150 @@ const LayoutAxis *find_layout_axis(const TensorMetadata &metadata,
     return nullptr;
 }
 
-struct RangedReadPlan {
-    std::vector<std::string> keys;
-    std::vector<size_t> dst_offsets;
-    std::vector<size_t> src_offsets;
-    std::vector<size_t> sizes;
+enum class ReadTargetMode {
+    AS_STORED,
+    SHARD,
+    FULL,
 };
 
-size_t product_of_dims(const std::vector<int64_t> &dims) {
-    size_t product = 1;
-    for (int64_t dim : dims) {
-        product *= static_cast<size_t>(dim);
-    }
-    return product;
+struct ParallelAxisSpec {
+    std::string kind;
+    int rank{0};
+    int size{1};
+    std::optional<int> split_dim;
+    std::optional<int> expert_id;
+    std::optional<int> stage_id;
+};
+
+struct TensorParallelismSpec {
+    std::vector<ParallelAxisSpec> axes;
+};
+
+struct ReadTargetSpec {
+    ReadTargetMode mode{ReadTargetMode::AS_STORED};
+    std::optional<TensorParallelismSpec> parallelism;
+};
+
+std::optional<LayoutAxisKind> parse_layout_axis_kind(const std::string &kind) {
+    std::string normalized = kind;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    if (normalized == "TP") return LayoutAxisKind::TP;
+    if (normalized == "DP") return LayoutAxisKind::DP;
+    if (normalized == "EP") return LayoutAxisKind::EP;
+    if (normalized == "PP") return LayoutAxisKind::PP;
+    LOG(ERROR) << "Unsupported parallel axis kind: " << kind;
+    return std::nullopt;
 }
 
-std::optional<RangedReadPlan> plan_tp_shard_read(
-    const std::string &key, const TensorMetadata &metadata) {
-    const LayoutAxis *tp_axis = find_layout_axis(metadata, LayoutAxisKind::TP);
-    if (!tp_axis) {
-        return std::nullopt;
-    }
-
-    int split_dim = tp_axis->split_dim;
-    if (split_dim < 0 || split_dim >= metadata.header.ndim) {
-        return std::nullopt;
-    }
-
-    auto local_shape =
-        TensorShapeToVector(metadata.layout.local_shape, metadata.header.ndim);
-    auto global_shape =
-        TensorShapeToVector(metadata.layout.global_shape, metadata.header.ndim);
-    size_t local_elems = product_of_dims(local_shape);
-    if (local_elems == 0 || metadata.header.data_bytes % local_elems != 0) {
-        return std::nullopt;
-    }
-
-    size_t inner_elems = 1;
-    for (int i = split_dim + 1; i < metadata.header.ndim; ++i) {
-        inner_elems *= static_cast<size_t>(global_shape[i]);
-    }
-
-    size_t outer_elems = 1;
-    for (int i = 0; i < split_dim; ++i) {
-        outer_elems *= static_cast<size_t>(global_shape[i]);
-    }
-
-    size_t item_size = static_cast<size_t>(metadata.header.data_bytes) / local_elems;
-    size_t shard_span_bytes =
-        static_cast<size_t>(local_shape[split_dim]) * inner_elems * item_size;
-
-    RangedReadPlan plan;
-    plan.keys.reserve(outer_elems);
-    plan.dst_offsets.reserve(outer_elems);
-    plan.src_offsets.reserve(outer_elems);
-    plan.sizes.reserve(outer_elems);
-
-    for (size_t outer = 0; outer < outer_elems; ++outer) {
-        size_t offset = outer * shard_span_bytes;
-        plan.keys.push_back(key);
-        plan.dst_offsets.push_back(offset);
-        plan.src_offsets.push_back(metadata.header.data_offset + offset);
-        plan.sizes.push_back(shard_span_bytes);
-    }
-
-    return plan;
+bool is_tp_parallelism(const TensorParallelismSpec &parallelism) {
+    return parallelism.axes.size() == 1 &&
+           parse_layout_axis_kind(parallelism.axes[0].kind) ==
+               std::optional<LayoutAxisKind>(LayoutAxisKind::TP);
 }
 
-pybind11::object payload_to_tensor(const TensorMetadata &metadata,
-                                   char *payload_buffer,
-                                   size_t payload_size) {
-    if (!payload_buffer) return pybind11::none();
+bool is_default_replicate_config(const ReplicateConfig &config) {
+    return config.replica_num == 1 && !config.with_soft_pin &&
+           !config.with_hard_pin && config.preferred_segments.empty() &&
+           config.preferred_segment.empty() &&
+           !config.prefer_alloc_in_same_node;
+}
 
-    TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.header.dtype);
-    if (dtype_enum == TensorDtype::UNKNOWN) {
-        LOG(ERROR) << "Invalid tensor dtype in metadata";
-        return pybind11::none();
+std::optional<ParallelAxisSpec> parse_parallel_axis_spec(const py::handle &obj) {
+    if (!py::hasattr(obj, "kind") || !py::hasattr(obj, "rank") ||
+        !py::hasattr(obj, "size")) {
+        LOG(ERROR) << "ParallelAxis must provide kind, rank, and size";
+        return std::nullopt;
     }
 
-    size_t expected_size = static_cast<size_t>(metadata.header.data_bytes);
-    if (payload_size < expected_size || expected_size == 0) {
-        LOG(ERROR) << "Payload buffer too small for tensor reconstruction";
-        return pybind11::none();
+    ParallelAxisSpec axis;
+    axis.kind = py::cast<std::string>(obj.attr("kind"));
+    if (!parse_layout_axis_kind(axis.kind).has_value()) {
+        return std::nullopt;
+    }
+    axis.rank = py::cast<int>(obj.attr("rank"));
+    axis.size = py::cast<int>(obj.attr("size"));
+    py::object split_dim = obj.attr("split_dim");
+    if (!split_dim.is_none()) axis.split_dim = py::cast<int>(split_dim);
+    py::object expert_id = obj.attr("expert_id");
+    if (!expert_id.is_none()) axis.expert_id = py::cast<int>(expert_id);
+    py::object stage_id = obj.attr("stage_id");
+    if (!stage_id.is_none()) axis.stage_id = py::cast<int>(stage_id);
+    return axis;
+}
+
+std::optional<TensorParallelismSpec> parse_tensor_parallelism_spec(
+    const py::object &obj) {
+    if (obj.is_none()) {
+        return std::nullopt;
+    }
+    if (!py::hasattr(obj, "axes")) {
+        LOG(ERROR) << "TensorParallelism must provide axes";
+        return std::nullopt;
     }
 
-    int dtype_index = static_cast<int>(dtype_enum);
-    if (dtype_index < 0 ||
-        dtype_index >= static_cast<int>(array_creators.size())) {
-        LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
-        return pybind11::none();
-    }
-
-    try {
-        py::object np_array =
-            array_creators[dtype_index](payload_buffer, 0, expected_size, false);
-
-        if (metadata.header.ndim > 0) {
-            auto shape_dims = TensorShapeToVector(metadata.layout.local_shape,
-                                                  metadata.header.ndim);
-            py::tuple shape_tuple = py::cast(shape_dims);
-            np_array = np_array.attr("reshape")(shape_tuple);
+    TensorParallelismSpec parallelism;
+    py::list axes = py::cast<py::list>(obj.attr("axes"));
+    for (const auto &axis_obj : axes) {
+        auto axis = parse_parallel_axis_spec(axis_obj);
+        if (!axis.has_value()) {
+            return std::nullopt;
         }
-
-        pybind11::object tensor = torch_module().attr("from_numpy")(np_array);
-        if (dtype_enum == TensorDtype::BFLOAT16) {
-            tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
-        } else if (dtype_enum == TensorDtype::FLOAT16) {
-            tensor = tensor.attr("view")(torch_module().attr("float16"));
-        } else if (dtype_enum == TensorDtype::FLOAT8_E4M3) {
-            tensor = tensor.attr("view")(torch_module().attr("float8_e4m3fn"));
-        } else if (dtype_enum == TensorDtype::FLOAT8_E5M2) {
-            tensor = tensor.attr("view")(torch_module().attr("float8_e5m2"));
-        }
-        return tensor;
-    } catch (const std::exception &e) {
-        LOG(ERROR) << "Failed to convert payload to tensor: " << e.what();
-        return pybind11::none();
+        parallelism.axes.push_back(*axis);
     }
+    return parallelism;
+}
+
+std::optional<ReadTargetMode> parse_read_target_mode(const py::object &obj) {
+    std::string mode = py::cast<std::string>(obj);
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    if (mode == "AS_STORED") return ReadTargetMode::AS_STORED;
+    if (mode == "SHARD") return ReadTargetMode::SHARD;
+    if (mode == "FULL") return ReadTargetMode::FULL;
+    LOG(ERROR) << "Unsupported ReadTarget mode: " << mode;
+    return std::nullopt;
+}
+
+std::optional<ReadTargetSpec> parse_read_target_spec(const py::object &obj) {
+    if (obj.is_none()) {
+        return ReadTargetSpec{};
+    }
+    if (!py::hasattr(obj, "mode") || !py::hasattr(obj, "parallelism")) {
+        LOG(ERROR) << "ReadTarget must provide mode and parallelism";
+        return std::nullopt;
+    }
+
+    ReadTargetSpec target;
+    auto mode = parse_read_target_mode(obj.attr("mode"));
+    if (!mode.has_value()) {
+        return std::nullopt;
+    }
+    target.mode = *mode;
+    auto parallelism = parse_tensor_parallelism_spec(obj.attr("parallelism"));
+    if (obj.attr("parallelism").is_none()) {
+        target.parallelism = std::nullopt;
+    } else if (!parallelism.has_value()) {
+        return std::nullopt;
+    } else {
+        target.parallelism = *parallelism;
+    }
+    return target;
+}
+
+std::optional<ParallelAxisSpec> get_single_tp_axis(
+    const std::optional<TensorParallelismSpec> &parallelism,
+    const std::string &error_context) {
+    if (!parallelism.has_value()) {
+        LOG(ERROR) << error_context << ": parallelism is required";
+        return std::nullopt;
+    }
+    if (!is_tp_parallelism(*parallelism)) {
+        LOG(ERROR) << error_context
+                   << ": only single-axis TP parallelism is supported in this phase";
+        return std::nullopt;
+    }
+    return parallelism->axes[0];
 }
 
 std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
@@ -470,7 +496,7 @@ class MooncakeStorePyWrapper {
         return store_->health_check();
     }
 
-    std::string get_tp_key_name(const std::string &base_key, int rank) {
+    std::string get_tp_key_name(const std::string &base_key, int rank) const {
         return base_key + "_tp_" + std::to_string(rank);
     }
 
@@ -564,6 +590,38 @@ class MooncakeStorePyWrapper {
         return get_tensor(read_key);
     }
 
+    pybind11::object get_tensor_with_parallelism(const std::string &key,
+                                                 const py::object &target = py::none()) {
+        auto parsed_target = parse_read_target_spec(target);
+        if (!parsed_target.has_value()) {
+            return pybind11::none();
+        }
+        if (parsed_target->mode == ReadTargetMode::AS_STORED &&
+            !parsed_target->parallelism.has_value()) {
+            return get_tensor(key);
+        }
+        if (parsed_target->mode == ReadTargetMode::FULL) {
+            auto axis = get_single_tp_axis(parsed_target->parallelism,
+                                           "ReadTarget(mode=full)");
+            if (!axis.has_value()) {
+                return pybind11::none();
+            }
+            return get_tensor_with_tp(key, axis->rank, axis->size,
+                                      axis->split_dim.value_or(0));
+        }
+        if (parsed_target->mode == ReadTargetMode::SHARD) {
+            auto axis = get_single_tp_axis(parsed_target->parallelism,
+                                           "ReadTarget(mode=shard)");
+            if (!axis.has_value()) {
+                return pybind11::none();
+            }
+            return get_tensor_with_tp(key, axis->rank, axis->size,
+                                      axis->split_dim.value_or(0));
+        }
+        LOG(ERROR) << "Unsupported ReadTarget mode";
+        return pybind11::none();
+    }
+
     pybind11::list batch_get_tensor_with_tp(
         const std::vector<std::string> &base_keys, int tp_rank = 0,
         int tp_size = 1) {
@@ -584,6 +642,87 @@ class MooncakeStorePyWrapper {
                 continue;
             }
             results.append(get_tensor(read_key));
+        }
+        return results;
+    }
+
+    pybind11::list batch_get_tensor_with_parallelism(
+        const std::vector<std::string> &keys,
+        const py::object &targets = py::none()) {
+        if (targets.is_none()) {
+            return batch_get_tensor(keys);
+        }
+        if (!py::isinstance<py::list>(targets)) {
+            LOG(ERROR) << "targets must be a list or None";
+            py::list empty;
+            for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
+            return empty;
+        }
+
+        py::list target_list = py::cast<py::list>(targets);
+        if (target_list.size() != keys.size()) {
+            LOG(ERROR) << "keys and targets must have the same length";
+            py::list empty;
+            for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
+            return empty;
+        }
+
+        py::list results;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.append(get_tensor_with_parallelism(keys[i], target_list[i]));
+        }
+        return results;
+    }
+
+    pybind11::object get_tensor_with_parallelism_into(
+        const std::string &key, uintptr_t buffer_ptr, size_t size,
+        const py::object &target = py::none()) {
+        auto parsed_target = parse_read_target_spec(target);
+        if (!parsed_target.has_value()) {
+            return pybind11::none();
+        }
+        if (parsed_target->mode == ReadTargetMode::AS_STORED &&
+            !parsed_target->parallelism.has_value()) {
+            return get_tensor_into(key, buffer_ptr, size);
+        }
+        auto axis = get_single_tp_axis(parsed_target->parallelism,
+                                       "get_tensor_with_parallelism_into");
+        if (!axis.has_value()) {
+            return pybind11::none();
+        }
+        return get_tensor_with_tp_into(key, buffer_ptr, size, axis->rank,
+                                       axis->size,
+                                       axis->split_dim.value_or(0));
+    }
+
+    pybind11::list batch_get_tensor_with_parallelism_into(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes,
+        const py::object &targets = py::none()) {
+        if (targets.is_none()) {
+            return batch_get_tensor_into(keys, buffer_ptrs, sizes);
+        }
+        if (!py::isinstance<py::list>(targets)) {
+            LOG(ERROR) << "targets must be a list or None";
+            py::list empty;
+            for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
+            return empty;
+        }
+
+        py::list target_list = py::cast<py::list>(targets);
+        if (target_list.size() != keys.size() || buffer_ptrs.size() != keys.size() ||
+            sizes.size() != keys.size()) {
+            LOG(ERROR) << "keys, buffer_ptrs, sizes, and targets must have the same length";
+            py::list empty;
+            for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
+            return empty;
+        }
+
+        py::list results;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.append(get_tensor_with_parallelism_into(
+                keys[i], buffer_ptrs[i], sizes[i], target_list[i]));
         }
         return results;
     }
@@ -753,51 +892,6 @@ class MooncakeStorePyWrapper {
             return pybind11::none();
         }
 
-        if (tp_size > 1) {
-            size_t payload_size = static_cast<size_t>(metadata->data_bytes);
-            if (size < payload_size) {
-                LOG(ERROR) << "Buffer too small for TP shard payload. Required: "
-                           << payload_size << ", provided: " << size;
-                return pybind11::none();
-            }
-
-            auto plan = plan_tp_shard_read(read_key, metadata->metadata);
-            if (!plan.has_value()) {
-                LOG(ERROR) << "Failed to build TP ranged read plan for key "
-                           << read_key;
-                return pybind11::none();
-            }
-
-            std::vector<void *> buffers{reinterpret_cast<void *>(buffer_ptr)};
-            std::vector<std::vector<std::string>> all_keys{plan->keys};
-            std::vector<std::vector<std::vector<size_t>>> all_dst_offsets{
-                {plan->dst_offsets}};
-            std::vector<std::vector<std::vector<size_t>>> all_src_offsets{
-                {plan->src_offsets}};
-            std::vector<std::vector<std::vector<size_t>>> all_sizes{
-                {plan->sizes}};
-            {
-                py::gil_scoped_release release_gil;
-                auto results = store_->get_into_ranges(buffers, all_keys,
-                                                       all_dst_offsets,
-                                                       all_src_offsets,
-                                                       all_sizes);
-                if (results.empty() || results[0].empty()) {
-                    return pybind11::none();
-                }
-                for (const auto &ret : results[0][0]) {
-                    if (ret < 0) {
-                        LOG(ERROR) << "TP ranged read failed for key "
-                                   << read_key << " with code " << ret;
-                        return pybind11::none();
-                    }
-                }
-            }
-            return payload_to_tensor(metadata->metadata,
-                                     reinterpret_cast<char *>(buffer_ptr),
-                                     payload_size);
-        }
-
         return get_tensor_into(read_key, buffer_ptr, size);
     }
 
@@ -920,6 +1014,32 @@ class MooncakeStorePyWrapper {
                                        tp_size, split_dim);
     }
 
+    int put_tensor_with_parallelism(const std::string &key, pybind11::object tensor,
+                                    const py::object &parallelism = py::none(),
+                                    const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!parallelism.is_none()) {
+            auto parsed_parallelism = parse_tensor_parallelism_spec(parallelism);
+            if (!parsed_parallelism.has_value()) {
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+            if (!is_tp_parallelism(*parsed_parallelism)) {
+                LOG(ERROR) << "Only single-axis TP parallelism is supported in this phase";
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+            const auto &axis = parsed_parallelism->axes[0];
+            return put_tensor_with_tp_impl(key, tensor, config, axis.rank,
+                                           axis.size, axis.split_dim.value_or(0));
+        }
+
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) return validate_result;
+        return put_tensor_impl(key, tensor, config);
+    }
+
     std::vector<int> batch_put_tensor_impl(
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
@@ -1020,7 +1140,7 @@ class MooncakeStorePyWrapper {
         try {
             for (size_t i = 0; i < base_keys.size(); ++i) {
                 py::object tensor = tensors_list[i];
-                if (tensor.is_none() || !tensor.attr("shape").cast<py::tuple>()) {
+                if (tensor.is_none()) {
                     final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
@@ -1088,6 +1208,43 @@ class MooncakeStorePyWrapper {
         return batch_put_tensor_with_tp_impl(base_keys, tensors_list,
                                              ReplicateConfig{}, tp_rank,
                                              tp_size, split_dim);
+    }
+
+    std::vector<int> batch_put_tensor_with_parallelism(
+        const std::vector<std::string> &keys, const pybind11::list &tensors_list,
+        const py::object &parallelisms = py::none(),
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (parallelisms.is_none()) {
+            if (!is_client_initialized() || use_dummy_client_) {
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            int validate_result = validate_replicate_config(config);
+            if (validate_result) {
+                return std::vector<int>(keys.size(), validate_result);
+            }
+            return batch_put_tensor_impl(keys, tensors_list, config);
+        }
+        if (!py::isinstance<py::list>(parallelisms)) {
+            LOG(ERROR) << "parallelisms must be a list or None";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        py::list parallelism_list = py::cast<py::list>(parallelisms);
+        if (parallelism_list.size() != keys.size() ||
+            tensors_list.size() != keys.size()) {
+            LOG(ERROR) << "keys, tensors_list, and parallelisms must have the same length";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        std::vector<int> results(keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = put_tensor_with_parallelism(keys[i], tensors_list[i],
+                                                     parallelism_list[i], config);
+        }
+        return results;
     }
 
     bool is_valid_tensor_object_buffer(uintptr_t buffer_ptr, size_t size,
@@ -1198,6 +1355,51 @@ class MooncakeStorePyWrapper {
                                        tp_size, split_dim);
     }
 
+    int put_tensor_with_parallelism_from(
+        const std::string &key, uintptr_t buffer_ptr, size_t size,
+        const py::object &parallelism = py::none(),
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (parallelism.is_none()) {
+            if (!is_default_replicate_config(config)) {
+                if (!is_valid_tensor_object_buffer(buffer_ptr, size,
+                                                   "put_tensor_with_parallelism_from")) {
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+                if (!is_client_initialized() || use_dummy_client_) {
+                    LOG(ERROR) << "put_tensor_with_parallelism_from is not supported for dummy client";
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+                int validate_result = validate_replicate_config(config);
+                if (validate_result) return validate_result;
+                py::gil_scoped_release release_gil;
+                return store_->put_from(key, reinterpret_cast<void *>(buffer_ptr),
+                                        size, config);
+            }
+            return put_tensor_from(key, buffer_ptr, size);
+        }
+
+        auto axis = get_single_tp_axis(parse_tensor_parallelism_spec(parallelism),
+                                       "put_tensor_with_parallelism_from");
+        if (!axis.has_value()) {
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (!is_default_replicate_config(config)) {
+            pybind11::object tensor =
+                buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
+                                 static_cast<int64_t>(size));
+            if (tensor.is_none()) {
+                LOG(ERROR) << "Failed to decode tensor buffer for put_tensor_with_parallelism_from";
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+            return put_tensor_with_tp_impl(key, tensor, config, axis->rank,
+                                           axis->size,
+                                           axis->split_dim.value_or(0));
+        }
+        return put_tensor_with_tp_from(key, buffer_ptr, size, axis->rank,
+                                       axis->size,
+                                       axis->split_dim.value_or(0));
+    }
+
     std::vector<int> batch_put_tensor_with_tp_from(
         const std::vector<std::string> &base_keys,
         const std::vector<uintptr_t> &buffer_ptrs,
@@ -1269,6 +1471,65 @@ class MooncakeStorePyWrapper {
             final_results[processed_indices[i]] = op_results[i];
         }
         return final_results;
+    }
+
+    std::vector<int> batch_put_tensor_with_parallelism_from(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes,
+        const py::object &parallelisms = py::none(),
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (parallelisms.is_none()) {
+            if (!is_default_replicate_config(config)) {
+                if (!is_client_initialized() || use_dummy_client_) {
+                    return std::vector<int>(keys.size(),
+                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                int validate_result = validate_replicate_config(config);
+                if (validate_result) {
+                    return std::vector<int>(keys.size(), validate_result);
+                }
+                if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
+                    LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must have the same length";
+                    return std::vector<int>(keys.size(),
+                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                for (size_t i = 0; i < sizes.size(); ++i) {
+                    if (!is_valid_tensor_object_buffer(
+                            buffer_ptrs[i], sizes[i],
+                            "tensor object buffer at index " + std::to_string(i))) {
+                        return std::vector<int>(keys.size(),
+                                                to_py_ret(ErrorCode::INVALID_PARAMS));
+                    }
+                }
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release_gil;
+                return store_->batch_put_from(keys, buffers, sizes, config);
+            }
+            return batch_put_tensor_from(keys, buffer_ptrs, sizes);
+        }
+        if (!py::isinstance<py::list>(parallelisms)) {
+            LOG(ERROR) << "parallelisms must be a list or None";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        py::list parallelism_list = py::cast<py::list>(parallelisms);
+        if (parallelism_list.size() != keys.size() || buffer_ptrs.size() != keys.size() ||
+            sizes.size() != keys.size()) {
+            LOG(ERROR) << "keys, buffer_ptrs, sizes, and parallelisms must have the same length";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        std::vector<int> results(keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = put_tensor_with_parallelism_from(
+                keys[i], buffer_ptrs[i], sizes[i], parallelism_list[i], config);
+        }
+        return results;
     }
 
     // --- Upsert tensor methods ---
@@ -1345,6 +1606,33 @@ class MooncakeStorePyWrapper {
                                           tp_size, split_dim);
     }
 
+    int upsert_tensor_with_parallelism(
+        const std::string &key, pybind11::object tensor,
+        const py::object &parallelism = py::none(),
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!parallelism.is_none()) {
+            auto parsed_parallelism = parse_tensor_parallelism_spec(parallelism);
+            if (!parsed_parallelism.has_value()) {
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+            if (!is_tp_parallelism(*parsed_parallelism)) {
+                LOG(ERROR) << "Only single-axis TP parallelism is supported in this phase";
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+            const auto &axis = parsed_parallelism->axes[0];
+            return upsert_tensor_with_tp_impl(key, tensor, config, axis.rank,
+                                              axis.size, axis.split_dim.value_or(0));
+        }
+
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) return validate_result;
+        return upsert_tensor_impl(key, tensor, config);
+    }
+
     int upsert_tensor_from(const std::string &key, uintptr_t buffer_ptr,
                            size_t size) {
         if (!is_valid_tensor_object_buffer(buffer_ptr, size,
@@ -1363,6 +1651,50 @@ class MooncakeStorePyWrapper {
         }
         py::gil_scoped_release release_gil;
         return store_->upsert_from(key, buffer, size, ReplicateConfig{});
+    }
+
+    int upsert_tensor_with_parallelism_from(
+        const std::string &key, uintptr_t buffer_ptr, size_t size,
+        const py::object &parallelism = py::none(),
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (parallelism.is_none()) {
+            if (!is_default_replicate_config(config)) {
+                if (!is_valid_tensor_object_buffer(buffer_ptr, size,
+                                                   "upsert_tensor_with_parallelism_from")) {
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                if (!is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+                if (use_dummy_client_) {
+                    LOG(ERROR) << "upsert_tensor_with_parallelism_from is not supported for dummy client";
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+                int validate_result = validate_replicate_config(config);
+                if (validate_result) return validate_result;
+                py::gil_scoped_release release_gil;
+                return store_->upsert_from(key, buffer, size, config);
+            }
+            return upsert_tensor_from(key, buffer_ptr, size);
+        }
+
+        auto axis = get_single_tp_axis(parse_tensor_parallelism_spec(parallelism),
+                                       "upsert_tensor_with_parallelism_from");
+        if (!axis.has_value()) {
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        pybind11::object tensor =
+            buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
+                             static_cast<int64_t>(size));
+        if (tensor.is_none()) {
+            LOG(ERROR) << "Failed to decode tensor buffer for upsert_tensor_with_parallelism_from";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        return upsert_tensor_with_tp_impl(key, tensor, config, axis->rank,
+                                          axis->size,
+                                          axis->split_dim.value_or(0));
     }
 
     std::vector<int> batch_upsert_tensor_from(
@@ -1405,6 +1737,74 @@ class MooncakeStorePyWrapper {
         py::gil_scoped_release release_gil;
         return store_->batch_upsert_from(keys, buffers, sizes,
                                          ReplicateConfig{});
+    }
+
+    std::vector<int> batch_upsert_tensor_with_parallelism_from(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes,
+        const py::object &parallelisms = py::none(),
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (parallelisms.is_none()) {
+            if (!is_default_replicate_config(config)) {
+                if (!is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>(keys.size(),
+                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                if (use_dummy_client_) {
+                    LOG(ERROR) << "batch_upsert_tensor_with_parallelism_from is not supported for dummy client";
+                    return std::vector<int>(keys.size(),
+                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                int validate_result = validate_replicate_config(config);
+                if (validate_result) {
+                    return std::vector<int>(keys.size(), validate_result);
+                }
+                if (keys.empty()) {
+                    return std::vector<int>();
+                }
+                if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
+                    LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must have the same length";
+                    return std::vector<int>(keys.size(),
+                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                for (size_t i = 0; i < sizes.size(); ++i) {
+                    if (!is_valid_tensor_object_buffer(
+                            buffer_ptrs[i], sizes[i],
+                            "tensor object buffer at index " + std::to_string(i))) {
+                        return std::vector<int>(keys.size(),
+                                                to_py_ret(ErrorCode::INVALID_PARAMS));
+                    }
+                }
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release_gil;
+                return store_->batch_upsert_from(keys, buffers, sizes, config);
+            }
+            return batch_upsert_tensor_from(keys, buffer_ptrs, sizes);
+        }
+        if (!py::isinstance<py::list>(parallelisms)) {
+            LOG(ERROR) << "parallelisms must be a list or None";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        py::list parallelism_list = py::cast<py::list>(parallelisms);
+        if (parallelism_list.size() != keys.size() || buffer_ptrs.size() != keys.size() ||
+            sizes.size() != keys.size()) {
+            LOG(ERROR) << "keys, buffer_ptrs, sizes, and parallelisms must have the same length";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        std::vector<int> results(keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = upsert_tensor_with_parallelism_from(
+                keys[i], buffer_ptrs[i], sizes[i], parallelism_list[i], config);
+        }
+        return results;
     }
 
     std::vector<int> batch_upsert_tensor_impl(
@@ -1507,7 +1907,7 @@ class MooncakeStorePyWrapper {
         try {
             for (size_t i = 0; i < base_keys.size(); ++i) {
                 py::object tensor = tensors_list[i];
-                if (tensor.is_none() || !tensor.attr("shape").cast<py::tuple>()) {
+                if (tensor.is_none()) {
                     final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
@@ -1572,6 +1972,43 @@ class MooncakeStorePyWrapper {
         return batch_upsert_tensor_with_tp_impl(base_keys, tensors_list,
                                                 ReplicateConfig{}, tp_rank,
                                                 tp_size, split_dim);
+    }
+
+    std::vector<int> batch_upsert_tensor_with_parallelism(
+        const std::vector<std::string> &keys, const pybind11::list &tensors_list,
+        const py::object &parallelisms = py::none(),
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (parallelisms.is_none()) {
+            if (!is_client_initialized() || use_dummy_client_) {
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            int validate_result = validate_replicate_config(config);
+            if (validate_result) {
+                return std::vector<int>(keys.size(), validate_result);
+            }
+            return batch_upsert_tensor_impl(keys, tensors_list, config);
+        }
+        if (!py::isinstance<py::list>(parallelisms)) {
+            LOG(ERROR) << "parallelisms must be a list or None";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        py::list parallelism_list = py::cast<py::list>(parallelisms);
+        if (parallelism_list.size() != keys.size() ||
+            tensors_list.size() != keys.size()) {
+            LOG(ERROR) << "keys, tensors_list, and parallelisms must have the same length";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        std::vector<int> results(keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = upsert_tensor_with_parallelism(
+                keys[i], tensors_list[i], parallelism_list[i], config);
+        }
+        return results;
     }
 
     int upsert_pub_tensor(const std::string &key, pybind11::object tensor,
@@ -2018,6 +2455,43 @@ PYBIND11_MODULE(store, m) {
                  return self.shm_helper_->free(reinterpret_cast<void *>(ptr));
              });
 
+    py::class_<ParallelAxisSpec>(m, "ParallelAxis")
+        .def(py::init<>())
+        .def_readwrite("kind", &ParallelAxisSpec::kind)
+        .def_readwrite("rank", &ParallelAxisSpec::rank)
+        .def_readwrite("size", &ParallelAxisSpec::size)
+        .def_readwrite("split_dim", &ParallelAxisSpec::split_dim)
+        .def_readwrite("expert_id", &ParallelAxisSpec::expert_id)
+        .def_readwrite("stage_id", &ParallelAxisSpec::stage_id);
+
+    py::class_<TensorParallelismSpec>(m, "TensorParallelism")
+        .def(py::init<>())
+        .def_readwrite("axes", &TensorParallelismSpec::axes);
+
+    py::class_<ReadTargetSpec>(m, "ReadTarget")
+        .def(py::init<>())
+        .def_property(
+            "mode",
+            [](const ReadTargetSpec &self) {
+                switch (self.mode) {
+                    case ReadTargetMode::AS_STORED:
+                        return std::string("as_stored");
+                    case ReadTargetMode::SHARD:
+                        return std::string("shard");
+                    case ReadTargetMode::FULL:
+                        return std::string("full");
+                }
+                return std::string("as_stored");
+            },
+            [](ReadTargetSpec &self, const std::string &mode) {
+                auto parsed = parse_read_target_mode(py::str(mode));
+                if (!parsed.has_value()) {
+                    throw std::runtime_error("Unsupported ReadTarget mode");
+                }
+                self.mode = *parsed;
+            })
+        .def_readwrite("parallelism", &ReadTargetSpec::parallelism);
+
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
@@ -2219,6 +2693,24 @@ PYBIND11_MODULE(store, m) {
              "Tensor Parallel rank.")
         .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
              "Get a PyTorch tensor from the store")
+        .def("get_tensor_with_parallelism",
+             &MooncakeStorePyWrapper::get_tensor_with_parallelism,
+             py::arg("key"), py::arg("target") = py::none(),
+             "Get a PyTorch tensor from the store using a ReadTarget request.")
+        .def("batch_get_tensor_with_parallelism",
+             &MooncakeStorePyWrapper::batch_get_tensor_with_parallelism,
+             py::arg("keys"), py::arg("targets") = py::none(),
+             "Get a batch of PyTorch tensors from the store using ReadTarget requests.")
+        .def("get_tensor_with_parallelism_into",
+             &MooncakeStorePyWrapper::get_tensor_with_parallelism_into,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             py::arg("target") = py::none(),
+             "Get a PyTorch tensor from the store directly into a pre-allocated buffer using a ReadTarget request.")
+        .def("batch_get_tensor_with_parallelism_into",
+             &MooncakeStorePyWrapper::batch_get_tensor_with_parallelism_into,
+             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("targets") = py::none(),
+             "Get a batch of PyTorch tensors into pre-allocated buffers using ReadTarget requests.")
         .def("put_tensor_with_tp", &MooncakeStorePyWrapper::put_tensor_with_tp,
              py::arg("key"), py::arg("tensor"), py::arg("tp_rank") = 0,
              py::arg("tp_size") = 1, py::arg("split_dim") = 0,
@@ -2235,6 +2727,30 @@ PYBIND11_MODULE(store, m) {
              "into shards for tensor parallelism.")
         .def("put_tensor", &MooncakeStorePyWrapper::put_tensor, py::arg("key"),
              py::arg("tensor"), "Put a PyTorch tensor into the store")
+        .def("put_tensor_with_parallelism",
+             &MooncakeStorePyWrapper::put_tensor_with_parallelism,
+             py::arg("key"), py::arg("tensor"),
+             py::arg("parallelism") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Put a PyTorch tensor into the store using a TensorParallelism request.")
+        .def("batch_put_tensor_with_parallelism",
+             &MooncakeStorePyWrapper::batch_put_tensor_with_parallelism,
+             py::arg("keys"), py::arg("tensors_list"),
+             py::arg("parallelisms") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Put a batch of PyTorch tensors into the store using TensorParallelism requests.")
+        .def("put_tensor_with_parallelism_from",
+             &MooncakeStorePyWrapper::put_tensor_with_parallelism_from,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             py::arg("parallelism") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Put a tensor directly from a pre-allocated buffer using a TensorParallelism request.")
+        .def("batch_put_tensor_with_parallelism_from",
+             &MooncakeStorePyWrapper::batch_put_tensor_with_parallelism_from,
+             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("parallelisms") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Put a batch of tensors directly from pre-allocated buffers using TensorParallelism requests.")
         .def("batch_get_tensor", &MooncakeStorePyWrapper::batch_get_tensor,
              py::arg("keys"), "Get a batch of PyTorch tensors from the store")
         .def("batch_put_tensor", &MooncakeStorePyWrapper::batch_put_tensor,
@@ -2339,6 +2855,12 @@ PYBIND11_MODULE(store, m) {
         .def("upsert_tensor", &MooncakeStorePyWrapper::upsert_tensor,
              py::arg("key"), py::arg("tensor"),
              "Upsert a PyTorch tensor into the store (insert or update)")
+        .def("upsert_tensor_with_parallelism",
+             &MooncakeStorePyWrapper::upsert_tensor_with_parallelism,
+             py::arg("key"), py::arg("tensor"),
+             py::arg("parallelism") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Upsert a PyTorch tensor into the store using a TensorParallelism request.")
         .def("upsert_tensor_with_tp",
              &MooncakeStorePyWrapper::upsert_tensor_with_tp, py::arg("key"),
              py::arg("tensor"), py::arg("tp_rank") = 0,
@@ -2349,6 +2871,12 @@ PYBIND11_MODULE(store, m) {
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
              "Upsert a tensor directly from a pre-allocated buffer. Buffer "
              "layout must be [TensorObjectHeader+layout metadata][tensor data].")
+        .def("upsert_tensor_with_parallelism_from",
+             &MooncakeStorePyWrapper::upsert_tensor_with_parallelism_from,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             py::arg("parallelism") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Upsert a tensor directly from a pre-allocated buffer using a TensorParallelism request.")
         .def("batch_upsert_tensor_from",
              &MooncakeStorePyWrapper::batch_upsert_tensor_from, py::arg("keys"),
              py::arg("buffer_ptrs"), py::arg("sizes"),
@@ -2360,6 +2888,18 @@ PYBIND11_MODULE(store, m) {
              py::arg("tensors_list"),
              "Upsert a batch of PyTorch tensors into the store (insert or "
              "update)")
+        .def("batch_upsert_tensor_with_parallelism_from",
+             &MooncakeStorePyWrapper::batch_upsert_tensor_with_parallelism_from,
+             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("parallelisms") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Upsert a batch of tensors directly from pre-allocated buffers using TensorParallelism requests.")
+        .def("batch_upsert_tensor_with_parallelism",
+             &MooncakeStorePyWrapper::batch_upsert_tensor_with_parallelism,
+             py::arg("keys"), py::arg("tensors_list"),
+             py::arg("parallelisms") = py::none(),
+             py::arg("config") = ReplicateConfig{},
+             "Upsert a batch of PyTorch tensors into the store using TensorParallelism requests.")
         .def("batch_upsert_tensor_with_tp",
              &MooncakeStorePyWrapper::batch_upsert_tensor_with_tp,
              py::arg("base_keys"), py::arg("tensors_list"),
