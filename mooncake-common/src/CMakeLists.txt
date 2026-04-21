@@ -54,6 +54,11 @@ add_library(mooncake_common
     ${MOONCAKE_COMMON_SOURCES}
 )
 
+target_include_directories(mooncake_common PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+    $<INSTALL_INTERFACE:include>
+)
+
 target_link_libraries(mooncake_common PUBLIC
     yaml-cpp
     jsoncpp
