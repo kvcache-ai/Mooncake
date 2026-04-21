@@ -289,6 +289,34 @@ mooncake-store-admin \
   cleanup-stale-segments
 ```
 
+## Admin HTTP Migration Tasks
+
+`mooncake-store-admin-server` now exposes an in-memory route-migration task queue over HTTP.
+
+Current endpoints:
+
+- `POST /v1/route-migrations`
+- `GET /v1/route-migrations`
+- `GET /v1/route-migrations/<task_id>`
+
+Task request fields:
+
+- `authority`
+- `tenant`
+- `key`
+- `mode = "copy" | "move"`
+- `source_segment`
+- `target_segments`
+- `task_executor`
+- optional `max_retries`
+
+Operational notes:
+
+- the admin server does not move bytes itself; it submits migration RPC to the chosen `task_executor`
+- `copy` supports multiple targets, while `move` currently requires exactly one target
+- admin keeps task state only in process memory, so queued tasks are lost if the admin server restarts
+- admin retry is automatic while the server stays alive; route visibility is used as the authoritative completion check when executor status is lost
+
 Manage tenant policy or clean up stale segment registrations with the packaged admin binary:
 
 ```bash

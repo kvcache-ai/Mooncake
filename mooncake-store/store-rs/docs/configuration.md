@@ -71,6 +71,24 @@ Server maintenance defaults:
 - `--quota-reconcile-interval-ms 0` disables background tenant quota reconcile
 - `--quota-reconcile-tenant <tenant>` can be repeated; when unset, no tenant quota reconcile worker is started
 
+## Admin route-migration queue
+
+The standalone admin HTTP server keeps explicit route-migration tasks in process memory and retries transient executor failures automatically while the server remains alive.
+
+Environment knobs:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MC_STORE_ADMIN_MIGRATION_MAX_RETRIES` | `5` | default retry budget for tasks that do not override `max_retries` |
+| `MC_STORE_ADMIN_MIGRATION_RETRY_BASE_DELAY_MS` | `3000` | base delay used by the admin retry backoff |
+| `MC_STORE_ADMIN_MIGRATION_RETRY_MAX_DELAY_MS` | `30000` | maximum delay cap for the admin retry backoff |
+| `MC_STORE_ADMIN_MIGRATION_POLL_INTERVAL_MS` | `100` | background admin polling interval for task dispatch and executor status refresh |
+
+Notes:
+
+- these knobs are read by `mooncake-store-admin server` through `AdminService::from_config(...)`
+- task state is not persisted in metadata, so these settings control a live in-memory queue rather than a durable scheduler
+
 ## `StoreClientBuilder`
 
 `StoreClientBuilder` is the main construction surface for Rust clients.

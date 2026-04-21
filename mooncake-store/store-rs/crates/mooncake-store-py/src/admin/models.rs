@@ -161,6 +161,64 @@ pub struct ListTenantQuotaReservationsResponse {
     pub reservations: Vec<TenantQuotaReservation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMigrationMode {
+    Copy,
+    Move,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMigrationTaskState {
+    Pending,
+    Dispatching,
+    Running,
+    RetryWait,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteMigrationTaskSubmitRequest {
+    pub authority: String,
+    pub tenant: String,
+    pub key: String,
+    pub mode: RouteMigrationMode,
+    pub source_segment: String,
+    pub target_segments: Vec<String>,
+    pub task_executor: String,
+    pub max_retries: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteMigrationTaskStatusResponse {
+    pub task_id: String,
+    pub namespace: String,
+    pub authority: String,
+    pub tenant: String,
+    pub key: String,
+    pub mode: RouteMigrationMode,
+    pub source_segment: String,
+    pub target_segments: Vec<String>,
+    pub task_executor: String,
+    pub state: RouteMigrationTaskState,
+    pub attempts: u32,
+    pub max_retries: u32,
+    pub execution_id: Option<String>,
+    pub next_retry_at_ms: Option<u64>,
+    pub last_error: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteMigrationTaskListResponse {
+    pub count: usize,
+    pub tasks: Vec<RouteMigrationTaskStatusResponse>,
+}
+
 fn default_updated_by() -> String {
     "admin".to_string()
 }

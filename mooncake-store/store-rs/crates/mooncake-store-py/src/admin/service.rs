@@ -1,19 +1,28 @@
+use std::collections::BTreeMap;
+use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{
     ClientLeaseLiveness, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace,
     RedisMetadataBackend, RedisMetadataCleanupReport, RedisMetadataConfig,
 };
-use mooncake_store_client::record_tenant_quota_reconcile;
+use mooncake_store_client::{
+    control_plane_pb, record_tenant_quota_reconcile, MigrationControlClient,
+};
 use mooncake_store_core::{
-    route_logical_object_id, ClientEpoch, ClientRuntimeId, LogicalObjectId, MetadataBackend,
-    NamespaceScope, ObjectKey, RoutePolicy, RoutePolicyDomain, StoreError,
+    route_logical_object_id, ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId,
+    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, RoutePolicy,
+    RoutePolicyDomain, StoreError,
     TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantObjectAccountingState,
     TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
     TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationState, TenantRoutePolicy,
     DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
 };
+use parking_lot::Mutex;
 use url::Url;
 
 use crate::config::build_store_metadata_backend;
@@ -22,17 +31,759 @@ use super::models::{
     AdminCleanupReport, AdminMaintenanceReport, AdminOwnerCleanupReport, AdminOwnerCleanupState,
     DeleteTenantPolicyResponse, GetTenantObjectAccountingResponse, GetTenantPolicyResponse,
     GetTenantQuotaStateResponse, ListTenantQuotaReservationsResponse, PolicyPatchInput,
+    RouteMigrationMode, RouteMigrationTaskListResponse, RouteMigrationTaskState,
+    RouteMigrationTaskStatusResponse, RouteMigrationTaskSubmitRequest,
     RoutePolicyResponse, TenantQuotaAbortResponse, TenantQuotaReconcileAction,
     TenantQuotaReconcileReport,
 };
 
 pub type AdminResult<T> = mooncake_store_core::Result<T>;
 
+const DEFAULT_MIGRATION_MAX_RETRIES: u32 = 5;
+const DEFAULT_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_secs(3);
+const DEFAULT_MIGRATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const DEFAULT_MIGRATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MIGRATION_MAX_RETRIES_ENV: &str = "MC_STORE_ADMIN_MIGRATION_MAX_RETRIES";
+const MIGRATION_RETRY_BASE_DELAY_MS_ENV: &str = "MC_STORE_ADMIN_MIGRATION_RETRY_BASE_DELAY_MS";
+const MIGRATION_RETRY_MAX_DELAY_MS_ENV: &str = "MC_STORE_ADMIN_MIGRATION_RETRY_MAX_DELAY_MS";
+const MIGRATION_POLL_INTERVAL_MS_ENV: &str = "MC_STORE_ADMIN_MIGRATION_POLL_INTERVAL_MS";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationQueueConfig {
+    pub default_max_retries: u32,
+    pub retry_base_delay: Duration,
+    pub retry_max_delay: Duration,
+    pub poll_interval: Duration,
+}
+
+impl Default for MigrationQueueConfig {
+    fn default() -> Self {
+        Self {
+            default_max_retries: DEFAULT_MIGRATION_MAX_RETRIES,
+            retry_base_delay: DEFAULT_MIGRATION_RETRY_BASE_DELAY,
+            retry_max_delay: DEFAULT_MIGRATION_RETRY_MAX_DELAY,
+            poll_interval: DEFAULT_MIGRATION_POLL_INTERVAL,
+        }
+    }
+}
+
+impl MigrationQueueConfig {
+    fn from_env() -> AdminResult<Self> {
+        let mut config = Self::default();
+        if let Some(value) = parse_env_u32(MIGRATION_MAX_RETRIES_ENV)? {
+            config.default_max_retries = value.max(1);
+        }
+        if let Some(value) = parse_env_duration_ms(MIGRATION_RETRY_BASE_DELAY_MS_ENV)? {
+            config.retry_base_delay = value.max(Duration::from_millis(1));
+        }
+        if let Some(value) = parse_env_duration_ms(MIGRATION_RETRY_MAX_DELAY_MS_ENV)? {
+            config.retry_max_delay = value.max(config.retry_base_delay);
+        }
+        if let Some(value) = parse_env_duration_ms(MIGRATION_POLL_INTERVAL_MS_ENV)? {
+            config.poll_interval = value.max(Duration::from_millis(1));
+        }
+        Ok(config)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MigrationExecutionProbe {
+    pub(crate) state: control_plane_pb::MigrationExecutionState,
+    pub(crate) attempts: u32,
+    pub(crate) last_error: String,
+}
+
+pub(crate) trait MigrationRpc: Send + Sync {
+    fn submit_migration_task(
+        &self,
+        lease: &ClientLease,
+        request: control_plane_pb::SubmitMigrationTaskRequest,
+    ) -> AdminResult<String>;
+
+    fn get_migration_execution_status(
+        &self,
+        lease: &ClientLease,
+        request: control_plane_pb::GetMigrationExecutionStatusRequest,
+    ) -> AdminResult<MigrationExecutionProbe>;
+
+    fn get_route(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> AdminResult<Option<ObjectRoute>>;
+}
+
+struct ControlPlaneMigrationRpc;
+
+impl MigrationRpc for ControlPlaneMigrationRpc {
+    fn submit_migration_task(
+        &self,
+        lease: &ClientLease,
+        request: control_plane_pb::SubmitMigrationTaskRequest,
+    ) -> AdminResult<String> {
+        MigrationControlClient::new()?.submit_migration_task(lease, request)
+    }
+
+    fn get_migration_execution_status(
+        &self,
+        lease: &ClientLease,
+        request: control_plane_pb::GetMigrationExecutionStatusRequest,
+    ) -> AdminResult<MigrationExecutionProbe> {
+        let reply =
+            MigrationControlClient::new()?.get_migration_execution_status_detail(lease, request)?;
+        Ok(MigrationExecutionProbe {
+            state: control_plane_pb::MigrationExecutionState::try_from(reply.state)
+                .unwrap_or(control_plane_pb::MigrationExecutionState::Unspecified),
+            attempts: reply.attempts,
+            last_error: reply.last_error,
+        })
+    }
+
+    fn get_route(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> AdminResult<Option<ObjectRoute>> {
+        MigrationControlClient::new()?.get_route(lease, namespace, authority, key)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RouteMigrationTaskRecord {
+    task_id: String,
+    namespace: String,
+    authority: String,
+    tenant: String,
+    key: String,
+    mode: RouteMigrationMode,
+    source_segment: String,
+    target_segments: Vec<String>,
+    task_executor: String,
+    state: RouteMigrationTaskState,
+    attempts: u32,
+    max_retries: u32,
+    execution_id: Option<String>,
+    next_retry_at_ms: Option<u64>,
+    last_error: String,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+}
+
+impl RouteMigrationTaskRecord {
+    fn to_response(&self) -> RouteMigrationTaskStatusResponse {
+        RouteMigrationTaskStatusResponse {
+            task_id: self.task_id.clone(),
+            namespace: self.namespace.clone(),
+            authority: self.authority.clone(),
+            tenant: self.tenant.clone(),
+            key: self.key.clone(),
+            mode: self.mode,
+            source_segment: self.source_segment.clone(),
+            target_segments: self.target_segments.clone(),
+            task_executor: self.task_executor.clone(),
+            state: self.state,
+            attempts: self.attempts,
+            max_retries: self.max_retries,
+            execution_id: self.execution_id.clone(),
+            next_retry_at_ms: self.next_retry_at_ms,
+            last_error: self.last_error.clone(),
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MigrationTaskManager {
+    state: Arc<MigrationTaskManagerState>,
+}
+
+struct MigrationTaskManagerState {
+    backend: Arc<dyn MetadataBackend>,
+    rpc: Arc<dyn MigrationRpc>,
+    config: MigrationQueueConfig,
+    next_task_id: AtomicU64,
+    tasks: Mutex<BTreeMap<String, RouteMigrationTaskRecord>>,
+}
+
+#[derive(Clone, Debug)]
+enum RouteCompletionCheck {
+    Pending,
+    Completed,
+    Conflict(String),
+}
+
+impl MigrationTaskManager {
+    fn new(
+        backend: Arc<dyn MetadataBackend>,
+        rpc: Arc<dyn MigrationRpc>,
+        config: MigrationQueueConfig,
+    ) -> Self {
+        let state = Arc::new(MigrationTaskManagerState {
+            backend,
+            rpc,
+            config,
+            next_task_id: AtomicU64::new(1),
+            tasks: Mutex::new(BTreeMap::new()),
+        });
+        let weak = Arc::downgrade(&state);
+        let poll_interval = state.config.poll_interval.max(Duration::from_millis(1));
+        let _ = thread::Builder::new()
+            .name("mooncake-admin-migration".to_string())
+            .spawn(move || {
+                while let Some(state) = weak.upgrade() {
+                    state.tick();
+                    thread::sleep(poll_interval);
+                }
+            });
+        Self { state }
+    }
+
+    fn submit(
+        &self,
+        request: RouteMigrationTaskSubmitRequest,
+    ) -> AdminResult<RouteMigrationTaskStatusResponse> {
+        validate_route_migration_request(&request)?;
+        let now = now_ms();
+        let sequence = self.state.next_task_id.fetch_add(1, Ordering::SeqCst);
+        let task_id = format!("route-migration-{sequence}");
+        let max_retries = request
+            .max_retries
+            .unwrap_or(self.state.config.default_max_retries)
+            .max(1);
+        let record = RouteMigrationTaskRecord {
+            task_id: task_id.clone(),
+            namespace: self.state.backend.route_namespace(),
+            authority: request.authority,
+            tenant: request.tenant,
+            key: request.key,
+            mode: request.mode,
+            source_segment: request.source_segment,
+            target_segments: request.target_segments,
+            task_executor: request.task_executor,
+            state: RouteMigrationTaskState::Pending,
+            attempts: 0,
+            max_retries,
+            execution_id: None,
+            next_retry_at_ms: None,
+            last_error: String::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let response = record.to_response();
+        self.state.tasks.lock().insert(task_id, record);
+        Ok(response)
+    }
+
+    fn get(&self, task_id: &str) -> AdminResult<RouteMigrationTaskStatusResponse> {
+        self.state
+            .tasks
+            .lock()
+            .get(task_id)
+            .cloned()
+            .map(|record| record.to_response())
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("route migration task {task_id} was not found"))
+            })
+    }
+
+    fn list(&self) -> RouteMigrationTaskListResponse {
+        let mut tasks = self
+            .state
+            .tasks
+            .lock()
+            .values()
+            .cloned()
+            .map(|record| record.to_response())
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.task_id.cmp(&right.task_id))
+        });
+        RouteMigrationTaskListResponse {
+            count: tasks.len(),
+            tasks,
+        }
+    }
+}
+
+impl MigrationTaskManagerState {
+    fn tick(&self) {
+        let now = now_ms();
+        let task_ids = self.tasks.lock().keys().cloned().collect::<Vec<_>>();
+        for task_id in task_ids {
+            let action = {
+                let tasks = self.tasks.lock();
+                let Some(record) = tasks.get(&task_id).cloned() else {
+                    continue;
+                };
+                match record.state {
+                    RouteMigrationTaskState::Pending => Some(MigrationTaskAction::Dispatch(record)),
+                    RouteMigrationTaskState::RetryWait
+                        if record.next_retry_at_ms.is_some_and(|retry_at| retry_at <= now) =>
+                    {
+                        if record.execution_id.is_some() {
+                            Some(MigrationTaskAction::Poll(record))
+                        } else {
+                            Some(MigrationTaskAction::Dispatch(record))
+                        }
+                    }
+                    RouteMigrationTaskState::Dispatching | RouteMigrationTaskState::Running => {
+                        Some(MigrationTaskAction::Poll(record))
+                    }
+                    _ => None,
+                }
+            };
+            match action {
+                Some(MigrationTaskAction::Dispatch(record)) => self.dispatch(record),
+                Some(MigrationTaskAction::Poll(record)) => self.poll(record),
+                None => {}
+            }
+        }
+    }
+
+    fn dispatch(&self, record: RouteMigrationTaskRecord) {
+        let attempted_dispatches = record.attempts.saturating_add(1);
+        let result = self
+            .resolve_live_lease(&record.task_executor)
+            .and_then(|lease| {
+                self.rpc.submit_migration_task(
+                    &lease,
+                    control_plane_pb::SubmitMigrationTaskRequest {
+                        namespace: record.namespace.clone(),
+                        authority: record.authority.clone(),
+                        tenant: record.tenant.clone(),
+                        key: record.key.clone(),
+                        mode: migration_mode_to_proto(record.mode) as i32,
+                        source_segment: record.source_segment.clone(),
+                        target_segments: record.target_segments.clone(),
+                        task_executor: record.task_executor.clone(),
+                        max_retries: record.max_retries as u64,
+                    },
+                )
+            });
+        match result {
+            Ok(execution_id) => self.update_task(
+                &record.task_id,
+                RouteMigrationTaskState::Dispatching,
+                attempted_dispatches,
+                Some(execution_id),
+                None,
+                String::new(),
+            ),
+            Err(error) => self.handle_attempt_failure(
+                record,
+                attempted_dispatches,
+                error.to_string(),
+            ),
+        }
+    }
+
+    fn poll(&self, record: RouteMigrationTaskRecord) {
+        let Some(execution_id) = record.execution_id.clone() else {
+            self.handle_execution_failure(record, "route migration task is missing execution_id");
+            return;
+        };
+        let lease = match self.resolve_live_lease(&record.task_executor) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.handle_execution_failure(record, &error.to_string());
+                return;
+            }
+        };
+        let result = self.rpc.get_migration_execution_status(
+            &lease,
+            control_plane_pb::GetMigrationExecutionStatusRequest {
+                namespace: record.namespace.clone(),
+                authority: record.authority.clone(),
+                execution_id: execution_id.clone(),
+            },
+        );
+        match result {
+            Ok(status) => match status.state {
+                control_plane_pb::MigrationExecutionState::Pending
+                | control_plane_pb::MigrationExecutionState::Dispatching => self.update_task(
+                    &record.task_id,
+                    RouteMigrationTaskState::Dispatching,
+                    record.attempts.max(status.attempts),
+                    Some(execution_id),
+                    None,
+                    status.last_error,
+                ),
+                control_plane_pb::MigrationExecutionState::Running
+                | control_plane_pb::MigrationExecutionState::RetryWait => self.update_task(
+                    &record.task_id,
+                    RouteMigrationTaskState::Running,
+                    record.attempts.max(status.attempts),
+                    Some(execution_id),
+                    None,
+                    status.last_error,
+                ),
+                control_plane_pb::MigrationExecutionState::Succeeded => self.update_task(
+                    &record.task_id,
+                    RouteMigrationTaskState::Succeeded,
+                    record.attempts.max(status.attempts),
+                    Some(execution_id),
+                    None,
+                    status.last_error,
+                ),
+                control_plane_pb::MigrationExecutionState::Failed
+                | control_plane_pb::MigrationExecutionState::Cancelled
+                | control_plane_pb::MigrationExecutionState::Unspecified => {
+                    let last_error = if status.last_error.is_empty() {
+                        format!("task executor reported {:?}", status.state)
+                    } else {
+                        status.last_error
+                    };
+                    self.handle_execution_failure(record, &last_error);
+                }
+            },
+            Err(error) => self.handle_status_query_failure(record, &error.to_string()),
+        }
+    }
+
+    fn handle_status_query_failure(&self, record: RouteMigrationTaskRecord, error: &str) {
+        match self.check_route_completion(&record) {
+            RouteCompletionCheck::Completed => self.update_task(
+                &record.task_id,
+                RouteMigrationTaskState::Succeeded,
+                record.attempts,
+                record.execution_id.clone(),
+                None,
+                String::new(),
+            ),
+            RouteCompletionCheck::Conflict(message) => self.update_task(
+                &record.task_id,
+                RouteMigrationTaskState::Failed,
+                record.attempts,
+                record.execution_id.clone(),
+                None,
+                format!("{error}; {message}"),
+            ),
+            RouteCompletionCheck::Pending => {
+                if record.attempts < record.max_retries {
+                    self.update_task(
+                        &record.task_id,
+                        RouteMigrationTaskState::RetryWait,
+                        record.attempts,
+                        record.execution_id.clone(),
+                        Some(self.next_retry_at_ms(record.attempts)),
+                        error.to_string(),
+                    );
+                } else {
+                    self.update_task(
+                        &record.task_id,
+                        RouteMigrationTaskState::Failed,
+                        record.attempts,
+                        record.execution_id.clone(),
+                        None,
+                        error.to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_execution_failure(&self, record: RouteMigrationTaskRecord, error: &str) {
+        match self.check_route_completion(&record) {
+            RouteCompletionCheck::Completed => self.update_task(
+                &record.task_id,
+                RouteMigrationTaskState::Succeeded,
+                record.attempts,
+                record.execution_id.clone(),
+                None,
+                String::new(),
+            ),
+            RouteCompletionCheck::Conflict(message) => self.update_task(
+                &record.task_id,
+                RouteMigrationTaskState::Failed,
+                record.attempts,
+                record.execution_id.clone(),
+                None,
+                format!("{error}; {message}"),
+            ),
+            RouteCompletionCheck::Pending => {
+                if record.attempts < record.max_retries {
+                    self.update_task(
+                        &record.task_id,
+                        RouteMigrationTaskState::RetryWait,
+                        record.attempts,
+                        None,
+                        Some(self.next_retry_at_ms(record.attempts)),
+                        error.to_string(),
+                    );
+                } else {
+                    self.update_task(
+                        &record.task_id,
+                        RouteMigrationTaskState::Failed,
+                        record.attempts,
+                        record.execution_id.clone(),
+                        None,
+                        error.to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_attempt_failure(
+        &self,
+        record: RouteMigrationTaskRecord,
+        attempted_dispatches: u32,
+        error: String,
+    ) {
+        match self.check_route_completion(&record) {
+            RouteCompletionCheck::Completed => self.update_task(
+                &record.task_id,
+                RouteMigrationTaskState::Succeeded,
+                attempted_dispatches,
+                record.execution_id.clone(),
+                None,
+                String::new(),
+            ),
+            RouteCompletionCheck::Conflict(message) => self.update_task(
+                &record.task_id,
+                RouteMigrationTaskState::Failed,
+                attempted_dispatches,
+                record.execution_id.clone(),
+                None,
+                format!("{error}; {message}"),
+            ),
+            RouteCompletionCheck::Pending => {
+                if attempted_dispatches < record.max_retries {
+                    self.update_task(
+                        &record.task_id,
+                        RouteMigrationTaskState::RetryWait,
+                        attempted_dispatches,
+                        None,
+                        Some(self.next_retry_at_ms(attempted_dispatches)),
+                        error,
+                    );
+                } else {
+                    self.update_task(
+                        &record.task_id,
+                        RouteMigrationTaskState::Failed,
+                        attempted_dispatches,
+                        record.execution_id.clone(),
+                        None,
+                        error,
+                    );
+                }
+            }
+        }
+    }
+
+    fn check_route_completion(&self, record: &RouteMigrationTaskRecord) -> RouteCompletionCheck {
+        let object_key = ObjectKey::from_logical_id(&LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some(record.tenant.as_str()), None, None),
+            record.key.clone(),
+        ));
+        if let Ok(authority) = self.resolve_live_lease(&record.authority) {
+            let authority_id = authority.runtime.stable_id.clone();
+            if let Ok(route) = self
+                .rpc
+                .get_route(&authority, &record.namespace, &authority_id, &object_key)
+            {
+                let completion = evaluate_route_completion(record, route.as_ref());
+                if !matches!(completion, RouteCompletionCheck::Pending) {
+                    return completion;
+                }
+            }
+        }
+        let route = match self.backend.get_object_route(&object_key) {
+            Ok(route) => route,
+            Err(_) => return RouteCompletionCheck::Pending,
+        };
+        evaluate_route_completion(record, route.as_ref())
+    }
+
+    fn resolve_live_lease(&self, stable_id: &str) -> AdminResult<ClientLease> {
+        let mut matches = self
+            .backend
+            .list_live_clients()?
+            .into_iter()
+            .filter(|lease| lease.runtime.stable_id.0 == stable_id)
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .runtime
+                .epoch
+                .0
+                .cmp(&left.runtime.epoch.0)
+                .then_with(|| right.expires_at_ms.cmp(&left.expires_at_ms))
+        });
+        matches.into_iter().next().ok_or_else(|| {
+            StoreError::NotFound(format!("live client lease for {stable_id} was not found"))
+        })
+    }
+
+    fn next_retry_at_ms(&self, attempts: u32) -> u64 {
+        let exponent = attempts.saturating_sub(1).min(16);
+        let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
+        let delay = self
+            .config
+            .retry_base_delay
+            .saturating_mul(multiplier)
+            .min(self.config.retry_max_delay);
+        now_ms().saturating_add(delay.as_millis() as u64)
+    }
+
+    fn update_task(
+        &self,
+        task_id: &str,
+        state: RouteMigrationTaskState,
+        attempts: u32,
+        execution_id: Option<String>,
+        next_retry_at_ms: Option<u64>,
+        last_error: String,
+    ) {
+        if let Some(record) = self.tasks.lock().get_mut(task_id) {
+            record.state = state;
+            record.attempts = attempts;
+            record.execution_id = execution_id;
+            record.next_retry_at_ms = next_retry_at_ms;
+            record.last_error = last_error;
+            record.updated_at_ms = now_ms();
+        }
+    }
+}
+
+enum MigrationTaskAction {
+    Dispatch(RouteMigrationTaskRecord),
+    Poll(RouteMigrationTaskRecord),
+}
+
+fn migration_mode_to_proto(mode: RouteMigrationMode) -> control_plane_pb::MigrationMode {
+    match mode {
+        RouteMigrationMode::Copy => control_plane_pb::MigrationMode::Copy,
+        RouteMigrationMode::Move => control_plane_pb::MigrationMode::Move,
+    }
+}
+
+fn parse_env_u32(name: &str) -> AdminResult<Option<u32>> {
+    match env::var(name) {
+        Ok(value) => value.parse::<u32>().map(Some).map_err(|error| {
+            StoreError::InvalidState(format!(
+                "invalid {name} environment variable value {value:?}: {error}"
+            ))
+        }),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(StoreError::InvalidState(format!(
+            "failed to read {name} environment variable: {error}"
+        ))),
+    }
+}
+
+fn parse_env_duration_ms(name: &str) -> AdminResult<Option<Duration>> {
+    Ok(parse_env_u32(name)?.map(|value| Duration::from_millis(value as u64)))
+}
+
+fn validate_route_migration_request(request: &RouteMigrationTaskSubmitRequest) -> AdminResult<()> {
+    if request.authority.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "route migration task is missing authority".to_string(),
+        ));
+    }
+    if request.tenant.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "route migration task is missing tenant".to_string(),
+        ));
+    }
+    if request.key.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "route migration task is missing key".to_string(),
+        ));
+    }
+    if request.source_segment.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "route migration task is missing source_segment".to_string(),
+        ));
+    }
+    if request.task_executor.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "route migration task is missing task_executor".to_string(),
+        ));
+    }
+    match request.mode {
+        RouteMigrationMode::Copy if request.target_segments.is_empty() => Err(
+            StoreError::InvalidState(
+                "route migration copy tasks require at least one target_segment".to_string(),
+            ),
+        ),
+        RouteMigrationMode::Move if request.target_segments.len() != 1 => Err(
+            StoreError::InvalidState(
+                "route migration move tasks require exactly one target_segment".to_string(),
+            ),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn evaluate_route_completion(
+    record: &RouteMigrationTaskRecord,
+    route: Option<&ObjectRoute>,
+) -> RouteCompletionCheck {
+    let Some(route) = route else {
+        return RouteCompletionCheck::Pending;
+    };
+    let has_source = route
+        .replicas
+        .iter()
+        .any(|replica| replica.segment_name.0 == record.source_segment);
+    let target_matches = record
+        .target_segments
+        .iter()
+        .map(|target| {
+            route.replicas
+                .iter()
+                .any(|replica| replica.segment_name.0 == *target)
+        })
+        .collect::<Vec<_>>();
+    match record.mode {
+        RouteMigrationMode::Copy => {
+            if has_source && target_matches.iter().all(|present| *present) {
+                RouteCompletionCheck::Completed
+            } else if target_matches.iter().any(|present| *present) || !has_source {
+                RouteCompletionCheck::Conflict(
+                    "route migration copy requires source visibility plus all requested targets"
+                        .to_string(),
+                )
+            } else {
+                RouteCompletionCheck::Pending
+            }
+        }
+        RouteMigrationMode::Move => {
+            let has_target = target_matches.first().copied().unwrap_or(false);
+            if has_target && !has_source {
+                RouteCompletionCheck::Completed
+            } else if has_target && has_source {
+                RouteCompletionCheck::Conflict(
+                    "route migration move left both source and target replicas visible"
+                        .to_string(),
+                )
+            } else if !has_target && !has_source {
+                RouteCompletionCheck::Conflict(
+                    "route migration move lost the source replica before the target became visible"
+                        .to_string(),
+                )
+            } else {
+                RouteCompletionCheck::Pending
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AdminService {
     backend: Arc<dyn MetadataBackend>,
     metadata_url: String,
     keyspace: MetadataKeyspace,
+    migrations: MigrationTaskManager,
 }
 
 trait AdminMaintenanceBackend {
@@ -190,11 +941,13 @@ impl AdminService {
     pub fn from_config(metadata_url: &str, keyspace: Option<String>) -> AdminResult<Self> {
         let keyspace = keyspace.map(MetadataKeyspace::new).unwrap_or_default();
         let backend = build_store_metadata_backend(metadata_url, keyspace.clone())?;
-        Ok(Self {
+        Ok(Self::new_with_migration_support(
             backend,
-            metadata_url: metadata_url.to_string(),
+            metadata_url.to_string(),
             keyspace,
-        })
+            MigrationQueueConfig::from_env()?,
+            Arc::new(ControlPlaneMigrationRpc),
+        ))
     }
 
     pub fn new(
@@ -202,7 +955,28 @@ impl AdminService {
         metadata_url: impl Into<String>,
         keyspace: MetadataKeyspace,
     ) -> Self {
+        Self::new_with_migration_support(
+            backend,
+            metadata_url,
+            keyspace,
+            MigrationQueueConfig::default(),
+            Arc::new(ControlPlaneMigrationRpc),
+        )
+    }
+
+    pub(crate) fn new_with_migration_support(
+        backend: Arc<dyn MetadataBackend>,
+        metadata_url: impl Into<String>,
+        keyspace: MetadataKeyspace,
+        migration_config: MigrationQueueConfig,
+        migration_rpc: Arc<dyn MigrationRpc>,
+    ) -> Self {
         Self {
+            migrations: MigrationTaskManager::new(
+                backend.clone(),
+                migration_rpc,
+                migration_config,
+            ),
             backend,
             metadata_url: metadata_url.into(),
             keyspace,
@@ -223,6 +997,24 @@ impl AdminService {
 
     pub fn redacted_metadata_url(&self) -> String {
         redact_redis_url(&self.metadata_url)
+    }
+
+    pub fn submit_route_migration_task(
+        &self,
+        request: RouteMigrationTaskSubmitRequest,
+    ) -> AdminResult<RouteMigrationTaskStatusResponse> {
+        self.migrations.submit(request)
+    }
+
+    pub fn get_route_migration_task(
+        &self,
+        task_id: &str,
+    ) -> AdminResult<RouteMigrationTaskStatusResponse> {
+        self.migrations.get(task_id)
+    }
+
+    pub fn list_route_migration_tasks(&self) -> RouteMigrationTaskListResponse {
+        self.migrations.list()
     }
 
     pub fn get_route_policy(&self, tenant: Option<&str>) -> AdminResult<RoutePolicyResponse> {
@@ -885,7 +1677,9 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
+    use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
@@ -893,8 +1687,10 @@ mod tests {
         EtcdMetadataBackend, EtcdMetadataConfig, InMemoryMetadataBackend, RedisMetadataBackend,
         RedisMetadataConfig,
     };
+    use mooncake_store_client::control_plane_pb;
     use mooncake_store_core::{
-        ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, MetadataBackend, ObjectRoute,
+        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+        ClientStableId, CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute,
         ReplicaRoute, ReplicaTier, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
         SegmentAnnouncement, SegmentLifecycleState, SegmentName, TenantObjectAccounting,
         TenantObjectAccountingState, TenantPolicy, TenantQuotaAbortOutcome,
@@ -902,6 +1698,7 @@ mod tests {
         TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
         TenantQuotaReservationState, TenantQuotaState,
     };
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -1424,6 +2221,189 @@ mod tests {
                 writer_runtime: ClientRuntimeId::new("writer-a", ClientEpoch(1)),
             })
             .expect("reservation should store");
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeMigrationRpc {
+        submit_results: Arc<Mutex<VecDeque<AdminResult<String>>>>,
+        status_results: Arc<Mutex<VecDeque<AdminResult<MigrationExecutionProbe>>>>,
+        route_results: Arc<Mutex<VecDeque<AdminResult<Option<ObjectRoute>>>>>,
+        submit_calls: Arc<AtomicUsize>,
+        status_calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeMigrationRpc {
+        fn submit_calls(&self) -> usize {
+            self.submit_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl MigrationRpc for FakeMigrationRpc {
+        fn submit_migration_task(
+            &self,
+            _lease: &ClientLease,
+            _request: control_plane_pb::SubmitMigrationTaskRequest,
+        ) -> AdminResult<String> {
+            self.submit_calls.fetch_add(1, Ordering::Relaxed);
+            self.submit_results
+                .lock()
+                .pop_front()
+                .unwrap_or_else(|| Ok("execution-1".to_string()))
+        }
+
+        fn get_migration_execution_status(
+            &self,
+            _lease: &ClientLease,
+            _request: control_plane_pb::GetMigrationExecutionStatusRequest,
+        ) -> AdminResult<MigrationExecutionProbe> {
+            self.status_calls.fetch_add(1, Ordering::Relaxed);
+            self.status_results.lock().pop_front().unwrap_or_else(|| {
+                Ok(MigrationExecutionProbe {
+                    state: control_plane_pb::MigrationExecutionState::Succeeded,
+                    attempts: 1,
+                    last_error: String::new(),
+                })
+            })
+        }
+
+        fn get_route(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _key: &ObjectKey,
+        ) -> AdminResult<Option<ObjectRoute>> {
+            self.route_results
+                .lock()
+                .pop_front()
+                .unwrap_or(Ok(None))
+        }
+    }
+
+    fn test_migration_service_with_rpc(
+        backend: Arc<dyn MetadataBackend>,
+        rpc: Arc<dyn MigrationRpc>,
+        config: MigrationQueueConfig,
+    ) -> AdminService {
+        AdminService::new_with_migration_support(
+            backend,
+            "memory://test",
+            MetadataKeyspace::default(),
+            config,
+            rpc,
+        )
+    }
+
+    fn live_lease(stable_id: &str, epoch: u64) -> ClientLease {
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(epoch)),
+            compatibility: CompatibilityDescriptor::default(),
+            state: ClientLifecycleState::Active,
+            endpoints: ClientEndpointSet {
+                rpc_address: format!("127.0.0.1:{}", 18_000 + epoch),
+                segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
+                labels: [
+                    ("control_addr".to_string(), format!("http://127.0.0.1:{}", 19_000 + epoch)),
+                    ("route".to_string(), "true".to_string()),
+                    ("storage".to_string(), "true".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            expires_at_ms: u64::MAX,
+        }
+    }
+
+    fn wait_for_task_state(
+        service: &AdminService,
+        task_id: &str,
+        expected: RouteMigrationTaskState,
+    ) -> RouteMigrationTaskStatusResponse {
+        let started = now_ms();
+        loop {
+            let response = service
+                .get_route_migration_task(task_id)
+                .expect("task status should read");
+            if response.state == expected {
+                return response;
+            }
+            assert!(
+                now_ms().saturating_sub(started) < 5_000,
+                "task {task_id} should reach {expected:?}, current={:?}",
+                response.state
+            );
+            sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn sample_move_request() -> RouteMigrationTaskSubmitRequest {
+        RouteMigrationTaskSubmitRequest {
+            authority: "authority-a".to_string(),
+            tenant: "tenant-a".to_string(),
+            key: "object-a".to_string(),
+            mode: RouteMigrationMode::Move,
+            source_segment: "segment-a".to_string(),
+            target_segments: vec!["segment-b".to_string()],
+            task_executor: "executor-a".to_string(),
+            max_retries: None,
+        }
+    }
+
+    fn sample_copy_request() -> RouteMigrationTaskSubmitRequest {
+        RouteMigrationTaskSubmitRequest {
+            authority: "authority-a".to_string(),
+            tenant: "tenant-a".to_string(),
+            key: "object-a".to_string(),
+            mode: RouteMigrationMode::Copy,
+            source_segment: "segment-a".to_string(),
+            target_segments: vec!["segment-b".to_string()],
+            task_executor: "executor-a".to_string(),
+            max_retries: None,
+        }
+    }
+
+    fn sample_active_route(key: &str, source_segment: &str, target_segments: &[&str]) -> ObjectRoute {
+        let mut replicas = Vec::new();
+        if !source_segment.is_empty() {
+            replicas.push(ReplicaRoute {
+                owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
+                segment_name: SegmentName::new(source_segment),
+                offset: 0,
+                segment_offset: 0,
+                length: 12,
+                checksum: None,
+                tier: ReplicaTier::Nvme,
+                priority: 0,
+            });
+        }
+        for (index, segment) in target_segments.iter().enumerate() {
+            replicas.push(ReplicaRoute {
+                owner: ClientRuntimeId::new("storage-b", ClientEpoch(1)),
+                segment_name: SegmentName::new(*segment),
+                offset: 64 * (index as u64 + 1),
+                segment_offset: 64 * (index as u64 + 1),
+                length: 12,
+                checksum: None,
+                tier: ReplicaTier::Nvme,
+                priority: (index + 1) as u16,
+            });
+        }
+        ObjectRoute {
+            key: ObjectKey::new(format!("tenant-a::{key}")),
+            namespace: Some(NamespaceScope::with_defaults(
+                Some("tenant-a"),
+                None::<&str>,
+                None::<&str>,
+            )),
+            logical_key: Some(key.to_string()),
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas,
+        }
     }
 
     #[test]
@@ -1990,5 +2970,282 @@ mod tests {
             .list_due_client_lease_expiries(super::now_ms(), 8)
             .expect("expiry queue should be queryable")
             .is_empty());
+    }
+
+    #[test]
+    fn admin_service_route_migration_succeeds_after_executor_reports_success() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("authority-a", 1))
+            .expect("authority lease should store");
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(vec![Ok("execution-1".to_string())].into())),
+            status_results: Arc::new(Mutex::new(
+                vec![
+                    Ok(MigrationExecutionProbe {
+                        state: control_plane_pb::MigrationExecutionState::Running,
+                        attempts: 1,
+                        last_error: String::new(),
+                    }),
+                    Ok(MigrationExecutionProbe {
+                        state: control_plane_pb::MigrationExecutionState::Succeeded,
+                        attempts: 1,
+                        last_error: String::new(),
+                    }),
+                ]
+                .into(),
+            )),
+            route_results: Arc::new(Mutex::new(VecDeque::new())),
+            submit_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let service = test_migration_service_with_rpc(
+            backend,
+            rpc,
+            MigrationQueueConfig {
+                default_max_retries: 3,
+                retry_base_delay: Duration::from_millis(5),
+                retry_max_delay: Duration::from_millis(5),
+                poll_interval: Duration::from_millis(5),
+            },
+        );
+
+        let submitted = service
+            .submit_route_migration_task(sample_move_request())
+            .expect("migration task submit should succeed");
+        let status = wait_for_task_state(
+            &service,
+            &submitted.task_id,
+            RouteMigrationTaskState::Succeeded,
+        );
+        assert_eq!(status.attempts, 1);
+        assert_eq!(status.execution_id.as_deref(), Some("execution-1"));
+        assert!(status.last_error.is_empty());
+    }
+
+    #[test]
+    fn admin_service_route_migration_marks_succeeded_when_route_is_already_visible() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("authority-a", 1))
+            .expect("authority lease should store");
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(vec![Ok("execution-1".to_string())].into())),
+            status_results: Arc::new(Mutex::new(
+                vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
+            )),
+            route_results: Arc::new(Mutex::new(
+                vec![Ok(Some(sample_active_route("object-a", "", &["segment-b"])))].into(),
+            )),
+            submit_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let service = test_migration_service_with_rpc(
+            backend,
+            rpc,
+            MigrationQueueConfig {
+                default_max_retries: 2,
+                retry_base_delay: Duration::from_millis(5),
+                retry_max_delay: Duration::from_millis(5),
+                poll_interval: Duration::from_millis(5),
+            },
+        );
+
+        let submitted = service
+            .submit_route_migration_task(sample_move_request())
+            .expect("migration task submit should succeed");
+        let status = wait_for_task_state(
+            &service,
+            &submitted.task_id,
+            RouteMigrationTaskState::Succeeded,
+        );
+        assert_eq!(status.attempts, 1);
+        assert_eq!(status.execution_id.as_deref(), Some("execution-1"));
+    }
+
+    #[test]
+    fn admin_service_route_migration_retries_and_fails_after_budget() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("authority-a", 1))
+            .expect("authority lease should store");
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(
+                vec![
+                    Err(StoreError::Transport("executor down".to_string())),
+                    Err(StoreError::Transport("executor down".to_string())),
+                ]
+                .into(),
+            )),
+            status_results: Arc::new(Mutex::new(VecDeque::new())),
+            route_results: Arc::new(Mutex::new(vec![Ok(None), Ok(None)].into())),
+            submit_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let service = test_migration_service_with_rpc(
+            backend,
+            rpc,
+            MigrationQueueConfig {
+                default_max_retries: 2,
+                retry_base_delay: Duration::from_millis(5),
+                retry_max_delay: Duration::from_millis(5),
+                poll_interval: Duration::from_millis(5),
+            },
+        );
+
+        let submitted = service
+            .submit_route_migration_task(sample_move_request())
+            .expect("migration task submit should succeed");
+        let status = wait_for_task_state(
+            &service,
+            &submitted.task_id,
+            RouteMigrationTaskState::Failed,
+        );
+        assert_eq!(status.attempts, 2);
+        assert!(status.last_error.contains("executor down"));
+    }
+
+    #[test]
+    fn admin_service_route_migration_uses_metadata_fallback_when_authority_is_missing() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        backend
+            .compare_and_swap_object_route(
+                &ObjectKey::new("tenant-a::object-a"),
+                None,
+                Some(&sample_active_route("object-a", "", &["segment-b"])),
+            )
+            .expect("route should store");
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(vec![Ok("execution-1".to_string())].into())),
+            status_results: Arc::new(Mutex::new(
+                vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
+            )),
+            route_results: Arc::new(Mutex::new(VecDeque::new())),
+            submit_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let service = test_migration_service_with_rpc(
+            backend,
+            rpc,
+            MigrationQueueConfig {
+                default_max_retries: 2,
+                retry_base_delay: Duration::from_millis(5),
+                retry_max_delay: Duration::from_millis(5),
+                poll_interval: Duration::from_millis(5),
+            },
+        );
+
+        let submitted = service
+            .submit_route_migration_task(sample_move_request())
+            .expect("migration task submit should succeed");
+        let status = wait_for_task_state(
+            &service,
+            &submitted.task_id,
+            RouteMigrationTaskState::Succeeded,
+        );
+        assert_eq!(status.attempts, 1);
+    }
+
+    #[test]
+    fn admin_service_route_migration_copy_requires_source_visibility_for_success() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("authority-a", 1))
+            .expect("authority lease should store");
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(vec![Ok("execution-1".to_string())].into())),
+            status_results: Arc::new(Mutex::new(
+                vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
+            )),
+            route_results: Arc::new(Mutex::new(
+                vec![Ok(Some(sample_active_route("object-a", "", &["segment-b"])))].into(),
+            )),
+            submit_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let service = test_migration_service_with_rpc(
+            backend,
+            rpc,
+            MigrationQueueConfig {
+                default_max_retries: 2,
+                retry_base_delay: Duration::from_millis(5),
+                retry_max_delay: Duration::from_millis(5),
+                poll_interval: Duration::from_millis(5),
+            },
+        );
+
+        let submitted = service
+            .submit_route_migration_task(sample_copy_request())
+            .expect("migration task submit should succeed");
+        let status = wait_for_task_state(
+            &service,
+            &submitted.task_id,
+            RouteMigrationTaskState::Failed,
+        );
+        assert!(status.last_error.contains("requires source visibility"));
+    }
+
+    #[test]
+    fn admin_service_route_migration_status_retry_does_not_resubmit_task() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("authority-a", 1))
+            .expect("authority lease should store");
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(vec![Ok("execution-1".to_string())].into())),
+            status_results: Arc::new(Mutex::new(
+                vec![
+                    Err(StoreError::Transport("temporary status miss".to_string())),
+                    Ok(MigrationExecutionProbe {
+                        state: control_plane_pb::MigrationExecutionState::Succeeded,
+                        attempts: 1,
+                        last_error: String::new(),
+                    }),
+                ]
+                .into(),
+            )),
+            route_results: Arc::new(Mutex::new(vec![Ok(None)].into())),
+            submit_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let service = test_migration_service_with_rpc(
+            backend,
+            rpc.clone(),
+            MigrationQueueConfig {
+                default_max_retries: 2,
+                retry_base_delay: Duration::from_millis(5),
+                retry_max_delay: Duration::from_millis(5),
+                poll_interval: Duration::from_millis(5),
+            },
+        );
+
+        let submitted = service
+            .submit_route_migration_task(sample_move_request())
+            .expect("migration task submit should succeed");
+        let status = wait_for_task_state(
+            &service,
+            &submitted.task_id,
+            RouteMigrationTaskState::Succeeded,
+        );
+        assert_eq!(status.attempts, 1);
+        assert_eq!(rpc.submit_calls(), 1);
     }
 }
