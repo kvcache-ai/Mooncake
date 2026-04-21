@@ -265,6 +265,40 @@ Port reminder:
 - cross-host real-mode deployments should set both a reachable `local_hostname` and a fixed `transport_rpc_port`
 - `local_hostname` may also be passed as `host:port`; the compatibility layer will split the port into `transport_rpc_port`
 
+## Run Route-Migration E2E
+
+Use the local route-migration e2e helper to validate admin HTTP submission plus
+end-to-end `query_route` / `get` correctness for explicit `move`, single-target
+`copy`, or multi-target `copy`.
+
+Examples:
+
+```bash
+./scripts/e2e/run-route-migration-e2e.sh
+./scripts/e2e/run-route-migration-e2e.sh move
+./scripts/e2e/run-route-migration-e2e.sh copy
+./scripts/e2e/run-route-migration-e2e.sh copy-multi
+```
+
+The script:
+
+- starts a local Redis metadata backend when needed
+- launches two or three standalone `mooncake-store-client` storage nodes
+- launches `mooncake-store-admin-server`
+- writes a seed key into the source segment
+- submits `POST /v1/route-migrations`
+- polls `GET /v1/route-migrations/<task_id>`
+- verifies final `query_route` shape and payload readability
+
+Important knobs:
+
+- `MC_STORE_RS_ROUTE_MIGRATION_MODE=move|copy|copy-multi`
+- `MC_STORE_RS_ROUTE_MIGRATION_LEASE_TTL_MS`
+- `MC_STORE_RS_ROUTE_MIGRATION_STORAGE_BYTES`
+- `MC_STORE_RS_ROUTE_MIGRATION_SCRATCH_BYTES`
+- `MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS`
+- `MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR`
+
 Heartbeat behavior:
 
 - timeout knobs now come from one shared helper across the standalone client, Python compatibility runtime, and dummy client
@@ -293,6 +327,32 @@ mooncake-store-admin \
 
 `mooncake-store-admin-server` now exposes an in-memory route-migration task queue over HTTP.
 
+The packaged `mooncake-store-admin` binary acts as an operator client for that
+HTTP surface. Route-migration tasks are not kept in the CLI process, so
+`migrate ...` commands must point at a long-lived admin server with `--admin-url`:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  --admin-url http://127.0.0.1:18080 \
+  migrate copy \
+  --authority source-store \
+  --tenant tenant-a \
+  --domain domain-a \
+  --object-set set-a \
+  --key object-a \
+  --source-segment source-segment \
+  --target-segment target-segment-a \
+  --target-segment target-segment-b \
+  --task-executor executor-store \
+  --max-retries 5
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  --admin-url http://127.0.0.1:18080 \
+  migrate task list
+```
+
 Current endpoints:
 
 - `POST /v1/route-migrations`
@@ -303,6 +363,8 @@ Task request fields:
 
 - `authority`
 - `tenant`
+- optional `domain`
+- optional `object_set`
 - `key`
 - `mode = "copy" | "move"`
 - `source_segment`
@@ -314,8 +376,11 @@ Operational notes:
 
 - the admin server does not move bytes itself; it submits migration RPC to the chosen `task_executor`
 - `copy` supports multiple targets, while `move` currently requires exactly one target
+- scoped migration requests may carry `domain` and `object_set`; omitted values fall back to the default namespace
 - admin keeps task state only in process memory, so queued tasks are lost if the admin server restarts
 - admin retry is automatic while the server stays alive; route visibility is used as the authoritative completion check when executor status is lost
+- current CLI support covers `migrate copy`, `migrate move`, `migrate task list`, and `migrate task get`
+- `migrate` commands require `--admin-url`; the CLI no longer starts a private in-process task queue for these asynchronous operations
 
 Manage tenant policy or clean up stale segment registrations with the packaged admin binary:
 

@@ -759,6 +759,7 @@ impl StoreClient {
         }
     }
 
+    #[cfg(test)]
     fn explicit_migration_policy(plan: &ExplicitMigrationPlan) -> Result<ReplicationPolicy> {
         if plan.target_segments.is_empty() {
             return Err(StoreError::InvalidState(
@@ -856,9 +857,8 @@ impl StoreClient {
         let payload = self.read_payload_from_explicit_source(object_id, &current, &source)?;
         let object_ref =
             Self::explicit_migration_object_ref(object_id, current.qos_tier.as_deref());
-        let policy = self.resolve_replication_policy(Some(&Self::explicit_migration_policy(plan)?))?;
         let (targets, reservations) =
-            self.reserve_replica_targets(&object_ref, payload.len(), &policy)?;
+            self.reserve_explicit_migration_targets(&object_ref, payload.len(), plan)?;
         let offsets = match self.write_reserved_replicas(&targets, &reservations, &payload) {
             Ok(offsets) => offsets,
             Err(error) => {
@@ -940,6 +940,72 @@ impl StoreClient {
         }
 
         Ok(next_route)
+    }
+
+    fn reserve_explicit_migration_targets(
+        &self,
+        object: &ObjectRef<'_>,
+        length_bytes: usize,
+        plan: &ExplicitMigrationPlan,
+    ) -> Result<(
+        Vec<ReplicaWriteTarget>,
+        Vec<mooncake_store_core::SegmentReservation>,
+    )> {
+        let tenant = object.tenant.unwrap_or(self.default_tenant());
+        let key = object.key;
+        let mut targets = Vec::with_capacity(plan.target_segments.len());
+        let mut reservations = Vec::with_capacity(plan.target_segments.len());
+
+        for requested_segment in &plan.target_segments {
+            let preferred = self.lookup_preferred_segment(requested_segment).map_err(|error| {
+                StoreError::NotFound(format!(
+                    "explicit migration target segment {} is unavailable: {error}",
+                    requested_segment.0
+                ))
+            })?;
+            if self.runtime_is_suspect(&preferred.owner) {
+                let _ = self.release_reserved_allocations(&targets, &reservations);
+                return Err(StoreError::Transport(format!(
+                    "explicit migration target segment {} belongs to suspect runtime {}",
+                    requested_segment.0, preferred.owner
+                )));
+            }
+            let is_local = preferred.owner == self.lease.runtime;
+            let (target, reservation) = match self.reserve_specific_segment(
+                &preferred.owner,
+                &preferred.segment_name,
+                length_bytes,
+                is_local,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = self.release_reserved_allocations(&targets, &reservations);
+                    return Err(error);
+                }
+            };
+            if target.storage_runtime != preferred.owner || target.segment_name != preferred.segment_name
+            {
+                let _ = self.release_reserved_allocations(&targets, &reservations);
+                return Err(StoreError::Conflict(format!(
+                    "explicit migration reserved target {} on {} instead of requested {} on {}",
+                    target.segment_name.0,
+                    target.storage_runtime,
+                    preferred.segment_name.0,
+                    preferred.owner
+                )));
+            }
+            debug!(
+                tenant,
+                key,
+                storage_runtime = %target.storage_runtime,
+                segment = %target.segment_name.0,
+                "reserved explicit migration target"
+            );
+            targets.push(target);
+            reservations.push(reservation);
+        }
+
+        Ok((targets, reservations))
     }
 
     fn build_explicit_copy_route_delta(

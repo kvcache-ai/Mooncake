@@ -1,4 +1,6 @@
 use std::error::Error;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::mpsc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -9,9 +11,10 @@ use std::time::Duration;
 
 use _store_rs::admin::{
     format_policy_scope, format_route_policy_domain, format_tenant_object_accounting_state,
-    format_tenant_quota_reservation_state, redact_redis_url, route_policy_domain,
-    AdminHttpServerHandle, AdminService, PolicyPatchInput, TenantQuotaAbortRequest,
-    TenantQuotaReconcileRequest,
+    format_tenant_quota_reservation_state, redact_redis_url, route_policy_domain, AdminService,
+    ErrorResponse, PolicyPatchInput, RouteMigrationMode, RouteMigrationTaskListResponse,
+    RouteMigrationTaskState, RouteMigrationTaskStatusResponse, RouteMigrationTaskSubmitRequest,
+    TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
 };
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::MetadataKeyspace;
@@ -19,6 +22,8 @@ use mooncake_store_client::{init_tracing, RouteControlMode};
 use mooncake_store_core::{
     RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaReservationState,
 };
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tracing::{info, warn};
 use url::Url;
 
@@ -28,6 +33,8 @@ use url::Url;
 struct Args {
     #[arg(long)]
     metadata_url: String,
+    #[arg(long)]
+    admin_url: Option<String>,
     #[arg(long)]
     keyspace: Option<String>,
     #[arg(long)]
@@ -41,6 +48,10 @@ enum Command {
     CleanupStaleSegments,
     #[command(alias = "serve")]
     Server(ServerArgs),
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
@@ -115,6 +126,35 @@ enum QuotaCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum MigrateCommand {
+    Copy {
+        #[command(flatten)]
+        common: RouteMigrationArgs,
+        #[arg(long = "target-segment", required = true)]
+        target_segments: Vec<String>,
+    },
+    Move {
+        #[command(flatten)]
+        common: RouteMigrationArgs,
+        #[arg(long = "target-segment")]
+        target_segment: String,
+    },
+    Task {
+        #[command(subcommand)]
+        command: MigrateTaskCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MigrateTaskCommand {
+    List,
+    Get {
+        #[arg(long)]
+        task_id: String,
+    },
+}
+
 #[derive(ClapArgs, Clone, Debug)]
 struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:0")]
@@ -127,6 +167,26 @@ struct ServerArgs {
     quota_reconcile_interval_ms: u64,
     #[arg(long = "quota-reconcile-tenant")]
     quota_reconcile_tenants: Vec<String>,
+}
+
+#[derive(ClapArgs, Clone, Debug)]
+struct RouteMigrationArgs {
+    #[arg(long)]
+    authority: String,
+    #[arg(long)]
+    tenant: String,
+    #[arg(long)]
+    domain: Option<String>,
+    #[arg(long = "object-set")]
+    object_set: Option<String>,
+    #[arg(long)]
+    key: String,
+    #[arg(long = "source-segment")]
+    source_segment: String,
+    #[arg(long = "task-executor")]
+    task_executor: String,
+    #[arg(long)]
+    max_retries: Option<u32>,
 }
 
 #[derive(ClapArgs, Clone, Debug)]
@@ -233,7 +293,6 @@ impl From<ReservationStateArg> for TenantQuotaReservationState {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    validate_args(&args)?;
     init_tracing(args.trace_filter.as_deref())?;
 
     match &args.command {
@@ -242,6 +301,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             cleanup_stale_segments(&service)
         }
         Command::Server(server_args) => run_server_command(&args, server_args),
+        Command::Migrate { command } => run_migrate_command(&args, command),
         Command::Policy { command } => {
             let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
             run_policy_command(&service, &args, command)
@@ -253,9 +313,46 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
-    Url::parse(&args.metadata_url)?;
-    Ok(())
+fn run_migrate_command(args: &Args, command: &MigrateCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        MigrateCommand::Copy {
+            common,
+            target_segments,
+        } => submit_route_migration(
+            args,
+            RouteMigrationTaskSubmitRequest {
+                authority: common.authority.clone(),
+                tenant: common.tenant.clone(),
+                domain: common.domain.clone(),
+                object_set: common.object_set.clone(),
+                key: common.key.clone(),
+                mode: RouteMigrationMode::Copy,
+                source_segment: common.source_segment.clone(),
+                target_segments: target_segments.clone(),
+                task_executor: common.task_executor.clone(),
+                max_retries: common.max_retries,
+            },
+        ),
+        MigrateCommand::Move {
+            common,
+            target_segment,
+        } => submit_route_migration(
+            args,
+            RouteMigrationTaskSubmitRequest {
+                authority: common.authority.clone(),
+                tenant: common.tenant.clone(),
+                domain: common.domain.clone(),
+                object_set: common.object_set.clone(),
+                key: common.key.clone(),
+                mode: RouteMigrationMode::Move,
+                source_segment: common.source_segment.clone(),
+                target_segments: vec![target_segment.clone()],
+                task_executor: common.task_executor.clone(),
+                max_retries: common.max_retries,
+            },
+        ),
+        MigrateCommand::Task { command } => run_migrate_task_command(args, command),
+    }
 }
 
 fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<dyn Error>> {
@@ -290,6 +387,37 @@ fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<d
             .map_err(|_| std::io::Error::other("admin quota reconcile worker panicked"))?;
     }
     Ok(())
+}
+
+fn run_migrate_task_command(
+    args: &Args,
+    command: &MigrateTaskCommand,
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        MigrateTaskCommand::List => {
+            let response: RouteMigrationTaskListResponse =
+                admin_http_get_json(args, "/v1/route-migrations")?;
+            println!("route migration tasks:");
+            println!("  admin_url: {}", admin_base_url(args)?);
+            println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+            println!("  keyspace: {}", current_keyspace(args).prefix());
+            println!("  count: {}", response.count);
+            for task in response.tasks {
+                print_route_migration_task(&task, 2);
+            }
+            Ok(())
+        }
+        MigrateTaskCommand::Get { task_id } => {
+            let response: RouteMigrationTaskStatusResponse =
+                admin_http_get_json(args, &format!("/v1/route-migrations/{task_id}"))?;
+            println!("route migration task:");
+            println!("  admin_url: {}", admin_base_url(args)?);
+            println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+            println!("  keyspace: {}", current_keyspace(args).prefix());
+            print_route_migration_task(&response, 2);
+            Ok(())
+        }
+    }
 }
 
 fn spawn_stale_segment_maintenance_worker(
@@ -469,6 +597,123 @@ fn run_quota_command(
             TenantQuotaReconcileRequest { dry_run: *dry_run },
         ),
     }
+}
+
+fn submit_route_migration(
+    args: &Args,
+    request: RouteMigrationTaskSubmitRequest,
+) -> Result<(), Box<dyn Error>> {
+    let response: RouteMigrationTaskStatusResponse =
+        admin_http_post_json(args, "/v1/route-migrations", &request)?;
+    println!("route migration task submitted:");
+    println!("  admin_url: {}", admin_base_url(args)?);
+    println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+    println!("  keyspace: {}", current_keyspace(args).prefix());
+    print_route_migration_task(&response, 2);
+    Ok(())
+}
+
+fn admin_base_url(args: &Args) -> Result<Url, Box<dyn Error>> {
+    let raw = args
+        .admin_url
+        .as_ref()
+        .ok_or("--admin-url is required for migrate commands because route migration tasks live in the long-lived admin server")?;
+    let url = Url::parse(raw)?;
+    match url.scheme() {
+        "http" => {}
+        other => {
+            return Err(
+                format!("unsupported admin_url scheme {other:?}; only http is supported").into(),
+            )
+        }
+    }
+    if url.host_str().is_none() || url.port_or_known_default().is_none() {
+        return Err(format!("admin_url {raw:?} is missing host or port").into());
+    }
+    Ok(url)
+}
+
+fn admin_http_get_json<T>(args: &Args, path: &str) -> Result<T, Box<dyn Error>>
+where
+    T: DeserializeOwned,
+{
+    admin_http_json_request::<(), T>(args, "GET", path, None)
+}
+
+fn admin_http_post_json<P, T>(args: &Args, path: &str, payload: &P) -> Result<T, Box<dyn Error>>
+where
+    P: Serialize,
+    T: DeserializeOwned,
+{
+    admin_http_json_request(args, "POST", path, Some(payload))
+}
+
+fn admin_http_json_request<P, T>(
+    args: &Args,
+    method: &str,
+    path: &str,
+    payload: Option<&P>,
+) -> Result<T, Box<dyn Error>>
+where
+    P: Serialize,
+    T: DeserializeOwned,
+{
+    let base = admin_base_url(args)?;
+    let host = base
+        .host_str()
+        .ok_or("admin_url is missing host")?
+        .to_string();
+    let port = base
+        .port_or_known_default()
+        .ok_or("admin_url is missing port")?;
+    let base_path = base.path().trim_end_matches('/');
+    let full_path = if base_path.is_empty() || base_path == "/" {
+        path.to_string()
+    } else {
+        format!("{base_path}{path}")
+    };
+    let body = payload
+        .map(serde_json::to_vec)
+        .transpose()?
+        .unwrap_or_default();
+    let mut request = format!(
+        "{method} {full_path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
+    );
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    let mut stream = TcpStream::connect((host.as_str(), port))?;
+    stream.write_all(request.as_bytes())?;
+    if !body.is_empty() {
+        stream.write_all(&body)?;
+    }
+    stream.flush()?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (status_line, response_body) = split_http_response(&response)?;
+    if status_line.contains(" 200 ") {
+        return Ok(serde_json::from_str(response_body)?);
+    }
+
+    let message = serde_json::from_str::<ErrorResponse>(response_body)
+        .map(|error| error.error)
+        .unwrap_or_else(|_| response_body.trim().to_string());
+    Err(format!("admin http request failed: {status_line}: {message}").into())
+}
+
+fn split_http_response(response: &str) -> Result<(&str, &str), Box<dyn Error>> {
+    let mut lines = response.lines();
+    let status_line = lines
+        .next()
+        .ok_or("admin http response is missing status line")?;
+    let separator = response
+        .find("\r\n\r\n")
+        .ok_or("admin http response is missing header terminator")?;
+    Ok((status_line, &response[separator + 4..]))
 }
 
 fn get_policy(
@@ -741,6 +986,67 @@ fn quota_reconcile(
     Ok(())
 }
 
+fn print_route_migration_task(task: &RouteMigrationTaskStatusResponse, indent: usize) {
+    let pad = " ".repeat(indent);
+    println!("{pad}task_id: {}", task.task_id);
+    println!("{pad}namespace: {}", task.namespace);
+    println!("{pad}authority: {}", task.authority);
+    println!("{pad}tenant: {}", task.tenant);
+    println!(
+        "{pad}domain: {}",
+        task.domain.as_deref().unwrap_or("default")
+    );
+    println!(
+        "{pad}object_set: {}",
+        task.object_set.as_deref().unwrap_or("default")
+    );
+    println!("{pad}key: {}", task.key);
+    println!(
+        "{pad}mode: {}",
+        match task.mode {
+            RouteMigrationMode::Copy => "copy",
+            RouteMigrationMode::Move => "move",
+        }
+    );
+    println!("{pad}source_segment: {}", task.source_segment);
+    println!("{pad}target_segments: {}", task.target_segments.join(","));
+    println!("{pad}task_executor: {}", task.task_executor);
+    println!(
+        "{pad}state: {}",
+        match task.state {
+            RouteMigrationTaskState::Pending => "pending",
+            RouteMigrationTaskState::Dispatching => "dispatching",
+            RouteMigrationTaskState::Running => "running",
+            RouteMigrationTaskState::RetryWait => "retry_wait",
+            RouteMigrationTaskState::Succeeded => "succeeded",
+            RouteMigrationTaskState::Failed => "failed",
+            RouteMigrationTaskState::Cancelled => "cancelled",
+        }
+    );
+    println!("{pad}attempts: {}", task.attempts);
+    println!("{pad}max_retries: {}", task.max_retries);
+    println!(
+        "{pad}execution_id: {}",
+        task.execution_id.as_deref().unwrap_or("none")
+    );
+    println!(
+        "{pad}next_retry_at_ms: {}",
+        task.next_retry_at_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!(
+        "{pad}last_error: {}",
+        if task.last_error.is_empty() {
+            "none"
+        } else {
+            task.last_error.as_str()
+        }
+    );
+    println!("{pad}created_at_ms: {}", task.created_at_ms);
+    println!("{pad}updated_at_ms: {}", task.updated_at_ms);
+}
+
 fn get_legacy_route_policy(
     service: &AdminService,
     args: &Args,
@@ -869,7 +1175,12 @@ fn cleanup_stale_segments(service: &AdminService) -> Result<(), Box<dyn Error>> 
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     use clap::Parser;
     use mooncake_metadata::InMemoryMetadataBackend;
@@ -1126,6 +1437,174 @@ mod tests {
             redact_redis_url("redis://user:pass@127.0.0.1:6379/0"),
             "redis://127.0.0.1:6379/0"
         );
+    }
+
+    fn sample_cli_args_with_admin_url(admin_url: &str) -> Args {
+        Args {
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            admin_url: Some(admin_url.to_string()),
+            keyspace: None,
+            trace_filter: None,
+            command: Command::CleanupStaleSegments,
+        }
+    }
+
+    fn serve_single_response(
+        response: String,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should expose address");
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("http client should connect");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("read timeout should set");
+            let mut buffer = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).expect("request should read");
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                let request = String::from_utf8_lossy(&buffer);
+                let Some(header_end) = request.find("\r\n\r\n") else {
+                    continue;
+                };
+                let body = &buffer[header_end + 4..];
+                let content_length = request
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if body.len() >= content_length {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&buffer).into_owned();
+            tx.send(request).expect("request should send");
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should write");
+            stream.flush().expect("response should flush");
+        });
+        (format!("http://{address}"), rx, handle)
+    }
+
+    #[test]
+    fn route_migration_http_client_submits_task_to_admin_server() {
+        let response = serde_json::to_string(&RouteMigrationTaskStatusResponse {
+            task_id: "task-1".to_string(),
+            namespace: "mooncake/routes".to_string(),
+            authority: "authority-a".to_string(),
+            tenant: "tenant-a".to_string(),
+            domain: None,
+            object_set: None,
+            key: "object-a".to_string(),
+            mode: RouteMigrationMode::Copy,
+            source_segment: "segment-a".to_string(),
+            target_segments: vec!["segment-b".to_string()],
+            task_executor: "executor-a".to_string(),
+            state: RouteMigrationTaskState::Pending,
+            attempts: 0,
+            max_retries: 5,
+            execution_id: None,
+            next_retry_at_ms: None,
+            last_error: String::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        })
+        .expect("response json should serialize");
+        let (admin_url, requests, handle) = serve_single_response(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        ));
+        let args = sample_cli_args_with_admin_url(&admin_url);
+
+        let task = admin_http_post_json::<_, RouteMigrationTaskStatusResponse>(
+            &args,
+            "/v1/route-migrations",
+            &RouteMigrationTaskSubmitRequest {
+                authority: "authority-a".to_string(),
+                tenant: "tenant-a".to_string(),
+                domain: None,
+                object_set: None,
+                key: "object-a".to_string(),
+                mode: RouteMigrationMode::Copy,
+                source_segment: "segment-a".to_string(),
+                target_segments: vec!["segment-b".to_string()],
+                task_executor: "executor-a".to_string(),
+                max_retries: Some(5),
+            },
+        )
+        .expect("http submit should succeed");
+        assert_eq!(task.task_id, "task-1");
+        let request = requests.recv().expect("request should capture");
+        assert!(request.starts_with("POST /v1/route-migrations HTTP/1.1\r\n"));
+        assert!(request.contains("\"task_executor\":\"executor-a\""));
+        handle.join().expect("server thread should join");
+    }
+
+    #[test]
+    fn route_migration_http_client_lists_tasks_from_admin_server() {
+        let response = serde_json::to_string(&RouteMigrationTaskListResponse {
+            count: 1,
+            tasks: vec![RouteMigrationTaskStatusResponse {
+                task_id: "task-2".to_string(),
+                namespace: "mooncake/routes".to_string(),
+                authority: "authority-a".to_string(),
+                tenant: "tenant-a".to_string(),
+                domain: Some("domain-a".to_string()),
+                object_set: Some("set-a".to_string()),
+                key: "object-a".to_string(),
+                mode: RouteMigrationMode::Move,
+                source_segment: "segment-a".to_string(),
+                target_segments: vec!["segment-b".to_string()],
+                task_executor: "executor-a".to_string(),
+                state: RouteMigrationTaskState::Succeeded,
+                attempts: 1,
+                max_retries: 5,
+                execution_id: Some("execution-1".to_string()),
+                next_retry_at_ms: None,
+                last_error: String::new(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }],
+        })
+        .expect("response json should serialize");
+        let (admin_url, requests, handle) = serve_single_response(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        ));
+        let args = sample_cli_args_with_admin_url(&admin_url);
+
+        let listed: RouteMigrationTaskListResponse =
+            admin_http_get_json(&args, "/v1/route-migrations").expect("http list should succeed");
+        assert_eq!(listed.count, 1);
+        assert_eq!(listed.tasks[0].domain.as_deref(), Some("domain-a"));
+        let request = requests.recv().expect("request should capture");
+        assert!(request.starts_with("GET /v1/route-migrations HTTP/1.1\r\n"));
+        handle.join().expect("server thread should join");
+    }
+
+    #[test]
+    fn migrate_commands_require_admin_url() {
+        let args = Args {
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            admin_url: None,
+            keyspace: None,
+            trace_filter: None,
+            command: Command::CleanupStaleSegments,
+        };
+        let error = admin_base_url(&args).expect_err("missing admin_url should fail");
+        assert!(error.to_string().contains("--admin-url"));
     }
 
     #[test]

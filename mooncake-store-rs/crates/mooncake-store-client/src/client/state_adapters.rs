@@ -493,7 +493,11 @@ impl LocalMigrationExecutionContext {
             }
         };
         let object_id = LogicalObjectId::new(
-            NamespaceScope::with_defaults(Some(request.tenant.as_str()), None, None),
+            NamespaceScope::with_defaults(
+                Some(request.tenant.as_str()),
+                (!request.domain.is_empty()).then_some(request.domain.as_str()),
+                (!request.object_set.is_empty()).then_some(request.object_set.as_str()),
+            ),
             request.key.as_str(),
         );
         let plan = ExplicitMigrationPlan {

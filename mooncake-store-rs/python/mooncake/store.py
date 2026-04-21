@@ -28,7 +28,12 @@ def _load_native():
 
         return native
     except Exception:
-        target_root = repo_root / "target"
+        target_roots: list[pathlib.Path] = []
+        for env_key in ("MOONCAKE_PYTHON_TARGET_DIR", "CARGO_TARGET_DIR"):
+            env_value = os.environ.get(env_key)
+            if env_value:
+                target_roots.append(pathlib.Path(env_value).expanduser())
+        target_roots.append(repo_root / "target")
         suffixes = list(importlib.machinery.EXTENSION_SUFFIXES) + [".so"]
         patterns = []
         for suffix in suffixes:
@@ -36,15 +41,16 @@ def _load_native():
 
         candidates: list[pathlib.Path] = []
         seen: set[pathlib.Path] = set()
-        for profile in ("debug", "release"):
-            for profile_dir in (target_root / profile, target_root / profile / "deps"):
-                for pattern in patterns:
-                    for candidate in profile_dir.glob(pattern):
-                        resolved = candidate.resolve()
-                        if resolved in seen or not resolved.exists():
-                            continue
-                        seen.add(resolved)
-                        candidates.append(resolved)
+        for target_root in target_roots:
+            for profile in ("debug", "release"):
+                for profile_dir in (target_root / profile, target_root / profile / "deps"):
+                    for pattern in patterns:
+                        for candidate in profile_dir.glob(pattern):
+                            resolved = candidate.resolve()
+                            if resolved in seen or not resolved.exists():
+                                continue
+                            seen.add(resolved)
+                            candidates.append(resolved)
 
         candidates.sort(
             key=lambda candidate: (

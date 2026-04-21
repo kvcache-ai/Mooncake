@@ -314,6 +314,8 @@ message SubmitMigrationTaskRequest {
   string task_executor = 8;
   // Admin-owned retry budget. P1 executor implementations do not retry a submitted execution.
   uint64 max_retries = 9;
+  string domain = 10;
+  string object_set = 11;
 }
 
 message SubmitMigrationTaskReply {
