@@ -197,6 +197,29 @@ impl ReplicationPolicy {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ExplicitMigrationMode {
+    Copy,
+    Move,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplicaReadSelector {
+    Segment(SegmentName),
+    OwnerAndSegment {
+        owner: ClientRuntimeId,
+        segment_name: SegmentName,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplicitMigrationPlan {
+    pub mode: ExplicitMigrationMode,
+    pub source: ReplicaReadSelector,
+    pub target_segments: Vec<SegmentName>,
+    pub all_or_nothing: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct PutRequest<'a> {
     pub tenant: Option<&'a str>,

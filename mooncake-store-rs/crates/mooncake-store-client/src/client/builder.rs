@@ -415,11 +415,28 @@ impl StoreClientBuilder {
             transfer_stall_timeout: self.transfer_stall_timeout,
             request_timeout_override: self.request_timeout_override,
         });
-        let control_plane = ControlPlaneHandle::spawn(
+        let migration_adapter = Arc::new(LocalMigrationAdapter::new(
+            LocalMigrationExecutionContext {
+                executor_stable_id: runtime.stable_id.clone(),
+                base_lease: provisional_lease.clone(),
+                metadata: self.metadata.clone(),
+                transport_factory: self.transport_factory.clone(),
+                default_tenant: self.default_tenant.clone(),
+                local_memory: self.local_memory.clone(),
+                write_mode: self.write_mode.clone(),
+                route_control: effective_route_control,
+                route_topk: effective_route_topk,
+                transfer_stall_timeout: self.transfer_stall_timeout,
+                request_timeout_override: self.request_timeout_override,
+                executions: Arc::new(Mutex::new(BTreeMap::new())),
+            },
+        ));
+        let control_plane = ControlPlaneHandle::spawn_with_migration(
             &control_bind_host(&endpoints.rpc_address),
             local_authority.clone(),
             storage_adapter.clone(),
             storage_adapter,
+            migration_adapter,
         )?;
         crate::route_directory::bind_local_authority_service(
             &route_namespace,

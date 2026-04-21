@@ -356,3 +356,261 @@ impl EvictionService for LocalAllocatorAdapter {
         Ok(self.storage_owner.track_routes(routes))
     }
 }
+
+#[derive(Clone, Debug)]
+struct MigrationExecutionRecord {
+    state: pb::MigrationExecutionState,
+    attempts: u32,
+    last_error: String,
+}
+
+#[derive(Clone)]
+struct MigrationWorkItem {
+    execution_id: String,
+    request: pb::SubmitMigrationTaskRequest,
+}
+
+#[derive(Clone)]
+struct LocalMigrationExecutionContext {
+    executor_stable_id: ClientStableId,
+    base_lease: ClientLease,
+    metadata: Arc<dyn MetadataBackend>,
+    transport_factory: Option<Arc<dyn StoreTransportFactory>>,
+    default_tenant: String,
+    local_memory: LocalMemoryConfig,
+    write_mode: WriteMode,
+    route_control: RouteControlMode,
+    route_topk: usize,
+    transfer_stall_timeout: Duration,
+    request_timeout_override: Option<Duration>,
+    executions: Arc<Mutex<BTreeMap<String, MigrationExecutionRecord>>>,
+}
+
+impl LocalMigrationExecutionContext {
+    fn update_execution(
+        &self,
+        execution_id: &str,
+        state: pb::MigrationExecutionState,
+        attempts: u32,
+        last_error: String,
+    ) {
+        self.executions.lock().insert(
+            execution_id.to_string(),
+            MigrationExecutionRecord {
+                state,
+                attempts,
+                last_error,
+            },
+        );
+    }
+
+    fn build_helper_writer(&self, execution_id: &str) -> Result<StoreClient> {
+        let Some(factory) = self.transport_factory.clone() else {
+            return Err(StoreError::Unsupported(
+                "migration helper writer requires a transport factory".to_string(),
+            ));
+        };
+
+        let helper_stable_id = format!(
+            "{}-migration-helper-{}",
+            self.executor_stable_id.0, execution_id
+        );
+        let helper_segment_name = format!(
+            "{}-segment-{}",
+            helper_stable_id.replace(':', "-"),
+            self.base_lease.runtime.epoch.0
+        );
+        let helper_transport = factory.create(&helper_segment_name)?;
+        let helper_expiry_ms = self
+            .base_lease
+            .expires_at_ms
+            .max(now_ms().saturating_add(30_000));
+
+        let mut builder = StoreClientBuilder::new(self.metadata.clone(), helper_stable_id)
+            .epoch(self.base_lease.runtime.epoch)
+            .state(ClientLifecycleState::Active)
+            .activate_on_local_memory_registration()
+            .tenant(self.default_tenant.clone())
+            .compatibility(self.base_lease.compatibility.clone())
+            .local_memory(self.local_memory.clone())
+            .transport(helper_transport)
+            .transport_factory(factory)
+            .route_control(self.route_control)
+            .route_topk(self.route_topk)
+            .transfer_timeout(self.transfer_stall_timeout)
+            .startup_prewarm_max_delay(Duration::ZERO);
+        if let Some(timeout) = self.request_timeout_override {
+            builder = builder.request_timeout(timeout);
+        }
+
+        let mut labels = self.base_lease.endpoints.labels.clone();
+        labels.remove(control_address_label());
+        labels.insert("storage".to_string(), "false".to_string());
+        labels.insert("route".to_string(), "false".to_string());
+        for (key, value) in labels {
+            builder = builder.label(key, value);
+        }
+
+        if let WriteMode::Routed {
+            planner,
+            replica_count,
+        } = &self.write_mode
+        {
+            builder = builder.routed_writes(planner.clone(), *replica_count);
+        }
+
+        let helper = builder.build(helper_expiry_ms)?;
+        helper.register_local_memory()?;
+        Ok(helper)
+    }
+
+    fn build_task_plan(
+        &self,
+        request: &pb::SubmitMigrationTaskRequest,
+    ) -> Result<(LogicalObjectId, ExplicitMigrationPlan)> {
+        let mode = match pb::MigrationMode::try_from(request.mode)
+            .unwrap_or(pb::MigrationMode::Unspecified)
+        {
+            pb::MigrationMode::Copy => ExplicitMigrationMode::Copy,
+            pb::MigrationMode::Move => ExplicitMigrationMode::Move,
+            pb::MigrationMode::Unspecified => {
+                return Err(StoreError::InvalidState(
+                    "migration task is missing mode".to_string(),
+                ));
+            }
+        };
+        let object_id = LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some(request.tenant.as_str()), None, None),
+            request.key.as_str(),
+        );
+        let plan = ExplicitMigrationPlan {
+            mode,
+            source: ReplicaReadSelector::Segment(SegmentName::new(request.source_segment.clone())),
+            target_segments: request
+                .target_segments
+                .iter()
+                .cloned()
+                .map(SegmentName::new)
+                .collect(),
+            all_or_nothing: true,
+        };
+        Ok((object_id, plan))
+    }
+
+    fn execute_task(
+        &self,
+        execution_id: String,
+        request: pb::SubmitMigrationTaskRequest,
+    ) {
+        self.update_execution(
+            &execution_id,
+            pb::MigrationExecutionState::Running,
+            1,
+            String::new(),
+        );
+        let result = (|| -> Result<()> {
+            let helper = self.build_helper_writer(&execution_id)?;
+            let (object_id, plan) = self.build_task_plan(&request)?;
+            helper.execute_explicit_route_migration(&object_id, &plan)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.update_execution(
+                &execution_id,
+                pb::MigrationExecutionState::Succeeded,
+                1,
+                String::new(),
+            ),
+            Err(error) => self.update_execution(
+                &execution_id,
+                pb::MigrationExecutionState::Failed,
+                1,
+                error.to_string(),
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LocalMigrationAdapter {
+    executor_stable_id: ClientStableId,
+    executions: Arc<Mutex<BTreeMap<String, MigrationExecutionRecord>>>,
+    next_execution_id: Arc<AtomicU64>,
+    task_sender: std::sync::mpsc::Sender<MigrationWorkItem>,
+}
+
+impl LocalMigrationAdapter {
+    fn new(context: LocalMigrationExecutionContext) -> Self {
+        let executions = context.executions.clone();
+        let next_execution_id = Arc::new(AtomicU64::new(1));
+        let (task_sender, task_receiver) = std::sync::mpsc::channel::<MigrationWorkItem>();
+        let worker_context = context.clone();
+        let worker_name = format!("store-migration-{}", context.executor_stable_id.0);
+        let _ = std::thread::Builder::new()
+            .name(worker_name)
+            .spawn(move || {
+                while let Ok(work_item) = task_receiver.recv() {
+                    worker_context.execute_task(work_item.execution_id, work_item.request);
+                }
+            });
+
+        Self {
+            executor_stable_id: context.executor_stable_id,
+            executions,
+            next_execution_id,
+            task_sender,
+        }
+    }
+}
+
+impl MigrationService for LocalMigrationAdapter {
+    fn submit_task(&self, request: &pb::SubmitMigrationTaskRequest) -> Result<String> {
+        if request.task_executor != self.executor_stable_id.0 {
+            return Err(StoreError::InvalidState(format!(
+                "migration task targets executor {} but request was submitted to {}",
+                request.task_executor, self.executor_stable_id
+            )));
+        }
+
+        let sequence = self.next_execution_id.fetch_add(1, Ordering::SeqCst);
+        let execution_id = format!("{}-{sequence}", self.executor_stable_id.0);
+        self.executions.lock().insert(
+            execution_id.clone(),
+            MigrationExecutionRecord {
+                state: pb::MigrationExecutionState::Dispatching,
+                attempts: 0,
+                last_error: String::new(),
+            },
+        );
+        self.task_sender
+            .send(MigrationWorkItem {
+                execution_id: execution_id.clone(),
+                request: request.clone(),
+            })
+            .map_err(|_| {
+                StoreError::Transport(
+                    "migration task executor worker is not accepting new tasks".to_string(),
+                )
+            })?;
+        Ok(execution_id)
+    }
+
+    fn get_execution_status(&self, execution_id: &str) -> Result<MigrationExecutionStatus> {
+        let record = self
+            .executions
+            .lock()
+            .get(execution_id)
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "migration execution {} is not known by {}",
+                    execution_id, self.executor_stable_id
+                ))
+            })?;
+        Ok(MigrationExecutionStatus {
+            state: record.state,
+            attempts: record.attempts,
+            last_error: record.last_error,
+        })
+    }
+}

@@ -23,6 +23,7 @@ pub use observability::{
     OperationTracker,
 };
 pub use placement::{PlacementChoice, PlacementPlanner};
+pub use control_plane::{pb as control_plane_pb, MigrationControlClient};
 pub use transport::{
     http_transport_label, wait_for_batch_completion, ClassicTeTransportFactory,
     HttpStoreTransportFactory, HttpTransportServerHandle, StoreTransport, StoreTransportFactory,

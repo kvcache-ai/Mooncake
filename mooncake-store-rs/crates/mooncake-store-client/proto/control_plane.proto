@@ -18,6 +18,8 @@ service ControlPlaneService {
   rpc ListRoutesByReplicaOwner(ListRoutesByReplicaOwnerRequest) returns (ListRoutesByReplicaOwnerReply);
   rpc BatchReportRouteHits(BatchReportRouteHitsRequest) returns (BatchReportRouteHitsReply);
   rpc BatchTrackReplicaRoutes(BatchTrackReplicaRoutesRequest) returns (BatchTrackReplicaRoutesReply);
+  rpc SubmitMigrationTask(SubmitMigrationTaskRequest) returns (SubmitMigrationTaskReply);
+  rpc GetMigrationExecutionStatus(GetMigrationExecutionStatusRequest) returns (GetMigrationExecutionStatusReply);
   rpc ControlStream(stream ControlStreamRequest) returns (stream ControlStreamReply);
 }
 
@@ -64,6 +66,23 @@ enum ReplicaTier {
   REPLICA_TIER_NVME = 2;
   REPLICA_TIER_FILE = 3;
   REPLICA_TIER_UNKNOWN = 4;
+}
+
+enum MigrationMode {
+  MIGRATION_MODE_UNSPECIFIED = 0;
+  MIGRATION_MODE_COPY = 1;
+  MIGRATION_MODE_MOVE = 2;
+}
+
+enum MigrationExecutionState {
+  MIGRATION_EXECUTION_STATE_UNSPECIFIED = 0;
+  MIGRATION_EXECUTION_STATE_PENDING = 1;
+  MIGRATION_EXECUTION_STATE_DISPATCHING = 2;
+  MIGRATION_EXECUTION_STATE_RUNNING = 3;
+  MIGRATION_EXECUTION_STATE_RETRY_WAIT = 4;
+  MIGRATION_EXECUTION_STATE_SUCCEEDED = 5;
+  MIGRATION_EXECUTION_STATE_FAILED = 6;
+  MIGRATION_EXECUTION_STATE_CANCELLED = 7;
 }
 
 message ReplicaRoute {
@@ -277,6 +296,37 @@ message BatchTrackReplicaRoutesRequest {
 message BatchTrackReplicaRoutesReply {
   uint64 accepted = 1;
   ErrorDetail error = 2;
+}
+
+message SubmitMigrationTaskRequest {
+  string namespace = 1;
+  string authority = 2;
+  string tenant = 3;
+  string key = 4;
+  MigrationMode mode = 5;
+  string source_segment = 6;
+  repeated string target_segments = 7;
+  string task_executor = 8;
+  uint64 max_retries = 9;
+}
+
+message SubmitMigrationTaskReply {
+  string execution_id = 1;
+  ErrorDetail error = 2;
+}
+
+message GetMigrationExecutionStatusRequest {
+  string namespace = 1;
+  string authority = 2;
+  string execution_id = 3;
+}
+
+message GetMigrationExecutionStatusReply {
+  string execution_id = 1;
+  MigrationExecutionState state = 2;
+  uint32 attempts = 3;
+  string last_error = 4;
+  ErrorDetail error = 5;
 }
 
 message ControlStreamRequest {
