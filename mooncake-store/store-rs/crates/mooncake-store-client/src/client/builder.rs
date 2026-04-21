@@ -77,6 +77,16 @@ fn validate_segment_owner_conflict(
         );
         return Ok(());
     };
+    if remote.state != ClientLifecycleState::Active {
+        debug!(
+            local_runtime = %local.runtime,
+            remote_runtime = %remote.runtime,
+            remote_state = ?remote.state,
+            segment = %segment.0,
+            "startup guard ignored segment-owner lease that is no longer writable"
+        );
+        return Ok(());
+    }
     if !validate_reachable_runtime(control_client, local, &remote)? {
         return Ok(());
     }
@@ -457,15 +467,11 @@ impl StoreClientBuilder {
             expires_at_ms,
         };
         self.metadata.upsert_client_lease(&lease)?;
+        prewarm_live_client_cache(self.metadata.as_ref(), &live_client_cache, &lease)?;
         let prewarm_delay = startup_prewarm_delay(&runtime, self.startup_prewarm_max_delay);
         if !prewarm_delay.is_zero() {
             std::thread::sleep(prewarm_delay);
         }
-        refresh_live_client_cache(
-            self.metadata.as_ref(),
-            &live_client_cache,
-            "live_client_snapshot_prewarm",
-        )?;
         let membership_sync = MembershipSyncHandle::spawn(
             &runtime,
             self.metadata.clone(),
@@ -639,6 +645,29 @@ fn resolved_bandwidth_shaping(spec: &TenantPolicySpec) -> Option<BandwidthShapin
 
 fn resolved_placement_policy(spec: &TenantPolicySpec) -> Option<TenantPlacementPolicy> {
     spec.placement.clone()
+}
+
+fn prewarm_live_client_cache(
+    metadata: &dyn MetadataBackend,
+    live_client_cache: &SharedLiveClientCache,
+    local_lease: &ClientLease,
+) -> Result<()> {
+    match metadata.list_live_clients() {
+        Ok(leases) => {
+            let live_leases = filter_live_client_leases(&leases);
+            registry::record_runtime_leases(&live_leases);
+            live_client_cache.lock().store(live_leases);
+            Ok(())
+        }
+        Err(StoreError::Unsupported(_)) => {
+            registry::record_runtime_leases(std::slice::from_ref(local_lease));
+            live_client_cache
+                .lock()
+                .store(vec![local_lease.clone()]);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn startup_prewarm_max_delay_from_env() -> Duration {

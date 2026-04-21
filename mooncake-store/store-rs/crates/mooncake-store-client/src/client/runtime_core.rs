@@ -128,10 +128,18 @@ impl StoreClient {
     }
 
     pub fn runtime_state(&self, runtime: &ClientRuntimeId) -> Result<Option<ClientLifecycleState>> {
+        if *runtime == self.lease.runtime {
+            return Ok(Some(self.lifecycle_state()));
+        }
+        let _ = refresh_live_client_cache(
+            self.metadata.as_ref(),
+            &self.live_client_cache,
+            "live_client_snapshot_runtime_state",
+        );
         Ok(self
-            .compatible_live_clients(true)?
-            .into_iter()
-            .find(|lease| lease.runtime == *runtime)
+            .metadata
+            .get_client_lease(runtime)?
+            .filter(|lease| compatibility_matches(&self.lease, lease))
             .map(|lease| lease.state))
     }
 

@@ -709,7 +709,7 @@ mod tests {
                 state,
                 compatibility: CompatibilityDescriptor::default(),
                 endpoints,
-                expires_at_ms: 10_000,
+                expires_at_ms: u64::MAX,
             })
             .expect("lease should upsert");
     }
@@ -741,7 +741,7 @@ mod tests {
                 state,
                 compatibility,
                 endpoints,
-                expires_at_ms: 10_000,
+                expires_at_ms: u64::MAX,
             })
             .expect("lease should upsert");
     }
