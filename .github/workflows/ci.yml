@@ -746,6 +746,18 @@ jobs:
     uses: ./.github/workflows/ci_cu13.yml
     secrets: inherit
 
+  ascend-test:
+    needs: [build, check-paths]
+    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    uses: ./.github/workflows/ci_ascend.yml
+    secrets: inherit
+
+  integration-test:
+    needs: [build, check-paths]
+    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    uses: ./.github/workflows/integration-test.yml
+    secrets: inherit
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -758,6 +770,8 @@ jobs:
       - build-docker
       - test-wheel-ubuntu
       - build-wheel-cu13
+      - ascend-test
+      - integration-test
     runs-on: ubuntu-latest
     steps:
       - name: Check required job results
