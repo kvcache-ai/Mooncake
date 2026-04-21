@@ -14,6 +14,7 @@
 #include "types.h"
 #include "p2p_client_service.h"
 #include "centralized_client_service.h"
+#include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
 
@@ -47,12 +48,14 @@ size_t ClientService::CalculateSliceSize(std::span<const Slice> slices) {
 
 ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
                              const std::string& metadata_connstring,
+                             uint16_t metrics_port, bool enable_metrics_http,
                              const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels(labels))),
       local_ip_(local_ip),
       te_port_(te_port),
-      metadata_connstring_(metadata_connstring) {
+      metadata_connstring_(metadata_connstring),
+      enable_metrics_http_(enable_metrics_http) {
     LOG(INFO) << "client_id=" << client_id_;
 
     if (metrics_) {
@@ -68,13 +71,16 @@ ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
         LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
                      "enable)";
     }
+
+    // Start metrics HTTP server
+    metrics_port_ = StartMetricsHttpServer(enable_metrics_http, metrics_port);
 }
 
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const CentralizedClientConfig& config) {
     auto client = std::make_shared<CentralizedClientService>(
         config.local_ip, config.te_port, config.metadata_connstring,
-        config.labels);
+        config.metrics_port, config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -90,7 +96,7 @@ std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const P2PClientConfig& config) {
     auto client = std::make_shared<P2PClientService>(
         config.local_ip, config.te_port, config.metadata_connstring,
-        config.labels);
+        config.metrics_port, config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -107,7 +113,10 @@ ClientService::~ClientService() {
     Destroy();
 }
 
-void ClientService::Stop() { StopHeartbeat(); }
+void ClientService::Stop() {
+    StopMetricsHttpServer();
+    StopHeartbeat();
+}
 
 void ClientService::StopHeartbeat() {
     // Stop ping thread only after no need to contact master anymore
@@ -613,6 +622,89 @@ bool ClientService::ReconnectToMaster(bool is_ha_mode,
         }
         LOG(INFO) << "Reconnected to master " << current_master_address;
         return true;
+    }
+}
+
+uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
+                                               uint16_t metrics_port) {
+    // Check if metrics HTTP is disabled
+    if (!enable_metrics_http) {
+        LOG(INFO) << "Client metrics HTTP server disabled";
+        return 0;
+    }
+
+    // Check if metrics are enabled
+    if (!metrics_) {
+        LOG(INFO) << "Client metrics disabled, skipping HTTP server start";
+        return 0;
+    }
+
+    try {
+        // Create HTTP server with 1 thread for metrics
+        metrics_http_server_ =
+            std::make_unique<coro_http::coro_http_server>(1, metrics_port);
+
+        using namespace coro_http;
+
+        // Prometheus-style metrics endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/metrics",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                if (!metrics_) {
+                    resp.set_status_and_content(
+                        status_type::service_unavailable,
+                        "Metrics not available");
+                    return;
+                }
+                std::string metrics_str;
+                metrics_->serialize(metrics_str);
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok,
+                                            std::move(metrics_str));
+            });
+
+        // Human-readable summary endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/metrics/summary",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                if (!metrics_) {
+                    resp.set_status_and_content(
+                        status_type::service_unavailable,
+                        "Metrics not available");
+                    return;
+                }
+                std::string summary = metrics_->summary_metrics();
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok,
+                                            std::move(summary));
+            });
+
+        // Health check endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/health",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok, GetHealthStatus());
+            });
+
+        metrics_http_server_->async_start();
+        uint16_t actual_port = metrics_http_server_->port();
+        LOG(INFO) << "Client metrics HTTP server started on port "
+                  << actual_port;
+        return actual_port;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to start client metrics HTTP server: "
+                   << e.what();
+        return 0;
+    }
+}
+
+void ClientService::StopMetricsHttpServer() {
+    if (metrics_http_server_) {
+        LOG(INFO) << "Stopping client metrics HTTP server on port "
+                  << metrics_port_;
+        metrics_http_server_->stop();
+        metrics_http_server_.reset();
     }
 }
 

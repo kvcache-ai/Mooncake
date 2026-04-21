@@ -375,6 +375,19 @@ inline std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
+inline const char* toString(HAClientState state) noexcept {
+    switch (state) {
+        case HAClientState::FULL:
+            return "FULL";
+        case HAClientState::DEGRADED:
+            return "DEGRADED";
+        case HAClientState::SYNCING:
+            return "SYNCING";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 /**
  * @enum HAEvent
  * @brief Events that drive client-side HA state transitions.

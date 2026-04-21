@@ -21,6 +21,7 @@
 #include "replica.h"
 #include "master_client.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_http/coro_http_server.hpp>
 #include "client_config_builder.h"
 #include "client_buffer.hpp"
 
@@ -305,6 +306,24 @@ class ClientService {
         return str;
     }
 
+    /**
+     * @brief Gets the metrics HTTP server port.
+     * @return The port number, or 0 if metrics server is disabled.
+     */
+    uint16_t GetMetricsPort() const { return metrics_port_; }
+
+    /**
+     * @brief Checks if metrics HTTP server is enabled.
+     * @return True if enabled, false otherwise.
+     */
+    bool IsMetricsHttpEnabled() const { return enable_metrics_http_; }
+
+    /**
+     * @brief Gets the health status for the /health endpoint.
+     * @return A string representing the health status.
+     */
+    virtual std::string GetHealthStatus() const { return "OK"; }
+
    public:
     /**
      * @brief Gets the local transport endpoint (IP and port).
@@ -348,6 +367,7 @@ class ClientService {
      */
     ClientService(const std::string& local_ip, uint16_t te_port,
                   const std::string& metadata_connstring,
+                  uint16_t metrics_port = 9003, bool enable_metrics_http = true,
                   const std::map<std::string, std::string>& labels = {});
 
     /**
@@ -420,6 +440,20 @@ class ClientService {
      */
     void WaitForNextHeartbeat(int interval_ms);
     virtual HeartbeatRequest build_heartbeat_request() = 0;
+
+    /**
+     * @brief Starts the metrics HTTP server.
+     * @param enable_metrics_http Whether to enable the HTTP server.
+     * @param metrics_port Port to use.
+     * @return The actual port number, or 0 if disabled.
+     */
+    uint16_t StartMetricsHttpServer(bool enable_metrics_http,
+                                    uint16_t metrics_port);
+
+    /**
+     * @brief Stops the metrics HTTP server.
+     */
+    void StopMetricsHttpServer();
 
     /**
      * @brief Registers the client into the master server.
@@ -541,6 +575,11 @@ class ClientService {
     // Shutdown protection
     SharedMutex running_rw_mtx_;
     bool is_running_ GUARDED_BY(running_rw_mtx_) = false;
+
+    // Metrics HTTP server
+    std::unique_ptr<coro_http::coro_http_server> metrics_http_server_;
+    uint16_t metrics_port_ = 0;  // 0 means disabled
+    bool enable_metrics_http_ = true;
 };
 
 }  // namespace mooncake

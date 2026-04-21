@@ -42,7 +42,8 @@ class CentralizedClientService
    public:
     CentralizedClientService(
         const std::string& local_ip, uint16_t te_port,
-        const std::string& metadata_connstring,
+        const std::string& metadata_connstring, uint16_t metrics_port = 9003,
+        bool enable_metrics_http = true,
         const std::map<std::string, std::string>& labels = {});
 
     ~CentralizedClientService() override;

@@ -30,10 +30,14 @@ class P2PClientService final : public ClientService {
      * @param local_ip IP address of the local node.
      * @param te_port TE port of the local node.
      * @param metadata_connstring Connection string for metadata server.
+     * @param metrics_port Port for metrics HTTP server.
+     * @param enable_metrics_http Whether to enable metrics HTTP server.
      * @param labels Optional labels for client metrics.
      */
     P2PClientService(const std::string& local_ip, uint16_t te_port,
                      const std::string& metadata_connstring,
+                     uint16_t metrics_port = 9003,
+                     bool enable_metrics_http = true,
                      const std::map<std::string, std::string>& labels = {});
 
     virtual ~P2PClientService();
@@ -166,6 +170,8 @@ class P2PClientService final : public ClientService {
     tl::expected<long, ErrorCode> RemoveAll() override;
 
     MasterClient& GetMasterClient() override { return master_client_; }
+
+    std::string GetHealthStatus() const override;
 
    private:
     /**

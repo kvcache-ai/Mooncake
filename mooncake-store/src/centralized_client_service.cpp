@@ -21,9 +21,10 @@ namespace mooncake {
 
 CentralizedClientService::CentralizedClientService(
     const std::string& local_ip, uint16_t te_port,
-    const std::string& metadata_connstring,
-    const std::map<std::string, std::string>& labels)
-    : ClientService(local_ip, te_port, metadata_connstring, labels),
+    const std::string& metadata_connstring, uint16_t metrics_port,
+    bool enable_metrics_http, const std::map<std::string, std::string>& labels)
+    : ClientService(local_ip, te_port, metadata_connstring, metrics_port,
+                    enable_metrics_http, labels),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       write_thread_pool_(2) {}
