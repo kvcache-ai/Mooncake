@@ -36,6 +36,7 @@ Operational notes:
 - object-accounting lookups still accept nested selectors so operators can specify the logical object namespace they care about
 - reconcile currently aborts expired pending reservations and finalizes pending reservations whose authoritative route + accounting state is already visible
 - other mismatches remain operator-visible and are reported as skipped rather than repaired speculatively
+- the admin HTTP surface rejects requests whose declared `Content-Length` exceeds `1 MiB` with `413 Payload Too Large`; because the server does not drain the remaining body, it responds with `Connection: close`
 
 ## `StoreClientBuilder`
 
