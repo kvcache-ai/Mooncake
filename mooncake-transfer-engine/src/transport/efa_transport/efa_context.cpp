@@ -19,12 +19,12 @@
 
 #include <atomic>
 #include <cassert>
-#include <fstream>
-#include <memory>
-#include <thread>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
+#include <memory>
 #include <sstream>
+#include <thread>
 
 #include "config.h"
 #include "cuda_alike.h"
@@ -34,117 +34,8 @@
 
 namespace mooncake {
 
-// EfaEndpointStore implementation
-
-EfaEndpointStore::EfaEndpointStore(size_t max_endpoints,
-                                   double inactive_timeout_sec)
-    : max_endpoints_(max_endpoints),
-      inactive_timeout_sec_(inactive_timeout_sec) {}
-
-std::shared_ptr<EfaEndPoint> EfaEndpointStore::get(
-    const std::string& peer_nic_path) {
-    RWSpinlock::ReadGuard guard(lock_);
-    auto it = endpoints_.find(peer_nic_path);
-    if (it != endpoints_.end()) {
-        it->second->set_active(true);
-        return it->second;
-    }
-    return nullptr;
-}
-
-std::shared_ptr<EfaEndPoint> EfaEndpointStore::getOrInsert(
-    const std::string& peer_nic_path, std::shared_ptr<EfaEndPoint> new_ep) {
-    RWSpinlock::WriteGuard guard(lock_);
-    auto it = endpoints_.find(peer_nic_path);
-    if (it != endpoints_.end()) {
-        it->second->set_active(true);
-        return it->second;  // Another thread already created it
-    }
-    // Evict stale endpoints if at capacity
-    if (endpoints_.size() >= max_endpoints_) {
-        size_t evicted = evictStaleLocked();
-        if (evicted == 0 && endpoints_.size() >= max_endpoints_) {
-            LOG(WARNING) << "EfaEndpointStore at capacity (" << max_endpoints_
-                         << ") with no stale endpoints to evict";
-        }
-    }
-    endpoints_[peer_nic_path] = new_ep;
-    new_ep->set_active(true);
-    return new_ep;
-}
-
-void EfaEndpointStore::add(const std::string& peer_nic_path,
-                           std::shared_ptr<EfaEndPoint> endpoint) {
-    RWSpinlock::WriteGuard guard(lock_);
-    endpoints_[peer_nic_path] = endpoint;
-}
-
-void EfaEndpointStore::remove(const std::string& peer_nic_path) {
-    RWSpinlock::WriteGuard guard(lock_);
-    endpoints_.erase(peer_nic_path);
-}
-
-int EfaEndpointStore::disconnectAll() {
-    RWSpinlock::WriteGuard guard(lock_);
-    for (auto& entry : endpoints_) {
-        if (entry.second) {
-            entry.second->disconnect();
-        }
-    }
-    return 0;
-}
-
-size_t EfaEndpointStore::size() const {
-    RWSpinlock::ReadGuard guard(lock_);
-    return endpoints_.size();
-}
-
-size_t EfaEndpointStore::evictStale() {
-    RWSpinlock::WriteGuard guard(lock_);
-    return evictStaleLocked();
-}
-
-size_t EfaEndpointStore::evictStaleLocked() {
-    size_t evicted = 0;
-    for (auto it = endpoints_.begin(); it != endpoints_.end();) {
-        auto& ep = it->second;
-        double age = ep ? ep->lastUsedAge() : 0;
-        bool outstanding = ep ? ep->hasOutstandingSlice() : false;
-        if (ep && !outstanding && age > inactive_timeout_sec_) {
-            LOG(INFO) << "Evicting stale EFA endpoint: " << it->first
-                      << " (idle " << age
-                      << "s, timeout=" << inactive_timeout_sec_ << "s)";
-            ep->disconnect();
-            it = endpoints_.erase(it);
-            ++evicted;
-        } else {
-            ++it;
-        }
-    }
-    if (endpoints_.size() > 0) {
-        VLOG(1) << "evictStale: " << endpoints_.size() << " endpoints, "
-                << evicted << " evicted";
-    }
-    return evicted;
-}
-
-size_t EfaEndpointStore::removeDisconnected() {
-    RWSpinlock::WriteGuard guard(lock_);
-    size_t removed = 0;
-    for (auto it = endpoints_.begin(); it != endpoints_.end();) {
-        auto& ep = it->second;
-        if (ep && !ep->connected() && !ep->hasOutstandingSlice()) {
-            LOG(INFO) << "Removing disconnected EFA endpoint: " << it->first;
-            it = endpoints_.erase(it);
-            ++removed;
-        } else {
-            ++it;
-        }
-    }
-    return removed;
-}
-
 // EfaContext implementation
+
 EfaContext::EfaContext(EfaTransport& engine, const std::string& device_name)
     : engine_(engine),
       device_name_(device_name),
@@ -153,7 +44,11 @@ EfaContext::EfaContext(EfaTransport& engine, const std::string& device_name)
       fabric_(nullptr),
       domain_(nullptr),
       av_(nullptr),
-      active_(true) {}
+      active_(true),
+      shared_ep_(nullptr),
+      wr_depth_(0),
+      max_wr_depth_(0),
+      post_lock_(ATOMIC_FLAG_INIT) {}
 
 EfaContext::~EfaContext() {
     if (fabric_) deconstruct();
@@ -162,7 +57,9 @@ EfaContext::~EfaContext() {
 int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                           uint8_t port, int gid_index, size_t max_cqe,
                           int max_endpoints) {
-    endpoint_store_ = std::make_shared<EfaEndpointStore>(max_endpoints);
+    (void)num_comp_channels;
+    (void)port;
+    (void)gid_index;
 
 #if !defined(USE_CUDA) && !defined(USE_HIP)
     // When built without GPU support, prevent libfabric's EFA provider from
@@ -232,7 +129,9 @@ int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         return ERR_CONTEXT;
     }
 
-    // Create address vector
+    // Create address vector.  Capacity sized for the largest peer count we
+    // expect to support in a single process.  AV entries are cheap (no QP
+    // cost), so we over-provision.
     struct fi_av_attr av_attr = {};
     av_attr.type = FI_AV_TABLE;
     av_attr.count = max_endpoints;
@@ -269,18 +168,102 @@ int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         cq_list_[i] = cq;
     }
 
+    // Build the shared endpoint that services every peer through AV lookup.
+    ret = buildSharedEndpoint(globalConfig().max_wr, 64);
+    if (ret) {
+        LOG(ERROR) << "EfaContext::construct: buildSharedEndpoint failed for "
+                   << device_name_;
+        return ret;
+    }
+
     LOG(INFO) << "EFA device (libfabric): " << device_name_
               << ", domain: " << fi_info_->domain_attr->name
-              << ", provider: " << fi_info_->fabric_attr->prov_name;
+              << ", provider: " << fi_info_->fabric_attr->prov_name
+              << " (shared endpoint, max_wr=" << max_wr_depth_ << ")";
 
     return 0;
 }
 
+int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
+    (void)max_inline;
+    if (shared_ep_) return 0;
+
+    shared_cq_ = cq_list_.empty() ? nullptr : cq_list_[0];
+    if (!shared_cq_) {
+        LOG(ERROR) << "EfaContext::buildSharedEndpoint: no CQ available";
+        return ERR_CONTEXT;
+    }
+    max_wr_depth_ = static_cast<int>(max_wr);
+
+    int ret = fi_endpoint(domain_, fi_info_, &shared_ep_, nullptr);
+    if (ret) {
+        LOG(ERROR) << "fi_endpoint failed: " << fi_strerror(-ret);
+        shared_ep_ = nullptr;
+        return ERR_ENDPOINT;
+    }
+
+    ret = fi_ep_bind(shared_ep_, &av_->fid, 0);
+    if (ret) {
+        LOG(ERROR) << "fi_ep_bind(av) failed: " << fi_strerror(-ret);
+        fi_close(&shared_ep_->fid);
+        shared_ep_ = nullptr;
+        return ERR_ENDPOINT;
+    }
+
+    ret = fi_ep_bind(shared_ep_, &shared_cq_->cq->fid, FI_TRANSMIT);
+    if (ret) {
+        LOG(ERROR) << "fi_ep_bind(tx_cq) failed: " << fi_strerror(-ret);
+        fi_close(&shared_ep_->fid);
+        shared_ep_ = nullptr;
+        return ERR_ENDPOINT;
+    }
+
+    ret = fi_ep_bind(shared_ep_, &shared_cq_->cq->fid, FI_RECV);
+    if (ret) {
+        LOG(ERROR) << "fi_ep_bind(rx_cq) failed: " << fi_strerror(-ret);
+        fi_close(&shared_ep_->fid);
+        shared_ep_ = nullptr;
+        return ERR_ENDPOINT;
+    }
+
+    ret = fi_enable(shared_ep_);
+    if (ret) {
+        LOG(ERROR) << "fi_enable failed: " << fi_strerror(-ret);
+        fi_close(&shared_ep_->fid);
+        shared_ep_ = nullptr;
+        return ERR_ENDPOINT;
+    }
+
+    // Cache our own libfabric address for handshake advertisement.
+    size_t addr_len = 64;
+    local_ep_addr_.assign(addr_len, 0);
+    ret = fi_getname(&shared_ep_->fid, local_ep_addr_.data(), &addr_len);
+    if (ret) {
+        LOG(ERROR) << "fi_getname failed: " << fi_strerror(-ret);
+        fi_close(&shared_ep_->fid);
+        shared_ep_ = nullptr;
+        local_ep_addr_.clear();
+        return ERR_ENDPOINT;
+    }
+    local_ep_addr_.resize(addr_len);
+    return 0;
+}
+
 int EfaContext::deconstruct() {
-    // Destroy all endpoints before closing domain/fabric/AV.
-    // Endpoints hold fi_ep handles that reference the domain, so they must
-    // be closed first.
-    endpoint_store_.reset();
+    // Drop all peer handles first so fi_av_remove() runs before the AV is
+    // closed.  We don't actually own fid_ep entries per-peer anymore.
+    {
+        RWSpinlock::WriteGuard guard(peer_map_lock_);
+        for (auto& entry : peer_map_) {
+            if (entry.second) entry.second->disconnect();
+        }
+        peer_map_.clear();
+    }
+
+    if (shared_ep_) {
+        fi_close(&shared_ep_->fid);
+        shared_ep_ = nullptr;
+    }
 
     {
         RWSpinlock::WriteGuard guard(mr_lock_);
@@ -299,6 +282,7 @@ int EfaContext::deconstruct() {
         }
     }
     cq_list_.clear();
+    shared_cq_.reset();
 
     if (av_) {
         fi_close(&av_->fid);
@@ -331,6 +315,7 @@ int EfaContext::deconstruct() {
 int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
                                              int access,
                                              EfaMemoryRegionMeta& mrMeta) {
+    (void)access;
     if (length > (size_t)globalConfig().max_mr_size) {
         LOG(ERROR) << "Buffer length " << length
                    << " exceeds device max_mr_size "
@@ -417,24 +402,23 @@ int EfaContext::registerMemoryRegion(void* addr, size_t length, int access) {
 int EfaContext::unregisterMemoryRegion(void* addr) {
     RWSpinlock::WriteGuard guard(mr_lock_);
     auto it = mr_map_.find((uint64_t)addr);
-    if (it != mr_map_.end()) {
-        if (it->second.mr) {
-            int ret = fi_close(&it->second.mr->fid);
-            if (ret) {
-                LOG(ERROR) << "Failed to unregister memory " << addr << ": "
-                           << fi_strerror(-ret);
-                return ERR_CONTEXT;
-            }
-        }
-        mr_map_.erase(it);
+    if (it == mr_map_.end()) {
+        return 0;
     }
+    if (it->second.mr) {
+        fi_close(&it->second.mr->fid);
+    }
+    mr_map_.erase(it);
     return 0;
 }
 
 int EfaContext::preTouchMemory(void* addr, size_t length) {
-    volatile char* ptr = (volatile char*)addr;
-    for (size_t i = 0; i < length; i += 4096) {
-        ptr[i] = ptr[i];
+    volatile char* p = static_cast<char*>(addr);
+    const size_t page_size = sysconf(_SC_PAGESIZE) > 0
+                                 ? static_cast<size_t>(sysconf(_SC_PAGESIZE))
+                                 : 4096;
+    for (size_t off = 0; off < length; off += page_size) {
+        p[off] = p[off];
     }
     return 0;
 }
@@ -445,7 +429,7 @@ uint64_t EfaContext::rkey(void* addr) {
     if (it != mr_map_.begin()) {
         --it;
         if ((uint64_t)addr < it->first + it->second.length && it->second.mr) {
-            return it->second.key;
+            return fi_mr_key(it->second.mr);
         }
     }
     return 0;
@@ -477,83 +461,65 @@ void* EfaContext::mrDesc(void* addr) {
 
 std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     const std::string& peer_nic_path) {
-    if (!endpoint_store_) return nullptr;
-
     // Use normalized key (strip port) so the same physical peer reuses its
-    // endpoint across reconnections.  Each P2PHANDSHAKE run picks a random
+    // handle across reconnections.  Each P2PHANDSHAKE run picks a random
     // port, producing a different peer_nic_path for the same peer host+NIC.
     std::string key = normalizeNicPath(peer_nic_path);
 
-    // Fast path: endpoint already exists for this physical peer.
-    // Update peer_nic_path in case the port changed (new initiator run).
-    // setPeerNicPath disconnects old connection (fi_av_remove) if needed.
-    auto ep = endpoint_store_->get(key);
-    if (ep) {
-        ep->setPeerNicPath(peer_nic_path);
-        return ep;
-    }
-
-    // Slow path: create new endpoint, then atomically insert (or get existing
-    // if another thread raced us).  getOrInsert prevents duplicate endpoints
-    // and duplicate AV entries for the same peer.
-    auto new_endpoint = std::make_shared<EfaEndPoint>(*this);
-    auto cq = nextCq();
-    if (cq) {
-        int ret = new_endpoint->construct(cq->cq, &cq->outstanding, 1, 4,
-                                          globalConfig().max_wr, 64);
-        if (ret != 0) {
-            // fi_enable can return -FI_ENOMEM when the device is at its QP
-            // cap (768/device on p6-B300). Evict stale endpoints and retry
-            // once before giving up. This is a rare failure path (only hit
-            // on resource exhaustion), so the ~30 ms eviction scan is
-            // acceptable, and it lets callers that drift endpoint keys
-            // (e.g. keys carrying a timestamp) recover instead of failing
-            // permanently.
-            size_t evicted =
-                endpoint_store_ ? endpoint_store_->evictStale() : 0;
-            if (evicted > 0) {
-                LOG(INFO) << "EfaContext::endpoint: construct failed, "
-                          << "evicted " << evicted
-                          << " stale endpoints, retrying";
-                new_endpoint = std::make_shared<EfaEndPoint>(*this);
-                ret = new_endpoint->construct(cq->cq, &cq->outstanding, 1, 4,
-                                              globalConfig().max_wr, 64);
-            }
-            if (ret != 0) {
-                LOG(ERROR) << "Failed to construct EFA endpoint";
-                return nullptr;
-            }
+    {
+        RWSpinlock::ReadGuard guard(peer_map_lock_);
+        auto it = peer_map_.find(key);
+        if (it != peer_map_.end()) {
+            it->second->setPeerNicPath(peer_nic_path);
+            return it->second;
         }
     }
-    // Still set the full peer_nic_path (with port) for handshake routing
-    new_endpoint->setPeerNicPath(peer_nic_path);
-    ep = endpoint_store_->getOrInsert(key, new_endpoint);
-    // If another thread won the race, new_endpoint is discarded (RAII cleanup)
-    return ep;
+
+    auto new_ep = std::make_shared<EfaEndPoint>(*this);
+    new_ep->setPeerNicPath(peer_nic_path);
+
+    RWSpinlock::WriteGuard guard(peer_map_lock_);
+    auto it = peer_map_.find(key);
+    if (it != peer_map_.end()) {
+        it->second->setPeerNicPath(peer_nic_path);
+        return it->second;
+    }
+    peer_map_[key] = new_ep;
+    return new_ep;
 }
 
 std::shared_ptr<EfaEndPoint> EfaContext::peekEndpoint(
     const std::string& peer_nic_path) {
-    if (!endpoint_store_) return nullptr;
-    return endpoint_store_->get(normalizeNicPath(peer_nic_path));
+    RWSpinlock::ReadGuard guard(peer_map_lock_);
+    auto it = peer_map_.find(normalizeNicPath(peer_nic_path));
+    if (it == peer_map_.end()) return nullptr;
+    return it->second;
 }
 
 int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
-    if (endpoint_store_) {
-        endpoint_store_->remove(peer_nic_path);
+    std::shared_ptr<EfaEndPoint> ep;
+    {
+        RWSpinlock::WriteGuard guard(peer_map_lock_);
+        auto it = peer_map_.find(normalizeNicPath(peer_nic_path));
+        if (it == peer_map_.end()) return 0;
+        ep = it->second;
+        peer_map_.erase(it);
     }
+    if (ep) ep->disconnect();  // runs fi_av_remove
     return 0;
 }
 
 int EfaContext::disconnectAllEndpoints() {
-    if (endpoint_store_) {
-        return endpoint_store_->disconnectAll();
+    RWSpinlock::WriteGuard guard(peer_map_lock_);
+    for (auto& entry : peer_map_) {
+        if (entry.second) entry.second->disconnect();
     }
     return 0;
 }
 
 size_t EfaContext::getTotalQPNumber() const {
-    return endpoint_store_ ? endpoint_store_->size() : 0;
+    RWSpinlock::ReadGuard guard(peer_map_lock_);
+    return peer_map_.size();
 }
 
 std::string EfaContext::nicPath() const {
@@ -561,11 +527,7 @@ std::string EfaContext::nicPath() const {
 }
 
 std::string EfaContext::localAddr() const {
-    // Return a hex string representation of the local address info
-    if (!fi_info_ || !fi_info_->src_addr) {
-        return "";
-    }
-
+    if (!fi_info_ || !fi_info_->src_addr) return "";
     std::ostringstream oss;
     const uint8_t* addr = static_cast<const uint8_t*>(fi_info_->src_addr);
     for (size_t i = 0; i < fi_info_->src_addrlen; ++i) {
@@ -574,27 +536,61 @@ std::string EfaContext::localAddr() const {
     return oss.str();
 }
 
+std::string EfaContext::localEpAddr() const {
+    std::ostringstream oss;
+    for (uint8_t b : local_ep_addr_) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+    }
+    return oss.str();
+}
+
+int EfaContext::insertPeerAddr(const std::string& peer_hex_addr,
+                               fi_addr_t& out) {
+    if (peer_hex_addr.empty() || (peer_hex_addr.size() % 2) != 0) {
+        LOG(ERROR) << "insertPeerAddr: invalid hex length "
+                   << peer_hex_addr.size();
+        return ERR_INVALID_ARGUMENT;
+    }
+    std::vector<uint8_t> bin;
+    bin.reserve(peer_hex_addr.size() / 2);
+    for (size_t i = 0; i < peer_hex_addr.size(); i += 2) {
+        std::string byte_str = peer_hex_addr.substr(i, 2);
+        uint8_t byte = (uint8_t)strtol(byte_str.c_str(), nullptr, 16);
+        bin.push_back(byte);
+    }
+    int ret = fi_av_insert(av_, bin.data(), 1, &out, 0, nullptr);
+    if (ret != 1) {
+        LOG(ERROR) << "fi_av_insert failed: " << fi_strerror(-ret);
+        return ERR_ENDPOINT;
+    }
+    return 0;
+}
+
+void EfaContext::removePeerAddr(fi_addr_t fi_addr) {
+    if (fi_addr == FI_ADDR_UNSPEC) return;
+    int ret = fi_av_remove(av_, &fi_addr, 1, 0);
+    if (ret) {
+        LOG(WARNING) << "fi_av_remove failed: " << fi_strerror(-ret);
+    }
+}
+
 int EfaContext::submitPostSend(
     const std::vector<Transport::Slice*>& slice_list) {
-    // Route slices to appropriate endpoints for sending
-    // Group slices by peer NIC path
+    // Route slices to appropriate peer handles.  Group by peer NIC path.
     std::unordered_map<std::string, std::vector<Transport::Slice*>>
         slices_by_peer;
-    std::vector<Transport::Slice*> failed_slices;
 
     for (auto* slice : slice_list) {
         if (!slice) continue;
 
-        // Fast path: peer info already resolved by submitTransferTask's
-        // striping path (dest_rkey and peer_nic_path pre-set on slice).
-        // This eliminates per-slice metadata lookup, selectDevice(), and
-        // string construction — the main bottleneck for multi-NIC striping.
+        // Fast path: peer info pre-resolved by submitTransferTask's striping
+        // path (dest_rkey and peer_nic_path already set on slice).
         if (!slice->peer_nic_path.empty()) {
             slices_by_peer[slice->peer_nic_path].push_back(slice);
             continue;
         }
 
-        // Slow path: resolve peer info per-slice (non-striped transfers)
+        // Slow path: resolve peer info per-slice (non-striped transfers).
         auto peer_segment_desc =
             engine_.meta()->getSegmentDescByID(slice->target_id);
         if (!peer_segment_desc) {
@@ -604,7 +600,6 @@ int EfaContext::submitPostSend(
             continue;
         }
 
-        // Find the buffer and device for this destination address
         int buffer_id = -1, device_id = -1;
         if (EfaTransport::selectDevice(peer_segment_desc.get(),
                                        slice->rdma.dest_addr, slice->length,
@@ -615,47 +610,204 @@ int EfaContext::submitPostSend(
             continue;
         }
 
-        // Set the remote key from the peer's registered memory region
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
 
-        // Construct peer NIC path: "server_name@device_name"
         std::string peer_nic_path = peer_segment_desc->name + "@" +
                                     peer_segment_desc->devices[device_id].name;
         slice->peer_nic_path = peer_nic_path;
-
         slices_by_peer[peer_nic_path].push_back(slice);
     }
 
-    // Now send to each peer endpoint
     for (auto& entry : slices_by_peer) {
         const std::string& peer_nic_path = entry.first;
         auto& peer_slices = entry.second;
 
-        // Get or create endpoint for this peer
         auto ep = endpoint(peer_nic_path);
         if (!ep) {
-            LOG(ERROR) << "Cannot create endpoint for peer " << peer_nic_path;
-            for (auto* slice : peer_slices) {
-                slice->markFailed();
-            }
+            LOG(ERROR) << "Cannot create peer handle for " << peer_nic_path;
+            for (auto* slice : peer_slices) slice->markFailed();
             continue;
         }
 
-        // Submit to endpoint
         std::vector<Transport::Slice*> failed_slice_list;
         int rc = ep->submitPostSend(peer_slices, failed_slice_list);
+        for (auto* slice : failed_slice_list) slice->markFailed();
 
-        // Handle any slices that failed to post
-        for (auto* slice : failed_slice_list) {
-            slice->markFailed();
-        }
-
-        // If the endpoint is no longer connected after submit (e.g.
-        // setupConnectionsByActive failed inside submitPostSend), drop it
-        // so its QP is released instead of occupying an AV/QP slot forever.
+        // Drop peer handle if it is no longer connected after submit,
+        // freeing its AV entry for reuse.  Under the shared-endpoint model
+        // this is cheap (no fid_ep to destroy).
         if (rc != 0 && !ep->connected()) {
             deleteEndpoint(normalizeNicPath(peer_nic_path));
+        }
+    }
+
+    return 0;
+}
+
+int EfaContext::submitSlicesOnPeer(
+    fi_addr_t peer_fi_addr, std::vector<Transport::Slice*>& slice_list,
+    std::vector<Transport::Slice*>& failed_slice_list) {
+    // Batched submission against the shared endpoint.  Mirrors the previous
+    // per-endpoint submit path but uses context-level wr_depth / post_lock.
+    //
+    // 1. Reserve N WR+CQ slots in bulk (single CAS each)
+    // 2. Prepare MR descriptors and op contexts outside the lock
+    // 3. Hold post_lock_ once for the entire batch of fi_write calls
+    const int kMaxBackoffYields = 100000;
+    const int cq_limit = static_cast<int>(globalConfig().max_cqe);
+    volatile int* cq_outstanding =
+        shared_cq_ ? &shared_cq_->outstanding : nullptr;
+
+    struct BatchEntry {
+        Transport::Slice* slice;
+        void* local_desc;
+        EfaOpContext* op_ctx;
+    };
+
+    while (!slice_list.empty()) {
+        int batch_count = 0;
+        int backoff = 0;
+        bool timed_out = false;
+        while (batch_count == 0) {
+            int cur_wr = wr_depth_;
+            int wr_avail = max_wr_depth_ - cur_wr;
+            if (wr_avail <= 0) {
+                if (++backoff > kMaxBackoffYields) {
+                    timed_out = true;
+                    break;
+                }
+                std::this_thread::yield();
+                continue;
+            }
+            int want = std::min(wr_avail, (int)slice_list.size());
+            if (cq_outstanding) {
+                int cur_cq = *cq_outstanding;
+                int cq_avail = cq_limit - cur_cq;
+                if (cq_avail <= 0) {
+                    if (++backoff > kMaxBackoffYields) {
+                        timed_out = true;
+                        break;
+                    }
+                    std::this_thread::yield();
+                    continue;
+                }
+                want = std::min(want, cq_avail);
+                if (!__sync_bool_compare_and_swap(&wr_depth_, cur_wr,
+                                                  cur_wr + want)) {
+                    continue;
+                }
+                cur_cq = *cq_outstanding;
+                cq_avail = cq_limit - cur_cq;
+                if (cq_avail < want) {
+                    __sync_fetch_and_sub(&wr_depth_, want);
+                    continue;
+                }
+                if (!__sync_bool_compare_and_swap(cq_outstanding, cur_cq,
+                                                  cur_cq + want)) {
+                    __sync_fetch_and_sub(&wr_depth_, want);
+                    continue;
+                }
+            } else {
+                if (!__sync_bool_compare_and_swap(&wr_depth_, cur_wr,
+                                                  cur_wr + want)) {
+                    continue;
+                }
+            }
+            batch_count = want;
+        }
+
+        if (timed_out) {
+            LOG(WARNING) << "EFA submitSlicesOnPeer: timed out waiting for CQ"
+                         << " drain (wr_depth=" << wr_depth_
+                         << ", max=" << max_wr_depth_ << ", cq_outstanding="
+                         << (cq_outstanding ? *cq_outstanding : -1)
+                         << ", max_cqe=" << cq_limit << ")";
+            for (auto* slice : slice_list) failed_slice_list.push_back(slice);
+            slice_list.clear();
+            return 0;
+        }
+
+        std::vector<BatchEntry> batch(batch_count);
+        int valid_count = 0;
+
+        for (int i = 0; i < batch_count; i++) {
+            Transport::Slice* slice = slice_list[i];
+            void* local_desc = mrDesc(slice->source_addr);
+            if (!local_desc) {
+                LOG(ERROR) << "No MR descriptor found for address "
+                           << slice->source_addr;
+                failed_slice_list.push_back(slice);
+                continue;
+            }
+            EfaOpContext* op_ctx = new EfaOpContext();
+            memset(op_ctx, 0, sizeof(EfaOpContext));
+            op_ctx->slice = slice;
+            op_ctx->wr_depth = &wr_depth_;
+            batch[valid_count++] = {slice, local_desc, op_ctx};
+        }
+
+        int mr_failures = batch_count - valid_count;
+        if (mr_failures > 0) {
+            __sync_fetch_and_sub(&wr_depth_, mr_failures);
+            if (cq_outstanding)
+                __sync_fetch_and_sub(cq_outstanding, mr_failures);
+        }
+
+        std::vector<Transport::Slice*> retry_slices;
+        if (valid_count > 0) {
+            while (post_lock_.test_and_set(std::memory_order_acquire)) {
+            }
+            for (int i = 0; i < valid_count; i++) {
+                auto& entry = batch[i];
+                ssize_t ret;
+                if (entry.slice->opcode == Transport::TransferRequest::READ) {
+                    ret = fi_read(shared_ep_, (void*)entry.slice->source_addr,
+                                  entry.slice->length, entry.local_desc,
+                                  peer_fi_addr, entry.slice->rdma.dest_addr,
+                                  entry.slice->rdma.dest_rkey,
+                                  &entry.op_ctx->fi_ctx);
+                } else {
+                    ret = fi_write(shared_ep_, (void*)entry.slice->source_addr,
+                                   entry.slice->length, entry.local_desc,
+                                   peer_fi_addr, entry.slice->rdma.dest_addr,
+                                   entry.slice->rdma.dest_rkey,
+                                   &entry.op_ctx->fi_ctx);
+                }
+                if (ret == 0) {
+                    entry.slice->status = Transport::Slice::PENDING;
+                } else if (ret == -FI_EAGAIN) {
+                    delete entry.op_ctx;
+                    int not_posted = valid_count - i;
+                    __sync_fetch_and_sub(&wr_depth_, not_posted);
+                    if (cq_outstanding)
+                        __sync_fetch_and_sub(cq_outstanding, not_posted);
+                    for (int j = i; j < valid_count; j++) {
+                        if (j > i) delete batch[j].op_ctx;
+                        retry_slices.push_back(batch[j].slice);
+                    }
+                    break;
+                } else {
+                    LOG(ERROR)
+                        << "fi_read/fi_write failed: " << fi_strerror(-ret)
+                        << " (source=" << entry.slice->source_addr
+                        << ", len=" << entry.slice->length
+                        << ", dest=" << (void*)entry.slice->rdma.dest_addr
+                        << ", rkey=" << entry.slice->rdma.dest_rkey << ")";
+                    delete entry.op_ctx;
+                    __sync_fetch_and_sub(&wr_depth_, 1);
+                    if (cq_outstanding) __sync_fetch_and_sub(cq_outstanding, 1);
+                    failed_slice_list.push_back(entry.slice);
+                }
+            }
+            post_lock_.clear(std::memory_order_release);
+        }
+
+        slice_list.erase(slice_list.begin(), slice_list.begin() + batch_count);
+        if (!retry_slices.empty()) {
+            slice_list.insert(slice_list.begin(), retry_slices.begin(),
+                              retry_slices.end());
+            std::this_thread::yield();
         }
     }
 
@@ -670,14 +822,12 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
     struct fid_cq* cq = cq_list_[cq_index]->cq;
     if (!cq) return 0;
 
-    // Use fi_cq_data format for completions
     struct fi_cq_data_entry entries[64];
     int to_poll = std::min(max_entries, 64);
 
     ssize_t ret = fi_cq_read(cq, entries, to_poll);
 
     if (ret > 0) {
-        // Process completions outside the lock (markSuccess / delete are safe)
         std::unordered_map<volatile int*, int> wr_depth_set;
         for (ssize_t i = 0; i < ret; i++) {
             EfaOpContext* op_ctx =
@@ -699,7 +849,6 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
     } else if (ret == -FI_EAGAIN) {
         return 0;
     } else if (ret < 0) {
-        // CQ error - drain all queued error entries under the domain lock
         int err_count = 0;
         struct fi_cq_err_entry err_entry;
         std::unordered_map<volatile int*, int> wr_depth_set;

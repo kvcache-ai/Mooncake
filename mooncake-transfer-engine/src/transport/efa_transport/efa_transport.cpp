@@ -147,12 +147,10 @@ void EfaTransport::workerThreadFunc(int thread_id) {
             }
         }
 
-        // Stale endpoint eviction happens on-demand in
-        // EfaEndpointStore::getOrInsert when the store is at capacity,
-        // not periodically here.  Periodic eviction is unsafe because
-        // target-side endpoints never get touchLastUsed() updates
-        // (the initiator writes remotely via fi_write, bypassing
-        // the target's endpoint code).
+        // Under the shared-endpoint model there is no per-peer QP to evict:
+        // a new peer costs one AV entry (~bytes), not an fi_endpoint slot.
+        // Stale peers are reclaimed when submitPostSend() drops a peer whose
+        // handshake failed.
 
         // If no work was done, yield CPU briefly
         if (!did_work) {
@@ -719,12 +717,11 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
         return 0;
     }
 
-    // Warm up every (local_ctx, peer_nic) pair concurrently. Each
-    // EfaContext::endpoint() + setupConnectionsByActive() is idempotent and
-    // takes its own lock, so parallel calls across distinct peer_nic_paths
-    // (and distinct contexts) are safe. We use std::async to get roughly
-    // per-pair parallelism — the critical path is now max(handshake RTT) not
-    // sum(handshake RTT).
+    // Warm up every (local_ctx, peer_nic) pair concurrently.  Under the
+    // shared-endpoint model each warmup is just a handshake RPC +
+    // fi_av_insert (no fi_endpoint, no fi_enable), so the critical path is
+    // max(handshake RTT), not sum.  We still dispatch with std::async for
+    // concurrency, but total wall time is typically ms-level.
     std::vector<std::future<int>> futs;
     futs.reserve(n_pairs);
     for (auto& ctx : context_list_) {
@@ -741,11 +738,10 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
                     if (ep->connected()) return 0;
                     int rc = ep->setupConnectionsByActive();
                     if (rc != 0) {
-                        // Handshake failed: drop the endpoint so its fid_ep
-                        // is destroyed and the QP is released. Without this,
-                        // callers that retry with drifting keys (e.g. keys
-                        // carrying a timestamp) accumulate dead endpoints
-                        // until fi_enable returns ENOMEM at ~768 QP/device.
+                        // Handshake failed: drop the peer handle so the AV
+                        // slot is freed and the next warmup retry starts
+                        // clean.  Cheap under the shared-endpoint model —
+                        // no fi_endpoint teardown required.
                         ctx->deleteEndpoint(normalizeNicPath(path));
                     }
                     return rc;
