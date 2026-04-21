@@ -28,6 +28,19 @@ from vllm.attention.selector import get_attn_backend
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
+
+# SupportsHMA was introduced in vllm-project/vllm PR #25712 and is enforced
+# for KV connectors by PR #27592. It is the marker the Hybrid Memory
+# Allocator uses to allow PD-disaggregation with hybrid (e.g. attention +
+# Mamba2) models. We import it conditionally so this connector keeps
+# working on older vLLM releases that pre-date the interface; on those
+# releases the marker is a no-op object base and the
+# `request_finished_all_groups` shim below is dead code.
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        SupportsHMA)
+except ImportError:  # pragma: no cover - older vLLM
+    SupportsHMA = object  # type: ignore[assignment, misc]
 from vllm.distributed.parallel_state import (get_tensor_model_parallel_rank,
                                              get_tp_group)
 from vllm.forward_context import ForwardContext
@@ -104,7 +117,12 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             self.reqs_to_send[request_id] = local_block_ids
 
 
-class MooncakeConnector(KVConnectorBase_V1):
+class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
+    # Subclassing SupportsHMA gates this connector through vLLM's Hybrid
+    # Memory Allocator path, which is required to PD-disaggregate hybrid
+    # attention + Mamba2 models (e.g. nvidia/NVIDIA-Nemotron-Nano-9B-v2).
+    # On vLLM versions that pre-date PR #25712 the marker resolves to
+    # `object` and this is identical to the previous single-base class.
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
         assert vllm_config.kv_transfer_config is not None
@@ -153,6 +171,28 @@ class MooncakeConnector(KVConnectorBase_V1):
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """SupportsHMA hook for hybrid (multi-group) KV cache layouts.
+
+        Hybrid models (e.g. attention + Mamba2) expose one block-id list
+        per KV cache group instead of a single flat list. The Mooncake
+        transport itself does not yet distinguish groups on the wire, so
+        we flatten the per-group lists and delegate to the existing
+        single-group `request_finished`. This is the minimum-viable shim
+        that satisfies the `SupportsHMA` contract and unblocks the
+        Hybrid Memory Allocator gate so the engine can start up; cross-
+        node fidelity for non-attention SSM/Mamba state is not asserted
+        by this method and remains a follow-up (the Mamba2 backend in
+        vLLM still raises NotImplementedError from
+        `get_kv_cache_shape()`).
+        """
+        flat: list[int] = [b for group in block_ids for b in group]
+        return self.request_finished(request, flat)
 
     ############################################################
     # Worker Side Methods

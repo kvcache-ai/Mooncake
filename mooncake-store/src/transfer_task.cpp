@@ -416,10 +416,17 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       transfer_metric_(transfer_metric) {
-    // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
+    // Read MC_STORE_MEMCPY environment variable.
+    // When not set, auto-detect based on transport type:
+    //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
+    //   - RDMA/other transports: disable memcpy (RDMA is more efficient)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
     if (env_value == nullptr) {
-        memcpy_enabled_ = false;  // Default: disabled
+        memcpy_enabled_ = engine_.isTcpOnly();
+        LOG(INFO) << "MC_STORE_MEMCPY not set, auto-detected: "
+                  << (memcpy_enabled_ ? "TCP-only environment, memcpy enabled"
+                                      : "non-TCP transport available, memcpy "
+                                        "disabled");
     } else {
         std::string env_str(env_value);
         // Convert to lowercase for case-insensitive comparison

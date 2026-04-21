@@ -351,12 +351,23 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     return {};
 }
 
+std::unordered_set<UUID, boost::hash<UUID>>
+MasterService::getAliveClientsSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    return ok_client_;
+}
+
 void MasterService::ClearInvalidHandles() {
+    ClearInvalidHandles(getAliveClientsSnapshot());
+}
+
+void MasterService::ClearInvalidHandles(
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
                 // replication_tasks, and offloading_tasks.
@@ -842,13 +853,15 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=put_start_begin";
 
+    auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
     const auto now = std::chrono::system_clock::now();
     auto it = shard->metadata.find(key);
-    if (it != shard->metadata.end() && !CleanupStaleHandles(it->second)) {
+    if (it != shard->metadata.end() &&
+        !CleanupStaleHandles(it->second, alive_clients)) {
         auto& metadata = it->second;
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
@@ -1085,6 +1098,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     //   during full metadata snapshots.
     // shard lock (exclusive via MetadataShardAccessorRW): serializes all
     //   operations on keys that hash to the same shard.
+    auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
@@ -1094,7 +1108,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // --- Step 0: stale handle cleanup ---
     // If all memory replicas point to unmounted segments (node crashed and
     // restarted), the metadata is useless — erase it and treat as new key.
-    if (it != shard->metadata.end() && CleanupStaleHandles(it->second)) {
+    // Also clean up local_disk replicas whose owner client has expired.
+    if (it != shard->metadata.end() &&
+        CleanupStaleHandles(it->second, alive_clients)) {
         shard->processing_keys.erase(key);
         shard->metadata.erase(it);
         it = shard->metadata.end();
@@ -1931,6 +1947,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
 
+    auto alive_clients = getAliveClientsSnapshot();
+
     // Process each shard once, acquiring lock per shard
     for (auto& [shard_idx, key_group] : keys_by_shard) {
         MetadataShardAccessorRW shard(this, shard_idx);
@@ -1948,7 +1966,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Clean up stale replica handles (consistent with single Remove)
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
                 shard->processing_keys.erase(key);
                 shard->replication_tasks.erase(key);
                 shard->offloading_tasks.erase(key);
@@ -1996,10 +2014,14 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     return results;
 }
 
-bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
-    // Remove those with invalid allocators
-    metadata.EraseReplicas([](const Replica& replica) {
-        return replica.has_invalid_mem_handle();
+bool MasterService::CleanupStaleHandles(
+    ObjectMetadata& metadata,
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+    // Remove those with invalid allocators (memory replicas on unmounted
+    // segments) and local_disk replicas whose owner client is no longer alive.
+    metadata.EraseReplicas([&alive_clients](const Replica& replica) {
+        return replica.has_invalid_mem_handle() ||
+               replica.has_stale_local_disk_client(alive_clients);
     });
 
     // Return true if no valid replicas remain after cleanup
@@ -3771,9 +3793,15 @@ void MasterService::ClientMonitorFunc() {
             }  // Release the mutex before long-running ClearInvalidHandles and
                // avoid deadlocks
 
-            if (!unmount_segments.empty()) {
-                ClearInvalidHandles();
+            // Always clean up invalid handles when there are expired clients,
+            // even if no memory segments were unmounted. This is necessary
+            // to clean up local_disk replicas whose owner client has expired.
+            ClearInvalidHandles();
 
+            // Commit unmount of memory segments and clean up local_disk
+            // segments for expired clients. Both require the exclusive
+            // segment lock.
+            {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
@@ -3782,6 +3810,9 @@ void MasterService::ClientMonitorFunc() {
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_segment";
+                }
+                for (auto& client_id : expired_clients) {
+                    segment_access.UnmountLocalDiskSegment(client_id);
                 }
             }
         }

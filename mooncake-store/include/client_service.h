@@ -447,6 +447,15 @@ class Client {
         return master_client_.CalcCacheStats();
     }
 
+    void ObserveTransferOperation(TransferOperationKind kind,
+                                  const std::string& op_name, uint64_t bytes,
+                                  uint64_t latency_us) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveTransferOperation(kind, op_name, bytes,
+                                               latency_us);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

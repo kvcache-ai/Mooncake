@@ -7,6 +7,7 @@
 #include "pyclient.h"
 #include "real_client.h"
 #include "shm_helper.h"
+#include "client_metric.h"
 #include <memory>
 
 namespace mooncake {
@@ -203,6 +204,22 @@ class DummyClient : public PyClient {
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args &&...args);
 
+    template <auto ServiceMethod, typename... Args>
+    int invoke_observed_void_rpc(TransferOperationKind kind,
+                                 const char *op_name, size_t bytes, bool batch,
+                                 Args &&...args) {
+        auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
+            [&]() {
+                return invoke_rpc<ServiceMethod, void>(
+                    std::forward<Args>(args)...);
+            },
+            [](const auto &ret) { return ret.has_value(); },
+            [&](uint64_t latency_us, const auto &) {
+                ObserveTransferMetric(kind, op_name, bytes, latency_us, batch);
+            });
+        return to_py_ret(result);
+    }
+
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client
      * pool cannot reconnect to a different address, a new coro_rpc_client
@@ -261,6 +278,11 @@ class DummyClient : public PyClient {
 
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
     int32_t device_id_ = 0;
+
+    std::unique_ptr<ClientMetric> metrics_;
+
+    void ObserveTransferMetric(TransferOperationKind kind, const char *op_name,
+                               size_t bytes, uint64_t latency_us, bool batch);
 };
 
 }  // namespace mooncake

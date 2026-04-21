@@ -42,9 +42,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.local_buffer_size = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.scanmeta_iterator_keys_limit =
+    config.scanmeta_iterator_keys_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
         GetEnvOr<int64_t>("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
-                          config.scanmeta_iterator_keys_limit);
+                          config.scanmeta_iterator_keys_limit));
 
     config.total_keys_limit = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
@@ -63,7 +64,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
                            config.client_buffer_gc_ttl_ms);
 
-    auto use_uring_str = GetEnvStringOr("MOONCAKE_USE_URING", "false");
+    auto use_uring_str =
+        GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
+                       GetEnvStringOr("MOONCAKE_USE_URING", "false"));
     config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
 
     return config;

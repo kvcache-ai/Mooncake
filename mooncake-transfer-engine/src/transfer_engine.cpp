@@ -179,6 +179,8 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
 }
 
+bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
+
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {
     return impl_->syncSegmentCache(segment_name);
 }
@@ -576,6 +578,15 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
         return nullptr;
     else
         return impl_->getTransport(proto);
+}
+
+bool TransferEngine::isTcpOnly() const {
+    if (use_tent_)
+        // TENT already rejects TCP loopback transfers when MC_STORE_MEMCPY
+        // is disabled, so auto-enabling memcpy is unnecessary in TENT mode.
+        return false;
+    else
+        return impl_->isTcpOnly();
 }
 
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {
