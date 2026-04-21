@@ -1,9 +1,11 @@
 use std::error::Error;
+use std::sync::mpsc;
 
 use _store_rs::admin::{
     format_policy_scope, format_route_policy_domain, format_tenant_object_accounting_state,
-    format_tenant_quota_reservation_state, redact_redis_url, route_policy_domain, AdminService,
-    PolicyPatchInput, TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
+    format_tenant_quota_reservation_state, redact_redis_url, route_policy_domain,
+    AdminHttpServerHandle, AdminService, PolicyPatchInput, TenantQuotaAbortRequest,
+    TenantQuotaReconcileRequest,
 };
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::MetadataKeyspace;
@@ -11,6 +13,8 @@ use mooncake_store_client::{init_tracing, RouteControlMode};
 use mooncake_store_core::{
     RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaReservationState,
 };
+use tracing::info;
+use url::Url;
 
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-admin")]
@@ -29,6 +33,8 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Command {
     CleanupStaleSegments,
+    #[command(alias = "serve")]
+    Server(ServerArgs),
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
@@ -101,6 +107,12 @@ enum QuotaCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+}
+
+#[derive(ClapArgs, Clone, Debug)]
+struct ServerArgs {
+    #[arg(long, default_value = "127.0.0.1:0")]
+    bind_addr: String,
 }
 
 #[derive(ClapArgs, Clone, Debug)]
@@ -207,14 +219,44 @@ impl From<ReservationStateArg> for TenantQuotaReservationState {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    validate_args(&args)?;
     init_tracing(args.trace_filter.as_deref())?;
-    let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
 
     match &args.command {
-        Command::CleanupStaleSegments => cleanup_stale_segments(&service),
-        Command::Policy { command } => run_policy_command(&service, &args, command),
-        Command::Quota { command } => run_quota_command(&service, &args, command),
+        Command::CleanupStaleSegments => {
+            let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
+            cleanup_stale_segments(&service)
+        }
+        Command::Server(server_args) => run_server_command(&args, server_args),
+        Command::Policy { command } => {
+            let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
+            run_policy_command(&service, &args, command)
+        }
+        Command::Quota { command } => {
+            let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
+            run_quota_command(&service, &args, command)
+        }
     }
+}
+
+fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
+    Url::parse(&args.metadata_url)?;
+    Ok(())
+}
+
+fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<dyn Error>> {
+    let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
+    let mut server = AdminHttpServerHandle::start(&server_args.bind_addr, service)?;
+    info!(address = %server.address(), "admin http server listening");
+
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = shutdown_tx.send(());
+    })?;
+    let _ = shutdown_rx.recv();
+
+    server.shutdown()?;
+    Ok(())
 }
 
 fn run_policy_command(
@@ -685,6 +727,42 @@ mod tests {
             RouteControlMode::from(RouteControlArg::MetadataOnly),
             RouteControlMode::MetadataOnly
         );
+    }
+
+    #[test]
+    fn server_subcommand_parses_bind_addr() {
+        let args = Args::parse_from([
+            "mooncake-store-admin",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "server",
+            "--bind-addr",
+            "127.0.0.1:8080",
+        ]);
+        match args.command {
+            Command::Server(server_args) => {
+                assert_eq!(server_args.bind_addr, "127.0.0.1:8080");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_alias_parses_bind_addr() {
+        let args = Args::parse_from([
+            "mooncake-store-admin",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "serve",
+            "--bind-addr",
+            "127.0.0.1:0",
+        ]);
+        match args.command {
+            Command::Server(server_args) => {
+                assert_eq!(server_args.bind_addr, "127.0.0.1:0");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
