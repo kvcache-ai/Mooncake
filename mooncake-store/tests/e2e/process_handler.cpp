@@ -21,9 +21,9 @@ namespace testing {
 namespace {
 
 std::string ResolveMasterBackendConnstring(const MasterRunnerConfig& config) {
-    return ResolveConfiguredHABackendConnstring(
-        config.ha_backend_type, config.ha_backend_connstring,
-        config.etcd_endpoints);
+    return ResolveConfiguredHABackendConnstring(config.ha_backend_type,
+                                                config.ha_backend_connstring,
+                                                config.etcd_endpoints);
 }
 
 }  // namespace

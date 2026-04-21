@@ -423,14 +423,13 @@ TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
               legacy_config.etcd_endpoints);
 }
 
-TEST_F(SnapshotChildProcessTest,
-       NonEtcdBackendsDoNotFallbackToEtcdEndpoints) {
-    EXPECT_TRUE(ResolveConfiguredHABackendConnstring(
-                    "k8s", "", "127.0.0.1:2379")
-                    .empty());
-    EXPECT_TRUE(ResolveConfiguredHABackendConnstring(
-                    "redis", "", "127.0.0.1:2379")
-                    .empty());
+TEST_F(SnapshotChildProcessTest, NonEtcdBackendsDoNotFallbackToEtcdEndpoints) {
+    EXPECT_TRUE(
+        ResolveConfiguredHABackendConnstring("k8s", "", "127.0.0.1:2379")
+            .empty());
+    EXPECT_TRUE(
+        ResolveConfiguredHABackendConnstring("redis", "", "127.0.0.1:2379")
+            .empty());
 
     MasterConfig config;
     config.enable_ha = true;

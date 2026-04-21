@@ -33,7 +33,7 @@ namespace testing {
                   "HA backend type for tests: etcd | redis | k8s");
 #define FLAG_ha_backend_connstring                                          \
     DEFINE_string(ha_backend_connstring, "",                                \
-                  "HA backend connection string for tests; if unset, only "  \
+                  "HA backend connection string for tests; if unset, only " \
                   "backend_type=etcd falls back to etcd_endpoints");
 #define FLAG_master_path                                               \
     DEFINE_string(master_path, "./mooncake-store/src/mooncake_master", \
@@ -50,9 +50,9 @@ namespace testing {
                  "Random seed, 0 means use current time as seed");
 
 inline std::string ResolveTestHABackendConnstring() {
-    return ResolveConfiguredHABackendConnstring(
-        ::FLAGS_ha_backend_type, ::FLAGS_ha_backend_connstring,
-        ::FLAGS_etcd_endpoints);
+    return ResolveConfiguredHABackendConnstring(::FLAGS_ha_backend_type,
+                                                ::FLAGS_ha_backend_connstring,
+                                                ::FLAGS_etcd_endpoints);
 }
 
 inline std::string NormalizeConnstringScheme(const std::string& connstring) {
