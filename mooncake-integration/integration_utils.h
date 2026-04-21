@@ -244,13 +244,14 @@ inline bool ValidateTensorMetadata(const TensorMetadata &metadata,
         return false;
     }
 
-    if (metadata.header.data_bytes != total_length - metadata.header.data_offset) {
+    if (metadata.header.data_bytes !=
+        total_length - metadata.header.data_offset) {
         return false;
     }
 
     for (int32_t i = 0; i < metadata.header.ndim; ++i) {
         if (metadata.layout.global_shape.dims[i] <= 0 ||
-            metadata.layout.local_shape.dims[i] <= 0) {
+            metadata.layout.local_shape.dims[i] < 0) {
             return false;
         }
     }
@@ -292,7 +293,8 @@ inline std::optional<ParsedTensorMetadata> ParseTensorMetadata(
         return std::nullopt;
     }
 
-    parsed.data_offset = static_cast<size_t>(parsed.metadata.header.data_offset);
+    parsed.data_offset =
+        static_cast<size_t>(parsed.metadata.header.data_offset);
     parsed.data_bytes = static_cast<size_t>(parsed.metadata.header.data_bytes);
     return parsed;
 }
