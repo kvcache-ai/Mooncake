@@ -483,6 +483,11 @@ fn build_classic_config(
     if let Some(password) = auth.password {
         config = config.redis_password(password);
     }
+    if let Ok(gid_index) = std::env::var("MC_STORE_RS_GID_INDEX") {
+        if !gid_index.trim().is_empty() {
+            config = config.gid_index(gid_index);
+        }
+    }
     Ok(config)
 }
 

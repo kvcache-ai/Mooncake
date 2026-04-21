@@ -329,6 +329,9 @@ install -m 0755 \
 install -m 0755 \
   "${REPO_ROOT}/target/release/mooncake-store-admin" \
   "${BIN_DIR}/mooncake-store-admin"
+install -m 0755 \
+  "${REPO_ROOT}/target/release/mooncake_store_bench" \
+  "${BIN_DIR}/mooncake-store-bench"
 
 LATEST_WHEEL=$(ls -1t "${WHEEL_DIR}"/*.whl 2>/dev/null | head -n 1 || true)
 if [[ -z "${LATEST_WHEEL}" ]]; then
@@ -343,6 +346,7 @@ fi
   "${REPO_ROOT}/target/release/build" \
   "${REPO_ROOT}/target/release/mooncake-store-client" \
   "${REPO_ROOT}/target/release/mooncake-store-admin" \
+  "${REPO_ROOT}/target/release/mooncake_store_bench" \
   "${BUILD_GIT_BRANCH}" \
   "${BUILD_GIT_COMMIT}" \
   "${BUILD_TIME}"
@@ -364,15 +368,17 @@ upstream_build_dir = pathlib.Path(sys.argv[3])
 transport_build_dir = pathlib.Path(sys.argv[4])
 store_client_path = pathlib.Path(sys.argv[5])
 store_admin_path = pathlib.Path(sys.argv[6])
-build_git_branch = sys.argv[7]
-build_git_commit = sys.argv[8]
-build_time = sys.argv[9]
+store_bench_path = pathlib.Path(sys.argv[7])
+build_git_branch = sys.argv[8]
+build_git_commit = sys.argv[9]
+build_time = sys.argv[10]
 upstream_py_dir = repo_root / "third_party" / "Mooncake" / "mooncake-wheel" / "mooncake"
 transport_shim_out_dirs = sorted(transport_build_dir.glob("mooncake-transport-sys-*/out"))
 
 binary_assets = {
     "mooncake-store-client": store_client_path,
     "mooncake-store-admin": store_admin_path,
+    "mooncake-store-bench": store_bench_path,
     "transfer_engine_bench": upstream_build_dir
     / "mooncake-transfer-engine"
     / "example"
@@ -530,4 +536,5 @@ wheel:  ${LATEST_WHEEL}
 meta:   ${LATEST_META_WHEEL}
 client: ${BIN_DIR}/mooncake-store-client
 admin:  ${BIN_DIR}/mooncake-store-admin
+bench:  ${BIN_DIR}/mooncake-store-bench
 EOF
