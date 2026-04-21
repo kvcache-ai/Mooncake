@@ -548,6 +548,11 @@ impl StoreDispatcher {
             .is_some_and(|cache| cache.contains(&HotCacheKey::new(tenant, key)))
     }
 
+    #[cfg(test)]
+    pub(crate) fn hot_cache_contains_in_scope(&self, scope: &str, tenant: &str, key: &str) -> bool {
+        scope == self.compat_scope && self.hot_cache_contains(tenant, key)
+    }
+
     pub async fn put(&self, request: pb::PutRequest) -> Result<i32, StoreError> {
         let state = self.state.clone();
         let hot_cache = self.hot_cache.clone();
