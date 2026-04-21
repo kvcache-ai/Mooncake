@@ -326,8 +326,10 @@ struct LocalStorageMetric {
         auto put_count = put_requests.value();
         auto get_count = get_requests.value();
         ss << "Local Put: " << put_count << " requests, "
+           << put_failures.value() << " failures, "
            << byte_size_to_string(put_bytes.value()) << " written\n";
         ss << "Local Get: " << get_count << " requests, "
+           << get_failures.value() << " failures, "
            << byte_size_to_string(get_bytes.value()) << " read, "
            << get_misses.value() << " misses\n";
 
