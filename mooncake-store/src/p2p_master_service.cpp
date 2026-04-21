@@ -142,6 +142,35 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     return response;
 }
 
+auto P2PMasterService::BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
+    -> BatchGetWriteRouteResponse {
+    const size_t n = req.keys.size();
+    BatchGetWriteRouteResponse response;
+    response.responses.resize(n);
+    response.error_codes.resize(n, ErrorCode::OK);
+
+    if (req.keys.size() != req.sizes.size()) {
+        std::fill(response.error_codes.begin(), response.error_codes.end(),
+                  ErrorCode::INVALID_PARAMS);
+        return response;
+    }
+
+    WriteRouteRequest single_req;
+    single_req.client_id = req.client_id;
+    single_req.config    = req.config;
+    for (size_t i = 0; i < n; ++i) {
+        single_req.key  = req.keys[i];
+        single_req.size = req.sizes[i];
+        auto result = GetWriteRoute(single_req);
+        if (result.has_value()) {
+            response.responses[i] = std::move(*result);
+        } else {
+            response.error_codes[i] = result.error();
+        }
+    }
+    return response;
+}
+
 auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
     -> tl::expected<void, ErrorCode> {
     auto accessor = GetMetadataAccessor(req.key);

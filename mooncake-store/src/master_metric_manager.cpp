@@ -247,6 +247,15 @@ MasterMetricManager::MasterMetricManager()
       batch_remove_replica_failed_items_(
           "master_batch_remove_replica_failed_items_total",
           "Total number of failed items in BatchRemoveReplica requests"),
+      batch_get_write_route_requests_(
+          "master_batch_get_write_route_requests_total",
+          "Total number of BatchGetWriteRoute requests received"),
+      batch_get_write_route_failures_(
+          "master_batch_get_write_route_failures_total",
+          "Total number of failed BatchGetWriteRoute requests"),
+      batch_get_write_route_partial_successes_(
+          "master_batch_get_write_route_partial_successes_total",
+          "Total number of partially successful BatchGetWriteRoute requests"),
 
       // Initialize cache hit rate metrics
       mem_cache_hit_nums_("mem_cache_hit_nums_",
@@ -378,6 +387,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_remove_replica_partial_successes_.inc(0);
     batch_remove_replica_items_.inc(0);
     batch_remove_replica_failed_items_.inc(0);
+    batch_get_write_route_requests_.inc(0);
+    batch_get_write_route_failures_.inc(0);
+    batch_get_write_route_partial_successes_.inc(0);
 
     // Update cache hit rate metrics
     mem_cache_hit_nums_.inc(0);
@@ -772,6 +784,20 @@ void MasterMetricManager::inc_batch_remove_replica_partial_success(
     batch_remove_replica_partial_successes_.inc(1);
     batch_remove_replica_failed_items_.inc(failed_items);
 }
+void MasterMetricManager::inc_batch_get_write_route_requests(int64_t items) {
+    batch_get_write_route_requests_.inc(1);
+    (void)items;
+}
+void MasterMetricManager::inc_batch_get_write_route_failures(
+    int64_t failed_items) {
+    batch_get_write_route_failures_.inc(1);
+    (void)failed_items;
+}
+void MasterMetricManager::inc_batch_get_write_route_partial_success(
+    int64_t failed_items) {
+    batch_get_write_route_partial_successes_.inc(1);
+    (void)failed_items;
+}
 
 // PutStart Discard Metrics
 void MasterMetricManager::inc_put_start_discard_cnt(int64_t count,
@@ -1069,6 +1095,18 @@ int64_t MasterMetricManager::get_batch_remove_replica_failed_items() {
     return batch_remove_replica_failed_items_.value();
 }
 
+int64_t MasterMetricManager::get_batch_get_write_route_requests() {
+    return batch_get_write_route_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_write_route_failures() {
+    return batch_get_write_route_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_get_write_route_partial_successes() {
+    return batch_get_write_route_partial_successes_.value();
+}
+
 // Eviction Metrics
 void MasterMetricManager::inc_eviction_success(int64_t key_count,
                                                int64_t size) {
@@ -1194,6 +1232,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(batch_remove_replica_partial_successes_);
     serialize_metric(batch_remove_replica_items_);
     serialize_metric(batch_remove_replica_failed_items_);
+    serialize_metric(batch_get_write_route_requests_);
+    serialize_metric(batch_get_write_route_failures_);
+    serialize_metric(batch_get_write_route_partial_successes_);
 
     // Serialize Eviction Counters
     serialize_metric(eviction_success_);

@@ -280,9 +280,23 @@ class P2PClientService final : public ClientService {
         std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise);
 
    private:
+    // Fetch write routes for all keys in one master RPC.
+    tl::expected<BatchGetWriteRouteResponse, ErrorCode> BatchFetchWriteRoutes(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const WriteRouteRequestConfig& config);
+
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> CreatePutHandle(
         const std::string& key, std::vector<Slice>& slices,
         const WriteRouteRequestConfig& config);
+
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
+    CreateLocalPutHandle(const std::string& key, std::vector<Slice>& slices);
+
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
+    InnerCreatePutHandle(const std::string& key, std::vector<Slice>& slices,
+                         const WriteRouteRequestConfig& config,
+                         std::vector<WriteCandidate> candidates);
 
     tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
         const std::string& key,
