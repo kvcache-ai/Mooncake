@@ -106,9 +106,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
 
         if (tiered_backend_->Exist(key)) {
             LOG(WARNING) << "PutViaTe: key already exists: " << key;
-            if (local_storage_metrics_) {
-                local_storage_metrics_->put_failures.inc();
-            }
+            // Key already exists is not a failure, just return error
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
 
@@ -121,9 +119,13 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
                 LOG(WARNING)
                     << "PutViaTe: object already exists for key: " << key
                     << ", error code: " << err;
-            }
-            if (local_storage_metrics_) {
-                local_storage_metrics_->put_failures.inc();
+                // Key/replica already exists is not a failure
+            } else {
+                LOG(ERROR) << "PutViaTe: failed to allocate for key: " << key
+                           << ", error code: " << err;
+                if (local_storage_metrics_) {
+                    local_storage_metrics_->put_failures.inc();
+                }
             }
             return tl::unexpected(err);
         }
@@ -147,8 +149,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
          total_size]() mutable -> tl::expected<void, ErrorCode> {
             ScopedVLogTimer timer(1, "DataManager::PutViaTe");
             timer.LogRequest("key=", key);
-
-            auto start_time = std::chrono::steady_clock::now();
+            Stopwatch sw;
 
             auto wait_result = WaitAllTransferBatches(ctx.transfer_batches);
             if (!wait_result) {
@@ -189,14 +190,9 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
 
             // Record successful put metrics
             if (local_storage_metrics_) {
-                auto end_time = std::chrono::steady_clock::now();
-                auto latency_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        end_time - start_time)
-                        .count();
                 local_storage_metrics_->put_bytes.inc(total_size);
                 local_storage_metrics_->put_latency_us.observe(
-                    static_cast<double>(latency_us));
+                    static_cast<double>(sw.elapsed_us()));
             }
 
             timer.LogResponse("error_code=", ErrorCode::OK);
@@ -224,9 +220,7 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
 
         if (tiered_backend_->Exist(key)) {
             LOG(WARNING) << "Key already exists: " << key;
-            if (local_storage_metrics_) {
-                local_storage_metrics_->put_failures.inc();
-            }
+            // Key already exists is not a failure, just return error
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
 
@@ -274,20 +268,6 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
         return {};
     };
 
-    // Helper lambda to record successful put metrics
-    auto record_success_metrics = [this, total_size](auto start_time) {
-        if (local_storage_metrics_) {
-            auto end_time = std::chrono::steady_clock::now();
-            auto latency_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    end_time - start_time)
-                    .count();
-            local_storage_metrics_->put_bytes.inc(total_size);
-            local_storage_metrics_->put_latency_us.observe(
-                static_cast<double>(latency_us));
-        }
-    };
-
     if (async_memcpy_executor_) {
         // async write + sync commit
         auto future = async_memcpy_executor_
@@ -295,11 +275,10 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
                               std::move(write_fn));
         return CallableTaskHandle<void>::Create(
             [this, f = std::move(future), commit_fn = std::move(commit_fn), key,
-             record_success_metrics]() mutable
-                -> tl::expected<void, ErrorCode> {
+             total_size]() mutable -> tl::expected<void, ErrorCode> {
                 ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
                 timer.LogRequest("key=", key);
-                auto start_time = std::chrono::steady_clock::now();
+                Stopwatch sw;
 
                 auto write_result = f.get();
                 if (!write_result) {
@@ -320,7 +299,11 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
                     return tl::make_unexpected(commit_result.error());
                 }
 
-                record_success_metrics(start_time);
+                if (local_storage_metrics_) {
+                    local_storage_metrics_->put_bytes.inc(total_size);
+                    local_storage_metrics_->put_latency_us.observe(
+                        static_cast<double>(sw.elapsed_us()));
+                }
 
                 timer.LogResponse("error_code=", ErrorCode::OK);
                 return {};
@@ -330,11 +313,10 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
         return CallableTaskHandle<void>::Create(
             [this, write_fn = std::move(write_fn),
              commit_fn = std::move(commit_fn), key,
-             record_success_metrics]() mutable
-                -> tl::expected<void, ErrorCode> {
+             total_size]() mutable -> tl::expected<void, ErrorCode> {
                 ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
                 timer.LogRequest("key=", key);
-                auto start_time = std::chrono::steady_clock::now();
+                Stopwatch sw;
 
                 auto write_result = write_fn();
                 if (!write_result) {
@@ -355,7 +337,11 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
                     return tl::make_unexpected(commit_result.error());
                 }
 
-                record_success_metrics(start_time);
+                if (local_storage_metrics_) {
+                    local_storage_metrics_->put_bytes.inc(total_size);
+                    local_storage_metrics_->put_latency_us.observe(
+                        static_cast<double>(sw.elapsed_us()));
+                }
 
                 timer.LogResponse("error_code=", ErrorCode::OK);
                 return {};
@@ -374,7 +360,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
         local_storage_metrics_->get_requests.inc();
     }
     // Latency measurement covers the full operation including async transfer.
-    auto start_time = std::chrono::steady_clock::now();
+    auto sw = std::make_shared<Stopwatch>();
 
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
@@ -426,7 +412,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     // Wrap the task handle to record metrics after async transfer completes
     auto original_handle = std::move(result->task_handle);
     result->task_handle = CallableTaskHandle<void>::Create(
-        [this, original_handle = std::move(original_handle), start_time,
+        [this, original_handle = std::move(original_handle), sw,
          local_size]() mutable -> tl::expected<void, ErrorCode> {
             auto wait_result = original_handle->Wait();
             if (!wait_result) {
@@ -437,14 +423,9 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
             }
             // Record successful get metrics
             if (local_storage_metrics_) {
-                auto end_time = std::chrono::steady_clock::now();
-                auto latency_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        end_time - start_time)
-                        .count();
                 local_storage_metrics_->get_bytes.inc(local_size);
                 local_storage_metrics_->get_latency_us.observe(
-                    static_cast<double>(latency_us));
+                    static_cast<double>(sw->elapsed_us()));
             }
             return {};
         });
@@ -459,7 +440,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
         local_storage_metrics_->get_requests.inc();
     }
     // Latency measurement covers the full operation including async transfer.
-    auto start_time = std::chrono::steady_clock::now();
+    auto sw = std::make_shared<Stopwatch>();
     size_t total_size = 0;
     for (const auto& s : slices) total_size += s.size;
 
@@ -492,7 +473,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     // Wrap the task handle to record metrics after async transfer completes
     auto original_handle = std::move(result->task_handle);
     result->task_handle = CallableTaskHandle<void>::Create(
-        [this, original_handle = std::move(original_handle), start_time,
+        [this, original_handle = std::move(original_handle), sw,
          total_size]() mutable -> tl::expected<void, ErrorCode> {
             auto wait_result = original_handle->Wait();
             if (!wait_result) {
@@ -503,14 +484,9 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
             }
             // Record successful get metrics
             if (local_storage_metrics_) {
-                auto end_time = std::chrono::steady_clock::now();
-                auto latency_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        end_time - start_time)
-                        .count();
                 local_storage_metrics_->get_bytes.inc(total_size);
                 local_storage_metrics_->get_latency_us.observe(
-                    static_cast<double>(latency_us));
+                    static_cast<double>(sw->elapsed_us()));
             }
             return {};
         });

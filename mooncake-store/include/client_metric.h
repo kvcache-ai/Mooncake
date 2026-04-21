@@ -22,6 +22,22 @@ const std::vector<double> kLatencyBucket = {
     // safeguards for long tails
     50000, 100000, 200000, 500000, 1000000};
 
+// Simple stopwatch for measuring elapsed time in microseconds
+class Stopwatch {
+   public:
+    Stopwatch() : start_time_(std::chrono::steady_clock::now()) {}
+
+    int64_t elapsed_us() const {
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   now - start_time_)
+            .count();
+    }
+
+   private:
+    std::chrono::steady_clock::time_point start_time_;
+};
+
 static inline std::string get_env_or_default(
     const char* env_var, const std::string& default_val = "") {
     const char* val = getenv(env_var);
