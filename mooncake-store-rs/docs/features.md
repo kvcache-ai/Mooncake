@@ -103,6 +103,26 @@ What it provides:
 
 For simpler bring-up or debugging, the runtime can store and resolve routes directly through the metadata backend.
 
+### Explicit route migration tasks
+
+The current implementation also exposes admin-driven explicit route migration tasks for key-level `copy` and `move`.
+
+What it provides:
+
+- explicit `source_segment -> target_segment(s)` selection
+- multi-target `copy`
+- single-target `move`
+- a task-executor model where admin submits control-plane RPC and the executor runtime performs the transfer
+- in-memory admin task queue with `pending`, `dispatching`, `running`, `retry_wait`, `succeeded`, and `failed` states
+- admin-side retry with configurable backoff and a default retry budget of `5`
+- route-based completion checks so admin can mark a task successful after executor loss when the final route is already authoritative
+
+Design boundary:
+
+- the admin queue is runtime memory only and does not recover across admin restart
+- the authoritative durable state remains the object route, not the admin task record
+- retry is for executor loss or transient RPC failure, not for preserving a persistent migration backlog
+
 ## Placement and Replication
 
 ### Local-first placement

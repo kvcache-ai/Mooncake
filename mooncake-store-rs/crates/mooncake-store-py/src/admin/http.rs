@@ -8,7 +8,8 @@ use mooncake_store_core::StoreError;
 use serde::Serialize;
 
 use super::models::{
-    ErrorResponse, PutTenantPolicyRequest, TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
+    ErrorResponse, PutTenantPolicyRequest, RouteMigrationTaskSubmitRequest,
+    TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
 };
 use super::service::AdminService;
 
@@ -152,11 +153,33 @@ fn route_request(service: &AdminService, request: HttpRequest) -> String {
                 Err(error) => http_store_error(error),
             }
         }
+        ("GET", "/v1/route-migrations") => {
+            http_json_response("200 OK", &service.list_route_migration_tasks())
+        }
+        ("POST", "/v1/route-migrations") => {
+            let payload = match serde_json::from_slice::<RouteMigrationTaskSubmitRequest>(&request.body)
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return http_error_response(
+                        "400 Bad Request",
+                        &format!("invalid JSON body: {error}"),
+                    )
+                }
+            };
+            match service.submit_route_migration_task(payload) {
+                Ok(response) => http_json_response("200 OK", &response),
+                Err(error) => http_store_error(error),
+            }
+        }
         _ => route_scoped_request(service, request, path_only.as_str()),
     }
 }
 
 fn route_scoped_request(service: &AdminService, request: HttpRequest, path_only: &str) -> String {
+    if path_only.starts_with("/v1/route-migrations/") {
+        return route_migration_request(service, request, path_only);
+    }
     if path_only.starts_with("/v1/tenant-quotas/") {
         return route_tenant_quota_request(service, request, path_only);
     }
@@ -164,6 +187,23 @@ fn route_scoped_request(service: &AdminService, request: HttpRequest, path_only:
         return route_tenant_object_accounting_request(service, request, path_only);
     }
     route_policy_scope_request(service, request, path_only)
+}
+
+fn route_migration_request(
+    service: &AdminService,
+    request: HttpRequest,
+    path_only: &str,
+) -> String {
+    let Some(task_id) = path_only.strip_prefix("/v1/route-migrations/") else {
+        return http_error_response("404 Not Found", "not found");
+    };
+    if request.method != "GET" {
+        return http_error_response("405 Method Not Allowed", "method not allowed");
+    }
+    match service.get_route_migration_task(task_id) {
+        Ok(response) => http_json_response("200 OK", &response),
+        Err(error) => http_store_error(error),
+    }
 }
 
 fn route_policy_scope_request(
@@ -672,19 +712,28 @@ fn http_error_response(status: &str, message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::Arc;
+    use std::thread::sleep;
+    use std::time::Duration;
 
     use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
-    use mooncake_store_client::RouteControlMode;
+    use mooncake_store_client::{control_plane_pb, RouteControlMode};
+    use parking_lot::Mutex;
     use mooncake_store_core::{
-        ClientEpoch, ClientRuntimeId, MetadataBackend, StoreError, TenantObjectAccountingState,
-        TenantPolicySpec, TenantQuotaPolicy, TenantQuotaReservationRequest, TenantRoutePolicy,
+        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+        CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute, ReplicaRoute,
+        ReplicaTier, RouteState, RouteVersion, SegmentName, StoreError,
+        TenantObjectAccountingState, TenantPolicySpec, TenantQuotaPolicy,
+        TenantQuotaReservationRequest, TenantRoutePolicy,
     };
 
     use crate::admin::models::PolicyPatchInput;
-    use crate::admin::service::AdminService;
+    use crate::admin::service::{
+        AdminService, MigrationExecutionProbe, MigrationQueueConfig, MigrationRpc,
+    };
 
     use super::{
         http_store_error, parse_policy_scope_path, parse_quota_abort_path, parse_quota_scope_path,
@@ -707,6 +756,140 @@ mod tests {
     fn test_service() -> AdminService {
         let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
         AdminService::new(backend, "memory://test", MetadataKeyspace::default())
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeMigrationRpc {
+        submit_results: Arc<Mutex<VecDeque<mooncake_store_core::Result<String>>>>,
+        status_results: Arc<Mutex<VecDeque<mooncake_store_core::Result<MigrationExecutionProbe>>>>,
+        route_results: Arc<Mutex<VecDeque<mooncake_store_core::Result<Option<ObjectRoute>>>>>,
+    }
+
+    impl MigrationRpc for FakeMigrationRpc {
+        fn submit_migration_task(
+            &self,
+            _lease: &ClientLease,
+            _request: control_plane_pb::SubmitMigrationTaskRequest,
+        ) -> mooncake_store_core::Result<String> {
+            self.submit_results
+                .lock()
+                .pop_front()
+                .unwrap_or_else(|| Ok("execution-1".to_string()))
+        }
+
+        fn get_migration_execution_status(
+            &self,
+            _lease: &ClientLease,
+            _request: control_plane_pb::GetMigrationExecutionStatusRequest,
+        ) -> mooncake_store_core::Result<MigrationExecutionProbe> {
+            self.status_results.lock().pop_front().unwrap_or_else(|| {
+                Ok(MigrationExecutionProbe {
+                    state: control_plane_pb::MigrationExecutionState::Succeeded,
+                    attempts: 1,
+                    last_error: String::new(),
+                })
+            })
+        }
+
+        fn get_route(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &mooncake_store_core::ClientStableId,
+            _key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+            self.route_results.lock().pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    fn test_migration_service(rpc: Arc<dyn MigrationRpc>) -> AdminService {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("authority-a", 1))
+            .expect("authority lease should store");
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        AdminService::new_with_migration_support(
+            backend,
+            "memory://test",
+            MetadataKeyspace::default(),
+            MigrationQueueConfig {
+                default_max_retries: 2,
+                retry_base_delay: Duration::from_millis(5),
+                retry_max_delay: Duration::from_millis(5),
+                poll_interval: Duration::from_millis(5),
+            },
+            rpc,
+        )
+    }
+
+    fn live_lease(stable_id: &str, epoch: u64) -> ClientLease {
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(epoch)),
+            compatibility: CompatibilityDescriptor::default(),
+            state: ClientLifecycleState::Active,
+            endpoints: ClientEndpointSet {
+                rpc_address: format!("127.0.0.1:{}", 28_000 + epoch),
+                segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
+                labels: [
+                    ("control_addr".to_string(), format!("http://127.0.0.1:{}", 29_000 + epoch)),
+                    ("route".to_string(), "true".to_string()),
+                    ("storage".to_string(), "true".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            expires_at_ms: u64::MAX,
+        }
+    }
+
+    fn wait_for_http_task_state(
+        address: &str,
+        task_id: &str,
+        expected: &str,
+    ) -> String {
+        for _ in 0..200 {
+            let response = http_request(
+                address,
+                &format!(
+                    "GET /v1/route-migrations/{task_id} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            if response.contains(expected) {
+                return response;
+            }
+            sleep(Duration::from_millis(10));
+        }
+        panic!("task {task_id} did not reach {expected}");
+    }
+
+    fn sample_completed_move_route() -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new("tenant-a::object-a"),
+            namespace: Some(mooncake_store_core::NamespaceScope::with_defaults(
+                Some("tenant-a"),
+                None::<&str>,
+                None::<&str>,
+            )),
+            logical_key: Some("object-a".to_string()),
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("storage-b", ClientEpoch(1)),
+                segment_name: SegmentName::new("segment-b"),
+                offset: 64,
+                segment_offset: 64,
+                length: 12,
+                checksum: None,
+                tier: ReplicaTier::Nvme,
+                priority: 1,
+            }],
+        }
     }
 
     #[test]
@@ -1127,6 +1310,115 @@ mod tests {
             reservations.reservations[0].state,
             mooncake_store_core::TenantQuotaReservationState::Aborted
         );
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_accepts_route_migration_tasks_and_reports_status() {
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(vec![Ok("execution-1".to_string())].into())),
+            status_results: Arc::new(Mutex::new(
+                vec![
+                    Ok(MigrationExecutionProbe {
+                        state: control_plane_pb::MigrationExecutionState::Running,
+                        attempts: 1,
+                        last_error: String::new(),
+                    }),
+                    Ok(MigrationExecutionProbe {
+                        state: control_plane_pb::MigrationExecutionState::Succeeded,
+                        attempts: 1,
+                        last_error: String::new(),
+                    }),
+                ]
+                .into(),
+            )),
+            route_results: Arc::new(Mutex::new(VecDeque::new())),
+        });
+        let service = test_migration_service(rpc);
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "move",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b"],
+            "task_executor": "executor-a"
+        })
+        .to_string();
+        let submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(submit.contains("HTTP/1.1 200 OK"));
+        assert!(submit.contains("\"task_id\":\"route-migration-1\""));
+
+        let listed = http_request(
+            &address,
+            &format!(
+                "GET /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(listed.contains("\"count\":1"));
+        let status = wait_for_http_task_state(
+            &address,
+            "route-migration-1",
+            "\"state\":\"succeeded\"",
+        );
+        assert!(status.contains("\"execution_id\":\"execution-1\""));
+        assert!(status.contains("\"attempts\":1"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_route_migration_status_reflects_route_based_success() {
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(vec![Ok("execution-1".to_string())].into())),
+            status_results: Arc::new(Mutex::new(
+                vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
+            )),
+            route_results: Arc::new(Mutex::new(vec![Ok(Some(sample_completed_move_route()))].into())),
+        });
+        let service = test_migration_service(rpc);
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "move",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b"],
+            "task_executor": "executor-a"
+        })
+        .to_string();
+        let submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(submit.contains("HTTP/1.1 200 OK"));
+
+        let status = wait_for_http_task_state(
+            &address,
+            "route-migration-1",
+            "\"state\":\"succeeded\"",
+        );
+        assert!(!status.contains("\"state\":\"failed\""));
 
         server.shutdown().expect("server shutdown");
     }
