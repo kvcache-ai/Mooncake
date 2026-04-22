@@ -43,10 +43,13 @@ int EfaEndPoint::setupConnectionsByActive() {
     RWSpinlock::WriteGuard guard(lock_);
     if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
 
-    // Loopback: handshake against ourselves.
+    // Loopback: handshake against ourselves.  Use the binary overload
+    // so we avoid hex-encoding the local address just to have
+    // insertPeerAddr decode it right back.
     if (context_.nicPath() == peer_nic_path_) {
-        int ret =
-            context_.insertPeerAddr(context_.localEpAddr(), peer_fi_addr_);
+        const auto& bytes = context_.localEpAddrBytes();
+        int ret = context_.insertPeerAddrBytes(bytes.data(), bytes.size(),
+                                               peer_fi_addr_);
         if (ret != 0) return ret;
         status_.store(CONNECTED, std::memory_order_release);
         LOG(INFO) << "EFA loopback connection established: " << toString();

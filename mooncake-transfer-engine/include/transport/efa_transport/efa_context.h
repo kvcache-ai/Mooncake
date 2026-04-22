@@ -158,10 +158,21 @@ class EfaContext {
     // Populated by construct() -> buildSharedEndpoint().
     std::string localEpAddr() const;
 
+    // Raw bytes of the local endpoint address.  Use this for loopback
+    // (skip the hex encode/decode round-trip) or for any caller that
+    // already has the bytes.
+    const std::vector<uint8_t>& localEpAddrBytes() const {
+        return local_ep_addr_;
+    }
+
     // Insert a peer's hex-encoded EFA address into this context's AV and
     // return the resulting fi_addr_t.  Thread-safe (fi_av_insert is safe
     // under libfabric's domain-level threading).
     int insertPeerAddr(const std::string& peer_hex_addr, fi_addr_t& out);
+
+    // Binary variant — avoids the hex-decode when the caller already
+    // has the raw address bytes (e.g. loopback).
+    int insertPeerAddrBytes(const uint8_t* addr, size_t len, fi_addr_t& out);
 
     // Remove a peer from the AV.  No-op if fi_addr is FI_ADDR_UNSPEC.
     void removePeerAddr(fi_addr_t fi_addr);

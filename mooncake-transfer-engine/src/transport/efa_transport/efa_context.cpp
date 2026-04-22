@@ -534,11 +534,22 @@ std::string EfaContext::localAddr() const {
 }
 
 std::string EfaContext::localEpAddr() const {
-    std::ostringstream oss;
-    for (uint8_t b : local_ep_addr_) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(local_ep_addr_.size() * 2);
+    for (size_t i = 0; i < local_ep_addr_.size(); ++i) {
+        out[2 * i] = kHex[(local_ep_addr_[i] >> 4) & 0xF];
+        out[2 * i + 1] = kHex[local_ep_addr_[i] & 0xF];
     }
-    return oss.str();
+    return out;
+}
+
+// Decode one hex nibble, -1 on invalid input.
+static inline int hexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
 }
 
 int EfaContext::insertPeerAddr(const std::string& peer_hex_addr,
@@ -548,14 +559,24 @@ int EfaContext::insertPeerAddr(const std::string& peer_hex_addr,
                    << peer_hex_addr.size();
         return ERR_INVALID_ARGUMENT;
     }
-    std::vector<uint8_t> bin;
-    bin.reserve(peer_hex_addr.size() / 2);
-    for (size_t i = 0; i < peer_hex_addr.size(); i += 2) {
-        std::string byte_str = peer_hex_addr.substr(i, 2);
-        uint8_t byte = (uint8_t)strtol(byte_str.c_str(), nullptr, 16);
-        bin.push_back(byte);
+    const size_t n = peer_hex_addr.size() / 2;
+    std::vector<uint8_t> bin(n);
+    for (size_t i = 0; i < n; ++i) {
+        int hi = hexNibble(peer_hex_addr[2 * i]);
+        int lo = hexNibble(peer_hex_addr[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            LOG(ERROR) << "insertPeerAddr: non-hex char at offset " << (2 * i);
+            return ERR_INVALID_ARGUMENT;
+        }
+        bin[i] = static_cast<uint8_t>((hi << 4) | lo);
     }
-    int ret = fi_av_insert(av_, bin.data(), 1, &out, 0, nullptr);
+    return insertPeerAddrBytes(bin.data(), bin.size(), out);
+}
+
+int EfaContext::insertPeerAddrBytes(const uint8_t* addr, size_t len,
+                                    fi_addr_t& out) {
+    if (!addr || len == 0) return ERR_INVALID_ARGUMENT;
+    int ret = fi_av_insert(av_, addr, 1, &out, 0, nullptr);
     if (ret != 1) {
         LOG(ERROR) << "fi_av_insert failed: " << fi_strerror(-ret);
         return ERR_ENDPOINT;
