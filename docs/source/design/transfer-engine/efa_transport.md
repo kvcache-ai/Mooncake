@@ -228,6 +228,11 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
 
+> **Note:** numbers below predate the SRD shared-endpoint refactor and
+> current EFA tuning work. They are a lower bound for the current
+> code; we will re-sweep and update when a B300 pair is available
+> again.
+
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=2147483648`):
 
 | Configuration | Write | Read |
@@ -251,6 +256,11 @@ Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 1
 #### p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
 
 Tested on two p6-b200.48xlarge instances in the same AWS placement group.
+
+> **Note:** numbers below predate the SRD shared-endpoint refactor and
+> current EFA tuning work. They are a lower bound for the current
+> code; we will re-sweep and update when a B200 pair is available
+> again.
 
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
 
@@ -287,29 +297,19 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 > **Peak read: 304 GB/s** at `threads=16, batch=32` — reads tolerate
 > smaller in-flight queues, and throughput drops as batch grows.
 
-**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`, or `--use_vram=false` on a CUDA build, `--buffer_size=4294967296`):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| Single instance (block=1MB, threads=32, batch=128, buf=4GB) | 179 GB/s | 185 GB/s |
-| NUMA-split (block=1MB, 2 instances, 8 NICs each, threads=16, buf=2GB) | **192 GB/s** | **182 GB/s** |
+| block=1MB, threads=8, batch=128 | 210.76 GB/s | 209.93 GB/s |
+| block=1MB, threads=16, batch=128 | 212.71 GB/s | 211.21 GB/s |
+| **block=1MB, threads=16, batch=32** | 211.67 GB/s | **212.18 GB/s** |
+| block=1MB, threads=32, batch=128 | 212.99 GB/s | 210.33 GB/s |
+| **block=1MB, threads=48, batch=32** | **213.57 GB/s** | 206.92 GB/s |
 
-> CPU-to-CPU throughput is bottlenecked by DRAM bandwidth (~155 GB/s per NUMA node, measured with STREAM Copy).
-
-#### Cross-Transport Comparison
-
-| Transport | Throughput | Notes |
-|-----------|-----------|-------|
-| **EFA GPU-to-GPU (B300)** | **752 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, ~94% line rate |
-| **EFA GPU-to-GPU (B200)** | **313 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB |
-| **EFA GPU-to-GPU (H200)** | **366 GB/s** | p5en.48xlarge, 16×200G, block=1MB, ~91% line rate |
-| **EFA CPU-to-CPU (B300)** | **230 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, DRAM-limited |
-| **EFA CPU-to-CPU (B200)** | **222 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB, DRAM-limited |
-| **EFA CPU-to-CPU (H200)** | **192 GB/s** | p5en.48xlarge, block=1MB, NUMA-split, DRAM-limited |
-| EFA (default params) | 69.47 GB/s | Default block=64KB |
-| TCP (iperf3 baseline) | 9.5 GB/s | Kernel TCP stack, 8 parallel streams |
-
-**EFA vs RoCE RDMA**: On comparable 8×400 Gbps RoCE networks, Mooncake's RDMA transport achieves ~190 GB/s. Tuned EFA **exceeds** RoCE performance with GPU memory (313-347 GB/s) and on CPU-to-CPU (222 GB/s).
+> CPU-to-CPU is DRAM-bound — throughput is essentially flat (~205–214 GB/s)
+> across every thread / batch combination that doesn't hit the WR cap.
+> Peak write 213.57 GB/s, peak read 212.18 GB/s.
 
 ### Tuning Tips
 
