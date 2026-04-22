@@ -130,13 +130,6 @@ cd build && ctest --output-on-failure -R 'efa'
 > a machine that is only provisioned for EFA testing — the failures are not
 > EFA-specific. Use `-R 'efa'` to restrict the run to the EFA tests.
 
-Environment variables for test configuration:
-
-```bash
-export MC_METADATA_SERVER=P2PHANDSHAKE     # default
-export MC_LOCAL_SERVER_NAME=127.0.0.1:12345  # default
-```
-
 ## Performance Benchmark
 
 Use `transfer_engine_bench` to measure EFA transport throughput between two nodes.
