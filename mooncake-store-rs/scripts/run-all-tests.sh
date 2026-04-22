@@ -18,6 +18,7 @@ LIST_ONLY=0
 DRY_RUN=0
 FAIL_FAST=0
 FAIL_ON_SKIP=0
+JOBS="${MC_STORE_RS_JOBS:-1}"
 LOG_DIR="${MC_STORE_RS_SCRIPT_CI_LOG_DIR:-${LOG_DIR_DEFAULT}}"
 
 declare -a INCLUDE_PATTERNS=()
@@ -52,7 +53,8 @@ Options:
   --exclude PATTERN    Drop tests whose path contains PATTERN (repeatable)
   --tag TAG            Keep only tests carrying TAG (repeatable)
   --skip-tag TAG       Drop tests carrying TAG (repeatable)
-  --fail-fast          Stop at the first failure
+  --jobs N             Run up to N non-serial tests in parallel (default: 1)
+  --fail-fast          Stop at the first failure (serial tests only)
   --fail-on-skip       Return non-zero if any test is skipped
   --log-dir PATH       Override the log directory
   -h, --help           Show this help
@@ -60,11 +62,13 @@ Options:
 Examples:
   ./scripts/run-all-tests.sh
   ./scripts/run-all-tests.sh --list
+  ./scripts/run-all-tests.sh --jobs 4
   ./scripts/run-all-tests.sh --include rolling --include hot-upgrade
   ./scripts/run-all-tests.sh --skip-tag sglang
   ./scripts/run-all-tests.sh --tag client --tag rolling
 
 Environment:
+  MC_STORE_RS_JOBS                          Default --jobs value (default: 1)
   MC_STORE_RS_SCRIPT_CI_LOG_DIR             Log directory override
   MC_STORE_RS_SCRIPT_TIMEOUT_DEFAULT        Default per-test timeout in seconds
                                             (default: 1800)
@@ -76,7 +80,7 @@ Environment:
                                             (default: 2400)
 
 Tag examples:
-  e2e, sglang, client, rolling, compat, stress, hot-cache,
+  e2e, sglang, client, rolling, serial, compat, stress, hot-cache,
   hot-upgrade, rollback, redis-recovery, real, dummy, requires-model
 EOF
 }
@@ -105,6 +109,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-tag)
       EXCLUDE_TAGS+=("${2:?--skip-tag requires a value}")
+      shift 2
+      ;;
+    --jobs)
+      JOBS="${2:?--jobs requires a value}"
       shift 2
       ;;
     --fail-fast)
@@ -149,7 +157,7 @@ script_tags() {
     scripts/e2e/*) tags+=(e2e) ;;
     scripts/sglang/*) tags+=(sglang) ;;
     scripts/tests/client/*) tags+=(client) ;;
-    scripts/tests/rolling/*) tags+=(rolling) ;;
+    scripts/tests/rolling/*) tags+=(rolling serial) ;;
   esac
 
   [[ "${path}" == *compat* ]] && tags+=(compat)
@@ -344,6 +352,7 @@ run_one_test() {
     status="DRY"
     reason="selected"
     record_result "${status}" "${path}" "${reason}" "${log_file}" "${duration}"
+    printf '%s\t%s\t%s\n' "${status}" "${reason}" "${duration}" > "${log_file}.result"
     echo "[DRY ] ${path}"
     return 0
   fi
@@ -402,6 +411,7 @@ run_one_test() {
   fi
 
   record_result "${status}" "${path}" "${reason}" "${log_file}" "${duration}"
+  printf '%s\t%s\t%s\n' "${status}" "${reason}" "${duration}" > "${log_file}.result"
 
   case "${status}" in
     PASS) printf '[PASS] %s (%ss)\n' "${path}" "${duration}" ;;
@@ -494,13 +504,92 @@ echo "==> scripts regression runner"
 echo "==> repo: ${REPO_ROOT}"
 echo "==> log dir: ${LOG_DIR}"
 echo "==> selected: ${#SELECTED_TESTS[@]}"
+echo "==> jobs: ${JOBS}"
 
 if (( DRY_RUN == 1 )); then
   print_list
 fi
 
-index=0
+# ---------------------------------------------------------------------------
+# Partition into parallel and serial (tagged "serial") groups.
+# ---------------------------------------------------------------------------
+declare -a PARALLEL_TESTS=()
+declare -a SERIAL_TESTS=()
 for test_path in "${SELECTED_TESTS[@]}"; do
+  if [[ "$(script_tags "${test_path}")" == *serial* ]]; then
+    SERIAL_TESTS+=("${test_path}")
+  else
+    PARALLEL_TESTS+=("${test_path}")
+  fi
+done
+
+index=0
+
+# ---------------------------------------------------------------------------
+# Parallel group — run up to JOBS tests concurrently.
+# Results are written to ${log_file}.result and collected after all finish.
+# ---------------------------------------------------------------------------
+if ((JOBS > 1 && ${#PARALLEL_TESTS[@]} > 0)); then
+  declare -a par_pids=()
+  declare -a par_indices=()
+  par_start=$((index + 1))
+
+  for i in "${!PARALLEL_TESTS[@]}"; do
+    index=$((par_start + i))
+    par_indices+=("${index}")
+
+    # Throttle: wait for a slot to free up before launching the next test.
+    while ((${#par_pids[@]} >= JOBS)); do
+      new_pids=()
+      for pid in "${par_pids[@]}"; do
+        kill -0 "${pid}" 2>/dev/null && new_pids+=("${pid}")
+      done
+      par_pids=("${new_pids[@]}")
+      ((${#par_pids[@]} >= JOBS)) && sleep 0.1
+    done
+
+    run_one_test "${index}" "${PARALLEL_TESTS[$i]}" &
+    par_pids+=($!)
+  done
+
+  # Wait for all parallel tests to finish.
+  for pid in "${par_pids[@]}"; do
+    wait "${pid}" || true
+  done
+
+  # Collect results from the .result files written by each subshell.
+  for i in "${!PARALLEL_TESTS[@]}"; do
+    idx="${par_indices[$i]}"
+    path="${PARALLEL_TESTS[$i]}"
+    log_file="${LOG_DIR}/$(printf '%02d' "${idx}")-$(sanitize_name "${path}").log"
+    if [[ -f "${log_file}.result" ]]; then
+      IFS=$'\t' read -r r_status r_reason r_duration < "${log_file}.result"
+      record_result "${r_status}" "${path}" "${r_reason}" "${log_file}" "${r_duration}"
+    else
+      record_result "FAIL" "${path}" "result-file-missing" "${log_file}" "0"
+    fi
+  done
+
+  index=$((par_start + ${#PARALLEL_TESTS[@]} - 1))
+else
+  # JOBS == 1: run parallel group sequentially (same as before).
+  for test_path in "${PARALLEL_TESTS[@]}"; do
+    index=$((index + 1))
+    if ! run_one_test "${index}" "${test_path}"; then
+      if (( FAIL_FAST == 1 )); then
+        break
+      fi
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Serial group — always sequential (rolling upgrade tests mutate source files).
+# ---------------------------------------------------------------------------
+if ((${#SERIAL_TESTS[@]} > 0)); then
+  echo "==> serial tests: ${#SERIAL_TESTS[@]}"
+fi
+for test_path in "${SERIAL_TESTS[@]}"; do
   index=$((index + 1))
   if ! run_one_test "${index}" "${test_path}"; then
     if (( FAIL_FAST == 1 )); then
