@@ -419,6 +419,7 @@ This preserves compatibility for integrations that expect a dummy client / exter
 | `crates/mooncake-store-py/src/dummy_service.rs` | standalone dummy compatibility service |
 | `crates/mooncake-store-py/src/shm.rs` | shm region ownership, fd passing, shared mapping helpers |
 | `crates/mooncake-store-e2e` | runnable system validation |
+| `crates/mooncake-store-test-utils` | test-only fixtures, counting / faulty backend decorators, `TestTransport` and `FaultyTransport` |
 
 ## When to Read Which Document
 
@@ -427,4 +428,5 @@ This preserves compatibility for integrations that expect a dummy client / exter
 - Read `docs/rust.md` for Rust integration
 - Read `docs/configuration.md` for defaults and tuning knobs
 - Read `docs/python.md` for the Python layer
+- Read `docs/testing.md` for the test suite layout, fault-injection model, and CI entry point
 - Read `crates/mooncake-store-e2e/src/main.rs` for a complete runnable example
