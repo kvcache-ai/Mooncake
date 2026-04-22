@@ -110,9 +110,10 @@ Errors in this part usually indicate that the error occurred within the `mooncak
      *    hard    memlock    unlimited
      ```
 
-7. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
+7. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. Possible ways to resolve this issue:
    - Update Mooncake to version v0.3.5 or later
    - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
+   - If the leak persists under sustained peer failures (many `endpoint evicted` log lines accompanying the QP growth), update to a version that includes the fix for [issue #1845](https://github.com/kvcache-ai/Mooncake/issues/1845). Prior to that fix, the endpoint store's `waiting_list_` only drained when new endpoints were inserted, so evictions under failure load accumulated QPs until the driver limit was hit. The fix adds a periodic reclaim tick to `monitorWorker`.
 
 ## RDMA Transfer Period
 ### Recommended Troubleshooting Directions
