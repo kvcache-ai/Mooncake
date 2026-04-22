@@ -8,7 +8,8 @@ This script is a WRAPPER that orchestrates the following C++ binaries:
 2. stress_workload_test (The benchmark client)
 
 The locations of these two binaries MUST be correctly provided via the MASTER_BIN and TEST_BIN
-variables before running this script.
+variables before running this script. Moreover, bad rounds (non-100% PUT/GET success) are excluded from averages and
+surfaced in the CSV as bad_round_count.
 
 Usage:
 ------
@@ -52,6 +53,9 @@ import argparse
 import json
 import csv
 import itertools
+import socket
+import urllib.request
+import urllib.error
 
 # --- Configuration ---
 # PROJECT_ROOT points to the repository root directory (two levels up from mooncake-store/tests/)
@@ -60,6 +64,7 @@ MASTER_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store/src/mooncake_maste
 TEST_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store/tests/stress_workload_test")
 RPC_PORT = 50051
 METRICS_PORT = 9003
+HTTP_METADATA_PORT = 8080  # master's HttpMetadataServer /health endpoint
 
 # --- Utils ---
 def run_command(cmd):
@@ -77,36 +82,57 @@ def kill_existing_processes():
     subprocess.run("killall -9 mooncake_master stress_workload_test 2>/dev/null", shell=True)
     time.sleep(1)
 
+def wait_master_ready(http_port, timeout_s=30):
+    """Poll master's HttpMetadataServer /health endpoint until it responds
+    with HTTP 200 + body "OK", indicating the master process has completed
+    startup and is accepting requests. Replaces a brittle time.sleep(2)."""
+    url = f"http://127.0.0.1:{http_port}/health"
+    deadline = time.time() + timeout_s
+    last_err = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=0.5) as resp:
+                if resp.status == 200 and resp.read().strip() == b"OK":
+                    return True
+        except (urllib.error.URLError, OSError, socket.timeout) as e:
+            last_err = e
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"Master not ready on {url} within {timeout_s}s (last error: {last_err})"
+    )
+
 def parse_metrics(output):
-    """Parse the benchmark output for key performance indicators."""
-    # Initialize with default values to avoid KeyError
+    """Parse the benchmark output. Returns (metrics_dict, is_bad_round).
+    A round is considered bad if the benchmark emitted a
+    PUT_SUCCESS_RATE_NOT_FULL or GET_SUCCESS_RATE_NOT_FULL marker — in that
+    case the measured throughput/latency reflects a partial run and must be
+    excluded from config-level averages."""
     metrics = {
-        'ops_sec': 0.0,
-        'throughput_mb_s': 0.0,
         'put_throughput': 0.0,
         'get_throughput': 0.0,
-        'success_rate': 0.0,
+        'put_ops_sec': 0.0,
+        'get_ops_sec': 0.0,
+        'put_success_rate': 0.0,
+        'get_success_rate': 0.0,
         'put_p50': 0.0, 'put_p70': 0.0, 'put_p90': 0.0, 'put_p95': 0.0, 'put_p99': 0.0,
-        'get_p50': 0.0, 'get_p70': 0.0, 'get_p90': 0.0, 'get_p95': 0.0, 'get_p99': 0.0
+        'get_p50': 0.0, 'get_p70': 0.0, 'get_p90': 0.0, 'get_p95': 0.0, 'get_p99': 0.0,
+        'put_batch_p50': 0.0, 'put_batch_p90': 0.0, 'put_batch_p99': 0.0,
+        'get_batch_p50': 0.0, 'get_batch_p90': 0.0, 'get_batch_p99': 0.0,
     }
-    
-    # Throughput
-    ops_sec = re.search(r"Total Operations/sec: ([\d.]+)", output)
-    if ops_sec: metrics['ops_sec'] = float(ops_sec.group(1))
-    
-    put_throughput = re.search(r"PUT Data Throughput \(MB/s\): ([\d.]+)", output)
-    get_throughput = re.search(r"GET Data Throughput \(MB/s\): ([\d.]+)", output)
-    
-    success_rate = re.search(r"Success Rate: ([\d.]+)%", output)
-    if success_rate: metrics['success_rate'] = float(success_rate.group(1))
-    
-    put_tp_val = float(put_throughput.group(1)) if put_throughput else 0.0
-    get_tp_val = float(get_throughput.group(1)) if get_throughput else 0.0
-    metrics['throughput_mb_s'] = put_tp_val + get_tp_val
-    metrics['put_throughput'] = put_tp_val
-    metrics['get_throughput'] = get_tp_val
-    
-    # Latency Regex Patterns
+
+    def grab(pattern, key):
+        m = re.search(pattern, output)
+        if m:
+            metrics[key] = float(m.group(1))
+
+    grab(r"PUT Data Throughput \(MB/s\): ([\d.]+)", 'put_throughput')
+    grab(r"GET Data Throughput \(MB/s\): ([\d.]+)", 'get_throughput')
+    grab(r"PUT Operations/sec: ([\d.]+)", 'put_ops_sec')
+    grab(r"GET Operations/sec: ([\d.]+)", 'get_ops_sec')
+    grab(r"PUT Success Rate: ([\d.]+)%", 'put_success_rate')
+    grab(r"GET Success Rate: ([\d.]+)%", 'get_success_rate')
+
+    # Per-key latency percentiles
     for op in ["PUT", "GET"]:
         pattern = rf"{op} Operations - P50: ([\d.]+), P70: ([\d.]+), P90: ([\d.]+), P95: ([\d.]+), P99: ([\d.]+)"
         match = re.search(pattern, output)
@@ -116,21 +142,50 @@ def parse_metrics(output):
             metrics[f'{op.lower()}_p90'] = float(match.group(3))
             metrics[f'{op.lower()}_p95'] = float(match.group(4))
             metrics[f'{op.lower()}_p99'] = float(match.group(5))
-            
-    return metrics
+
+    # Batch-completion latency percentiles (P50, P90, P99 only — covers the
+    # practical questions "typical batch wait" and "worst-case batch wait")
+    for op in ["PUT", "GET"]:
+        pattern = rf"{op} Batch - P50: ([\d.]+), P70: [\d.]+, P90: ([\d.]+), P95: [\d.]+, P99: ([\d.]+)"
+        match = re.search(pattern, output)
+        if match:
+            metrics[f'{op.lower()}_batch_p50'] = float(match.group(1))
+            metrics[f'{op.lower()}_batch_p90'] = float(match.group(2))
+            metrics[f'{op.lower()}_batch_p99'] = float(match.group(3))
+
+    is_bad = ("PUT_SUCCESS_RATE_NOT_FULL" in output or
+              "GET_SUCCESS_RATE_NOT_FULL" in output)
+    # Also bad if test binary crashed or produced no metrics at all.
+    if metrics['put_ops_sec'] == 0.0 and metrics['get_ops_sec'] == 0.0:
+        is_bad = True
+    return metrics, is_bad
 
 def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
                          batch=1, p2p_local_transfer_mode="te",
                          local_memcpy_async_worker_num=32,
-                         route_cache_max_memory_mb=300, route_cache_ttl_ms=300000):
+                         route_cache_max_memory_mb=300, route_cache_ttl_ms=300000,
+                         http_metadata_port=HTTP_METADATA_PORT):
     """Run a specific configuration for a single mode."""
     kill_existing_processes()
 
-    master_cmd = f"{MASTER_BIN} --rpc_port={RPC_PORT} --metrics_port={METRICS_PORT} --deployment_mode={mode} --rpc_thread_num={rpc_threads}"
+    # Enable master's HttpMetadataServer so we can poll /health deterministically
+    # instead of sleeping a fixed 2s and hoping startup is fast enough.
+    master_cmd = (
+        f"{MASTER_BIN} --rpc_port={RPC_PORT} --metrics_port={METRICS_PORT} "
+        f"--deployment_mode={mode} --rpc_thread_num={rpc_threads} "
+        f"--enable_http_metadata_server=true "
+        f"--http_metadata_server_port={http_metadata_port}"
+    )
     master_proc = subprocess.Popen(master_cmd.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2) # Wait for master
+    try:
+        wait_master_ready(http_metadata_port)
+    except RuntimeError as e:
+        master_proc.terminate()
+        print(f"    [!] Master startup failed: {e}")
+        return None
 
-    all_rounds_metrics = []
+    good_rounds = []
+    bad_rounds = []
     for r in range(1, rounds + 1):
         test_cmd = (f"{TEST_BIN} --client_type={mode} --num_threads={threads} --value_size={value_size} "
                     f"--test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb} --batch_size={batch}")
@@ -145,29 +200,39 @@ def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ra
                 test_cmd += (
                     f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
                 )
-            
+
         output = run_command(test_cmd)
-        metrics = parse_metrics(output)
-        if metrics:
-            all_rounds_metrics.append(metrics)
+        metrics, is_bad = parse_metrics(output)
+        if is_bad:
+            bad_rounds.append(metrics)
+            print(f"    [!] Mode {mode} Round {r}/{rounds} BAD "
+                  f"(put_success={metrics['put_success_rate']:.1f}% "
+                  f"get_success={metrics['get_success_rate']:.1f}%) — excluded from average.")
         else:
-            print(f"    [!] Mode {mode} Round {r}/{rounds} Failed.")
-            
+            good_rounds.append(metrics)
+
     master_proc.terminate()
     try:
         master_proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         master_proc.kill()
-        
-    if not all_rounds_metrics:
+
+    if not good_rounds:
+        print(f"    [!] All {rounds} rounds bad for this config — no data recorded.")
         return None
-        
-    # Average results
-    avg = {}
-    keys = all_rounds_metrics[0].keys()
+
+    # Aggregate: mean + min + max + stdev over the good rounds. Bad rounds
+    # (partial PUT/GET) are excluded so the averaged numbers reflect a clean
+    # run rather than a mix of clean and degraded runs.
+    keys = good_rounds[0].keys()
+    agg = {'bad_round_count': len(bad_rounds), 'good_round_count': len(good_rounds)}
     for key in keys:
-        avg[key] = statistics.mean([r[key] for r in all_rounds_metrics if key in r])
-    return avg
+        vals = [r[key] for r in good_rounds]
+        agg[key] = statistics.mean(vals)
+        agg[f'{key}_min'] = min(vals)
+        agg[f'{key}_max'] = max(vals)
+        agg[f'{key}_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    return agg
 
 # --- Execution ---
 def parse_list_arg(arg, type_fn=int):
@@ -179,7 +244,7 @@ def main():
     # Basic Config
     parser.add_argument("--mode", type=str, default="both", choices=["Centralization", "P2P", "both"], help="Test mode")
     parser.add_argument("--rounds", type=int, default=5, help="Rounds per configuration")
-    parser.add_argument("--ops", type=str, default="100", help="Operations per thread (list: 100,500,1000)")
+    parser.add_argument("--ops", type=str, default="100", help="Batch operations per thread (list: 100,500,1000)")
     
     # Matrix Dimensions (can be single values or comma-separated lists)
     parser.add_argument("--threads", type=str, default="8", help="Worker threads (list: 4,8,16)")
@@ -200,6 +265,8 @@ def main():
     # Flags
     parser.add_argument("--matrix", action="store_true", help="Enable matrix sweep mode")
     parser.add_argument("--output", type=str, help="Output file path (ends in .csv or .json)")
+    parser.add_argument("--http_metadata_port", type=int, default=HTTP_METADATA_PORT,
+                        help="Port for master's HttpMetadataServer (used for readiness probe)")
     
     args = parser.parse_args()
     
@@ -271,7 +338,8 @@ def main():
             current += 1
             print(f"\n[{current}/{total_runs}] Testing: mode=Centralization")
             print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
-            avg = run_benchmark_config("Centralization", args.rounds, th, v_size, ops, r_th, r_buf_gb, batch=batch)
+            avg = run_benchmark_config("Centralization", args.rounds, th, v_size, ops, r_th, r_buf_gb, batch=batch,
+                                       http_metadata_port=args.http_metadata_port)
             if avg:
                 entry = {"mode": "Centralization", **base_cfg, **avg}
                 results.append(entry)
@@ -298,7 +366,8 @@ def main():
                                            batch=batch, p2p_local_transfer_mode=transfer_mode,
                                            local_memcpy_async_worker_num=wk,
                                            route_cache_max_memory_mb=rc_mem,
-                                           route_cache_ttl_ms=rc_ttl)
+                                           route_cache_ttl_ms=rc_ttl,
+                                           http_metadata_port=args.http_metadata_port)
                 if avg:
                     entry = {"mode": "P2P", **base_cfg, **p2p_cfg, **avg}
                     results.append(entry)
@@ -318,10 +387,13 @@ def main():
         save_results(results, args.output)
 
 def print_single_result(mode, avg):
+    bad = avg.get('bad_round_count', 0)
+    good = avg.get('good_round_count', 0)
     print(f"    [{mode}] PUT: {avg['put_throughput']:.1f} MB/s  GET: {avg['get_throughput']:.1f} MB/s  "
-          f"Ops/s: {avg['ops_sec']:.1f}  Success: {avg['success_rate']:.1f}%  "
+          f"PUT Ops/s: {avg['put_ops_sec']:.1f}  GET Ops/s: {avg['get_ops_sec']:.1f}  "
           f"PUT P50/P99: {avg['put_p50']:.1f}/{avg['put_p99']:.1f} us  "
-          f"GET P50/P99: {avg['get_p50']:.1f}/{avg['get_p99']:.1f} us")
+          f"GET P50/P99: {avg['get_p50']:.1f}/{avg['get_p99']:.1f} us  "
+          f"(good={good}, bad={bad})")
 
 def print_comparison_table(threads, value_size, rpc_threads, ops, ram_buffer_size_gb, results, rounds):
     print("\n" + "="*80)
@@ -330,11 +402,12 @@ def print_comparison_table(threads, value_size, rpc_threads, ops, ram_buffer_siz
     print("-" * 80)
     print(f"{'Metric':<30} | {'Centralization':<20} | {'P2P':<20}")
     print("-" * 80)
-    
+
     metrics_to_show = [
-        ("Success Rate (%)", "success_rate", "{:.2f}"),
-        ("Total Ops/sec", "ops_sec", "{:.2f}"),
-        ("Total Throughput (MB/s)", "throughput_mb_s", "{:.2f}"),
+        ("PUT Success Rate (%)", "put_success_rate", "{:.2f}"),
+        ("GET Success Rate (%)", "get_success_rate", "{:.2f}"),
+        ("PUT Ops/sec", "put_ops_sec", "{:.2f}"),
+        ("GET Ops/sec", "get_ops_sec", "{:.2f}"),
         ("PUT Throughput (MB/s)", "put_throughput", "{:.2f}"),
         ("GET Throughput (MB/s)", "get_throughput", "{:.2f}"),
         ("PUT P50 (us)", "put_p50", "{:.1f}"),
@@ -343,6 +416,10 @@ def print_comparison_table(threads, value_size, rpc_threads, ops, ram_buffer_siz
         ("GET P50 (us)", "get_p50", "{:.1f}"),
         ("GET P70 (us)", "get_p70", "{:.1f}"),
         ("GET P99 (us)", "get_p99", "{:.1f}"),
+        ("PUT Batch P50 (us)", "put_batch_p50", "{:.1f}"),
+        ("PUT Batch P99 (us)", "put_batch_p99", "{:.1f}"),
+        ("GET Batch P50 (us)", "get_batch_p50", "{:.1f}"),
+        ("GET Batch P99 (us)", "get_batch_p99", "{:.1f}"),
     ]
     
     for label, key, fmt in metrics_to_show:
@@ -352,29 +429,30 @@ def print_comparison_table(threads, value_size, rpc_threads, ops, ram_buffer_siz
     print("=" * 80 + "\n")
 
 def print_matrix_summary(results):
-    print("\n" + "="*200)
-    print("MATRIX SWEEP SUMMARY")
-    print("-" * 200)
+    print("\n" + "="*210)
+    print("MATRIX SWEEP SUMMARY  (Bad = rounds excluded from average due to PUT/GET failures)")
+    print("-" * 210)
     latency_hdr = " | ".join([f"{'P-P50':<6} {'P-P90':<6} {'P-P99':<6}",
                                f"{'G-P50':<6} {'G-P90':<6} {'G-P99':<6}"])
     header = (
-        f"{'Mode':<15} | {'Th':<3} | {'Bch':<3} | {'Val(MB)':<7} | {'RPC':<3} | "
-        f"{'Ops':<5} | {'Buf':<3} | {'TransferMode':<12} | {'Workers':<7} | "
+        f"{'Mode':<15} | {'Th':<3} | {'Bch':<4} | {'Val(MB)':<7} | {'RPC':<3} | "
+        f"{'Ops':<5} | {'Buf':<3} | {'TransferMode':<12} | {'Workers':<7} | {'Bad':<3} | "
         f"{'PUT-MB/s':<10} | {'GET-MB/s':<10} | {latency_hdr}"
     )
     print(header)
-    print("-" * 200)
+    print("-" * 210)
     for r in results:
         put_lat = f"{r['put_p50']:<6.1f} {r['put_p90']:<6.1f} {r['put_p99']:<6.1f}"
         get_lat = f"{r['get_p50']:<6.1f} {r['get_p90']:<6.1f} {r['get_p99']:<6.1f}"
         transfer_mode = str(r.get('p2p_local_transfer_mode', '-'))
         wk_val = r.get('local_memcpy_async_worker_num')
         wk = '-' if wk_val is None else str(wk_val)
-        print(f"{r['mode']:<15} | {r['threads']:<3} | {r.get('batch', 1):<3} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "
-              f"{transfer_mode:<12} | {wk:<7} | "
+        bad = str(r.get('bad_round_count', 0))
+        print(f"{r['mode']:<15} | {r['threads']:<3} | {r.get('batch', 1):<4} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "
+              f"{transfer_mode:<12} | {wk:<7} | {bad:<3} | "
               f"{r['put_throughput']:<10.1f} | {r['get_throughput']:<10.1f} | "
               f"{put_lat} | {get_lat}")
-    print("=" * 200 + "\n")
+    print("=" * 210 + "\n")
 
 def save_results(results, path):
     print(f"Saving results to {path}...")
