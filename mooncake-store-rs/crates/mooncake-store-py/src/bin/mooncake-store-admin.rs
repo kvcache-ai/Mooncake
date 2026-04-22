@@ -1595,6 +1595,47 @@ mod tests {
     }
 
     #[test]
+    fn route_migration_http_client_gets_task_from_admin_server() {
+        let response = serde_json::to_string(&RouteMigrationTaskStatusResponse {
+            task_id: "task-3".to_string(),
+            namespace: "mooncake/routes".to_string(),
+            authority: "authority-a".to_string(),
+            tenant: "tenant-a".to_string(),
+            domain: None,
+            object_set: None,
+            key: "object-a".to_string(),
+            mode: RouteMigrationMode::Move,
+            source_segment: "segment-a".to_string(),
+            target_segments: vec!["segment-b".to_string()],
+            task_executor: "executor-a".to_string(),
+            state: RouteMigrationTaskState::Succeeded,
+            attempts: 1,
+            max_retries: 5,
+            execution_id: Some("execution-1".to_string()),
+            next_retry_at_ms: None,
+            last_error: String::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        })
+        .expect("response json should serialize");
+        let (admin_url, requests, handle) = serve_single_response(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        ));
+        let args = sample_cli_args_with_admin_url(&admin_url);
+
+        let task: RouteMigrationTaskStatusResponse =
+            admin_http_get_json(&args, "/v1/route-migrations/task-3")
+                .expect("http get should succeed");
+        assert_eq!(task.task_id, "task-3");
+        assert_eq!(task.state, RouteMigrationTaskState::Succeeded);
+        let request = requests.recv().expect("request should capture");
+        assert!(request.starts_with("GET /v1/route-migrations/task-3 HTTP/1.1\r\n"));
+        handle.join().expect("server thread should join");
+    }
+
+    #[test]
     fn migrate_commands_require_admin_url() {
         let args = Args {
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),

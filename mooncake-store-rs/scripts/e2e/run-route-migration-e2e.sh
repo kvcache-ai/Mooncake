@@ -33,6 +33,9 @@ Environment:
   MC_STORE_RS_KEEP_TEMP             Keep temp dir on failure when set to 1
   MC_STORE_RS_ROUTE_MIGRATION_MODE  Optional mode override when no CLI arg is
                                    passed (`move`, `copy`, or `copy-multi`)
+  MC_STORE_RS_ROUTE_MIGRATION_SUBMITTER
+                                   Task submitter used by the Python driver:
+                                   `http` (default) or `cli`
   MC_STORE_RS_ROUTE_MIGRATION_LEASE_TTL_MS
                                    Lease TTL for the standalone clients
                                    (default: 15000)
@@ -57,6 +60,8 @@ Environment:
                                    Optional explicit client binary path.
   MC_STORE_RS_ROUTE_MIGRATION_ADMIN_BIN
                                    Optional explicit admin server binary path.
+  MC_STORE_RS_ROUTE_MIGRATION_ADMIN_CLI_BIN
+                                   Optional explicit admin CLI binary path.
   MOONCAKE_UPSTREAM_DIR            Mooncake upstream checkout override
   MOONCAKE_UPSTREAM_BUILD_DIR      Built upstream directory override
 EOF
@@ -73,6 +78,13 @@ fi
 
 if [[ "${MODE}" != "move" && "${MODE}" != "copy" && "${MODE}" != "copy-multi" ]]; then
   echo "unsupported mode: ${MODE}" >&2
+  usage >&2
+  exit 1
+fi
+
+SUBMITTER="${MC_STORE_RS_ROUTE_MIGRATION_SUBMITTER:-http}"
+if [[ "${SUBMITTER}" != "http" && "${SUBMITTER}" != "cli" ]]; then
+  echo "unsupported submitter: ${SUBMITTER}" >&2
   usage >&2
   exit 1
 fi
@@ -282,9 +294,11 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMP_DIR}/cargo-target}"
 
 CLIENT_BIN_OVERRIDE=${MC_STORE_RS_ROUTE_MIGRATION_CLIENT_BIN:-}
 ADMIN_BIN_OVERRIDE=${MC_STORE_RS_ROUTE_MIGRATION_ADMIN_BIN:-}
+ADMIN_CLI_BIN_OVERRIDE=${MC_STORE_RS_ROUTE_MIGRATION_ADMIN_CLI_BIN:-}
 if [[ -n "${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR:-}" ]]; then
   CLIENT_BIN_OVERRIDE=${CLIENT_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-client}
   ADMIN_BIN_OVERRIDE=${ADMIN_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-admin-server}
+  ADMIN_CLI_BIN_OVERRIDE=${ADMIN_CLI_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-admin}
 fi
 
 start_local_or_docker_redis_if_needed \
@@ -305,6 +319,7 @@ fi
 TARGET_DIR="${CARGO_TARGET_DIR}"
 BIN="${CLIENT_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-client}"
 ADMIN_BIN="${ADMIN_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-admin-server}"
+ADMIN_CLI_BIN="${ADMIN_CLI_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-admin}"
 
 if [[ ! -x "${BIN}" ]]; then
   echo "expected client binary was not produced at ${BIN}" >&2
@@ -312,6 +327,10 @@ if [[ ! -x "${BIN}" ]]; then
 fi
 if [[ ! -x "${ADMIN_BIN}" ]]; then
   echo "expected admin binary was not produced at ${ADMIN_BIN}" >&2
+  exit 1
+fi
+if [[ "${SUBMITTER}" == "cli" && ! -x "${ADMIN_CLI_BIN}" ]]; then
+  echo "expected admin CLI binary was not produced at ${ADMIN_CLI_BIN}" >&2
   exit 1
 fi
 
@@ -386,8 +405,10 @@ print(json.dumps(segments))
 PY
 )
 
-python3 - "${ADMIN_URL}" "${REDIS_URL}" "${MODE}" "${TENANT}" "${KEYSPACE}" "${KEY}" "${PAYLOAD}" "${SOURCE_SEGMENT}" "${TARGET_SEGMENTS_JSON}" "${SOURCE_STABLE_ID}" "${MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS:-2000}" <<'PY'
+python3 - "${ADMIN_URL}" "${REDIS_URL}" "${MODE}" "${TENANT}" "${KEYSPACE}" "${KEY}" "${PAYLOAD}" "${SOURCE_SEGMENT}" "${TARGET_SEGMENTS_JSON}" "${SOURCE_STABLE_ID}" "${MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS:-2000}" "${SUBMITTER}" "${ADMIN_CLI_BIN}" <<'PY'
 import json
+import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -405,6 +426,8 @@ source_segment = sys.argv[8]
 target_segments = json.loads(sys.argv[9])
 source_stable_id = sys.argv[10]
 request_timeout_ms = int(sys.argv[11])
+submitter = sys.argv[12]
+admin_cli_bin = sys.argv[13]
 request_timeout_s = max(request_timeout_ms / 1000.0, 1.0)
 submit_mode = "copy" if mode == "copy-multi" else mode
 
@@ -421,11 +444,53 @@ def request_json(method, path, body=None):
         return json.loads(response.read().decode())
 
 
+def run_admin_cli(*args):
+    completed = subprocess.run(
+        [admin_cli_bin, *args],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"admin cli failed rc={completed.returncode}: {completed.stdout}"
+        )
+    return completed.stdout
+
+
+def parse_cli_fields(output):
+    fields = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if ": " not in line:
+            continue
+        key_name, value = line.split(": ", 1)
+        fields[key_name] = value
+    return fields
+
+
 def wait_for_task(task_id):
     deadline = time.time() + 60.0
     last_status = None
     while time.time() < deadline:
-        status = request_json("GET", f"/v1/route-migrations/{task_id}")
+        if submitter == "cli":
+            output = run_admin_cli(
+                "--metadata-url",
+                redis_url,
+                "--admin-url",
+                admin_url,
+                "--keyspace",
+                keyspace,
+                "migrate",
+                "task",
+                "get",
+                "--task-id",
+                task_id,
+            )
+            status = parse_cli_fields(output)
+        else:
+            status = request_json("GET", f"/v1/route-migrations/{task_id}")
         last_status = status
         state = status["state"]
         if state in {"succeeded", "failed", "cancelled"}:
@@ -475,21 +540,61 @@ assert initial_route is not None
 assert_route_shape(initial_route, expected_source=True, expected_targets=False)
 assert store.get(key, tenant=tenant) == payload
 
-submit_body = {
-    "authority": source_stable_id,
-    "tenant": tenant,
-    "key": key,
-    "mode": submit_mode,
-    "source_segment": source_segment,
-    "target_segments": target_segments,
-    "task_executor": source_stable_id,
-}
-submit_response = request_json("POST", "/v1/route-migrations", submit_body)
-task_id = submit_response["task_id"]
+if submitter == "cli":
+    submit_args = [
+        "--metadata-url",
+        redis_url,
+        "--admin-url",
+        admin_url,
+        "--keyspace",
+        keyspace,
+        "migrate",
+        submit_mode,
+        "--authority",
+        source_stable_id,
+        "--tenant",
+        tenant,
+        "--key",
+        key,
+        "--source-segment",
+        source_segment,
+    ]
+    for target_segment in target_segments:
+        submit_args.extend(["--target-segment", target_segment])
+    submit_args.extend(["--task-executor", source_stable_id])
+    submit_output = run_admin_cli(*submit_args)
+    submit_response = parse_cli_fields(submit_output)
+    task_id = submit_response["task_id"]
 
-listed = request_json("GET", "/v1/route-migrations")
-assert listed["count"] >= 1
-assert any(task["task_id"] == task_id for task in listed["tasks"])
+    listed_output = run_admin_cli(
+        "--metadata-url",
+        redis_url,
+        "--admin-url",
+        admin_url,
+        "--keyspace",
+        keyspace,
+        "migrate",
+        "task",
+        "list",
+    )
+    listed = parse_cli_fields(listed_output)
+    assert int(listed["count"]) >= 1
+else:
+    submit_body = {
+        "authority": source_stable_id,
+        "tenant": tenant,
+        "key": key,
+        "mode": submit_mode,
+        "source_segment": source_segment,
+        "target_segments": target_segments,
+        "task_executor": source_stable_id,
+    }
+    submit_response = request_json("POST", "/v1/route-migrations", submit_body)
+    task_id = submit_response["task_id"]
+
+    listed = request_json("GET", "/v1/route-migrations")
+    assert listed["count"] >= 1
+    assert any(task["task_id"] == task_id for task in listed["tasks"])
 
 status = wait_for_task(task_id)
 assert status["state"] == "succeeded", status
