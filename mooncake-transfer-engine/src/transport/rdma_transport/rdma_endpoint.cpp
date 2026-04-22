@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <chrono>
 #include <thread>
+#include <sstream>
 
 #include "common.h"
 #include "config.h"
@@ -160,16 +161,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
-            auto segment_desc =
-                context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
-            if (segment_desc) {
-                for (auto &nic : segment_desc->devices)
-                    if (nic.name == context_.deviceName())
-                        return doSetupConnection(nic.gid, nic.lid, qpNum());
-            }
-            LOG(ERROR) << "Peer NIC " << context_.deviceName()
-                       << " not found in localhost";
-            return ERR_DEVICE_NOT_FOUND;
+            return doSetupConnection(context_.gid(), context_.lid(), qpNum());
         }
 
         // Only proceed with RPC if we are the first to transition from
@@ -189,6 +181,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
             }
 
             local_desc.local_nic_path = context_.nicPath();
+            local_desc.local_lid = context_.lid();
+            local_desc.local_gid = context_.gid();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
         }
@@ -290,16 +284,26 @@ int RdmaEndPoint::setupConnectionsByActive() {
         return ERR_REJECT_HANDSHAKE;
     }
 
-    auto segment_desc =
-        context_.engine().meta()->getSegmentDescByName(peer_server_name);
-    if (segment_desc) {
-        for (auto &nic : segment_desc->devices) {
-            if (nic.name == peer_nic_name) {
-                int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
-                if (ret != 0) {
-                    resetConnection("failed connection setup (active)");
+    if (!peer_desc.local_gid.empty()) {
+        int ret = doSetupConnection(peer_desc.local_gid, peer_desc.local_lid,
+                                    peer_desc.qp_num);
+        if (ret != 0) {
+            resetConnection("failed connection setup (active)");
+        }
+        return ret;
+    } else {
+        auto segment_desc =
+            context_.engine().meta()->getSegmentDescByName(peer_server_name);
+        if (segment_desc) {
+            for (auto &nic : segment_desc->devices) {
+                if (nic.name == peer_nic_name) {
+                    int ret =
+                        doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
+                    if (ret != 0) {
+                        resetConnection("failed connection setup (active)");
+                    }
+                    return ret;
                 }
-                return ret;
             }
         }
     }
@@ -316,6 +320,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         // If already connected with the same peer QP info, return success
         if (peer_qp_num_list_ == peer_desc.qp_num) {
             local_desc.local_nic_path = context_.nicPath();
+            local_desc.local_lid = context_.lid();
+            local_desc.local_gid = context_.gid();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
             LOG(INFO) << "Received same peer QP numbers, reusing connection.";
@@ -357,20 +363,32 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     }
 
     local_desc.local_nic_path = context_.nicPath();
+    local_desc.local_lid = context_.lid();
+    local_desc.local_gid = context_.gid();
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.qp_num = qpNum();
 
-    auto segment_desc =
-        context_.engine().meta()->getSegmentDescByName(peer_server_name);
-    if (segment_desc) {
-        for (auto &nic : segment_desc->devices) {
-            if (nic.name == peer_nic_name) {
-                int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
-                                            &local_desc.reply_msg);
-                if (ret != 0) {
-                    resetConnection("failed connection setup (passive)");
+    if (!peer_desc.local_gid.empty()) {
+        int ret = doSetupConnection(peer_desc.local_gid, peer_desc.local_lid,
+                                    peer_desc.qp_num, &local_desc.reply_msg);
+        if (ret != 0) {
+            resetConnection("failed connection setup (passive)");
+        }
+        return ret;
+    } else {
+        auto segment_desc =
+            context_.engine().meta()->getSegmentDescByName(peer_server_name);
+        if (segment_desc) {
+            for (auto &nic : segment_desc->devices) {
+                if (nic.name == peer_nic_name) {
+                    int ret =
+                        doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
+                                          &local_desc.reply_msg);
+                    if (ret != 0) {
+                        resetConnection("failed connection setup (passive)");
+                    }
+                    return ret;
                 }
-                return ret;
             }
         }
     }
@@ -542,6 +560,44 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     return ret;
 }
 
+static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
+    if (gid_str.empty()) {
+        LOG(ERROR) << "GID string is empty";
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    // Prepend a colon to the GID string to simplify parsing.
+    std::istringstream iss(":" + gid_str);
+    for (size_t i = 0; i < sizeof(gid_out.raw); i++) {
+        if (iss.get() != ':') {
+            LOG(ERROR) << "Invalid GID format at byte " << i
+                       << ", peer_gid=" << gid_str;
+            return ERR_INVALID_ARGUMENT;
+        }
+
+        uint32_t byte = 0;
+        iss >> std::hex >> byte;
+
+        if (iss.fail() || byte > 0xFF) {
+            LOG(ERROR) << "Invalid GID format at byte " << i
+                       << ", peer_gid=" << gid_str;
+            return ERR_INVALID_ARGUMENT;
+        }
+
+        gid_out.raw[i] = static_cast<uint8_t>(byte);
+    }
+
+    // Ensure no trailing data remains after 16 bytes
+    char extra;
+    if (iss.get(extra)) {
+        LOG(ERROR) << "GID string has trailing data after 16 bytes"
+                   << ", peer_gid=" << gid_str;
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    return 0;
+}
+
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
@@ -555,8 +611,18 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
         return ERR_INVALID_ARGUMENT;
     }
 
+    // Verify and parse the peer GID before proceeding.
+    ibv_gid peer_gid_raw = {};
+    int ret = parseGidString(peer_gid, peer_gid_raw);
+    if (ret) {
+        std::string message = "Invalid peer GID: " + peer_gid;
+        LOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message;
+        return ret;
+    }
+
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
-        int ret = doSetupConnection(qp_index, peer_gid, peer_lid,
+        int ret = doSetupConnection(qp_index, peer_gid_raw, peer_lid,
                                     peer_qp_num_list[qp_index], reply_msg);
         if (ret) return ret;
     }
@@ -566,7 +632,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
     return 0;
 }
 
-int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
+int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                                     uint16_t peer_lid, uint32_t peer_qp_num,
                                     std::string *reply_msg) {
     if (qp_index < 0 || qp_index > (int)qp_list_.size())
@@ -609,15 +675,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     attr.path_mtu = context_.activeMTU();
     if (globalConfig().mtu_length < attr.path_mtu)
         attr.path_mtu = globalConfig().mtu_length;
-    ibv_gid peer_gid_raw;
-    std::istringstream iss(peer_gid);
-    for (int i = 0; i < 16; ++i) {
-        int value;
-        iss >> std::hex >> value;
-        peer_gid_raw.raw[i] = static_cast<uint8_t>(value);
-        if (i < 15) iss.ignore(1, ':');
-    }
-    attr.ah_attr.grh.dgid = peer_gid_raw;
+    attr.ah_attr.grh.dgid = peer_gid;
     // TODO gidIndex and portNum must fetch from REMOTE
     attr.ah_attr.grh.sgid_index = context_.gidIndex();
     attr.ah_attr.grh.hop_limit = MAX_HOP_LIMIT;
