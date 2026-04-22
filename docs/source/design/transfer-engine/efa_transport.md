@@ -118,11 +118,17 @@ The test suite includes:
 | `LargeTransfer` | 128 MB buffer, 64 x 1 MB slices — exercises WR / CQ pacing |
 | `RepeatedOpenSegment` | `openSegment()` on the same peer repeatedly still transfers correctly |
 
-You can also run all unit tests via CTest:
+You can also run the EFA tests via CTest:
 
 ```bash
-cd build && ctest --output-on-failure
+cd build && ctest --output-on-failure -R 'efa'
 ```
+
+> **Note:** `ctest --output-on-failure` without a filter runs every test in
+> the build, including TCP / metadata / master-service suites that require
+> an etcd server or a running `mooncake_master`. Those will fail or hang on
+> a machine that is only provisioned for EFA testing — the failures are not
+> EFA-specific. Use `-R 'efa'` to restrict the run to the EFA tests.
 
 Environment variables for test configuration:
 
