@@ -4,6 +4,9 @@
 
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <cstring>
 #include <transport/device/ibgda/memheap.h>
@@ -513,10 +516,21 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp* qp,
     DEVX_SET(qpc, qpc, min_rnr_nak, 7);
     DEVX_SET(qpc, qpc, log_rra_max, 1);  // log2(max_rd_atomic)
     if (qp->port_attr.link_layer == IBV_LINK_LAYER_INFINIBAND) {
+#ifdef USE_SHCA
+        const uint32_t dlid = u17_to_32(ah_attr.dlid);
+#else
+        const uint32_t dlid = ah_attr.dlid;
+#endif
         DEVX_SET(qpc, qpc, primary_address_path.sl,
                  ah_attr.sl);  // infiniband only
-        DEVX_SET(qpc, qpc, primary_address_path.rlid, ah_attr.dlid);
+        DEVX_SET(qpc, qpc, primary_address_path.rlid, dlid);
     } else if (qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET) {
+#ifdef USE_SHCA
+        const uint16_t udp_sport =
+            static_cast<uint16_t>(u17_to_32(ah_attr.dlid));
+#else
+        const uint16_t udp_sport = ah_attr.dlid;
+#endif
         struct mlx5dv_obj dv;
         struct mlx5dv_ah dah;
 
@@ -536,7 +550,7 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp* qp,
                  ah_attr.grh.hop_limit);
         DEVX_SET(qpc, qpc, primary_address_path.src_addr_index,
                  ah_attr.grh.sgid_index);
-        DEVX_SET(qpc, qpc, primary_address_path.udp_sport, ah_attr.dlid);
+        DEVX_SET(qpc, qpc, primary_address_path.udp_sport, udp_sport);
         memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rgid_rip),
                &dah.av->rgid, sizeof(dah.av->rgid));
     }

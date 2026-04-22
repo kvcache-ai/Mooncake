@@ -269,6 +269,20 @@ else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
 
+# Handle package name modification for TianLong SHCA builds
+if [ "$SHCA_BUILD" = "1" ]; then
+    echo "Modifying package name for TianLong SHCA build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-shca"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (TianLong SHCA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "tianlong", "shca"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-shca"
+else
+    echo "Using standard package name: mooncake-transfer-engine"
+fi
+
 echo "Cleaning up previous build artifacts..."
 rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}

@@ -196,6 +196,8 @@
 - `-DUSE_HYGON=[ON|OFF]`: 通过 DTK SDK 启用对海光 DCU 的支持。默认 OFF；使用 CUDA 兼容运行时。
 - `-DDTK_ROOT=/path/to/dtk`: 在 `-DUSE_HYGON=ON` 时覆盖默认 DTK SDK 根路径；未设置时使用 `DTK_HOME` 或 `/opt/dtk`。
 - `-DDTK_INCLUDE_DIR=/path/to/include` / `-DDTK_LIB_DIR=/path/to/lib64`: 在 `-DUSE_HYGON=ON` 时覆盖 DTK 头文件与库目录。
+- `-DUSE_FAKE_HIP_RPC=[ON|OFF]`: 使用假的 HIP RPC 实现（无需真实 hylink 驱动）。默认 OFF；会隐含打开 `-DUSE_HYGON=ON`。
+- `-DUSE_SHCA=[ON|OFF]`: 启用 TianLong SHCA InfiniBand 支持。默认 OFF；SHCA 构建下不支持 `MC_RPC_PROTOCOL=rdma`。
 - `-DUSE_COREX=[ON|OFF]`: 启用对天数智芯 CoreX GPU 的支持。默认 OFF；使用 CUDA 兼容运行时。
 - `-DCOREX_ROOT=/path/to/corex`: 在 `-DUSE_COREX=ON` 时覆盖默认 CoreX SDK 根路径；未设置时使用 `COREX_HOME` 或 `/usr/local/corex`。
 - `-DCOREX_INCLUDE_DIR=/path/to/include` / `-DCOREX_LIB_DIR=/path/to/lib`: 在 `-DUSE_COREX=ON` 时覆盖 CoreX 头文件与库目录。

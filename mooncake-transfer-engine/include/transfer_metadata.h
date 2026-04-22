@@ -46,7 +46,7 @@ class TransferMetadata {
    public:
     struct DeviceDesc {
         std::string name;
-        uint16_t lid;
+        uint32_t lid;
         std::string gid;
         std::string eid;  // for ub
 
@@ -157,7 +157,7 @@ class TransferMetadata {
 
     struct HandShakeDesc {
         std::string local_nic_path;
-        uint16_t local_lid = 0;
+        uint32_t local_lid = 0;
         std::string local_gid;
         std::string peer_nic_path;
 #ifdef USE_UB

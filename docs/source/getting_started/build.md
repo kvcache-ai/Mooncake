@@ -65,6 +65,7 @@ environment setup must be prepared separately.
 | AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
 | Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
+| TianLong SHCA | `-DUSE_SHCA=ON` | Install `shca-tools` before `dependencies.sh`. | `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds. |
 
 ```{admonition} GPU-Direct RDMA
 :class: note
@@ -148,6 +149,8 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_MACA=ON/OFF` | `OFF` | Enable MetaX (Muxi) GPU support via MACA. |
 | `-DUSE_HIP=ON/OFF` | `OFF` | Enable AMD GPU support via HIP/ROCm. |
 | `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
+| `-DUSE_FAKE_HIP_RPC=ON/OFF` | `OFF` | Use stub HIP RPC (implies USE_HYGON). |
+| `-DUSE_SHCA=ON/OFF` | `OFF` | TianLong SHCA InfiniBand; `MC_RPC_PROTOCOL=rdma` not supported on SHCA builds. |
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |

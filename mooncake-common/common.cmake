@@ -80,6 +80,7 @@ option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
+option(USE_FAKE_HIP_RPC "option for using fake HIP RPC implementation" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -97,6 +98,18 @@ option(USE_SUNRISE
 option(USE_TPU
        "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
        OFF)
+option(USE_SHCA "option for using TianLong SHCA InfiniBand" OFF)
+
+if (USE_SHCA)
+  message(STATUS "TianLong SHCA InfiniBand is enabled")
+endif()
+
+if (USE_FAKE_HIP_RPC)
+  # Fake HIP RPC stubs live under USE_HYGON paths in hip_transport.
+  set(USE_HYGON ON)
+  add_compile_definitions(USE_FAKE_HIP_RPC)
+  message(STATUS "Using fake HIP RPC implementation")
+endif()
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -531,4 +544,10 @@ if(NOT TARGET gflags::gflags)
   endforeach()
 endif()
 find_package(yalantinglibs CONFIG REQUIRED)
-add_compile_definitions(YLT_ENABLE_IBV)
+# SHCA uses extended 17-bit LIDs incompatible with yalantinglibs ib_socket;
+# skip IBV RPC and fall back to TCP when USE_SHCA is ON.
+if(USE_SHCA)
+  add_compile_definitions(USE_SHCA)
+else()
+  add_compile_definitions(YLT_ENABLE_IBV)
+endif()

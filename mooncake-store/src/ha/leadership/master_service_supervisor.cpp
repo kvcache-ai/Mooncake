@@ -375,9 +375,15 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
         const char* protocol = std::getenv("MC_RPC_PROTOCOL");
+#ifdef YLT_ENABLE_IBV
         if (protocol && std::string_view(protocol) == "rdma") {
             server.init_ibv();
         }
+#else
+        if (protocol && std::string_view(protocol) == "rdma") {
+            LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP RPC";
+        }
+#endif
 
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.

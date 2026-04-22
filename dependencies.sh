@@ -149,6 +149,14 @@ fi
 print_section "Installing system packages"
 echo -e "${YELLOW}This may take a few minutes...${NC}"
 
+USE_SHCA=OFF
+if [ -f "/usr/include/infiniband/shca_17b_types.h" ]; then
+    USE_SHCA=ON
+    echo -e "${GREEN}SHCA headers detected. Will build with SHCA support.${NC}"
+else
+    echo -e "${YELLOW}SHCA headers not found. Will build without SHCA support.${NC}"
+fi
+
 if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     SYSTEM_PACKAGES="build-essential \
                      cmake \
@@ -182,6 +190,16 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      patchelf \
                      libc6-dev \
                      libc-bin"
+
+    # TianLong SHCA (shca-tools) ships its own libibverbs headers/libs; installing
+    # libibverbs-dev conflicts with it. libboost-all-dev pulls OpenMPI/libfabric,
+    # which also depend on distro ibverbs and fail on SHCA systems.
+    if [ "$USE_SHCA" = "ON" ]; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/libibverbs-dev//g')
+        SAFE_BOOST="libboost-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-program-options-dev libboost-regex-dev libboost-serialization-dev"
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed "s/libboost-all-dev/$SAFE_BOOST/g")
+        echo -e "${GREEN}SHCA headers detected. Will build with SHCA support and adjust system packages accordingly.${NC}"
+    fi
 
     apt-get install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"

@@ -31,7 +31,45 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 #ifdef USE_HYGON
+#if USE_FAKE_HIP_RPC
+// hipFabricHandle_t is already provided by hip_runtime.h on DTK; only stub the
+// Hygon RPC entry points that may be unavailable without hylink.
+struct hipFabricHandle_t {
+    unsigned char reserved[64];
+};
+
+static hipError_t hipHsaExtRpcMemoryCreate(void* addr, size_t length,
+                                           hipFabricHandle_t* handle) {
+    (void)addr;
+    (void)length;
+    (void)handle;
+    LOG(ERROR) << "HipTransport: hipHsaExtRpcMemoryCreate is unavailable in "
+                  "the current HIP driver";
+    return hipErrorNotSupported;
+}
+
+static hipError_t hipHsaExtRpcMemoryAttachDevice(const hipFabricHandle_t* handle,
+                                                 size_t num_devices,
+                                                 int* devices,
+                                                 void** shm_addr) {
+    (void)handle;
+    (void)num_devices;
+    (void)devices;
+    (void)shm_addr;
+    LOG(ERROR) << "HipTransport: hipHsaExtRpcMemoryAttachDevice is "
+                  "unavailable in the current HIP driver";
+    return hipErrorNotSupported;
+}
+
+static hipError_t hipHsaExtRpcMemoryDetach(void* shm_addr) {
+    (void)shm_addr;
+    LOG(ERROR) << "HipTransport: hipHsaExtRpcMemoryDetach is unavailable in "
+                  "the current HIP driver";
+    return hipErrorNotSupported;
+}
+#else
 #include "hip/hip_hsa_ext.h"
+#endif
 #include <fstream>
 #include <iomanip>
 #include <mutex>
@@ -419,6 +457,15 @@ static bool supportFabricMem() {
         return false;
     }
 
+#if USE_FAKE_HIP_RPC
+    static std::once_flag warn_once;
+    std::call_once(warn_once, []() {
+        LOG(WARNING) << "HipTransport: HIP fabric RPC is not available in "
+                        "this build, falling back to IPC mode";
+    });
+    return false;
+#endif
+
     int num_devices = 0;
     if (!checkHip(hipGetDeviceCount(&num_devices),
                   "HipTransport: hipGetDeviceCount failed")) {
@@ -666,7 +713,7 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
 
     // Perform async memory copy
 #ifdef USE_HYGON
-    if (!supportFabricMem()) {
+    if (!use_fabric_mem_) {
         if (slice->opcode == TransferRequest::READ) {
             err = hipMemcpyAsync(slice->source_addr, (void*)slice->local.dest_addr,
                                  slice->length, hipMemcpyDefault, stream);

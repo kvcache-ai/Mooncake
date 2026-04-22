@@ -56,10 +56,12 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
     // Initialize client pools with proper configuration
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     const char* value = std::getenv("MC_RPC_PROTOCOL");
+#ifdef YLT_ENABLE_IBV
     if (value && std::string_view(value) == "rdma") {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
+#endif
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf);
@@ -73,6 +75,7 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
             config.thread_count, config.listen_address,
             std::chrono::seconds(config.timeout_seconds));
 
+#ifdef YLT_ENABLE_IBV
         if (value && std::string_view(value) == "rdma") {
             if (server_) {
                 try {
@@ -93,6 +96,7 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
                 LOG(WARNING) << "Falling back to TCP mode";
             }
         }
+#endif
 
         server_->register_handler<&RpcCommunicator::handleDataTransfer,
                                   &RpcCommunicator::handleTensorTransfer>(this);
@@ -100,7 +104,12 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
     LOG(INFO) << "Environment variable MC_RPC_PROTOCOL is set to "
               << (value ? value : "not set");
     if (value && std::string_view(value) == "rdma") {
+#ifdef YLT_ENABLE_IBV
         LOG(INFO) << "Using RDMA transport for RPC communication";
+#else
+        LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP "
+                        "transport for RPC communication";
+#endif
     } else {
         LOG(INFO) << "Using TCP transport for RPC communication";
     }
