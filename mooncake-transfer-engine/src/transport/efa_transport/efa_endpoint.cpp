@@ -138,6 +138,12 @@ void EfaEndPoint::disconnectUnlocked() {
     status_.store(UNCONNECTED, std::memory_order_release);
 }
 
+void EfaEndPoint::markDetachedForTeardown() {
+    RWSpinlock::WriteGuard guard(lock_);
+    peer_fi_addr_ = FI_ADDR_UNSPEC;
+    status_.store(UNCONNECTED, std::memory_order_release);
+}
+
 const std::string EfaEndPoint::toString() const {
     return "EfaEndPoint[" + context_.nicPath() + " <-> " + peer_nic_path_ + "]";
 }

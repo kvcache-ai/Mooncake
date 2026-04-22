@@ -89,6 +89,12 @@ class EfaEndPoint {
 
     void disconnect();
 
+    // Called during EfaContext teardown: forget the AV slot WITHOUT calling
+    // fi_av_remove().  The AV itself is about to be closed, which invalidates
+    // every slot in one shot; calling fi_av_remove after the shared endpoint
+    // has been closed trips an assertion inside the EFA provider.
+    void markDetachedForTeardown();
+
    private:
     void disconnectUnlocked();
 

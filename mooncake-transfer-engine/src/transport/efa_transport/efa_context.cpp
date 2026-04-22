@@ -250,19 +250,22 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
 }
 
 int EfaContext::deconstruct() {
-    // Drop all peer handles first so fi_av_remove() runs before the AV is
-    // closed.  We don't actually own fid_ep entries per-peer anymore.
-    {
-        RWSpinlock::WriteGuard guard(peer_map_lock_);
-        for (auto& entry : peer_map_) {
-            if (entry.second) entry.second->disconnect();
-        }
-        peer_map_.clear();
-    }
-
+    // Teardown order matters for the EFA provider: the shared endpoint must
+    // be closed before the AV it is bound to.  We also cannot call
+    // fi_av_remove() after fi_close(ep) — the provider faults — so we just
+    // clear the peer map (dropping shared_ptrs) and let fi_av_close() below
+    // invalidate every AV slot in one shot.
     if (shared_ep_) {
         fi_close(&shared_ep_->fid);
         shared_ep_ = nullptr;
+    }
+
+    {
+        RWSpinlock::WriteGuard guard(peer_map_lock_);
+        for (auto& entry : peer_map_) {
+            if (entry.second) entry.second->markDetachedForTeardown();
+        }
+        peer_map_.clear();
     }
 
     {
