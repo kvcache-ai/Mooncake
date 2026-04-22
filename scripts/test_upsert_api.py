@@ -816,64 +816,62 @@ class TestUnifiedParallelismUpsert(UpsertTestBase):
             self.store.unregister_buffer(base_ptr)
 
 
-class TestUpsertTpTensor(UpsertTestBase):
-    """TP variants for tensor upsert / pub upsert."""
+class TestUpsertParallelTensor(UpsertTestBase):
+    """Parallelism-based tensor upsert coverage for TP cases."""
 
-    def test_upsert_tensor_with_tp(self):
+    def test_upsert_tensor_with_parallelism_tp(self):
+        require_unified_parallelism_api(self)
         tp_size = 2
         split_dim = 1
         key = "tp_upsert_single"
         original = torch.arange(24, dtype=torch.float32).view(4, 6).contiguous()
         updated = (original + 100).contiguous()
+        parallelism = make_tensor_parallelism(
+            [make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)]
+        )
+        target = make_read_target("shard", parallelism)
 
         self.assertEqual(
-            self.store.put_tensor_with_tp(key, original, tp_size=tp_size,
-                                          split_dim=split_dim),
+            self.store.put_tensor_with_tp(key, original, tp_size=tp_size, split_dim=split_dim),
             0,
         )
         self.assertEqual(
-            self.store.upsert_tensor_with_tp(key, updated, tp_size=tp_size,
-                                             split_dim=split_dim),
+            self.store.upsert_tensor_with_parallelism(key, updated, parallelism),
             0,
         )
 
-        expected_chunks = updated.chunk(tp_size, split_dim)
-        for rank in range(tp_size):
-            got = self.store.get_tensor_with_tp(key, tp_rank=rank,
-                                                tp_size=tp_size,
-                                                split_dim=split_dim)
-            self.assertTrue(torch.equal(got, expected_chunks[rank]))
+        got = self.store.get_tensor_with_parallelism(key, target)
+        self.assertTrue(torch.equal(got, updated.chunk(tp_size, split_dim)[0]))
 
-    def test_batch_upsert_tensor_with_tp(self):
+    def test_batch_upsert_tensor_with_parallelism_tp(self):
+        require_unified_parallelism_api(self)
         tp_size = 2
         split_dim = 0
         keys = ["tp_batch_upsert_0", "tp_batch_upsert_1"]
         originals = [torch.arange(16, dtype=torch.float32).view(4, 4).contiguous(),
                      torch.arange(16, 32, dtype=torch.float32).view(4, 4).contiguous()]
         updates = [(t + 1000).contiguous() for t in originals]
+        parallelism = make_tensor_parallelism(
+            [make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)]
+        )
+        targets = [make_read_target("shard", parallelism) for _ in keys]
 
         self.assertEqual(
-            list(self.store.batch_put_tensor_with_tp(keys, originals,
-                                                     tp_size=tp_size,
-                                                     split_dim=split_dim)),
+            list(self.store.batch_put_tensor_with_tp(keys, originals, tp_size=tp_size, split_dim=split_dim)),
             [0, 0],
         )
         self.assertEqual(
-            list(self.store.batch_upsert_tensor_with_tp(keys, updates,
-                                                        tp_size=tp_size,
-                                                        split_dim=split_dim)),
+            list(self.store.batch_upsert_tensor_with_parallelism(keys, updates, [parallelism] * len(keys))),
             [0, 0],
         )
 
-        for rank in range(tp_size):
-            got_shards = self.store.batch_get_tensor_with_tp(
-                keys, tp_rank=rank, tp_size=tp_size)
-            expected_shards = [tensor.chunk(tp_size, split_dim)[rank]
-                               for tensor in updates]
-            for got, expected in zip(got_shards, expected_shards):
-                self.assertTrue(torch.equal(got, expected))
+        got_shards = self.store.batch_get_tensor_with_parallelism(keys, targets)
+        expected_shards = [tensor.chunk(tp_size, split_dim)[0] for tensor in updates]
+        for got, expected in zip(got_shards, expected_shards):
+            self.assertTrue(torch.equal(got, expected))
 
-    def test_upsert_pub_tensor_with_tp(self):
+    def test_upsert_tensor_with_parallelism_tp_with_config(self):
+        require_unified_parallelism_api(self)
         tp_size = 2
         split_dim = 1
         key = "tp_upsert_pub_single"
@@ -881,28 +879,25 @@ class TestUpsertTpTensor(UpsertTestBase):
         config.replica_num = 1
         base = torch.ones(4, 6, dtype=torch.float32).contiguous()
         updated = torch.full((4, 6), 7.0, dtype=torch.float32).contiguous()
+        parallelism = make_tensor_parallelism(
+            [make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)]
+        )
+        target = make_read_target("shard", parallelism)
 
         self.assertEqual(
-            self.store.pub_tensor_with_tp(key, base, config=config,
-                                          tp_size=tp_size,
-                                          split_dim=split_dim),
+            self.store.pub_tensor_with_tp(key, base, config=config, tp_size=tp_size, split_dim=split_dim),
             0,
         )
         self.assertEqual(
-            self.store.upsert_pub_tensor_with_tp(key, updated, config=config,
-                                                 tp_size=tp_size,
-                                                 split_dim=split_dim),
+            self.store.upsert_tensor_with_parallelism(key, updated, parallelism, config=config),
             0,
         )
 
-        expected_chunks = updated.chunk(tp_size, split_dim)
-        for rank in range(tp_size):
-            got = self.store.get_tensor_with_tp(key, tp_rank=rank,
-                                                tp_size=tp_size,
-                                                split_dim=split_dim)
-            self.assertTrue(torch.equal(got, expected_chunks[rank]))
+        got = self.store.get_tensor_with_parallelism(key, target)
+        self.assertTrue(torch.equal(got, updated.chunk(tp_size, split_dim)[0]))
 
-    def test_batch_upsert_pub_tensor_with_tp(self):
+    def test_batch_upsert_tensor_with_parallelism_tp_with_config(self):
+        require_unified_parallelism_api(self)
         tp_size = 2
         split_dim = 0
         config = ReplicateConfig()
@@ -912,27 +907,24 @@ class TestUpsertTpTensor(UpsertTestBase):
                 torch.full((4, 4), 2.0, dtype=torch.float32).contiguous()]
         updates = [torch.full((4, 4), 9.0, dtype=torch.float32).contiguous(),
                    torch.full((4, 4), 11.0, dtype=torch.float32).contiguous()]
+        parallelism = make_tensor_parallelism(
+            [make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)]
+        )
+        targets = [make_read_target("shard", parallelism) for _ in keys]
 
         self.assertEqual(
-            list(self.store.batch_pub_tensor_with_tp(keys, base, config=config,
-                                                     tp_size=tp_size,
-                                                     split_dim=split_dim)),
+            list(self.store.batch_pub_tensor_with_tp(keys, base, config=config, tp_size=tp_size, split_dim=split_dim)),
             [0, 0],
         )
         self.assertEqual(
-            list(self.store.batch_upsert_pub_tensor_with_tp(
-                keys, updates, config=config, tp_size=tp_size,
-                split_dim=split_dim)),
+            list(self.store.batch_upsert_tensor_with_parallelism(keys, updates, [parallelism] * len(keys), config=config)),
             [0, 0],
         )
 
-        for rank in range(tp_size):
-            got_shards = self.store.batch_get_tensor_with_tp(
-                keys, tp_rank=rank, tp_size=tp_size)
-            expected_shards = [tensor.chunk(tp_size, split_dim)[rank]
-                               for tensor in updates]
-            for got, expected in zip(got_shards, expected_shards):
-                self.assertTrue(torch.equal(got, expected))
+        got_shards = self.store.batch_get_tensor_with_parallelism(keys, targets)
+        expected_shards = [tensor.chunk(tp_size, split_dim)[0] for tensor in updates]
+        for got, expected in zip(got_shards, expected_shards):
+            self.assertTrue(torch.equal(got, expected))
 
 
 # ==========================================
@@ -992,9 +984,8 @@ if __name__ == "__main__":
     print("               upsert_from, batch_upsert_from")
     print("   Tensor:     upsert_tensor, batch_upsert_tensor,")
     print("               upsert_tensor_from, batch_upsert_tensor_from,")
-    print("               upsert_tensor_with_tp, batch_upsert_tensor_with_tp")
-    print("   Pub tensor: upsert_pub_tensor, batch_upsert_pub_tensor,")
-    print("               upsert_pub_tensor_with_tp,")
-    print("               batch_upsert_pub_tensor_with_tp")
+    print("               upsert_tensor_with_parallelism,")
+    print("               batch_upsert_tensor_with_parallelism")
+    print("   Pub tensor: upsert_pub_tensor, batch_upsert_pub_tensor")
     print("   Mixed:      cross-interface, sequential, size changes")
     unittest.main(verbosity=2)
