@@ -147,7 +147,7 @@ p6-b200.48xlarge). Two things matter the most:
   becomes one `fi_write` / `fi_read`, so larger blocks amortize
   per-op overhead and are the main knob for hitting line rate.
 
-### Target Node (receiver)
+### 1. Target Node (receiver)
 
 ```bash
 ./build/mooncake-transfer-engine/example/transfer_engine_bench \
@@ -162,7 +162,7 @@ p6-b200.48xlarge). Two things matter the most:
 `--buffer_size` — the initiator writes into offsets `[0, buffer_size)`
 on the target, so keep these in sync.
 
-### Initiator Node (sender)
+### 2. Initiator Node (sender)
 
 ```bash
 ./build/mooncake-transfer-engine/example/transfer_engine_bench \
@@ -224,7 +224,7 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 ### Benchmark Results
 
-#### p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
+#### 1. p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
 
 Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
 
@@ -252,7 +252,7 @@ Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 1
 
 > CPU-to-CPU is bounded by DRAM bandwidth (~250 GB/s/socket on Xeon 8559C). Per-NIC sampling shows NUMA-0 NICs at 90 Gbps and NUMA-1 NICs at 53 Gbps, confirming DRAM controller saturation rather than NIC limit.
 
-#### p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
+#### 2. p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
 
 Tested on two p6-b200.48xlarge instances in the same AWS placement group.
 
@@ -274,7 +274,7 @@ Tested on two p6-b200.48xlarge instances in the same AWS placement group.
 |---------------|-------|------|
 | block=1MB, threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
 
-#### p5en.48xlarge (H200, 16 EFA × 200 Gbps)
+#### 3. p5en.48xlarge (H200, 16 EFA × 200 Gbps)
 
 Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA devices) in the same AWS placement group.
 
@@ -389,7 +389,7 @@ The warmup call itself takes roughly the same wall time as the stall it replaces
 
 ## Usage with vLLM
 
-### Prefill Instance
+### 1. Prefill Instance
 
 ```bash
 VLLM_MOONCAKE_BOOTSTRAP_PORT=8998 \
@@ -399,7 +399,7 @@ vllm serve <model_path> -tp 8 \
    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"mooncake_protocol":"efa"}}'
 ```
 
-### Decode Instance
+### 2. Decode Instance
 
 ```bash
 vllm serve <model_path> -tp 8 \
