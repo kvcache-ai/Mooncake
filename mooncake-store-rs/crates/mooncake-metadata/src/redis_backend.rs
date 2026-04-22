@@ -3418,4 +3418,449 @@ mod tests {
             "redis://127.0.0.1:6379/0".to_string()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial: transient-error classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transient_error_classifier_covers_all_io_error_kinds() {
+        use super::should_retry_transient_redis_error;
+        let transient_kinds = [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::NotConnected,
+        ];
+        for kind in &transient_kinds {
+            let err = redis::RedisError::from(std::io::Error::from(*kind));
+            assert!(
+                should_retry_transient_redis_error(&err),
+                "IO kind {kind:?} must classify as transient"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_error_classifier_matches_message_patterns() {
+        use super::should_retry_transient_redis_error;
+        let transient_messages = [
+            "connection refused",
+            "Connection reset by peer",
+            "CONNECTION ABORTED",
+            "connection closed unexpectedly",
+            "not connected to server",
+            "broken pipe",
+            "resource temporarily unavailable",
+            "operation timed out",
+            "interrupted system call",
+        ];
+        for message in &transient_messages {
+            let err =
+                redis::RedisError::from((redis::ErrorKind::IoError, "test", message.to_string()));
+            assert!(
+                should_retry_transient_redis_error(&err),
+                "message '{message}' must classify as transient"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_error_classifier_rejects_non_transient_errors() {
+        use super::should_retry_transient_redis_error;
+        let non_transient = [
+            redis::RedisError::from((
+                redis::ErrorKind::AuthenticationFailed,
+                "WRONGPASS",
+                "invalid username-password pair".to_string(),
+            )),
+            redis::RedisError::from((
+                redis::ErrorKind::TypeError,
+                "WRONGTYPE",
+                "Operation against a key holding the wrong kind of value".to_string(),
+            )),
+            redis::RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "ERR",
+                "unknown command 'FOOBAR'".to_string(),
+            )),
+            redis::RedisError::from((
+                redis::ErrorKind::ReadOnly,
+                "READONLY",
+                "You can't write against a read only replica".to_string(),
+            )),
+        ];
+        for err in &non_transient {
+            assert!(
+                !should_retry_transient_redis_error(err),
+                "err {err:?} must NOT classify as transient"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial: retry-config env-var handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redis_retry_config_defaults_are_sane_when_env_unset() {
+        let _guard = env_lock();
+        std::env::remove_var(REDIS_RETRY_ATTEMPTS_ENV);
+        std::env::remove_var(REDIS_RETRY_DELAY_ENV);
+
+        assert_eq!(redis_retry_attempts(), DEFAULT_REDIS_RETRY_ATTEMPTS);
+        assert_eq!(redis_retry_delay(), DEFAULT_REDIS_RETRY_DELAY);
+        assert_eq!(redis_connect_timeout(), DEFAULT_REDIS_CONNECT_TIMEOUT);
+        assert_eq!(redis_io_timeout(), DEFAULT_REDIS_IO_TIMEOUT);
+    }
+
+    #[test]
+    fn redis_retry_config_rejects_zero_and_invalid_values() {
+        let _guard = env_lock();
+        std::env::set_var(REDIS_RETRY_ATTEMPTS_ENV, "0");
+        assert_eq!(
+            redis_retry_attempts(),
+            DEFAULT_REDIS_RETRY_ATTEMPTS,
+            "zero attempts must fall back to default"
+        );
+        std::env::set_var(REDIS_RETRY_ATTEMPTS_ENV, "not-a-number");
+        assert_eq!(
+            redis_retry_attempts(),
+            DEFAULT_REDIS_RETRY_ATTEMPTS,
+            "non-numeric must fall back to default"
+        );
+        std::env::set_var(REDIS_RETRY_DELAY_ENV, "");
+        assert_eq!(
+            redis_retry_delay(),
+            DEFAULT_REDIS_RETRY_DELAY,
+            "empty string must fall back to default"
+        );
+        std::env::remove_var(REDIS_RETRY_ATTEMPTS_ENV);
+        std::env::remove_var(REDIS_RETRY_DELAY_ENV);
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial: Redis integration (skipped if redis-server unavailable)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redis_backend_concurrent_route_cas_only_one_wins() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = std::sync::Arc::new(
+            RedisMetadataBackend::new(
+                RedisMetadataConfig::new(server.url())
+                    .keyspace(MetadataKeyspace::new("test/redis-concurrent-cas")),
+            )
+            .expect("redis backend"),
+        );
+
+        let key = ObjectKey::new("contested-key");
+        let wins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                let backend = backend.clone();
+                let key = key.clone();
+                let wins = wins.clone();
+                std::thread::spawn(move || {
+                    let mut route = sample_route(1);
+                    route.key = key.clone();
+                    route.replicas[0].owner =
+                        ClientRuntimeId::new(format!("racer-{i}"), ClientEpoch(1));
+                    let res = backend
+                        .compare_and_swap_object_route(&key, None, Some(&route))
+                        .unwrap();
+                    if res.applied {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            wins.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly one insert CAS must win"
+        );
+    }
+
+    #[test]
+    fn redis_backend_route_cas_delete_with_wrong_version_does_not_apply() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-cas-delete")),
+        )
+        .expect("redis backend");
+
+        let key = ObjectKey::new("delete-me");
+        let route = sample_route(1);
+        let inserted = backend
+            .compare_and_swap_object_route(&key, None, Some(&route))
+            .expect("insert");
+        assert!(inserted.applied);
+
+        let wrong = backend
+            .compare_and_swap_object_route(&key, Some(RouteVersion(99)), None)
+            .expect("cas must not crash on wrong version");
+        assert!(!wrong.applied);
+        assert!(
+            backend.get_object_route(&key).unwrap().is_some(),
+            "route must survive the failed CAS-delete"
+        );
+    }
+
+    #[test]
+    fn redis_backend_route_cas_version_chain_is_sequential() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-cas-chain")),
+        )
+        .expect("redis backend");
+
+        let key = ObjectKey::new("versioned-key");
+        let r1 = {
+            let mut r = sample_route(1);
+            r.key = key.clone();
+            r
+        };
+        let r2 = {
+            let mut r = sample_route(2);
+            r.key = key.clone();
+            r
+        };
+        let r3 = {
+            let mut r = sample_route(3);
+            r.key = key.clone();
+            r
+        };
+        assert!(
+            backend
+                .compare_and_swap_object_route(&key, None, Some(&r1))
+                .unwrap()
+                .applied
+        );
+        assert!(
+            backend
+                .compare_and_swap_object_route(&key, Some(RouteVersion(1)), Some(&r2))
+                .unwrap()
+                .applied
+        );
+        assert!(
+            backend
+                .compare_and_swap_object_route(&key, Some(RouteVersion(2)), Some(&r3))
+                .unwrap()
+                .applied
+        );
+
+        let current = backend.get_object_route(&key).unwrap().unwrap();
+        assert_eq!(current.version, RouteVersion(3));
+    }
+
+    #[test]
+    fn redis_backend_multiple_keyspaces_are_isolated() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let url = server.url();
+
+        let backend_a = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(url).keyspace(MetadataKeyspace::new("test/ns-a")),
+        )
+        .expect("backend A");
+        let backend_b = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(url).keyspace(MetadataKeyspace::new("test/ns-b")),
+        )
+        .expect("backend B");
+
+        let lease_a = ClientLease {
+            runtime: ClientRuntimeId::new("node-a", ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: Default::default(),
+            expires_at_ms: super::now_ms() + 60_000,
+        };
+        let lease_b = ClientLease {
+            runtime: ClientRuntimeId::new("node-b", ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: Default::default(),
+            expires_at_ms: super::now_ms() + 60_000,
+        };
+        backend_a.upsert_client_lease(&lease_a).unwrap();
+        backend_b.upsert_client_lease(&lease_b).unwrap();
+
+        let listed_a = backend_a.list_live_clients().unwrap();
+        let listed_b = backend_b.list_live_clients().unwrap();
+        assert_eq!(listed_a.len(), 1);
+        assert_eq!(listed_b.len(), 1);
+        assert_eq!(listed_a[0].runtime.stable_id.0, "node-a");
+        assert_eq!(listed_b[0].runtime.stable_id.0, "node-b");
+    }
+
+    #[test]
+    fn redis_backend_handoff_put_get_round_trip() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-handoff")),
+        )
+        .expect("redis backend");
+
+        let stable_id = ClientStableId::new("handoff-node");
+        let plan = HandoffPlan {
+            stable_id: stable_id.clone(),
+            from: ClientRuntimeId::new("old-runtime", ClientEpoch(1)),
+            to: ClientRuntimeId::new("new-runtime", ClientEpoch(2)),
+            kind: HandoffKind::GracefulDrain,
+            barrier_version: 42,
+            created_at_ms: 1_000,
+            deadline_ms: Some(5_000),
+        };
+        backend.put_handoff(&plan).unwrap();
+
+        let got = backend
+            .get_handoff(&stable_id)
+            .unwrap()
+            .expect("handoff must be retrievable");
+        assert_eq!(got.stable_id.0, "handoff-node");
+        assert!(matches!(got.kind, HandoffKind::GracefulDrain));
+        assert_eq!(got.barrier_version, 42);
+        assert_eq!(got.deadline_ms, Some(5_000));
+    }
+
+    #[test]
+    fn redis_backend_update_client_state_on_nonexistent_returns_not_found() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-update-ghost")),
+        )
+        .expect("redis backend");
+
+        let ghost = ClientRuntimeId::new("ghost-node", ClientEpoch(99));
+        let err = backend
+            .update_client_state(&ghost, ClientLifecycleState::Draining)
+            .expect_err("phantom client must not update");
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn redis_backend_unpublish_then_republish_segment() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-unpub-repub")),
+        )
+        .expect("redis backend");
+
+        let owner = sample_runtime();
+        let segment_name = SegmentName::new("volatile-seg");
+        let segment = SegmentAnnouncement {
+            owner: owner.clone(),
+            segment_name: segment_name.clone(),
+            capacity_bytes: 256,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 16,
+            tags: vec![],
+        };
+
+        backend.publish_segment(&segment).unwrap();
+        assert_eq!(backend.list_segments(Some(&owner)).unwrap().len(), 1);
+        backend.unpublish_segment(&owner, &segment_name).unwrap();
+        assert_eq!(backend.list_segments(Some(&owner)).unwrap().len(), 0);
+        backend.publish_segment(&segment).unwrap();
+        assert_eq!(backend.list_segments(Some(&owner)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn redis_backend_segment_draining_rejects_new_reservations() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-seg-drain")),
+        )
+        .expect("redis backend");
+
+        let owner = sample_runtime();
+        let segment_name = SegmentName::new("drain-seg");
+        let segment = SegmentAnnouncement {
+            owner: owner.clone(),
+            segment_name: segment_name.clone(),
+            capacity_bytes: 512,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 1,
+            tags: vec![],
+        };
+        backend.publish_segment(&segment).unwrap();
+        backend
+            .update_segment_state(&owner, &segment_name, SegmentLifecycleState::Draining)
+            .unwrap();
+
+        let err = backend
+            .reserve_segment(&owner, &segment_name, 64)
+            .expect_err("draining segment must reject new reservations");
+        assert!(matches!(
+            err,
+            StoreError::InvalidState(_) | StoreError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn redis_backend_segment_exhaustion_returns_error() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-seg-exhaust")),
+        )
+        .expect("redis backend");
+
+        let owner = sample_runtime();
+        backend
+            .publish_segment(&SegmentAnnouncement {
+                owner: owner.clone(),
+                segment_name: SegmentName::new("tiny-seg"),
+                capacity_bytes: 64,
+                used_bytes: 0,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: 1,
+                tags: vec![],
+            })
+            .unwrap();
+
+        backend
+            .reserve_segment(&owner, &SegmentName::new("tiny-seg"), 32)
+            .unwrap();
+        backend
+            .reserve_segment(&owner, &SegmentName::new("tiny-seg"), 32)
+            .unwrap();
+        let err = backend
+            .reserve_segment(&owner, &SegmentName::new("tiny-seg"), 1)
+            .expect_err("must reject reserve past capacity");
+        assert!(matches!(err, StoreError::Allocator(_)));
+    }
 }
