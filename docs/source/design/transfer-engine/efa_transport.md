@@ -311,6 +311,38 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 > across every thread / batch combination that doesn't hit the WR cap.
 > Peak write 213.57 GB/s, peak read 212.18 GB/s.
 
+**block_size sweep** (p5en GPU-to-GPU, `threads=16 batch=128 buf=4GB --gpu_id=-1`):
+
+| block | Write | Read |
+|-------|-------|------|
+| 64 KB (default) | 97.11 GB/s | 96.87 GB/s |
+| 128 KB | 190.82 GB/s | 203.88 GB/s |
+| 256 KB | 324.90 GB/s | 296.19 GB/s |
+| 512 KB | 357.62 GB/s | 289.47 GB/s |
+| **1 MB (recommended)** | **352.59 GB/s** | **301.14 GB/s** |
+| 2 MB | 366.87 GB/s | 302.25 GB/s |
+
+> The 64 KB default only reaches ~26% of peak. Write throughput
+> climbs steeply up to ~512 KB and plateaus between 1 MB and 2 MB;
+> read saturates at ~256 KB. 2 MB is the `MC_EFA_STRIPING_THRESHOLD`
+> boundary — above it, each transfer is striped across all NICs
+> (a different code path). 1 MB is the sweet spot: within 4% of the
+> 2 MB peak and safely below the striping threshold.
+
+**buffer_size sweep** (p5en GPU-to-GPU, `threads=16 batch=128 block=1MB --gpu_id=-1`):
+
+| buffer_size | Write | Read |
+|-------------|-------|------|
+| 2 GB (min: `block × batch × threads`) | 353.51 GB/s | 297.03 GB/s |
+| 4 GB | 364.86 GB/s | 293.79 GB/s |
+
+> `buffer_size` only needs to satisfy `buffer_size ≥ block_size × batch_size × threads`
+> (the bench auto-adjusts if smaller, but silently). Anything larger
+> than that minimum does not change throughput — 2 GB vs 4 GB differs
+> by ~3% on write, read is flat within noise. The example commands
+> use 4 GB because it is safe for any reasonable threads/batch
+> combination without having to recompute the minimum.
+
 ### Tuning Tips
 
 - **Use `--block_size=1048576` (1MB)** — this is the most important tuning parameter for EFA. Each `block_size`-sized transfer becomes a single `fi_write`/`fi_read` call, so larger blocks amortize per-operation overhead. 1MB gives ~2× throughput over the 64KB default.
