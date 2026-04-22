@@ -116,8 +116,8 @@ mod tests {
 
     #[test]
     fn error_with_unicode_message() {
-        let err = StoreError::Metadata("连接超时".to_string());
-        assert!(err.to_string().contains("连接超时"));
+        let err = StoreError::Metadata("café-naïve-α".to_string());
+        assert!(err.to_string().contains("café-naïve-α"));
     }
 
     #[test]
