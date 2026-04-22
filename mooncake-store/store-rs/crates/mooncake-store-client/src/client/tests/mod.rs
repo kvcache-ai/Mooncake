@@ -7575,7 +7575,6 @@ fn builder_allows_takeover_of_unreachable_duplicate_runtime() {
         .expect("stale runtime should publish");
 
     StoreClientBuilder::new(metadata, "takeover-runtime")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7104")
         .segment_name("takeover-segment")
@@ -7589,7 +7588,6 @@ fn builder_rejects_stale_epoch_when_newer_runtime_is_reachable() {
         Arc::new(InMemoryMetadataBackend::new()),
     ));
     let _newer = StoreClientBuilder::new(metadata.clone(), "epoch-fence")
-        .epoch(ClientEpoch(2))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7105")
         .segment_name("epoch-fence-newer")
@@ -7597,7 +7595,6 @@ fn builder_rejects_stale_epoch_when_newer_runtime_is_reachable() {
         .expect("newer runtime should build");
 
     let error = match StoreClientBuilder::new(metadata, "epoch-fence")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7106")
         .segment_name("epoch-fence-older")
@@ -7639,7 +7636,6 @@ fn builder_rejects_live_segment_name_reuse_across_runtimes() {
 fn builder_ignores_stale_segment_owner_index_without_live_lease() {
     let inner = Arc::new(InMemoryMetadataBackend::new());
     let owner = StoreClientBuilder::new(inner.clone(), "stale-owner")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7110")
         .segment_name("stale-shared-segment")
@@ -7651,7 +7647,6 @@ fn builder_ignores_stale_segment_owner_index_without_live_lease() {
 
     let metadata = Arc::new(NoHotPathMetadataBackend::with_metadata_lists_blocked(inner));
     let _replacement = StoreClientBuilder::new(metadata, "replacement-owner")
-        .epoch(ClientEpoch(1))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7111")
         .segment_name("stale-shared-segment")
