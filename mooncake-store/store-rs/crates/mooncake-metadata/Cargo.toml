@@ -11,3 +11,6 @@ redis = "0.27"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

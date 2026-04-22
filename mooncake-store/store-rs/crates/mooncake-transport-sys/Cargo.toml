@@ -6,3 +6,6 @@ build = "build.rs"
 
 [dependencies]
 libc = "0.2"
+
+[lints]
+workspace = true

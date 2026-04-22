@@ -24,3 +24,6 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 mooncake-metadata = { path = "../mooncake-metadata" }
+
+[lints]
+workspace = true

@@ -15,6 +15,9 @@ edition = "2021"
 version = "0.1.0"
 license = "Apache-2.0"
 
+[workspace.lints.rust]
+warnings = "deny"
+
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
