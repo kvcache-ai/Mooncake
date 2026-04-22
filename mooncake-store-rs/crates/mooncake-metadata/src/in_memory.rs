@@ -201,7 +201,11 @@ impl MetadataBackend for InMemoryMetadataBackend {
         }
 
         let active_max = Self::prune_stale_epochs(&mut state, &stable_id_key);
-        let hwm = state.client_epoch_hwm.get(&stable_id_key).copied().unwrap_or(0);
+        let hwm = state
+            .client_epoch_hwm
+            .get(&stable_id_key)
+            .copied()
+            .unwrap_or(0);
         let floor = active_max.max(hwm);
         let allow_same_epoch_reclaim = new_epoch == hwm && new_epoch > active_max;
         if new_epoch <= floor && !allow_same_epoch_reclaim {
