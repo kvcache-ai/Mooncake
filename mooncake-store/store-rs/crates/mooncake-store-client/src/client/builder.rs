@@ -21,38 +21,9 @@ fn validate_runtime_conflicts(
     local: &ClientLease,
     local_segment: Option<&SegmentName>,
 ) -> Result<()> {
-    if let Some(remote) = metadata.get_live_runtime_by_stable_id(&local.runtime.stable_id)? {
-        validate_stable_id_conflict(control_client, local, &remote)?;
-    }
     if let Some(segment) = local_segment {
         validate_segment_owner_conflict(metadata, control_client, local, segment)?;
     }
-    Ok(())
-}
-
-fn validate_stable_id_conflict(
-    control_client: &ControlPlaneClient,
-    local: &ClientLease,
-    remote: &ClientLease,
-) -> Result<()> {
-    if !validate_reachable_runtime(control_client, local, remote)? {
-        return Ok(());
-    }
-
-    if remote.runtime.epoch > local.runtime.epoch {
-        return Err(StoreError::StaleEpoch(format!(
-            "runtime {} is fenced by newer live runtime {}",
-            local.runtime, remote.runtime
-        )));
-    }
-
-    if remote.runtime.epoch == local.runtime.epoch {
-        return Err(StoreError::Conflict(format!(
-            "runtime {} is already live",
-            remote.runtime
-        )));
-    }
-
     Ok(())
 }
 
