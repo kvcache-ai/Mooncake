@@ -5,8 +5,9 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2"
-mooncake-store-core = { path = "../mooncake-store-core" }
-mooncake-transport = { path = "../mooncake-transport" }
+mooncake-store-core           = { path = "../mooncake-store-core" }
+mooncake-store-transport-core = { path = "../mooncake-store-transport-core" }
+mooncake-transport            = { path = "../mooncake-transport" }
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

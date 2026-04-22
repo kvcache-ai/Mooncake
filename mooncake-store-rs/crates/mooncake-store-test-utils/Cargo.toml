@@ -5,8 +5,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
-mooncake-store-core = { path = "../mooncake-store-core" }
-mooncake-metadata   = { path = "../mooncake-metadata" }
+mooncake-store-core           = { path = "../mooncake-store-core" }
+mooncake-store-transport-core = { path = "../mooncake-store-transport-core" }
+mooncake-transport            = { path = "../mooncake-transport" }
+mooncake-metadata             = { path = "../mooncake-metadata" }
 parking_lot.workspace = true
 
 [lints]

@@ -181,7 +181,7 @@ impl StoreClientBuilder {
     }
 
     pub fn with_tent(mut self, engine: Arc<TentEngine>) -> Self {
-        self.transport = Some(engine);
+        self.transport = Some(Arc::new(TentStoreTransport(engine)));
         self
     }
 

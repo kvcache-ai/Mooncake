@@ -100,43 +100,7 @@ impl From<BatchWaitError> for StoreError {
     }
 }
 
-pub trait StoreTransport: Send + Sync {
-    fn segment_name(&self) -> Result<String>;
-    fn rpc_server_address(&self) -> Result<(String, u16)>;
-    fn open_segment(&self, segment_name: &str) -> Result<u64>;
-    fn close_segment(&self, handle: u64) -> Result<()>;
-    fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo>;
-    fn republish_local_metadata(&self) -> Result<()> {
-        Ok(())
-    }
-    fn adopt_local_memory(&self, _addr: *mut c_void, _size: usize, _location: &str) -> Result<()> {
-        Ok(())
-    }
-    fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void>;
-    fn free_memory(&self, addr: *mut c_void) -> Result<()>;
-    fn max_registration_bytes(&self) -> Option<usize> {
-        None
-    }
-    fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
-    fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
-    fn allocate_batch(&self, batch_size: usize) -> Result<u64>;
-    fn free_batch(&self, batch_id: u64) -> Result<()>;
-    fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()>;
-    fn submit_with_hints(
-        &self,
-        batch_id: u64,
-        requests: &[TransferRequest],
-        _hints: &TransferBatchHints,
-    ) -> Result<()> {
-        self.submit(batch_id, requests)
-    }
-    fn task_status(&self, batch_id: u64, task_id: usize) -> Result<TransferProgress>;
-    fn overall_status(&self, batch_id: u64) -> Result<TransferProgress>;
-}
-
-pub trait StoreTransportFactory: Send + Sync {
-    fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>>;
-}
+pub use mooncake_store_transport_core::{StoreTransport, StoreTransportFactory};
 
 pub(crate) fn registration_chunks(
     addr: *mut c_void,
@@ -252,11 +216,13 @@ impl TentTransportFactory {
     }
 }
 
+pub struct TentStoreTransport(pub Arc<TentEngine>);
+
 impl StoreTransportFactory for TentTransportFactory {
     fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>> {
-        Ok(Arc::new(TentEngine::new(
+        Ok(Arc::new(TentStoreTransport(Arc::new(TentEngine::new(
             &self.config.clone().set("local_segment_name", segment_name),
-        )?))
+        )?))))
     }
 }
 
@@ -290,41 +256,41 @@ impl StoreTransportFactory for ClassicTeTransportFactory {
     }
 }
 
-impl StoreTransport for TentEngine {
+impl StoreTransport for TentStoreTransport {
     fn segment_name(&self) -> Result<String> {
-        TentEngine::segment_name(self)
+        TentEngine::segment_name(&self.0)
     }
 
     fn rpc_server_address(&self) -> Result<(String, u16)> {
-        TentEngine::rpc_server_address(self)
+        TentEngine::rpc_server_address(&self.0)
     }
 
     fn open_segment(&self, segment_name: &str) -> Result<u64> {
-        TentEngine::open_segment(self, segment_name)
+        TentEngine::open_segment(&self.0, segment_name)
     }
 
     fn close_segment(&self, handle: u64) -> Result<()> {
-        TentEngine::close_segment(self, handle)
+        TentEngine::close_segment(&self.0, handle)
     }
 
     fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo> {
-        TentEngine::get_segment_info(self, handle)
+        TentEngine::get_segment_info(&self.0, handle)
     }
 
     fn republish_local_metadata(&self) -> Result<()> {
-        TentEngine::republish_local_metadata(self)
+        TentEngine::republish_local_metadata(&self.0)
     }
 
     fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void> {
-        TentEngine::allocate_memory(self, size, location)
+        TentEngine::allocate_memory(&self.0, size, location)
     }
 
     fn free_memory(&self, addr: *mut c_void) -> Result<()> {
-        TentEngine::free_memory(self, addr)
+        TentEngine::free_memory(&self.0, addr)
     }
 
     fn max_registration_bytes(&self) -> Option<usize> {
-        TentEngine::max_registration_bytes(self)
+        TentEngine::max_registration_bytes(&self.0)
     }
 
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
@@ -332,7 +298,7 @@ impl StoreTransport for TentEngine {
             addr,
             size,
             self.max_registration_bytes(),
-            |chunk_addr, chunk_len| TentEngine::register_memory(self, chunk_addr, chunk_len),
+            |chunk_addr, chunk_len| TentEngine::register_memory(&self.0, chunk_addr, chunk_len),
         )
     }
 
@@ -341,20 +307,20 @@ impl StoreTransport for TentEngine {
             addr,
             size,
             self.max_registration_bytes(),
-            |chunk_addr, chunk_len| TentEngine::unregister_memory(self, chunk_addr, chunk_len),
+            |chunk_addr, chunk_len| TentEngine::unregister_memory(&self.0, chunk_addr, chunk_len),
         )
     }
 
     fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
-        TentEngine::allocate_batch(self, batch_size)
+        TentEngine::allocate_batch(&self.0, batch_size)
     }
 
     fn free_batch(&self, batch_id: u64) -> Result<()> {
-        TentEngine::free_batch(self, batch_id)
+        TentEngine::free_batch(&self.0, batch_id)
     }
 
     fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()> {
-        TentEngine::submit(self, batch_id, requests)
+        TentEngine::submit(&self.0, batch_id, requests)
     }
 
     fn submit_with_hints(
@@ -363,15 +329,15 @@ impl StoreTransport for TentEngine {
         requests: &[TransferRequest],
         _hints: &TransferBatchHints,
     ) -> Result<()> {
-        TentEngine::submit(self, batch_id, requests)
+        TentEngine::submit(&self.0, batch_id, requests)
     }
 
     fn task_status(&self, batch_id: u64, task_id: usize) -> Result<TransferProgress> {
-        TentEngine::task_status(self, batch_id, task_id)
+        TentEngine::task_status(&self.0, batch_id, task_id)
     }
 
     fn overall_status(&self, batch_id: u64) -> Result<TransferProgress> {
-        TentEngine::overall_status(self, batch_id)
+        TentEngine::overall_status(&self.0, batch_id)
     }
 }
 
