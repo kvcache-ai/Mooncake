@@ -78,15 +78,6 @@ impl DummySession {
         Ok(session)
     }
 
-    pub fn with_rpc_timeout(mut self, timeout: Duration) -> Self {
-        if timeout.is_zero() {
-            self.rpc_timeout = Duration::from_millis(1);
-        } else {
-            self.rpc_timeout = timeout;
-        }
-        self
-    }
-
     pub fn server_addr(&self) -> &str {
         &self.server_addr
     }
