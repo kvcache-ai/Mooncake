@@ -33,6 +33,7 @@ Environment:
   MC_STORE_RS_TEST_PROTOCOL   Transport protocol (`tcp` by default)
   MOONCAKE_UPSTREAM_DIR       Mooncake upstream submodule path
   MOONCAKE_UPSTREAM_BUILD_DIR Explicit upstream build directory override
+  MC_STORE_RS_CLIENT_RW_BIN   Optional explicit standalone client binary path.
 EOF
 }
 
@@ -124,10 +125,15 @@ mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
-echo "==> building standalone mooncake-store-client binary"
-cargo build -p mooncake-store-py
+if [[ -n "${MC_STORE_RS_CLIENT_RW_BIN:-}" ]]; then
+  echo "==> reusing prebuilt standalone mooncake-store-client binary"
+  BIN="${MC_STORE_RS_CLIENT_RW_BIN}"
+else
+  echo "==> building standalone mooncake-store-client binary"
+  cargo build -p mooncake-store-py
+  BIN="${REPO_ROOT}/target/debug/mooncake-store-client"
+fi
 
-BIN="${REPO_ROOT}/target/debug/mooncake-store-client"
 if [[ ! -x "${BIN}" ]]; then
   echo "expected binary was not produced at ${BIN}" >&2
   exit 1
