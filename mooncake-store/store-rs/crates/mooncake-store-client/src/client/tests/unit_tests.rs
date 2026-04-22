@@ -597,3 +597,242 @@ fn store_client_builder_state_is_reflected_in_lease() {
     let lease = client.lease();
     assert_eq!(lease.state, ClientLifecycleState::Standby);
 }
+
+// ===========================================================================
+// StoreError — Display and static bounds
+// ===========================================================================
+
+#[test]
+fn error_not_found_display() {
+    let err = mooncake_store_core::StoreError::NotFound("the-key".to_string());
+    let s = format!("{err}");
+    assert!(s.contains("not found"), "Display must mention 'not found'");
+    assert!(
+        s.contains("the-key"),
+        "Display must include the key payload"
+    );
+}
+
+#[test]
+fn error_conflict_display() {
+    let err = mooncake_store_core::StoreError::Conflict("version mismatch".to_string());
+    let s = format!("{err}");
+    assert!(s.contains("conflict"));
+    assert!(s.contains("version mismatch"));
+}
+
+#[test]
+fn error_stale_epoch_display() {
+    let err = mooncake_store_core::StoreError::StaleEpoch("epoch=1".to_string());
+    let s = format!("{err}");
+    assert!(s.contains("stale epoch"));
+    assert!(s.contains("epoch=1"));
+}
+
+#[test]
+fn error_transport_display() {
+    let err = mooncake_store_core::StoreError::Transport("broken pipe".to_string());
+    let s = format!("{err}");
+    assert!(s.contains("transport"));
+    assert!(s.contains("broken pipe"));
+}
+
+#[test]
+fn error_metadata_display() {
+    let err = mooncake_store_core::StoreError::Metadata("etcd unavailable".to_string());
+    let s = format!("{err}");
+    assert!(s.contains("metadata"));
+    assert!(s.contains("etcd unavailable"));
+}
+
+#[test]
+fn error_allocator_display() {
+    let err = mooncake_store_core::StoreError::Allocator("out of space".to_string());
+    let s = format!("{err}");
+    assert!(s.contains("allocator"));
+    assert!(s.contains("out of space"));
+}
+
+#[test]
+fn error_invalid_state_display() {
+    let err = mooncake_store_core::StoreError::InvalidState("draining".to_string());
+    let s = format!("{err}");
+    assert!(s.contains("invalid state"));
+    assert!(s.contains("draining"));
+}
+
+#[test]
+fn error_unsupported_display() {
+    let err = mooncake_store_core::StoreError::Unsupported("evacuate".to_string());
+    let s = format!("{err}");
+    assert!(s.contains("unsupported"));
+    assert!(s.contains("evacuate"));
+}
+
+#[test]
+fn error_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<mooncake_store_core::StoreError>();
+}
+
+#[test]
+fn error_propagates_through_question_mark() {
+    fn inner() -> Result<(), mooncake_store_core::StoreError> {
+        Err(mooncake_store_core::StoreError::NotFound("k".to_string()))
+    }
+    fn outer() -> Result<(), mooncake_store_core::StoreError> {
+        inner()?;
+        Ok(())
+    }
+    match outer() {
+        Err(mooncake_store_core::StoreError::NotFound(k)) => assert_eq!(k, "k"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+// ===========================================================================
+// Core types — construction, ordering, defaults
+// ===========================================================================
+
+#[test]
+fn core_client_epoch_ordering() {
+    assert!(ClientEpoch(1) < ClientEpoch(2));
+    assert!(ClientEpoch(10) > ClientEpoch(5));
+    assert_eq!(ClientEpoch(7), ClientEpoch(7));
+}
+
+#[test]
+fn core_route_version_next_increments() {
+    use mooncake_store_core::RouteVersion;
+    assert_eq!(RouteVersion(0).next(), RouteVersion(1));
+    assert_eq!(RouteVersion(99).next(), RouteVersion(100));
+}
+
+#[test]
+fn core_route_version_next_saturates() {
+    use mooncake_store_core::RouteVersion;
+    let maxed = RouteVersion(u64::MAX);
+    assert_eq!(maxed.next(), maxed, "next() must saturate at u64::MAX");
+}
+
+#[test]
+fn core_route_version_default_is_zero() {
+    use mooncake_store_core::RouteVersion;
+    assert_eq!(RouteVersion::default(), RouteVersion(0));
+}
+
+#[test]
+fn core_segment_name_construction() {
+    use mooncake_store_core::SegmentName;
+    let n = SegmentName("my-seg".to_string());
+    assert_eq!(n.0, "my-seg");
+    let m = SegmentName("my-seg".to_string());
+    assert_eq!(n, m);
+}
+
+#[test]
+fn core_client_runtime_id_construction() {
+    let r = ClientRuntimeId::new("stable-1", ClientEpoch(3));
+    assert_eq!(r.stable_id.0, "stable-1");
+    assert_eq!(r.epoch, ClientEpoch(3));
+}
+
+#[test]
+fn core_client_stable_id_construction() {
+    use mooncake_store_core::ClientStableId;
+    let s = ClientStableId::new("foo");
+    assert_eq!(s.0, "foo");
+    let t = ClientStableId("foo".to_string());
+    assert_eq!(s, t);
+}
+
+#[test]
+fn core_handoff_kind_variants_distinct() {
+    use mooncake_store_core::HandoffKind;
+    assert_ne!(HandoffKind::HotUpgrade, HandoffKind::HotStandbyPromotion);
+    assert_ne!(HandoffKind::HotUpgrade, HandoffKind::GracefulDrain);
+    assert_ne!(HandoffKind::HotStandbyPromotion, HandoffKind::GracefulDrain);
+}
+
+#[test]
+fn core_client_lifecycle_state_variants_distinct() {
+    assert_ne!(ClientLifecycleState::Active, ClientLifecycleState::Standby);
+    assert_ne!(ClientLifecycleState::Active, ClientLifecycleState::Draining);
+    assert_ne!(
+        ClientLifecycleState::Standby,
+        ClientLifecycleState::Draining
+    );
+}
+
+#[test]
+fn core_segment_lifecycle_state_variants_distinct() {
+    use mooncake_store_core::SegmentLifecycleState;
+    assert_ne!(
+        SegmentLifecycleState::Active,
+        SegmentLifecycleState::Draining
+    );
+    assert_ne!(
+        SegmentLifecycleState::Draining,
+        SegmentLifecycleState::Retired
+    );
+    assert_ne!(
+        SegmentLifecycleState::Active,
+        SegmentLifecycleState::Retired
+    );
+}
+
+// ===========================================================================
+// Copy/Clone round-trip (cheap structural equality)
+// ===========================================================================
+
+#[test]
+fn copy_roundtrip_route_version() {
+    use mooncake_store_core::RouteVersion;
+    let v = RouteVersion(42);
+    let cloned = v;
+    assert_eq!(v, cloned);
+}
+
+#[test]
+fn clone_roundtrip_segment_name() {
+    use mooncake_store_core::SegmentName;
+    let n = SegmentName("alpha".to_string());
+    let c = n.clone();
+    assert_eq!(n, c);
+}
+
+#[test]
+fn copy_roundtrip_handoff_kind() {
+    use mooncake_store_core::HandoffKind;
+    let k = HandoffKind::HotUpgrade;
+    let c = k;
+    assert_eq!(k, c);
+}
+
+#[test]
+fn copy_roundtrip_client_lifecycle_state() {
+    let s = ClientLifecycleState::Standby;
+    let c = s;
+    assert_eq!(s, c);
+}
+
+// ===========================================================================
+// Additional helper-function edge cases
+// ===========================================================================
+
+#[test]
+fn helper_now_ms_returns_reasonable_timestamp() {
+    // now_ms should be a Unix-millis value — strictly greater than year 2000.
+    let t = super::super::now_ms();
+    assert!(
+        t > 946_684_800_000u64,
+        "now_ms must be a real Unix timestamp"
+    );
+}
+
+#[test]
+fn helper_now_ms_is_monotonically_non_decreasing() {
+    let a = super::super::now_ms();
+    let b = super::super::now_ms();
+    assert!(b >= a, "second call must not go backwards");
+}

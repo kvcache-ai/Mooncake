@@ -1028,3 +1028,153 @@ fn stress_rapid_put_remove_cycles_maintain_consistency() {
         );
     }
 }
+
+// ===========================================================================
+// Data integrity — binary, null bytes, patterns
+// ===========================================================================
+
+#[test]
+fn data_integrity_null_bytes_in_value() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("null-seg"));
+    let client = make_writer(&meta, &transport);
+    client.register_local_memory().expect("register");
+
+    let payload = vec![0u8; 128];
+    client.put("null-key", &payload).expect("put");
+    let got = client.get("null-key").expect("get");
+    assert_eq!(got, payload, "null-byte payload must round-trip");
+}
+
+#[test]
+fn data_integrity_repeated_pattern() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("pat-seg"));
+    let client = make_writer(&meta, &transport);
+    client.register_local_memory().expect("register");
+
+    let pattern: Vec<u8> = (0..512).map(|i| ((i * 37) % 256) as u8).collect();
+    client.put("pattern-key", &pattern).expect("put");
+    assert_eq!(client.get("pattern-key").expect("get"), pattern);
+}
+
+#[test]
+fn data_integrity_multiple_overwrites_preserve_latest() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("ow-int-seg"));
+    let client = make_writer(&meta, &transport);
+    client.register_local_memory().expect("register");
+
+    for i in 0..10 {
+        client
+            .put("ow-key", format!("iter-{i}").as_bytes())
+            .expect("put");
+    }
+    let got = client.get("ow-key").expect("get");
+    assert_eq!(got, b"iter-9", "last overwrite must win");
+}
+
+// ===========================================================================
+// Multi-tenant — isolation of exist / size / remove
+// ===========================================================================
+
+#[test]
+fn multi_tenant_is_exist_in_tenant() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("mt-ie-seg"));
+    let client = make_writer(&meta, &transport);
+    client.register_local_memory().expect("register");
+
+    client
+        .put_in_tenant("alpha", "shared", b"a")
+        .expect("put alpha");
+
+    assert!(client.is_exist_in_tenant("alpha", "shared").expect("a"));
+    assert!(!client.is_exist_in_tenant("beta", "shared").expect("b"));
+}
+
+#[test]
+fn multi_tenant_get_size_in_tenant() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("mt-sz-seg"));
+    let client = make_writer(&meta, &transport);
+    client.register_local_memory().expect("register");
+
+    client.put_in_tenant("t1", "sized", b"abcdef").expect("put");
+    assert_eq!(client.get_size_in_tenant("t1", "sized").expect("size"), 6);
+}
+
+#[test]
+fn multi_tenant_remove_in_tenant_does_not_affect_other() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("mt-rm-seg"));
+    let client = make_writer(&meta, &transport);
+    client.register_local_memory().expect("register");
+
+    client.put_in_tenant("a", "k", b"va").expect("put a");
+    client.put_in_tenant("b", "k", b"vb").expect("put b");
+
+    client
+        .remove_in_tenant("a", "k", false)
+        .expect("remove in a");
+
+    assert!(!client.is_exist_in_tenant("a", "k").expect("a gone"));
+    assert!(client.is_exist_in_tenant("b", "k").expect("b remains"));
+}
+
+// ===========================================================================
+// Additional stress — overwrite burst, multi-tenant fanout
+// ===========================================================================
+
+#[test]
+fn stress_rapid_overwrite_100_times() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("ow-stress-seg"));
+    let client = make_writer(&meta, &transport);
+    client.register_local_memory().expect("register");
+
+    for i in 0..100 {
+        client
+            .put("burst-key", format!("v{i}").as_bytes())
+            .expect("put");
+    }
+    let got = client.get("burst-key").expect("get");
+    assert_eq!(got, b"v99", "after 100 overwrites latest value wins");
+}
+
+#[test]
+fn stress_concurrent_multi_tenant_writes() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("mt-conc-seg"));
+    let client = Arc::new(make_writer(&meta, &transport));
+    client.register_local_memory().expect("register");
+
+    let handles: Vec<_> = (0..4)
+        .map(|t| {
+            let client = client.clone();
+            thread::spawn(move || {
+                let tenant = format!("tenant-{t}");
+                for i in 0..20 {
+                    let key = format!("k{i}");
+                    let _ = client.put_in_tenant(&tenant, &key, b"v");
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("no panic");
+    }
+
+    // All 4 tenants * 20 keys must be readable in their own tenant
+    for t in 0..4 {
+        let tenant = format!("tenant-{t}");
+        for i in 0..20 {
+            let key = format!("k{i}");
+            assert!(
+                client.is_exist_in_tenant(&tenant, &key).expect("is_exist"),
+                "tenant={tenant} key={key} must exist"
+            );
+        }
+    }
+}

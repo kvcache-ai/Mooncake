@@ -10789,8 +10789,10 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
 
 mod adversarial;
 mod fault_injection_prop;
+mod lifecycle_tests;
 mod quota_prop;
 mod routing_prop;
+mod routing_tests;
 mod store_client_tests;
 mod transport_prop;
 mod unit_tests;
