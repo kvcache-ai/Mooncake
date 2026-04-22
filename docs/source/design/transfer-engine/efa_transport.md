@@ -134,6 +134,19 @@ cd build && ctest --output-on-failure -R 'efa'
 
 Use `transfer_engine_bench` to measure EFA transport throughput between two nodes.
 
+The following commands are the GPU-to-GPU configuration that produces
+the headline numbers in the [Benchmark Results](#benchmark-results)
+tables (≈ 350 GB/s write on a p5en.48xlarge pair, ≈ 302 GB/s on
+p6-b200.48xlarge). Two things matter the most:
+
+- `--gpu_id=-1` on **both** sides — this fans buffers across every GPU,
+  which in turn lets both NUMA nodes' NICs saturate. Pinning a single
+  GPU (the default `--gpu_id=0`) halves throughput because half the
+  NICs end up cross-NUMA.
+- `--block_size=1048576` (1MB, not the 64 KB default) — each block
+  becomes one `fi_write` / `fi_read`, so larger blocks amortize
+  per-op overhead and are the main knob for hitting line rate.
+
 ### Target Node (receiver)
 
 ```bash
@@ -141,26 +154,15 @@ Use `transfer_engine_bench` to measure EFA transport throughput between two node
     --mode=target \
     --protocol=efa \
     --metadata_server=P2PHANDSHAKE \
-    --buffer_size=4294967296
+    --buffer_size=4294967296 \
+    --gpu_id=-1
 ```
 
 `--buffer_size` must be at least as large as the initiator's
-`--buffer_size`, since the initiator writes into offsets `[0, buffer_size)`
-on the target. Keep these two flags in sync.
-
-> **Note:** `--use_vram` / `--gpu_id` also apply to the target — to
-> mirror a GPU-to-GPU initiator, pass `--gpu_id=-1` (use all GPUs) on
-> both sides. For CPU-to-CPU, build with `-DUSE_CUDA=OFF` **or** pass
-> `--use_vram=false` to the CUDA-enabled binary.
+`--buffer_size` — the initiator writes into offsets `[0, buffer_size)`
+on the target, so keep these in sync.
 
 ### Initiator Node (sender)
-
-The values below are the ones that produce the headline numbers in the
-[Benchmark Results](#benchmark-results) tables. In particular,
-`block_size=1MB` (not the 64 KB default) is what actually lets EFA
-reach line rate; using smaller blocks will look dramatically slower
-(~50 GB/s on an 8×400G host) and is usually the reason a fresh run
-seems "broken".
 
 ```bash
 ./build/mooncake-transfer-engine/example/transfer_engine_bench \
@@ -170,18 +172,27 @@ seems "broken".
     --segment_id=<target_hostname>:<target_port> \
     --operation=write \
     --duration=10 \
-    --threads=32 \
+    --threads=16 \
     --block_size=1048576 \
     --batch_size=128 \
     --buffer_size=4294967296 \
+    --gpu_id=-1 \
     --report_unit=GB
 ```
 
-For GPU-to-GPU, add `--gpu_id=-1` (use all GPUs) on **both** initiator
-and target, and build with `-DUSE_CUDA=ON`. For CPU-to-CPU, build with
-`-DUSE_CUDA=OFF` or pass `--use_vram=false` to the CUDA build.
+Replace `<target_hostname>:<target_port>` with the target node's
+address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
-Replace `<target_hostname>:<target_port>` with the target node's address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
+> **CPU-to-CPU** (no GPUs): build with `-DUSE_CUDA=OFF`, **or** pass
+> `--use_vram=false` to a CUDA-enabled binary. Drop `--gpu_id=-1` in
+> that case — the bench will spread buffers across NUMA nodes instead.
+
+> **Why `threads=16` and not 32:** the SRD shared endpoint caps
+> outstanding WRs per NIC (default 256 — see `MC_MAX_WR`). With
+> `threads × batch ≤ NICs × max_wr` the CQ never saturates; going
+> higher triggers backoff and times out. 32 threads × 128 batch =
+> 4096 slices chasing 16 × 256 = 4096 WRs has no headroom, so the
+> steady-state config settles at 16 threads.
 
 ### Key Parameters
 
