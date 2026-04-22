@@ -404,4 +404,176 @@ mod tests {
         assert_eq!(state.announcement.used_bytes, 96);
         assert_eq!(state.cursor_bytes, 96);
     }
+
+    // -----------------------------------------------------------------------
+    // Adversarial: allocator boundaries (capacity / alignment / overflow)
+    // -----------------------------------------------------------------------
+
+    fn announcement_with(capacity: u64, alignment: u64) -> SegmentAnnouncement {
+        SegmentAnnouncement {
+            owner: ClientRuntimeId::new("node", ClientEpoch(1)),
+            segment_name: SegmentName::new("seg"),
+            capacity_bytes: capacity,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: alignment,
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn reserve_fills_segment_to_exact_capacity_then_next_reserve_fails() {
+        let mut state = StoredSegmentState::new(announcement_with(256, 1));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        let r = state.reserve(&owner, &seg, 256).expect("exact capacity");
+        assert_eq!(r.offset_bytes, 0);
+        assert_eq!(state.cursor_bytes, 256);
+        assert!(matches!(
+            state.reserve(&owner, &seg, 1),
+            Err(StoreError::Allocator(_))
+        ));
+    }
+
+    #[test]
+    fn reserve_with_alignment_one_does_not_pad() {
+        let mut state = StoredSegmentState::new(announcement_with(100, 1));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        let r = state.reserve(&owner, &seg, 7).unwrap();
+        assert_eq!(r.offset_bytes, 0);
+        assert_eq!(state.cursor_bytes, 7);
+    }
+
+    #[test]
+    fn reserve_with_alignment_zero_treated_as_one() {
+        let mut state = StoredSegmentState::new(announcement_with(100, 0));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        let r = state.reserve(&owner, &seg, 5).unwrap();
+        assert_eq!(r.offset_bytes, 0);
+        assert_eq!(r.length_bytes, 5);
+    }
+
+    #[test]
+    fn reserve_with_non_power_of_two_alignment_is_accepted() {
+        let mut state = StoredSegmentState::new(announcement_with(1024, 3));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        let r = state.reserve(&owner, &seg, 1).unwrap();
+        assert_eq!(r.offset_bytes, 0);
+        assert_eq!(state.cursor_bytes, 1);
+    }
+
+    #[test]
+    fn interleaved_reserve_release_coalesces_adjacent_free_spans() {
+        let mut state = StoredSegmentState::new(announcement_with(1024, 64));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        let r0 = state.reserve(&owner, &seg, 64).unwrap();
+        let r1 = state.reserve(&owner, &seg, 64).unwrap();
+        let r2 = state.reserve(&owner, &seg, 64).unwrap();
+        state
+            .release(&owner, &seg, r1.offset_bytes, r1.length_bytes)
+            .unwrap();
+        state
+            .release(&owner, &seg, r0.offset_bytes, r0.length_bytes)
+            .unwrap();
+        assert_eq!(
+            state.free_spans.len(),
+            1,
+            "adjacent spans must coalesce into one"
+        );
+        assert_eq!(state.free_spans[0].offset_bytes, 0);
+        assert_eq!(state.free_spans[0].length_bytes, 128);
+        state
+            .release(&owner, &seg, r2.offset_bytes, r2.length_bytes)
+            .unwrap();
+        assert_eq!(state.cursor_bytes, 0);
+        assert!(state.free_spans.is_empty());
+    }
+
+    #[test]
+    fn release_beyond_capacity_is_rejected() {
+        let mut state = StoredSegmentState::new(announcement_with(256, 1));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        assert!(matches!(
+            state.release(&owner, &seg, 200, 100),
+            Err(StoreError::Allocator(_))
+        ));
+    }
+
+    #[test]
+    fn release_at_u64_max_offset_rejects_without_overflow() {
+        let mut state = StoredSegmentState::new(announcement_with(u64::MAX, 1));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        assert!(matches!(
+            state.release(&owner, &seg, u64::MAX, 1),
+            Err(StoreError::Allocator(_))
+        ));
+    }
+
+    #[test]
+    fn reserve_on_retired_segment_is_rejected() {
+        let mut ann = announcement_with(1024, 1);
+        ann.state = SegmentLifecycleState::Retired;
+        let mut state = StoredSegmentState::new(ann);
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        assert!(matches!(
+            state.reserve(&owner, &seg, 1),
+            Err(StoreError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn many_small_reserves_exhaust_capacity_exactly() {
+        let mut state = StoredSegmentState::new(announcement_with(64, 1));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        for _ in 0..64 {
+            state.reserve(&owner, &seg, 1).expect("byte reserve");
+        }
+        assert!(matches!(
+            state.reserve(&owner, &seg, 1),
+            Err(StoreError::Allocator(_))
+        ));
+    }
+
+    #[test]
+    fn merge_announcement_with_lower_used_bytes_keeps_higher_watermark() {
+        let mut state = StoredSegmentState::new(announcement_with(1024, 64));
+        state.announcement.used_bytes = 512;
+        state.cursor_bytes = 512;
+        let mut lower = announcement_with(1024, 64);
+        lower.used_bytes = 100;
+        state.merge_announcement(&lower);
+        assert_eq!(
+            state.announcement.used_bytes, 512,
+            "merge must not roll back the higher used_bytes watermark"
+        );
+    }
+
+    #[test]
+    fn free_span_reuse_picks_first_fit() {
+        let mut state = StoredSegmentState::new(announcement_with(1024, 1));
+        let owner = state.announcement.owner.clone();
+        let seg = state.announcement.segment_name.clone();
+        let r0 = state.reserve(&owner, &seg, 100).unwrap();
+        let _r1 = state.reserve(&owner, &seg, 200).unwrap();
+        let r2 = state.reserve(&owner, &seg, 50).unwrap();
+        state
+            .release(&owner, &seg, r0.offset_bytes, r0.length_bytes)
+            .unwrap();
+        state
+            .release(&owner, &seg, r2.offset_bytes, r2.length_bytes)
+            .unwrap();
+        let reused = state.reserve(&owner, &seg, 40).unwrap();
+        assert_eq!(
+            reused.offset_bytes, r0.offset_bytes,
+            "first-fit should reuse the earliest free span"
+        );
+    }
 }

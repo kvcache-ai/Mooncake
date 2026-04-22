@@ -882,6 +882,54 @@ mod tests {
 
     use super::InMemoryMetadataBackend;
 
+    use mooncake_store_core::{ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion};
+
+    fn active_lease(stable_id: &str, epoch: u64) -> ClientLease {
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(epoch)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: Default::default(),
+            expires_at_ms: 10_000,
+        }
+    }
+
+    fn sample_segment(owner: &ClientRuntimeId, name: &str, capacity: u64) -> SegmentAnnouncement {
+        SegmentAnnouncement {
+            owner: owner.clone(),
+            segment_name: SegmentName::new(name),
+            capacity_bytes: capacity,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 64,
+            tags: vec![],
+        }
+    }
+
+    fn sample_route(key_str: &str, owner_id: &str, seg_name: &str) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(key_str),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new(owner_id, ClientEpoch(1)),
+                segment_name: SegmentName::new(seg_name),
+                offset: 0,
+                segment_offset: 0,
+                length: 4096,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+        }
+    }
+
     #[test]
     fn segment_reservation_is_aligned_and_monotonic() {
         let metadata = InMemoryMetadataBackend::new();
@@ -1468,5 +1516,255 @@ mod tests {
             .upsert_client_lease(&make_lease("client-a", 1))
             .expect_err("epoch behind active set must be rejected");
         assert!(matches!(rejected, StoreError::StaleEpoch(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial: concurrency + idempotency + error paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_lease_upserts_for_distinct_stable_ids_all_land() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let meta = metadata.clone();
+            handles.push(thread::spawn(move || {
+                meta.upsert_client_lease(&active_lease(&format!("concurrent-{i}"), 1))
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let clients = metadata.list_live_clients().unwrap();
+        assert_eq!(clients.len(), 20);
+    }
+
+    #[test]
+    fn concurrent_cas_insert_on_same_key_exactly_one_winner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let key = ObjectKey::new("cas-race-key");
+        let wins = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let meta = metadata.clone();
+            let k = key.clone();
+            let w = wins.clone();
+            handles.push(thread::spawn(move || {
+                let owner_id = format!("racer-{i}");
+                let route = sample_route("cas-race-key", &owner_id, "seg");
+                let result = meta
+                    .compare_and_swap_object_route(&k, None, Some(&route))
+                    .unwrap();
+                if result.applied {
+                    w.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            wins.load(Ordering::Relaxed),
+            1,
+            "exactly one CAS insert should apply"
+        );
+    }
+
+    #[test]
+    fn concurrent_segment_reserves_are_serialized_without_oversubscribing() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let owner = ClientRuntimeId::new("reserve-node", ClientEpoch(1));
+        metadata
+            .upsert_client_lease(&active_lease("reserve-node", 1))
+            .unwrap();
+        metadata
+            .publish_segment(&sample_segment(&owner, "seg", 640))
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let md = Arc::clone(&metadata);
+            let o = owner.clone();
+            handles.push(thread::spawn(move || {
+                md.reserve_segment(&o, &SegmentName::new("seg"), 64)
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok, 10,
+            "capacity is exactly 10x64 — all reserves must succeed"
+        );
+
+        let no_room = metadata
+            .reserve_segment(&owner, &SegmentName::new("seg"), 1)
+            .expect_err("segment is exhausted");
+        assert!(matches!(no_room, StoreError::Allocator(_)));
+    }
+
+    #[test]
+    fn publish_segment_is_idempotent() {
+        let metadata = InMemoryMetadataBackend::new();
+        let owner = ClientRuntimeId::new("node", ClientEpoch(1));
+        let ann = sample_segment(&owner, "seg", 1024);
+        metadata.publish_segment(&ann).unwrap();
+        metadata.publish_segment(&ann).unwrap();
+        assert_eq!(metadata.list_segments(Some(&owner)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn publish_segment_merges_later_announcement_into_existing_state() {
+        let metadata = InMemoryMetadataBackend::new();
+        let owner = ClientRuntimeId::new("merge-owner", ClientEpoch(1));
+        metadata
+            .publish_segment(&sample_segment(&owner, "merge-seg", 1024))
+            .unwrap();
+
+        let mut updated = sample_segment(&owner, "merge-seg", 2048);
+        updated.state = SegmentLifecycleState::Draining;
+        metadata.publish_segment(&updated).unwrap();
+
+        let segments = metadata.list_segments(Some(&owner)).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].capacity_bytes, 2048);
+        assert_eq!(segments[0].state, SegmentLifecycleState::Draining);
+    }
+
+    #[test]
+    fn unpublish_segment_is_idempotent() {
+        let metadata = InMemoryMetadataBackend::new();
+        let owner = ClientRuntimeId::new("node", ClientEpoch(1));
+        let seg = SegmentName::new("ephemeral");
+        metadata
+            .publish_segment(&sample_segment(&owner, "ephemeral", 1024))
+            .unwrap();
+        metadata.unpublish_segment(&owner, &seg).unwrap();
+        metadata
+            .unpublish_segment(&owner, &seg)
+            .expect("second unpublish must be silent");
+    }
+
+    #[test]
+    fn unpublish_nonexistent_segment_is_silent() {
+        let metadata = InMemoryMetadataBackend::new();
+        let owner = ClientRuntimeId::new("node", ClientEpoch(1));
+        metadata
+            .unpublish_segment(&owner, &SegmentName::new("nonexistent"))
+            .expect("unpublishing unknown segment is a no-op");
+    }
+
+    #[test]
+    fn reserve_on_unpublished_segment_returns_not_found() {
+        let metadata = InMemoryMetadataBackend::new();
+        let owner = ClientRuntimeId::new("node", ClientEpoch(1));
+        let err = metadata
+            .reserve_segment(&owner, &SegmentName::new("missing"), 64)
+            .expect_err("reserve on missing segment must fail");
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn reserve_on_retired_segment_is_rejected() {
+        let metadata = InMemoryMetadataBackend::new();
+        let owner = ClientRuntimeId::new("node", ClientEpoch(1));
+        let mut ann = sample_segment(&owner, "retired-seg", 1024);
+        ann.state = SegmentLifecycleState::Retired;
+        metadata.publish_segment(&ann).unwrap();
+        let err = metadata
+            .reserve_segment(&owner, &SegmentName::new("retired-seg"), 64)
+            .expect_err("retired segment must reject");
+        assert!(matches!(
+            err,
+            StoreError::InvalidState(_) | StoreError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn update_client_state_on_missing_client_returns_not_found() {
+        let metadata = InMemoryMetadataBackend::new();
+        let runtime = ClientRuntimeId::new("phantom", ClientEpoch(1));
+        let err = metadata
+            .update_client_state(&runtime, ClientLifecycleState::Draining)
+            .expect_err("phantom lease has no state to update");
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn cas_with_stale_expected_version_conflicts_without_mutating() {
+        let metadata = InMemoryMetadataBackend::new();
+        let key = ObjectKey::new("stale-cas");
+        let route = sample_route("stale-cas", "owner", "seg");
+        metadata
+            .compare_and_swap_object_route(&key, None, Some(&route))
+            .unwrap();
+
+        let mut updated = route.clone();
+        updated.version = RouteVersion(2);
+        let result = metadata
+            .compare_and_swap_object_route(&key, Some(RouteVersion(999)), Some(&updated))
+            .unwrap();
+        assert!(!result.applied);
+        // Current stored version must still be 1
+        let current = metadata.get_object_route(&key).unwrap().unwrap();
+        assert_eq!(current.version, RouteVersion(1));
+    }
+
+    #[test]
+    fn cas_delete_on_nonexistent_with_expected_none_succeeds() {
+        let metadata = InMemoryMetadataBackend::new();
+        let key = ObjectKey::new("ghost");
+        let result = metadata
+            .compare_and_swap_object_route(&key, None, None)
+            .unwrap();
+        assert!(
+            result.applied,
+            "expected=None with next=None on absent key is a no-op apply"
+        );
+    }
+
+    #[test]
+    fn multiple_segments_for_same_owner_are_all_listed() {
+        let metadata = InMemoryMetadataBackend::new();
+        let owner = ClientRuntimeId::new("multi-owner", ClientEpoch(1));
+        for i in 0..5 {
+            metadata
+                .publish_segment(&sample_segment(&owner, &format!("seg-{i}"), 1024))
+                .unwrap();
+        }
+        assert_eq!(metadata.list_segments(Some(&owner)).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn unicode_object_key_round_trips_through_cas_and_get() {
+        let metadata = InMemoryMetadataBackend::new();
+        let key = ObjectKey::new("α-tenant/β-set/layer-42");
+        let route = sample_route("α-tenant/β-set/layer-42", "owner-1", "seg-1");
+        let result = metadata
+            .compare_and_swap_object_route(&key, None, Some(&route))
+            .unwrap();
+        assert!(result.applied);
+        let found = metadata.get_object_route(&key).unwrap();
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn get_object_route_returns_none_for_missing_key() {
+        let metadata = InMemoryMetadataBackend::new();
+        let got = metadata
+            .get_object_route(&ObjectKey::new("never-stored"))
+            .unwrap();
+        assert!(got.is_none());
     }
 }
