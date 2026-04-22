@@ -181,6 +181,7 @@ pub enum RouteMigrationTaskState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteMigrationTaskSubmitRequest {
     pub authority: String,
     pub tenant: String,
