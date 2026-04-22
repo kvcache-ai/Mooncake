@@ -2320,7 +2320,8 @@ std::optional<RealClient::RegisteredBufferRegion>
 RealClient::resolve_registered_buffer(void *buffer) const {
     std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     const auto target = reinterpret_cast<uintptr_t>(buffer);
-    for (const auto &[registered_buffer, registered_size] : registered_buffer_sizes_) {
+    for (const auto &[registered_buffer, registered_size] :
+         registered_buffer_sizes_) {
         const auto base = reinterpret_cast<uintptr_t>(registered_buffer);
         if (target < base) {
             continue;

@@ -196,13 +196,13 @@ std::string get_writer_shard_key_name(const std::string &base_key,
 
 std::optional<ParsedWriterShardManifest> parse_writer_shard_manifest(
     BufferHandle *buffer_handle) {
-    if (!buffer_handle ||
-        buffer_handle->size() < sizeof(WriterShardManifest)) {
+    if (!buffer_handle || buffer_handle->size() < sizeof(WriterShardManifest)) {
         return std::nullopt;
     }
 
     ParsedWriterShardManifest parsed{};
-    std::memcpy(&parsed.manifest, buffer_handle->ptr(), sizeof(WriterShardManifest));
+    std::memcpy(&parsed.manifest, buffer_handle->ptr(),
+                sizeof(WriterShardManifest));
     if (parsed.manifest.header.magic != kWriterShardManifestMagic ||
         parsed.manifest.header.version != kWriterShardManifestVersion ||
         parsed.manifest.header.header_size != sizeof(WriterShardManifest) ||
@@ -240,19 +240,20 @@ WriterShardManifest build_writer_shard_manifest_from_shape(
     return manifest;
 }
 
-WriterShardManifest build_writer_shard_manifest(const py::handle &tensor,
-                                                TensorDtype dtype_enum,
-                                                const WriterPartitionSpec &writer) {
+WriterShardManifest build_writer_shard_manifest(
+    const py::handle &tensor, TensorDtype dtype_enum,
+    const WriterPartitionSpec &writer) {
     return build_writer_shard_manifest_from_shape(
-        tensor_shape_to_vector(tensor), static_cast<int32_t>(dtype_enum), writer);
+        tensor_shape_to_vector(tensor), static_cast<int32_t>(dtype_enum),
+        writer);
 }
 
-TensorMetadata build_writer_shard_tensor_metadata(const py::handle &full_tensor,
-                                                  const py::handle &shard_tensor,
-                                                  TensorDtype dtype_enum,
-                                                  const WriterPartitionSpec &writer,
-                                                  size_t tensor_size) {
-    ParallelAxisSpec axis_spec{"tp", writer.rank, writer.size, writer.split_dim,
+TensorMetadata build_writer_shard_tensor_metadata(
+    const py::handle &full_tensor, const py::handle &shard_tensor,
+    TensorDtype dtype_enum, const WriterPartitionSpec &writer,
+    size_t tensor_size) {
+    ParallelAxisSpec axis_spec{"tp",         writer.rank,
+                               writer.size,  writer.split_dim,
                                std::nullopt, std::nullopt};
     auto metadata = build_shard_metadata_from_parallelism(
         full_tensor, shard_tensor, dtype_enum, {axis_spec}, tensor_size);
@@ -313,7 +314,8 @@ std::optional<TensorMetadata> build_shard_metadata_from_shapes(
         int64_t local_split_extent = -1;
         if (axes[i].split_dim.has_value()) {
             int split_dim = axes[i].split_dim.value();
-            if (split_dim < 0 || split_dim >= static_cast<int>(local_shape.size())) {
+            if (split_dim < 0 ||
+                split_dim >= static_cast<int>(local_shape.size())) {
                 return std::nullopt;
             }
             local_split_extent = local_shape[split_dim];
@@ -347,8 +349,8 @@ TensorMetadata build_tp_shard_metadata(const py::handle &full_tensor,
                                        TensorDtype dtype_enum, int tp_rank,
                                        int tp_size, int split_dim,
                                        size_t tensor_size) {
-    ParallelAxisSpec axis_spec{"tp", tp_rank, tp_size, split_dim, std::nullopt,
-                               std::nullopt};
+    ParallelAxisSpec axis_spec{"tp",      tp_rank,      tp_size,
+                               split_dim, std::nullopt, std::nullopt};
     auto metadata = build_shard_metadata_from_parallelism(
         full_tensor, shard_tensor, dtype_enum, {axis_spec}, tensor_size);
     return metadata.value_or(TensorMetadata{});
@@ -388,8 +390,8 @@ std::optional<PyTensorInfo> build_direct_parallelism_shard_info(
 }
 
 std::optional<py::object> materialize_shard_tensor(const py::handle &tensor,
-                                                 int split_dim, int rank,
-                                                 int shard_count) {
+                                                   int split_dim, int rank,
+                                                   int shard_count) {
     auto shape = tensor_shape_to_vector(tensor);
     if (split_dim < 0 || split_dim >= static_cast<int>(shape.size()) ||
         shard_count <= 0 || rank < 0 || rank >= shard_count) {
@@ -405,11 +407,12 @@ std::optional<py::object> materialize_shard_tensor(const py::handle &tensor,
             local_shape.append(py::int_(static_cast<int64_t>(
                 dim == static_cast<size_t>(split_dim) ? 0 : shape[dim])));
         }
-        return torch_module().attr("empty")(py::tuple(local_shape),
-                                            py::arg("dtype") = tensor.attr("dtype"));
+        return torch_module().attr("empty")(
+            py::tuple(local_shape), py::arg("dtype") = tensor.attr("dtype"));
     }
 
-    return torch_tensor.attr("narrow")(split_dim, start, size).attr("contiguous")();
+    return torch_tensor.attr("narrow")(split_dim, start, size)
+        .attr("contiguous")();
 }
 
 std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
@@ -439,9 +442,9 @@ std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
 
         auto info = extract_tensor_info(*chunk, key_for_rank(rank));
         if (axes.empty()) {
-            info.metadata = build_tp_shard_metadata(tensor, *chunk, dtype_enum, rank,
-                                                    tp_size, split_dim,
-                                                    info.tensor_size);
+            info.metadata =
+                build_tp_shard_metadata(tensor, *chunk, dtype_enum, rank,
+                                        tp_size, split_dim, info.tensor_size);
         } else {
             auto shard_axes = axes;
             if (!tp_axis_index.has_value()) {
@@ -570,14 +573,14 @@ resolve_parallelism_shard_read_routes(
         ParallelismShardReadStorageRoute::PARALLELISM_SHARD_KEY,
     };
     if (can_read_single_tp_request_from_writer_partition_storage(parallelism)) {
-        routes.push_back(
-            ParallelismShardReadStorageRoute::WRITER_PARTITION_COMPATIBLE_SHARD);
+        routes.push_back(ParallelismShardReadStorageRoute::
+                             WRITER_PARTITION_COMPATIBLE_SHARD);
     }
     return routes;
 }
 
-std::optional<TensorParallelismSpec>
-writer_partition_parallelism_from_metadata(const TensorMetadata &metadata) {
+std::optional<TensorParallelismSpec> writer_partition_parallelism_from_metadata(
+    const TensorMetadata &metadata) {
     auto parallelism = parallelism_from_metadata(metadata);
     if (!parallelism.has_value() || !uses_legacy_tp_storage_key(*parallelism)) {
         return std::nullopt;
@@ -599,13 +602,15 @@ struct ResolvedParallelismWriteRequest {
     std::optional<WriterPartitionSpec> writer_partition;
 };
 
-std::optional<ResolvedParallelismWriteRequest> resolve_parallelism_write_request(
-    const py::object &parallelism_obj, const py::object &writer_partition_obj,
-    const std::string &error_context) {
+std::optional<ResolvedParallelismWriteRequest>
+resolve_parallelism_write_request(const py::object &parallelism_obj,
+                                  const py::object &writer_partition_obj,
+                                  const std::string &error_context) {
     if (!writer_partition_obj.is_none()) {
         if (!parallelism_obj.is_none()) {
-            LOG(ERROR) << error_context
-                       << ": writer_partition cannot be combined with parallelism";
+            LOG(ERROR)
+                << error_context
+                << ": writer_partition cannot be combined with parallelism";
             return std::nullopt;
         }
         auto writer_partition =
@@ -688,13 +693,14 @@ std::optional<py::list> validate_batch_writer_partition_list(
                                        error_context, "writer_partitions");
 }
 
-bool axis_specs_equal(const ParallelAxisSpec &lhs, const ParallelAxisSpec &rhs) {
+bool axis_specs_equal(const ParallelAxisSpec &lhs,
+                      const ParallelAxisSpec &rhs) {
     auto lhs_kind = parse_layout_axis_kind(lhs.kind);
     auto rhs_kind = parse_layout_axis_kind(rhs.kind);
-    return lhs_kind.has_value() && rhs_kind.has_value() && lhs_kind == rhs_kind &&
-           lhs.rank == rhs.rank && lhs.size == rhs.size &&
-           lhs.split_dim == rhs.split_dim && lhs.expert_id == rhs.expert_id &&
-           lhs.stage_id == rhs.stage_id;
+    return lhs_kind.has_value() && rhs_kind.has_value() &&
+           lhs_kind == rhs_kind && lhs.rank == rhs.rank &&
+           lhs.size == rhs.size && lhs.split_dim == rhs.split_dim &&
+           lhs.expert_id == rhs.expert_id && lhs.stage_id == rhs.stage_id;
 }
 
 int canonical_axis_kind_order(LayoutAxisKind kind) {
@@ -775,7 +781,6 @@ bool parallelism_specs_equal_by_kind(const TensorParallelismSpec &lhs,
     return true;
 }
 
-
 bool is_default_replicate_config(const ReplicateConfig &config) {
     return config.replica_num == 1 && !config.with_soft_pin &&
            !config.with_hard_pin && config.preferred_segments.empty() &&
@@ -847,8 +852,9 @@ std::optional<WriterPartitionSpec> parse_writer_partition_spec(
     }
     if (!py::hasattr(obj, "rank") || !py::hasattr(obj, "size") ||
         !py::hasattr(obj, "split_dim")) {
-        LOG(ERROR) << error_context
-                   << ": writer_partition must provide rank, size, and split_dim";
+        LOG(ERROR)
+            << error_context
+            << ": writer_partition must provide rank, size, and split_dim";
         return std::nullopt;
     }
 
@@ -893,8 +899,8 @@ std::optional<WriterShardTensorInfo> build_writer_shard_tensor_info(
         return std::nullopt;
     }
 
-    auto shard_tensor =
-        materialize_shard_tensor(tensor, writer.split_dim, writer.rank, writer.size);
+    auto shard_tensor = materialize_shard_tensor(tensor, writer.split_dim,
+                                                 writer.rank, writer.size);
     if (!shard_tensor.has_value()) {
         LOG(ERROR) << error_context << ": failed to materialize writer shard";
         return std::nullopt;
@@ -902,14 +908,17 @@ std::optional<WriterShardTensorInfo> build_writer_shard_tensor_info(
 
     WriterShardTensorInfo writer_info;
     writer_info.shard_key = get_writer_shard_key_name(key, writer);
-    writer_info.info = extract_tensor_info(*shard_tensor, writer_info.shard_key);
+    writer_info.info =
+        extract_tensor_info(*shard_tensor, writer_info.shard_key);
     writer_info.info.metadata = build_writer_shard_tensor_metadata(
-        tensor, *shard_tensor, dtype_enum, writer, writer_info.info.tensor_size);
+        tensor, *shard_tensor, dtype_enum, writer,
+        writer_info.info.tensor_size);
     if (!writer_info.info.valid()) {
         LOG(ERROR) << error_context << ": invalid writer shard tensor info";
         return std::nullopt;
     }
-    writer_info.manifest = build_writer_shard_manifest(tensor, dtype_enum, writer);
+    writer_info.manifest =
+        build_writer_shard_manifest(tensor, dtype_enum, writer);
     return writer_info;
 }
 
@@ -949,14 +958,15 @@ std::optional<ResolvedTensorRead> probe_parallelism_shard_read(
             std::string read_key = get_parallelism_key_name(key, parallelism);
             std::shared_ptr<BufferHandle> buffer_handle;
             auto metadata = load_metadata(read_key, &buffer_handle);
-            if (!metadata.has_value() ||
-                !parallelism_matches_metadata(parallelism, metadata->metadata)) {
+            if (!metadata.has_value() || !parallelism_matches_metadata(
+                                             parallelism, metadata->metadata)) {
                 return std::nullopt;
             }
             return ResolvedTensorRead{read_key, *metadata,
                                       std::move(buffer_handle)};
         }
-        case ParallelismShardReadStorageRoute::WRITER_PARTITION_COMPATIBLE_SHARD: {
+        case ParallelismShardReadStorageRoute::
+            WRITER_PARTITION_COMPATIBLE_SHARD: {
             const auto &axis = parallelism.axes[0];
             WriterPartitionSpec writer{
                 .rank = axis.rank,
@@ -973,7 +983,8 @@ std::optional<ResolvedTensorRead> probe_parallelism_shard_read(
             auto writer_parallelism =
                 writer_partition_parallelism_from_metadata(metadata->metadata);
             if (!writer_parallelism.has_value() ||
-                !parallelism_matches_metadata(parallelism, metadata->metadata)) {
+                !parallelism_matches_metadata(parallelism,
+                                              metadata->metadata)) {
                 return std::nullopt;
             }
             return ResolvedTensorRead{read_key, *metadata,
@@ -1016,7 +1027,8 @@ std::optional<TensorParallelismSpec> validate_parallelism_spec(
         return std::nullopt;
     }
     if (parallelism->axes.size() > kMaxLayoutAxes) {
-        LOG(ERROR) << error_context << ": axis count exceeds max supported axes";
+        LOG(ERROR) << error_context
+                   << ": axis count exceeds max supported axes";
         return std::nullopt;
     }
 
@@ -1042,8 +1054,8 @@ std::optional<TensorParallelismSpec> validate_parallelism_spec(
         switch (*kind) {
             case LayoutAxisKind::TP:
                 if (!axis.split_dim.has_value()) {
-                    LOG(ERROR) << error_context
-                               << ": TP axis requires split_dim";
+                    LOG(ERROR)
+                        << error_context << ": TP axis requires split_dim";
                     return std::nullopt;
                 }
                 break;
@@ -1056,20 +1068,21 @@ std::optional<TensorParallelismSpec> validate_parallelism_spec(
                 break;
             case LayoutAxisKind::EP:
                 if (!axis.expert_id.has_value()) {
-                    LOG(ERROR) << error_context
-                               << ": EP axis requires expert_id";
+                    LOG(ERROR)
+                        << error_context << ": EP axis requires expert_id";
                     return std::nullopt;
                 }
                 if (axis.split_dim.has_value()) {
-                    LOG(ERROR) << error_context
-                               << ": EP axis must not provide split_dim in this phase";
+                    LOG(ERROR)
+                        << error_context
+                        << ": EP axis must not provide split_dim in this phase";
                     return std::nullopt;
                 }
                 break;
             case LayoutAxisKind::PP:
                 if (!axis.stage_id.has_value()) {
-                    LOG(ERROR) << error_context
-                               << ": PP axis requires stage_id";
+                    LOG(ERROR)
+                        << error_context << ": PP axis requires stage_id";
                     return std::nullopt;
                 }
                 if (axis.split_dim.has_value()) {
@@ -1188,7 +1201,8 @@ bool parallelism_matches_metadata(const TensorParallelismSpec &parallelism,
     return true;
 }
 
-std::optional<TensorParallelismSpec> resolve_tp_compatible_parallelism_from_metadata(
+std::optional<TensorParallelismSpec>
+resolve_tp_compatible_parallelism_from_metadata(
     const TensorParallelismSpec &parallelism, const TensorMetadata &metadata,
     const std::string &error_context) {
     auto stored_parallelism = parallelism_from_metadata(metadata);
@@ -1203,9 +1217,9 @@ std::optional<TensorParallelismSpec> resolve_tp_compatible_parallelism_from_meta
 
     auto request_tp_axis_index = find_tp_axis_index(parallelism.axes);
     auto stored_tp_axis_index = find_tp_axis_index(stored_parallelism->axes);
-    if (!request_tp_axis_index.has_value() || !stored_tp_axis_index.has_value()) {
-        LOG(ERROR) << error_context
-                   << ": reconstruction requires a TP axis";
+    if (!request_tp_axis_index.has_value() ||
+        !stored_tp_axis_index.has_value()) {
+        LOG(ERROR) << error_context << ": reconstruction requires a TP axis";
         return std::nullopt;
     }
     if (*request_tp_axis_index != *stored_tp_axis_index) {
@@ -1215,19 +1229,25 @@ std::optional<TensorParallelismSpec> resolve_tp_compatible_parallelism_from_meta
 
     for (size_t i = 0; i < parallelism.axes.size(); ++i) {
         if (i == *request_tp_axis_index) {
-            const auto request_kind = parse_layout_axis_kind(parallelism.axes[i].kind);
-            const auto stored_kind = parse_layout_axis_kind(stored_parallelism->axes[i].kind);
+            const auto request_kind =
+                parse_layout_axis_kind(parallelism.axes[i].kind);
+            const auto stored_kind =
+                parse_layout_axis_kind(stored_parallelism->axes[i].kind);
             if (!request_kind.has_value() || !stored_kind.has_value() ||
                 request_kind != stored_kind ||
-                parallelism.axes[i].split_dim != stored_parallelism->axes[i].split_dim ||
-                parallelism.axes[i].expert_id != stored_parallelism->axes[i].expert_id ||
-                parallelism.axes[i].stage_id != stored_parallelism->axes[i].stage_id) {
+                parallelism.axes[i].split_dim !=
+                    stored_parallelism->axes[i].split_dim ||
+                parallelism.axes[i].expert_id !=
+                    stored_parallelism->axes[i].expert_id ||
+                parallelism.axes[i].stage_id !=
+                    stored_parallelism->axes[i].stage_id) {
                 LOG(ERROR) << error_context << ": TP axis metadata mismatch";
                 return std::nullopt;
             }
             continue;
         }
-        if (!axis_specs_equal(parallelism.axes[i], stored_parallelism->axes[i])) {
+        if (!axis_specs_equal(parallelism.axes[i],
+                              stored_parallelism->axes[i])) {
             LOG(ERROR) << error_context << ": non-TP axis metadata mismatch";
             return std::nullopt;
         }
@@ -1300,8 +1320,8 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_raw_buffer(
         LOG(ERROR) << operation_name << ": buffer pointer cannot be null";
         return std::nullopt;
     }
-    auto parsed = ParseTensorMetadata(
-        reinterpret_cast<const char *>(buffer_ptr), size);
+    auto parsed =
+        ParseTensorMetadata(reinterpret_cast<const char *>(buffer_ptr), size);
     if (!parsed.has_value()) {
         LOG(ERROR) << operation_name << ": invalid tensor object metadata";
         return std::nullopt;
@@ -1310,15 +1330,15 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_raw_buffer(
 }
 
 std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
-    const ParsedTensorMetadata &parsed, int split_dim, int rank, int shard_count,
-    const char *operation_name) {
-    const auto global_shape = TensorShapeToVector(parsed.metadata.layout.global_shape,
-                                                  parsed.metadata.header.ndim);
-    const auto local_shape = TensorShapeToVector(parsed.metadata.layout.local_shape,
-                                                 parsed.metadata.header.ndim);
+    const ParsedTensorMetadata &parsed, int split_dim, int rank,
+    int shard_count, const char *operation_name) {
+    const auto global_shape = TensorShapeToVector(
+        parsed.metadata.layout.global_shape, parsed.metadata.header.ndim);
+    const auto local_shape = TensorShapeToVector(
+        parsed.metadata.layout.local_shape, parsed.metadata.header.ndim);
     if (split_dim < 0 || split_dim >= static_cast<int>(global_shape.size()) ||
-        global_shape.size() != local_shape.size() || shard_count <= 0 || rank < 0 ||
-        rank >= shard_count) {
+        global_shape.size() != local_shape.size() || shard_count <= 0 ||
+        rank < 0 || rank >= shard_count) {
         LOG(ERROR) << operation_name << ": invalid shard parameters";
         return std::nullopt;
     }
@@ -1332,8 +1352,10 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
         }
         global_numel *= global_shape[dim];
         local_numel *= local_shape[dim];
-        if (static_cast<int>(dim) != split_dim && global_shape[dim] != local_shape[dim]) {
-            LOG(ERROR) << operation_name << ": unsupported non-split local shape";
+        if (static_cast<int>(dim) != split_dim &&
+            global_shape[dim] != local_shape[dim]) {
+            LOG(ERROR) << operation_name
+                       << ": unsupported non-split local shape";
             return std::nullopt;
         }
     }
@@ -1342,13 +1364,15 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
         return std::nullopt;
     }
     if ((local_numel == 0 && parsed.data_bytes != 0) ||
-        (local_numel > 0 && parsed.data_bytes % static_cast<size_t>(local_numel) != 0)) {
+        (local_numel > 0 &&
+         parsed.data_bytes % static_cast<size_t>(local_numel) != 0)) {
         LOG(ERROR) << operation_name << ": invalid tensor byte size";
         return std::nullopt;
     }
 
     const size_t element_size =
-        local_numel == 0 ? 0 : parsed.data_bytes / static_cast<size_t>(local_numel);
+        local_numel == 0 ? 0
+                         : parsed.data_bytes / static_cast<size_t>(local_numel);
     const auto [shard_start, shard_extent] =
         calculate_shard_range(global_shape[split_dim], rank, shard_count);
 
@@ -1360,9 +1384,9 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
     }
     const size_t shard_bytes = static_cast<size_t>(shard_numel) * element_size;
 
-    TensorMetadata metadata = BuildTensorMetadata(
-        parsed.metadata.header.dtype, global_shape, shard_shape,
-        TensorLayoutKind::SHARD);
+    TensorMetadata metadata =
+        BuildTensorMetadata(parsed.metadata.header.dtype, global_shape,
+                            shard_shape, TensorLayoutKind::SHARD);
     metadata.header.data_bytes = shard_bytes;
 
     RawTensorShardWritePlan plan;
@@ -1384,10 +1408,11 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
                              static_cast<size_t>(elements_after) * element_size;
     plan.data_ranges.reserve(static_cast<size_t>(elements_before));
     for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
-        const size_t src_offset = parsed.data_offset +
-                                  static_cast<size_t>(slice_idx * global_shape[split_dim] +
-                                                      shard_start) *
-                                      static_cast<size_t>(elements_after) * element_size;
+        const size_t src_offset =
+            parsed.data_offset +
+            static_cast<size_t>(slice_idx * global_shape[split_dim] +
+                                shard_start) *
+                static_cast<size_t>(elements_after) * element_size;
         plan.data_ranges.emplace_back(src_offset, row_bytes);
     }
     return plan;
@@ -1635,14 +1660,14 @@ class MooncakeStorePyWrapper {
             }
             auto tp_axis_index = find_tp_axis_index(parallelism->axes);
             if (!tp_axis_index.has_value()) {
-                LOG(ERROR) << "ReadTarget(mode=full): full reconstruction requires a TP axis";
+                LOG(ERROR) << "ReadTarget(mode=full): full reconstruction "
+                              "requires a TP axis";
                 return pybind11::none();
             }
             const auto &axis = parallelism->axes[*tp_axis_index];
-            return get_tensor_with_tp_full(key, axis.rank, axis.size,
-                                           axis.split_dim.value_or(0),
-                                           "get_tensor_with_parallelism",
-                                           *parallelism);
+            return get_tensor_with_tp_full(
+                key, axis.rank, axis.size, axis.split_dim.value_or(0),
+                "get_tensor_with_parallelism", *parallelism);
         }
         if (parsed_target->mode == ReadTargetMode::SHARD) {
             auto parallelism = validate_parallelism_spec(
@@ -1733,8 +1758,8 @@ class MooncakeStorePyWrapper {
 
         if (parsed_target->mode == ReadTargetMode::FULL &&
             !parsed_target->parallelism.has_value()) {
-            return build_writer_shard_full_tensor_into_plan(key, buffer_ptr, size,
-                                                            context);
+            return build_writer_shard_full_tensor_into_plan(key, buffer_ptr,
+                                                            size, context);
         }
 
         auto parallelism = validate_parallelism_spec(parsed_target->parallelism,
@@ -1751,8 +1776,8 @@ class MooncakeStorePyWrapper {
                 },
                 key, *parallelism);
             if (!resolved.has_value()) {
-                LOG(ERROR) << context << ": parallelism metadata mismatch for key "
-                           << key;
+                LOG(ERROR) << context
+                           << ": parallelism metadata mismatch for key " << key;
                 return std::nullopt;
             }
             return build_tensor_into_plan(resolved->read_key, buffer_ptr, size,
@@ -1760,8 +1785,8 @@ class MooncakeStorePyWrapper {
         }
 
         if (parsed_target->mode == ReadTargetMode::FULL) {
-            return build_parallelism_full_tensor_into_plan(key, buffer_ptr, size,
-                                                           *parallelism, context);
+            return build_parallelism_full_tensor_into_plan(
+                key, buffer_ptr, size, *parallelism, context);
         }
 
         LOG(ERROR) << context << ": unsupported ReadTarget mode";
@@ -2072,14 +2097,15 @@ class MooncakeStorePyWrapper {
             }
         }
         const auto &representative = sources[representative_index].metadata;
-        const auto representative_local_shape = TensorShapeToVector(
-            representative.metadata.layout.local_shape,
-            representative.metadata.header.ndim);
+        const auto representative_local_shape =
+            TensorShapeToVector(representative.metadata.layout.local_shape,
+                                representative.metadata.header.ndim);
         if (global_shape.size() != representative_local_shape.size()) {
             LOG(ERROR) << context << ": invalid tensor metadata shape";
             return std::nullopt;
         }
-        if (split_dim < 0 || split_dim >= static_cast<int>(global_shape.size())) {
+        if (split_dim < 0 ||
+            split_dim >= static_cast<int>(global_shape.size())) {
             LOG(ERROR) << context << ": invalid split_dim";
             return std::nullopt;
         }
@@ -2091,12 +2117,13 @@ class MooncakeStorePyWrapper {
                 shard_numel *= dim;
             }
             if (shard_numel <= 0 ||
-                representative.data_bytes % static_cast<size_t>(shard_numel) != 0) {
+                representative.data_bytes % static_cast<size_t>(shard_numel) !=
+                    0) {
                 LOG(ERROR) << context << ": invalid shard tensor byte size";
                 return std::nullopt;
             }
-            element_size = representative.data_bytes /
-                           static_cast<size_t>(shard_numel);
+            element_size =
+                representative.data_bytes / static_cast<size_t>(shard_numel);
         }
 
         size_t total_tensor_numel = 1;
@@ -2105,7 +2132,8 @@ class MooncakeStorePyWrapper {
         }
         const size_t total_tensor_bytes = total_tensor_numel * element_size;
         const size_t total_length = sizeof(TensorMetadata) + total_tensor_bytes;
-        if (total_length > size || region->offset + total_length > region->size) {
+        if (total_length > size ||
+            region->offset + total_length > region->size) {
             LOG(ERROR) << context
                        << ": buffer too small for reconstructed tensor";
             return std::nullopt;
@@ -2141,9 +2169,9 @@ class MooncakeStorePyWrapper {
         int64_t shard_offset = 0;
         for (size_t i = 0; i < sources.size(); ++i) {
             const auto &source = sources[i];
-            const auto local_shape = TensorShapeToVector(
-                source.metadata.metadata.layout.local_shape,
-                source.metadata.metadata.header.ndim);
+            const auto local_shape =
+                TensorShapeToVector(source.metadata.metadata.layout.local_shape,
+                                    source.metadata.metadata.header.ndim);
             if (local_shape.size() != global_shape.size()) {
                 LOG(ERROR) << context << ": invalid shard shape for key "
                            << source.read_key;
@@ -2170,12 +2198,13 @@ class MooncakeStorePyWrapper {
             std::vector<size_t> local_strides(local_shape.size(), 1);
             for (int dim = static_cast<int>(local_shape.size()) - 2; dim >= 0;
                  --dim) {
-                local_strides[dim] =
-                    local_strides[dim + 1] * static_cast<size_t>(local_shape[dim + 1]);
+                local_strides[dim] = local_strides[dim + 1] *
+                                     static_cast<size_t>(local_shape[dim + 1]);
             }
 
             const size_t chunk_data_offset = source.metadata.data_offset;
-            for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
+            for (int64_t slice_idx = 0; slice_idx < elements_before;
+                 ++slice_idx) {
                 size_t dst_prefix_linear = 0;
                 size_t src_prefix_linear = 0;
                 int64_t remaining = slice_idx;
@@ -2190,11 +2219,12 @@ class MooncakeStorePyWrapper {
                 }
 
                 const size_t dst_element_index =
-                    dst_prefix_linear +
-                    static_cast<size_t>(shard_start) * global_strides[split_dim];
+                    dst_prefix_linear + static_cast<size_t>(shard_start) *
+                                            global_strides[split_dim];
                 const size_t src_element_index = src_prefix_linear;
                 const size_t copy_elements =
-                    static_cast<size_t>(shard_size) * static_cast<size_t>(elements_after);
+                    static_cast<size_t>(shard_size) *
+                    static_cast<size_t>(elements_after);
 
                 plan.fragments.push_back(TensorIntoFragment{
                     .read_key = source.read_key,
@@ -2208,13 +2238,15 @@ class MooncakeStorePyWrapper {
         }
 
         if (shard_offset != global_shape[split_dim]) {
-            LOG(ERROR) << context
-                       << ": shard extents do not cover reconstructed dimension";
+            LOG(ERROR)
+                << context
+                << ": shard extents do not cover reconstructed dimension";
             return std::nullopt;
         }
         if (plan.fragments.empty() &&
             !(allow_empty_fragments && total_tensor_bytes == 0)) {
-            LOG(ERROR) << context << ": no fragments planned for reconstruction";
+            LOG(ERROR) << context
+                       << ": no fragments planned for reconstruction";
             return std::nullopt;
         }
         return plan;
@@ -2223,15 +2255,17 @@ class MooncakeStorePyWrapper {
     std::optional<TensorIntoPlan> build_tp_full_tensor_into_plan(
         const std::string &key, uintptr_t buffer_ptr, size_t size,
         const ParallelAxisSpec &axis, const std::string &context,
-        const std::optional<TensorParallelismSpec> &parallelism = std::nullopt) {
+        const std::optional<TensorParallelismSpec> &parallelism =
+            std::nullopt) {
         auto reconstruction = load_tp_full_reconstruction_sources(
             key, axis, context, parallelism);
         if (!reconstruction.has_value()) {
             return std::nullopt;
         }
         return build_full_tensor_into_plan_from_sources(
-            buffer_ptr, size, reconstruction->sources, reconstruction->global_shape,
-            reconstruction->split_dim, reconstruction->dtype, context,
+            buffer_ptr, size, reconstruction->sources,
+            reconstruction->global_shape, reconstruction->split_dim,
+            reconstruction->dtype, context,
             reconstruction->allow_empty_fragments);
     }
 
@@ -2239,7 +2273,8 @@ class MooncakeStorePyWrapper {
     load_tp_full_reconstruction_sources(
         const std::string &key, const ParallelAxisSpec &axis,
         const std::string &context,
-        const std::optional<TensorParallelismSpec> &parallelism = std::nullopt) {
+        const std::optional<TensorParallelismSpec> &parallelism =
+            std::nullopt) {
         if (axis.size <= 0) {
             LOG(ERROR) << context << ": tp_size must be positive";
             return std::nullopt;
@@ -2253,7 +2288,8 @@ class MooncakeStorePyWrapper {
                 auto shard_parallelism = *parallelism;
                 auto tp_axis_index = find_tp_axis_index(shard_parallelism.axes);
                 if (!tp_axis_index.has_value()) {
-                    LOG(ERROR) << context << ": missing TP axis in full reconstruction";
+                    LOG(ERROR) << context
+                               << ": missing TP axis in full reconstruction";
                     return std::nullopt;
                 }
                 shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
@@ -2287,10 +2323,12 @@ class MooncakeStorePyWrapper {
         }
 
         reconstruction.global_shape = TensorShapeToVector(
-            reconstruction.sources.front().metadata.metadata.layout.global_shape,
+            reconstruction.sources.front()
+                .metadata.metadata.layout.global_shape,
             reconstruction.sources.front().metadata.metadata.header.ndim);
-        const LayoutAxis *stored_tp_axis = find_layout_axis(
-            reconstruction.sources.front().metadata.metadata, LayoutAxisKind::TP);
+        const LayoutAxis *stored_tp_axis =
+            find_layout_axis(reconstruction.sources.front().metadata.metadata,
+                             LayoutAxisKind::TP);
         if (!stored_tp_axis) {
             LOG(ERROR) << context << ": missing TP axis metadata";
             return std::nullopt;
@@ -2307,8 +2345,8 @@ class MooncakeStorePyWrapper {
     }
 
     std::optional<FullTensorReconstructionSources>
-    load_writer_shard_reconstruction(
-        const std::string &key, const std::string &context) {
+    load_writer_shard_reconstruction(const std::string &key,
+                                     const std::string &context) {
         if (!is_client_initialized()) {
             LOG(ERROR) << context << ": client is not initialized";
             return std::nullopt;
@@ -2317,9 +2355,11 @@ class MooncakeStorePyWrapper {
         std::shared_ptr<BufferHandle> manifest_handle;
         {
             py::gil_scoped_release release_gil;
-            manifest_handle = store_->get_buffer(get_writer_manifest_key_name(key));
+            manifest_handle =
+                store_->get_buffer(get_writer_manifest_key_name(key));
         }
-        auto parsed_manifest = parse_writer_shard_manifest(manifest_handle.get());
+        auto parsed_manifest =
+            parse_writer_shard_manifest(manifest_handle.get());
         if (!parsed_manifest.has_value()) {
             return std::nullopt;
         }
@@ -2328,7 +2368,8 @@ class MooncakeStorePyWrapper {
         const auto &global_shape = manifest.global_shape;
         const int split_dim = manifest.manifest.header.split_dim;
         const int shard_count = manifest.manifest.header.shard_count;
-        if (split_dim < 0 || split_dim >= static_cast<int>(global_shape.size())) {
+        if (split_dim < 0 ||
+            split_dim >= static_cast<int>(global_shape.size())) {
             LOG(ERROR) << context << ": invalid writer split_dim";
             return std::nullopt;
         }
@@ -2341,10 +2382,12 @@ class MooncakeStorePyWrapper {
                 .size = shard_count,
                 .split_dim = split_dim,
             };
-            const std::string shard_key = get_writer_shard_key_name(key, writer);
+            const std::string shard_key =
+                get_writer_shard_key_name(key, writer);
             auto metadata = get_tensor_metadata(shard_key);
             if (!metadata.has_value()) {
-                LOG(ERROR) << context << ": missing writer shard key " << shard_key;
+                LOG(ERROR) << context << ": missing writer shard key "
+                           << shard_key;
                 return std::nullopt;
             }
             auto writer_parallelism =
@@ -2353,7 +2396,8 @@ class MooncakeStorePyWrapper {
                 writer_parallelism->axes[0].rank != shard_rank ||
                 writer_parallelism->axes[0].size != shard_count ||
                 writer_parallelism->axes[0].split_dim != split_dim) {
-                LOG(ERROR) << context << ": writer shard metadata mismatch for key "
+                LOG(ERROR) << context
+                           << ": writer shard metadata mismatch for key "
                            << shard_key;
                 return std::nullopt;
             }
@@ -2376,8 +2420,9 @@ class MooncakeStorePyWrapper {
         }
 
         return build_full_tensor_into_plan_from_sources(
-            buffer_ptr, size, reconstruction->sources, reconstruction->global_shape,
-            reconstruction->split_dim, reconstruction->dtype, context,
+            buffer_ptr, size, reconstruction->sources,
+            reconstruction->global_shape, reconstruction->split_dim,
+            reconstruction->dtype, context,
             reconstruction->allow_empty_fragments);
     }
 
@@ -2406,25 +2451,29 @@ class MooncakeStorePyWrapper {
 
         FullTensorReconstructionSources reconstruction;
         reconstruction.sources.reserve(request_tp_axis->size);
-        for (int shard_rank = 0; shard_rank < request_tp_axis->size; ++shard_rank) {
+        for (int shard_rank = 0; shard_rank < request_tp_axis->size;
+             ++shard_rank) {
             auto shard_parallelism = *canonical_parallelism;
             shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
             const std::string shard_key =
                 get_parallelism_key_name(key, shard_parallelism);
             auto metadata = get_tensor_metadata(shard_key);
             if (!metadata.has_value()) {
-                LOG(ERROR) << context << ": no shard matched requested layout for TP rank "
+                LOG(ERROR) << context
+                           << ": no shard matched requested layout for TP rank "
                            << shard_rank;
                 return std::nullopt;
             }
 
-            auto stored_parallelism = resolve_tp_compatible_parallelism_from_metadata(
-                shard_parallelism, metadata->metadata, context);
+            auto stored_parallelism =
+                resolve_tp_compatible_parallelism_from_metadata(
+                    shard_parallelism, metadata->metadata, context);
             if (!stored_parallelism.has_value() ||
                 !parallelism_specs_equal_by_kind(
                     *canonical_parallelism, *stored_parallelism,
                     true /* allow_tp_rank_mismatch */)) {
-                LOG(ERROR) << context << ": shard metadata mismatch for TP rank "
+                LOG(ERROR) << context
+                           << ": shard metadata mismatch for TP rank "
                            << shard_rank;
                 return std::nullopt;
             }
@@ -2432,8 +2481,9 @@ class MooncakeStorePyWrapper {
                 ReconstructedShardSource{shard_key, *metadata});
         }
 
-        const LayoutAxis *stored_tp_axis = find_layout_axis(
-            reconstruction.sources.front().metadata.metadata, LayoutAxisKind::TP);
+        const LayoutAxis *stored_tp_axis =
+            find_layout_axis(reconstruction.sources.front().metadata.metadata,
+                             LayoutAxisKind::TP);
         if (!stored_tp_axis) {
             LOG(ERROR) << context << ": missing TP axis metadata";
             return std::nullopt;
@@ -2446,7 +2496,8 @@ class MooncakeStorePyWrapper {
         }
 
         reconstruction.global_shape = TensorShapeToVector(
-            reconstruction.sources.front().metadata.metadata.layout.global_shape,
+            reconstruction.sources.front()
+                .metadata.metadata.layout.global_shape,
             reconstruction.sources.front().metadata.metadata.header.ndim);
         reconstruction.dtype =
             reconstruction.sources.front().metadata.metadata.header.dtype;
@@ -2462,8 +2513,9 @@ class MooncakeStorePyWrapper {
             return std::nullopt;
         }
         return build_full_tensor_into_plan_from_sources(
-            buffer_ptr, size, reconstruction->sources, reconstruction->global_shape,
-            reconstruction->split_dim, reconstruction->dtype, context,
+            buffer_ptr, size, reconstruction->sources,
+            reconstruction->global_shape, reconstruction->split_dim,
+            reconstruction->dtype, context,
             reconstruction->allow_empty_fragments);
     }
 
@@ -2533,8 +2585,8 @@ class MooncakeStorePyWrapper {
             }
 
             success[i] = true;
-            for (size_t key_idx = 0; key_idx < all_sizes[i].size() && success[i];
-                 ++key_idx) {
+            for (size_t key_idx = 0;
+                 key_idx < all_sizes[i].size() && success[i]; ++key_idx) {
                 if (range_results[i][key_idx].size() !=
                     all_sizes[i][key_idx].size()) {
                     success[i] = false;
@@ -2598,18 +2650,21 @@ class MooncakeStorePyWrapper {
                 continue;
             }
             int64_t shard_numel = 1;
-            const auto local_shape = TensorShapeToVector(
-                source.metadata.metadata.layout.local_shape,
-                source.metadata.metadata.header.ndim);
+            const auto local_shape =
+                TensorShapeToVector(source.metadata.metadata.layout.local_shape,
+                                    source.metadata.metadata.header.ndim);
             for (auto dim : local_shape) {
                 shard_numel *= dim;
             }
             if (shard_numel <= 0 ||
-                source.metadata.data_bytes % static_cast<size_t>(shard_numel) != 0) {
-                LOG(ERROR) << context << ": invalid writer shard tensor byte size";
+                source.metadata.data_bytes % static_cast<size_t>(shard_numel) !=
+                    0) {
+                LOG(ERROR) << context
+                           << ": invalid writer shard tensor byte size";
                 return py::none();
             }
-            element_size = source.metadata.data_bytes / static_cast<size_t>(shard_numel);
+            element_size =
+                source.metadata.data_bytes / static_cast<size_t>(shard_numel);
             break;
         }
 
@@ -2653,7 +2708,8 @@ class MooncakeStorePyWrapper {
     pybind11::object get_tensor_with_tp_full(
         const std::string &key, int tp_rank, int tp_size, int split_dim,
         const std::string &context,
-        const std::optional<TensorParallelismSpec> &parallelism = std::nullopt) {
+        const std::optional<TensorParallelismSpec> &parallelism =
+            std::nullopt) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
@@ -2671,11 +2727,11 @@ class MooncakeStorePyWrapper {
             .stage_id = std::nullopt,
         };
 
-        auto reconstruction = parallelism.has_value()
-                                  ? load_parallelism_full_reconstruction_sources(
-                                        key, *parallelism, context)
-                                  : load_tp_full_reconstruction_sources(
-                                        key, axis, context);
+        auto reconstruction =
+            parallelism.has_value()
+                ? load_parallelism_full_reconstruction_sources(
+                      key, *parallelism, context)
+                : load_tp_full_reconstruction_sources(key, axis, context);
         if (!reconstruction.has_value()) {
             return pybind11::none();
         }
@@ -2690,14 +2746,15 @@ class MooncakeStorePyWrapper {
                 continue;
             }
             int64_t shard_numel = 1;
-            const auto local_shape = TensorShapeToVector(
-                source.metadata.metadata.layout.local_shape,
-                source.metadata.metadata.header.ndim);
+            const auto local_shape =
+                TensorShapeToVector(source.metadata.metadata.layout.local_shape,
+                                    source.metadata.metadata.header.ndim);
             for (auto dim : local_shape) {
                 shard_numel *= dim;
             }
             if (shard_numel <= 0 ||
-                source.metadata.data_bytes % static_cast<size_t>(shard_numel) != 0) {
+                source.metadata.data_bytes % static_cast<size_t>(shard_numel) !=
+                    0) {
                 LOG(ERROR) << context << ": invalid shard tensor byte size";
                 return pybind11::none();
             }
@@ -2900,9 +2957,8 @@ class MooncakeStorePyWrapper {
     template <typename BatchWriteFromFn>
     std::vector<int> batch_write_tensor_impl(
         const std::vector<std::string> &keys,
-        const std::vector<PyTensorInfo> &infos,
-        const ReplicateConfig &config, const char *operation_name,
-        BatchWriteFromFn &&batch_write_from) {
+        const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config,
+        const char *operation_name, BatchWriteFromFn &&batch_write_from) {
         std::vector<int> results(keys.size(), 0);
 
         {
@@ -2962,7 +3018,8 @@ class MooncakeStorePyWrapper {
     bool ensure_tensor_write_supported(const char *operation_name) const {
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << operation_name
-                       << ": client not initialized or dummy client not supported for tensors";
+                       << ": client not initialized or dummy client not "
+                          "supported for tensors";
             return false;
         }
         return true;
@@ -2977,13 +3034,15 @@ class MooncakeStorePyWrapper {
         ParallelismWriteFn &&parallelism_write,
         WriterPartitionWriteFn &&writer_partition_write) {
         if (!parallelisms.is_none() && !writer_partitions.is_none()) {
-            LOG(ERROR) << error_context
-                       << ": writer_partitions cannot be combined with parallelisms";
+            LOG(ERROR)
+                << error_context
+                << ": writer_partitions cannot be combined with parallelisms";
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         if (value_count != keys.size()) {
-            LOG(ERROR) << error_context << ": values and keys must have the same length";
+            LOG(ERROR) << error_context
+                       << ": values and keys must have the same length";
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -3007,7 +3066,7 @@ class MooncakeStorePyWrapper {
         }
 
         auto writer_partition_list = validate_batch_writer_partition_list(
-        writer_partitions, keys.size(), error_context);
+            writer_partitions, keys.size(), error_context);
         if (!writer_partition_list.has_value()) {
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
@@ -3026,7 +3085,8 @@ class MooncakeStorePyWrapper {
         const ResolvedParallelismWriteRequest &request,
         const ReplicateConfig &config, const char *error_context,
         DirectWriteFn &&direct_write, WriterShardWriteFn &&writer_shard_write,
-        LegacyTpWriteFn &&legacy_tp_write, TpParallelWriteFn &&tp_parallel_write,
+        LegacyTpWriteFn &&legacy_tp_write,
+        TpParallelWriteFn &&tp_parallel_write,
         GenericShardWriteFn &&generic_shard_write) {
         switch (request.route) {
             case ParallelismWriteStorageRoute::DIRECT_FULL_OBJECT:
@@ -3042,8 +3102,8 @@ class MooncakeStorePyWrapper {
                 if (!request.writer_partition.has_value()) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
-                return writer_shard_write(key, tensor, *request.writer_partition,
-                                          config);
+                return writer_shard_write(key, tensor,
+                                          *request.writer_partition, config);
             case ParallelismWriteStorageRoute::LEGACY_SINGLE_TP:
             case ParallelismWriteStorageRoute::TP_SHARDED_PARALLELISM:
             case ParallelismWriteStorageRoute::GENERIC_PARALLELISM_SHARD: {
@@ -3053,9 +3113,9 @@ class MooncakeStorePyWrapper {
                 switch (request.route) {
                     case ParallelismWriteStorageRoute::LEGACY_SINGLE_TP: {
                         const auto &axis = request.parallelism->axes[0];
-                        return legacy_tp_write(
-                            key, tensor, config, axis.rank, axis.size,
-                            axis.split_dim.value_or(0));
+                        return legacy_tp_write(key, tensor, config, axis.rank,
+                                               axis.size,
+                                               axis.split_dim.value_or(0));
                     }
                     case ParallelismWriteStorageRoute::TP_SHARDED_PARALLELISM: {
                         auto tp_axis_index =
@@ -3063,14 +3123,17 @@ class MooncakeStorePyWrapper {
                         if (!tp_axis_index.has_value()) {
                             return to_py_ret(ErrorCode::INVALID_PARAMS);
                         }
-                        const auto &axis = request.parallelism->axes[*tp_axis_index];
-                        return tp_parallel_write(
-                            key, tensor, config, axis.rank, axis.size,
-                            axis.split_dim.value_or(0), request.parallelism->axes);
+                        const auto &axis =
+                            request.parallelism->axes[*tp_axis_index];
+                        return tp_parallel_write(key, tensor, config, axis.rank,
+                                                 axis.size,
+                                                 axis.split_dim.value_or(0),
+                                                 request.parallelism->axes);
                     }
-                    case ParallelismWriteStorageRoute::GENERIC_PARALLELISM_SHARD:
-                        return generic_shard_write(key, tensor, *request.parallelism,
-                                                   config);
+                    case ParallelismWriteStorageRoute::
+                        GENERIC_PARALLELISM_SHARD:
+                        return generic_shard_write(
+                            key, tensor, *request.parallelism, config);
                     default:
                         break;
                 }
@@ -3080,7 +3143,8 @@ class MooncakeStorePyWrapper {
         return to_py_ret(ErrorCode::INVALID_PARAMS);
     }
 
-    pybind11::object decode_tensor_object_buffer(uintptr_t buffer_ptr, size_t size,
+    pybind11::object decode_tensor_object_buffer(uintptr_t buffer_ptr,
+                                                 size_t size,
                                                  const char *operation_name) {
         if (!is_valid_tensor_object_buffer(buffer_ptr, size, operation_name)) {
             return py::none();
@@ -3089,13 +3153,15 @@ class MooncakeStorePyWrapper {
             buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
                              static_cast<int64_t>(size));
         if (tensor.is_none()) {
-            LOG(ERROR) << "Failed to decode tensor buffer for " << operation_name;
+            LOG(ERROR) << "Failed to decode tensor buffer for "
+                       << operation_name;
         }
         return tensor;
     }
 
-    std::string get_tp_write_shard_key(const std::string &base_key, int rank,
-                                       const std::vector<ParallelAxisSpec> &axes) {
+    std::string get_tp_write_shard_key(
+        const std::string &base_key, int rank,
+        const std::vector<ParallelAxisSpec> &axes) {
         if (axes.empty()) {
             return get_tp_key_name(base_key, rank);
         }
@@ -3105,19 +3171,24 @@ class MooncakeStorePyWrapper {
             return std::string();
         }
         shard_axes[*tp_axis_index].rank = rank;
-        return get_parallelism_key_name(base_key, TensorParallelismSpec{shard_axes});
+        return get_parallelism_key_name(base_key,
+                                        TensorParallelismSpec{shard_axes});
     }
 
     template <typename WriteShardFn>
-    int execute_tp_tensor_write_impl(
-        const std::string &key, pybind11::object tensor,
-        const ReplicateConfig &config, int tp_size, int split_dim,
-        const std::vector<ParallelAxisSpec> &axes, const char *error_context,
-        WriteShardFn &&write_shard) {
+    int execute_tp_tensor_write_impl(const std::string &key,
+                                     pybind11::object tensor,
+                                     const ReplicateConfig &config, int tp_size,
+                                     int split_dim,
+                                     const std::vector<ParallelAxisSpec> &axes,
+                                     const char *error_context,
+                                     WriteShardFn &&write_shard) {
         try {
             auto shard_infos = build_tp_shard_infos(
                 tensor, tp_size, split_dim,
-                [&](int rank) { return get_tp_write_shard_key(key, rank, axes); },
+                [&](int rank) {
+                    return get_tp_write_shard_key(key, rank, axes);
+                },
                 axes);
             if (!shard_infos.has_value()) {
                 LOG(ERROR) << error_context;
@@ -3157,18 +3228,19 @@ class MooncakeStorePyWrapper {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
-            auto plan = build_raw_tensor_shard_write_plan(*parsed, split_dim, rank,
-                                                          tp_size, error_context);
+            auto plan = build_raw_tensor_shard_write_plan(
+                *parsed, split_dim, rank, tp_size, error_context);
             if (!plan.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            const auto global_shape = TensorShapeToVector(
-                parsed->metadata.layout.global_shape, parsed->metadata.header.ndim);
+            const auto global_shape =
+                TensorShapeToVector(parsed->metadata.layout.global_shape,
+                                    parsed->metadata.header.ndim);
             const auto local_shape = TensorShapeToVector(
                 plan->metadata.layout.local_shape, plan->metadata.header.ndim);
             if (axes.empty()) {
-                ParallelAxisSpec axis_spec{"tp", rank, tp_size, split_dim,
-                                           std::nullopt, std::nullopt};
+                ParallelAxisSpec axis_spec{
+                    "tp", rank, tp_size, split_dim, std::nullopt, std::nullopt};
                 auto metadata = build_shard_metadata_from_shapes(
                     parsed->metadata.header.dtype, global_shape, local_shape,
                     {axis_spec}, plan->metadata.header.data_bytes);
@@ -3183,8 +3255,9 @@ class MooncakeStorePyWrapper {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 shard_axes[*tp_axis_index].rank = rank;
-                const auto local_shape = TensorShapeToVector(
-                    plan->metadata.layout.local_shape, plan->metadata.header.ndim);
+                const auto local_shape =
+                    TensorShapeToVector(plan->metadata.layout.local_shape,
+                                        plan->metadata.header.ndim);
                 auto metadata = build_shard_metadata_from_shapes(
                     parsed->metadata.header.dtype, global_shape, local_shape,
                     shard_axes, plan->metadata.header.data_bytes);
@@ -3199,7 +3272,8 @@ class MooncakeStorePyWrapper {
                                 plan->metadata.header.data_offset);
             for (const auto &[src_offset, part_size] : plan->data_ranges) {
                 values.emplace_back(
-                    reinterpret_cast<const char *>(buffer_ptr + src_offset), part_size);
+                    reinterpret_cast<const char *>(buffer_ptr + src_offset),
+                    part_size);
             }
             int ret = write_parts(shard_key, values, config);
             if (ret != 0) {
@@ -3211,9 +3285,10 @@ class MooncakeStorePyWrapper {
 
     template <typename BatchWriteFn>
     std::vector<int> batch_execute_tp_tensor_write_impl(
-        const std::vector<std::string> &base_keys, const pybind11::list &tensors_list,
-        const ReplicateConfig &config, int tp_size, int split_dim,
-        const char *error_context, BatchWriteFn &&batch_write) {
+        const std::vector<std::string> &base_keys,
+        const pybind11::list &tensors_list, const ReplicateConfig &config,
+        int tp_size, int split_dim, const char *error_context,
+        BatchWriteFn &&batch_write) {
         std::vector<std::string> all_chunk_keys;
         std::vector<PyTensorInfo> all_chunk_infos;
         std::vector<size_t> processed_indices;
@@ -3229,8 +3304,9 @@ class MooncakeStorePyWrapper {
                 }
 
                 auto shard_infos = build_tp_shard_infos(
-                    tensor, tp_size, split_dim,
-                    [&](int rank) { return get_tp_key_name(base_keys[i], rank); });
+                    tensor, tp_size, split_dim, [&](int rank) {
+                        return get_tp_key_name(base_keys[i], rank);
+                    });
                 if (!shard_infos.has_value()) {
                     final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
@@ -3238,7 +3314,8 @@ class MooncakeStorePyWrapper {
 
                 processed_indices.push_back(i);
                 for (int rank = 0; rank < tp_size; ++rank) {
-                    all_chunk_keys.push_back(get_tp_key_name(base_keys[i], rank));
+                    all_chunk_keys.push_back(
+                        get_tp_key_name(base_keys[i], rank));
                     all_chunk_infos.push_back((*shard_infos)[rank]);
                 }
             }
@@ -3288,22 +3365,24 @@ class MooncakeStorePyWrapper {
                 if (!request.writer_partition.has_value()) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
-                return writer_shard_from_write(key, buffer_ptr, size,
-                                               *request.writer_partition, config);
+                return writer_shard_from_write(
+                    key, buffer_ptr, size, *request.writer_partition, config);
             case ParallelismWriteStorageRoute::LEGACY_SINGLE_TP:
             case ParallelismWriteStorageRoute::TP_SHARDED_PARALLELISM: {
                 if (!request.parallelism.has_value()) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
-                auto tp_axis_index = find_tp_axis_index(request.parallelism->axes);
+                auto tp_axis_index =
+                    find_tp_axis_index(request.parallelism->axes);
                 if (!tp_axis_index.has_value()) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 const auto &axis = request.parallelism->axes[*tp_axis_index];
-                const auto axes = request.route ==
-                                          ParallelismWriteStorageRoute::LEGACY_SINGLE_TP
-                                      ? std::vector<ParallelAxisSpec>{}
-                                      : request.parallelism->axes;
+                const auto axes =
+                    request.route ==
+                            ParallelismWriteStorageRoute::LEGACY_SINGLE_TP
+                        ? std::vector<ParallelAxisSpec>{}
+                        : request.parallelism->axes;
                 return tp_shard_from_write(key, buffer_ptr, size, axis.size,
                                            axis.split_dim.value_or(0), axes,
                                            config);
@@ -3350,9 +3429,10 @@ class MooncakeStorePyWrapper {
         return put_tensor_impl(key, info, config);
     }
 
-    int put_tensor_with_writer_shards(const std::string &key, pybind11::object tensor,
-                                      const WriterPartitionSpec &writer,
-                                      const ReplicateConfig &config = ReplicateConfig{}) {
+    int put_tensor_with_writer_shards(
+        const std::string &key, pybind11::object tensor,
+        const WriterPartitionSpec &writer,
+        const ReplicateConfig &config = ReplicateConfig{}) {
         if (!ensure_tensor_write_supported("put_tensor_with_writer_shards")) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
@@ -3363,7 +3443,8 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        int ret = put_tensor_impl(writer_info->shard_key, writer_info->info, config);
+        int ret =
+            put_tensor_impl(writer_info->shard_key, writer_info->info, config);
         if (ret != 0) {
             return ret;
         }
@@ -3371,7 +3452,8 @@ class MooncakeStorePyWrapper {
                                  writer_info->manifest, config);
     }
 
-    int put_direct_parallelism_shard(const std::string &key, pybind11::object tensor,
+    int put_direct_parallelism_shard(const std::string &key,
+                                     pybind11::object tensor,
                                      const TensorParallelismSpec &parallelism,
                                      const ReplicateConfig &config) {
         auto info =
@@ -3379,8 +3461,8 @@ class MooncakeStorePyWrapper {
         if (!info.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return put_tensor_impl(get_parallelism_key_name(key, parallelism), *info,
-                               config);
+        return put_tensor_impl(get_parallelism_key_name(key, parallelism),
+                               *info, config);
     }
 
     int put_tensor_with_writer_shards_from(
@@ -3393,14 +3475,15 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        auto plan = build_raw_tensor_shard_write_plan(*parsed, writer.split_dim,
-                                                      writer.rank, writer.size,
-                                                      "put_tensor_with_parallelism_from");
+        auto plan = build_raw_tensor_shard_write_plan(
+            *parsed, writer.split_dim, writer.rank, writer.size,
+            "put_tensor_with_parallelism_from");
         if (!plan.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        ParallelAxisSpec axis_spec{"tp", writer.rank, writer.size, writer.split_dim,
+        ParallelAxisSpec axis_spec{"tp",         writer.rank,
+                                   writer.size,  writer.split_dim,
                                    std::nullopt, std::nullopt};
         auto metadata = build_shard_metadata_from_shapes(
             parsed->metadata.header.dtype,
@@ -3418,20 +3501,21 @@ class MooncakeStorePyWrapper {
         values.emplace_back(reinterpret_cast<const char *>(&plan->metadata),
                             plan->metadata.header.data_offset);
         for (const auto &[src_offset, part_size] : plan->data_ranges) {
-            values.emplace_back(reinterpret_cast<const char *>(buffer_ptr + src_offset),
-                                part_size);
+            values.emplace_back(
+                reinterpret_cast<const char *>(buffer_ptr + src_offset),
+                part_size);
         }
 
         int ret;
         {
             py::gil_scoped_release release_gil;
-            ret = store_->put_parts(get_writer_shard_key_name(key, writer), values,
-                                    config);
+            ret = store_->put_parts(get_writer_shard_key_name(key, writer),
+                                    values, config);
         }
         if (ret != 0) {
             LOG(ERROR) << "put_parts failed for writer shard key "
-                       << get_writer_shard_key_name(key, writer) << " with code "
-                       << ret;
+                       << get_writer_shard_key_name(key, writer)
+                       << " with code " << ret;
             return ret;
         }
         return put_manifest_impl(
@@ -3443,10 +3527,10 @@ class MooncakeStorePyWrapper {
             config);
     }
 
-    int put_direct_parallelism_shard_from(const std::string &key,
-                                          uintptr_t buffer_ptr, size_t size,
-                                          const TensorParallelismSpec &parallelism,
-                                          const ReplicateConfig &config) {
+    int put_direct_parallelism_shard_from(
+        const std::string &key, uintptr_t buffer_ptr, size_t size,
+        const TensorParallelismSpec &parallelism,
+        const ReplicateConfig &config) {
         auto parsed = parse_tensor_metadata_from_raw_buffer(
             buffer_ptr, size, "put_tensor_with_parallelism_from");
         if (!parsed.has_value()) {
@@ -3460,14 +3544,15 @@ class MooncakeStorePyWrapper {
             if (parallelism.axes[i].split_dim.has_value()) {
                 int split_dim = parallelism.axes[i].split_dim.value();
                 if (split_dim < 0 ||
-                    split_dim >= static_cast<int>(parsed->metadata.header.ndim)) {
+                    split_dim >=
+                        static_cast<int>(parsed->metadata.header.ndim)) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 local_split_extent =
                     parsed->metadata.layout.local_shape.dims[split_dim];
             }
-            auto layout_axis =
-                build_layout_axis_from_spec(parallelism.axes[i], i, local_split_extent);
+            auto layout_axis = build_layout_axis_from_spec(
+                parallelism.axes[i], i, local_split_extent);
             if (!layout_axis.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
@@ -3481,7 +3566,8 @@ class MooncakeStorePyWrapper {
             TensorShapeToVector(parsed->metadata.layout.local_shape,
                                 parsed->metadata.header.ndim),
             TensorLayoutKind::SHARD,
-            std::span<const LayoutAxis>(layout_axes.data(), layout_axes.size()));
+            std::span<const LayoutAxis>(layout_axes.data(),
+                                        layout_axes.size()));
         metadata.header.data_bytes = parsed->data_bytes;
 
         std::string shard_key = get_parallelism_key_name(key, parallelism);
@@ -3514,26 +3600,28 @@ class MooncakeStorePyWrapper {
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const WriterPartitionSpec &writer,
                    const ReplicateConfig &write_config) {
-                return put_tensor_with_writer_shards(write_key, write_tensor, writer,
-                                                     write_config);
+                return put_tensor_with_writer_shards(write_key, write_tensor,
+                                                     writer, write_config);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const ReplicateConfig &write_config, int rank, int size,
                    int split_dim) {
-                return put_tensor_with_tp_impl(write_key, write_tensor, write_config,
-                                               rank, size, split_dim);
+                return put_tensor_with_tp_impl(write_key, write_tensor,
+                                               write_config, rank, size,
+                                               split_dim);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const ReplicateConfig &write_config, int rank, int size,
                    int split_dim, const std::vector<ParallelAxisSpec> &axes) {
-                return put_tensor_with_tp_impl(write_key, write_tensor, write_config,
-                                               rank, size, split_dim, axes);
+                return put_tensor_with_tp_impl(write_key, write_tensor,
+                                               write_config, rank, size,
+                                               split_dim, axes);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const TensorParallelismSpec &parallelism_spec,
                    const ReplicateConfig &write_config) {
-                return put_direct_parallelism_shard(write_key, write_tensor,
-                                                    parallelism_spec, write_config);
+                return put_direct_parallelism_shard(
+                    write_key, write_tensor, parallelism_spec, write_config);
             });
     }
 
@@ -3638,7 +3726,8 @@ class MooncakeStorePyWrapper {
             [this](const std::vector<std::string> &chunk_keys,
                    const std::vector<PyTensorInfo> &chunk_infos,
                    const ReplicateConfig &write_config) {
-                return batch_put_tensor_impl(chunk_keys, chunk_infos, write_config);
+                return batch_put_tensor_impl(chunk_keys, chunk_infos,
+                                             write_config);
             });
     }
 
@@ -3673,8 +3762,8 @@ class MooncakeStorePyWrapper {
             "batch_put_tensor_with_parallelism",
             [this, &keys, &tensors_list, &config]() {
                 if (!is_client_initialized() || use_dummy_client_) {
-                    return std::vector<int>(keys.size(),
-                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                    return std::vector<int>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                 }
                 int validate_result = validate_replicate_config(config);
                 if (validate_result) {
@@ -3682,15 +3771,17 @@ class MooncakeStorePyWrapper {
                 }
                 return batch_put_tensor_impl(keys, tensors_list, config);
             },
-            [this, &keys, &tensors_list, &config](size_t i, const py::handle &parallelism) {
-                return put_tensor_with_parallelism(keys[i], tensors_list[i],
-                                                   py::reinterpret_borrow<py::object>(parallelism),
-                                                   config);
+            [this, &keys, &tensors_list, &config](
+                size_t i, const py::handle &parallelism) {
+                return put_tensor_with_parallelism(
+                    keys[i], tensors_list[i],
+                    py::reinterpret_borrow<py::object>(parallelism), config);
             },
-            [this, &keys, &tensors_list, &config](size_t i, const py::handle &writer_partition) {
-                return put_tensor_with_parallelism(keys[i], tensors_list[i], py::none(),
-                                                   config,
-                                                   py::reinterpret_borrow<py::object>(writer_partition));
+            [this, &keys, &tensors_list, &config](
+                size_t i, const py::handle &writer_partition) {
+                return put_tensor_with_parallelism(
+                    keys[i], tensors_list[i], py::none(), config,
+                    py::reinterpret_borrow<py::object>(writer_partition));
             });
     }
 
@@ -3818,7 +3909,8 @@ class MooncakeStorePyWrapper {
                             "put_tensor_with_parallelism_from")) {
                         return to_py_ret(ErrorCode::INVALID_PARAMS);
                     }
-                    int validate_result = validate_replicate_config(write_config);
+                    int validate_result =
+                        validate_replicate_config(write_config);
                     if (validate_result) return validate_result;
                     py::gil_scoped_release release_gil;
                     return store_->put_from(
@@ -3831,23 +3923,26 @@ class MooncakeStorePyWrapper {
                    size_t write_size, const WriterPartitionSpec &writer,
                    const ReplicateConfig &write_config) {
                 return put_tensor_with_writer_shards_from(
-                    write_key, write_buffer_ptr, write_size, writer, write_config);
+                    write_key, write_buffer_ptr, write_size, writer,
+                    write_config);
             },
             [this](const std::string &write_key, uintptr_t write_buffer_ptr,
                    size_t write_size, int tp_size, int split_dim,
                    const std::vector<ParallelAxisSpec> &axes,
                    const ReplicateConfig &write_config) {
                 return execute_tp_tensor_write_from_impl(
-                    write_key, write_buffer_ptr, write_size, write_config, tp_size,
-                    split_dim, axes, "put_tensor_with_parallelism_from",
+                    write_key, write_buffer_ptr, write_size, write_config,
+                    tp_size, split_dim, axes,
+                    "put_tensor_with_parallelism_from",
                     [this](const std::string &shard_key,
                            const std::vector<std::span<const char>> &values,
                            const ReplicateConfig &parts_config) {
                         py::gil_scoped_release release_gil;
-                        int ret = store_->put_parts(shard_key, values, parts_config);
+                        int ret =
+                            store_->put_parts(shard_key, values, parts_config);
                         if (ret != 0) {
-                            LOG(ERROR) << "put_parts failed for key " << shard_key
-                                       << " with code " << ret;
+                            LOG(ERROR) << "put_parts failed for key "
+                                       << shard_key << " with code " << ret;
                         }
                         return ret;
                     });
@@ -3977,8 +4072,9 @@ class MooncakeStorePyWrapper {
                     }
                     if (keys.size() != buffer_ptrs.size() ||
                         keys.size() != sizes.size()) {
-                        LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes "
-                                      "must have the same length";
+                        LOG(ERROR)
+                            << "Size mismatch: keys, buffer_ptrs, and sizes "
+                               "must have the same length";
                         return std::vector<int>(
                             keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                     }
@@ -3988,7 +4084,8 @@ class MooncakeStorePyWrapper {
                                 "tensor object buffer at index " +
                                     std::to_string(i))) {
                             return std::vector<int>(
-                                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                                keys.size(),
+                                to_py_ret(ErrorCode::INVALID_PARAMS));
                         }
                     }
                     std::vector<void *> buffers;
@@ -4001,12 +4098,14 @@ class MooncakeStorePyWrapper {
                 }
                 return batch_put_tensor_from(keys, buffer_ptrs, sizes);
             },
-            [this, &keys, &buffer_ptrs, &sizes, &config](size_t i, const py::handle &parallelism) {
+            [this, &keys, &buffer_ptrs, &sizes, &config](
+                size_t i, const py::handle &parallelism) {
                 return put_tensor_with_parallelism_from(
                     keys[i], buffer_ptrs[i], sizes[i],
                     py::reinterpret_borrow<py::object>(parallelism), config);
             },
-            [this, &keys, &buffer_ptrs, &sizes, &config](size_t i, const py::handle &writer_partition) {
+            [this, &keys, &buffer_ptrs, &sizes, &config](
+                size_t i, const py::handle &writer_partition) {
                 return put_tensor_with_parallelism_from(
                     keys[i], buffer_ptrs[i], sizes[i], py::none(), config,
                     py::reinterpret_borrow<py::object>(writer_partition));
@@ -4050,7 +4149,8 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const WriterPartitionSpec &writer,
         const ReplicateConfig &config = ReplicateConfig{}) {
-        if (!ensure_tensor_write_supported("upsert_tensor_with_writer_shards")) {
+        if (!ensure_tensor_write_supported(
+                "upsert_tensor_with_writer_shards")) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
@@ -4069,10 +4169,10 @@ class MooncakeStorePyWrapper {
                                     writer_info->manifest, config);
     }
 
-    int upsert_direct_parallelism_shard(const std::string &key,
-                                        pybind11::object tensor,
-                                        const TensorParallelismSpec &parallelism,
-                                        const ReplicateConfig &config) {
+    int upsert_direct_parallelism_shard(
+        const std::string &key, pybind11::object tensor,
+        const TensorParallelismSpec &parallelism,
+        const ReplicateConfig &config) {
         auto info =
             build_direct_parallelism_shard_info(tensor, parallelism.axes, key);
         if (!info.has_value()) {
@@ -4092,14 +4192,15 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        auto plan = build_raw_tensor_shard_write_plan(*parsed, writer.split_dim,
-                                                      writer.rank, writer.size,
-                                                      "upsert_tensor_with_parallelism_from");
+        auto plan = build_raw_tensor_shard_write_plan(
+            *parsed, writer.split_dim, writer.rank, writer.size,
+            "upsert_tensor_with_parallelism_from");
         if (!plan.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        ParallelAxisSpec axis_spec{"tp", writer.rank, writer.size, writer.split_dim,
+        ParallelAxisSpec axis_spec{"tp",         writer.rank,
+                                   writer.size,  writer.split_dim,
                                    std::nullopt, std::nullopt};
         auto metadata = build_shard_metadata_from_shapes(
             parsed->metadata.header.dtype,
@@ -4117,20 +4218,21 @@ class MooncakeStorePyWrapper {
         values.emplace_back(reinterpret_cast<const char *>(&plan->metadata),
                             plan->metadata.header.data_offset);
         for (const auto &[src_offset, part_size] : plan->data_ranges) {
-            values.emplace_back(reinterpret_cast<const char *>(buffer_ptr + src_offset),
-                                part_size);
+            values.emplace_back(
+                reinterpret_cast<const char *>(buffer_ptr + src_offset),
+                part_size);
         }
 
         int ret;
         {
             py::gil_scoped_release release_gil;
-            ret = store_->upsert_parts(get_writer_shard_key_name(key, writer), values,
-                                       config);
+            ret = store_->upsert_parts(get_writer_shard_key_name(key, writer),
+                                       values, config);
         }
         if (ret != 0) {
             LOG(ERROR) << "upsert_parts failed for writer shard key "
-                       << get_writer_shard_key_name(key, writer) << " with code "
-                       << ret;
+                       << get_writer_shard_key_name(key, writer)
+                       << " with code " << ret;
             return ret;
         }
         return upsert_manifest_impl(
@@ -4159,14 +4261,15 @@ class MooncakeStorePyWrapper {
             if (parallelism.axes[i].split_dim.has_value()) {
                 int split_dim = parallelism.axes[i].split_dim.value();
                 if (split_dim < 0 ||
-                    split_dim >= static_cast<int>(parsed->metadata.header.ndim)) {
+                    split_dim >=
+                        static_cast<int>(parsed->metadata.header.ndim)) {
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 local_split_extent =
                     parsed->metadata.layout.local_shape.dims[split_dim];
             }
-            auto layout_axis =
-                build_layout_axis_from_spec(parallelism.axes[i], i, local_split_extent);
+            auto layout_axis = build_layout_axis_from_spec(
+                parallelism.axes[i], i, local_split_extent);
             if (!layout_axis.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
@@ -4180,7 +4283,8 @@ class MooncakeStorePyWrapper {
             TensorShapeToVector(parsed->metadata.layout.local_shape,
                                 parsed->metadata.header.ndim),
             TensorLayoutKind::SHARD,
-            std::span<const LayoutAxis>(layout_axes.data(), layout_axes.size()));
+            std::span<const LayoutAxis>(layout_axes.data(),
+                                        layout_axes.size()));
         metadata.header.data_bytes = parsed->data_bytes;
 
         std::string shard_key = get_parallelism_key_name(key, parallelism);
@@ -4236,7 +4340,8 @@ class MooncakeStorePyWrapper {
             key, tensor, request, config, "upsert_tensor_with_parallelism",
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const ReplicateConfig &write_config) {
-                return upsert_tensor_impl(write_key, write_tensor, write_config);
+                return upsert_tensor_impl(write_key, write_tensor,
+                                          write_config);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const WriterPartitionSpec &writer,
@@ -4276,8 +4381,8 @@ class MooncakeStorePyWrapper {
         if (!request.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return execute_upsert_tensor_with_parallelism_route(key, tensor, *request,
-                                                            config);
+        return execute_upsert_tensor_with_parallelism_route(key, tensor,
+                                                            *request, config);
     }
 
     int upsert_tensor_from(const std::string &key, uintptr_t buffer_ptr,
@@ -4321,39 +4426,45 @@ class MooncakeStorePyWrapper {
                         return to_py_ret(ErrorCode::INVALID_PARAMS);
                     }
                     if (use_dummy_client_) {
-                        LOG(ERROR) << "upsert_tensor_with_parallelism_from is not "
-                                      "supported for dummy client";
+                        LOG(ERROR)
+                            << "upsert_tensor_with_parallelism_from is not "
+                               "supported for dummy client";
                         return to_py_ret(ErrorCode::INVALID_PARAMS);
                     }
-                    int validate_result = validate_replicate_config(write_config);
+                    int validate_result =
+                        validate_replicate_config(write_config);
                     if (validate_result) return validate_result;
                     py::gil_scoped_release release_gil;
                     return store_->upsert_from(write_key, buffer, write_size,
                                                write_config);
                 }
-                return upsert_tensor_from(write_key, write_buffer_ptr, write_size);
+                return upsert_tensor_from(write_key, write_buffer_ptr,
+                                          write_size);
             },
             [this](const std::string &write_key, uintptr_t write_buffer_ptr,
                    size_t write_size, const WriterPartitionSpec &writer,
                    const ReplicateConfig &write_config) {
                 return upsert_tensor_with_writer_shards_from(
-                    write_key, write_buffer_ptr, write_size, writer, write_config);
+                    write_key, write_buffer_ptr, write_size, writer,
+                    write_config);
             },
             [this](const std::string &write_key, uintptr_t write_buffer_ptr,
                    size_t write_size, int tp_size, int split_dim,
                    const std::vector<ParallelAxisSpec> &axes,
                    const ReplicateConfig &write_config) {
                 return execute_tp_tensor_write_from_impl(
-                    write_key, write_buffer_ptr, write_size, write_config, tp_size,
-                    split_dim, axes, "upsert_tensor_with_parallelism_from",
+                    write_key, write_buffer_ptr, write_size, write_config,
+                    tp_size, split_dim, axes,
+                    "upsert_tensor_with_parallelism_from",
                     [this](const std::string &shard_key,
                            const std::vector<std::span<const char>> &values,
                            const ReplicateConfig &parts_config) {
                         py::gil_scoped_release release_gil;
-                        int ret = store_->upsert_parts(shard_key, values, parts_config);
+                        int ret = store_->upsert_parts(shard_key, values,
+                                                       parts_config);
                         if (ret != 0) {
-                            LOG(ERROR) << "upsert_parts failed for key " << shard_key
-                                       << " with code " << ret;
+                            LOG(ERROR) << "upsert_parts failed for key "
+                                       << shard_key << " with code " << ret;
                         }
                         return ret;
                     });
@@ -4449,8 +4560,9 @@ class MooncakeStorePyWrapper {
                             keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                     }
                     if (use_dummy_client_) {
-                        LOG(ERROR) << "batch_upsert_tensor_with_parallelism_from "
-                                      "is not supported for dummy client";
+                        LOG(ERROR)
+                            << "batch_upsert_tensor_with_parallelism_from "
+                               "is not supported for dummy client";
                         return std::vector<int>(
                             keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                     }
@@ -4463,8 +4575,9 @@ class MooncakeStorePyWrapper {
                     }
                     if (keys.size() != buffer_ptrs.size() ||
                         keys.size() != sizes.size()) {
-                        LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes "
-                                      "must have the same length";
+                        LOG(ERROR)
+                            << "Size mismatch: keys, buffer_ptrs, and sizes "
+                               "must have the same length";
                         return std::vector<int>(
                             keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                     }
@@ -4474,7 +4587,8 @@ class MooncakeStorePyWrapper {
                                 "tensor object buffer at index " +
                                     std::to_string(i))) {
                             return std::vector<int>(
-                                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                                keys.size(),
+                                to_py_ret(ErrorCode::INVALID_PARAMS));
                         }
                     }
                     std::vector<void *> buffers;
@@ -4483,16 +4597,19 @@ class MooncakeStorePyWrapper {
                         buffers.push_back(reinterpret_cast<void *>(ptr));
                     }
                     py::gil_scoped_release release_gil;
-                    return store_->batch_upsert_from(keys, buffers, sizes, config);
+                    return store_->batch_upsert_from(keys, buffers, sizes,
+                                                     config);
                 }
                 return batch_upsert_tensor_from(keys, buffer_ptrs, sizes);
             },
-            [this, &keys, &buffer_ptrs, &sizes, &config](size_t i, const py::handle &parallelism) {
+            [this, &keys, &buffer_ptrs, &sizes, &config](
+                size_t i, const py::handle &parallelism) {
                 return upsert_tensor_with_parallelism_from(
                     keys[i], buffer_ptrs[i], sizes[i],
                     py::reinterpret_borrow<py::object>(parallelism), config);
             },
-            [this, &keys, &buffer_ptrs, &sizes, &config](size_t i, const py::handle &writer_partition) {
+            [this, &keys, &buffer_ptrs, &sizes, &config](
+                size_t i, const py::handle &writer_partition) {
                 return upsert_tensor_with_parallelism_from(
                     keys[i], buffer_ptrs[i], sizes[i], py::none(), config,
                     py::reinterpret_borrow<py::object>(writer_partition));
@@ -4587,8 +4704,8 @@ class MooncakeStorePyWrapper {
             "batch_upsert_tensor_with_parallelism",
             [this, &keys, &tensors_list, &config]() {
                 if (!is_client_initialized() || use_dummy_client_) {
-                    return std::vector<int>(keys.size(),
-                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                    return std::vector<int>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                 }
                 int validate_result = validate_replicate_config(config);
                 if (validate_result) {
@@ -4596,15 +4713,17 @@ class MooncakeStorePyWrapper {
                 }
                 return batch_upsert_tensor_impl(keys, tensors_list, config);
             },
-            [this, &keys, &tensors_list, &config](size_t i, const py::handle &parallelism) {
-                return upsert_tensor_with_parallelism(keys[i], tensors_list[i],
-                                                      py::reinterpret_borrow<py::object>(parallelism),
-                                                      config);
+            [this, &keys, &tensors_list, &config](
+                size_t i, const py::handle &parallelism) {
+                return upsert_tensor_with_parallelism(
+                    keys[i], tensors_list[i],
+                    py::reinterpret_borrow<py::object>(parallelism), config);
             },
-            [this, &keys, &tensors_list, &config](size_t i, const py::handle &writer_partition) {
-                return upsert_tensor_with_parallelism(keys[i], tensors_list[i], py::none(),
-                                                      config,
-                                                      py::reinterpret_borrow<py::object>(writer_partition));
+            [this, &keys, &tensors_list, &config](
+                size_t i, const py::handle &writer_partition) {
+                return upsert_tensor_with_parallelism(
+                    keys[i], tensors_list[i], py::none(), config,
+                    py::reinterpret_borrow<py::object>(writer_partition));
             });
     }
 
