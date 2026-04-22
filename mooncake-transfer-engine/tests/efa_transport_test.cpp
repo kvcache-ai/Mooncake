@@ -340,7 +340,8 @@ TEST_F(EFATransportTest, WarmupSegmentLoopback) {
     auto setup = createEngine();
 
     auto *efa = dynamic_cast<EfaTransport *>(setup.xport);
-    ASSERT_NE(efa, nullptr) << "installTransport did not return an EfaTransport";
+    ASSERT_NE(efa, nullptr)
+        << "installTransport did not return an EfaTransport";
 
     // First call: should connect every (local NIC x peer NIC) pair.
     int rc = efa->warmupSegment(setup.engine->getLocalIpAndPort());
@@ -377,8 +378,8 @@ TEST_F(EFATransportTest, RegisterMemoryBatch) {
     auto engine = std::make_unique<TransferEngine>(false);
     engine->getLocalTopology()->discover({});
     auto hp = parseHostNameWithPort(local_server_name_);
-    int rc = engine->init(metadata_server_, local_server_name_, hp.first.c_str(),
-                          hp.second);
+    int rc = engine->init(metadata_server_, local_server_name_,
+                          hp.first.c_str(), hp.second);
     ASSERT_EQ(rc, 0);
 
     Transport *xport = engine->installTransport("efa", nullptr);

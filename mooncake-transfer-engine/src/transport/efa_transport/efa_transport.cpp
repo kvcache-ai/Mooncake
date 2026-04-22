@@ -404,7 +404,10 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         size_t chunk_len = chunks[ci].second;
         const auto& assigned_nics = nic_assignments[ci];
 
-        bool do_pre_touch = context_list_.size() > 0 &&
+        // preTouchMemory does a CPU-side store to each page, which segfaults
+        // on GPU VRAM (cudaMalloc'd pointers). Restrict it to host memory.
+        bool is_host_mem = resolved_name.rfind("cpu", 0) == 0;
+        bool do_pre_touch = is_host_mem && context_list_.size() > 0 &&
                             std::thread::hardware_concurrency() >= 4 &&
                             chunk_len >= (size_t)4 * 1024 * 1024 * 1024;
         if (do_pre_touch) {

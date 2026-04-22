@@ -148,6 +148,11 @@ Use `transfer_engine_bench` to measure EFA transport throughput between two node
 `--buffer_size`, since the initiator writes into offsets `[0, buffer_size)`
 on the target. Keep these two flags in sync.
 
+> **Note:** `--use_vram` / `--gpu_id` also apply to the target — to
+> mirror a GPU-to-GPU initiator, pass `--gpu_id=-1` (use all GPUs) on
+> both sides. For CPU-to-CPU, build with `-DUSE_CUDA=OFF` **or** pass
+> `--use_vram=false` to the CUDA-enabled binary.
+
 ### Initiator Node (sender)
 
 The values below are the ones that produce the headline numbers in the
@@ -172,8 +177,9 @@ seems "broken".
     --report_unit=GB
 ```
 
-For GPU-to-GPU, add `--gpu_id=-1` (use all GPUs) and build with
-`-DUSE_CUDA=ON`.
+For GPU-to-GPU, add `--gpu_id=-1` (use all GPUs) on **both** initiator
+and target, and build with `-DUSE_CUDA=ON`. For CPU-to-CPU, build with
+`-DUSE_CUDA=OFF` or pass `--use_vram=false` to the CUDA build.
 
 Replace `<target_hostname>:<target_port>` with the target node's address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
