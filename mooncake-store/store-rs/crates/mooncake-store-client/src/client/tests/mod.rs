@@ -11226,3 +11226,5 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
     assert_eq!(due[1].segment_name, SegmentName::new("seg-c"));
     assert_eq!(due[2].segment_name, SegmentName::new("seg-a"));
 }
+
+mod adversarial;
