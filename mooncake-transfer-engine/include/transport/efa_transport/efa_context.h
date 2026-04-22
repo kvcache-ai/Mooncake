@@ -47,7 +47,7 @@ class EfaTransport;
 struct EfaCq {
     EfaCq() : cq(nullptr), outstanding(0) {}
     struct fid_cq* cq;
-    volatile int outstanding;
+    std::atomic<int> outstanding;
 };
 
 struct EfaMemoryRegionMeta {
@@ -198,8 +198,11 @@ class EfaContext {
     struct fid_ep* shared_ep_;
     std::vector<uint8_t> local_ep_addr_;  // bytes returned by fi_getname()
     // Pacing for outstanding work requests on the shared endpoint.  Shared
-    // across all peers routed through this context.
-    volatile int wr_depth_;
+    // across all peers routed through this context.  std::atomic<int> so the
+    // submit-path fetch_add and the CQ-poller fetch_sub obey the C++ memory
+    // model; plain `volatile int` + __sync_* was UB under the current
+    // standard.
+    std::atomic<int> wr_depth_;
     int max_wr_depth_;
     // CQ that shared_ep_ is bound to (FI_TRANSMIT|FI_RECV).  Points into
     // cq_list_[0]; kept here to avoid re-indexing on the hot path.

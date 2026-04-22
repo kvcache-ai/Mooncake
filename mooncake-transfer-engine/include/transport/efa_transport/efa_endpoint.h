@@ -41,8 +41,10 @@ class EfaContext;
 struct EfaOpContext {
     struct fi_context fi_ctx;  // Must be first member
     Transport::Slice* slice;   // Slice pointer for completion handling
-    volatile int* wr_depth;    // Pointer to the context's wr_depth_ for CQ
-                               // completion decrement
+    // Pointer to the context's wr_depth_ for CQ completion decrement.
+    // std::atomic<int> (not volatile int) so the CQ-poller decrement
+    // and the submit-path fetch_add play by the C++ memory model.
+    std::atomic<int>* wr_depth;
 };
 
 // Per-peer handle in the shared-endpoint SRD model.

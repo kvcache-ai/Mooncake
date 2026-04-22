@@ -674,7 +674,7 @@ int EfaContext::submitSlicesOnPeer(
     // 3. Hold post_lock_ once for the entire batch of fi_write calls
     const int kMaxBackoffYields = 100000;
     const int cq_limit = static_cast<int>(globalConfig().max_cqe);
-    volatile int* cq_outstanding =
+    std::atomic<int>* cq_outstanding =
         shared_cq_ ? &shared_cq_->outstanding : nullptr;
 
     struct BatchEntry {
@@ -683,12 +683,28 @@ int EfaContext::submitSlicesOnPeer(
         EfaOpContext* op_ctx;
     };
 
-    while (!slice_list.empty()) {
+    // Consume slice_list via a moving index instead of erase-from-front,
+    // which was O(N^2) on large batches.  retry_slices accumulate across
+    // passes and are applied by rewinding the cursor.
+    size_t cursor = 0;
+    std::vector<Transport::Slice*> retry_slices;
+    while (cursor < slice_list.size() || !retry_slices.empty()) {
+        if (!retry_slices.empty()) {
+            // Splice retry slices back in at the current cursor so the next
+            // pass picks them up.  O(retry_slices.size()) per retry wave,
+            // which is bounded by valid_count of the last batch.
+            slice_list.insert(slice_list.begin() + cursor, retry_slices.begin(),
+                              retry_slices.end());
+            retry_slices.clear();
+            std::this_thread::yield();
+        }
+
+        const size_t remaining = slice_list.size() - cursor;
         int batch_count = 0;
         int backoff = 0;
         bool timed_out = false;
         while (batch_count == 0) {
-            int cur_wr = wr_depth_;
+            int cur_wr = wr_depth_.load(std::memory_order_relaxed);
             int wr_avail = max_wr_depth_ - cur_wr;
             if (wr_avail <= 0) {
                 if (++backoff > kMaxBackoffYields) {
@@ -698,9 +714,9 @@ int EfaContext::submitSlicesOnPeer(
                 std::this_thread::yield();
                 continue;
             }
-            int want = std::min(wr_avail, (int)slice_list.size());
+            int want = std::min(wr_avail, (int)remaining);
             if (cq_outstanding) {
-                int cur_cq = *cq_outstanding;
+                int cur_cq = cq_outstanding->load(std::memory_order_relaxed);
                 int cq_avail = cq_limit - cur_cq;
                 if (cq_avail <= 0) {
                     if (++backoff > kMaxBackoffYields) {
@@ -711,24 +727,27 @@ int EfaContext::submitSlicesOnPeer(
                     continue;
                 }
                 want = std::min(want, cq_avail);
-                if (!__sync_bool_compare_and_swap(&wr_depth_, cur_wr,
-                                                  cur_wr + want)) {
+                if (!wr_depth_.compare_exchange_weak(
+                        cur_wr, cur_wr + want, std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
                     continue;
                 }
-                cur_cq = *cq_outstanding;
+                cur_cq = cq_outstanding->load(std::memory_order_relaxed);
                 cq_avail = cq_limit - cur_cq;
                 if (cq_avail < want) {
-                    __sync_fetch_and_sub(&wr_depth_, want);
+                    wr_depth_.fetch_sub(want, std::memory_order_acq_rel);
                     continue;
                 }
-                if (!__sync_bool_compare_and_swap(cq_outstanding, cur_cq,
-                                                  cur_cq + want)) {
-                    __sync_fetch_and_sub(&wr_depth_, want);
+                if (!cq_outstanding->compare_exchange_weak(
+                        cur_cq, cur_cq + want, std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
+                    wr_depth_.fetch_sub(want, std::memory_order_acq_rel);
                     continue;
                 }
             } else {
-                if (!__sync_bool_compare_and_swap(&wr_depth_, cur_wr,
-                                                  cur_wr + want)) {
+                if (!wr_depth_.compare_exchange_weak(
+                        cur_wr, cur_wr + want, std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
                     continue;
                 }
             }
@@ -737,11 +756,16 @@ int EfaContext::submitSlicesOnPeer(
 
         if (timed_out) {
             LOG(WARNING) << "EFA submitSlicesOnPeer: timed out waiting for CQ"
-                         << " drain (wr_depth=" << wr_depth_
+                         << " drain (wr_depth="
+                         << wr_depth_.load(std::memory_order_relaxed)
                          << ", max=" << max_wr_depth_ << ", cq_outstanding="
-                         << (cq_outstanding ? *cq_outstanding : -1)
+                         << (cq_outstanding ? cq_outstanding->load(
+                                                  std::memory_order_relaxed)
+                                            : -1)
                          << ", max_cqe=" << cq_limit << ")";
-            for (auto* slice : slice_list) failed_slice_list.push_back(slice);
+            for (size_t i = cursor; i < slice_list.size(); ++i) {
+                failed_slice_list.push_back(slice_list[i]);
+            }
             slice_list.clear();
             return 0;
         }
@@ -750,7 +774,7 @@ int EfaContext::submitSlicesOnPeer(
         int valid_count = 0;
 
         for (int i = 0; i < batch_count; i++) {
-            Transport::Slice* slice = slice_list[i];
+            Transport::Slice* slice = slice_list[cursor + i];
             void* local_desc = mrDesc(slice->source_addr);
             if (!local_desc) {
                 LOG(ERROR) << "No MR descriptor found for address "
@@ -767,12 +791,12 @@ int EfaContext::submitSlicesOnPeer(
 
         int mr_failures = batch_count - valid_count;
         if (mr_failures > 0) {
-            __sync_fetch_and_sub(&wr_depth_, mr_failures);
+            wr_depth_.fetch_sub(mr_failures, std::memory_order_acq_rel);
             if (cq_outstanding)
-                __sync_fetch_and_sub(cq_outstanding, mr_failures);
+                cq_outstanding->fetch_sub(mr_failures,
+                                          std::memory_order_acq_rel);
         }
 
-        std::vector<Transport::Slice*> retry_slices;
         if (valid_count > 0) {
             while (post_lock_.test_and_set(std::memory_order_acquire)) {
             }
@@ -797,9 +821,10 @@ int EfaContext::submitSlicesOnPeer(
                 } else if (ret == -FI_EAGAIN) {
                     delete entry.op_ctx;
                     int not_posted = valid_count - i;
-                    __sync_fetch_and_sub(&wr_depth_, not_posted);
+                    wr_depth_.fetch_sub(not_posted, std::memory_order_acq_rel);
                     if (cq_outstanding)
-                        __sync_fetch_and_sub(cq_outstanding, not_posted);
+                        cq_outstanding->fetch_sub(not_posted,
+                                                  std::memory_order_acq_rel);
                     for (int j = i; j < valid_count; j++) {
                         if (j > i) delete batch[j].op_ctx;
                         retry_slices.push_back(batch[j].slice);
@@ -813,22 +838,19 @@ int EfaContext::submitSlicesOnPeer(
                         << ", dest=" << (void*)entry.slice->rdma.dest_addr
                         << ", rkey=" << entry.slice->rdma.dest_rkey << ")";
                     delete entry.op_ctx;
-                    __sync_fetch_and_sub(&wr_depth_, 1);
-                    if (cq_outstanding) __sync_fetch_and_sub(cq_outstanding, 1);
+                    wr_depth_.fetch_sub(1, std::memory_order_acq_rel);
+                    if (cq_outstanding)
+                        cq_outstanding->fetch_sub(1, std::memory_order_acq_rel);
                     failed_slice_list.push_back(entry.slice);
                 }
             }
             post_lock_.clear(std::memory_order_release);
         }
 
-        slice_list.erase(slice_list.begin(), slice_list.begin() + batch_count);
-        if (!retry_slices.empty()) {
-            slice_list.insert(slice_list.begin(), retry_slices.begin(),
-                              retry_slices.end());
-            std::this_thread::yield();
-        }
+        cursor += batch_count;
     }
 
+    slice_list.clear();
     return 0;
 }
 
@@ -846,7 +868,7 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
     ssize_t ret = fi_cq_read(cq, entries, to_poll);
 
     if (ret > 0) {
-        std::unordered_map<volatile int*, int> wr_depth_set;
+        std::unordered_map<std::atomic<int>*, int> wr_depth_set;
         for (ssize_t i = 0; i < ret; i++) {
             EfaOpContext* op_ctx =
                 reinterpret_cast<EfaOpContext*>(entries[i].op_context);
@@ -859,17 +881,17 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
             }
         }
         for (auto& entry : wr_depth_set) {
-            __sync_fetch_and_sub(entry.first, entry.second);
+            entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
         }
-        __sync_fetch_and_sub(&cq_list_[cq_index]->outstanding,
-                             static_cast<int>(ret));
+        cq_list_[cq_index]->outstanding.fetch_sub(static_cast<int>(ret),
+                                                  std::memory_order_acq_rel);
         return static_cast<int>(ret);
     } else if (ret == -FI_EAGAIN) {
         return 0;
     } else if (ret < 0) {
         int err_count = 0;
         struct fi_cq_err_entry err_entry;
-        std::unordered_map<volatile int*, int> wr_depth_set;
+        std::unordered_map<std::atomic<int>*, int> wr_depth_set;
 
         while ((ret = fi_cq_readerr(cq, &err_entry, 0)) > 0) {
             EfaOpContext* op_ctx =
@@ -889,10 +911,11 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
         }
 
         for (auto& entry : wr_depth_set) {
-            __sync_fetch_and_sub(entry.first, entry.second);
+            entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
         }
         if (err_count > 0) {
-            __sync_fetch_and_sub(&cq_list_[cq_index]->outstanding, err_count);
+            cq_list_[cq_index]->outstanding.fetch_sub(
+                err_count, std::memory_order_acq_rel);
         }
         return err_count;
     }
