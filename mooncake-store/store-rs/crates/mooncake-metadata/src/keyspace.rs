@@ -334,9 +334,13 @@ impl Default for MetadataKeyspace {
 mod tests {
     use mooncake_store_core::{
         ClientEpoch, ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName,
+        TenantPolicyScope,
     };
 
-    use super::{parse_route_policy_domain, parse_tenant_policy_scope, MetadataKeyspace};
+    use super::{
+        decode_key_component_checked, encode_key_component, parse_route_policy_domain,
+        parse_tenant_policy_scope, MetadataKeyspace,
+    };
 
     #[test]
     fn keyspace_builds_scoped_keys_and_patterns() {
@@ -548,5 +552,103 @@ mod tests {
                 "all keys must share the same hash tag: {key}"
             );
         }
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Adversarial: percent-encoding roundtrip + rejection + key-shape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encode_decode_round_trip_ascii_safe_chars() {
+        let input = "abcABC012-_";
+        let encoded = encode_key_component(input);
+        assert_eq!(encoded, input, "ASCII-safe chars must not be escaped");
+        let decoded = decode_key_component_checked(&encoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_special_chars() {
+        let input = "has/slash has:colon%percent?question#hash";
+        let encoded = encode_key_component(input);
+        assert_ne!(encoded, input, "special chars must be percent-escaped");
+        let decoded = decode_key_component_checked(&encoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_unicode() {
+        let input = "α-tenant/β-domain/γ-set naïve/path";
+        let encoded = encode_key_component(input);
+        let decoded = decode_key_component_checked(&encoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn encode_decode_round_trip_empty_string() {
+        let encoded = encode_key_component("");
+        assert_eq!(encoded, "");
+        let decoded = decode_key_component_checked(&encoded).unwrap();
+        assert_eq!(decoded, "");
+    }
+
+    #[test]
+    fn decode_rejects_truncated_percent_at_end() {
+        assert!(decode_key_component_checked("hello%").is_none());
+        assert!(decode_key_component_checked("hello%2").is_none());
+    }
+
+    #[test]
+    fn decode_rejects_non_hex_after_percent() {
+        assert!(decode_key_component_checked("%XY").is_none());
+        assert!(decode_key_component_checked("%0G").is_none());
+    }
+
+    #[test]
+    fn keyspace_object_key_preserves_embedded_slashes() {
+        let keyspace = MetadataKeyspace::new("ns");
+        let key = ObjectKey::new("path/to/model/weights");
+        let full = keyspace.object(&key);
+        assert!(
+            full.contains("path/to/model/weights"),
+            "ObjectKey slashes must survive into the key path: got {full}"
+        );
+    }
+
+    #[test]
+    fn keyspace_segment_key_preserves_special_chars_in_name() {
+        let keyspace = MetadataKeyspace::new("ns");
+        let runtime = ClientRuntimeId::new("node-1", ClientEpoch(42));
+        let segment = SegmentName::new("seg:special");
+        let key = keyspace.segment(&runtime, &segment);
+        assert!(
+            key.contains("seg:special"),
+            "segment-name colons must survive into the key: got {key}"
+        );
+    }
+
+    #[test]
+    fn route_policy_domain_tenant_with_special_chars_round_trips_via_percent_encoding() {
+        let keyspace = MetadataKeyspace::new("ns");
+        let domain = RoutePolicyDomain::Tenant("tenant/with:special".to_string());
+        let key = keyspace.route_policy(&domain);
+        let parsed = parse_route_policy_domain(&keyspace, &key);
+        assert_eq!(parsed, Some(domain));
+    }
+
+    #[test]
+    fn route_policy_domain_parse_rejects_unrelated_key() {
+        let keyspace = MetadataKeyspace::new("ns");
+        assert_eq!(parse_route_policy_domain(&keyspace, "unrelated/key"), None);
+    }
+
+    #[test]
+    fn tenant_policy_scope_with_unicode_round_trips() {
+        let keyspace = MetadataKeyspace::new("ns");
+        let scope = TenantPolicyScope::new("α-tenant", Some("β-domain"), Some("γ-set"));
+        let key = keyspace.tenant_policy(&scope);
+        let parsed = parse_tenant_policy_scope(&keyspace, &key);
+        assert_eq!(parsed, Some(scope));
     }
 }
