@@ -32,13 +32,6 @@ sudo ./dependencies.sh -y
 
 This installs all system packages, git submodules (including pybind11 and yalantinglibs), and Go.
 
-**Additional EFA-specific dependencies** (not covered by `dependencies.sh`):
-
-```bash
-# gflags is needed by transfer_engine_bench and EFA unit tests
-sudo apt-get install -y libgflags-dev
-```
-
 > **Note:** The EFA driver and libfabric are **not** installed by `dependencies.sh`. They must be pre-installed on the instance (see section 1 above).
 
 ## Building Mooncake with EFA Support
