@@ -33,6 +33,7 @@ function(add_ha_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+add_store_test(compute_segment_sizes_test compute_segment_sizes_test.cpp)
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)

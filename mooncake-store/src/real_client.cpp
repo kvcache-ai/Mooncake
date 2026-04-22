@@ -313,6 +313,55 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+// Compute GiB-aligned segment sizes that sum exactly to total_bytes.
+//
+// For non-RDMA protocols there is no hardware MR size limit, so a single
+// segment of total_bytes is returned.
+//
+// For RDMA/EFA, segments are split to respect the ibv_reg_mr() hardware
+// limit (max_mr_size).  The algorithm uses two parallel trackers:
+//   remaining_gib_ceil  — ceil-rounded GiB quota, drives even splitting
+//   remaining_bytes     — actual bytes remaining, determines real sizes
+//
+// This keeps all non-last segments strictly GiB-aligned while letting the
+// last segment naturally absorb the sub-GiB tail via min(), guaranteeing:
+//   (a) every segment <= max_mr_size
+//   (b) adjacent segments differ by at most 1 GiB
+//   (c) sum of all segments == total_bytes  (no memory wasted)
+std::vector<size_t> computeSegmentSizes(size_t total_bytes,
+                                        size_t max_mr_size,
+                                        bool is_rdma) {
+    static constexpr size_t kGiB = 1ULL << 30;
+
+    // Non-RDMA: single segment, no splitting needed.
+    if (!is_rdma) return {total_bytes};
+
+    // Round total UP so the sub-GiB tail occupies a full GiB quota slot,
+    // preventing the last segment from exceeding max_mr_size.
+    const size_t total_gib_ceil = (total_bytes + kGiB - 1) / kGiB;
+
+    // Floor division keeps each GiB-aligned segment within max_mr_size
+    // even when max_mr_size itself is not GiB-aligned.
+    size_t max_seg_gib = max_mr_size / kGiB;
+    if (max_seg_gib == 0) max_seg_gib = 1;  // max_mr_size < 1 GiB
+
+    const size_t num_segments = std::max<size_t>(
+        1, (total_gib_ceil + max_seg_gib - 1) / max_seg_gib);
+
+    std::vector<size_t> sizes;
+    sizes.reserve(num_segments);
+    size_t remaining_gib_ceil = total_gib_ceil;
+    size_t remaining_bytes = total_bytes;
+    for (size_t i = 0; i < num_segments; i++) {
+        size_t seg_gib = remaining_gib_ceil / (num_segments - i);
+        remaining_gib_ceil -= seg_gib;
+        size_t seg_bytes = std::min(seg_gib * kGiB, remaining_bytes);
+        remaining_bytes -= seg_bytes;
+        sizes.push_back(seg_bytes);
+    }
+    return sizes;
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -459,26 +508,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     } else if (global_segment_size == 0) {
         LOG(INFO) << "Global segment size is 0, skip mounting segment";
     } else {
-        // Only RDMA/EFA needs splitting due to ibv_reg_mr() hardware limits.
-        // Other transports mount as a single segment to avoid unnecessary
-        // allocator fragmentation. RDMA/EFA splits into equal-sized GiB-aligned
-        // segments (e.g. 1401 GiB → 701 GiB + 700 GiB).
-        //
-        // Strategy: round total UP to the next GiB boundary as the scheduling
-        // quota, then allocate min(quota_bytes, remaining_bytes) per segment.
-        // This keeps non-last segments strictly GiB-aligned while letting the
-        // last segment naturally absorb the sub-GiB tail — without exceeding
-        // max_segment_size regardless of whether max_mr_size is GiB-aligned.
-        static constexpr size_t kGiB = 1ULL << 30;
-        size_t max_segment_size = (protocol == "rdma" || protocol == "efa")
-                                      ? globalConfig().max_mr_size
-                                      : global_segment_size;
-        size_t max_seg_gib = max_segment_size / kGiB;
-        if (max_seg_gib == 0)
-            max_seg_gib = 1;  // max_mr_size < 1 GiB: 1 GiB cap
-        size_t total_gib_ceil = (global_segment_size + kGiB - 1) / kGiB;
-        size_t num_segments = std::max<size_t>(
-            1, (total_gib_ceil + max_seg_gib - 1) / max_seg_gib);
+        const bool is_rdma = (protocol == "rdma" || protocol == "efa");
+        const std::vector<size_t> seg_sizes = computeSegmentSizes(
+            global_segment_size, globalConfig().max_mr_size, is_rdma);
+        const size_t num_segments = seg_sizes.size();
 
         // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
         // and distribute global_segment across them for full NIC utilization.
@@ -498,23 +531,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        // Two parallel trackers:
-        //   remaining_gib_ceil — GiB quota (ceil-rounded), drives even
-        //   splitting remaining_bytes    — actual bytes left, determines real
-        //   segment size
-        size_t remaining_gib_ceil = total_gib_ceil;
-        size_t remaining_bytes = global_segment_size;
+        static constexpr size_t kGiB = 1ULL << 30;
         size_t mounted_bytes = 0;
         for (size_t i = 0; i < num_segments; i++) {
-            // Distribute remaining quota evenly across remaining segments.
-            // Floor division ensures sizes differ by at most 1 GiB.
-            size_t seg_gib = remaining_gib_ceil / (num_segments - i);
-            remaining_gib_ceil -= seg_gib;
-            // Non-last segments: exactly seg_gib * kGiB (GiB-aligned).
-            // Last segment: min() absorbs the sub-GiB tail, staying within
-            // max_segment_size since seg_gib <= max_seg_gib and tail < kGiB.
-            size_t segment_size = std::min(seg_gib * kGiB, remaining_bytes);
-            remaining_bytes -= segment_size;
+            size_t segment_size = seg_sizes[i];
             mounted_bytes += segment_size;
             LOG(INFO) << "Mounting segment [" << i + 1 << "/" << num_segments
                       << "]: " << segment_size / kGiB << " GiB"
