@@ -147,7 +147,7 @@ mod tests {
     use mooncake_store_client::{
         GetRequest, MooncakeCompatibilityFacade, ObjectRef, PutRequest, RouteControlMode,
     };
-    use mooncake_store_core::{ClientEpoch, ClientLifecycleState, HandoffKind, StoreError};
+    use mooncake_store_core::{ClientLifecycleState, HandoffKind, StoreError};
 
     use super::{default_segment_name, now_ms, CompatRuntimeArgs};
     use crate::config::CompatSetupArgs;
@@ -666,10 +666,11 @@ mod tests {
             .client
             .enter_draining()
             .expect("predecessor should drain");
+        let successor_runtime = successor.client.runtime_id().clone();
         predecessor
             .client
             .plan_handoff(
-                ClientEpoch(2),
+                successor_runtime.epoch,
                 HandoffKind::HotUpgrade,
                 1,
                 100,
@@ -681,8 +682,6 @@ mod tests {
             .activate_if_targeted_handoff()
             .expect("successor activation should succeed")
             .expect("targeted handoff should be visible");
-
-        let successor_runtime = successor.client.runtime_id().clone();
         let migrated = predecessor
             .client
             .evacuate_owned_replicas_to_runtime(&successor_runtime)
