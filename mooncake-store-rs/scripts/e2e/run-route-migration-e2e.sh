@@ -56,6 +56,9 @@ Environment:
   MC_STORE_RS_ROUTE_MIGRATION_EXPECT_STATE
                                    Expected terminal state for the task:
                                    `succeeded` (default) or `failed`
+  MC_STORE_RS_ROUTE_MIGRATION_EXPECT_RETRY_WAIT
+                                   When set to 1, assert the task history
+                                   contains a retry/backoff transition
   MC_STORE_RS_ROUTE_MIGRATION_MAX_RETRIES
                                    Optional per-task retry budget override
   MC_STORE_RS_ROUTE_MIGRATION_TASK_EXECUTOR
@@ -530,7 +533,7 @@ elif [[ "${TASK_EXECUTOR}" == "${EXECUTOR_STABLE_ID}" ]]; then
   EXECUTOR_PID=${EXECUTOR_PID}
 fi
 
-python3 - "${ADMIN_URL}" "${REDIS_URL}" "${MODE}" "${TENANT}" "${KEYSPACE}" "${KEY}" "${PAYLOAD}" "${MC_STORE_RS_ROUTE_MIGRATION_PAYLOAD_BYTES:-0}" "${SOURCE_SEGMENT}" "${TARGET_SEGMENTS_JSON}" "${SOURCE_STABLE_ID}" "${MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS:-2000}" "${SUBMITTER}" "${ADMIN_CLI_BIN}" "${ROUTE_CONTROL}" "${ROUTE_TOPK}" "${EXPECT_STATE}" "${TASK_EXECUTOR}" "${TASK_MAX_RETRIES}" "${KILL_EXECUTOR_AFTER_SUBMIT}" "${KILL_EXECUTOR_AT}" "${EXECUTOR_PID}" <<'PY'
+python3 - "${ADMIN_URL}" "${REDIS_URL}" "${MODE}" "${TENANT}" "${KEYSPACE}" "${KEY}" "${PAYLOAD}" "${MC_STORE_RS_ROUTE_MIGRATION_PAYLOAD_BYTES:-0}" "${SOURCE_SEGMENT}" "${TARGET_SEGMENTS_JSON}" "${SOURCE_STABLE_ID}" "${MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS:-2000}" "${SUBMITTER}" "${ADMIN_CLI_BIN}" "${ROUTE_CONTROL}" "${ROUTE_TOPK}" "${EXPECT_STATE}" "${MC_STORE_RS_ROUTE_MIGRATION_EXPECT_RETRY_WAIT:-0}" "${TASK_EXECUTOR}" "${TASK_MAX_RETRIES}" "${KILL_EXECUTOR_AFTER_SUBMIT}" "${KILL_EXECUTOR_AT}" "${EXECUTOR_PID}" <<'PY'
 import json
 import os
 import re
@@ -559,11 +562,12 @@ admin_cli_bin = sys.argv[14]
 route_control = sys.argv[15].replace("-", "_")
 route_topk = int(sys.argv[16])
 expected_state = sys.argv[17]
-task_executor = sys.argv[18]
-max_retries = int(sys.argv[19]) if sys.argv[19] else None
-kill_executor_after_submit = sys.argv[20] == "1"
-kill_executor_at = sys.argv[21]
-executor_pid = int(sys.argv[22])
+expect_retry_wait = sys.argv[18] == "1"
+task_executor = sys.argv[19]
+max_retries = int(sys.argv[20]) if sys.argv[20] else None
+kill_executor_after_submit = sys.argv[21] == "1"
+kill_executor_at = sys.argv[22]
+executor_pid = int(sys.argv[23])
 request_timeout_s = max(request_timeout_ms / 1000.0, 1.0)
 submit_mode = "copy" if mode == "copy-multi" else mode
 
@@ -612,28 +616,56 @@ def parse_cli_fields(output):
     return fields
 
 
-def wait_for_task(task_id):
+def normalize_status(status):
+    normalized = dict(status)
+    for key_name in (
+        "attempts",
+        "max_retries",
+        "next_retry_at_ms",
+        "created_at_ms",
+        "updated_at_ms",
+    ):
+        value = normalized.get(key_name)
+        if value in (None, "", "None", "null"):
+            normalized[key_name] = None
+        elif isinstance(value, str) and re.fullmatch(r"-?\d+", value):
+            normalized[key_name] = int(value)
+    return normalized
+
+
+def fetch_task_status(task_id):
+    if submitter == "cli":
+        output = run_admin_cli(
+            "--metadata-url",
+            redis_url,
+            "--admin-url",
+            admin_url,
+            "--keyspace",
+            keyspace,
+            "migrate",
+            "task",
+            "get",
+            "--task-id",
+            task_id,
+        )
+        status = parse_cli_fields(output)
+    else:
+        status = request_json("GET", f"/v1/route-migrations/{task_id}")
+    return normalize_status(status)
+
+
+def record_status(history, status):
+    if not history or history[-1] != status:
+        history.append(status)
+
+
+def wait_for_task(task_id, history):
     deadline = time.time() + 60.0
     last_status = None
     while time.time() < deadline:
-        if submitter == "cli":
-            output = run_admin_cli(
-                "--metadata-url",
-                redis_url,
-                "--admin-url",
-                admin_url,
-                "--keyspace",
-                keyspace,
-                "migrate",
-                "task",
-                "get",
-                "--task-id",
-                task_id,
-            )
-            status = parse_cli_fields(output)
-        else:
-            status = request_json("GET", f"/v1/route-migrations/{task_id}")
+        status = fetch_task_status(task_id)
         last_status = status
+        record_status(history, status)
         state = status["state"]
         if state in {"succeeded", "failed", "cancelled"}:
             return status
@@ -641,28 +673,13 @@ def wait_for_task(task_id):
     raise AssertionError(f"route migration task {task_id} did not finish: {last_status!r}")
 
 
-def wait_for_task_state(task_id, allowed_states):
+def wait_for_task_state(task_id, allowed_states, history):
     deadline = time.time() + 20.0
     last_status = None
     while time.time() < deadline:
-        if submitter == "cli":
-            output = run_admin_cli(
-                "--metadata-url",
-                redis_url,
-                "--admin-url",
-                admin_url,
-                "--keyspace",
-                keyspace,
-                "migrate",
-                "task",
-                "get",
-                "--task-id",
-                task_id,
-            )
-            status = parse_cli_fields(output)
-        else:
-            status = request_json("GET", f"/v1/route-migrations/{task_id}")
+        status = fetch_task_status(task_id)
         last_status = status
+        record_status(history, status)
         state = status["state"]
         if state in allowed_states:
             return status
@@ -673,6 +690,40 @@ def wait_for_task_state(task_id, allowed_states):
         time.sleep(0.1)
     raise AssertionError(
         f"route migration task {task_id} never entered {allowed_states!r}: {last_status!r}"
+    )
+
+
+def assert_retry_process(history):
+    retry_indices = [
+        index for index, status in enumerate(history) if status.get("state") == "retry_wait"
+    ]
+    assert retry_indices, history
+    first_retry = history[retry_indices[0]]
+    retry_attempts = first_retry.get("attempts")
+    retry_at = first_retry.get("next_retry_at_ms")
+    updated_at = first_retry.get("updated_at_ms")
+    assert retry_attempts == 1, first_retry
+    assert first_retry.get("last_error"), first_retry
+    assert retry_at is not None and updated_at is not None, first_retry
+    assert retry_at > updated_at, first_retry
+
+    later = history[retry_indices[0] + 1 :]
+    assert later, history
+    first_left_retry = next(
+        (status for status in later if status.get("state") != "retry_wait"),
+        None,
+    )
+    assert first_left_retry is not None, history
+    assert first_left_retry.get("state") in {"dispatching", "running", "failed", "succeeded", "cancelled"}, (
+        first_retry,
+        first_left_retry,
+    )
+
+    final_status = history[-1]
+    assert final_status.get("state") in {"failed", "succeeded", "cancelled"}, history
+    assert final_status.get("attempts") == retry_attempts, (
+        first_retry,
+        final_status,
     )
 
 
@@ -782,17 +833,25 @@ else:
     assert listed["count"] >= 1
     assert any(task["task_id"] == task_id for task in listed["tasks"])
 
+status_history = []
+
 if kill_executor_after_submit and executor_pid > 0:
     if kill_executor_at == "dispatching":
-        wait_for_task_state(task_id, {"dispatching", "running", "retry_wait"})
+        wait_for_task_state(
+            task_id,
+            {"dispatching", "running", "retry_wait"},
+            status_history,
+        )
     elif kill_executor_at == "running":
-        wait_for_task_state(task_id, {"running"})
+        wait_for_task_state(task_id, {"running"}, status_history)
     os.kill(executor_pid, signal.SIGKILL)
     time.sleep(0.2)
 
-status = wait_for_task(task_id)
+status = wait_for_task(task_id, status_history)
 assert status["state"] == expected_state, status
 assert status["task_executor"] == task_executor
+if expect_retry_wait:
+    assert_retry_process(status_history)
 
 final_route = None
 deadline = time.time() + 30.0
@@ -838,6 +897,8 @@ print(
             "state": status["state"],
             "mode": mode,
             "route_segments": route_segments(final_route),
+            "status_history_states": [entry["state"] for entry in status_history],
+            "status_history_attempts": [entry.get("attempts") for entry in status_history],
         },
         sort_keys=True,
     )
