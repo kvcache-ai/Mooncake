@@ -50,6 +50,10 @@ class EndpointStore {
 
     // Get the total number of QPs across all endpoints
     virtual size_t getTotalQPNumber() = 0;
+
+    // Number of endpoints awaiting reclaim (evicted or explicitly deleted but
+    // not yet destructed). Exposed for tests and for operator observability.
+    virtual size_t waitingListSize() const = 0;
 };
 
 // FIFO
@@ -69,6 +73,7 @@ class FIFOEndpointStore : public EndpointStore {
     int disconnectQPs() override;
 
     size_t getTotalQPNumber() override;
+    size_t waitingListSize() const override { return waiting_list_.size(); }
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -100,6 +105,13 @@ class SIEVEEndpointStore : public EndpointStore {
     int disconnectQPs() override;
 
     size_t getTotalQPNumber() override;
+    size_t waitingListSize() const override {
+        return waiting_list_len_.load(std::memory_order_relaxed);
+    }
+
+    // Test-only: push a pre-constructed endpoint into waiting_list_ so reclaim
+    // logic can be exercised without standing up an RDMA device.
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep);
 
    private:
     RWSpinlock endpoint_map_lock_;

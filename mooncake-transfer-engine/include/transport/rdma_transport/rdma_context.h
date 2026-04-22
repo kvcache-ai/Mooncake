@@ -107,6 +107,10 @@ class RdmaContext {
     // load while evictions/deletions continue). See issue #1845.
     void reclaimEndpoints();
 
+    // Raw accessor for the endpoint cache. Null before construct() runs.
+    // Used by integration tests that need to observe waiting_list_ directly.
+    EndpointStore *endpointStore() const { return endpoint_store_.get(); }
+
     int disconnectAllEndpoints();
 
     // Get the total number of QPs across all endpoints in this context

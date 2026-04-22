@@ -240,6 +240,13 @@ int SIEVEEndpointStore::disconnectQPs() {
 
 size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
 
+void SIEVEEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(ep);
+    waiting_list_len_++;
+}
+
 size_t SIEVEEndpointStore::getTotalQPNumber() {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     size_t total_qps = 0;
