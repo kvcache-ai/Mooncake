@@ -385,13 +385,6 @@ impl StoreClientBuilder {
         let suspect_runtime_cache = shared_suspect_runtime_cache(&route_namespace);
         let control_client = Arc::new(ControlPlaneClient::new()?);
 
-        validate_startup_segment_conflicts(
-            self.metadata.as_ref(),
-            control_client.as_ref(),
-            &self.stable_id,
-            endpoints.segment_name.as_ref(),
-        )?;
-
         let template = ClientLease {
             runtime: ClientRuntimeId {
                 stable_id: self.stable_id.clone(),
@@ -402,6 +395,11 @@ impl StoreClientBuilder {
             endpoints: endpoints.clone(),
             expires_at_ms,
         };
+        validate_startup_conflicts(
+            self.metadata.as_ref(),
+            control_client.as_ref(),
+            &template,
+        )?;
         let runtime = self.metadata.allocate_client_lease(&template)?;
         let provisional_lease = ClientLease {
             runtime: runtime.clone(),
