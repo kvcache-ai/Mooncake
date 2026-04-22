@@ -345,13 +345,29 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 ### Tuning Tips
 
-- **Use `--block_size=1048576` (1MB)** — this is the most important tuning parameter for EFA. Each `block_size`-sized transfer becomes a single `fi_write`/`fi_read` call, so larger blocks amortize per-operation overhead. 1MB gives ~2× throughput over the 64KB default.
-- Increase `--threads` to 32-48 to saturate multiple EFA devices (2-4 threads per device is a good starting point)
-- For **CPU-to-CPU**: use `--block_size=1048576` (1MB) with NUMA-split (separate instances per NUMA node) for best results
-- For **GPU-to-GPU**: use `--block_size=1048576` (1MB), `--gpu_id=-1` (all GPUs), and `--buffer_size=2147483648` (2GB max per GPU). Write peaks at threads=32, read at threads=16
-- Keep `--batch_size` such that `block_size * batch_size * threads <= buffer_size`
-- Allocate buffers on both NUMA nodes for balanced NIC utilization (the bench tool does this by default for CPU mode)
-- On 16-NIC instances (p5en), writes are NUMA-sensitive: 8 local-NUMA NICs reach 90 Gbps each, while 8 cross-NUMA NICs only reach ~20 Gbps without NUMA-split
+- **Use `--block_size=1048576` (1MB)** — the single most important
+  knob. The 64 KB default reaches only ~26% of peak. 1 MB is within
+  a few percent of the 2 MB plateau (which is the
+  `MC_EFA_STRIPING_THRESHOLD` boundary) and stays on the single-NIC
+  `fi_write`/`fi_read` code path.
+- **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD
+  shared endpoint each NIC carries one `fid_ep` with a 256 WR cap
+  (`MC_MAX_WR`), giving `16 NICs × 256 = 4096` in-flight slots on a
+  16-NIC host. Exceeding this trips "timed out waiting for CQ drain".
+  In practice `threads=16, batch=128` is a solid baseline; going
+  higher rarely adds throughput and routinely hits the cap.
+- **Write vs read:** write benefits from larger batches (peak at
+  `batch=128`); read prefers smaller in-flight queues (peak at
+  `batch=32` on p5en).
+- For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers
+  fan out across every GPU. Pinning a single GPU halves throughput
+  because half the NICs end up cross-NUMA.
+- For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split
+  (separate initiator/target instances per NUMA node) can help
+  reduce contention when one instance can't saturate both nodes.
+- `--buffer_size` only needs `≥ block × batch × threads`; larger
+  values do not improve throughput. The example commands use 4 GB
+  because that is safe for any reasonable config.
 
 ### Eager endpoint warmup (first-request latency)
 
