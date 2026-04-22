@@ -3,48 +3,63 @@ use mooncake_store_core::{
 };
 use std::borrow::Cow;
 
+// ── MetadataKeyspace ──────────────────────────────────────────────────
+//
+// All generated Redis keys embed a hash-tag `{prefix}` so that every
+// key in the same keyspace maps to the same Redis Cluster hash slot.
+// This is required because Lua scripts (lease allocation, tenant quota,
+// etc.) touch multiple keys atomically and Redis Cluster demands all
+// KEYS in a single EVALSHA land in the same slot.
+
 #[derive(Clone, Debug)]
 pub struct MetadataKeyspace {
-    prefix: String,
+    raw_prefix: String,
+    slot_tag: String,
 }
 
 impl MetadataKeyspace {
     pub fn new(prefix: impl Into<String>) -> Self {
+        let raw_prefix = prefix.into();
+        let slot_tag = format!("{{{raw_prefix}}}");
         Self {
-            prefix: prefix.into(),
+            raw_prefix,
+            slot_tag,
         }
     }
 
     pub fn client(&self, runtime: &ClientRuntimeId) -> String {
-        format!("{}/clients/{}", self.prefix, runtime.storage_key())
+        format!("{}/clients/{}", self.slot_tag, runtime.storage_key())
     }
 
     pub fn client_prefix_for_stable(&self, stable_id: &ClientStableId) -> String {
-        format!("{}/clients/{}:", self.prefix, stable_id.0)
+        format!("{}/clients/{}:", self.slot_tag, stable_id.0)
     }
 
     pub fn client_pattern(&self) -> String {
-        format!("{}/clients/*", self.prefix)
+        format!("{}/clients/*", self.slot_tag)
     }
 
     pub fn client_index(&self) -> String {
-        format!("{}/indexes/clients", self.prefix)
+        format!("{}/indexes/clients", self.slot_tag)
     }
 
     pub fn client_by_stable_index(&self, stable_id: &ClientStableId) -> String {
-        format!("{}/indexes/clients/by-stable/{}", self.prefix, stable_id.0)
+        format!(
+            "{}/indexes/clients/by-stable/{}",
+            self.slot_tag, stable_id.0
+        )
     }
 
     pub fn client_by_stable_index_prefix(&self) -> String {
-        format!("{}/indexes/clients/by-stable/", self.prefix)
+        format!("{}/indexes/clients/by-stable/", self.slot_tag)
     }
 
     pub fn client_epoch_hwm(&self, stable_id: &ClientStableId) -> String {
-        format!("{}/state/client-epoch-hwm/{}", self.prefix, stable_id.0)
+        format!("{}/state/client-epoch-hwm/{}", self.slot_tag, stable_id.0)
     }
 
     pub fn parse_client_key(&self, key: &str) -> Option<(String, u64)> {
-        let prefix = format!("{}/clients/", self.prefix);
+        let prefix = format!("{}/clients/", self.slot_tag);
         let rest = key.strip_prefix(&prefix)?;
         let (stable_id, epoch_str) = rest.rsplit_once(':')?;
         let epoch = epoch_str.parse::<u64>().ok()?;
@@ -54,18 +69,21 @@ impl MetadataKeyspace {
     pub fn client_by_stable_marker(&self, stable_id: &ClientStableId, epoch: u64) -> String {
         format!(
             "{}/indexes/clients/by-stable/{}/{}",
-            self.prefix, stable_id.0, epoch
+            self.slot_tag, stable_id.0, epoch
         )
     }
 
     pub fn client_by_stable_marker_prefix(&self, stable_id: &ClientStableId) -> String {
-        format!("{}/indexes/clients/by-stable/{}/", self.prefix, stable_id.0)
+        format!(
+            "{}/indexes/clients/by-stable/{}/",
+            self.slot_tag, stable_id.0
+        )
     }
 
     pub fn segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> String {
         format!(
             "{}/segments/{}:{}",
-            self.prefix,
+            self.slot_tag,
             owner.storage_key(),
             segment.0
         )
@@ -73,8 +91,10 @@ impl MetadataKeyspace {
 
     pub fn segment_prefix(&self, owner: Option<&ClientRuntimeId>) -> String {
         match owner {
-            Some(owner) => format!("{}/segments/{}:", self.prefix, owner.storage_key()),
-            None => format!("{}/segments/", self.prefix),
+            Some(owner) => {
+                format!("{}/segments/{}:", self.slot_tag, owner.storage_key())
+            }
+            None => format!("{}/segments/", self.slot_tag),
         }
     }
 
@@ -84,21 +104,23 @@ impl MetadataKeyspace {
 
     pub fn segment_index(&self, owner: Option<&ClientRuntimeId>) -> String {
         match owner {
-            Some(owner) => format!("{}/indexes/segments/{}", self.prefix, owner.storage_key()),
-            None => format!("{}/indexes/segments", self.prefix),
+            Some(owner) => {
+                format!("{}/indexes/segments/{}", self.slot_tag, owner.storage_key())
+            }
+            None => format!("{}/indexes/segments", self.slot_tag),
         }
     }
 
     pub fn segment_index_for_owner_key(&self, owner_storage_key: &str) -> String {
-        format!("{}/indexes/segments/{}", self.prefix, owner_storage_key)
+        format!("{}/indexes/segments/{}", self.slot_tag, owner_storage_key)
     }
 
     pub fn object(&self, key: &ObjectKey) -> String {
-        format!("{}/objects/{}", self.prefix, key.0)
+        format!("{}/objects/{}", self.slot_tag, key.0)
     }
 
     pub fn object_prefix(&self) -> String {
-        format!("{}/objects/", self.prefix)
+        format!("{}/objects/", self.slot_tag)
     }
 
     pub fn object_pattern(&self) -> String {
@@ -106,11 +128,11 @@ impl MetadataKeyspace {
     }
 
     pub fn object_index(&self) -> String {
-        format!("{}/indexes/objects", self.prefix)
+        format!("{}/indexes/objects", self.slot_tag)
     }
 
     pub fn handoff(&self, stable_id: &ClientStableId) -> String {
-        format!("{}/handoffs/{}", self.prefix, stable_id.0)
+        format!("{}/handoffs/{}", self.slot_tag, stable_id.0)
     }
 
     pub fn route_policy(&self, domain: &RoutePolicyDomain) -> String {
@@ -125,13 +147,13 @@ impl MetadataKeyspace {
     }
 
     pub fn route_policy_prefix(&self) -> String {
-        format!("{}/system/route-policy/", self.prefix)
+        format!("{}/system/route-policy/", self.slot_tag)
     }
 
     pub fn tenant_policy(&self, scope: &TenantPolicyScope) -> String {
         let mut key = format!(
             "{}/system/tenant-policy/tenants/{}",
-            self.prefix,
+            self.slot_tag,
             encode_key_component(&scope.tenant)
         );
         if let Some(domain) = scope.domain.as_deref() {
@@ -149,17 +171,17 @@ impl MetadataKeyspace {
         match tenant {
             Some(tenant) => format!(
                 "{}/system/tenant-policy/tenants/{}/",
-                self.prefix,
+                self.slot_tag,
                 encode_key_component(tenant)
             ),
-            None => format!("{}/system/tenant-policy/tenants/", self.prefix),
+            None => format!("{}/system/tenant-policy/tenants/", self.slot_tag),
         }
     }
 
     pub fn tenant_quota_state(&self, scope: &TenantPolicyScope) -> String {
         format!(
             "{}/system/tenant-quota/tenants/{}",
-            self.prefix,
+            self.slot_tag,
             encode_key_component(&scope.tenant)
         )
     }
@@ -167,18 +189,18 @@ impl MetadataKeyspace {
     pub fn tenant_object_accounting(&self, key: &ObjectKey) -> String {
         format!(
             "{}/system/tenant-object-accounting/objects/{}",
-            self.prefix, key.0
+            self.slot_tag, key.0
         )
     }
 
     pub fn tenant_object_accounting_prefix(&self) -> String {
-        format!("{}/system/tenant-object-accounting/objects/", self.prefix)
+        format!("{}/system/tenant-object-accounting/objects/", self.slot_tag)
     }
 
     pub fn tenant_quota_reservation(&self, reservation_id: &str) -> String {
         format!(
             "{}/system/tenant-quota-reservations/{}",
-            self.prefix,
+            self.slot_tag,
             encode_key_component(reservation_id)
         )
     }
@@ -187,12 +209,12 @@ impl MetadataKeyspace {
         match tenant {
             Some(tenant) => format!(
                 "{}/system/tenant-quota-reservations/by-tenant/{}/",
-                self.prefix,
+                self.slot_tag,
                 encode_key_component(tenant)
             ),
             None => format!(
                 "{}/system/tenant-quota-reservations/by-tenant/",
-                self.prefix
+                self.slot_tag
             ),
         }
     }
@@ -211,7 +233,7 @@ impl MetadataKeyspace {
     }
 
     pub fn prefix(&self) -> &str {
-        &self.prefix
+        &self.raw_prefix
     }
 }
 
@@ -234,7 +256,7 @@ pub fn parse_tenant_policy_scope(
     keyspace: &MetadataKeyspace,
     key: &str,
 ) -> Option<TenantPolicyScope> {
-    let prefix = format!("{}/system/tenant-policy/tenants/", keyspace.prefix());
+    let prefix = keyspace.tenant_policy_prefix(None);
     let rest = key.strip_prefix(&prefix)?;
     let mut parts = rest.split('/');
     let tenant = decode_key_component_checked(parts.next()?)?.into_owned();
@@ -324,76 +346,76 @@ mod tests {
         let object = ObjectKey::new("alpha");
         let segment = SegmentName::new("seg-1");
 
-        assert_eq!(keyspace.client(&runtime), "tenant-a/clients/writer:9");
+        assert_eq!(keyspace.client(&runtime), "{tenant-a}/clients/writer:9");
         assert_eq!(
             keyspace.client_prefix_for_stable(&stable),
-            "tenant-a/clients/writer:"
+            "{tenant-a}/clients/writer:"
         );
-        assert_eq!(keyspace.client_pattern(), "tenant-a/clients/*");
-        assert_eq!(keyspace.client_index(), "tenant-a/indexes/clients");
+        assert_eq!(keyspace.client_pattern(), "{tenant-a}/clients/*");
+        assert_eq!(keyspace.client_index(), "{tenant-a}/indexes/clients");
         assert_eq!(
             keyspace.client_by_stable_index(&stable),
-            "tenant-a/indexes/clients/by-stable/writer"
+            "{tenant-a}/indexes/clients/by-stable/writer"
         );
         assert_eq!(
             keyspace.client_by_stable_index_prefix(),
-            "tenant-a/indexes/clients/by-stable/"
+            "{tenant-a}/indexes/clients/by-stable/"
         );
         assert_eq!(
             keyspace.client_epoch_hwm(&stable),
-            "tenant-a/state/client-epoch-hwm/writer"
+            "{tenant-a}/state/client-epoch-hwm/writer"
         );
         assert_eq!(
-            keyspace.parse_client_key("tenant-a/clients/writer:9"),
+            keyspace.parse_client_key("{tenant-a}/clients/writer:9"),
             Some(("writer".to_string(), 9))
         );
         assert_eq!(
-            keyspace.parse_client_key("tenant-a/clients/host:b:42"),
+            keyspace.parse_client_key("{tenant-a}/clients/host:b:42"),
             Some(("host:b".to_string(), 42))
         );
         assert_eq!(
-            keyspace.parse_client_key("tenant-a/clients/malformed"),
+            keyspace.parse_client_key("{tenant-a}/clients/malformed"),
             None
         );
         assert_eq!(keyspace.parse_client_key("other/clients/writer:9"), None);
         assert_eq!(
             keyspace.client_by_stable_marker(&stable, 9),
-            "tenant-a/indexes/clients/by-stable/writer/9"
+            "{tenant-a}/indexes/clients/by-stable/writer/9"
         );
         assert_eq!(
             keyspace.client_by_stable_marker_prefix(&stable),
-            "tenant-a/indexes/clients/by-stable/writer/"
+            "{tenant-a}/indexes/clients/by-stable/writer/"
         );
         assert_eq!(
             keyspace.segment(&runtime, &segment),
-            "tenant-a/segments/writer:9:seg-1"
+            "{tenant-a}/segments/writer:9:seg-1"
         );
         assert_eq!(
             keyspace.segment_prefix(Some(&runtime)),
-            "tenant-a/segments/writer:9:"
+            "{tenant-a}/segments/writer:9:"
         );
-        assert_eq!(keyspace.segment_prefix(None), "tenant-a/segments/");
+        assert_eq!(keyspace.segment_prefix(None), "{tenant-a}/segments/");
         assert_eq!(
             keyspace.segment_pattern(Some(&runtime)),
-            "tenant-a/segments/writer:9:*"
+            "{tenant-a}/segments/writer:9:*"
         );
         assert_eq!(
             keyspace.segment_index(Some(&runtime)),
-            "tenant-a/indexes/segments/writer:9"
+            "{tenant-a}/indexes/segments/writer:9"
         );
-        assert_eq!(keyspace.segment_index(None), "tenant-a/indexes/segments");
-        assert_eq!(keyspace.object(&object), "tenant-a/objects/alpha");
-        assert_eq!(keyspace.object_prefix(), "tenant-a/objects/");
-        assert_eq!(keyspace.object_pattern(), "tenant-a/objects/*");
-        assert_eq!(keyspace.object_index(), "tenant-a/indexes/objects");
-        assert_eq!(keyspace.handoff(&stable), "tenant-a/handoffs/writer");
+        assert_eq!(keyspace.segment_index(None), "{tenant-a}/indexes/segments");
+        assert_eq!(keyspace.object(&object), "{tenant-a}/objects/alpha");
+        assert_eq!(keyspace.object_prefix(), "{tenant-a}/objects/");
+        assert_eq!(keyspace.object_pattern(), "{tenant-a}/objects/*");
+        assert_eq!(keyspace.object_index(), "{tenant-a}/indexes/objects");
+        assert_eq!(keyspace.handoff(&stable), "{tenant-a}/handoffs/writer");
         assert_eq!(
             keyspace.route_policy(&RoutePolicyDomain::Default),
-            "tenant-a/system/route-policy/default"
+            "{tenant-a}/system/route-policy/default"
         );
         assert_eq!(
             keyspace.route_policy(&RoutePolicyDomain::Tenant("tenant/a".to_string())),
-            "tenant-a/system/route-policy/tenants/tenant%2Fa"
+            "{tenant-a}/system/route-policy/tenants/tenant%2Fa"
         );
         assert_eq!(keyspace.prefix(), "tenant-a");
     }
@@ -434,11 +456,11 @@ mod tests {
         let keyspace = MetadataKeyspace::new("tenant-a");
         assert_eq!(
             keyspace.route_policy_prefix(),
-            "tenant-a/system/route-policy/"
+            "{tenant-a}/system/route-policy/"
         );
         assert_eq!(
             keyspace.tenant_policy_prefix(Some("tenant/a")),
-            "tenant-a/system/tenant-policy/tenants/tenant%2Fa/"
+            "{tenant-a}/system/tenant-policy/tenants/tenant%2Fa/"
         );
     }
 
@@ -458,7 +480,7 @@ mod tests {
     #[test]
     fn tenant_policy_scope_parser_rejects_invalid_utf8_after_decoding() {
         let keyspace = MetadataKeyspace::new("tenant-a");
-        let key = "tenant-a/system/tenant-policy/tenants/%FF";
+        let key = "{tenant-a}/system/tenant-policy/tenants/%FF";
         assert_eq!(parse_tenant_policy_scope(&keyspace, key), None);
     }
 
@@ -466,15 +488,15 @@ mod tests {
     fn tenant_policy_scope_parser_rejects_incomplete_percent_encoding() {
         let keyspace = MetadataKeyspace::new("tenant-a");
         assert_eq!(
-            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%"),
+            parse_tenant_policy_scope(&keyspace, "{tenant-a}/system/tenant-policy/tenants/%"),
             None
         );
         assert_eq!(
-            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%A"),
+            parse_tenant_policy_scope(&keyspace, "{tenant-a}/system/tenant-policy/tenants/%A"),
             None
         );
         assert_eq!(
-            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%1"),
+            parse_tenant_policy_scope(&keyspace, "{tenant-a}/system/tenant-policy/tenants/%1"),
             None
         );
     }
@@ -483,16 +505,48 @@ mod tests {
     fn tenant_policy_scope_parser_rejects_invalid_hex_chars() {
         let keyspace = MetadataKeyspace::new("tenant-a");
         assert_eq!(
-            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%GG"),
+            parse_tenant_policy_scope(&keyspace, "{tenant-a}/system/tenant-policy/tenants/%GG"),
             None
         );
         assert_eq!(
-            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%ZZ"),
+            parse_tenant_policy_scope(&keyspace, "{tenant-a}/system/tenant-policy/tenants/%ZZ"),
             None
         );
         assert_eq!(
-            parse_tenant_policy_scope(&keyspace, "tenant-a/system/tenant-policy/tenants/%1G"),
+            parse_tenant_policy_scope(&keyspace, "{tenant-a}/system/tenant-policy/tenants/%1G"),
             None
         );
+    }
+
+    #[test]
+    fn all_keys_in_same_redis_cluster_slot() {
+        let keyspace = MetadataKeyspace::new("mc/store-rs/v1");
+        let stable = ClientStableId::new("writer");
+        let runtime = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        let keys = [
+            keyspace.client(&runtime),
+            keyspace.client_prefix_for_stable(&stable),
+            keyspace.client_index(),
+            keyspace.client_by_stable_index(&stable),
+            keyspace.client_epoch_hwm(&stable),
+            keyspace.object(&ObjectKey::new("key-1")),
+            keyspace.object_index(),
+        ];
+
+        fn extract_hash_tag(key: &str) -> Option<&str> {
+            let start = key.find('{')?;
+            let end = key[start..].find('}')? + start;
+            Some(&key[start + 1..end])
+        }
+
+        let first_tag = extract_hash_tag(&keys[0]).expect("key should have hash tag");
+        for key in &keys[1..] {
+            assert_eq!(
+                extract_hash_tag(key).expect("key should have hash tag"),
+                first_tag,
+                "all keys must share the same hash tag: {key}"
+            );
+        }
     }
 }
