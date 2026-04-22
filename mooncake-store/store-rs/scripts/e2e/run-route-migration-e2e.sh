@@ -48,6 +48,34 @@ Environment:
   MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS
                                    Python helper HTTP timeout in milliseconds
                                    (default: 2000)
+  MC_STORE_RS_ROUTE_MIGRATION_PAYLOAD_BYTES
+                                   Optional payload size for the seeded object.
+                                   When set, the driver writes a payload of the
+                                   requested size instead of the default small
+                                   string.
+  MC_STORE_RS_ROUTE_MIGRATION_EXPECT_STATE
+                                   Expected terminal state for the task:
+                                   `succeeded` (default) or `failed`
+  MC_STORE_RS_ROUTE_MIGRATION_MAX_RETRIES
+                                   Optional per-task retry budget override
+  MC_STORE_RS_ROUTE_MIGRATION_TASK_EXECUTOR
+                                   Optional task_executor override. Accepts a
+                                   concrete stable_id or the symbolic values
+                                   `source`, `target`, `extra-target`,
+                                   `executor`
+                                   (default: source stable_id)
+  MC_STORE_RS_ROUTE_MIGRATION_KILL_EXECUTOR_AFTER_SUBMIT
+                                   When set to 1, wait until the task reaches
+                                   the configured state, then send SIGKILL to
+                                   the selected task_executor
+  MC_STORE_RS_ROUTE_MIGRATION_KILL_EXECUTOR_AT
+                                   State gate used before killing the executor:
+                                   `submit`, `dispatching`, or `running`
+                                   (default: `running`)
+  MC_STORE_RS_ROUTE_MIGRATION_ENABLE_DEDICATED_EXECUTOR
+                                   When set to 1, start a standalone scratch-only
+                                   executor runtime and allow
+                                   `task_executor=executor`
   MC_STORE_RS_ROUTE_MIGRATION_TRANSPORT_BACKEND
                                    Transport backend passed to standalone
                                    clients (`classic-te` or `tent`,
@@ -103,6 +131,21 @@ fi
 TRANSPORT_BACKEND="${MC_STORE_RS_ROUTE_MIGRATION_TRANSPORT_BACKEND:-classic-te}"
 ROUTE_CONTROL="${MC_STORE_RS_ROUTE_MIGRATION_ROUTE_CONTROL:-metadata-only}"
 ROUTE_TOPK="${MC_STORE_RS_ROUTE_MIGRATION_ROUTE_TOPK:-2}"
+EXPECT_STATE="${MC_STORE_RS_ROUTE_MIGRATION_EXPECT_STATE:-succeeded}"
+if [[ "${EXPECT_STATE}" != "succeeded" && "${EXPECT_STATE}" != "failed" ]]; then
+  echo "unsupported expected state: ${EXPECT_STATE}" >&2
+  usage >&2
+  exit 1
+fi
+TASK_MAX_RETRIES="${MC_STORE_RS_ROUTE_MIGRATION_MAX_RETRIES:-}"
+KILL_EXECUTOR_AFTER_SUBMIT="${MC_STORE_RS_ROUTE_MIGRATION_KILL_EXECUTOR_AFTER_SUBMIT:-0}"
+KILL_EXECUTOR_AT="${MC_STORE_RS_ROUTE_MIGRATION_KILL_EXECUTOR_AT:-running}"
+DEDICATED_EXECUTOR_ENABLED="${MC_STORE_RS_ROUTE_MIGRATION_ENABLE_DEDICATED_EXECUTOR:-0}"
+if [[ "${KILL_EXECUTOR_AT}" != "submit" && "${KILL_EXECUTOR_AT}" != "dispatching" && "${KILL_EXECUTOR_AT}" != "running" ]]; then
+  echo "unsupported kill stage: ${KILL_EXECUTOR_AT}" >&2
+  usage >&2
+  exit 1
+fi
 
 allocate_port() {
   python3 - <<'PY'
@@ -238,17 +281,20 @@ REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-$(allocate_port)}"
 SOURCE_TRANSPORT_PORT="$(allocate_port)"
 TARGET_TRANSPORT_PORT="$(allocate_port)"
 EXTRA_TARGET_TRANSPORT_PORT="$(allocate_port)"
+EXECUTOR_TRANSPORT_PORT="$(allocate_port)"
 ADMIN_PORT="$(allocate_port)"
 
 SOURCE_STABLE_ID="route-migration-source-$(date +%s%N)"
 TARGET_STABLE_ID="route-migration-target-$(date +%s%N)"
 EXTRA_TARGET_STABLE_ID="route-migration-target-extra-$(date +%s%N)"
+EXECUTOR_STABLE_ID="route-migration-executor-$(date +%s%N)"
 KEYSPACE="mc/store-rs/e2e/route-migration/$(date +%s%N)"
 KEY="route-migration-key"
 TENANT="default"
 SOURCE_SEGMENT="route-migration-source-segment-${SOURCE_STABLE_ID}"
 TARGET_SEGMENT="route-migration-target-segment-${TARGET_STABLE_ID}"
 EXTRA_TARGET_SEGMENT="route-migration-target-segment-${EXTRA_TARGET_STABLE_ID}"
+EXECUTOR_SEGMENT="route-migration-executor-segment-${EXECUTOR_STABLE_ID}"
 PAYLOAD="route-migration-payload-${SOURCE_STABLE_ID}"
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
 ADMIN_URL="http://127.0.0.1:${ADMIN_PORT}"
@@ -259,7 +305,12 @@ SOURCE_LOG="${TMP_DIR}/source-client.log"
 TARGET_LOG="${TMP_DIR}/target-client.log"
 EXTRA_TARGET_LOG="${TMP_DIR}/target-extra-client.log"
 ADMIN_LOG="${TMP_DIR}/admin-server.log"
+EXECUTOR_LOG="${TMP_DIR}/executor-client.log"
 PIDS=()
+SOURCE_PID=0
+TARGET_PID=0
+EXTRA_TARGET_PID=0
+EXECUTOR_PID=0
 REDIS_STARTED=0
 REDIS_CONTAINER_NAME="mc-route-migration-e2e-redis-${SOURCE_STABLE_ID}"
 REDIS_CONTAINER_STARTED=
@@ -373,7 +424,8 @@ echo "==> starting source store client"
   --transport-rpc-port "${SOURCE_TRANSPORT_PORT}" \
   --local-segment-name "${SOURCE_SEGMENT}" \
   >"${SOURCE_LOG}" 2>&1 &
-PIDS+=($!)
+SOURCE_PID=$!
+PIDS+=("${SOURCE_PID}")
 wait_for_log "${SOURCE_LOG}" "mooncake-store-client started stable_id=${SOURCE_STABLE_ID}" 30
 
 echo "==> starting target store client"
@@ -384,7 +436,8 @@ echo "==> starting target store client"
   --transport-rpc-port "${TARGET_TRANSPORT_PORT}" \
   --local-segment-name "${TARGET_SEGMENT}" \
   >"${TARGET_LOG}" 2>&1 &
-PIDS+=($!)
+TARGET_PID=$!
+PIDS+=("${TARGET_PID}")
 wait_for_log "${TARGET_LOG}" "mooncake-store-client started stable_id=${TARGET_STABLE_ID}" 30
 
 if [[ "${MODE}" == "copy-multi" ]]; then
@@ -396,8 +449,36 @@ if [[ "${MODE}" == "copy-multi" ]]; then
     --transport-rpc-port "${EXTRA_TARGET_TRANSPORT_PORT}" \
     --local-segment-name "${EXTRA_TARGET_SEGMENT}" \
     >"${EXTRA_TARGET_LOG}" 2>&1 &
-  PIDS+=($!)
+  EXTRA_TARGET_PID=$!
+  PIDS+=("${EXTRA_TARGET_PID}")
   wait_for_log "${EXTRA_TARGET_LOG}" "mooncake-store-client started stable_id=${EXTRA_TARGET_STABLE_ID}" 30
+fi
+
+if [[ "${DEDICATED_EXECUTOR_ENABLED}" == "1" ]]; then
+  echo "==> starting dedicated executor client"
+  "${BIN}" \
+    --local-hostname 127.0.0.1 \
+    --metadata-url "${REDIS_URL}" \
+    --storage-bytes 0 \
+    --scratch-bytes "${MC_STORE_RS_ROUTE_MIGRATION_SCRATCH_BYTES:-$((16 * 1024 * 1024))}" \
+    --protocol tcp \
+    --transport-backend "${TRANSPORT_BACKEND}" \
+    --route-control "${ROUTE_CONTROL}" \
+    --route-topk "${ROUTE_TOPK}" \
+    --keyspace "${KEYSPACE}" \
+    --lease-ttl-ms "${MC_STORE_RS_ROUTE_MIGRATION_LEASE_TTL_MS:-15000}" \
+    --heartbeat-interval-ms 500 \
+    --label pool=pool-a \
+    --label storage=false \
+    --label route=false \
+    --stable-id "${EXECUTOR_STABLE_ID}" \
+    --epoch 1 \
+    --transport-rpc-port "${EXECUTOR_TRANSPORT_PORT}" \
+    --local-segment-name "${EXECUTOR_SEGMENT}" \
+    >"${EXECUTOR_LOG}" 2>&1 &
+  EXECUTOR_PID=$!
+  PIDS+=("${EXECUTOR_PID}")
+  wait_for_log "${EXECUTOR_LOG}" "mooncake-store-client started stable_id=${EXECUTOR_STABLE_ID}" 30
 fi
 
 echo "==> starting admin HTTP server"
@@ -421,9 +502,39 @@ print(json.dumps(segments))
 PY
 )
 
-python3 - "${ADMIN_URL}" "${REDIS_URL}" "${MODE}" "${TENANT}" "${KEYSPACE}" "${KEY}" "${PAYLOAD}" "${SOURCE_SEGMENT}" "${TARGET_SEGMENTS_JSON}" "${SOURCE_STABLE_ID}" "${MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS:-2000}" "${SUBMITTER}" "${ADMIN_CLI_BIN}" "${ROUTE_CONTROL}" "${ROUTE_TOPK}" <<'PY'
+TASK_EXECUTOR_SELECTOR="${MC_STORE_RS_ROUTE_MIGRATION_TASK_EXECUTOR:-${SOURCE_STABLE_ID}}"
+case "${TASK_EXECUTOR_SELECTOR}" in
+  source)
+    TASK_EXECUTOR="${SOURCE_STABLE_ID}"
+    ;;
+  target)
+    TASK_EXECUTOR="${TARGET_STABLE_ID}"
+    ;;
+  extra-target)
+    TASK_EXECUTOR="${EXTRA_TARGET_STABLE_ID}"
+    ;;
+  executor)
+    TASK_EXECUTOR="${EXECUTOR_STABLE_ID}"
+    ;;
+  *)
+    TASK_EXECUTOR="${TASK_EXECUTOR_SELECTOR}"
+    ;;
+esac
+if [[ "${TASK_EXECUTOR}" == "${SOURCE_STABLE_ID}" ]]; then
+  EXECUTOR_PID=${SOURCE_PID}
+elif [[ "${TASK_EXECUTOR}" == "${TARGET_STABLE_ID}" ]]; then
+  EXECUTOR_PID=${TARGET_PID}
+elif [[ -n "${EXTRA_TARGET_STABLE_ID:-}" && "${TASK_EXECUTOR}" == "${EXTRA_TARGET_STABLE_ID}" ]]; then
+  EXECUTOR_PID=${EXTRA_TARGET_PID}
+elif [[ "${TASK_EXECUTOR}" == "${EXECUTOR_STABLE_ID}" ]]; then
+  EXECUTOR_PID=${EXECUTOR_PID}
+fi
+
+python3 - "${ADMIN_URL}" "${REDIS_URL}" "${MODE}" "${TENANT}" "${KEYSPACE}" "${KEY}" "${PAYLOAD}" "${MC_STORE_RS_ROUTE_MIGRATION_PAYLOAD_BYTES:-0}" "${SOURCE_SEGMENT}" "${TARGET_SEGMENTS_JSON}" "${SOURCE_STABLE_ID}" "${MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS:-2000}" "${SUBMITTER}" "${ADMIN_CLI_BIN}" "${ROUTE_CONTROL}" "${ROUTE_TOPK}" "${EXPECT_STATE}" "${TASK_EXECUTOR}" "${TASK_MAX_RETRIES}" "${KILL_EXECUTOR_AFTER_SUBMIT}" "${KILL_EXECUTOR_AT}" "${EXECUTOR_PID}" <<'PY'
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -438,16 +549,29 @@ tenant = sys.argv[4]
 keyspace = sys.argv[5]
 key = sys.argv[6]
 payload = sys.argv[7].encode()
-source_segment = sys.argv[8]
-target_segments = json.loads(sys.argv[9])
-source_stable_id = sys.argv[10]
-request_timeout_ms = int(sys.argv[11])
-submitter = sys.argv[12]
-admin_cli_bin = sys.argv[13]
-route_control = sys.argv[14].replace("-", "_")
-route_topk = int(sys.argv[15])
+payload_bytes = int(sys.argv[8])
+source_segment = sys.argv[9]
+target_segments = json.loads(sys.argv[10])
+source_stable_id = sys.argv[11]
+request_timeout_ms = int(sys.argv[12])
+submitter = sys.argv[13]
+admin_cli_bin = sys.argv[14]
+route_control = sys.argv[15].replace("-", "_")
+route_topk = int(sys.argv[16])
+expected_state = sys.argv[17]
+task_executor = sys.argv[18]
+max_retries = int(sys.argv[19]) if sys.argv[19] else None
+kill_executor_after_submit = sys.argv[20] == "1"
+kill_executor_at = sys.argv[21]
+executor_pid = int(sys.argv[22])
 request_timeout_s = max(request_timeout_ms / 1000.0, 1.0)
 submit_mode = "copy" if mode == "copy-multi" else mode
+
+if payload_bytes > 0:
+    payload = b"x" * payload_bytes
+
+driver_storage_bytes = max(4 * 1024 * 1024, len(payload) + 4 * 1024 * 1024)
+driver_scratch_bytes = max(1 * 1024 * 1024, len(payload) + 1 * 1024 * 1024)
 
 
 def request_json(method, path, body=None):
@@ -517,6 +641,41 @@ def wait_for_task(task_id):
     raise AssertionError(f"route migration task {task_id} did not finish: {last_status!r}")
 
 
+def wait_for_task_state(task_id, allowed_states):
+    deadline = time.time() + 20.0
+    last_status = None
+    while time.time() < deadline:
+        if submitter == "cli":
+            output = run_admin_cli(
+                "--metadata-url",
+                redis_url,
+                "--admin-url",
+                admin_url,
+                "--keyspace",
+                keyspace,
+                "migrate",
+                "task",
+                "get",
+                "--task-id",
+                task_id,
+            )
+            status = parse_cli_fields(output)
+        else:
+            status = request_json("GET", f"/v1/route-migrations/{task_id}")
+        last_status = status
+        state = status["state"]
+        if state in allowed_states:
+            return status
+        if state in {"succeeded", "failed", "cancelled"}:
+            raise AssertionError(
+                f"task {task_id} reached terminal state before executor kill: {status!r}"
+            )
+        time.sleep(0.1)
+    raise AssertionError(
+        f"route migration task {task_id} never entered {allowed_states!r}: {last_status!r}"
+    )
+
+
 def route_segments(route):
     return [replica["segment_name"] for replica in route["replicas"]]
 
@@ -538,8 +697,8 @@ store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1",
     redis_url,
-    4 * 1024 * 1024,
-    1 * 1024 * 1024,
+    driver_storage_bytes,
+    driver_scratch_bytes,
     "tcp",
     "",
     "",
@@ -580,7 +739,9 @@ if submitter == "cli":
     ]
     for target_segment in target_segments:
         submit_args.extend(["--target-segment", target_segment])
-    submit_args.extend(["--task-executor", source_stable_id])
+    submit_args.extend(["--task-executor", task_executor])
+    if max_retries is not None:
+        submit_args.extend(["--max-retries", str(max_retries)])
     submit_output = run_admin_cli(*submit_args)
     submit_response = parse_cli_fields(submit_output)
     task_id = submit_response["task_id"]
@@ -610,8 +771,10 @@ else:
         "key": key,
         "source_segment": source_segment,
         "target_segments": target_segments,
-        "task_executor": source_stable_id,
+        "task_executor": task_executor,
     }
+    if max_retries is not None:
+        submit_body["max_retries"] = max_retries
     submit_response = request_json("POST", submit_path, submit_body)
     task_id = submit_response["task_id"]
 
@@ -619,9 +782,17 @@ else:
     assert listed["count"] >= 1
     assert any(task["task_id"] == task_id for task in listed["tasks"])
 
+if kill_executor_after_submit and executor_pid > 0:
+    if kill_executor_at == "dispatching":
+        wait_for_task_state(task_id, {"dispatching", "running", "retry_wait"})
+    elif kill_executor_at == "running":
+        wait_for_task_state(task_id, {"running"})
+    os.kill(executor_pid, signal.SIGKILL)
+    time.sleep(0.2)
+
 status = wait_for_task(task_id)
-assert status["state"] == "succeeded", status
-assert status["task_executor"] == source_stable_id
+assert status["state"] == expected_state, status
+assert status["task_executor"] == task_executor
 
 final_route = None
 deadline = time.time() + 30.0
@@ -640,10 +811,23 @@ while time.time() < deadline:
     time.sleep(0.2)
 
 assert final_route is not None
-if submit_mode == "move":
-    assert_route_shape(final_route, expected_source=False, expected_targets=True)
+if expected_state == "failed":
+    assert status["last_error"], status
+    if kill_executor_after_submit:
+        error_text = status["last_error"].lower()
+        assert (
+            "executor" in error_text
+            or "lease" in error_text
+            or "transport error" in error_text
+            or "control plane connect" in error_text
+            or task_executor.lower() in error_text
+        ), status
+    assert_route_shape(final_route, expected_source=True, expected_targets=False)
 else:
-    assert_route_shape(final_route, expected_source=True, expected_targets=True)
+    if submit_mode == "move":
+        assert_route_shape(final_route, expected_source=False, expected_targets=True)
+    else:
+        assert_route_shape(final_route, expected_source=True, expected_targets=True)
 
 assert store.get(key, tenant=tenant) == payload
 
