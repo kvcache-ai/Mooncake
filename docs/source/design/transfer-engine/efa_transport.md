@@ -112,6 +112,11 @@ The test suite includes:
 | `WriteAndRead` | Write then read with data integrity check |
 | `MultiWrite` | Batch write (16 requests) |
 | `StressMultipleBatches` | Stress test (20 batches x 8 requests) |
+| `WarmupSegmentLoopback` | `warmupSegment()` handshake path + idempotent re-call |
+| `WarmupSegmentNotFound` | `warmupSegment()` fails cleanly for an unknown segment |
+| `RegisterMemoryBatch` | `registerLocalMemoryBatch` / `unregisterLocalMemoryBatch` round-trip |
+| `LargeTransfer` | 128 MB buffer, 64 x 1 MB slices — exercises WR / CQ pacing |
+| `RepeatedOpenSegment` | `openSegment()` on the same peer repeatedly still transfers correctly |
 
 You can also run all unit tests via CTest:
 
