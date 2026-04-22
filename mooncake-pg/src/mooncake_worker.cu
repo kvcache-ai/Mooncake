@@ -3,6 +3,7 @@
 #include <memory>
 #include <thread>
 #include <mooncake_worker.cuh>
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 #include "pg_utils.h"
 
@@ -45,36 +46,68 @@ class MooncakeWorkCuda : public ::c10d::Work {
 
     bool wait(std::chrono::milliseconds timeout) override {
         // Wait until the task has been submitted to TransferEngine:
-        // This ensures that the CUDA kernels required for the transfer
+        // This tries to ensure that the CUDA kernels required for the transfer
         // have been launched by the time `waitUntilTasksSubmitted` returns.
-        // Although this is not required for CPU-only transports such as
-        // RdmaTransport, we keep this behavior to avoid invasive changes
-        // to TE/TENT.
+        //
+        // Why is this needed? PyTorch documentation implies that collective
+        // operations should be enqueued when `wait()` returns. In practice, we
+        // found that violating this causes hangs.
+        //
+        // Our current hypothesis for the hang is: PyTorch assumes the kernels
+        // needed for the transfer are already launched when `wait` returns
+        // true. It may then launch subsequent operations after the collective
+        // (e.g., `.cpu()`). Such operations may acquire a process-wide lock in
+        // the CUDA runtime. Also, they may rely on the data produced by the
+        // collective, thus causing a synchronization on enq_stream. However,
+        // holding that runtime lock prevents cudaMemcpy(Async) in TE/TENT from
+        // launching. This means the transfer can't finish, and enq_stream won't
+        // complete. Thus, a deadlock occurs.
+        // (In practice, we found that replacing all cudaMemcpyAsync in TENT
+        // with cuMemcpyAsync actually alleviates this, which further suggests a
+        // deadlock in the CUDA runtime. However, that change is too invasive
+        // for TE/TENT, so we do not adopt it here.)
+        //
+        // Strictly speaking, the wait is needed for another reason: The current
+        // stream will be blocked on the event below. Any subsequent work on
+        // `current_stream` will wait on that event, which effectively waits for
+        // the task to be done. Therefore, we must ensure all kernels needed for
+        // the transfer task are launched BEFORE blocking the current stream, in
+        // case TE/TENT use `current_stream` to launch those kernels (though it
+        // is rare).
         //
         // Please note that this logic relies on the assumption that TE/TENT
         // will launch all CUDA operations in `submitTransfer`.
         // Unfortunately, TcpTransport in TE and TENT currently violates this
-        // assumption (cudaMemcpy(Async) may be called from a callback), which
-        // can cause hangs in PG when a CUDA operation such as `x.cpu().item()`
-        // follows the collective. For TE's TcpTransport, the use of cudaMemcpy
-        // on the default stream may also contribute to the hang.
+        // assumption (cudaMemcpy(Async) may be called later from a callback),
+        // which can cause hangs in PG when a CUDA operation such as
+        // `x.cpu().item()` follows the collective. For TE's TcpTransport, the
+        // use of cudaMemcpy on the default stream may also contribute to the
+        // hang.
         //
-        // This wait is primarily needed for two reasons:
-        //   1. PyTorch documents that `wait` should ensure the operation is
-        //      issued, though not necessarily completed, for CUDA work.
-        //      In practice, this means the transfer kernel must at least be
-        //      launched; otherwise, a hang may occur.
-        //   2. The current stream is blocked on the event below. Any subsequent
-        //      work on `current_stream` will wait on that event, which
-        //      effectively waits for the task to be done. Therefore, we must
-        //      not block until all kernels needed for the transfer task have
-        //      been launched, in case TE/TENT use `current_stream` to
-        //      launch those kernels (though rare).
-        auto submitted =
-            worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
+        // Besides, for CPU-only transports (like RdmaTransport),
+        // waitUntilTasksSubmitted is totally unnecessary, but we keep it for
+        // uniform behavior to avoid invasive changes to TE/TENT.
+        bool submitted = true;
+        if (at::cuda::currentStreamCaptureStatus() ==
+            c10::cuda::CaptureStatus::None) {
+            // Normal execution: block until tasks are submitted.
+            submitted =
+                worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
+        } else {
+            // During CUDA graph capture, kernels are recorded but not actually
+            // executed. The enqueueTaskKernel would never run, so
+            // waitUntilTasksSubmitted would hang because the CPU worker thread
+            // never sees task.active == true.
+            //
+            // Note that this also means NvlinkTransport (and TcpTransport too,
+            // of course) won't work with CUDA Graphs: Kernels launched inside
+            // TE/TENT can't be captured by the graph, and during replay they
+            // are not ordered with the graph execution. This may trigger the
+            // same deadlock described above.
+        }
         if (!submitted) return false;
 
-        // Once all tasks have been submitted, create an event to synchronize
+        // Once all tasks have been submitted, use the event to synchronize
         // the current stream and the enqueue stream, but do not wait on this
         // event.
         //
@@ -101,6 +134,18 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     using MooncakeWorkCuda::MooncakeWorkCuda;
 
     bool wait(std::chrono::milliseconds timeout) override {
+        // Skip host-side synchronization during CUDA graph capture.
+        // cudaEventSynchronize is not permitted while a stream is capturing.
+        if (at::cuda::currentStreamCaptureStatus() !=
+            c10::cuda::CaptureStatus::None) {
+            // We still need stream-level synchronization so that subsequent
+            // operations on the capture stream are ordered after the barrier
+            // task on the enqueue stream.
+            auto current_stream = at::cuda::getCurrentCUDAStream();
+            event_->block(current_stream);
+            return true;
+        }
+
         if (timeout == kNoTimeout) {
             event_->synchronize();
             return true;
@@ -123,7 +168,7 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
     tasks[taskId].bufferOffset = bufferOffset;
-    tasks[taskId].submit_sequence = submitSequence;
+    tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
 
     // Publish task metadata before notifying the host worker thread.
@@ -356,7 +401,7 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     }
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
-        tasks_[i].submit_sequence = 0;
+        tasks_[i].submitSequence = 0;
         submitted_task_sequence_[i].store(0, std::memory_order_relaxed);
     }
 }

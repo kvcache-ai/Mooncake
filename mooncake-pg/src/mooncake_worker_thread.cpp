@@ -91,7 +91,7 @@ void MooncakeWorker::startWorker() {
                                      group->rank != task.broadcastRoot) ||
                                     task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
-                    const auto submit_sequence = task.submit_sequence;
+                    const auto submit_sequence = task.submitSequence;
                     if (skipTransfer) {
                         submitted_task_sequence_[i].store(
                             submit_sequence, std::memory_order_release);

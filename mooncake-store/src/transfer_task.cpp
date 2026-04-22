@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <sstream>
+#include <vector>
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -223,9 +225,13 @@ bool TransferEngineOperationState::is_completed() {
 }
 
 void TransferEngineOperationState::check_task_status() {
-    // Check all transfers in the batch
-    bool all_completed = true;
-    bool has_failure = false;
+    // Check all transfers in the batch.
+    // Wait for ALL tasks to reach a terminal state before setting the result,
+    // even if some have already failed. This prevents the caller from seeing
+    // "completed" while background transfers are still in progress, which
+    // could cause issues when freeBatchID is called in the destructor.
+    bool all_terminated = true;
+    std::vector<size_t> failed_task_ids;
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
@@ -240,38 +246,45 @@ void TransferEngineOperationState::check_task_status() {
 
         switch (status.s) {
             case TransferStatusEnum::COMPLETED:
-                // This transfer is done, continue checking others
+                // This transfer is done successfully
                 break;
             case TransferStatusEnum::FAILED:
             case TransferStatusEnum::CANCELED:
             case TransferStatusEnum::INVALID:
 #ifndef USE_ASCEND_DIRECT
-                LOG(ERROR) << "Transfer failed for batch " << batch_id_
-                           << " task " << i << " with status "
-                           << static_cast<int>(status.s);
+                VLOG(1) << "Transfer failed for batch " << batch_id_ << " task "
+                        << i << " with status " << static_cast<int>(status.s);
 #endif
-                has_failure = true;
+                failed_task_ids.push_back(i);
                 break;
             default:
-                // Transfer is still pending (PENDING, RUNNING, etc.)
-                all_completed = false;
+                // Transfer is still in progress (WAITING, PENDING, etc.)
+                all_terminated = false;
                 break;
         }
     }
 
-    if (has_failure) {
-        VLOG(1) << "Setting batch " << batch_id_
-                << " result to TRANSFER_FAIL due to task failures";
-        set_result_internal(ErrorCode::TRANSFER_FAIL);
+    if (!all_terminated) {
+        // Some tasks are still in progress; wait for next poll iteration.
+        // Do NOT set result yet, even if some tasks have already failed.
         return;
     }
 
-    if (all_completed) {
-        set_result_internal(ErrorCode::OK);
-        return;
+    // All tasks have reached a terminal state.
+    ErrorCode ec = ErrorCode::OK;
+    if (!failed_task_ids.empty()) {
+        std::ostringstream oss;
+        for (size_t j = 0; j < failed_task_ids.size(); ++j) {
+            if (j > 0) oss << ", ";
+            oss << failed_task_ids[j];
+        }
+        LOG(ERROR) << "Batch " << batch_id_
+                   << " completed with task failures: task_ids=[" << oss.str()
+                   << "]";
+        ec = ErrorCode::TRANSFER_FAIL;
     }
 
-    return;
+    set_result_internal(ec);
 }
 
 void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
