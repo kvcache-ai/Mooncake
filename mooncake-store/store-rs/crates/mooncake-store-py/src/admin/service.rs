@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,10 +16,11 @@ use mooncake_store_client::{
 use mooncake_store_core::{
     route_logical_object_id, ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId,
     LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, RoutePolicy,
-    RoutePolicyDomain, StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
-    TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
-    TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationState,
-    TenantRoutePolicy, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
+    RoutePolicyDomain, StoreError,
+    TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantObjectAccountingState,
+    TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationState, TenantRoutePolicy,
+    DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
 };
 use parking_lot::Mutex;
 use url::Url;
@@ -338,9 +339,7 @@ impl MigrationTaskManagerState {
                 match record.state {
                     RouteMigrationTaskState::Pending => Some(MigrationTaskAction::Dispatch(record)),
                     RouteMigrationTaskState::RetryWait
-                        if record
-                            .next_retry_at_ms
-                            .is_some_and(|retry_at| retry_at <= now) =>
+                        if record.next_retry_at_ms.is_some_and(|retry_at| retry_at <= now) =>
                     {
                         if record.execution_id.is_some() {
                             Some(MigrationTaskAction::Poll(record))
@@ -394,9 +393,11 @@ impl MigrationTaskManagerState {
                 None,
                 String::new(),
             ),
-            Err(error) => {
-                self.handle_attempt_failure(record, attempted_dispatches, error.to_string())
-            }
+            Err(error) => self.handle_attempt_failure(
+                record,
+                attempted_dispatches,
+                error.to_string(),
+            ),
         }
     }
 
@@ -795,16 +796,16 @@ fn validate_route_migration_request(
         ));
     }
     match mode {
-        RouteMigrationMode::Copy if request.target_segments.is_empty() => {
-            Err(StoreError::InvalidState(
+        RouteMigrationMode::Copy if request.target_segments.is_empty() => Err(
+            StoreError::InvalidState(
                 "route migration copy tasks require at least one target_segment".to_string(),
-            ))
-        }
-        RouteMigrationMode::Move if request.target_segments.len() != 1 => {
-            Err(StoreError::InvalidState(
+            ),
+        ),
+        RouteMigrationMode::Move if request.target_segments.len() != 1 => Err(
+            StoreError::InvalidState(
                 "route migration move tasks require exactly one target_segment".to_string(),
-            ))
-        }
+            ),
+        ),
         _ => Ok(()),
     }
 }
@@ -824,8 +825,7 @@ fn evaluate_route_completion(
         .target_segments
         .iter()
         .map(|target| {
-            route
-                .replicas
+            route.replicas
                 .iter()
                 .any(|replica| replica.segment_name.0 == *target)
         })
@@ -849,7 +849,8 @@ fn evaluate_route_completion(
                 RouteCompletionCheck::Completed
             } else if has_target && has_source {
                 RouteCompletionCheck::Conflict(
-                    "route migration move left both source and target replicas visible".to_string(),
+                    "route migration move left both source and target replicas visible"
+                        .to_string(),
                 )
             } else if !has_target && !has_source {
                 RouteCompletionCheck::Conflict(
@@ -1057,7 +1058,11 @@ impl AdminService {
         migration_rpc: Arc<dyn MigrationRpc>,
     ) -> Self {
         Self {
-            migrations: MigrationTaskManager::new(backend.clone(), migration_rpc, migration_config),
+            migrations: MigrationTaskManager::new(
+                backend.clone(),
+                migration_rpc,
+                migration_config,
+            ),
             backend,
             metadata_url: metadata_url.into(),
             keyspace,
@@ -1760,8 +1765,8 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
@@ -2359,7 +2364,10 @@ mod tests {
             _authority: &ClientStableId,
             _key: &ObjectKey,
         ) -> AdminResult<Option<ObjectRoute>> {
-            self.route_results.lock().pop_front().unwrap_or(Ok(None))
+            self.route_results
+                .lock()
+                .pop_front()
+                .unwrap_or(Ok(None))
         }
     }
 
@@ -2386,10 +2394,7 @@ mod tests {
                 rpc_address: format!("127.0.0.1:{}", 18_000 + epoch),
                 segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
                 labels: [
-                    (
-                        "control_addr".to_string(),
-                        format!("http://127.0.0.1:{}", 19_000 + epoch),
-                    ),
+                    ("control_addr".to_string(), format!("http://127.0.0.1:{}", 19_000 + epoch)),
                     ("route".to_string(), "true".to_string()),
                     ("storage".to_string(), "true".to_string()),
                 ]
@@ -2450,9 +2455,7 @@ mod tests {
         }
     }
 
-    fn sample_copy_request_with_targets(
-        target_segments: &[&str],
-    ) -> RouteMigrationTaskSubmitRequest {
+    fn sample_copy_request_with_targets(target_segments: &[&str]) -> RouteMigrationTaskSubmitRequest {
         let mut request = sample_copy_request();
         request.target_segments = target_segments
             .iter()
@@ -2509,11 +2512,7 @@ mod tests {
         }
     }
 
-    fn sample_active_route(
-        key: &str,
-        source_segment: &str,
-        target_segments: &[&str],
-    ) -> ObjectRoute {
+    fn sample_active_route(key: &str, source_segment: &str, target_segments: &[&str]) -> ObjectRoute {
         let mut replicas = Vec::new();
         if !source_segment.is_empty() {
             replicas.push(ReplicaRoute {
@@ -3214,12 +3213,7 @@ mod tests {
                 vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
             )),
             route_results: Arc::new(Mutex::new(
-                vec![Ok(Some(sample_active_route(
-                    "object-a",
-                    "",
-                    &["segment-b"],
-                )))]
-                .into(),
+                vec![Ok(Some(sample_active_route("object-a", "", &["segment-b"])))].into(),
             )),
             submit_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
@@ -3400,12 +3394,7 @@ mod tests {
                 vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
             )),
             route_results: Arc::new(Mutex::new(
-                vec![Ok(Some(sample_active_route(
-                    "object-a",
-                    "",
-                    &["segment-b"],
-                )))]
-                .into(),
+                vec![Ok(Some(sample_active_route("object-a", "", &["segment-b"])))].into(),
             )),
             submit_calls: Arc::new(AtomicUsize::new(0)),
             status_calls: Arc::new(AtomicUsize::new(0)),
@@ -3474,11 +3463,8 @@ mod tests {
                 sample_copy_request_with_targets(&["segment-b", "segment-c"]),
             )
             .expect("migration task submit should succeed");
-        let status = wait_for_task_state(
-            &service,
-            &submitted.task_id,
-            RouteMigrationTaskState::Failed,
-        );
+        let status =
+            wait_for_task_state(&service, &submitted.task_id, RouteMigrationTaskState::Failed);
         assert_eq!(status.attempts, 1);
         assert_eq!(status.execution_id.as_deref(), Some("execution-1"));
         assert!(status.last_error.contains("all requested targets"));
@@ -3496,21 +3482,13 @@ mod tests {
         assert!(matches!(
             evaluate_route_completion(
                 &copy_record,
-                Some(&sample_active_route(
-                    "object-a",
-                    "segment-a",
-                    &["segment-b", "segment-c"]
-                )),
+                Some(&sample_active_route("object-a", "segment-a", &["segment-b", "segment-c"])),
             ),
             RouteCompletionCheck::Completed
         ));
         let copy_conflict = evaluate_route_completion(
             &copy_record,
-            Some(&sample_active_route(
-                "object-a",
-                "segment-a",
-                &["segment-b"],
-            )),
+            Some(&sample_active_route("object-a", "segment-a", &["segment-b"])),
         );
         assert!(matches!(copy_conflict, RouteCompletionCheck::Conflict(_)));
         assert!(format!("{copy_conflict:?}").contains("Conflict"));
@@ -3525,11 +3503,7 @@ mod tests {
         ));
         let move_conflict_both_visible = evaluate_route_completion(
             &move_record,
-            Some(&sample_active_route(
-                "object-a",
-                "segment-a",
-                &["segment-b"],
-            )),
+            Some(&sample_active_route("object-a", "segment-a", &["segment-b"])),
         );
         assert!(matches!(
             move_conflict_both_visible,
@@ -3759,10 +3733,10 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(
-                RouteMigrationMode::Copy,
-                sample_copy_request_with_targets(&["segment-b", "segment-c"]),
-            )
+            .submit_route_migration_task(RouteMigrationMode::Copy, sample_copy_request_with_targets(&[
+                "segment-b",
+                "segment-c",
+            ]))
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
