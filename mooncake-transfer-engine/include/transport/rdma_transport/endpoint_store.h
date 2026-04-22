@@ -59,7 +59,8 @@ class EndpointStore {
 // FIFO
 class FIFOEndpointStore : public EndpointStore {
    public:
-    FIFOEndpointStore(size_t max_size) : max_size_(max_size) {}
+    FIFOEndpointStore(size_t max_size)
+        : waiting_list_len_(0), max_size_(max_size) {}
     std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
@@ -73,7 +74,9 @@ class FIFOEndpointStore : public EndpointStore {
     int disconnectQPs() override;
 
     size_t getTotalQPNumber() override;
-    size_t waitingListSize() const override { return waiting_list_.size(); }
+    size_t waitingListSize() const override {
+        return waiting_list_len_.load(std::memory_order_relaxed);
+    }
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -83,6 +86,7 @@ class FIFOEndpointStore : public EndpointStore {
     std::list<std::string> fifo_list_;
 
     std::unordered_set<std::shared_ptr<RdmaEndPoint>> waiting_list_;
+    std::atomic<int> waiting_list_len_;
 
     size_t max_size_;
 };
