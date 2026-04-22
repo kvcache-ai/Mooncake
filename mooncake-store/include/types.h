@@ -270,6 +270,8 @@ enum class ErrorCode : int32_t {
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
     OPLOG_ENTRY_NOT_FOUND =
         -1004,  ///< OpLog entry not found (backend-agnostic).
+    K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
+    K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
