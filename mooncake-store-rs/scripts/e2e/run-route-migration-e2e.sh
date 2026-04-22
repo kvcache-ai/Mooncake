@@ -589,7 +589,6 @@ else:
         "authority": source_stable_id,
         "tenant": tenant,
         "key": key,
-        "mode": submit_mode,
         "source_segment": source_segment,
         "target_segments": target_segments,
         "task_executor": source_stable_id,
