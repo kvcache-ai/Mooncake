@@ -65,7 +65,6 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
-    size_t efa_striping_threshold = 2 * 1024 * 1024;  // 2MB default
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;

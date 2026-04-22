@@ -195,16 +195,6 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    const char* efa_striping_env = std::getenv("MC_EFA_STRIPING_THRESHOLD");
-    if (efa_striping_env) {
-        size_t val = strtoull(efa_striping_env, nullptr, 10);
-        if (val > 0)
-            config.efa_striping_threshold = val;
-        else
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_EFA_STRIPING_THRESHOLD";
-    }
-
     const char* retry_cnt_env = std::getenv("MC_RETRY_CNT");
     if (retry_cnt_env) {
         size_t val = atoi(retry_cnt_env);

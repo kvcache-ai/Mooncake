@@ -794,15 +794,6 @@ Status EfaTransport::submitTransferTask(
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const int kMaxRetryCount = globalConfig().retry_cnt;
-    // Striping threshold: transfers larger than this stripe across all
-    // active local NICs (one chunk per NIC) instead of creating thousands
-    // of small slices.  This dramatically reduces per-slice overhead
-    // (spinlock acquisition, atomic ops, MR lookup, heap allocation).
-    // Configurable via GlobalConfig (MC_EFA_STRIPING_THRESHOLD env var).
-    // Default 2MB: below this, single-NIC is faster (avoids endpoint overhead
-    // for 16 tiny chunks); above this, multi-NIC striping with pre-resolved
-    // peer info gives up to +54% throughput.
-    const size_t kStripingThreshold = globalConfig().efa_striping_threshold;
 
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
@@ -821,97 +812,9 @@ Status EfaTransport::submitTransferTask(
             request_device_id = -1;
         }
 
-        if (request.length > kStripingThreshold && request_buffer_id >= 0) {
-            // LARGE TRANSFER: stripe across all active local NICs.
-            // Creates one slice per NIC instead of (length / 64KB) slices,
-            // e.g. 240MB transfer: 4-32 slices vs 3840 slices.
-            std::vector<std::pair<int, std::shared_ptr<EfaContext>>>
-                active_devs;
-            for (int d = 0; d < static_cast<int>(context_list_.size()); ++d) {
-                auto& ctx = context_list_[d];
-                if (!ctx || !ctx->active()) continue;
-                if (static_cast<size_t>(request_buffer_id) <
-                        local_segment_desc->buffers.size() &&
-                    local_segment_desc->buffers[request_buffer_id].lkey.size() >
-                        static_cast<size_t>(d) &&
-                    local_segment_desc->buffers[request_buffer_id].lkey[d] !=
-                        0) {
-                    active_devs.push_back({d, ctx});
-                }
-            }
-
-            if (active_devs.empty()) {
-                LOG(ERROR) << "No active EFA device for striping transfer of "
-                           << request.length << " bytes";
-                for (auto& entry : slices_to_post)
-                    for (auto s : entry.second) s->markFailed();
-                return Status::AddressNotRegistered(
-                    "No active EFA device found for striping");
-            }
-
-            size_t num_nics = active_devs.size();
-            size_t chunk_size = request.length / num_nics;
-
-            // Pre-resolve remote peer info ONCE for all striped slices.
-            // This eliminates per-slice overhead in submitPostSend:
-            //   - getSegmentDescByID lookup
-            //   - selectDevice() call
-            //   - string construction for peer_nic_path
-            // Using retry_count=i distributes slices across remote NICs.
-            auto peer_segment_desc =
-                metadata_->getSegmentDescByID(request.target_id);
-
-            for (size_t i = 0; i < num_nics; ++i) {
-                Slice* slice = getSliceCache().allocate();
-                assert(slice);
-                slice->peer_nic_path.clear();
-                slice->rdma.dest_rkey = 0;
-
-                size_t offset = i * chunk_size;
-                size_t len =
-                    (i == num_nics - 1) ? request.length - offset : chunk_size;
-
-                slice->source_addr = (char*)request.source + offset;
-                slice->length = len;
-                slice->opcode = request.opcode;
-                slice->rdma.dest_addr = request.target_offset + offset;
-                slice->rdma.retry_cnt = request.advise_retry_cnt;
-                slice->rdma.max_retry_cnt = kMaxRetryCount;
-                slice->task = &task;
-                slice->target_id = request.target_id;
-                slice->status = Slice::PENDING;
-                slice->ts = 0;
-                task.slice_list.push_back(slice);
-
-                int dev_id = active_devs[i].first;
-                auto& context = active_devs[i].second;
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[request_buffer_id].lkey[dev_id];
-
-                // Pre-resolve remote NIC: set dest_rkey and peer_nic_path
-                // so submitPostSend() can skip expensive per-slice lookups.
-                if (peer_segment_desc) {
-                    int remote_buffer_id = -1, remote_device_id = -1;
-                    if (selectDevice(peer_segment_desc.get(),
-                                     request.target_offset + offset, len,
-                                     remote_buffer_id, remote_device_id,
-                                     static_cast<int>(i)) == 0) {
-                        slice->rdma.dest_rkey =
-                            peer_segment_desc->buffers[remote_buffer_id]
-                                .rkey[remote_device_id];
-                        slice->peer_nic_path =
-                            peer_segment_desc->name + "@" +
-                            peer_segment_desc->devices[remote_device_id].name;
-                    }
-                }
-
-                slices_to_post[context].push_back(slice);
-                __sync_fetch_and_add(&task.total_bytes, slice->length);
-                __sync_fetch_and_add(&task.slice_count, 1);
-            }
-        } else if (request_buffer_id >= 0 && request_device_id >= 0) {
-            // SMALL TRANSFER (or single-NIC): one slice, no sub-slicing.
-            // Round-robin NIC selection is handled by selectDevice above.
+        if (request_buffer_id >= 0 && request_device_id >= 0) {
+            // One slice per request.  Round-robin NIC selection is
+            // handled by selectDevice above.
             auto& context = context_list_[request_device_id];
             if (!context || !context->active()) {
                 LOG(ERROR) << "EFA Device " << request_device_id

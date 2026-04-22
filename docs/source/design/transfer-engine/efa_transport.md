@@ -214,11 +214,11 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 | `--init_mem` | true | Zero-fill the allocated buffer; rarely needs to change |
 | `--auto_discovery` | false | Auto-discover topology on init; off for reproducible runs |
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `MC_EFA_STRIPING_THRESHOLD` | 2097152 | Transfers larger than this (bytes) are striped across all NICs |
-
-> **Note on EFA slicing:** EFA transport does not split each transfer into fixed-size slices the way RDMA transport does. Transfers ≤ `MC_EFA_STRIPING_THRESHOLD` (default 2MB) are sent as a **single `fi_write`/`fi_read`** whose size equals `block_size`; transfers larger than the threshold are striped across all NICs (one chunk per NIC). So **`block_size` is the key tuning parameter** for EFA throughput.
+> **Note on EFA slicing:** EFA transport does not split each transfer
+> into fixed-size slices the way RDMA transport does — each transfer
+> is sent as a single `fi_write` / `fi_read` whose size equals
+> `block_size`, round-robin'd across NICs per request. **`block_size`
+> is the key tuning parameter** for EFA throughput.
 
 > **Note:** `buffer_size` must be >= `block_size * batch_size * threads`. The benchmark auto-adjusts if too small.
 
@@ -249,7 +249,6 @@ Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 1
 | Configuration | Write | Read |
 |---------------|-------|------|
 | **block=1MB, threads=32, batch=128, buf=4GB** | **230 GB/s** | 180 GB/s |
-| block=16MB, threads=32, batch=8, buf=8GB (striping off) | 233 GB/s | - |
 
 > CPU-to-CPU is bounded by DRAM bandwidth (~250 GB/s/socket on Xeon 8559C). Per-NIC sampling shows NUMA-0 NICs at 90 Gbps and NUMA-1 NICs at 53 Gbps, confirming DRAM controller saturation rather than NIC limit.
 
@@ -324,10 +323,9 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 > The 64 KB default only reaches ~26% of peak. Write throughput
 > climbs steeply up to ~512 KB and plateaus between 1 MB and 2 MB;
-> read saturates at ~256 KB. 2 MB is the `MC_EFA_STRIPING_THRESHOLD`
-> boundary — above it, each transfer is striped across all NICs
-> (a different code path). 1 MB is the sweet spot: within 4% of the
-> 2 MB peak and safely below the striping threshold.
+> read saturates at ~256 KB. 1 MB is the recommended value — within
+> a few percent of the 2 MB peak with more headroom for `batch_size`
+> under the shared-endpoint WR cap.
 
 **buffer_size sweep** (p5en GPU-to-GPU, `threads=16 batch=128 block=1MB --gpu_id=-1`):
 
@@ -347,9 +345,8 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 - **Use `--block_size=1048576` (1MB)** — the single most important
   knob. The 64 KB default reaches only ~26% of peak. 1 MB is within
-  a few percent of the 2 MB plateau (which is the
-  `MC_EFA_STRIPING_THRESHOLD` boundary) and stays on the single-NIC
-  `fi_write`/`fi_read` code path.
+  a few percent of the 2 MB plateau while leaving headroom for
+  `batch_size` under the shared-endpoint WR cap.
 - **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD
   shared endpoint each NIC carries one `fid_ep` with a 256 WR cap
   (`MC_MAX_WR`), giving `16 NICs × 256 = 4096` in-flight slots on a
