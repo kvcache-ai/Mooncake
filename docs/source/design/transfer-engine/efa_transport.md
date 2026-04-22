@@ -140,8 +140,13 @@ Use `transfer_engine_bench` to measure EFA transport throughput between two node
 ./build/mooncake-transfer-engine/example/transfer_engine_bench \
     --mode=target \
     --protocol=efa \
-    --metadata_server=P2PHANDSHAKE
+    --metadata_server=P2PHANDSHAKE \
+    --buffer_size=4294967296
 ```
+
+`--buffer_size` must be at least as large as the initiator's
+`--buffer_size`, since the initiator writes into offsets `[0, buffer_size)`
+on the target. Keep these two flags in sync.
 
 ### Initiator Node (sender)
 
@@ -187,10 +192,9 @@ Replace `<target_hostname>:<target_port>` with the target node's address shown i
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `MC_SLICE_SIZE` | 65536 | Slice size for RDMA transport. **Not used by EFA transport** (see note below). |
 | `MC_EFA_STRIPING_THRESHOLD` | 2097152 | Transfers larger than this (bytes) are striped across all NICs |
 
-> **Note on EFA slicing:** Unlike RDMA transport which splits every transfer into fixed `MC_SLICE_SIZE` chunks, EFA transport uses a different strategy: transfers ≤ `MC_EFA_STRIPING_THRESHOLD` (default 2MB) are sent as a **single `fi_write`/`fi_read`** whose size equals `block_size`; transfers larger than the threshold are striped across all NICs (one chunk per NIC). This means **`block_size` directly determines per-operation size** and is the key tuning parameter for EFA, while `MC_SLICE_SIZE` has no effect — this applies to both CPU-to-CPU and GPU-to-GPU runs.
+> **Note on EFA slicing:** EFA transport does not split each transfer into fixed-size slices the way RDMA transport does. Transfers ≤ `MC_EFA_STRIPING_THRESHOLD` (default 2MB) are sent as a **single `fi_write`/`fi_read`** whose size equals `block_size`; transfers larger than the threshold are striped across all NICs (one chunk per NIC). So **`block_size` is the key tuning parameter** for EFA throughput.
 
 > **Note:** `buffer_size` must be >= `block_size * batch_size * threads`. The benchmark auto-adjusts if too small.
 
@@ -212,22 +216,6 @@ Tested on two p6-b200.48xlarge instances in the same AWS placement group.
 | Configuration | Write | Read |
 |---------------|-------|------|
 | block=1MB, threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
-
-<details>
-<summary>CPU Parameter Tuning History (p6-b200)</summary>
-
-Earlier CPU-to-CPU tuning results (before EFA striping optimization, when `MC_SLICE_SIZE` was still used by EFA):
-
-| block_size | threads | batch_size | MC_SLICE_SIZE | Throughput |
-|-----------|---------|------------|---------------|-----------|
-| 64KB  | 8  | 128 | default (64KB) | 69.47 GB/s |
-| 128KB | 32 | 128 | default        | 92.33 GB/s |
-| 128KB | 32 | 128 | 256KB          | 156.18 GB/s |
-| 128KB | 48 | 128 | 256KB          | 160.34 GB/s |
-
-> **Note:** These results predate the EFA striping optimization. With the current code, `MC_SLICE_SIZE` no longer affects EFA performance. Use `--block_size=1048576` (1MB) instead, which achieves 222 GB/s.
-
-</details>
 
 #### p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
 
@@ -296,7 +284,6 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 ### Tuning Tips
 
 - **Use `--block_size=1048576` (1MB)** — this is the most important tuning parameter for EFA. Each `block_size`-sized transfer becomes a single `fi_write`/`fi_read` call, so larger blocks amortize per-operation overhead. 1MB gives ~2× throughput over the 64KB default.
-- `MC_SLICE_SIZE` has **no effect** on EFA transport (it only applies to RDMA transport). Use `block_size` instead.
 - Increase `--threads` to 32-48 to saturate multiple EFA devices (2-4 threads per device is a good starting point)
 - For **CPU-to-CPU**: use `--block_size=1048576` (1MB) with NUMA-split (separate instances per NUMA node) for best results
 - For **GPU-to-GPU**: use `--block_size=1048576` (1MB), `--gpu_id=-1` (all GPUs), and `--buffer_size=2147483648` (2GB max per GPU). Write peaks at threads=32, read at threads=16
