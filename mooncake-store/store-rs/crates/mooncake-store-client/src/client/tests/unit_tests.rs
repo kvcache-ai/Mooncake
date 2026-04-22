@@ -93,7 +93,7 @@ fn object_ref_full_chain() {
 #[test]
 fn replication_policy_defaults_are_none() {
     let p = ReplicationPolicy::default();
-    assert!(p.replica_count.is_none() || p.replica_count == Some(1));
+    assert_eq!(p.replica_count, None);
 }
 
 #[test]
