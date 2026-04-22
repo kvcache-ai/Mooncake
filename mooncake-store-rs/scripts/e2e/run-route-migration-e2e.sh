@@ -59,6 +59,9 @@ Environment:
   MC_STORE_RS_ROUTE_MIGRATION_EXPECT_RETRY_WAIT
                                    When set to 1, assert the task history
                                    contains a retry/backoff transition
+  MC_STORE_RS_ROUTE_MIGRATION_SEQUENCE
+                                   Optional two-step sequence:
+                                   `copy-then-move` or `move-then-copy`
   MC_STORE_RS_ROUTE_MIGRATION_MAX_RETRIES
                                    Optional per-task retry budget override
   MC_STORE_RS_ROUTE_MIGRATION_TASK_EXECUTOR
@@ -141,12 +144,26 @@ if [[ "${EXPECT_STATE}" != "succeeded" && "${EXPECT_STATE}" != "failed" ]]; then
   exit 1
 fi
 TASK_MAX_RETRIES="${MC_STORE_RS_ROUTE_MIGRATION_MAX_RETRIES:-}"
+SEQUENCE="${MC_STORE_RS_ROUTE_MIGRATION_SEQUENCE:-}"
 KILL_EXECUTOR_AFTER_SUBMIT="${MC_STORE_RS_ROUTE_MIGRATION_KILL_EXECUTOR_AFTER_SUBMIT:-0}"
 KILL_EXECUTOR_AT="${MC_STORE_RS_ROUTE_MIGRATION_KILL_EXECUTOR_AT:-running}"
 DEDICATED_EXECUTOR_ENABLED="${MC_STORE_RS_ROUTE_MIGRATION_ENABLE_DEDICATED_EXECUTOR:-0}"
 if [[ "${KILL_EXECUTOR_AT}" != "submit" && "${KILL_EXECUTOR_AT}" != "dispatching" && "${KILL_EXECUTOR_AT}" != "running" ]]; then
   echo "unsupported kill stage: ${KILL_EXECUTOR_AT}" >&2
   usage >&2
+  exit 1
+fi
+if [[ -n "${SEQUENCE}" && "${SEQUENCE}" != "copy-then-move" && "${SEQUENCE}" != "move-then-copy" ]]; then
+  echo "unsupported sequence: ${SEQUENCE}" >&2
+  usage >&2
+  exit 1
+fi
+if [[ "${SEQUENCE}" == "copy-then-move" && "${MODE}" != "copy" ]]; then
+  echo "copy-then-move requires base mode copy" >&2
+  exit 1
+fi
+if [[ "${SEQUENCE}" == "move-then-copy" && "${MODE}" != "move" ]]; then
+  echo "move-then-copy requires base mode move" >&2
   exit 1
 fi
 
@@ -443,7 +460,7 @@ TARGET_PID=$!
 PIDS+=("${TARGET_PID}")
 wait_for_log "${TARGET_LOG}" "mooncake-store-client started stable_id=${TARGET_STABLE_ID}" 30
 
-if [[ "${MODE}" == "copy-multi" ]]; then
+if [[ "${MODE}" == "copy-multi" || -n "${SEQUENCE}" ]]; then
   echo "==> starting extra target store client"
   "${BIN}" \
     "${CLIENT_BASE_ARGS[@]}" \
@@ -533,7 +550,7 @@ elif [[ "${TASK_EXECUTOR}" == "${EXECUTOR_STABLE_ID}" ]]; then
   EXECUTOR_PID=${EXECUTOR_PID}
 fi
 
-python3 - "${ADMIN_URL}" "${REDIS_URL}" "${MODE}" "${TENANT}" "${KEYSPACE}" "${KEY}" "${PAYLOAD}" "${MC_STORE_RS_ROUTE_MIGRATION_PAYLOAD_BYTES:-0}" "${SOURCE_SEGMENT}" "${TARGET_SEGMENTS_JSON}" "${SOURCE_STABLE_ID}" "${MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS:-2000}" "${SUBMITTER}" "${ADMIN_CLI_BIN}" "${ROUTE_CONTROL}" "${ROUTE_TOPK}" "${EXPECT_STATE}" "${MC_STORE_RS_ROUTE_MIGRATION_EXPECT_RETRY_WAIT:-0}" "${TASK_EXECUTOR}" "${TASK_MAX_RETRIES}" "${KILL_EXECUTOR_AFTER_SUBMIT}" "${KILL_EXECUTOR_AT}" "${EXECUTOR_PID}" <<'PY'
+python3 - "${ADMIN_URL}" "${REDIS_URL}" "${MODE}" "${TENANT}" "${KEYSPACE}" "${KEY}" "${PAYLOAD}" "${MC_STORE_RS_ROUTE_MIGRATION_PAYLOAD_BYTES:-0}" "${SOURCE_SEGMENT}" "${TARGET_SEGMENTS_JSON}" "${EXTRA_TARGET_SEGMENT}" "${SOURCE_STABLE_ID}" "${MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS:-2000}" "${SUBMITTER}" "${ADMIN_CLI_BIN}" "${ROUTE_CONTROL}" "${ROUTE_TOPK}" "${EXPECT_STATE}" "${MC_STORE_RS_ROUTE_MIGRATION_EXPECT_RETRY_WAIT:-0}" "${TASK_EXECUTOR}" "${TASK_MAX_RETRIES}" "${KILL_EXECUTOR_AFTER_SUBMIT}" "${KILL_EXECUTOR_AT}" "${EXECUTOR_PID}" "${SEQUENCE}" <<'PY'
 import json
 import os
 import re
@@ -555,19 +572,21 @@ payload = sys.argv[7].encode()
 payload_bytes = int(sys.argv[8])
 source_segment = sys.argv[9]
 target_segments = json.loads(sys.argv[10])
-source_stable_id = sys.argv[11]
-request_timeout_ms = int(sys.argv[12])
-submitter = sys.argv[13]
-admin_cli_bin = sys.argv[14]
-route_control = sys.argv[15].replace("-", "_")
-route_topk = int(sys.argv[16])
-expected_state = sys.argv[17]
-expect_retry_wait = sys.argv[18] == "1"
-task_executor = sys.argv[19]
-max_retries = int(sys.argv[20]) if sys.argv[20] else None
-kill_executor_after_submit = sys.argv[21] == "1"
-kill_executor_at = sys.argv[22]
-executor_pid = int(sys.argv[23])
+extra_target_segment = sys.argv[11]
+source_stable_id = sys.argv[12]
+request_timeout_ms = int(sys.argv[13])
+submitter = sys.argv[14]
+admin_cli_bin = sys.argv[15]
+route_control = sys.argv[16].replace("-", "_")
+route_topk = int(sys.argv[17])
+expected_state = sys.argv[18]
+expect_retry_wait = sys.argv[19] == "1"
+task_executor = sys.argv[20]
+max_retries = int(sys.argv[21]) if sys.argv[21] else None
+kill_executor_after_submit = sys.argv[22] == "1"
+kill_executor_at = sys.argv[23]
+executor_pid = int(sys.argv[24])
+sequence = sys.argv[25]
 request_timeout_s = max(request_timeout_ms / 1000.0, 1.0)
 submit_mode = "copy" if mode == "copy-multi" else mode
 
@@ -744,6 +763,121 @@ def assert_route_shape(route, expected_source, expected_targets):
         )
 
 
+def wait_for_route_exact(expected_segments):
+    expected_set = set(expected_segments)
+    deadline = time.time() + 30.0
+    last_route = None
+    while time.time() < deadline:
+        route = store.query_route(key, tenant=tenant)
+        last_route = route
+        if route is not None:
+            segments = route_segments(route)
+            if len(segments) == len(expected_segments) and set(segments) == expected_set:
+                return route
+        time.sleep(0.2)
+    raise AssertionError((expected_segments, last_route))
+
+
+def submit_task(current_mode, current_source_segment, current_target_segments):
+    if submitter == "cli":
+        submit_args = [
+            "--metadata-url",
+            redis_url,
+            "--admin-url",
+            admin_url,
+            "--keyspace",
+            keyspace,
+            "migrate",
+            current_mode,
+            "--authority",
+            source_stable_id,
+            "--tenant",
+            tenant,
+            "--key",
+            key,
+            "--source-segment",
+            current_source_segment,
+        ]
+        for current_target_segment in current_target_segments:
+            submit_args.extend(["--target-segment", current_target_segment])
+        submit_args.extend(["--task-executor", task_executor])
+        if max_retries is not None:
+            submit_args.extend(["--max-retries", str(max_retries)])
+        submit_output = run_admin_cli(*submit_args)
+        submit_response = parse_cli_fields(submit_output)
+        task_id = submit_response["task_id"]
+
+        listed_output = run_admin_cli(
+            "--metadata-url",
+            redis_url,
+            "--admin-url",
+            admin_url,
+            "--keyspace",
+            keyspace,
+            "migrate",
+            "task",
+            "list",
+        )
+        listed = parse_cli_fields(listed_output)
+        assert int(listed["count"]) >= 1
+        return task_id
+
+    submit_path = (
+        "/v1/route-migrations/copy"
+        if current_mode == "copy"
+        else "/v1/route-migrations/move"
+    )
+    submit_body = {
+        "authority": source_stable_id,
+        "tenant": tenant,
+        "key": key,
+        "source_segment": current_source_segment,
+        "target_segments": current_target_segments,
+        "task_executor": task_executor,
+    }
+    if max_retries is not None:
+        submit_body["max_retries"] = max_retries
+    submit_response = request_json("POST", submit_path, submit_body)
+    task_id = submit_response["task_id"]
+
+    listed = request_json("GET", "/v1/route-migrations")
+    assert listed["count"] >= 1
+    assert any(task["task_id"] == task_id for task in listed["tasks"])
+    return task_id
+
+
+def run_task(
+    current_mode,
+    current_source_segment,
+    current_target_segments,
+    current_expected_state,
+    *,
+    expect_retry=False,
+    allow_kill=False,
+):
+    task_id = submit_task(current_mode, current_source_segment, current_target_segments)
+    history = []
+
+    if allow_kill and kill_executor_after_submit and executor_pid > 0:
+        if kill_executor_at == "dispatching":
+            wait_for_task_state(
+                task_id,
+                {"dispatching", "running", "retry_wait"},
+                history,
+            )
+        elif kill_executor_at == "running":
+            wait_for_task_state(task_id, {"running"}, history)
+        os.kill(executor_pid, signal.SIGKILL)
+        time.sleep(0.2)
+
+    status = wait_for_task(task_id, history)
+    assert status["state"] == current_expected_state, status
+    assert status["task_executor"] == task_executor
+    if expect_retry:
+        assert_retry_process(history)
+    return task_id, status, history
+
+
 store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1",
@@ -769,108 +903,17 @@ assert initial_route is not None
 assert_route_shape(initial_route, expected_source=True, expected_targets=False)
 assert store.get(key, tenant=tenant) == payload
 
-if submitter == "cli":
-    submit_args = [
-        "--metadata-url",
-        redis_url,
-        "--admin-url",
-        admin_url,
-        "--keyspace",
-        keyspace,
-        "migrate",
-        submit_mode,
-        "--authority",
-        source_stable_id,
-        "--tenant",
-        tenant,
-        "--key",
-        key,
-        "--source-segment",
-        source_segment,
-    ]
-    for target_segment in target_segments:
-        submit_args.extend(["--target-segment", target_segment])
-    submit_args.extend(["--task-executor", task_executor])
-    if max_retries is not None:
-        submit_args.extend(["--max-retries", str(max_retries)])
-    submit_output = run_admin_cli(*submit_args)
-    submit_response = parse_cli_fields(submit_output)
-    task_id = submit_response["task_id"]
+task_id, status, status_history = run_task(
+    submit_mode,
+    source_segment,
+    target_segments,
+    expected_state,
+    expect_retry=expect_retry_wait,
+    allow_kill=True,
+)
 
-    listed_output = run_admin_cli(
-        "--metadata-url",
-        redis_url,
-        "--admin-url",
-        admin_url,
-        "--keyspace",
-        keyspace,
-        "migrate",
-        "task",
-        "list",
-    )
-    listed = parse_cli_fields(listed_output)
-    assert int(listed["count"]) >= 1
-else:
-    submit_path = (
-        "/v1/route-migrations/copy"
-        if submit_mode == "copy"
-        else "/v1/route-migrations/move"
-    )
-    submit_body = {
-        "authority": source_stable_id,
-        "tenant": tenant,
-        "key": key,
-        "source_segment": source_segment,
-        "target_segments": target_segments,
-        "task_executor": task_executor,
-    }
-    if max_retries is not None:
-        submit_body["max_retries"] = max_retries
-    submit_response = request_json("POST", submit_path, submit_body)
-    task_id = submit_response["task_id"]
-
-    listed = request_json("GET", "/v1/route-migrations")
-    assert listed["count"] >= 1
-    assert any(task["task_id"] == task_id for task in listed["tasks"])
-
-status_history = []
-
-if kill_executor_after_submit and executor_pid > 0:
-    if kill_executor_at == "dispatching":
-        wait_for_task_state(
-            task_id,
-            {"dispatching", "running", "retry_wait"},
-            status_history,
-        )
-    elif kill_executor_at == "running":
-        wait_for_task_state(task_id, {"running"}, status_history)
-    os.kill(executor_pid, signal.SIGKILL)
-    time.sleep(0.2)
-
-status = wait_for_task(task_id, status_history)
-assert status["state"] == expected_state, status
-assert status["task_executor"] == task_executor
-if expect_retry_wait:
-    assert_retry_process(status_history)
-
-final_route = None
-deadline = time.time() + 30.0
-while time.time() < deadline:
-    final_route = store.query_route(key, tenant=tenant)
-    if final_route is not None:
-        segments = route_segments(final_route)
-        if submit_mode == "move":
-            if segments == target_segments:
-                break
-        else:
-            if source_segment in segments and all(
-                target_segment in segments for target_segment in target_segments
-            ):
-                break
-    time.sleep(0.2)
-
-assert final_route is not None
 if expected_state == "failed":
+    final_route = wait_for_route_exact([source_segment])
     assert status["last_error"], status
     if kill_executor_after_submit:
         error_text = status["last_error"].lower()
@@ -883,10 +926,51 @@ if expected_state == "failed":
         ), status
     assert_route_shape(final_route, expected_source=True, expected_targets=False)
 else:
-    if submit_mode == "move":
+    if sequence == "copy-then-move":
+        intermediate_route = wait_for_route_exact([source_segment, *target_segments])
+        assert extra_target_segment, sequence
+        _, second_status, second_history = run_task(
+            "move",
+            source_segment,
+            [extra_target_segment],
+            "succeeded",
+        )
+        final_route = wait_for_route_exact([*target_segments, extra_target_segment])
+        assert second_status["state"] == "succeeded", second_status
+        sequence_history = second_history
+    elif sequence == "move-then-copy":
+        intermediate_route = wait_for_route_exact(target_segments)
+        assert extra_target_segment, sequence
+        _, second_status, second_history = run_task(
+            "copy",
+            target_segments[0],
+            [extra_target_segment],
+            "succeeded",
+        )
+        final_route = wait_for_route_exact([target_segments[0], extra_target_segment])
+        assert second_status["state"] == "succeeded", second_status
+        sequence_history = second_history
+    else:
+        intermediate_route = None
+        sequence_history = []
+        if submit_mode == "move":
+            final_route = wait_for_route_exact(target_segments)
+        else:
+            final_route = wait_for_route_exact([source_segment, *target_segments])
+
+    if sequence == "copy-then-move":
+        assert source_segment not in route_segments(final_route), final_route
+        for final_target in [*target_segments, extra_target_segment]:
+            assert final_target in route_segments(final_route), final_route
+    elif sequence == "move-then-copy":
+        assert source_segment not in route_segments(final_route), final_route
+        for final_target in [target_segments[0], extra_target_segment]:
+            assert final_target in route_segments(final_route), final_route
+    elif submit_mode == "move":
         assert_route_shape(final_route, expected_source=False, expected_targets=True)
     else:
         assert_route_shape(final_route, expected_source=True, expected_targets=True)
+    status_history.extend(sequence_history)
 
 assert store.get(key, tenant=tenant) == payload
 
@@ -896,7 +980,11 @@ print(
             "task_id": task_id,
             "state": status["state"],
             "mode": mode,
+            "sequence": sequence or None,
             "route_segments": route_segments(final_route),
+            "intermediate_route_segments": route_segments(intermediate_route)
+            if expected_state == "succeeded" and intermediate_route is not None
+            else None,
             "status_history_states": [entry["state"] for entry in status_history],
             "status_history_attempts": [entry.get("attempts") for entry in status_history],
         },
