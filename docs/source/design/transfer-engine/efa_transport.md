@@ -368,24 +368,52 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 ### Eager endpoint warmup (first-request latency)
 
-libfabric `FI_EP_RDM` endpoints resolve peer addresses lazily: `fi_av_insert()` and the metadata handshake fire on the first send to each `(local_ctx, peer_nic)` pair. On 16-NIC instances that gives `16 × N_peer_NICs` serial handshakes inside the first `submitTransfer`, which shows up as a single-digit-second first-batch stall (measured ~4 s on p6-B300 for a 100 × 0.5 MB batch; the first batch runs at <0.1 GB/s while the CQ drains, steady-state afterwards is unaffected).
+Under the SRD shared-endpoint model, peer addressing still resolves
+lazily: `fi_av_insert()` and the metadata handshake fire on the first
+send to each `(local_NIC, peer_NIC)` pair. On a 16-NIC × 16-NIC
+topology that's up to 256 handshakes spread over the first few
+`submitTransfer` calls (since the initiator round-robins across local
+NICs, only a handful fire on any single submit). Each pair adds a few
+tens of ms; amortized across the first several calls, the stall looks
+like ~25 ms per submit until every pair is warm.
 
-Mooncake exposes an explicit eager-warmup API to eliminate the stall:
+Mooncake exposes an explicit eager-warmup API to pay this cost up
+front:
 
 - C++: `EfaTransport::warmupSegment(const std::string& segment_name)`
 - C: `int warmupEfaSegment(transfer_engine_t engine, const char *segment_name)`
 - Rust: `TransferEngine::warmup_efa_segment(name: &str)`
 
-Call it once per peer segment, right after `openSegment` (or after any metadata change that adds a new peer). Every `(local_ctx, peer_nic)` endpoint is connected concurrently via `std::async`; the critical path becomes `max(handshake RTT)` instead of `sum(handshake RTT)`. The call is idempotent — safe to re-run.
+Call it once per peer segment, right after `openSegment` (or after any
+metadata change that adds a new peer). Every `(local_NIC, peer_NIC)`
+pair is handshaken concurrently via `std::async`; the critical path is
+`max(handshake RTT)`, not `sum`. The call is idempotent — safe to
+re-run on the same segment.
 
-Measured on p6-B300 (16 local NICs × 16 peer NICs, dual-NUMA initiator, 100 × 0.5 MB batch):
+**Measured on p5en (16 local NICs × 16 peer NICs, cross-node probe,
+1 MB write, 3 reps, median):**
 
-| | first-batch latency | steady-state |
-|---|---:|---:|
-| No warmup | 4,043 ms | 141 GB/s |
-| `warmup_efa_segment` (256 endpoints connected in 4.1 s) | **13.5 ms** (~300×) | 230 GB/s |
+| code | warmup | cold submit #0 |
+|------|-------:|---------------:|
+| SRD shared endpoint (this PR)   | **1.1 s** | **26 ms** (no warmup) / 10 ms (after warmup) |
+| Per-peer `fid_ep` (upstream main) | 17 s | 99 ms (no warmup) / 11 ms (after warmup) |
 
-The warmup call itself takes roughly the same wall time as the stall it replaces — the win is that it's a one-time setup cost decoupled from the critical path of the first real transfer, not paid inside your latency budget.
+Two things fall out of this:
+
+1. **`warmupSegment` is ~15× faster** under the SRD shared endpoint —
+   256 × `handshake + fi_av_insert` (~4 ms each) vs the old 256 ×
+   `fi_endpoint + fi_enable` (~65 ms each, serial-bottlenecked, with
+   high variance: 9 / 17 / 17 s across three runs).
+2. **The cold first submit is ~4× faster** even if you don't call
+   `warmupSegment`: 26 ms vs 99 ms. The shared endpoint removes the
+   per-peer `fi_endpoint` allocation that dominated the old path.
+
+Together, any workload sensitive to first-request latency should see a
+double improvement: if you *do* call `warmupSegment`, the warmup itself
+is much shorter; if you *don't*, the first real `submitTransfer` is
+still 4× closer to steady-state latency.
+
+Reproducer: `mooncake-transfer-engine/example/efa_first_submit_probe.cpp`.
 
 ## Usage with vLLM
 
