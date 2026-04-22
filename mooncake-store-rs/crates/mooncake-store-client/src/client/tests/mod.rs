@@ -7583,28 +7583,25 @@ fn builder_allows_takeover_of_unreachable_duplicate_runtime() {
 }
 
 #[test]
-fn builder_rejects_stale_epoch_when_newer_runtime_is_reachable() {
+fn builder_auto_allocates_higher_epoch_when_newer_runtime_is_reachable() {
     let metadata = Arc::new(NoHotPathMetadataBackend::with_metadata_lists_blocked(
         Arc::new(InMemoryMetadataBackend::new()),
     ));
-    let _newer = StoreClientBuilder::new(metadata.clone(), "epoch-fence")
+    let newer = StoreClientBuilder::new(metadata.clone(), "epoch-fence")
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7105")
         .segment_name("epoch-fence-newer")
         .build(test_future_expiry_ms())
-        .expect("newer runtime should build");
+        .expect("first runtime should build");
 
-    let error = match StoreClientBuilder::new(metadata, "epoch-fence")
+    let successor = StoreClientBuilder::new(metadata, "epoch-fence")
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7106")
         .segment_name("epoch-fence-older")
         .build(test_future_expiry_ms())
-    {
-        Ok(_) => panic!("older runtime should be fenced by newer live epoch"),
-        Err(error) => error,
-    };
+        .expect("successor runtime should auto-allocate a newer epoch");
 
-    assert!(matches!(error, StoreError::StaleEpoch(_)));
+    assert!(successor.lease().runtime.epoch > newer.lease().runtime.epoch);
 }
 
 #[test]
