@@ -4,6 +4,7 @@ use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
+use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
     HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
@@ -1086,14 +1087,17 @@ impl MetadataBackend for EtcdMetadataBackend {
                             ))
                         })?;
                     if admitted > limit {
-                        return Err(StoreError::Conflict(format!(
-                            "tenant quota bytes exceeded for {}: used={} pending={} requested={} limit={}",
-                            scope.tenant,
-                            quota.used_bytes,
-                            quota.pending_reserved_bytes,
-                            positive_bytes,
-                            limit
-                        )));
+                        return Err(StoreError::QuotaExceeded {
+                            kind: QuotaKind::Bytes,
+                            message: format!(
+                                "tenant quota bytes exceeded for {}: used={} pending={} requested={} limit={}",
+                                scope.tenant,
+                                quota.used_bytes,
+                                quota.pending_reserved_bytes,
+                                positive_bytes,
+                                limit
+                            ),
+                        });
                     }
                 }
                 if let Some(limit) = normalized.limit.max_objects {
@@ -1114,14 +1118,17 @@ impl MetadataBackend for EtcdMetadataBackend {
                             ))
                         })?;
                     if admitted > limit {
-                        return Err(StoreError::Conflict(format!(
-                            "tenant quota objects exceeded for {}: used={} pending={} requested={} limit={}",
-                            scope.tenant,
-                            quota.used_objects,
-                            quota.pending_reserved_objects,
-                            positive_objects,
-                            limit
-                        )));
+                        return Err(StoreError::QuotaExceeded {
+                            kind: QuotaKind::Objects,
+                            message: format!(
+                                "tenant quota objects exceeded for {}: used={} pending={} requested={} limit={}",
+                                scope.tenant,
+                                quota.used_objects,
+                                quota.pending_reserved_objects,
+                                positive_objects,
+                                limit
+                            ),
+                        });
                     }
                 }
 
@@ -1655,6 +1662,7 @@ fn apply_signed_delta(base: u64, delta: i64, field: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use mooncake_store_core::error::QuotaKind;
     use std::collections::BTreeMap;
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -2256,7 +2264,13 @@ mod tests {
                 writer_runtime: writer.clone(),
             })
             .expect_err("bytes over limit should fail");
-        assert!(matches!(byte_limit, StoreError::Conflict(_)));
+        assert!(matches!(
+            byte_limit,
+            StoreError::QuotaExceeded {
+                kind: QuotaKind::Bytes,
+                ..
+            }
+        ));
 
         let object_limit = backend
             .reserve_tenant_quota(&TenantQuotaReservationRequest {
@@ -2275,7 +2289,13 @@ mod tests {
                 writer_runtime: writer,
             })
             .expect_err("objects over limit should fail");
-        assert!(matches!(object_limit, StoreError::Conflict(_)));
+        assert!(matches!(
+            object_limit,
+            StoreError::QuotaExceeded {
+                kind: QuotaKind::Objects,
+                ..
+            }
+        ));
 
         let reservations = backend
             .list_tenant_quota_reservations(&scope)

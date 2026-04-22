@@ -525,7 +525,7 @@ fn default_scope(operation: &'static str) -> &'static str {
 fn result_label<T>(result: &Result<T>) -> &'static str {
     match result {
         Ok(_) => "ok",
-        Err(StoreError::Conflict(_)) => "conflict",
+        Err(StoreError::Conflict(_) | StoreError::QuotaExceeded { .. }) => "conflict",
         Err(_) => "error",
     }
 }

@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
     HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
@@ -1834,26 +1835,32 @@ impl MetadataBackend for RedisMetadataBackend {
             -5 => {
                 let quota =
                     parse_tenant_quota_state_payload(&result.1, "redis reserve tenant quota")?;
-                Err(StoreError::Conflict(format!(
-                    "tenant quota bytes exceeded for {}: used={} pending={} requested={} limit={}",
-                    scope.tenant,
-                    quota.used_bytes,
-                    quota.pending_reserved_bytes,
-                    normalized.delta_bytes.max(0),
-                    normalized.limit.max_bytes.unwrap_or_default()
-                )))
+                Err(StoreError::QuotaExceeded {
+                    kind: QuotaKind::Bytes,
+                    message: format!(
+                        "tenant quota bytes exceeded for {}: used={} pending={} requested={} limit={}",
+                        scope.tenant,
+                        quota.used_bytes,
+                        quota.pending_reserved_bytes,
+                        normalized.delta_bytes.max(0),
+                        normalized.limit.max_bytes.unwrap_or_default()
+                    ),
+                })
             }
             -6 => {
                 let quota =
                     parse_tenant_quota_state_payload(&result.1, "redis reserve tenant quota")?;
-                Err(StoreError::Conflict(format!(
-                    "tenant quota objects exceeded for {}: used={} pending={} requested={} limit={}",
-                    scope.tenant,
-                    quota.used_objects,
-                    quota.pending_reserved_objects,
-                    normalized.delta_objects.max(0),
-                    normalized.limit.max_objects.unwrap_or_default()
-                )))
+                Err(StoreError::QuotaExceeded {
+                    kind: QuotaKind::Objects,
+                    message: format!(
+                        "tenant quota objects exceeded for {}: used={} pending={} requested={} limit={}",
+                        scope.tenant,
+                        quota.used_objects,
+                        quota.pending_reserved_objects,
+                        normalized.delta_objects.max(0),
+                        normalized.limit.max_objects.unwrap_or_default()
+                    ),
+                })
             }
             code => Err(StoreError::Metadata(format!(
                 "redis reserve tenant quota: unexpected status code {code}"
@@ -2179,6 +2186,7 @@ fn version_conflict(
 
 #[cfg(test)]
 mod tests {
+    use mooncake_store_core::error::QuotaKind;
     use std::collections::BTreeMap;
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -3265,7 +3273,13 @@ mod tests {
                 writer_runtime: writer.clone(),
             })
             .expect_err("bytes over limit should fail");
-        assert!(matches!(byte_limit, StoreError::Conflict(_)));
+        assert!(matches!(
+            byte_limit,
+            StoreError::QuotaExceeded {
+                kind: QuotaKind::Bytes,
+                ..
+            }
+        ));
 
         let object_limit = backend
             .reserve_tenant_quota(&TenantQuotaReservationRequest {
@@ -3284,7 +3298,13 @@ mod tests {
                 writer_runtime: writer,
             })
             .expect_err("objects over limit should fail");
-        assert!(matches!(object_limit, StoreError::Conflict(_)));
+        assert!(matches!(
+            object_limit,
+            StoreError::QuotaExceeded {
+                kind: QuotaKind::Objects,
+                ..
+            }
+        ));
 
         let reservations = backend
             .list_tenant_quota_reservations(&scope)

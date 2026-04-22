@@ -1513,6 +1513,7 @@ fn store_error_to_py(error: StoreError) -> PyErr {
     match error {
         StoreError::NotFound(message) => PyKeyError::new_err(message),
         StoreError::Conflict(message)
+        | StoreError::QuotaExceeded { message, .. }
         | StoreError::InvalidState(message)
         | StoreError::StaleEpoch(message)
         | StoreError::Unsupported(message)
@@ -1538,7 +1539,7 @@ fn soft_miss_status(error: &StoreError) -> i64 {
         StoreError::InvalidState(_) => -2,
         StoreError::Metadata(_) => -3,
         StoreError::Transport(_) => -4,
-        StoreError::Conflict(_) => -5,
+        StoreError::Conflict(_) | StoreError::QuotaExceeded { .. } => -5,
         StoreError::StaleEpoch(_) => -6,
         StoreError::Unsupported(_) => -7,
         StoreError::Allocator(_) => -8,

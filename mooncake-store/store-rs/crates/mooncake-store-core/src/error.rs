@@ -2,6 +2,12 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaKind {
+    Bytes,
+    Objects,
+}
+
 #[derive(Clone, Debug, Error)]
 pub enum StoreError {
     #[error("object not found: {0}")]
@@ -9,6 +15,9 @@ pub enum StoreError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    #[error("quota exceeded ({kind:?}): {message}")]
+    QuotaExceeded { kind: QuotaKind, message: String },
 
     #[error("invalid state: {0}")]
     InvalidState(String),
