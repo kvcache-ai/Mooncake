@@ -3029,6 +3029,128 @@ class MooncakeStorePyWrapper {
         return true;
     }
 
+    int validate_replicate_config(
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!config.preferred_segments.empty() &&
+            config.preferred_segments.size() != config.replica_num) {
+            LOG(ERROR) << "Preferred segments size ("
+                       << config.preferred_segments.size()
+                       << ") must match replica_num (" << config.replica_num
+                       << ")";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        return 0;
+    }
+
+    template <typename WriteFn>
+    int execute_single_tensor_write(const char *operation_name,
+                                    const ReplicateConfig &config,
+                                    WriteFn &&write_fn) {
+        if (!ensure_tensor_write_supported(operation_name)) {
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) {
+            return validate_result;
+        }
+        return write_fn();
+    }
+
+    template <typename WriteFn>
+    std::vector<int> execute_batch_tensor_write(
+        const char *operation_name, const char *size_error_context,
+        const std::vector<std::string> &keys, size_t value_count,
+        const ReplicateConfig &config, WriteFn &&write_fn) {
+        if (!ensure_tensor_write_supported(operation_name)) {
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (keys.size() != value_count || keys.empty()) {
+            if (!keys.empty()) {
+                LOG(ERROR) << size_error_context;
+            }
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) {
+            return std::vector<int>(keys.size(), validate_result);
+        }
+        return write_fn();
+    }
+
+    bool validate_tensor_object_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes, const char *size_error_context,
+        const char *buffer_error_context) {
+        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
+            LOG(ERROR) << size_error_context;
+            return false;
+        }
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (!is_valid_tensor_object_buffer(
+                    buffer_ptrs[i], sizes[i],
+                    std::string(buffer_error_context) + " at index " +
+                        std::to_string(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    template <typename WriteFromFn>
+    int execute_single_tensor_write_from(const char *operation_name,
+                                         const std::string &key,
+                                         uintptr_t buffer_ptr, size_t size,
+                                         const ReplicateConfig &config,
+                                         WriteFromFn &&write_from_fn) {
+        if (!ensure_tensor_write_supported(operation_name)) {
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (!is_valid_tensor_object_buffer(buffer_ptr, size, operation_name)) {
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) {
+            return validate_result;
+        }
+        return write_from_fn(key, reinterpret_cast<void *>(buffer_ptr), size,
+                             config);
+    }
+
+    template <typename BatchWriteFromFn>
+    std::vector<int> execute_batch_tensor_write_from(
+        const char *operation_name, const char *size_error_context,
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config,
+        BatchWriteFromFn &&batch_write_from_fn) {
+        if (!ensure_tensor_write_supported(operation_name)) {
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (keys.empty()) {
+            return std::vector<int>();
+        }
+        if (!validate_tensor_object_buffers(keys, buffer_ptrs, sizes,
+                                            size_error_context,
+                                            "tensor object buffer")) {
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) {
+            return std::vector<int>(keys.size(), validate_result);
+        }
+        std::vector<void *> buffers;
+        buffers.reserve(buffer_ptrs.size());
+        for (uintptr_t ptr : buffer_ptrs) {
+            buffers.push_back(reinterpret_cast<void *>(ptr));
+        }
+        return batch_write_from_fn(keys, buffers, sizes, config);
+    }
+
     template <typename DirectWriteFn, typename ParallelismWriteFn,
               typename WriterPartitionWriteFn>
     std::vector<int> execute_batch_parallelism_write_requests(
@@ -4653,128 +4775,6 @@ class MooncakeStorePyWrapper {
     }
 
     // --- End Upsert tensor methods ---
-
-    int validate_replicate_config(
-        const ReplicateConfig &config = ReplicateConfig{}) {
-        if (!config.preferred_segments.empty() &&
-            config.preferred_segments.size() != config.replica_num) {
-            LOG(ERROR) << "Preferred segments size ("
-                       << config.preferred_segments.size()
-                       << ") must match replica_num (" << config.replica_num
-                       << ")";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        return 0;
-    }
-
-    template <typename WriteFn>
-    int execute_single_tensor_write(const char *operation_name,
-                                    const ReplicateConfig &config,
-                                    WriteFn &&write_fn) {
-        if (!ensure_tensor_write_supported(operation_name)) {
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        int validate_result = validate_replicate_config(config);
-        if (validate_result) {
-            return validate_result;
-        }
-        return write_fn();
-    }
-
-    template <typename WriteFn>
-    std::vector<int> execute_batch_tensor_write(
-        const char *operation_name, const char *size_error_context,
-        const std::vector<std::string> &keys, size_t value_count,
-        const ReplicateConfig &config, WriteFn &&write_fn) {
-        if (!ensure_tensor_write_supported(operation_name)) {
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (keys.size() != value_count || keys.empty()) {
-            if (!keys.empty()) {
-                LOG(ERROR) << size_error_context;
-            }
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        int validate_result = validate_replicate_config(config);
-        if (validate_result) {
-            return std::vector<int>(keys.size(), validate_result);
-        }
-        return write_fn();
-    }
-
-    bool validate_tensor_object_buffers(
-        const std::vector<std::string> &keys,
-        const std::vector<uintptr_t> &buffer_ptrs,
-        const std::vector<size_t> &sizes, const char *size_error_context,
-        const char *buffer_error_context) {
-        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
-            LOG(ERROR) << size_error_context;
-            return false;
-        }
-        for (size_t i = 0; i < sizes.size(); ++i) {
-            if (!is_valid_tensor_object_buffer(
-                    buffer_ptrs[i], sizes[i],
-                    std::string(buffer_error_context) + " at index " +
-                        std::to_string(i))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    template <typename WriteFromFn>
-    int execute_single_tensor_write_from(const char *operation_name,
-                                         const std::string &key,
-                                         uintptr_t buffer_ptr, size_t size,
-                                         const ReplicateConfig &config,
-                                         WriteFromFn &&write_from_fn) {
-        if (!ensure_tensor_write_supported(operation_name)) {
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (!is_valid_tensor_object_buffer(buffer_ptr, size, operation_name)) {
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        int validate_result = validate_replicate_config(config);
-        if (validate_result) {
-            return validate_result;
-        }
-        return write_from_fn(key, reinterpret_cast<void *>(buffer_ptr), size,
-                             config);
-    }
-
-    template <typename BatchWriteFromFn>
-    std::vector<int> execute_batch_tensor_write_from(
-        const char *operation_name, const char *size_error_context,
-        const std::vector<std::string> &keys,
-        const std::vector<uintptr_t> &buffer_ptrs,
-        const std::vector<size_t> &sizes, const ReplicateConfig &config,
-        BatchWriteFromFn &&batch_write_from_fn) {
-        if (!ensure_tensor_write_supported(operation_name)) {
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (keys.empty()) {
-            return std::vector<int>();
-        }
-        if (!validate_tensor_object_buffers(keys, buffer_ptrs, sizes,
-                                            size_error_context,
-                                            "tensor object buffer")) {
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        int validate_result = validate_replicate_config(config);
-        if (validate_result) {
-            return std::vector<int>(keys.size(), validate_result);
-        }
-        std::vector<void *> buffers;
-        buffers.reserve(buffer_ptrs.size());
-        for (uintptr_t ptr : buffer_ptrs) {
-            buffers.push_back(reinterpret_cast<void *>(ptr));
-        }
-        return batch_write_from_fn(keys, buffers, sizes, config);
-    }
 
     int pub_tensor(const std::string &key, pybind11::object tensor,
                    const ReplicateConfig &config = ReplicateConfig{}) {
