@@ -6,7 +6,7 @@ use std::sync::{
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, Result, ReuseIdentity,
-    RouteCasRequest, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
+    RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
     SegmentLifecycleState, SegmentName, SegmentReservation, StoreError, TenantObjectAccounting,
     TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
     TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
