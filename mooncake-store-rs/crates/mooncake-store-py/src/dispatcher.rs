@@ -71,6 +71,7 @@ pub struct StoreDispatcher {
     executor: Arc<Runtime>,
     heartbeat_health: Arc<Mutex<HeartbeatHealthState>>,
     hot_cache: Option<Arc<LocalHotCache>>,
+    #[cfg_attr(not(test), allow(dead_code))]
     compat_scope: String,
 }
 

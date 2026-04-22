@@ -200,6 +200,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   python3 ./scripts/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
+    --keyspace "${KEYSPACE}" \
     --key_prefix "dummy-single-${RUN_ID}" \
     --num_kv 12 \
     --value_size 1024 \
@@ -211,6 +212,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   python3 ./scripts/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
+    --keyspace "${KEYSPACE}" \
     --key_prefix "dummy-batch-${RUN_ID}" \
     --num_kv 12 \
     --value_size 1024 \
@@ -223,6 +225,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   python3 ./scripts/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
+    --keyspace "${KEYSPACE}" \
     --key_prefix "dummy-multi-${RUN_ID}" \
     --num_kv 8 \
     --value_size 1536 \

@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
         help="Tenant used for read/write operations (default: default)",
     )
     parser.add_argument(
+        "--keyspace",
+        default=None,
+        help="Optional compatibility keyspace/worker scope to attach to",
+    )
+    parser.add_argument(
         "--num_kv",
         type=int,
         default=30,
@@ -543,7 +548,12 @@ def resolve_batch_api(batch_size: int, batch_api: str) -> str:
 def main() -> int:
     args = parse_args()
     store = MooncakeDistributedStore()
-    rc = store.setup_dummy(args.local_buf_size, args.scratch_size, args.daemon_addr)
+    rc = store.setup_dummy(
+        args.local_buf_size,
+        args.scratch_size,
+        args.daemon_addr,
+        keyspace=args.keyspace,
+    )
     if int(rc) != 0:
         raise RuntimeError(f"setup_dummy failed status={rc}")
     wait_for_dummy_ready(store)
