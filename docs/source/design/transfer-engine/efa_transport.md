@@ -366,52 +366,45 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
   values do not improve throughput. The example commands use 4 GB
   because that is safe for any reasonable config.
 
-### Eager endpoint warmup (first-request latency)
+### First-request latency
 
-Under the SRD shared-endpoint model, peer addressing still resolves
-lazily: `fi_av_insert()` and the metadata handshake fire on the first
-send to each `(local_NIC, peer_NIC)` pair. On a 16-NIC × 16-NIC
-topology that's up to 256 handshakes spread over the first few
-`submitTransfer` calls (since the initiator round-robins across local
-NICs, only a handful fire on any single submit). Each pair adds a few
-tens of ms; amortized across the first several calls, the stall looks
-like ~25 ms per submit until every pair is warm.
+Peer addressing resolves lazily: `fi_av_insert()` and the metadata
+handshake fire on the first send to each `(local_NIC, peer_NIC)`
+pair. On 16-NIC hosts, the first few `submitTransfer` calls carry
+this cost before steady state.
 
-Mooncake exposes an explicit eager-warmup API to pay this cost up
-front:
+**Measured on p5en (16 × 16 NICs, cross-node, 1 MB write, 3 reps, median):**
 
-- C++: `EfaTransport::warmupSegment(const std::string& segment_name)`
-- C: `int warmupEfaSegment(transfer_engine_t engine, const char *segment_name)`
-- Rust: `TransferEngine::warmup_efa_segment(name: &str)`
+| | cold submit #0 (no warmup) | `warmupSegment()` (all 256 pairs) |
+|---|---:|---:|
+| SRD shared endpoint (this PR) | **26 ms** | **1.1 s** |
+| Per-peer `fid_ep` (upstream main) | 99 ms | 17 s |
+| Speedup | **~4×** | **~15×** |
 
-Call it once per peer segment, right after `openSegment` (or after any
-metadata change that adds a new peer). Every `(local_NIC, peer_NIC)`
-pair is handshaken concurrently via `std::async`; the critical path is
-`max(handshake RTT)`, not `sum`. The call is idempotent — safe to
-re-run on the same segment.
+So this PR speeds up first-request latency two different ways:
 
-**Measured on p5en (16 local NICs × 16 peer NICs, cross-node probe,
-1 MB write, 3 reps, median):**
+- **Without any code change from callers** — the cold `submitTransfer`
+  is ~4× faster (26 ms vs 99 ms), because the shared endpoint removes
+  the per-peer `fi_endpoint` / `fi_enable` that used to dominate. This
+  is what existing Mooncake callers (vLLM, SGLang, etc.) will see.
+- **For callers that want sub-10 ms first-request latency**, an
+  explicit eager-warmup API lets you pay the handshake cost up front,
+  outside the critical path:
+  - C++: `EfaTransport::warmupSegment(const std::string& segment_name)`
+  - C: `int warmupEfaSegment(transfer_engine_t engine, const char *segment_name)`
+  - Rust: `TransferEngine::warmup_efa_segment(name: &str)`
+  - Python: `engine.warmup_efa_segment(segment_name)`
 
-| code | warmup | cold submit #0 |
-|------|-------:|---------------:|
-| SRD shared endpoint (this PR)   | **1.1 s** | **26 ms** (no warmup) / 10 ms (after warmup) |
-| Per-peer `fid_ep` (upstream main) | 17 s | 99 ms (no warmup) / 11 ms (after warmup) |
+  Call once per peer right after `openSegment`. The call is idempotent.
+  Under this PR `warmupSegment` itself is ~15× faster than on upstream
+  main (1.1 s vs 17 s), bounded by the peer's single-threaded handshake
+  RPC daemon (`accept` + JSON parse serialized on one thread), so it
+  scales linearly with the number of fresh NIC pairs.
 
-Two things fall out of this:
-
-1. **`warmupSegment` is ~15× faster** under the SRD shared endpoint —
-   256 × `handshake + fi_av_insert` (~4 ms each) vs the old 256 ×
-   `fi_endpoint + fi_enable` (~65 ms each, serial-bottlenecked, with
-   high variance: 9 / 17 / 17 s across three runs).
-2. **The cold first submit is ~4× faster** even if you don't call
-   `warmupSegment`: 26 ms vs 99 ms. The shared endpoint removes the
-   per-peer `fi_endpoint` allocation that dominated the old path.
-
-Together, any workload sensitive to first-request latency should see a
-double improvement: if you *do* call `warmupSegment`, the warmup itself
-is much shorter; if you *don't*, the first real `submitTransfer` is
-still 4× closer to steady-state latency.
+vLLM and SGLang do not currently call `warmupSegment` — they go
+through the generic `TransferEngine` interface and pick up the 4×
+cold-submit speedup automatically. The API is there for direct
+Mooncake callers that want the larger win.
 
 Reproducer: `mooncake-transfer-engine/example/efa_first_submit_probe.cpp`.
 
