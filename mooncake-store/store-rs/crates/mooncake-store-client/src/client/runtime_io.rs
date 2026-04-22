@@ -81,6 +81,12 @@ impl StoreClient {
         let delta_bytes = value_len as i64 - previous_len as i64;
         let delta_objects = if previous_len == 0 { 1 } else { 0 };
         let created_at_ms = now_ms();
+        let object_exceeds_byte_limit = limit
+            .max_bytes
+            .is_some_and(|max_bytes| delta_bytes.max(0) as u64 > max_bytes);
+        let object_exceeds_object_limit = limit
+            .max_objects
+            .is_some_and(|max_objects| delta_objects.max(0) as usize > max_objects);
         let mut request = TenantQuotaReservationRequest {
             reservation_id: self.next_tenant_quota_reservation_id(object_id),
             scope: self.tenant_quota_scope(object_id),
@@ -93,6 +99,7 @@ impl StoreClient {
             created_at_ms,
             writer_runtime: self.lease.runtime.clone(),
         };
+        let mut eviction_candidates = None;
         for _ in 0..MAX_TENANT_LOCAL_EVICTION_ATTEMPTS {
             let reserve_result = self.metadata.reserve_tenant_quota(&request);
             registry::record_tenant_quota_reservation(match &reserve_result {
@@ -103,9 +110,37 @@ impl StoreClient {
             match reserve_result {
                 Ok(_) => return Ok(Some(request)),
                 Err(StoreError::QuotaExceeded { kind, message }) => {
-                    if !self.try_evict_one_object_in_tenant(object_id, scoped_key)? {
+                    if object_exceeds_byte_limit || object_exceeds_object_limit {
+                        return Err(StoreError::QuotaExceeded { kind, message });
+                    }
+                    if !self.try_evict_one_object_in_tenant(
+                        object_id,
+                        scoped_key,
+                        &mut eviction_candidates,
+                    )? {
                         registry::record_tenant_local_eviction("miss");
                         return Err(StoreError::QuotaExceeded { kind, message });
+                    }
+                    registry::record_tenant_local_eviction("ok");
+                    let refreshed = self.metadata.get_tenant_object_accounting(scoped_key)?;
+                    request.expected_object_version =
+                        refreshed.as_ref().map(|object| object.version);
+                    continue;
+                }
+                Err(StoreError::Conflict(message))
+                    if message.contains("tenant quota bytes exceeded")
+                        || message.contains("tenant quota objects exceeded") =>
+                {
+                    if object_exceeds_byte_limit || object_exceeds_object_limit {
+                        return Err(StoreError::Conflict(message));
+                    }
+                    if !self.try_evict_one_object_in_tenant(
+                        object_id,
+                        scoped_key,
+                        &mut eviction_candidates,
+                    )? {
+                        registry::record_tenant_local_eviction("miss");
+                        return Err(StoreError::Conflict(message));
                     }
                     registry::record_tenant_local_eviction("ok");
                     let refreshed = self.metadata.get_tenant_object_accounting(scoped_key)?;
@@ -126,30 +161,30 @@ impl StoreClient {
         &self,
         object_id: &LogicalObjectId,
         scoped_key: &ObjectKey,
+        eviction_candidates: &mut Option<VecDeque<LogicalObjectId>>,
     ) -> Result<bool> {
-        let scope = self.tenant_quota_eviction_scope(object_id);
-        let mut routes = self
-            .list_routes_in_scope(&scope)?
-            .into_iter()
-            .filter(|route| route.key != *scoped_key && route.state == RouteState::Active)
-            .collect::<Vec<_>>();
-        routes.sort_by(|left, right| {
-            let left_len = Self::route_committed_length(Some(left));
-            let right_len = Self::route_committed_length(Some(right));
-            left
-                .version
-                .0
-                .cmp(&right.version.0)
-                .then_with(|| right_len.cmp(&left_len))
-        });
-        for route in routes {
-            let victim = match mooncake_store_core::route_logical_object_id(&route) {
-                Ok(victim) => victim,
-                Err(_) => continue,
-            };
-            if victim.scope.tenant != object_id.scope.tenant {
-                continue;
-            }
+        if eviction_candidates.is_none() {
+            let scope = self.tenant_quota_scope(object_id);
+            let candidates = self
+                .metadata
+                .list_tenant_eviction_candidates(&scope, MAX_TENANT_LOCAL_EVICTION_ATTEMPTS)?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.key != *scoped_key
+                        && candidate.state == TenantObjectAccountingState::Active
+                })
+                .filter_map(|candidate| {
+                    mooncake_store_core::parse_legacy_scoped_key(&candidate.key)
+                        .ok()
+                        .filter(|victim| victim.scope.tenant == object_id.scope.tenant)
+                })
+                .collect();
+            *eviction_candidates = Some(candidates);
+        }
+        let Some(candidates) = eviction_candidates.as_mut() else {
+            return Ok(false);
+        };
+        while let Some(victim) = candidates.pop_front() {
             if self
                 .remove_in_tenant(victim.scope.tenant.as_str(), victim.logical_key.as_str(), true)
                 .is_ok()

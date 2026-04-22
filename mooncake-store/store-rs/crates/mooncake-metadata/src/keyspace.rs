@@ -44,10 +44,7 @@ impl MetadataKeyspace {
     }
 
     pub fn client_by_stable_index(&self, stable_id: &ClientStableId) -> String {
-        format!(
-            "{}/indexes/clients/by-stable/{}",
-            self.slot_tag, stable_id.0
-        )
+        format!("{}/indexes/clients/by-stable/{}", self.slot_tag, stable_id.0)
     }
 
     pub fn client_by_stable_index_prefix(&self) -> String {
@@ -130,16 +127,13 @@ impl MetadataKeyspace {
     }
 
     pub fn client_by_stable_marker_prefix(&self, stable_id: &ClientStableId) -> String {
-        format!(
-            "{}/indexes/clients/by-stable/{}/",
-            self.slot_tag, stable_id.0
-        )
+        format!("{}/indexes/clients/by-stable/{}/", self.slot_tag, stable_id.0)
     }
 
     pub fn stable_runtime(&self, stable_id: &ClientStableId) -> String {
         format!(
             "{}/indexes/stable-runtimes/{}",
-            self.prefix,
+            self.slot_tag,
             encode_key_component(&stable_id.0)
         )
     }
@@ -155,9 +149,7 @@ impl MetadataKeyspace {
 
     pub fn segment_prefix(&self, owner: Option<&ClientRuntimeId>) -> String {
         match owner {
-            Some(owner) => {
-                format!("{}/segments/{}:", self.slot_tag, owner.storage_key())
-            }
+            Some(owner) => format!("{}/segments/{}:", self.slot_tag, owner.storage_key()),
             None => format!("{}/segments/", self.slot_tag),
         }
     }
@@ -168,9 +160,7 @@ impl MetadataKeyspace {
 
     pub fn segment_index(&self, owner: Option<&ClientRuntimeId>) -> String {
         match owner {
-            Some(owner) => {
-                format!("{}/indexes/segments/{}", self.slot_tag, owner.storage_key())
-            }
+            Some(owner) => format!("{}/indexes/segments/{}", self.slot_tag, owner.storage_key()),
             None => format!("{}/indexes/segments", self.slot_tag),
         }
     }
@@ -182,7 +172,7 @@ impl MetadataKeyspace {
     pub fn segment_owner(&self, segment: &SegmentName) -> String {
         format!(
             "{}/indexes/segment-owners/{}",
-            self.prefix,
+            self.slot_tag,
             encode_key_component(&segment.0)
         )
     }
@@ -304,6 +294,33 @@ impl MetadataKeyspace {
         )
     }
 
+    pub fn tenant_eviction_frontier(&self, tenant: &str) -> String {
+        format!(
+            "{}/indexes/tenant-eviction/tenants/{}",
+            self.slot_tag,
+            encode_key_component(tenant)
+        )
+    }
+
+    pub fn tenant_eviction_frontier_prefix(&self, tenant: &str) -> String {
+        format!("{}/", self.tenant_eviction_frontier(tenant))
+    }
+
+    pub fn tenant_eviction_candidate(
+        &self,
+        tenant: &str,
+        updated_at_ms: u64,
+        committed_length: u64,
+        key: &ObjectKey,
+    ) -> String {
+        format!(
+            "{}{updated_at_ms:020}/{:020}/{}",
+            self.tenant_eviction_frontier_prefix(tenant),
+            u64::MAX - committed_length,
+            encode_key_component(&key.0)
+        )
+    }
+
     pub fn prefix(&self) -> &str {
         &self.raw_prefix
     }
@@ -321,6 +338,25 @@ pub fn parse_route_policy_domain(
     let encoded = key.strip_prefix(&tenant_prefix)?;
     Some(RoutePolicyDomain::Tenant(
         decode_key_component_checked(encoded)?.into_owned(),
+    ))
+}
+
+pub fn parse_tenant_eviction_candidate_key(
+    keyspace: &MetadataKeyspace,
+    tenant: &str,
+    key: &str,
+) -> Option<ObjectKey> {
+    let prefix = keyspace.tenant_eviction_frontier_prefix(tenant);
+    let rest = key.strip_prefix(&prefix)?;
+    let mut parts = rest.split('/');
+    parts.next()?;
+    parts.next()?;
+    let encoded_key = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ObjectKey::new(
+        decode_key_component_checked(encoded_key)?.into_owned(),
     ))
 }
 
@@ -417,7 +453,7 @@ mod tests {
 
     use super::{
         decode_key_component_checked, encode_key_component, parse_route_policy_domain,
-        parse_tenant_policy_scope, MetadataKeyspace,
+        parse_tenant_eviction_candidate_key, parse_tenant_policy_scope, MetadataKeyspace,
     };
 
     #[test]
@@ -526,6 +562,18 @@ mod tests {
         assert_eq!(keyspace.object_prefix(), "{tenant-a}/objects/");
         assert_eq!(keyspace.object_pattern(), "{tenant-a}/objects/*");
         assert_eq!(keyspace.object_index(), "{tenant-a}/indexes/objects");
+        assert_eq!(
+            keyspace.tenant_eviction_frontier("tenant/a"),
+            "{tenant-a}/indexes/tenant-eviction/tenants/tenant%2Fa"
+        );
+        assert_eq!(
+            keyspace.tenant_eviction_frontier_prefix("tenant/a"),
+            "{tenant-a}/indexes/tenant-eviction/tenants/tenant%2Fa/"
+        );
+        assert_eq!(
+            keyspace.tenant_eviction_candidate("tenant/a", 7, 11, &object),
+            "{tenant-a}/indexes/tenant-eviction/tenants/tenant%2Fa/00000000000000000007/18446744073709551604/alpha"
+        );
         assert_eq!(keyspace.handoff(&stable), "{tenant-a}/handoffs/writer");
         assert_eq!(
             keyspace.route_policy(&RoutePolicyDomain::Default),
@@ -596,6 +644,18 @@ mod tests {
     }
 
     #[test]
+    fn tenant_eviction_candidate_key_parser_round_trips_encoded_object_key() {
+        let keyspace = MetadataKeyspace::new("tenant-a");
+        let object = ObjectKey::new("tenant/a::path/to/object");
+        let key = keyspace.tenant_eviction_candidate("tenant/a", 7, 11, &object);
+
+        assert_eq!(
+            parse_tenant_eviction_candidate_key(&keyspace, "tenant/a", &key),
+            Some(object)
+        );
+    }
+
+    #[test]
     fn tenant_policy_scope_parser_rejects_invalid_utf8_after_decoding() {
         let keyspace = MetadataKeyspace::new("tenant-a");
         let key = "{tenant-a}/system/tenant-policy/tenants/%FF";
@@ -653,6 +713,7 @@ mod tests {
             keyspace.client_lease_expiry_time(42, &runtime),
             keyspace.object(&ObjectKey::new("key-1")),
             keyspace.object_index(),
+            keyspace.tenant_eviction_frontier("tenant-a"),
         ];
 
         fn extract_hash_tag(key: &str) -> Option<&str> {

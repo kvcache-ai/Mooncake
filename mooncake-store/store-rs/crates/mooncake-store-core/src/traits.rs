@@ -231,6 +231,17 @@ pub trait MetadataBackend: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Option<TenantObjectAccounting>>;
 
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> Result<Option<TenantQuotaReservation>>;
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> Result<Vec<TenantObjectAccounting>>;
+
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,

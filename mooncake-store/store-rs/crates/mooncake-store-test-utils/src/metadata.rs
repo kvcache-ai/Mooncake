@@ -43,6 +43,7 @@ pub struct OperationCounts {
     pub delete_tenant_policy: AtomicU64,
     pub get_tenant_quota_state: AtomicU64,
     pub get_tenant_object_accounting: AtomicU64,
+    pub get_tenant_quota_reservation: AtomicU64,
     pub list_tenant_quota_reservations: AtomicU64,
     pub reserve_tenant_quota: AtomicU64,
     pub finalize_tenant_quota: AtomicU64,
@@ -291,6 +292,16 @@ impl MetadataBackend for CountingMetadataBackend {
             .get_tenant_object_accounting
             .fetch_add(1, Ordering::Relaxed);
         self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> Result<Option<TenantQuotaReservation>> {
+        self.counts
+            .get_tenant_quota_reservation
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.get_tenant_quota_reservation(reservation_id)
     }
 
     fn list_tenant_quota_reservations(
@@ -555,6 +566,14 @@ impl MetadataBackend for FaultyMetadataBackend {
     ) -> Result<Option<TenantObjectAccounting>> {
         self.check()?;
         self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> Result<Option<TenantQuotaReservation>> {
+        self.check()?;
+        self.inner.get_tenant_quota_reservation(reservation_id)
     }
 
     fn list_tenant_quota_reservations(

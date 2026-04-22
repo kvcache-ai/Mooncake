@@ -1015,10 +1015,15 @@ impl StoreClient {
         let segment = self
             .metadata
             .get_segment(&owner, segment_name)?
-            .filter(|segment| segment.state == SegmentLifecycleState::Active)
             .ok_or_else(|| {
                 StoreError::NotFound(format!("preferred segment {} not found", segment_name.0))
             })?;
+        if segment.state != SegmentLifecycleState::Active {
+            return Err(StoreError::NotFound(format!(
+                "preferred segment {} not found or not active",
+                segment_name.0
+            )));
+        }
         if !self.has_active_compatible_runtime(&segment.owner, false)?
             && !self.has_active_compatible_runtime(&segment.owner, true)?
         {

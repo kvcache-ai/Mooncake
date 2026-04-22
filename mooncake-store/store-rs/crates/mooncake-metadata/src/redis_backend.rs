@@ -14,7 +14,9 @@ use mooncake_store_core::{
 use redis::cmd;
 use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
 
-use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
+use crate::keyspace::{
+    parse_route_policy_domain, parse_tenant_eviction_candidate_key, parse_tenant_policy_scope,
+};
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 
@@ -350,6 +352,28 @@ redis.call('ZADD', expiry_index, expires_at_ms, lease_key)
 return {1, ''}
 "#;
 
+const UPDATE_CLIENT_STATE_SCRIPT: &str = r#"
+local lease_key = KEYS[1]
+local next_state = ARGV[1]
+
+local payload = redis.call('GET', lease_key)
+if not payload then
+    return {0, ''}
+end
+
+local ttl_ms = redis.call('PTTL', lease_key)
+local lease = cjson.decode(payload)
+lease['state'] = next_state
+local next_payload = cjson.encode(lease)
+
+if ttl_ms > 0 then
+    redis.call('SET', lease_key, next_payload, 'PX', ttl_ms)
+else
+    redis.call('SET', lease_key, next_payload)
+end
+return {1, next_payload}
+"#;
+
 const RESERVE_TENANT_QUOTA_SCRIPT: &str = r#"
 local quota_key = KEYS[1]
 local object_key = KEYS[2]
@@ -480,6 +504,7 @@ local quota_key = KEYS[1]
 local object_key = KEYS[2]
 local reservation_key = KEYS[3]
 local reservation_index_key = KEYS[4]
+local frontier_key = KEYS[5]
 
 local reservation_id = ARGV[1]
 local expected_object_version = ARGV[2]
@@ -489,6 +514,8 @@ local object_state = ARGV[5]
 local updated_at_ms = tonumber(ARGV[6])
 local updated_by = ARGV[7]
 local terminal_ttl_ms = tonumber(ARGV[8])
+local old_frontier_member = ARGV[9]
+local new_frontier_member = ARGV[10]
 
 local function parse_optional_number(value)
     if value == '__none__' then
@@ -510,6 +537,18 @@ local function apply_signed(base, delta)
         return nil
     end
     return next
+end
+
+local function trim_frontier()
+    local frontier_size = redis.call('ZCARD', frontier_key)
+    if frontier_size <= 16 then
+        return
+    end
+    local overflow = frontier_size - 16
+    local overflow_members = redis.call('ZREVRANGE', frontier_key, 0, overflow - 1)
+    for _, member in ipairs(overflow_members) do
+        redis.call('ZREM', frontier_key, member)
+    end
 end
 
 local reservation_payload = redis.call('GET', reservation_key)
@@ -569,6 +608,9 @@ quota['updated_by'] = updated_by
 local next_quota_payload = cjson.encode(quota)
 
 local next_object_payload = ''
+if old_frontier_member ~= '__none__' then
+    redis.call('ZREM', frontier_key, old_frontier_member)
+end
 if object_state == 'Active' then
     local next_object = {
         key = reservation['key'],
@@ -582,6 +624,8 @@ if object_state == 'Active' then
     }
     next_object_payload = cjson.encode(next_object)
     redis.call('SET', object_key, next_object_payload)
+    redis.call('ZADD', frontier_key, 0, new_frontier_member)
+    trim_frontier()
 else
     redis.call('DEL', object_key)
 end
@@ -665,6 +709,8 @@ if terminal_ttl_ms and terminal_ttl_ms > 0 then
 end
 return {2, next_quota_payload, next_reservation_payload}
 "#;
+
+const EVICTION_FRONTIER_LIMIT: usize = 16;
 
 const REDIS_CONNECT_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_CONNECT_TIMEOUT_MS";
 const REDIS_IO_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_IO_TIMEOUT_MS";
@@ -1390,39 +1436,42 @@ impl MetadataBackend for RedisMetadataBackend {
         next: ClientLifecycleState,
     ) -> Result<()> {
         let key = self.keyspace.client(runtime);
-        let stable_key = self.keyspace.stable_runtime(&runtime.stable_id);
-        let mut connection = self.connection()?;
-        let payload: Option<String> = connection
-            .get(&key)
-            .map_err(|error| metadata_error("redis get client lease", error))?;
-        let Some(payload) = payload else {
-            return Err(StoreError::NotFound(key));
+        let next_state = match next {
+            ClientLifecycleState::Standby => "Standby",
+            ClientLifecycleState::Active => "Active",
+            ClientLifecycleState::Draining => "Draining",
+            ClientLifecycleState::Sealed => "Sealed",
+            ClientLifecycleState::Offline => "Offline",
         };
-        let mut lease: ClientLease = serde_json::from_str(&payload).map_err(json_error)?;
-        lease.state = next;
-        let ttl_ms = lease.expires_at_ms.saturating_sub(now_ms()).max(1);
-        let payload = serde_json::to_string(&lease).map_err(json_error)?;
-        redis::cmd("SET")
-            .arg(&key)
-            .arg(payload)
-            .arg("PX")
-            .arg(ttl_ms)
-            .query::<()>(&mut connection)
-            .map_err(|error| metadata_error("redis update client lease", error))?;
-        if next == ClientLifecycleState::Active {
-            redis::cmd("SET")
-                .arg(&stable_key)
-                .arg(runtime.storage_key())
-                .arg("PX")
-                .arg(ttl_ms)
-                .query::<()>(&mut connection)
-                .map_err(|error| metadata_error("redis update stable runtime index", error))?;
-        } else {
-            connection
-                .del::<_, ()>(&stable_key)
-                .map_err(|error| metadata_error("redis delete stable runtime index", error))?;
+        let stable_key = self.keyspace.stable_runtime(&runtime.stable_id);
+        let result: (i32, String) =
+            self.query_idempotent_write("redis update client state", |connection| {
+                let result: (i32, String) = Script::new(UPDATE_CLIENT_STATE_SCRIPT)
+                    .key(&key)
+                    .arg(next_state)
+                    .invoke(connection)?;
+                if result.0 != 1 {
+                    return Ok(result);
+                }
+                let lease: ClientLease = serde_json::from_str(&result.1)
+                    .map_err(|error| store_error_to_redis_error(json_error(error)))?;
+                let ttl_ms = lease.expires_at_ms.saturating_sub(now_ms()).max(1);
+                if next == ClientLifecycleState::Active {
+                    redis::cmd("SET")
+                        .arg(&stable_key)
+                        .arg(runtime.storage_key())
+                        .arg("PX")
+                        .arg(ttl_ms)
+                        .query::<()>(connection)?;
+                } else {
+                    connection.del::<_, ()>(&stable_key)?;
+                }
+                Ok(result)
+            })?;
+        if result.0 == 1 {
+            return Ok(());
         }
-        Ok(())
+        Err(StoreError::NotFound(key))
     }
 
     fn get_client_lease(&self, runtime: &ClientRuntimeId) -> Result<Option<ClientLease>> {
@@ -2151,6 +2200,76 @@ impl MetadataBackend for RedisMetadataBackend {
             .transpose()
     }
 
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> Result<Option<TenantQuotaReservation>> {
+        let mut connection = self.connection()?;
+        let reservation_key = self.keyspace.tenant_quota_reservation(reservation_id);
+        let payload: Option<String> = connection
+            .get(&reservation_key)
+            .map_err(|error| metadata_error("redis get tenant quota reservation", error))?;
+        payload
+            .map(|payload| {
+                parse_tenant_quota_reservation_payload(
+                    &payload,
+                    "redis get tenant quota reservation",
+                )
+            })
+            .transpose()
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> Result<Vec<TenantObjectAccounting>> {
+        let scope = root_scope(scope)?;
+        let read_limit = limit.min(EVICTION_FRONTIER_LIMIT);
+        if read_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.connection()?;
+        let frontier_key = self.keyspace.tenant_eviction_frontier(&scope.tenant);
+        let members: Vec<String> = cmd("ZRANGE")
+            .arg(&frontier_key)
+            .arg(0)
+            .arg(read_limit.saturating_sub(1))
+            .query(&mut connection)
+            .map_err(|error| metadata_error("redis list tenant eviction frontier", error))?;
+        let mut candidates = Vec::new();
+        for member in members {
+            let Some(key) =
+                parse_tenant_eviction_candidate_key(&self.keyspace, &scope.tenant, &member)
+            else {
+                continue;
+            };
+            let payload: Option<String> = connection
+                .get(self.keyspace.tenant_object_accounting(&key))
+                .map_err(|error| {
+                    metadata_error("redis get tenant eviction candidate object", error)
+                })?;
+            let Some(payload) = payload else {
+                continue;
+            };
+            let object = parse_tenant_object_accounting_payload(
+                &payload,
+                "redis list tenant eviction candidates",
+            )?;
+            if object.scope == scope && object.state == TenantObjectAccountingState::Active {
+                candidates.push(object);
+            }
+        }
+        candidates.sort_by(|left, right| {
+            left.updated_at_ms
+                .cmp(&right.updated_at_ms)
+                .then_with(|| right.committed_length.cmp(&left.committed_length))
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        candidates.truncate(read_limit);
+        Ok(candidates)
+    }
+
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,
@@ -2346,11 +2465,36 @@ impl MetadataBackend for RedisMetadataBackend {
         let reservation_index_key = self
             .keyspace
             .tenant_quota_reservation_index(&scope, &request.reservation_id);
+        let frontier_key = self.keyspace.tenant_eviction_frontier(&scope.tenant);
+        let old_frontier_member = self
+            .get_tenant_object_accounting(&reservation.key)?
+            .map(|object| {
+                self.keyspace.tenant_eviction_candidate(
+                    &scope.tenant,
+                    object.updated_at_ms,
+                    object.committed_length,
+                    &object.key,
+                )
+            })
+            .unwrap_or_else(|| "__none__".to_string());
+        let new_frontier_member = if request.state == TenantObjectAccountingState::Active {
+            self.keyspace.tenant_eviction_candidate(
+                &scope.tenant,
+                request.updated_at_ms,
+                request
+                    .committed_length
+                    .expect("validated active finalize request"),
+                &reservation.key,
+            )
+        } else {
+            "__none__".to_string()
+        };
         let result = Script::new(FINALIZE_TENANT_QUOTA_SCRIPT)
             .key(&quota_key)
             .key(&object_key)
             .key(&reservation_key)
             .key(&reservation_index_key)
+            .key(&frontier_key)
             .arg(&request.reservation_id)
             .arg(
                 request
@@ -2377,6 +2521,8 @@ impl MetadataBackend for RedisMetadataBackend {
             .arg(request.updated_at_ms)
             .arg(&request.updated_by)
             .arg(self.tenant_quota_terminal_ttl.as_millis().max(1) as u64)
+            .arg(old_frontier_member)
+            .arg(new_frontier_member)
             .invoke::<(i32, String, String, String)>(&mut connection)
             .map_err(|error| metadata_error("redis finalize tenant quota", error))?;
 
@@ -2867,7 +3013,8 @@ mod tests {
         let live_clients = backend
             .list_live_clients()
             .expect("listing live clients should succeed");
-        assert!(live_clients.is_empty());
+        assert_eq!(live_clients.len(), 1);
+        assert_eq!(live_clients[0].state, ClientLifecycleState::Draining);
         assert!(matches!(
             backend.update_client_state(
                 &ClientRuntimeId::new("missing", ClientEpoch(1)),
@@ -2990,7 +3137,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_backend_point_lookups_only_return_active_leases() {
+    fn redis_backend_point_lookups_only_return_present_leases() {
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -3020,18 +3167,19 @@ mod tests {
         backend
             .update_client_state(&active.runtime, ClientLifecycleState::Draining)
             .expect("client state update should succeed");
-        assert!(backend
+        let draining = backend
             .get_client_lease(&active.runtime)
             .expect("draining lease lookup should succeed")
-            .is_none());
+            .expect("draining lease should remain present");
+        assert_eq!(draining.state, ClientLifecycleState::Draining);
         assert!(backend
             .get_live_runtime_by_stable_id(&active.runtime.stable_id)
             .expect("draining stable lookup should succeed")
             .is_none());
-        assert!(backend
+        let live = backend
             .list_live_clients()
-            .expect("live client listing should succeed")
-            .is_empty());
+            .expect("live client listing should succeed");
+        assert_eq!(live, vec![draining]);
     }
 
     #[test]
@@ -4163,6 +4311,160 @@ mod tests {
     }
 
     #[test]
+    fn redis_backend_tenant_eviction_frontier_orders_and_refreshes_candidates() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-tenant-eviction-frontier")),
+        )
+        .expect("redis backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-evict", None::<String>, None::<String>);
+        let writer = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        let seed = |backend: &RedisMetadataBackend,
+                    reservation_id: &str,
+                    key: &str,
+                    expected_object_version: Option<u64>,
+                    delta_bytes: i64,
+                    delta_objects: i64,
+                    committed_length: Option<u64>,
+                    state: TenantObjectAccountingState,
+                    updated_at_ms: u64| {
+            backend
+                .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                    reservation_id: reservation_id.to_string(),
+                    scope: scope.clone(),
+                    key: ObjectKey::new(key),
+                    expected_object_version,
+                    delta_bytes,
+                    delta_objects,
+                    limit: TenantQuotaPolicy {
+                        max_bytes: Some(4096),
+                        max_objects: Some(64),
+                    },
+                    expires_at_ms: updated_at_ms + 100,
+                    created_at_ms: updated_at_ms,
+                    writer_runtime: writer.clone(),
+                })
+                .expect("reservation should succeed");
+            backend
+                .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                    reservation_id: reservation_id.to_string(),
+                    expected_object_version,
+                    committed_length,
+                    route_version: None,
+                    state,
+                    updated_at_ms,
+                    updated_by: "writer".to_string(),
+                })
+                .expect("finalize should succeed");
+        };
+
+        seed(
+            &backend,
+            "resv-alpha",
+            "tenant-evict::alpha",
+            None,
+            10,
+            1,
+            Some(10),
+            TenantObjectAccountingState::Active,
+            100,
+        );
+        seed(
+            &backend,
+            "resv-beta",
+            "tenant-evict::beta",
+            None,
+            20,
+            1,
+            Some(20),
+            TenantObjectAccountingState::Active,
+            100,
+        );
+        seed(
+            &backend,
+            "resv-gamma",
+            "tenant-evict::gamma",
+            None,
+            5,
+            1,
+            Some(5),
+            TenantObjectAccountingState::Active,
+            90,
+        );
+
+        let listed = backend
+            .list_tenant_eviction_candidates(&scope, 16)
+            .expect("candidate listing should succeed");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|object| object.key.0.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "tenant-evict::gamma",
+                "tenant-evict::beta",
+                "tenant-evict::alpha"
+            ]
+        );
+
+        seed(
+            &backend,
+            "resv-beta-refresh",
+            "tenant-evict::beta",
+            Some(1),
+            5,
+            0,
+            Some(25),
+            TenantObjectAccountingState::Active,
+            130,
+        );
+        let refreshed = backend
+            .list_tenant_eviction_candidates(&scope, 16)
+            .expect("candidate listing after refresh should succeed");
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|object| (
+                    object.key.0.as_str(),
+                    object.updated_at_ms,
+                    object.committed_length
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tenant-evict::gamma", 90, 5),
+                ("tenant-evict::alpha", 100, 10),
+                ("tenant-evict::beta", 130, 25),
+            ]
+        );
+
+        seed(
+            &backend,
+            "resv-gamma-delete",
+            "tenant-evict::gamma",
+            Some(1),
+            -5,
+            -1,
+            None,
+            TenantObjectAccountingState::Deleted,
+            140,
+        );
+        let after_delete = backend
+            .list_tenant_eviction_candidates(&scope, 16)
+            .expect("candidate listing after delete should succeed");
+        assert_eq!(
+            after_delete
+                .iter()
+                .map(|object| object.key.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tenant-evict::alpha", "tenant-evict::beta"]
+        );
+    }
+
+    #[test]
     fn redis_backend_tenant_quota_reservation_enforces_limits_and_lists_by_tenant() {
         let Some(server) = RedisTestServer::start() else {
             return;
@@ -4715,6 +5017,44 @@ mod tests {
             .update_client_state(&ghost, ClientLifecycleState::Draining)
             .expect_err("phantom client must not update");
         assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn redis_backend_update_client_state_preserves_existing_lease() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-update-state")),
+        )
+        .expect("redis backend");
+
+        let runtime = ClientRuntimeId::new("update-node", ClientEpoch(1));
+        let lease = ClientLease {
+            runtime: runtime.clone(),
+            state: ClientLifecycleState::Standby,
+            compatibility: Default::default(),
+            endpoints: Default::default(),
+            expires_at_ms: super::now_ms() + 60_000,
+        };
+        backend.upsert_client_lease(&lease).unwrap();
+        backend
+            .update_client_state(&runtime, ClientLifecycleState::Draining)
+            .unwrap();
+
+        let key = backend.keyspace.client(&runtime);
+        let payload: Option<String> = backend
+            .connection()
+            .expect("redis connection should succeed")
+            .get(&key)
+            .expect("updated lease lookup should succeed");
+        let updated: ClientLease = serde_json::from_str(
+            &payload.expect("updated lease should remain stored in redis"),
+        )
+        .expect("updated lease payload should deserialize");
+        assert_eq!(updated.runtime, runtime);
+        assert_eq!(updated.state, ClientLifecycleState::Draining);
     }
 
     #[test]
