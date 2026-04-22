@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
     HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
@@ -578,14 +579,17 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     ))
                 })?;
             if admitted > limit {
-                return Err(StoreError::Conflict(format!(
-                    "tenant quota bytes exceeded for {}: used={} pending={} requested={} limit={}",
-                    scope.tenant,
-                    quota.used_bytes,
-                    quota.pending_reserved_bytes,
-                    positive_bytes,
-                    limit
-                )));
+                return Err(StoreError::QuotaExceeded {
+                    kind: QuotaKind::Bytes,
+                    message: format!(
+                        "tenant quota bytes exceeded for {}: used={} pending={} requested={} limit={}",
+                        scope.tenant,
+                        quota.used_bytes,
+                        quota.pending_reserved_bytes,
+                        positive_bytes,
+                        limit
+                    ),
+                });
             }
         }
         if let Some(limit) = request.limit.max_objects {
@@ -606,14 +610,17 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     ))
                 })?;
             if admitted > limit {
-                return Err(StoreError::Conflict(format!(
-                    "tenant quota objects exceeded for {}: used={} pending={} requested={} limit={}",
-                    scope.tenant,
-                    quota.used_objects,
-                    quota.pending_reserved_objects,
-                    positive_objects,
-                    limit
-                )));
+                return Err(StoreError::QuotaExceeded {
+                    kind: QuotaKind::Objects,
+                    message: format!(
+                        "tenant quota objects exceeded for {}: used={} pending={} requested={} limit={}",
+                        scope.tenant,
+                        quota.used_objects,
+                        quota.pending_reserved_objects,
+                        positive_objects,
+                        limit
+                    ),
+                });
             }
         }
 
@@ -882,6 +889,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
 
 #[cfg(test)]
 mod tests {
+    use mooncake_store_core::error::QuotaKind;
     use mooncake_store_core::{
         ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
         CompatibilityDescriptor, MetadataBackend, ObjectKey, RouteControlMode, RoutePolicy,
@@ -1389,7 +1397,13 @@ mod tests {
                 writer_runtime: writer.clone(),
             })
             .expect_err("bytes over limit should fail");
-        assert!(matches!(byte_limit, StoreError::Conflict(_)));
+        assert!(matches!(
+            byte_limit,
+            StoreError::QuotaExceeded {
+                kind: QuotaKind::Bytes,
+                ..
+            }
+        ));
 
         let object_limit = metadata
             .reserve_tenant_quota(&TenantQuotaReservationRequest {
@@ -1408,7 +1422,13 @@ mod tests {
                 writer_runtime: writer,
             })
             .expect_err("objects over limit should fail");
-        assert!(matches!(object_limit, StoreError::Conflict(_)));
+        assert!(matches!(
+            object_limit,
+            StoreError::QuotaExceeded {
+                kind: QuotaKind::Objects,
+                ..
+            }
+        ));
 
         let reservations = metadata
             .list_tenant_quota_reservations(&scope)

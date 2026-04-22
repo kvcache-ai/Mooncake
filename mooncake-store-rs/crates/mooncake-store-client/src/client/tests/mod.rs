@@ -7775,7 +7775,7 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
         .expect_err("oversized object should still be rejected when nothing can make room");
     assert!(matches!(
         objects_error,
-        StoreError::Conflict(_) | StoreError::Metadata(_)
+        StoreError::Conflict(_) | StoreError::QuotaExceeded { .. } | StoreError::Metadata(_)
     ));
     assert!(objects_error
         .to_string()
@@ -7862,7 +7862,7 @@ fn namespace_quota_overwrite_uses_committed_delta() {
         .expect_err("same object should fail once growth exceeds remaining quota");
     assert!(matches!(
         error,
-        StoreError::Conflict(_) | StoreError::Metadata(_)
+        StoreError::Conflict(_) | StoreError::QuotaExceeded { .. } | StoreError::Metadata(_)
     ));
     assert!(error.to_string().contains("tenant quota bytes exceeded"));
 
@@ -7997,7 +7997,7 @@ fn routed_batch_put_rejects_over_quota_all_or_nothing() {
         .expect_err("batch admission should fail atomically when combined bytes exceed quota");
     assert!(matches!(
         error,
-        StoreError::Conflict(_) | StoreError::Metadata(_)
+        StoreError::Conflict(_) | StoreError::QuotaExceeded { .. } | StoreError::Metadata(_)
     ));
 
     assert!(client
@@ -8124,6 +8124,102 @@ fn tenant_local_quota_eviction_does_not_touch_other_tenants() {
         .get_in_tenant("tenant-b", "stable")
         .expect("tenant-b value should remain readable");
     assert_eq!(tenant_b_value, b"BBBB");
+}
+
+#[test]
+fn tenant_local_quota_eviction_preserves_other_tenant_same_logical_key() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    for tenant in ["tenant-a", "tenant-b"] {
+        metadata
+            .put_tenant_policy(
+                &TenantPolicy {
+                    scope: TenantPolicyScope::new(tenant, None::<String>, None::<String>),
+                    spec: TenantPolicySpec {
+                        quota: Some(TenantQuotaPolicy {
+                            max_bytes: Some(5),
+                            max_objects: Some(1),
+                        }),
+                        routing: Some(TenantRoutePolicy {
+                            route_topk: Some(2),
+                            route_control: Some(RouteControlMode::MetadataOnly),
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 10,
+                    updated_by: "admin".to_string(),
+                },
+                None,
+            )
+            .expect("tenant quota policy should store");
+    }
+    let transport = Arc::new(TestTransport::new("tenant-local-quota-same-key-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "tenant-local-quota-same-key-client")
+        .tenant("tenant-a")
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    client
+        .put_in_tenant("tenant-b", "shared-key", b"BBBB")
+        .expect("tenant-b shared-key seed write should succeed");
+    client
+        .put("old", b"AAAA")
+        .expect("tenant-a seed write should succeed");
+    client
+        .put("shared-key", b"AAAAA")
+        .expect("tenant-a replacement write should succeed by evicting tenant-a only");
+
+    assert!(client
+        .query_route_in_tenant("tenant-a", "old")
+        .expect("tenant-a old route lookup should succeed")
+        .is_none());
+    assert!(client
+        .query_route_in_tenant("tenant-a", "shared-key")
+        .expect("tenant-a shared-key route lookup should succeed")
+        .is_some());
+    assert!(client
+        .query_route_in_tenant("tenant-b", "shared-key")
+        .expect("tenant-b shared-key route lookup should succeed")
+        .is_some());
+    assert_eq!(
+        client
+            .get("shared-key")
+            .expect("tenant-a shared-key should remain readable after eviction"),
+        b"AAAAA"
+    );
+    assert_eq!(
+        client
+            .get_in_tenant("tenant-b", "shared-key")
+            .expect("tenant-b shared-key should remain readable after tenant-a eviction"),
+        b"BBBB"
+    );
+
+    let quota_a = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("tenant-a quota state should load")
+        .expect("tenant-a quota state should exist");
+    let quota_b = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-b",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("tenant-b quota state should load")
+        .expect("tenant-b quota state should exist");
+    assert_eq!(quota_a.used_bytes, 5);
+    assert_eq!(quota_a.used_objects, 1);
+    assert_eq!(quota_b.used_bytes, 4);
+    assert_eq!(quota_b.used_objects, 1);
 }
 
 #[test]

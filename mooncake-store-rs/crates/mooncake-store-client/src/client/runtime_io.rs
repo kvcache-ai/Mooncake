@@ -93,18 +93,15 @@ impl StoreClient {
             let reserve_result = self.metadata.reserve_tenant_quota(&request);
             registry::record_tenant_quota_reservation(match &reserve_result {
                 Ok(_) => "ok",
-                Err(StoreError::Conflict(_)) => "conflict",
+                Err(StoreError::Conflict(_) | StoreError::QuotaExceeded { .. }) => "conflict",
                 Err(_) => "error",
             });
             match reserve_result {
                 Ok(_) => return Ok(Some(request)),
-                Err(StoreError::Conflict(message))
-                    if message.contains("tenant quota bytes exceeded")
-                        || message.contains("tenant quota objects exceeded") =>
-                {
+                Err(StoreError::QuotaExceeded { kind, message }) => {
                     if !self.try_evict_one_object_in_tenant(object_id, scoped_key)? {
                         registry::record_tenant_local_eviction("miss");
-                        return Err(StoreError::Conflict(message));
+                        return Err(StoreError::QuotaExceeded { kind, message });
                     }
                     registry::record_tenant_local_eviction("ok");
                     let refreshed = self.metadata.get_tenant_object_accounting(scoped_key)?;
@@ -146,9 +143,6 @@ impl StoreClient {
                 Ok(victim) => victim,
                 Err(_) => continue,
             };
-            if victim.scope.tenant != object_id.scope.tenant {
-                continue;
-            }
             if self
                 .remove_in_tenant(victim.scope.tenant.as_str(), victim.logical_key.as_str(), true)
                 .is_ok()
@@ -189,7 +183,7 @@ impl StoreClient {
         let reserve_result = self.metadata.reserve_tenant_quota(&request);
         registry::record_tenant_quota_reservation(match &reserve_result {
             Ok(_) => "ok",
-            Err(StoreError::Conflict(_)) => "conflict",
+            Err(StoreError::Conflict(_) | StoreError::QuotaExceeded { .. }) => "conflict",
             Err(_) => "error",
         });
         reserve_result?;

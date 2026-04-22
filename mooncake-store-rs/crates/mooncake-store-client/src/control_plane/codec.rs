@@ -46,6 +46,7 @@ pub(super) fn pb_error(error: StoreError) -> pb::ErrorDetail {
     let (kind, message) = match error {
         StoreError::NotFound(message) => (pb::ErrorKind::NotFound, message),
         StoreError::Conflict(message) => (pb::ErrorKind::Conflict, message),
+        StoreError::QuotaExceeded { message, .. } => (pb::ErrorKind::Conflict, message),
         StoreError::InvalidState(message) => (pb::ErrorKind::InvalidState, message),
         StoreError::StaleEpoch(message) => (pb::ErrorKind::StaleEpoch, message),
         StoreError::Unsupported(message) => (pb::ErrorKind::Unsupported, message),

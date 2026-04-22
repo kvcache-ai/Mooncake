@@ -596,9 +596,9 @@ fn query_flag(path: &str, key: &str) -> bool {
 
 fn http_store_error(error: StoreError) -> String {
     match error {
-        StoreError::Conflict(message) | StoreError::StaleEpoch(message) => {
-            http_error_response("409 Conflict", &message)
-        }
+        StoreError::Conflict(message)
+        | StoreError::QuotaExceeded { message, .. }
+        | StoreError::StaleEpoch(message) => http_error_response("409 Conflict", &message),
         StoreError::NotFound(message) => http_error_response("404 Not Found", &message),
         StoreError::Unsupported(message) => http_error_response("501 Not Implemented", &message),
         StoreError::InvalidState(message) => http_error_response("400 Bad Request", &message),
