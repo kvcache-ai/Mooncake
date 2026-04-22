@@ -41,6 +41,7 @@ use crate::route_directory::{
 };
 use crate::transport::{
     registration_chunks, wait_for_batch_completion_detailed, StoreTransport, StoreTransportFactory,
+    TentStoreTransport,
 };
 
 const DEFAULT_TENANT: &str = "default";

@@ -1,0 +1,12 @@
+[package]
+name = "mooncake-store-transport-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+mooncake-store-core = { path = "../mooncake-store-core" }
+mooncake-transport   = { path = "../mooncake-transport" }
+
+[lints]
+workspace = true

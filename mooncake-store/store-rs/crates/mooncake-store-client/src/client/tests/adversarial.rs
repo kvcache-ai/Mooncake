@@ -9,13 +9,13 @@ use mooncake_store_core::{
 use mooncake_store_test_utils::{
     fixtures::{now_ms, test_future_expiry_ms},
     metadata::{CountingMetadataBackend, FaultyMetadataBackend},
+    transport::{TestTransport, TestTransportFactory, TestTransportState},
 };
 use parking_lot::Mutex;
 use proptest::prelude::*;
 
 use crate::transport::{StoreTransport, StoreTransportFactory};
 
-// align_up_u64 is private in the parent client module; accessible here as a descendant.
 use super::super::align_up_u64;
 
 // ---------------------------------------------------------------------------
@@ -422,7 +422,7 @@ fn faulty_backend_high_threshold_allows_many_calls() {
 
 #[test]
 fn test_transport_segment_name_returns_constructor_argument() {
-    let transport = super::TestTransport::new("my-segment");
+    let transport = TestTransport::new("my-segment");
     let name = transport
         .segment_name()
         .expect("segment_name should succeed");
@@ -431,7 +431,7 @@ fn test_transport_segment_name_returns_constructor_argument() {
 
 #[test]
 fn test_transport_rpc_server_address_is_loopback() {
-    let transport = super::TestTransport::new("seg");
+    let transport = TestTransport::new("seg");
     let (host, _port) = transport
         .rpc_server_address()
         .expect("rpc_server_address should succeed");
@@ -440,7 +440,7 @@ fn test_transport_rpc_server_address_is_loopback() {
 
 #[test]
 fn test_transport_open_nonexistent_segment_returns_not_found() {
-    let transport = super::TestTransport::new("local");
+    let transport = TestTransport::new("local");
     let err = transport.open_segment("nonexistent").unwrap_err();
     assert!(
         matches!(err, StoreError::NotFound(_)),
@@ -450,7 +450,7 @@ fn test_transport_open_nonexistent_segment_returns_not_found() {
 
 #[test]
 fn test_transport_open_segment_after_memory_allocation_succeeds() {
-    let transport = super::TestTransport::new("local");
+    let transport = TestTransport::new("local");
     let addr = transport
         .allocate_memory(128, "cpu:0")
         .expect("allocate_memory should succeed");
@@ -474,7 +474,7 @@ fn test_transport_open_segment_after_memory_allocation_succeeds() {
 
 #[test]
 fn test_transport_allocate_and_free_batch_roundtrip() {
-    let transport = super::TestTransport::new("seg");
+    let transport = TestTransport::new("seg");
     let batch_id = transport
         .allocate_batch(4)
         .expect("allocate_batch should succeed");
@@ -485,7 +485,7 @@ fn test_transport_allocate_and_free_batch_roundtrip() {
 
 #[test]
 fn test_transport_free_nonexistent_batch_returns_not_found() {
-    let transport = super::TestTransport::new("seg");
+    let transport = TestTransport::new("seg");
     let err = transport.free_batch(9999).unwrap_err();
     assert!(
         matches!(err, StoreError::NotFound(_)),
@@ -495,7 +495,7 @@ fn test_transport_free_nonexistent_batch_returns_not_found() {
 
 #[test]
 fn test_transport_allocate_batch_zero_size_is_rejected() {
-    let transport = super::TestTransport::new("seg");
+    let transport = TestTransport::new("seg");
     assert!(
         transport.allocate_batch(0).is_err(),
         "zero batch size should be rejected"
@@ -504,7 +504,7 @@ fn test_transport_allocate_batch_zero_size_is_rejected() {
 
 #[test]
 fn test_transport_free_batch_twice_fails() {
-    let transport = super::TestTransport::new("seg");
+    let transport = TestTransport::new("seg");
     let batch_id = transport.allocate_batch(4).expect("should allocate");
     transport
         .free_batch(batch_id)
@@ -517,7 +517,7 @@ fn test_transport_free_batch_twice_fails() {
 
 #[test]
 fn test_transport_memory_register_unregister_roundtrip() {
-    let transport = super::TestTransport::new("seg");
+    let transport = TestTransport::new("seg");
     let addr = transport
         .allocate_memory(256, "cpu:0")
         .expect("allocate_memory should succeed");
@@ -534,7 +534,7 @@ fn test_transport_memory_register_unregister_roundtrip() {
 
 #[test]
 fn test_transport_republish_local_metadata_increments_counter() {
-    let transport = super::TestTransport::new("seg");
+    let transport = TestTransport::new("seg");
     assert_eq!(transport.republish_local_metadata_calls(), 0);
     transport
         .republish_local_metadata()
@@ -547,7 +547,7 @@ fn test_transport_republish_local_metadata_increments_counter() {
 
 #[test]
 fn test_transport_factory_creates_instances_sharing_segment_state() {
-    let state = Arc::new(Mutex::new(super::TestTransportState {
+    let state = Arc::new(Mutex::new(TestTransportState {
         next_handle: 1,
         next_batch: 1,
         allocations: BTreeMap::new(),
@@ -563,7 +563,7 @@ fn test_transport_factory_creates_instances_sharing_segment_state() {
         submitted_batch_hints: Vec::new(),
     }));
 
-    let factory = super::TestTransportFactory { state };
+    let factory = TestTransportFactory { state };
     let t1 = factory.create("seg-a").expect("create t1 should succeed");
     let t2 = factory.create("seg-b").expect("create t2 should succeed");
 
@@ -583,7 +583,7 @@ fn test_transport_factory_creates_instances_sharing_segment_state() {
 fn test_transport_fail_next_submit_injects_error_for_named_segment() {
     use mooncake_transport::{Opcode, TransferRequest};
 
-    let transport = super::TestTransport::new("seg-fail");
+    let transport = TestTransport::new("seg-fail");
     let _addr = transport
         .allocate_memory(128, "cpu:0")
         .expect("allocate should succeed");
@@ -613,7 +613,7 @@ fn test_transport_fail_next_submit_injects_error_for_named_segment() {
 fn test_transport_submit_batch_size_is_tracked() {
     use mooncake_transport::{Opcode, TransferBatchHints, TransferRequest};
 
-    let transport = super::TestTransport::new("seg-track");
+    let transport = TestTransport::new("seg-track");
     let addr = transport
         .allocate_memory(64, "cpu:0")
         .expect("allocate should succeed");
