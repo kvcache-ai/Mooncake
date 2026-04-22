@@ -320,13 +320,13 @@ fn run_migrate_command(args: &Args, command: &MigrateCommand) -> Result<(), Box<
             target_segments,
         } => submit_route_migration(
             args,
+            RouteMigrationMode::Copy,
             RouteMigrationTaskSubmitRequest {
                 authority: common.authority.clone(),
                 tenant: common.tenant.clone(),
                 domain: common.domain.clone(),
                 object_set: common.object_set.clone(),
                 key: common.key.clone(),
-                mode: RouteMigrationMode::Copy,
                 source_segment: common.source_segment.clone(),
                 target_segments: target_segments.clone(),
                 task_executor: common.task_executor.clone(),
@@ -338,13 +338,13 @@ fn run_migrate_command(args: &Args, command: &MigrateCommand) -> Result<(), Box<
             target_segment,
         } => submit_route_migration(
             args,
+            RouteMigrationMode::Move,
             RouteMigrationTaskSubmitRequest {
                 authority: common.authority.clone(),
                 tenant: common.tenant.clone(),
                 domain: common.domain.clone(),
                 object_set: common.object_set.clone(),
                 key: common.key.clone(),
-                mode: RouteMigrationMode::Move,
                 source_segment: common.source_segment.clone(),
                 target_segments: vec![target_segment.clone()],
                 task_executor: common.task_executor.clone(),
@@ -601,9 +601,10 @@ fn run_quota_command(
 
 fn submit_route_migration(
     args: &Args,
+    mode: RouteMigrationMode,
     request: RouteMigrationTaskSubmitRequest,
 ) -> Result<(), Box<dyn Error>> {
-    let path = route_migration_submit_path(request.mode);
+    let path = route_migration_submit_path(mode);
     let response: RouteMigrationTaskStatusResponse = admin_http_post_json(args, path, &request)?;
     println!("route migration task submitted:");
     println!("  admin_url: {}", admin_base_url(args)?);
@@ -1543,7 +1544,6 @@ mod tests {
                 domain: None,
                 object_set: None,
                 key: "object-a".to_string(),
-                mode: RouteMigrationMode::Copy,
                 source_segment: "segment-a".to_string(),
                 target_segments: vec!["segment-b".to_string()],
                 task_executor: "executor-a".to_string(),
@@ -1555,6 +1555,7 @@ mod tests {
         let request = requests.recv().expect("request should capture");
         assert!(request.starts_with("POST /v1/route-migrations/copy HTTP/1.1\r\n"));
         assert!(request.contains("\"task_executor\":\"executor-a\""));
+        assert!(!request.contains("\"mode\""));
         handle.join().expect("server thread should join");
     }
 
@@ -1598,7 +1599,6 @@ mod tests {
                 domain: None,
                 object_set: None,
                 key: "object-a".to_string(),
-                mode: RouteMigrationMode::Move,
                 source_segment: "segment-a".to_string(),
                 target_segments: vec!["segment-b".to_string()],
                 task_executor: "executor-a".to_string(),
@@ -1609,7 +1609,7 @@ mod tests {
         assert_eq!(task.task_id, "task-move-1");
         let request = requests.recv().expect("request should capture");
         assert!(request.starts_with("POST /v1/route-migrations/move HTTP/1.1\r\n"));
-        assert!(request.contains("\"mode\":\"move\""));
+        assert!(!request.contains("\"mode\""));
         handle.join().expect("server thread should join");
     }
 

@@ -177,23 +177,7 @@ fn submit_route_migration_request(
             return http_error_response("400 Bad Request", &format!("invalid JSON body: {error}"))
         }
     };
-    if payload.mode != expected_mode {
-        let actual = match payload.mode {
-            RouteMigrationMode::Copy => "copy",
-            RouteMigrationMode::Move => "move",
-        };
-        let expected = match expected_mode {
-            RouteMigrationMode::Copy => "copy",
-            RouteMigrationMode::Move => "move",
-        };
-        return http_error_response(
-            "400 Bad Request",
-            &format!(
-                "route migration mode mismatch: endpoint expects {expected} but request body declared {actual}"
-            ),
-        );
-    }
-    match service.submit_route_migration_task(payload) {
+    match service.submit_route_migration_task(expected_mode, payload) {
         Ok(response) => http_json_response("200 OK", &response),
         Err(error) => http_store_error(error),
     }
@@ -1366,7 +1350,6 @@ mod tests {
             "authority": "authority-a",
             "tenant": "tenant-a",
             "key": "object-a",
-            "mode": "move",
             "source_segment": "segment-a",
             "target_segments": ["segment-b"],
             "task_executor": "executor-a"
@@ -1418,7 +1401,6 @@ mod tests {
             "authority": "authority-a",
             "tenant": "tenant-a",
             "key": "object-a",
-            "mode": "move",
             "source_segment": "segment-a",
             "target_segments": ["segment-b"],
             "task_executor": "executor-a"
@@ -1452,7 +1434,6 @@ mod tests {
             "authority": "authority-a",
             "tenant": "tenant-a",
             "key": "object-a",
-            "mode": "move",
             "source_segment": "segment-a",
             "target_segments": ["segment-b"],
             "task_executor": "executor-a",
@@ -1484,7 +1465,6 @@ mod tests {
             "authority": "authority-a",
             "tenant": "tenant-a",
             "key": "object-a",
-            "mode": "copy",
             "source_segment": "segment-a",
             "target_segments": [],
             "task_executor": "executor-a"
@@ -1505,7 +1485,6 @@ mod tests {
             "authority": "authority-a",
             "tenant": "tenant-a",
             "key": "object-a",
-            "mode": "move",
             "source_segment": "segment-a",
             "target_segments": ["segment-b", "segment-c"],
             "task_executor": "executor-a"
@@ -1536,7 +1515,6 @@ mod tests {
             "authority": "authority-a",
             "tenant": "tenant-a",
             "key": "object-a",
-            "mode": "move",
             "source_segment": "segment-a",
             "target_segments": ["segment-b"],
             "task_executor": "executor-a"
@@ -1551,37 +1529,6 @@ mod tests {
             ),
         );
         assert!(submit.contains("HTTP/1.1 404 Not Found"));
-
-        server.shutdown().expect("server shutdown");
-    }
-
-    #[test]
-    fn admin_http_server_rejects_route_migration_mode_path_mismatches() {
-        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
-        let mut server =
-            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
-        let address = server.address().to_string();
-
-        let body = serde_json::json!({
-            "authority": "authority-a",
-            "tenant": "tenant-a",
-            "key": "object-a",
-            "mode": "move",
-            "source_segment": "segment-a",
-            "target_segments": ["segment-b"],
-            "task_executor": "executor-a"
-        })
-        .to_string();
-        let submit = http_request(
-            &address,
-            &format!(
-                "POST /v1/route-migrations/copy HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            ),
-        );
-        assert!(submit.contains("HTTP/1.1 400 Bad Request"));
-        assert!(submit.contains("mode mismatch"));
 
         server.shutdown().expect("server shutdown");
     }

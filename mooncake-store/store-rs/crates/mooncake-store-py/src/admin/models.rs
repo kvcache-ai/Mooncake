@@ -189,7 +189,6 @@ pub struct RouteMigrationTaskSubmitRequest {
     #[serde(default)]
     pub object_set: Option<String>,
     pub key: String,
-    pub mode: RouteMigrationMode,
     pub source_segment: String,
     pub target_segments: Vec<String>,
     pub task_executor: String,

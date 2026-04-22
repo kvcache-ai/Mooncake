@@ -249,9 +249,10 @@ impl MigrationTaskManager {
 
     fn submit(
         &self,
+        mode: RouteMigrationMode,
         request: RouteMigrationTaskSubmitRequest,
     ) -> AdminResult<RouteMigrationTaskStatusResponse> {
-        validate_route_migration_request(&request)?;
+        validate_route_migration_request(mode, &request)?;
         let now = now_ms();
         let sequence = self.state.next_task_id.fetch_add(1, Ordering::SeqCst);
         let task_id = format!("route-migration-{sequence}");
@@ -267,7 +268,7 @@ impl MigrationTaskManager {
             domain: request.domain,
             object_set: request.object_set,
             key: request.key,
-            mode: request.mode,
+            mode,
             source_segment: request.source_segment,
             target_segments: request.target_segments,
             task_executor: request.task_executor,
@@ -754,7 +755,10 @@ fn parse_env_duration_ms(name: &str) -> AdminResult<Option<Duration>> {
     Ok(parse_env_u32(name)?.map(|value| Duration::from_millis(value as u64)))
 }
 
-fn validate_route_migration_request(request: &RouteMigrationTaskSubmitRequest) -> AdminResult<()> {
+fn validate_route_migration_request(
+    mode: RouteMigrationMode,
+    request: &RouteMigrationTaskSubmitRequest,
+) -> AdminResult<()> {
     if request.authority.trim().is_empty() {
         return Err(StoreError::InvalidState(
             "route migration task is missing authority".to_string(),
@@ -785,7 +789,7 @@ fn validate_route_migration_request(request: &RouteMigrationTaskSubmitRequest) -
             "route migration task max_retries must be greater than zero".to_string(),
         ));
     }
-    match request.mode {
+    match mode {
         RouteMigrationMode::Copy if request.target_segments.is_empty() => {
             Err(StoreError::InvalidState(
                 "route migration copy tasks require at least one target_segment".to_string(),
@@ -1073,9 +1077,10 @@ impl AdminService {
 
     pub fn submit_route_migration_task(
         &self,
+        mode: RouteMigrationMode,
         request: RouteMigrationTaskSubmitRequest,
     ) -> AdminResult<RouteMigrationTaskStatusResponse> {
-        self.migrations.submit(request)
+        self.migrations.submit(mode, request)
     }
 
     pub fn get_route_migration_task(
@@ -2419,7 +2424,6 @@ mod tests {
             domain: None,
             object_set: None,
             key: "object-a".to_string(),
-            mode: RouteMigrationMode::Move,
             source_segment: "segment-a".to_string(),
             target_segments: vec!["segment-b".to_string()],
             task_executor: "executor-a".to_string(),
@@ -2434,7 +2438,6 @@ mod tests {
             domain: None,
             object_set: None,
             key: "object-a".to_string(),
-            mode: RouteMigrationMode::Copy,
             source_segment: "segment-a".to_string(),
             target_segments: vec!["segment-b".to_string()],
             task_executor: "executor-a".to_string(),
@@ -3179,7 +3182,7 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_move_request())
+            .submit_route_migration_task(RouteMigrationMode::Move, sample_move_request())
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3228,7 +3231,7 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_move_request())
+            .submit_route_migration_task(RouteMigrationMode::Move, sample_move_request())
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3273,7 +3276,7 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_move_request())
+            .submit_route_migration_task(RouteMigrationMode::Move, sample_move_request())
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3318,7 +3321,7 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_move_request())
+            .submit_route_migration_task(RouteMigrationMode::Move, sample_move_request())
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3367,7 +3370,7 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_move_request())
+            .submit_route_migration_task(RouteMigrationMode::Move, sample_move_request())
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3414,7 +3417,7 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_copy_request())
+            .submit_route_migration_task(RouteMigrationMode::Copy, sample_copy_request())
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3521,7 +3524,7 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_move_request())
+            .submit_route_migration_task(RouteMigrationMode::Move, sample_move_request())
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3566,7 +3569,7 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_move_request())
+            .submit_route_migration_task(RouteMigrationMode::Move, sample_move_request())
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3595,7 +3598,10 @@ mod tests {
         );
 
         let error = service
-            .submit_route_migration_task(sample_move_request_with_max_retries(0))
+            .submit_route_migration_task(
+                RouteMigrationMode::Move,
+                sample_move_request_with_max_retries(0),
+            )
             .expect_err("zero max_retries should be rejected");
         assert!(matches!(error, StoreError::InvalidState(_)));
         assert!(error.to_string().contains("max_retries"));
@@ -3619,7 +3625,7 @@ mod tests {
         let mut missing_authority = sample_move_request();
         missing_authority.authority.clear();
         assert!(service
-            .submit_route_migration_task(missing_authority)
+            .submit_route_migration_task(RouteMigrationMode::Move, missing_authority)
             .expect_err("missing authority should fail")
             .to_string()
             .contains("authority"));
@@ -3627,7 +3633,7 @@ mod tests {
         let mut missing_tenant = sample_move_request();
         missing_tenant.tenant.clear();
         assert!(service
-            .submit_route_migration_task(missing_tenant)
+            .submit_route_migration_task(RouteMigrationMode::Move, missing_tenant)
             .expect_err("missing tenant should fail")
             .to_string()
             .contains("tenant"));
@@ -3635,7 +3641,7 @@ mod tests {
         let mut missing_key = sample_move_request();
         missing_key.key.clear();
         assert!(service
-            .submit_route_migration_task(missing_key)
+            .submit_route_migration_task(RouteMigrationMode::Move, missing_key)
             .expect_err("missing key should fail")
             .to_string()
             .contains("key"));
@@ -3643,7 +3649,7 @@ mod tests {
         let mut missing_source = sample_move_request();
         missing_source.source_segment.clear();
         assert!(service
-            .submit_route_migration_task(missing_source)
+            .submit_route_migration_task(RouteMigrationMode::Move, missing_source)
             .expect_err("missing source_segment should fail")
             .to_string()
             .contains("source_segment"));
@@ -3651,7 +3657,7 @@ mod tests {
         let mut missing_executor = sample_move_request();
         missing_executor.task_executor.clear();
         assert!(service
-            .submit_route_migration_task(missing_executor)
+            .submit_route_migration_task(RouteMigrationMode::Move, missing_executor)
             .expect_err("missing task_executor should fail")
             .to_string()
             .contains("task_executor"));
@@ -3694,10 +3700,10 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_copy_request_with_targets(&[
-                "segment-b",
-                "segment-c",
-            ]))
+            .submit_route_migration_task(
+                RouteMigrationMode::Copy,
+                sample_copy_request_with_targets(&["segment-b", "segment-c"]),
+            )
             .expect("migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
@@ -3756,7 +3762,10 @@ mod tests {
         );
 
         let submitted = service
-            .submit_route_migration_task(sample_move_request_in_scope("domain-a", "set-a"))
+            .submit_route_migration_task(
+                RouteMigrationMode::Move,
+                sample_move_request_in_scope("domain-a", "set-a"),
+            )
             .expect("scoped migration task submit should succeed");
         let status = wait_for_task_state(
             &service,
