@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <numeric>
+#include <vector>
 
 #include "real_client.h"
 
@@ -53,7 +55,7 @@ TEST(ComputeSegmentSizesTest, RdmaGiBAlignedBalancedSplit) {
 
 // RDMA, sub-GiB tail: last segment absorbs the tail, must not exceed
 // max_mr_size even when max_mr_size is not GiB-aligned.
-// 7 GiB + 500 MB, max = 3 GiB -> 3 segments: [2 GiB, 3 GiB, 2 GiB+500 MB].
+// 7 GiB + 500 MiB, max = 3 GiB -> 3 segments: [2 GiB, 3 GiB, 2 GiB+500 MiB].
 TEST(ComputeSegmentSizesTest, RdmaSubGiBTailAbsorbedInLastSegment) {
     const size_t tail = 500 * 1024 * 1024;  // 500 MiB
     const size_t total = 7 * kGiB + tail;
@@ -98,21 +100,25 @@ TEST(ComputeSegmentSizesTest, RdmaTotalBelowMaxMrSizeWithTailSingleSegment) {
     EXPECT_EQ(sizes[0], total);
 }
 
-// RDMA, max_mr_size < 1 GiB: floor(max_mr_size/GiB) == 0, implementation
-// clamps max_seg_gib to 1, so every non-last segment ends up exactly 1 GiB.
-// This violates invariant (a) (seg > max_mr_size) — we test only the cap-to-1
-// behavior rather than calling checkInvariants, to pin down the current
-// contract: the function prefers GiB alignment over honoring a sub-GiB cap.
-TEST(ComputeSegmentSizesTest, RdmaMaxMrSizeBelowOneGiBClampsToOneGiB) {
+// RDMA, max_mr_size exactly 1 GiB: the boundary of the supported range.
+// Every segment must be exactly 1 GiB; invariant (a) must hold strictly.
+TEST(ComputeSegmentSizesTest, RdmaMaxMrSizeExactlyOneGiBHonorsCap) {
+    const size_t max_mr = kGiB;
+    const size_t total = 3 * kGiB;
+    auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
+    checkInvariants(sizes, total, max_mr);
+    ASSERT_EQ(sizes.size(), 3u);
+    for (size_t s : sizes) EXPECT_EQ(s, kGiB);
+}
+
+// RDMA, max_mr_size < 1 GiB: unsupported precondition. The function logs
+// an error and returns an empty vector so callers fail loudly rather than
+// mounting segments that violate the cap.
+TEST(ComputeSegmentSizesTest, RdmaMaxMrSizeBelowOneGiBReturnsEmpty) {
     const size_t max_mr = 512 * 1024 * 1024;  // 512 MiB, < 1 GiB
     const size_t total = 3 * kGiB;
     auto sizes = computeSegmentSizes(total, max_mr, /*is_rdma=*/true);
-    // max_seg_gib clamped to 1 → 3 segments of 1 GiB each.
-    ASSERT_EQ(sizes.size(), 3u);
-    for (size_t s : sizes) EXPECT_EQ(s, kGiB);
-    // Sum still matches (invariant (c)).
-    size_t sum = std::accumulate(sizes.begin(), sizes.end(), size_t{0});
-    EXPECT_EQ(sum, total);
+    EXPECT_TRUE(sizes.empty());
 }
 
 }  // namespace mooncake
