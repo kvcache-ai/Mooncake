@@ -54,13 +54,8 @@ EfaContext::~EfaContext() {
     if (fabric_) deconstruct();
 }
 
-int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
-                          uint8_t port, int gid_index, size_t max_cqe,
+int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
                           int max_endpoints) {
-    (void)num_comp_channels;
-    (void)port;
-    (void)gid_index;
-
 #if !defined(USE_CUDA) && !defined(USE_HIP)
     // When built without GPU support, prevent libfabric's EFA provider from
     // dlopen-ing libcudart/libcuda at fi_getinfo/fi_domain time. That
@@ -417,9 +412,8 @@ int EfaContext::unregisterMemoryRegion(void* addr) {
 
 int EfaContext::preTouchMemory(void* addr, size_t length) {
     volatile char* p = static_cast<char*>(addr);
-    const size_t page_size = sysconf(_SC_PAGESIZE) > 0
-                                 ? static_cast<size_t>(sysconf(_SC_PAGESIZE))
-                                 : 4096;
+    const long sc = sysconf(_SC_PAGESIZE);
+    const size_t page_size = sc > 0 ? static_cast<size_t>(sc) : 4096;
     for (size_t off = 0; off < length; off += page_size) {
         p[off] = p[off];
     }

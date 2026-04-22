@@ -1023,10 +1023,8 @@ int EfaTransport::initializeEfaResources() {
     for (auto& device_name : efa_devices) {
         auto context = std::make_shared<EfaContext>(*this, device_name);
         auto& config = globalConfig();
-        int ret = context->construct(config.num_cq_per_ctx,
-                                     config.num_comp_channels_per_ctx,
-                                     config.port, config.gid_index,
-                                     config.max_cqe, config.max_ep_per_ctx);
+        int ret = context->construct(config.num_cq_per_ctx, config.max_cqe,
+                                     config.max_ep_per_ctx);
         if (ret) {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "EfaTransport: Disable device " << device_name;

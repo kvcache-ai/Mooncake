@@ -75,8 +75,7 @@ class EfaContext {
 
     ~EfaContext();
 
-    int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
-                  uint8_t port = 1, int gid_index = -1, size_t max_cqe = 4096,
+    int construct(size_t num_cq_list = 1, size_t max_cqe = 4096,
                   int max_endpoints = 65536);
 
    private:
@@ -207,8 +206,6 @@ class EfaContext {
 
     RWSpinlock mr_lock_;
     std::map<uint64_t, EfaMemoryRegionMeta> mr_map_;
-
-    friend class EfaEndPoint;
 };
 
 }  // namespace mooncake

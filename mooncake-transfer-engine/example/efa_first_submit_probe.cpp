@@ -8,15 +8,25 @@
 //
 // First-submit latency probe for EFA transport.
 //
-// Reports, separately:
+// transfer_engine_bench reports a 10-second throughput average, which
+// hides the two costs that matter for first-request latency: the
+// handshake / fi_av_insert that fires on the first send to each
+// (local_NIC, peer_NIC) pair, and the optional warmupSegment() that
+// pre-pays that cost outside the critical path.  This probe times
+// those two things separately so the cost of each is directly visible.
+//
+// Reports:
 //   - warmup:             time for EfaTransport::warmupSegment() (if enabled)
 //   - submit #0..#N-1:    time for a single 1 MB submitTransfer + poll
 //
-// The first submit carries the handshake / av_insert cost when warmup is
-// off; the rest steady-state. Use to compare:
-//   (a) warmup=ON vs warmup=OFF (does pre-warming really remove the stall?)
-//   (b) old per-peer-endpoint code vs SRD shared-endpoint refactor
-//       (how much faster is warmup itself, and how much is the cold submit?)
+// The first submit carries the handshake cost when warmup is off; the
+// rest are steady-state.  It's a two-host tool (not hooked into ctest)
+// used to:
+//   (a) decide whether to call warmupSegment() in your application —
+//       does it actually remove the stall?
+//   (b) compare this PR's shared-endpoint cost against upstream
+//       per-peer-endpoint cost (see the numbers in docs/.../efa_transport.md
+//       under "First-request latency").
 //
 // Usage:
 //   Target:     ./efa_first_submit_probe --mode=target ...
