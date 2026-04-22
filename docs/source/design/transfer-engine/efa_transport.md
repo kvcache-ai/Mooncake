@@ -198,14 +198,21 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--block_size` | 65536 | Bytes per transfer request |
+| `--mode` | initiator | `initiator` (sender) or `target` (receiver) |
+| `--protocol` | rdma | Transport protocol; use `efa` here |
+| `--metadata_server` | `192.168.3.77:2379` | etcd address or `P2PHANDSHAKE` for standalone use |
+| `--segment_id` | `192.168.3.76` | Initiator only: `<target_host>:<target_port>` from the target's startup log |
+| `--operation` | read | `read` or `write` |
+| `--block_size` | 65536 | Bytes per transfer request; **1 MB (1048576) is the main knob for EFA throughput** |
 | `--batch_size` | 128 | Requests per batch |
-| `--threads` | 12 | Concurrent submission threads |
-| `--buffer_size` | 1 GB | Total buffer size (per GPU when `--gpu_id=-1`) |
+| `--threads` | 12 | Concurrent submission threads (initiator) |
+| `--buffer_size` | 1 GB | Buffer size (per GPU when `--gpu_id=-1`, otherwise total) |
 | `--duration` | 10 | Test duration in seconds |
-| `--operation` | write | `read` or `write` |
-| `--report_unit` | GB | `GB\|GiB\|Gb\|MB\|MiB\|Mb` |
-| `--gpu_id` | 0 | GPU device ID; `-1` to use all GPUs (requires `-DUSE_CUDA=ON`) |
+| `--report_unit` | GB | `GB\|GiB\|Gb\|MB\|MiB\|Mb\|KB\|KiB\|Kb` |
+| `--use_vram` | true | Allocate from GPU VRAM (requires `-DUSE_CUDA=ON`); pass `--use_vram=false` for CPU-to-CPU on a CUDA build |
+| `--gpu_id` | 0 | GPU device ID when `--use_vram=true`; `-1` fans buffers across every GPU and is what actually saturates all NICs in a GPU-to-GPU run |
+| `--init_mem` | true | Zero-fill the allocated buffer; rarely needs to change |
+| `--auto_discovery` | false | Auto-discover topology on init; off for reproducible runs |
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
