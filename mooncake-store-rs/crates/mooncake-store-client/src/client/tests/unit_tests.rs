@@ -15,13 +15,13 @@ use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId};
 
 use crate::{
-    GetRequest, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, PutRequest,
-    ReplicationPolicy, StoreClientBuilder,
+    BandwidthShaping, ExecutionFairness, GetRequest, MultiBufferGetRequest, MultiBufferPutRequest,
+    NamespaceQuota, ObjectRef, PutRequest, ReplicationPolicy, StoreClientBuilder,
 };
 
 use super::super::{
-    align_up_u64, control_bind_host, flatten_slices, scatter_into_buffers, LiveClientCache,
-    StoreState,
+    align_up_u64, control_bind_host, flatten_slices, payload_checksum, scatter_into_buffers,
+    LiveClientCache, StoreState,
 };
 use super::{storage_config, test_future_expiry_ms};
 
@@ -835,4 +835,130 @@ fn helper_now_ms_is_monotonically_non_decreasing() {
     let a = super::super::now_ms();
     let b = super::super::now_ms();
     assert!(b >= a, "second call must not go backwards");
+}
+
+// ===========================================================================
+// payload_checksum — FNV-1a boundary behavior
+// ===========================================================================
+
+#[test]
+fn payload_checksum_empty_payload_equals_fnv_offset_basis() {
+    // FNV-1a over no bytes is the offset basis constant
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    assert_eq!(payload_checksum(&[]), FNV_OFFSET);
+}
+
+#[test]
+fn payload_checksum_single_byte_is_deterministic() {
+    let a = payload_checksum(&[0u8]);
+    let b = payload_checksum(&[0u8]);
+    assert_eq!(a, b, "same input must yield same checksum");
+    let different = payload_checksum(&[1u8]);
+    assert_ne!(
+        a, different,
+        "different input must yield different checksum"
+    );
+}
+
+#[test]
+fn payload_checksum_all_0xff_bytes_is_deterministic() {
+    let payload = vec![0xFFu8; 64];
+    let first = payload_checksum(&payload);
+    let second = payload_checksum(&payload);
+    assert_eq!(first, second);
+}
+
+#[test]
+fn payload_checksum_is_order_sensitive() {
+    let ab = payload_checksum(&[0x01, 0x02]);
+    let ba = payload_checksum(&[0x02, 0x01]);
+    assert_ne!(ab, ba, "FNV-1a must be sensitive to byte order");
+}
+
+#[test]
+fn payload_checksum_length_matters() {
+    let one_byte = payload_checksum(&[0xAAu8]);
+    let two_byte = payload_checksum(&[0xAAu8, 0xAAu8]);
+    assert_ne!(
+        one_byte, two_byte,
+        "longer payload must produce distinct checksum"
+    );
+}
+
+// ===========================================================================
+// Type zero-clamp: BandwidthShaping / ExecutionFairness / NamespaceQuota
+// ===========================================================================
+
+#[test]
+fn bandwidth_shaping_max_remote_batch_bytes_clamps_zero_to_one() {
+    let bs = BandwidthShaping::new().max_remote_batch_bytes(0);
+    assert_eq!(bs.max_remote_batch_bytes, Some(1));
+}
+
+#[test]
+fn bandwidth_shaping_max_remote_batch_burst_items_clamps_zero_to_one() {
+    let bs = BandwidthShaping::new().max_remote_batch_burst_items(0);
+    assert_eq!(bs.max_remote_batch_burst_items, Some(1));
+}
+
+#[test]
+fn bandwidth_shaping_max_inflight_bytes_per_batch_clamps_zero_to_one() {
+    let bs = BandwidthShaping::new().max_inflight_bytes_per_batch(0);
+    assert_eq!(bs.max_inflight_bytes_per_batch, Some(1));
+}
+
+#[test]
+fn bandwidth_shaping_preserves_nonzero_values() {
+    let bs = BandwidthShaping::new()
+        .max_remote_batch_bytes(1024)
+        .max_remote_batch_burst_items(8)
+        .max_inflight_bytes_per_batch(1_048_576);
+    assert_eq!(bs.max_remote_batch_bytes, Some(1024));
+    assert_eq!(bs.max_remote_batch_burst_items, Some(8));
+    assert_eq!(bs.max_inflight_bytes_per_batch, Some(1_048_576));
+}
+
+#[test]
+fn execution_fairness_max_remote_batch_items_clamps_zero_to_one() {
+    let ef = ExecutionFairness::new().max_remote_batch_items_per_tenant(0);
+    assert_eq!(ef.max_remote_batch_items_per_tenant, Some(1));
+}
+
+#[test]
+fn namespace_quota_max_bytes_clamps_zero_to_one() {
+    let nq = NamespaceQuota::new().max_bytes(0);
+    assert_eq!(nq.max_bytes, Some(1));
+}
+
+#[test]
+fn namespace_quota_max_objects_clamps_zero_to_one() {
+    let nq = NamespaceQuota::new().max_objects(0);
+    assert_eq!(nq.max_objects, Some(1));
+}
+
+#[test]
+fn namespace_quota_preserves_nonzero_values() {
+    let nq = NamespaceQuota::new().max_bytes(1_000_000).max_objects(42);
+    assert_eq!(nq.max_bytes, Some(1_000_000));
+    assert_eq!(nq.max_objects, Some(42));
+}
+
+// ===========================================================================
+// control_bind_host — IPv6 and injection edge cases
+// ===========================================================================
+
+#[test]
+fn control_bind_host_ipv6_loopback_preserves_bracketed_host() {
+    assert_eq!(control_bind_host("[::1]:8080"), "[::1]");
+}
+
+#[test]
+fn control_bind_host_port_only_falls_back_to_loopback() {
+    // An empty host before the colon is rejected; host collapses to loopback.
+    assert_eq!(control_bind_host(":8080"), "127.0.0.1");
+}
+
+#[test]
+fn control_bind_host_rejects_wildcard_ipv4_in_favor_of_loopback() {
+    assert_eq!(control_bind_host("0.0.0.0:8080"), "127.0.0.1");
 }
