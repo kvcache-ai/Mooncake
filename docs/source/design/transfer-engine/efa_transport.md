@@ -269,17 +269,23 @@ Tested on two p6-b200.48xlarge instances in the same AWS placement group.
 
 Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA devices) in the same AWS placement group.
 
-**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=4294967296`):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| block=1MB, threads=8, batch=128, buf=1GB/GPU | 236 GB/s | 271 GB/s |
-| block=1MB, threads=16, batch=128, buf=2GB/GPU | 271 GB/s | **297-308 GB/s** |
-| **block=1MB, threads=32, batch=64, buf=2GB/GPU** | **337-347 GB/s** | 274 GB/s |
+| block=1MB, threads=8, batch=128 | 318.71 GB/s | 277.06 GB/s |
+| **block=1MB, threads=16, batch=128** | **365.66 GB/s** | 284.22 GB/s |
+| **block=1MB, threads=16, batch=32** | 297.23 GB/s | **303.78 GB/s** |
+| block=1MB, threads=32, batch=64 | 357.12 GB/s | 279.61 GB/s |
+| block=1MB, threads=32, batch=128 | 364.21 GB/s | 250.90 GB/s |
+| block=1MB, threads=48, batch=64 | 363.47 GB/s | 268.43 GB/s |
 
-> GPU HBM bandwidth (>3 TB/s) eliminates the memory bottleneck, allowing full EFA utilization. Write and read have different optimal thread counts: write peaks at 32 threads, read peaks at 16 threads.
-
-> **Note:** EFA memory region registration (fi_mr_reg) for GPU memory segfaults at 4GB+ per GPU. Use `--buffer_size=2147483648` (2GB) as the maximum per-GPU buffer.
+> **Peak write: 365 GB/s** at `threads=16, batch=128` — ~91% of the
+> 400 GB/s theoretical line rate (16×200 Gbps). Write saturates on
+> batch size, so `batch=128` outperforms smaller batches as long as
+> `threads × batch ≤ 16 × 256 = 4096` (the shared-endpoint WR cap).
+> **Peak read: 304 GB/s** at `threads=16, batch=32` — reads tolerate
+> smaller in-flight queues, and throughput drops as batch grows.
 
 **CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
 
@@ -296,7 +302,7 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 |-----------|-----------|-------|
 | **EFA GPU-to-GPU (B300)** | **752 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, ~94% line rate |
 | **EFA GPU-to-GPU (B200)** | **313 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB |
-| **EFA GPU-to-GPU (H200)** | **347 GB/s** | p5en.48xlarge, 16×200G, block=1MB |
+| **EFA GPU-to-GPU (H200)** | **366 GB/s** | p5en.48xlarge, 16×200G, block=1MB, ~91% line rate |
 | **EFA CPU-to-CPU (B300)** | **230 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, DRAM-limited |
 | **EFA CPU-to-CPU (B200)** | **222 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB, DRAM-limited |
 | **EFA CPU-to-CPU (H200)** | **192 GB/s** | p5en.48xlarge, block=1MB, NUMA-split, DRAM-limited |
