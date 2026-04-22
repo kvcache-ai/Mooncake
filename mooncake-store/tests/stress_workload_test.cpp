@@ -61,23 +61,8 @@ std::shared_ptr<ClientService> g_client = nullptr;
 void* g_segment_ptr = nullptr;
 size_t g_ram_buffer_size = 0;
 void* g_worker_buffer_base = nullptr;
-size_t g_per_thread_buffer_stride = 0;  // write_buf + read_pool per thread
-int g_read_slot_pool_size = 0;  // number of reusable read slots / thread
-
-// Per-thread read-pool memory budget. Caps RDMA pinned memory when batch and
-// value are both large (e.g. batch=2000, value=1MB would otherwise require
-// 2GB/thread and fail to pin). At typical 2+ threads, 256MiB * threads far
-// exceeds L3 (32~96MiB), keeping measurements DRAM-realistic rather than
-// cache-resident.
-constexpr size_t kPerThreadReadPoolBudget = 256ull * 1024 * 1024;
-
-int DeriveReadSlotPoolSize(int batch_size, size_t value_size) {
-    if (batch_size <= 0 || value_size == 0) return 1;
-    size_t by_budget =
-        std::max<size_t>(1, kPerThreadReadPoolBudget / value_size);
-    return static_cast<int>(
-        std::min<size_t>(by_budget, static_cast<size_t>(batch_size)));
-}
+size_t g_per_thread_buffer_stride =
+    0;  // (1 + batch_size) * value_size per thread
 
 // Synchronization primitives for coordinated start
 std::mutex g_sync_mutex;
@@ -197,25 +182,34 @@ bool initialize_client() {
 
     g_client = client_opt.value();
 
-    // Pre-allocate the worker buffer pool with exact sizing, bypassing the
-    // slab allocator (SimpleAllocator/CacheLib) to avoid fragmentation.
-    // Each thread gets: 1 write_buffer + g_read_slot_pool_size read slots.
-    //
-    // pool = min(batch, kPerThreadReadPoolBudget / value_size)
-    // - Capping at 256MiB/thread prevents RDMA pinning OOM on large batch size
-    //   or large value size.
-    g_read_slot_pool_size =
-        DeriveReadSlotPoolSize(FLAGS_batch_size, FLAGS_value_size);
-    g_per_thread_buffer_stride =
-        static_cast<size_t>(FLAGS_value_size) * (1 + g_read_slot_pool_size);
+    // Pre-allocate the worker buffer per thread, bypassing the slab allocator
+    // (SimpleAllocator/CacheLib) to avoid fragmentation.
+    // Layout: [write_buffer | dst_0 | dst_1 | ... | dst_{batch_size-1}]
+    // Stride = (1 + batch_size) * value_size.
+    if (FLAGS_batch_size <= 0) {
+        LOG(ERROR) << "batch_size must be greater than 0";
+        return false;
+    }
+
+    g_per_thread_buffer_stride = static_cast<size_t>(FLAGS_value_size) *
+                                 (1 + static_cast<size_t>(FLAGS_batch_size));
     size_t total_buffer_size = FLAGS_num_threads * g_per_thread_buffer_stride;
 
+    if (total_buffer_size < 4096) {
+        LOG(ERROR) << "total_buffer_size (" << total_buffer_size
+                   << ") is less than minimum alignment (4096). "
+                      "Consider increasing value_size, batch_size, or "
+                      "num_threads.";
+        return false;
+    }
+
     size_t read_working_set = static_cast<size_t>(FLAGS_num_threads) *
-                              static_cast<size_t>(g_read_slot_pool_size) *
+                              static_cast<size_t>(FLAGS_batch_size) *
                               static_cast<size_t>(FLAGS_value_size);
-    LOG(INFO) << "Read slot pool per thread: " << g_read_slot_pool_size
-              << " (batch=" << FLAGS_batch_size
-              << ", value=" << FLAGS_value_size << "), total read working set: "
+    LOG(INFO) << "Worker buffer per thread: "
+              << g_per_thread_buffer_stride / (1024 * 1024)
+              << " MiB (1 write + " << FLAGS_batch_size << " read destinations"
+              << "), total read working set: "
               << read_working_set / (1024 * 1024) << " MiB";
     if (read_working_set < 128ull * 1024 * 1024) {
         LOG(WARNING) << "Read working set is " << read_working_set / 1024
@@ -226,9 +220,10 @@ bool initialize_client() {
     }
 
     // Align to page boundary for RDMA registration.
-    g_worker_buffer_base = std::aligned_alloc(4096, total_buffer_size);
+    const size_t kAlignment = 4096;
+    g_worker_buffer_base = std::aligned_alloc(kAlignment, total_buffer_size);
     if (!g_worker_buffer_base) {
-        LOG(ERROR) << "Failed to allocate worker buffer pool of size "
+        LOG(ERROR) << "Failed to allocate worker buffer of size "
                    << total_buffer_size / (1024 * 1024) << "MB";
         return false;
     }
@@ -245,7 +240,7 @@ bool initialize_client() {
     }
 
     LOG(INFO) << "Client initialized successfully with "
-              << total_buffer_size / (1024 * 1024) << "MB worker buffer pool";
+              << total_buffer_size / (1024 * 1024) << "MB worker buffer";
     return true;
 }
 
@@ -271,22 +266,18 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     stats.batch_put_latency_us.reserve(FLAGS_test_operation_nums);
     stats.batch_get_latency_us.reserve(FLAGS_test_operation_nums);
 
-    // Each thread gets a dedicated slice of the pre-registered worker buffer
-    // pool. The stride is computed once in initialize_client() so all threads
-    // use the same formula and regions never overlap.
-    // Layout per thread: [write_buffer | read_pool_slot_0 | ... | slot_K-1]
-    // where K = g_read_slot_pool_size <= batch_size, reused across iterations
-    // via `j % num_read_slots` indexing below.
-    int num_read_slots = g_read_slot_pool_size;
+    // Each thread gets a dedicated slice of the pre-registered worker buffer.
+    // Layout: [write_buffer | dst_0 | dst_1 | ... | dst_{batch_size-1}]
+    // thread_base + 0             * value_size → write buffer (PUT source)
+    // thread_base + (1 + j)       * value_size → GET destination for key j
     char* thread_base =
         static_cast<char*>(g_worker_buffer_base) +
         static_cast<size_t>(thread_id) * g_per_thread_buffer_stride;
     void* write_buffer = thread_base;
-    void* read_pool = thread_base + FLAGS_value_size;
 
     if (!g_worker_buffer_base || g_per_thread_buffer_stride == 0) {
         LOG(ERROR) << "Thread " << thread_id
-                   << ": worker buffer pool not initialized";
+                   << ": worker buffer not initialized";
         return;
     }
 
@@ -317,7 +308,7 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     int warmup_successes = 0;
     auto warmup_start = std::chrono::high_resolution_clock::now();
     for (int w = 0; w < kWarmupBatches; ++w) {
-        int warmup_batch = std::max(1, FLAGS_batch_size);
+        int warmup_batch = FLAGS_batch_size;
         std::vector<ObjectKey> wkeys;
         wkeys.reserve(warmup_batch);
         std::vector<std::vector<Slice>> wslices(warmup_batch, slices);
@@ -408,9 +399,8 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         for (int j = 0; j < FLAGS_batch_size; ++j) {
             batch_keys.push_back(
                 stored_keys[(i * FLAGS_batch_size + j) % stored_keys.size()]);
-            void* slot = static_cast<char*>(read_pool) +
-                         (j % num_read_slots) * FLAGS_value_size;
-            all_buffers[j] = {slot};
+            all_buffers[j] = {thread_base +
+                              (1 + j) * static_cast<size_t>(FLAGS_value_size)};
         }
 
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -563,7 +553,6 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
     LOG(INFO) << "Key Size: 128 bytes";
     LOG(INFO) << "Value Size: " << FLAGS_value_size << " bytes";
     LOG(INFO) << "Batch Size: " << FLAGS_batch_size;
-    LOG(INFO) << "Read Slot Pool Size: " << g_read_slot_pool_size;
     LOG(INFO) << "Batches per thread: " << FLAGS_test_operation_nums;
     LOG(INFO) << "";
     LOG(INFO) << "=== Operation Statistics ===";
@@ -637,11 +626,10 @@ int main(int argc, char** argv) {
     // Skip for P2P mode where the segment is provisioned internally by tiered
     // backend config, not by ram_buffer_size_gb alone.
     if (FLAGS_client_type != "P2P") {
-        uint64_t put_working_set =
-            static_cast<uint64_t>(FLAGS_num_threads) *
-            FLAGS_test_operation_nums *
-            static_cast<uint64_t>(std::max(1, FLAGS_batch_size)) *
-            static_cast<uint64_t>(FLAGS_value_size);
+        uint64_t put_working_set = static_cast<uint64_t>(FLAGS_num_threads) *
+                                   FLAGS_test_operation_nums *
+                                   static_cast<uint64_t>(FLAGS_batch_size) *
+                                   static_cast<uint64_t>(FLAGS_value_size);
         uint64_t segment_cap = static_cast<uint64_t>(FLAGS_ram_buffer_size_gb) *
                                1024 * 1024 * 1024;
         uint64_t usable_cap = segment_cap;
@@ -651,7 +639,7 @@ int main(int argc, char** argv) {
                        << " * batches=" << FLAGS_test_operation_nums
                        << " * batch_size=" << FLAGS_batch_size
                        << " * value=" << FLAGS_value_size
-                       << ") exceeds 90% of ram_buffer_size_gb="
+                       << ") exceeds ram_buffer_size_gb="
                        << FLAGS_ram_buffer_size_gb
                        << "GB. Increase --ram_buffer_size_gb or reduce "
                           "batches/threads/batch_size/value_size.";
