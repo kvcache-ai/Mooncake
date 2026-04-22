@@ -267,9 +267,9 @@ Port reminder:
 
 ## Run Route-Migration E2E
 
-Use the local route-migration e2e helper to validate admin HTTP submission plus
-end-to-end `query_route` / `get` correctness for explicit `move`, single-target
-`copy`, or multi-target `copy`.
+Use the local route-migration e2e helper to validate end-to-end `query_route` /
+`get` correctness for explicit `move`, single-target `copy`, or multi-target
+`copy`.
 
 Examples:
 
@@ -286,13 +286,15 @@ The script:
 - launches two or three standalone `mooncake-store-client` storage nodes
 - launches `mooncake-store-admin-server`
 - writes a seed key into the source segment
-- submits `POST /v1/route-migrations`
-- polls `GET /v1/route-migrations/<task_id>`
+- submits the task either through admin HTTP directly or through
+  `mooncake-store-admin --admin-url ...`
+- polls task status through the same operator surface
 - verifies final `query_route` shape and payload readability
 
 Important knobs:
 
 - `MC_STORE_RS_ROUTE_MIGRATION_MODE=move|copy|copy-multi`
+- `MC_STORE_RS_ROUTE_MIGRATION_SUBMITTER=http|cli`
 - `MC_STORE_RS_ROUTE_MIGRATION_LEASE_TTL_MS`
 - `MC_STORE_RS_ROUTE_MIGRATION_STORAGE_BYTES`
 - `MC_STORE_RS_ROUTE_MIGRATION_SCRATCH_BYTES`
@@ -327,6 +329,9 @@ mooncake-store-admin \
 
 `mooncake-store-admin-server` now exposes an in-memory route-migration task queue over HTTP.
 
+For operator-facing task submission and query examples, see
+[Route Migration 使用手册](./route-migration-usage.md).
+
 The packaged `mooncake-store-admin` binary acts as an operator client for that
 HTTP surface. Route-migration tasks are not kept in the CLI process, so
 `migrate ...` commands must point at a long-lived admin server with `--admin-url`:
@@ -355,7 +360,8 @@ mooncake-store-admin \
 
 Current endpoints:
 
-- `POST /v1/route-migrations`
+- `POST /v1/route-migrations/copy`
+- `POST /v1/route-migrations/move`
 - `GET /v1/route-migrations`
 - `GET /v1/route-migrations/<task_id>`
 
@@ -366,7 +372,6 @@ Task request fields:
 - optional `domain`
 - optional `object_set`
 - `key`
-- `mode = "copy" | "move"`
 - `source_segment`
 - `target_segments`
 - `task_executor`
@@ -377,6 +382,7 @@ Operational notes:
 - the admin server does not move bytes itself; it submits migration RPC to the chosen `task_executor`
 - `copy` supports multiple targets, while `move` currently requires exactly one target
 - scoped migration requests may carry `domain` and `object_set`; omitted values fall back to the default namespace
+- submit bodies accept only the documented fields; legacy `mode` or other unknown fields are rejected with `400`
 - admin keeps task state only in process memory, so queued tasks are lost if the admin server restarts
 - admin retry is automatic while the server stays alive; route visibility is used as the authoritative completion check when executor status is lost
 - current CLI support covers `migrate copy`, `migrate move`, `migrate task list`, and `migrate task get`
