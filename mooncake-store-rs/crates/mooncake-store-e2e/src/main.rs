@@ -631,17 +631,17 @@ fn verify_strict_tenant_quota(
         )));
     }
 
-    let second = payload("strict-quota-over", value_size);
+    let oversized = payload("strict-quota-oversized", value_size + 1);
     let over_error = writer
-        .put(key_over, &second)
-        .expect_err("strict quota over-limit put should fail");
+        .put(key_over, &oversized)
+        .expect_err("strict quota oversized put should fail");
     if !matches!(
         over_error,
-        StoreError::Conflict(_) | StoreError::Metadata(_)
+        StoreError::Conflict(_) | StoreError::Metadata(_) | StoreError::QuotaExceeded { .. }
     ) || !over_error.to_string().contains("tenant quota")
     {
         return Err(StoreError::InvalidState(format!(
-            "strict quota over-limit error mismatch: {over_error}"
+            "strict quota oversized error mismatch: {over_error}"
         )));
     }
 
@@ -663,7 +663,41 @@ fn verify_strict_tenant_quota(
         )));
     }
 
-    writer.remove(key_ok, true)?;
+    let second = payload("strict-quota-evicted", value_size);
+    writer.put(key_over, &second)?;
+    let round_trip_after_evict = reader.get_in_tenant(tenant, key_over)?;
+    ensure_payload(
+        "strict quota eviction admitted replacement",
+        &second,
+        &round_trip_after_evict,
+    )?;
+    if metadata
+        .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_ok}")))?
+        .is_some()
+    {
+        return Err(StoreError::InvalidState(
+            "strict quota original accounting still exists after tenant-local eviction".to_string(),
+        ));
+    }
+    let quota_after_evict = metadata.get_tenant_quota_state(&scope)?.ok_or_else(|| {
+        StoreError::NotFound(format!("quota state missing for {tenant} after eviction"))
+    })?;
+    if quota_after_evict.used_bytes != value_size as u64
+        || quota_after_evict.used_objects != 1
+        || quota_after_evict.pending_reserved_bytes != 0
+        || quota_after_evict.pending_reserved_objects != 0
+    {
+        return Err(StoreError::InvalidState(format!(
+            "strict quota state after eviction mismatch: used_bytes={} used_objects={} pending_bytes={} pending_objects={} expected_used_bytes={} expected_used_objects=1",
+            quota_after_evict.used_bytes,
+            quota_after_evict.used_objects,
+            quota_after_evict.pending_reserved_bytes,
+            quota_after_evict.pending_reserved_objects,
+            value_size,
+        )));
+    }
+
+    writer.remove(key_over, true)?;
     let quota_after_delete = metadata.get_tenant_quota_state(&scope)?.ok_or_else(|| {
         StoreError::NotFound(format!("quota state missing for {tenant} after delete"))
     })?;
@@ -681,7 +715,7 @@ fn verify_strict_tenant_quota(
         )));
     }
     if metadata
-        .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_ok}")))?
+        .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_over}")))?
         .is_some()
     {
         return Err(StoreError::InvalidState(
@@ -692,13 +726,13 @@ fn verify_strict_tenant_quota(
     let delete_reservation = reservations_after_delete
         .iter()
         .find(|reservation| {
-            reservation.key == ObjectKey::new(format!("{tenant}::{key_ok}"))
+            reservation.key == ObjectKey::new(format!("{tenant}::{key_over}"))
                 && reservation.delta_bytes == -(value_size as i64)
                 && reservation.delta_objects == -1
         })
         .ok_or_else(|| {
             StoreError::NotFound(format!(
-                "strict quota delete reservation missing for {tenant}::{key_ok}"
+                "strict quota delete reservation missing for {tenant}::{key_over}"
             ))
         })?;
     if delete_reservation.state != TenantQuotaReservationState::Finalized {

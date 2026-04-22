@@ -1,10 +1,11 @@
+use std::cmp::Reverse;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
 use crate::redis_backend::{ClientLeaseLiveness, RedisMetadataCleanupReport};
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
-use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
+use etcd_client::{Client, Compare, CompareOp, DeleteOptions, GetOptions, Txn, TxnOp};
 use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
@@ -40,6 +41,15 @@ impl EtcdMetadataConfig {
     }
 }
 
+const EVICTION_FRONTIER_LIMIT: usize = 16;
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct EvictionCandidate {
+    updated_at_ms: u64,
+    committed_length: Reverse<u64>,
+    key: ObjectKey,
+}
+
 pub struct EtcdMetadataBackend {
     runtime: tokio::runtime::Runtime,
     config: EtcdMetadataConfig,
@@ -52,6 +62,50 @@ impl Default for EtcdMetadataBackend {
 }
 
 impl EtcdMetadataBackend {
+    fn candidate_from_object(object: &TenantObjectAccounting) -> EvictionCandidate {
+        EvictionCandidate {
+            updated_at_ms: object.updated_at_ms,
+            committed_length: Reverse(object.committed_length),
+            key: object.key.clone(),
+        }
+    }
+
+    fn frontier_entries_for_candidate(
+        &self,
+        tenant: &str,
+        candidate: &EvictionCandidate,
+    ) -> (String, String) {
+        let frontier_key = self.config.keyspace.tenant_eviction_candidate(
+            tenant,
+            candidate.updated_at_ms,
+            candidate.committed_length.0,
+            &candidate.key,
+        );
+        let object_key = self
+            .config
+            .keyspace
+            .tenant_object_accounting(&candidate.key);
+        (frontier_key, object_key)
+    }
+
+    fn frontier_entries_from_objects(
+        &self,
+        tenant: &str,
+        objects: &[TenantObjectAccounting],
+    ) -> Vec<(String, String)> {
+        let mut frontier = objects
+            .iter()
+            .filter(|object| object.state == TenantObjectAccountingState::Active)
+            .map(Self::candidate_from_object)
+            .collect::<Vec<_>>();
+        frontier.sort();
+        frontier.truncate(EVICTION_FRONTIER_LIMIT);
+        frontier
+            .into_iter()
+            .map(|candidate| self.frontier_entries_for_candidate(tenant, &candidate))
+            .collect()
+    }
+
     pub fn new() -> Self {
         Self::from_config(EtcdMetadataConfig::localhost())
             .expect("localhost etcd metadata backend should construct")
@@ -733,9 +787,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                 .first()
                 .map(|kv| serde_json::from_slice::<ClientLease>(kv.value()).map_err(json_error))
                 .transpose()?;
-            Ok(lease.filter(|lease| {
-                lease.state == ClientLifecycleState::Active && lease.expires_at_ms >= now_ms()
-            }))
+            Ok(lease.filter(|lease| lease.expires_at_ms >= now_ms()))
         })
     }
 
@@ -758,16 +810,16 @@ impl MetadataBackend for EtcdMetadataBackend {
             let mut stale_markers: Vec<String> = Vec::new();
             for kv in response.kvs() {
                 let lease: ClientLease = serde_json::from_slice(kv.value()).map_err(json_error)?;
-                if lease.expires_at_ms < now {
+                if lease.expires_at_ms >= now {
+                    live.push(lease);
+                } else {
                     stale_markers.push(
                         keyspace.client_by_stable_marker(
                             &lease.runtime.stable_id,
                             lease.runtime.epoch.0,
                         ),
                     );
-                    continue;
                 }
-                live.push(lease);
             }
             for marker in stale_markers {
                 client
@@ -1479,6 +1531,85 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> Result<Option<TenantQuotaReservation>> {
+        let key = self
+            .config
+            .keyspace
+            .tenant_quota_reservation(reservation_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key, None)
+                .await
+                .map_err(etcd_error("etcd get tenant quota reservation"))?;
+            response
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice(kv.value()).map_err(json_error))
+                .transpose()
+        })
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> Result<Vec<TenantObjectAccounting>> {
+        let scope = root_scope(scope)?;
+        let prefix = self
+            .config
+            .keyspace
+            .tenant_eviction_frontier_prefix(&scope.tenant);
+        let read_limit = limit.min(EVICTION_FRONTIER_LIMIT);
+        if read_limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(
+                    prefix,
+                    Some(
+                        GetOptions::new()
+                            .with_prefix()
+                            .with_limit(read_limit as i64),
+                    ),
+                )
+                .await
+                .map_err(etcd_error("etcd list tenant eviction frontier"))?;
+            let mut candidates = Vec::new();
+            for kv in response.kvs() {
+                let object_key = String::from_utf8(kv.value().to_vec()).map_err(|error| {
+                    StoreError::Metadata(format!(
+                        "etcd list tenant eviction frontier: invalid object key utf8: {error}"
+                    ))
+                })?;
+                let object_response = client
+                    .get(object_key, None)
+                    .await
+                    .map_err(etcd_error("etcd get tenant eviction candidate object"))?;
+                let Some(object_kv) = object_response.kvs().first() else {
+                    continue;
+                };
+                let object: TenantObjectAccounting =
+                    serde_json::from_slice(object_kv.value()).map_err(json_error)?;
+                if object.scope == scope && object.state == TenantObjectAccountingState::Active {
+                    candidates.push(object);
+                }
+            }
+            candidates.sort_by(|left, right| {
+                left.updated_at_ms
+                    .cmp(&right.updated_at_ms)
+                    .then_with(|| right.committed_length.cmp(&left.committed_length))
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+            candidates.truncate(read_limit);
+            Ok(candidates)
+        })
+    }
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,
@@ -1868,6 +1999,14 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .get(object_key.clone(), None)
                     .await
                     .map_err(etcd_error("etcd get tenant object accounting"))?;
+                let frontier_prefix = self
+                    .config
+                    .keyspace
+                    .tenant_eviction_frontier_prefix(&scope.tenant);
+                let frontier_response = client
+                    .get(frontier_prefix.clone(), Some(GetOptions::new().with_prefix()))
+                    .await
+                    .map_err(etcd_error("etcd get tenant eviction frontier"))?;
                 let current_object = object_response
                     .kvs()
                     .first()
@@ -1952,6 +2091,32 @@ impl MetadataBackend for EtcdMetadataBackend {
                 updated_reservation.state = TenantQuotaReservationState::Finalized;
                 updated_reservation.version = updated_reservation.version.saturating_add(1);
 
+                let mut frontier_objects = Vec::new();
+                for kv in frontier_response.kvs() {
+                    let object_key = String::from_utf8(kv.value().to_vec()).map_err(|error| {
+                        StoreError::Metadata(format!(
+                            "etcd get tenant eviction frontier: invalid object key utf8: {error}"
+                        ))
+                    })?;
+                    let object_response = client
+                        .get(object_key, None)
+                        .await
+                        .map_err(etcd_error("etcd get tenant eviction frontier object"))?;
+                    let Some(object_kv) = object_response.kvs().first() else {
+                        continue;
+                    };
+                    let object: TenantObjectAccounting =
+                        serde_json::from_slice(object_kv.value()).map_err(json_error)?;
+                    if object.scope == scope && object.state == TenantObjectAccountingState::Active {
+                        frontier_objects.push(object);
+                    }
+                }
+                frontier_objects.retain(|object| object.key != reservation.key);
+                if let Some(object) = next_object.clone() {
+                    frontier_objects.push(object);
+                }
+                let frontier_entries = self.frontier_entries_from_objects(&scope.tenant, &frontier_objects);
+
                 let quota_payload = serde_json::to_string(&quota).map_err(json_error)?;
                 let reservation_payload =
                     serde_json::to_string(&updated_reservation).map_err(json_error)?;
@@ -1979,6 +2144,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                 let mut ops = vec![
                     TxnOp::put(quota_key.clone(), quota_payload, None),
                     TxnOp::put(reservation_key.clone(), reservation_payload, None),
+                    TxnOp::delete(frontier_prefix.clone(), Some(DeleteOptions::new().with_prefix())),
                 ];
                 match next_object.as_ref() {
                     Some(object) => ops.push(TxnOp::put(
@@ -1987,6 +2153,9 @@ impl MetadataBackend for EtcdMetadataBackend {
                         None,
                     )),
                     None => ops.push(TxnOp::delete(object_key.clone(), None)),
+                }
+                for (frontier_key, object_key) in frontier_entries {
+                    ops.push(TxnOp::put(frontier_key, object_key, None));
                 }
                 txn = txn.and_then(ops);
                 let txn_response = client
@@ -2442,7 +2611,8 @@ mod tests {
         let live_clients = backend
             .list_live_clients()
             .expect("listing live clients should succeed");
-        assert!(live_clients.is_empty());
+        assert_eq!(live_clients.len(), 1);
+        assert_eq!(live_clients[0].state, ClientLifecycleState::Draining);
         assert!(matches!(
             backend.update_client_state(
                 &ClientRuntimeId::new("missing", ClientEpoch(1)),
@@ -2637,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn etcd_backend_point_lookups_keep_present_lease_visibility_and_live_stable_filtering() {
+    fn etcd_backend_point_lookups_only_return_present_leases() {
         let Some(server) = EtcdTestServer::start() else {
             return;
         };
@@ -2667,26 +2837,19 @@ mod tests {
         backend
             .update_client_state(&active.runtime, ClientLifecycleState::Draining)
             .expect("client state update should succeed");
-        let mut draining = active.clone();
-        draining.state = ClientLifecycleState::Draining;
-        assert_eq!(
-            backend
-                .get_client_lease(&active.runtime)
-                .expect("draining lease lookup should succeed"),
-            Some(draining.clone())
-        );
-        assert_eq!(
-            backend
-                .get_live_runtime_by_stable_id(&active.runtime.stable_id)
-                .expect("draining stable lookup should succeed"),
-            Some(draining.clone())
-        );
-        assert_eq!(
-            backend
-                .list_live_clients()
-                .expect("live client listing should succeed"),
-            vec![draining]
-        );
+        let draining = backend
+            .get_client_lease(&active.runtime)
+            .expect("draining lease lookup should succeed")
+            .expect("draining lease should remain present");
+        assert_eq!(draining.state, ClientLifecycleState::Draining);
+        assert!(backend
+            .get_live_runtime_by_stable_id(&active.runtime.stable_id)
+            .expect("draining stable lookup should succeed")
+            .is_none());
+        let live = backend
+            .list_live_clients()
+            .expect("live client listing should succeed");
+        assert_eq!(live, vec![draining]);
     }
 
     #[test]
@@ -3039,6 +3202,160 @@ mod tests {
             .get_tenant_object_accounting(&key)
             .expect("object accounting lookup should succeed")
             .is_none());
+    }
+
+    #[test]
+    fn etcd_backend_tenant_eviction_frontier_orders_and_refreshes_candidates() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-tenant-eviction-frontier")),
+        )
+        .expect("etcd backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-evict", None::<String>, None::<String>);
+        let writer = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        let seed = |backend: &EtcdMetadataBackend,
+                    reservation_id: &str,
+                    key: &str,
+                    expected_object_version: Option<u64>,
+                    delta_bytes: i64,
+                    delta_objects: i64,
+                    committed_length: Option<u64>,
+                    state: TenantObjectAccountingState,
+                    updated_at_ms: u64| {
+            backend
+                .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                    reservation_id: reservation_id.to_string(),
+                    scope: scope.clone(),
+                    key: ObjectKey::new(key),
+                    expected_object_version,
+                    delta_bytes,
+                    delta_objects,
+                    limit: TenantQuotaPolicy {
+                        max_bytes: Some(4096),
+                        max_objects: Some(64),
+                    },
+                    expires_at_ms: updated_at_ms + 100,
+                    created_at_ms: updated_at_ms,
+                    writer_runtime: writer.clone(),
+                })
+                .expect("reservation should succeed");
+            backend
+                .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                    reservation_id: reservation_id.to_string(),
+                    expected_object_version,
+                    committed_length,
+                    route_version: None,
+                    state,
+                    updated_at_ms,
+                    updated_by: "writer".to_string(),
+                })
+                .expect("finalize should succeed");
+        };
+
+        seed(
+            &backend,
+            "resv-alpha",
+            "tenant-evict::alpha",
+            None,
+            10,
+            1,
+            Some(10),
+            TenantObjectAccountingState::Active,
+            100,
+        );
+        seed(
+            &backend,
+            "resv-beta",
+            "tenant-evict::beta",
+            None,
+            20,
+            1,
+            Some(20),
+            TenantObjectAccountingState::Active,
+            100,
+        );
+        seed(
+            &backend,
+            "resv-gamma",
+            "tenant-evict::gamma",
+            None,
+            5,
+            1,
+            Some(5),
+            TenantObjectAccountingState::Active,
+            90,
+        );
+
+        let listed = backend
+            .list_tenant_eviction_candidates(&scope, 16)
+            .expect("candidate listing should succeed");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|object| object.key.0.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "tenant-evict::gamma",
+                "tenant-evict::beta",
+                "tenant-evict::alpha"
+            ]
+        );
+
+        seed(
+            &backend,
+            "resv-beta-refresh",
+            "tenant-evict::beta",
+            Some(1),
+            5,
+            0,
+            Some(25),
+            TenantObjectAccountingState::Active,
+            130,
+        );
+        let refreshed = backend
+            .list_tenant_eviction_candidates(&scope, 16)
+            .expect("candidate listing after refresh should succeed");
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|object| (
+                    object.key.0.as_str(),
+                    object.updated_at_ms,
+                    object.committed_length
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tenant-evict::gamma", 90, 5),
+                ("tenant-evict::alpha", 100, 10),
+                ("tenant-evict::beta", 130, 25),
+            ]
+        );
+
+        seed(
+            &backend,
+            "resv-gamma-delete",
+            "tenant-evict::gamma",
+            Some(1),
+            -5,
+            -1,
+            None,
+            TenantObjectAccountingState::Deleted,
+            140,
+        );
+        let after_delete = backend
+            .list_tenant_eviction_candidates(&scope, 16)
+            .expect("candidate listing after delete should succeed");
+        assert_eq!(
+            after_delete
+                .iter()
+                .map(|object| object.key.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tenant-evict::alpha", "tenant-evict::beta"]
+        );
     }
 
     #[test]
