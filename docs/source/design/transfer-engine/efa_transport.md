@@ -224,23 +224,6 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 ### Benchmark Results
 
-#### p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
-
-Tested on two p6-b200.48xlarge instances in the same AWS placement group.
-
-**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
-
-| Configuration | Write | Read |
-|---------------|-------|------|
-| block=1MB, threads=32, batch=64, buf=2GB/GPU | 285-296 GB/s | 312 GB/s |
-| **block=1MB, threads=16, batch=128, buf=2GB/GPU** | **302 GB/s** | **313 GB/s** |
-
-**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
-
-| Configuration | Write | Read |
-|---------------|-------|------|
-| block=1MB, threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
-
 #### p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
 
 Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
@@ -289,6 +272,23 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 | NUMA-split (block=1MB, 2 instances, 8 NICs each, threads=16, buf=2GB) | **192 GB/s** | **182 GB/s** |
 
 > CPU-to-CPU throughput is bottlenecked by DRAM bandwidth (~155 GB/s per NUMA node, measured with STREAM Copy).
+
+#### p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
+
+Tested on two p6-b200.48xlarge instances in the same AWS placement group.
+
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| block=1MB, threads=32, batch=64, buf=2GB/GPU | 285-296 GB/s | 312 GB/s |
+| **block=1MB, threads=16, batch=128, buf=2GB/GPU** | **302 GB/s** | **313 GB/s** |
+
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| block=1MB, threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
 
 #### Cross-Transport Comparison
 
