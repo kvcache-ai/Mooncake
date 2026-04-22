@@ -5,8 +5,8 @@ use std::sync::{
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, Result, ReuseIdentity,
-    RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
+    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, Result,
+    ReuseIdentity, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
     SegmentLifecycleState, SegmentName, SegmentReservation, StoreError, TenantObjectAccounting,
     TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
     TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
@@ -115,9 +115,7 @@ impl MetadataBackend for CountingMetadataBackend {
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
-        self.counts
-            .publish_segment
-            .fetch_add(1, Ordering::Relaxed);
+        self.counts.publish_segment.fetch_add(1, Ordering::Relaxed);
         self.inner.publish_segment(segment)
     }
 
@@ -151,9 +149,7 @@ impl MetadataBackend for CountingMetadataBackend {
         segment: &SegmentName,
         length_bytes: u64,
     ) -> Result<SegmentReservation> {
-        self.counts
-            .reserve_segment
-            .fetch_add(1, Ordering::Relaxed);
+        self.counts.reserve_segment.fetch_add(1, Ordering::Relaxed);
         self.inner.reserve_segment(owner, segment, length_bytes)
     }
 
@@ -164,17 +160,13 @@ impl MetadataBackend for CountingMetadataBackend {
         offset_bytes: u64,
         length_bytes: u64,
     ) -> Result<()> {
-        self.counts
-            .release_segment
-            .fetch_add(1, Ordering::Relaxed);
+        self.counts.release_segment.fetch_add(1, Ordering::Relaxed);
         self.inner
             .release_segment(owner, segment, offset_bytes, length_bytes)
     }
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
-        self.counts
-            .get_object_route
-            .fetch_add(1, Ordering::Relaxed);
+        self.counts.get_object_route.fetch_add(1, Ordering::Relaxed);
         self.inner.get_object_route(key)
     }
 
@@ -211,9 +203,7 @@ impl MetadataBackend for CountingMetadataBackend {
     }
 
     fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
-        self.counts
-            .get_route_policy
-            .fetch_add(1, Ordering::Relaxed);
+        self.counts.get_route_policy.fetch_add(1, Ordering::Relaxed);
         self.inner.get_route_policy(domain)
     }
 
@@ -229,9 +219,7 @@ impl MetadataBackend for CountingMetadataBackend {
     }
 
     fn put_route_policy(&self, domain: &RoutePolicyDomain, policy: &RoutePolicy) -> Result<()> {
-        self.counts
-            .put_route_policy
-            .fetch_add(1, Ordering::Relaxed);
+        self.counts.put_route_policy.fetch_add(1, Ordering::Relaxed);
         self.inner.put_route_policy(domain, policy)
     }
 
