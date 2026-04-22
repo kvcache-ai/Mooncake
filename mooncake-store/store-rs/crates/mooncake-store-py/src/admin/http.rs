@@ -1505,6 +1505,89 @@ mod tests {
     }
 
     #[test]
+    fn admin_http_server_rejects_legacy_mode_field_in_route_migration_submit_body() {
+        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let copy_body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "copy",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b"],
+            "task_executor": "executor-a"
+        })
+        .to_string();
+        let copy_submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations/copy HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                copy_body.len(),
+                copy_body
+            ),
+        );
+        assert!(copy_submit.contains("HTTP/1.1 400 Bad Request"));
+        assert!(copy_submit.contains("unknown field `mode`"));
+
+        let move_body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "move",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b"],
+            "task_executor": "executor-a"
+        })
+        .to_string();
+        let move_submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations/move HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                move_body.len(),
+                move_body
+            ),
+        );
+        assert!(move_submit.contains("HTTP/1.1 400 Bad Request"));
+        assert!(move_submit.contains("unknown field `mode`"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_rejects_unknown_route_migration_submit_fields() {
+        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b"],
+            "task_executor": "executor-a",
+            "unexpected": "surprise"
+        })
+        .to_string();
+        let submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations/move HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(submit.contains("HTTP/1.1 400 Bad Request"));
+        assert!(submit.contains("unknown field `unexpected`"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
     fn admin_http_server_rejects_legacy_unified_route_migration_submit_endpoint() {
         let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
         let mut server =
