@@ -43,6 +43,18 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
+#if defined(__has_feature)
+#define MC_HAS_FEATURE(x) __has_feature(x)
+#else
+#define MC_HAS_FEATURE(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || MC_HAS_FEATURE(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#define MC_LSAN_IGNORE_OBJECT(p) __lsan_ignore_object(p)
+#else
+#define MC_LSAN_IGNORE_OBJECT(p) ((void)(p))
+#endif
+
 using namespace mooncake;
 
 namespace {
@@ -77,8 +89,10 @@ TEST(EndpointStoreIntegration, MonitorWorkerTickDrainsWaitingList) {
            "or similar. Set MC_TEST_DEVICE_NAME to override.";
 
     // RdmaTransport's destructor dereferences metadata_ which is null until
-    // init(); leak the engine to avoid touching that path.
+    // init(); leak the engine to avoid touching that path. Marked ignored so
+    // LSAN under ASAN builds doesn't flag this intentional leak.
     auto *transport = new RdmaTransport();
+    MC_LSAN_IGNORE_OBJECT(transport);
     auto context = std::make_shared<RdmaContext>(*transport, device);
     auto &config = globalConfig();
     int rc = context->construct(config.num_cq_per_ctx,

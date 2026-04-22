@@ -26,6 +26,18 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
+#if defined(__has_feature)
+#define MC_HAS_FEATURE(x) __has_feature(x)
+#else
+#define MC_HAS_FEATURE(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || MC_HAS_FEATURE(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#define MC_LSAN_IGNORE_OBJECT(p) __lsan_ignore_object(p)
+#else
+#define MC_LSAN_IGNORE_OBJECT(p) ((void)(p))
+#endif
+
 using namespace mooncake;
 
 namespace {
@@ -56,6 +68,11 @@ class EndpointStoreTest : public ::testing::Test {
 
     void SetUp() override {
         transport_ = new RdmaTransport();
+        // Intentional leak: ~RdmaTransport dereferences metadata_, which is
+        // null until install(). Marking it ignored keeps LSAN under ASAN
+        // builds from flagging this one allocation while still catching
+        // real leaks elsewhere.
+        MC_LSAN_IGNORE_OBJECT(transport_);
         ctx_ = std::make_unique<RdmaContext>(*transport_, "unused");
     }
 };
