@@ -241,7 +241,9 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mc-local-hot-cache-e2e.XXXXXX")
 REDIS_DIR="${TMP_DIR}/redis"
 REDIS_LOG="${REDIS_DIR}/redis.log"
 DAEMON_LOG="${TMP_DIR}/dummy-daemon.log"
+RUN_ID="$(date +%s%N)"
 KEYSPACE="mc/store-rs/e2e/local-hot-cache/$(now_ms)"
+DUMMY_DAEMON_STABLE_ID="hot-cache-dummy-daemon-${RUN_ID}"
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
 export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_REDIS_URL="${REDIS_URL}"
 export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_KEYSPACE="${KEYSPACE}"
@@ -382,7 +384,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
       --scratch-bytes "${SCRATCH_BYTES}" \
       --protocol tcp \
       --transport-backend classic-te \
-      --stable-id "hot-cache-dummy-daemon" \
+      --stable-id "${DUMMY_DAEMON_STABLE_ID}" \
       --keyspace "${KEYSPACE}/dummy" \
       --label pool=hot-cache \
       --label storage=true \
@@ -392,8 +394,8 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
       --drain-on-exit \
       >"${DAEMON_LOG}" 2>&1 &
   DAEMON_PID=$!
-  wait_for_pattern_count "${KEYSPACE}/dummy/clients/hot-cache-dummy-daemon:*" 1 15
-  wait_for_pattern_count "${KEYSPACE}/dummy/segments/hot-cache-dummy-daemon:*" 1 15
+  wait_for_pattern_count "${KEYSPACE}/dummy/clients/${DUMMY_DAEMON_STABLE_ID}:*" 1 15
+  wait_for_pattern_count "${KEYSPACE}/dummy/segments/${DUMMY_DAEMON_STABLE_ID}:*" 1 15
 
   "${PYTHON_BIN}" - <<'PY'
 import os
