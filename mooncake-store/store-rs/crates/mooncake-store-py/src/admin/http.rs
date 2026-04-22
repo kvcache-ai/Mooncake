@@ -1501,4 +1501,42 @@ mod tests {
 
         server.shutdown().expect("server shutdown");
     }
+
+    #[test]
+    fn admin_http_server_rejects_unknown_route_migration_task_id() {
+        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "GET /v1/route-migrations/missing-task HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 404 Not Found"));
+        assert!(response.contains("missing-task"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_rejects_non_get_route_migration_detail_requests() {
+        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations/route-migration-1 HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.contains("HTTP/1.1 405 Method Not Allowed"));
+        assert!(response.contains("method not allowed"));
+
+        server.shutdown().expect("server shutdown");
+    }
 }

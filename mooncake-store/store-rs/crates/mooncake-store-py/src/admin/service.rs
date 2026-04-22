@@ -3602,6 +3602,62 @@ mod tests {
     }
 
     #[test]
+    fn admin_service_route_migration_rejects_missing_required_fields() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("authority-a", 1))
+            .expect("authority lease should store");
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        let service = test_migration_service_with_rpc(
+            backend,
+            Arc::new(FakeMigrationRpc::default()),
+            MigrationQueueConfig::default(),
+        );
+
+        let mut missing_authority = sample_move_request();
+        missing_authority.authority.clear();
+        assert!(service
+            .submit_route_migration_task(missing_authority)
+            .expect_err("missing authority should fail")
+            .to_string()
+            .contains("authority"));
+
+        let mut missing_tenant = sample_move_request();
+        missing_tenant.tenant.clear();
+        assert!(service
+            .submit_route_migration_task(missing_tenant)
+            .expect_err("missing tenant should fail")
+            .to_string()
+            .contains("tenant"));
+
+        let mut missing_key = sample_move_request();
+        missing_key.key.clear();
+        assert!(service
+            .submit_route_migration_task(missing_key)
+            .expect_err("missing key should fail")
+            .to_string()
+            .contains("key"));
+
+        let mut missing_source = sample_move_request();
+        missing_source.source_segment.clear();
+        assert!(service
+            .submit_route_migration_task(missing_source)
+            .expect_err("missing source_segment should fail")
+            .to_string()
+            .contains("source_segment"));
+
+        let mut missing_executor = sample_move_request();
+        missing_executor.task_executor.clear();
+        assert!(service
+            .submit_route_migration_task(missing_executor)
+            .expect_err("missing task_executor should fail")
+            .to_string()
+            .contains("task_executor"));
+    }
+
+    #[test]
     fn admin_service_route_migration_accepts_copy_with_multiple_targets() {
         let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
         backend
