@@ -400,6 +400,18 @@ SegmentSyncCallback P2PClientService::BuildSegmentSyncCallback() {
                           << segment.id << ", name=" << segment.name;
                 return {};
             }
+            // TODO: There is a race window between the IsDegraded() check above
+            // and the MountSegment() call below. During this window, the system
+            // could transition to degraded mode (e.g., due to master connection
+            // loss), causing the MountSegment RPC to fail. This would result in
+            // segment initialization failure even though the segment could be
+            // registered later during heartbeat recovery.
+            //
+            // Future improvement: Remove BuildSegmentSyncCallback function to
+            // decouple storage layer initialization from master interaction.
+            // The P2PClientService will manage this logic instead, and can
+            // directly convert ha_status to degraded upon RPC failure during
+            // initialization.
             LOG(INFO) << "Mounting segment with Master: id=" << segment.id
                       << ", name=" << segment.name << ", size=" << segment.size;
             auto result = master_client_.MountSegment(segment);
