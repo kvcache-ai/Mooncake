@@ -677,13 +677,15 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        default_segment_alignment_bytes, ObjectKey, RouteVersion, SegmentAnnouncement,
-        SegmentLifecycleState, SegmentName,
+        default_segment_alignment_bytes, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
+        RoutePolicy, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
+        SegmentName, TenantObjectAccountingState, TenantPolicyScope, TenantPolicySpec,
+        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantRoutePolicy,
     };
     use crate::NamespaceScope;
     use crate::{
         scoped_logical_object_id, scoped_object_key, ClientEndpointSet, ClientEpoch, ClientLease,
-        ClientLifecycleState, ClientRuntimeId, CompatibilityDescriptor,
+        ClientLifecycleState, ClientRuntimeId, CompatibilityDescriptor, RouteControlMode,
     };
 
     #[test]
@@ -765,5 +767,267 @@ mod tests {
         );
         assert_eq!(decoded.state, ClientLifecycleState::Active);
         assert_eq!(decoded.expires_at_ms, 42);
+    }
+
+    // --- Adversarial: TenantPolicyScope validation matrix ---------------
+
+    #[test]
+    fn tenant_policy_scope_accepts_valid_combinations() {
+        TenantPolicyScope::new("t", None::<String>, None::<String>)
+            .validate()
+            .expect("root scope");
+        TenantPolicyScope::new("t", Some("d"), None::<String>)
+            .validate()
+            .expect("tenant + domain");
+        TenantPolicyScope::new("t", Some("d"), Some("s"))
+            .validate()
+            .expect("tenant + domain + set");
+    }
+
+    #[test]
+    fn tenant_policy_scope_rejects_empty_tenant() {
+        assert!(TenantPolicyScope::new("", None::<String>, None::<String>)
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn tenant_policy_scope_rejects_object_set_without_domain() {
+        assert!(TenantPolicyScope::new("t", None::<String>, Some("s"))
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn tenant_policy_scope_specificity_increases_with_depth() {
+        assert_eq!(
+            TenantPolicyScope::new("t", None::<String>, None::<String>).specificity(),
+            1
+        );
+        assert_eq!(
+            TenantPolicyScope::new("t", Some("d"), None::<String>).specificity(),
+            2
+        );
+        assert_eq!(
+            TenantPolicyScope::new("t", Some("d"), Some("s")).specificity(),
+            3
+        );
+    }
+
+    #[test]
+    fn tenant_policy_scope_matches_namespace_with_partial_scope() {
+        let ns = crate::NamespaceScope::new("t", "d", "s");
+        assert!(TenantPolicyScope::new("t", None::<String>, None::<String>).matches_namespace(&ns));
+        assert!(TenantPolicyScope::new("t", Some("d"), None::<String>).matches_namespace(&ns));
+        assert!(!TenantPolicyScope::new("t", Some("other"), None::<String>).matches_namespace(&ns));
+        assert!(TenantPolicyScope::new("t", Some("d"), Some("s")).matches_namespace(&ns));
+        assert!(!TenantPolicyScope::new("t", Some("d"), Some("other")).matches_namespace(&ns));
+    }
+
+    #[test]
+    fn tenant_policy_scope_ancestors_produces_three_levels() {
+        let ns = crate::NamespaceScope::new("t", "d", "s");
+        let ancestors = TenantPolicyScope::ancestors(&ns);
+        assert_eq!(ancestors.len(), 3);
+        assert!(ancestors[0].domain.is_none());
+        assert!(ancestors[1].domain.is_some());
+        assert!(ancestors[1].object_set.is_none());
+        assert!(ancestors[2].object_set.is_some());
+    }
+
+    // --- Adversarial: TenantQuotaFinalizeRequest state-length matrix ----
+
+    #[test]
+    fn tenant_quota_finalize_request_validates_state_length_combinations() {
+        TenantQuotaFinalizeRequest {
+            reservation_id: "r".to_string(),
+            expected_object_version: None,
+            committed_length: Some(100),
+            route_version: None,
+            state: TenantObjectAccountingState::Active,
+            updated_at_ms: 0,
+            updated_by: "w".to_string(),
+        }
+        .validate()
+        .expect("active with length");
+
+        assert!(matches!(
+            TenantQuotaFinalizeRequest {
+                reservation_id: "r".to_string(),
+                expected_object_version: None,
+                committed_length: None,
+                route_version: None,
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 0,
+                updated_by: "w".to_string(),
+            }
+            .validate()
+            .unwrap_err(),
+            crate::StoreError::InvalidState(_)
+        ));
+
+        TenantQuotaFinalizeRequest {
+            reservation_id: "r".to_string(),
+            expected_object_version: None,
+            committed_length: None,
+            route_version: None,
+            state: TenantObjectAccountingState::Deleted,
+            updated_at_ms: 0,
+            updated_by: "w".to_string(),
+        }
+        .validate()
+        .expect("deleted without length");
+
+        assert!(matches!(
+            TenantQuotaFinalizeRequest {
+                reservation_id: "r".to_string(),
+                expected_object_version: None,
+                committed_length: Some(100),
+                route_version: None,
+                state: TenantObjectAccountingState::Deleted,
+                updated_at_ms: 0,
+                updated_by: "w".to_string(),
+            }
+            .validate()
+            .unwrap_err(),
+            crate::StoreError::InvalidState(_)
+        ));
+    }
+
+    #[test]
+    fn tenant_quota_finalize_request_rejects_empty_reservation_id() {
+        let err = TenantQuotaFinalizeRequest {
+            reservation_id: String::new(),
+            expected_object_version: None,
+            committed_length: Some(1),
+            route_version: None,
+            state: TenantObjectAccountingState::Active,
+            updated_at_ms: 0,
+            updated_by: "w".to_string(),
+        }
+        .validate()
+        .unwrap_err();
+        assert!(matches!(err, crate::StoreError::InvalidState(_)));
+    }
+
+    // --- Adversarial: policy-spec merge semantics -----------------------
+
+    #[test]
+    fn tenant_policy_spec_merge_overlay_wins_per_field() {
+        let base = TenantPolicySpec {
+            quota: Some(TenantQuotaPolicy {
+                max_bytes: Some(100),
+                max_objects: Some(10),
+            }),
+            routing: Some(TenantRoutePolicy {
+                route_topk: Some(3),
+                route_control: None,
+            }),
+            ..Default::default()
+        };
+        let overlay = TenantPolicySpec {
+            quota: Some(TenantQuotaPolicy {
+                max_bytes: Some(200),
+                max_objects: None,
+            }),
+            routing: Some(TenantRoutePolicy {
+                route_topk: None,
+                route_control: Some(RouteControlMode::MetadataOnly),
+            }),
+            ..Default::default()
+        };
+        let merged = base.merged_with(&overlay);
+        let q = merged.quota.as_ref().unwrap();
+        assert_eq!(q.max_bytes, Some(200));
+        assert_eq!(q.max_objects, Some(10));
+        let r = merged.routing.as_ref().unwrap();
+        assert_eq!(r.route_topk, Some(3));
+        assert_eq!(r.route_control, Some(RouteControlMode::MetadataOnly));
+    }
+
+    #[test]
+    fn tenant_policy_spec_merge_empty_overlay_preserves_base() {
+        let base = TenantPolicySpec {
+            quota: Some(TenantQuotaPolicy {
+                max_bytes: Some(100),
+                max_objects: Some(10),
+            }),
+            ..Default::default()
+        };
+        let merged = base.merged_with(&TenantPolicySpec::default());
+        assert_eq!(merged.quota.as_ref().unwrap().max_bytes, Some(100));
+    }
+
+    // --- Adversarial: RoutePolicy semantic equality ---------------------
+
+    #[test]
+    fn route_policy_semantic_match_ignores_creator_metadata() {
+        let a = RoutePolicy {
+            route_topk: 3,
+            route_control: RouteControlMode::MetadataOnly,
+            created_by: ClientRuntimeId::new("a", ClientEpoch(1)),
+            created_at_ms: 100,
+        };
+        let b = RoutePolicy {
+            route_topk: 3,
+            route_control: RouteControlMode::MetadataOnly,
+            created_by: ClientRuntimeId::new("b", ClientEpoch(2)),
+            created_at_ms: 200,
+        };
+        assert!(a.semantically_matches(&b));
+        let c = RoutePolicy {
+            route_topk: 5,
+            ..a.clone()
+        };
+        assert!(!a.semantically_matches(&c));
+    }
+
+    // --- Adversarial: ObjectRoute serde with / without optional fields ---
+
+    #[test]
+    fn object_route_serde_round_trip_with_all_optional_fields_populated() {
+        let route = ObjectRoute {
+            key: ObjectKey::new("tenant::key"),
+            namespace: Some(crate::NamespaceScope::new("t", "d", "s")),
+            logical_key: Some("key".to_string()),
+            canonical_key: Some("t/d/s/key".to_string()),
+            sharing_scope: Some("shared".to_string()),
+            qos_tier: Some("premium".to_string()),
+            version: RouteVersion(42),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("node", ClientEpoch(1)),
+                segment_name: SegmentName::new("seg"),
+                offset: 0,
+                segment_offset: 0,
+                length: 1024,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+        };
+        let encoded = serde_json::to_string(&route).unwrap();
+        let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, route);
+    }
+
+    #[test]
+    fn object_route_serde_round_trip_without_optional_fields() {
+        let route = ObjectRoute {
+            key: ObjectKey::new("tenant::bare"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::<ReplicaRoute>::new(),
+        };
+        let encoded = serde_json::to_string(&route).unwrap();
+        let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, route);
     }
 }

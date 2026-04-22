@@ -175,4 +175,91 @@ mod tests {
         assert_eq!(reuse.sharing_scope, "domain-a");
         assert_eq!(reuse.canonical_key, "tenant-b/default/default/key-b");
     }
+
+    // --- Adversarial: boundary inputs on codec routines -------------------
+
+    #[test]
+    fn parse_legacy_scoped_key_with_multiple_double_colons_splits_on_first() {
+        let id = parse_legacy_scoped_key(&ObjectKey::new("tenant::key::extra"))
+            .expect("multiple :: should parse using first occurrence");
+        assert_eq!(id.scope.tenant, "tenant");
+        assert_eq!(id.logical_key, "key::extra");
+    }
+
+    #[test]
+    fn parse_legacy_scoped_key_with_unicode_components() {
+        let id = parse_legacy_scoped_key(&ObjectKey::new("租户::模型权重"))
+            .expect("unicode key should parse");
+        assert_eq!(id.scope.tenant, "租户");
+        assert_eq!(id.logical_key, "模型权重");
+    }
+
+    #[test]
+    fn parse_legacy_scoped_key_with_10k_char_logical_key() {
+        let long = "a".repeat(10_000);
+        let id = parse_legacy_scoped_key(&ObjectKey::new(format!("tenant::{long}")))
+            .expect("long key should parse");
+        assert_eq!(id.logical_key.len(), 10_000);
+    }
+
+    #[test]
+    fn route_logical_object_id_prefers_namespace_over_legacy_key() {
+        let route = ObjectRoute {
+            key: ObjectKey::new("legacy-tenant::legacy-key"),
+            namespace: Some(crate::NamespaceScope::new(
+                "explicit-tenant",
+                "explicit-domain",
+                "explicit-set",
+            )),
+            logical_key: Some("explicit-key".to_string()),
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::<ReplicaRoute>::new(),
+        };
+        let id = route_logical_object_id(&route).expect("namespace path must win");
+        assert_eq!(id.scope.tenant, "explicit-tenant");
+        assert_eq!(id.logical_key, "explicit-key");
+    }
+
+    #[test]
+    fn route_reuse_identity_defaults_sharing_scope_when_absent() {
+        let route = ObjectRoute {
+            key: ObjectKey::new("tenant-x::key-x"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::<ReplicaRoute>::new(),
+        };
+        let reuse = route_reuse_identity(&route).expect("fallback build");
+        assert_eq!(reuse.sharing_scope, "default");
+    }
+
+    #[test]
+    fn apply_route_identity_overwrites_all_metadata_fields() {
+        let mut route = ObjectRoute {
+            key: ObjectKey::new("old::key"),
+            namespace: Some(crate::NamespaceScope::new("old", "old", "old")),
+            logical_key: Some("old".to_string()),
+            canonical_key: Some("old/old/old/old".to_string()),
+            sharing_scope: Some("old".to_string()),
+            qos_tier: Some("old".to_string()),
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::<ReplicaRoute>::new(),
+        };
+        apply_route_identity(&mut route, &scoped_logical_object_id("new-t", "new-k"));
+        assert_eq!(route.key.0, "new-t::new-k");
+        assert_eq!(route.namespace.as_ref().unwrap().tenant, "new-t");
+        assert_eq!(route.logical_key.as_ref().unwrap(), "new-k");
+    }
 }
