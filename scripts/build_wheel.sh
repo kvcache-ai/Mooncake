@@ -170,11 +170,8 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
-if command -v python${PYTHON_VERSION} &>/dev/null; then
+if command -v pip &>/dev/null; then
     python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
-elif command -v pip &>/dev/null; then
-    pip install --upgrade pip
-    pip install build setuptools wheel auditwheel
 elif command -v uv &>/dev/null; then
     uv pip install --upgrade pip
     uv pip install build setuptools wheel auditwheel
