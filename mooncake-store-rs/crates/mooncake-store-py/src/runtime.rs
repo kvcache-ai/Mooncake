@@ -147,7 +147,7 @@ mod tests {
     use mooncake_store_client::{
         GetRequest, MooncakeCompatibilityFacade, ObjectRef, PutRequest, RouteControlMode,
     };
-    use mooncake_store_core::{ClientLifecycleState, HandoffKind, StoreError};
+    use mooncake_store_core::{ClientEpoch, ClientLifecycleState, HandoffKind, StoreError};
 
     use super::{default_segment_name, now_ms, CompatRuntimeArgs};
     use crate::config::CompatSetupArgs;
