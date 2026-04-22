@@ -31,6 +31,7 @@ import os
 import sys
 import time
 import unittest
+from dataclasses import dataclass
 
 import torch
 import numpy as np
@@ -121,6 +122,24 @@ def make_tensor_parallelism(axes):
     parallelism = mooncake_store.TensorParallelism()
     parallelism.axes = axes
     return parallelism
+
+
+def make_read_target(mode, parallelism=None):
+    target = mooncake_store.ReadTarget()
+    target.mode = mode
+    target.parallelism = parallelism
+    return target
+
+
+@dataclass
+class WriterPartition:
+    rank: int
+    size: int
+    split_dim: int
+
+
+def make_writer_partition(rank, size, split_dim):
+    return WriterPartition(rank=rank, size=size, split_dim=split_dim)
 
 
 class UpsertTestBase(unittest.TestCase):
@@ -515,12 +534,51 @@ class TestUnifiedParallelismUpsert(UpsertTestBase):
             0,
         )
 
-        target = mooncake_store.ReadTarget()
-        target.mode = "shard"
-        target.parallelism = parallelism
+        target = make_read_target("shard", parallelism)
         got = self.store.get_tensor_with_parallelism(key, target)
         self.assertIsNotNone(got)
         self.assertTrue(torch.equal(got, updated.chunk(3, 1)[0]))
+
+    def test_batch_upsert_tensor_with_parallelism_multi_axis(self):
+        require_unified_parallelism_api(self)
+        keys = ["unified_multi_axis_batch_upsert_0", "unified_multi_axis_batch_upsert_1"]
+        originals = [
+            torch.arange(24, dtype=torch.float32).view(4, 6).contiguous(),
+            torch.arange(48, 72, dtype=torch.float32).view(4, 6).contiguous(),
+        ]
+        updates = [(tensor + 100).contiguous() for tensor in originals]
+
+        parallelisms = []
+        dp_tp = make_tensor_parallelism([
+            make_parallel_axis("dp", rank=1, size=2),
+            make_parallel_axis("tp", rank=2, size=3, split_dim=1),
+        ])
+        pp_tp = make_tensor_parallelism([
+            make_parallel_axis("pp", rank=0, size=2),
+            make_parallel_axis("tp", rank=1, size=2, split_dim=0),
+        ])
+        pp_tp.axes[0].stage_id = 3
+        parallelisms.extend([dp_tp, pp_tp])
+
+        self.assertEqual(
+            list(self.store.batch_put_tensor_with_parallelism(keys, originals, parallelisms)),
+            [0, 0],
+        )
+        self.assertEqual(
+            list(self.store.batch_upsert_tensor_with_parallelism(keys, updates, parallelisms)),
+            [0, 0],
+        )
+
+        targets = []
+        for parallelism in parallelisms:
+            target = mooncake_store.ReadTarget()
+            target.mode = "shard"
+            target.parallelism = parallelism
+            targets.append(target)
+        results = self.store.batch_get_tensor_with_parallelism(keys, targets)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(torch.equal(results[0], updates[0].chunk(3, 1)[2]))
+        self.assertTrue(torch.equal(results[1], updates[1].chunk(2, 0)[1]))
 
     def test_upsert_tensor_with_parallelism_from_multi_axis(self):
         require_unified_parallelism_api(self)
@@ -555,6 +613,80 @@ class TestUnifiedParallelismUpsert(UpsertTestBase):
             result = self.store.get_tensor_with_parallelism(key, target)
             self.assertIsNotNone(result)
             self.assertTrue(torch.equal(result, updated.chunk(3, 1)[1]))
+        finally:
+            self.store.unregister_buffer(ptr)
+
+    def test_upsert_tensor_with_writer_partition(self):
+        require_unified_parallelism_api(self)
+        key = "writer_partition_upsert"
+        original = torch.arange(24, dtype=torch.float32).view(4, 6).contiguous()
+        updated = (original + 33).contiguous()
+
+        for rank in range(3):
+            self.assertEqual(
+                self.store.put_tensor_with_parallelism(
+                    key,
+                    original,
+                    writer_partition=make_writer_partition(rank, 3, 1),
+                ),
+                0,
+            )
+        for rank in range(3):
+            self.assertEqual(
+                self.store.upsert_tensor_with_parallelism(
+                    key,
+                    updated,
+                    writer_partition=make_writer_partition(rank, 3, 1),
+                ),
+                0,
+            )
+
+        target = make_read_target("full")
+        got = self.store.get_tensor_with_parallelism(key, target)
+        self.assertIsNotNone(got)
+        self.assertTrue(torch.equal(got, updated))
+
+    def test_upsert_tensor_with_writer_partition_from(self):
+        require_unified_parallelism_api(self)
+        key = "writer_partition_upsert_from"
+        seed_key = "writer_partition_upsert_from_seed"
+        tensor = torch.arange(48, dtype=torch.float32).view(6, 8).contiguous()
+
+        self.assertEqual(self.store.put_tensor(seed_key, tensor), 0)
+        for rank in range(4):
+            self.assertEqual(
+                self.store.put_tensor_with_parallelism(
+                    key,
+                    tensor,
+                    writer_partition=make_writer_partition(rank, 4, 0),
+                ),
+                0,
+            )
+        buffer_size = serialized_tensor_size(tensor)
+        buf = ctypes.create_string_buffer(buffer_size)
+        ptr = ctypes.addressof(buf)
+        self.assertEqual(self.store.register_buffer(ptr, buffer_size), 0)
+        try:
+            got = self.store.get_tensor_into(seed_key, ptr, buffer_size)
+            self.assertIsNotNone(got)
+
+            for rank in range(4):
+                self.assertEqual(
+                    self.store.upsert_tensor_with_parallelism_from(
+                        key,
+                        ptr,
+                        buffer_size,
+                        writer_partition=make_writer_partition(rank, 4, 0),
+                    ),
+                    0,
+                )
+
+            target = mooncake_store.ReadTarget()
+            target.mode = "full"
+            target.parallelism = None
+            result = self.store.get_tensor_with_parallelism(key, target)
+            self.assertIsNotNone(result)
+            self.assertTrue(torch.equal(result, tensor))
         finally:
             self.store.unregister_buffer(ptr)
 
