@@ -100,6 +100,7 @@ fn handle_admin_http_connection(mut stream: TcpStream, service: &AdminService) {
     let response = match read_http_request(&mut stream) {
         Ok(request) => route_request(service, request),
         Err(HttpRequestReadError::ContentTooLarge) => {
+            drain_remaining_input(&mut stream);
             http_error_response("413 Payload Too Large", "request content is too large")
         }
         Err(HttpRequestReadError::Io) => return,
@@ -532,7 +533,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpRequestR
             }
         }
         if request.len() >= MAX_HTTP_BODY_BYTES {
-            break;
+            while stream.read(&mut buffer)? > 0 {}
+            return Err(HttpRequestReadError::ContentTooLarge);
         }
     }
 
@@ -547,6 +549,15 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpRequestR
     let body_end = usize::min(request.len(), body_start.saturating_add(content_length));
     let body = request[body_start..body_end].to_vec();
     Ok(HttpRequest { method, path, body })
+}
+
+fn drain_remaining_input(stream: &mut TcpStream) {
+    let mut buffer = [0_u8; 1024];
+    while let Ok(read) = stream.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+    }
 }
 
 fn parse_content_length(headers: &[u8]) -> usize {
