@@ -394,8 +394,8 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
       --drain-on-exit \
       >"${DAEMON_LOG}" 2>&1 &
   DAEMON_PID=$!
-  wait_for_pattern_count "${KEYSPACE}/dummy/clients/${DUMMY_DAEMON_STABLE_ID}:*" 1 15
-  wait_for_pattern_count "${KEYSPACE}/dummy/segments/${DUMMY_DAEMON_STABLE_ID}:*" 1 15
+  wait_for_pattern_count "{${KEYSPACE}}/dummy/clients/${DUMMY_DAEMON_STABLE_ID}:*" 1 15
+  wait_for_pattern_count "{${KEYSPACE}}/dummy/segments/${DUMMY_DAEMON_STABLE_ID}:*" 1 15
 
   "${PYTHON_BIN}" - <<'PY'
 import os

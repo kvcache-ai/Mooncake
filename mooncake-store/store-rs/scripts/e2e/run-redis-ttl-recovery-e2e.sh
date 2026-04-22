@@ -212,7 +212,7 @@ wait_for_pattern_count() {
 
 wait_for_route_policy() {
   local deadline=$((SECONDS + 20))
-  local key="${KEYSPACE}/system/route-policy/default"
+  local key="{${KEYSPACE}}/system/route-policy/default"
   while (( SECONDS < deadline )); do
     if [[ "$(redis-cli -u "${REDIS_URL}" EXISTS "${key}" | tr -d '[:space:]')" == "1" ]]; then
       return 0
@@ -224,10 +224,10 @@ wait_for_route_policy() {
 }
 
 wait_for_storage_metadata() {
-  wait_for_pattern_count "${KEYSPACE}/clients/${STORAGE_A_STABLE}:*" 1 25
-  wait_for_pattern_count "${KEYSPACE}/clients/${STORAGE_B_STABLE}:*" 1 25
-  wait_for_pattern_count "${KEYSPACE}/segments/${STORAGE_A_STABLE}:*" 1 25
-  wait_for_pattern_count "${KEYSPACE}/segments/${STORAGE_B_STABLE}:*" 1 25
+  wait_for_pattern_count "{${KEYSPACE}}/clients/${STORAGE_A_STABLE}:*" 1 25
+  wait_for_pattern_count "{${KEYSPACE}}/clients/${STORAGE_B_STABLE}:*" 1 25
+  wait_for_pattern_count "{${KEYSPACE}}/segments/${STORAGE_A_STABLE}:*" 1 25
+  wait_for_pattern_count "{${KEYSPACE}}/segments/${STORAGE_B_STABLE}:*" 1 25
   wait_for_route_policy
 }
 

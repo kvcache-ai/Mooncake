@@ -94,7 +94,7 @@ assert store.get("py-key") == b"hello-python"
 assert store_peer.get("py-key") == b"hello-python"
 route = store.query_route("py-key")
 assert route is not None and route["key"] == "default::py-key"
-route_key = f"{keyspace}/objects/default::py-key"
+route_key = f"{{{keyspace}}}/objects/default::py-key"
 route_exists = subprocess.check_output(
     ["redis-cli", "-u", redis_url, "EXISTS", route_key],
     text=True,
