@@ -126,7 +126,7 @@ class HARecoveryManagerTest : public ::testing::Test {
     UUID client_id_{};
     Segment segment_;
     std::unique_ptr<P2PMasterClient> master_client_;
-    ViewVersionId view_version_ = 0;
+    std::atomic<ViewVersionId> view_version_{0};
     std::optional<DataManager> data_manager_;
     std::unique_ptr<AsyncMetadataNotifier> notifier_;
 };
@@ -141,6 +141,7 @@ std::string HARecoveryManagerTest::master_addr_;
 
 TEST_F(HARecoveryManagerTest, BasicStateMachineSmoke) {
     auto mgr = CreateManager();
+    mgr->SetReadyForRecovery();
 
     // Initial state
     EXPECT_EQ(mgr->GetState(), HAClientState::FULL);
@@ -206,6 +207,7 @@ TEST_F(HARecoveryManagerTest, NotifierRestartedOnReachableFromDegraded) {
                                                 /*queue_capacity=*/4000);
     notifier_->Start();
     auto mgr = CreateManager();
+    mgr->SetReadyForRecovery();
 
     // Go to DEGRADED
     mgr->HandleEvent(HAEvent::MASTER_UNREACHABLE);
@@ -222,6 +224,7 @@ TEST_F(HARecoveryManagerTest, NotifierRestartedOnReachableFromDegraded) {
 
 TEST_F(HARecoveryManagerTest, ConcurrentEvents) {
     auto mgr = CreateManagerWithNotifier();
+    mgr->SetReadyForRecovery();
     std::atomic<bool> stop{false};
 
     // Thread A: rapid UNREACHABLE events

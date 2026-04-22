@@ -40,7 +40,8 @@ class HARecoveryManager {
     HARecoveryManager(const UUID& client_id, P2PMasterClient& master_client,
                       std::optional<DataManager>& data_manager,
                       std::unique_ptr<AsyncMetadataNotifier>& notifier,
-                      ViewVersionId& view_version);
+                      std::atomic<ViewVersionId>& view_version,
+                      HAClientState initial_state = HAClientState::FULL);
     ~HARecoveryManager();
 
     HARecoveryManager(const HARecoveryManager&) = delete;
@@ -55,6 +56,15 @@ class HARecoveryManager {
 
     HAClientState GetState() const {
         return state_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * @brief Mark that P2PClientService::Init has completed. Called at the end
+     * of Init(). Recovery thread will wait for this before accessing
+     * data_manager_.
+     */
+    void SetReadyForRecovery() {
+        ready_for_recovery_.store(true, std::memory_order_release);
     }
 
     void HandleEvent(HAEvent event);
@@ -79,13 +89,22 @@ class HARecoveryManager {
                           size_t size, bool is_hot,
                           const AbortToken& need_abort);
 
+    /**
+     * @brief Wait for P2PClientService::Init to complete.
+     *        Checks ready_for_recovery_ and data_manager_ availability.
+     * @return true if ready, false if aborted or data_manager not initialized.
+     */
+    bool WaitForReady(const AbortToken& need_abort);
+
     const UUID& client_id_;
     P2PMasterClient& master_client_;
     std::optional<DataManager>& data_manager_;
     std::unique_ptr<AsyncMetadataNotifier>& notifier_;
-    ViewVersionId& view_version_;
+    std::atomic<ViewVersionId>& view_version_;
 
-    std::atomic<HAClientState> state_{HAClientState::FULL};
+    std::atomic<HAClientState> state_;
+    std::atomic<bool> ready_for_recovery_{
+        false};         // Set true when P2PClientService::Init completes
     std::mutex mutex_;  // protects transitions + recovery thread lifecycle
     std::thread recovery_thread_;
     AbortToken need_abort_;  // signals recovery thread to exit

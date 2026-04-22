@@ -11,12 +11,16 @@ HARecoveryManager::HARecoveryManager(
     const UUID& client_id, P2PMasterClient& master_client,
     std::optional<DataManager>& data_manager,
     std::unique_ptr<AsyncMetadataNotifier>& notifier,
-    ViewVersionId& view_version)
+    std::atomic<ViewVersionId>& view_version, HAClientState initial_state)
     : client_id_(client_id),
       master_client_(master_client),
       data_manager_(data_manager),
       notifier_(notifier),
-      view_version_(view_version) {}
+      view_version_(view_version),
+      state_(initial_state) {
+    LOG(INFO) << "HA recovery manager initialized with state: "
+              << initial_state;
+}
 
 HARecoveryManager::~HARecoveryManager() { Stop(); }
 
@@ -50,7 +54,8 @@ void HARecoveryManager::TransitionState(HAClientState to,
                                         const std::string& reason) {
     auto from = state_.load(std::memory_order_relaxed);
     LOG(WARNING) << "HA state: " << from << " -> " << to
-                 << ", reason=" << reason << ", view_version=" << view_version_;
+                 << ", reason=" << reason
+                 << ", view_version=" << view_version_.load();
     state_.store(to, std::memory_order_release);
 }
 
@@ -109,11 +114,35 @@ void HARecoveryManager::StartRecoveryThread() {
         std::thread([this, need_abort]() { RecoveryPipelineMain(need_abort); });
 }
 
+bool HARecoveryManager::WaitForReady(const AbortToken& need_abort) {
+    // Wait for P2PClientService::Init to complete (InitStorage initializes
+    // data_manager_, and Init calls SetReadyForRecovery() at the end).
+    // This avoids data race on data_manager_ which is an std::optional.
+    while (!ready_for_recovery_.load(std::memory_order_acquire) &&
+           !need_abort->load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (need_abort->load(std::memory_order_acquire)) {
+        LOG(INFO) << "Recovery pipeline aborted during wait for ready signal";
+        return false;
+    }
+
+    // After ready_for_recovery_ is set, data_manager_ should be initialized.
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "DataManager not initialized, cannot run recovery";
+        TransitionState(HAClientState::DEGRADED,
+                        "data_manager not initialized");
+        return false;
+    }
+
+    LOG(INFO) << "Recovery pipeline proceeding, service ready";
+    return true;
+}
+
 void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
     LOG(INFO) << "Recovery pipeline started";
 
-    if (!data_manager_.has_value()) {
-        LOG(ERROR) << "DataManager not initialized, cannot run recovery";
+    if (!WaitForReady(need_abort)) {
         return;
     }
 

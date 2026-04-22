@@ -148,24 +148,28 @@ void ClientService::StartHeartbeat(const std::string& master_server_entry) {
     std::string current_master_address;
 
     if (is_ha_mode) {
-        // For HA mode, resolve the actual address from etcd
+        // For HA mode, try to resolve the actual address from etcd.
+        // If etcd is unavailable, start heartbeat thread anyway - it will
+        // retry and recover when etcd/master becomes available.
         ViewVersionId master_version = 0;
         auto err = master_view_helper_.GetMasterView(current_master_address,
                                                      master_version);
         if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to get master address for heartbeat";
-            return;
+            LOG(WARNING) << "Failed to get master address from etcd, "
+                         << "starting heartbeat thread in degraded mode "
+                         << "(will retry): " << err;
+            // Don't return - Let heartbeat thread handle reconnection
         }
     } else {
         current_master_address = master_server_entry;
     }
 
     heartbeat_running_ = true;
-    heartbeat_thread_ =
-        std::thread([this, is_ha_mode, current_master_address]() mutable {
-            this->HeartbeatThreadMain(is_ha_mode,
-                                      std::move(current_master_address));
-        });
+    heartbeat_thread_ = std::thread([this, is_ha_mode, current_master_address,
+                                     master_server_entry]() mutable {
+        this->HeartbeatThreadMain(is_ha_mode, std::move(current_master_address),
+                                  master_server_entry);
+    });
 }
 
 ErrorCode ClientService::ConnectToMaster(
@@ -454,8 +458,9 @@ tl::expected<void, ErrorCode> ClientService::unregisterLocalMemory(
     return {};
 }
 
-void ClientService::HeartbeatThreadMain(bool is_ha_mode,
-                                        std::string current_master_address) {
+void ClientService::HeartbeatThreadMain(
+    bool is_ha_mode, std::string current_master_address,
+    const std::string& master_server_entry) {
     // How many failed heartbeats before getting latest master view from etcd
     const int max_heartbeat_fail_count = 10;
     // How long to wait for next heartbeat after success
@@ -541,12 +546,12 @@ bool ClientService::HandleHeartbeatResponse(
     const std::string& current_master_address,
     const std::function<void()>& register_client,
     std::future<void>& register_client_future) {
-    if (response.view_version != view_version_) {
+    if (response.view_version != view_version_.load()) {
         LOG(WARNING) << "Master view_version changed"
                      << ", client status in master: " << (int)response.status
                      << ", master address: " << current_master_address
                      << ", Master version: " << response.view_version
-                     << ", Client version: " << view_version_;
+                     << ", Client version: " << view_version_.load();
     }
     for (auto& task_result : response.task_results) {
         HandleHeartbeatTaskResult(task_result);
