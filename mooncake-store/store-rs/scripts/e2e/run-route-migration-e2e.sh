@@ -580,6 +580,11 @@ if submitter == "cli":
     listed = parse_cli_fields(listed_output)
     assert int(listed["count"]) >= 1
 else:
+    submit_path = (
+        "/v1/route-migrations/copy"
+        if submit_mode == "copy"
+        else "/v1/route-migrations/move"
+    )
     submit_body = {
         "authority": source_stable_id,
         "tenant": tenant,
@@ -589,7 +594,7 @@ else:
         "target_segments": target_segments,
         "task_executor": source_stable_id,
     }
-    submit_response = request_json("POST", "/v1/route-migrations", submit_body)
+    submit_response = request_json("POST", submit_path, submit_body)
     task_id = submit_response["task_id"]
 
     listed = request_json("GET", "/v1/route-migrations")

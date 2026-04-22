@@ -603,14 +603,21 @@ fn submit_route_migration(
     args: &Args,
     request: RouteMigrationTaskSubmitRequest,
 ) -> Result<(), Box<dyn Error>> {
-    let response: RouteMigrationTaskStatusResponse =
-        admin_http_post_json(args, "/v1/route-migrations", &request)?;
+    let path = route_migration_submit_path(request.mode);
+    let response: RouteMigrationTaskStatusResponse = admin_http_post_json(args, path, &request)?;
     println!("route migration task submitted:");
     println!("  admin_url: {}", admin_base_url(args)?);
     println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
     println!("  keyspace: {}", current_keyspace(args).prefix());
     print_route_migration_task(&response, 2);
     Ok(())
+}
+
+fn route_migration_submit_path(mode: RouteMigrationMode) -> &'static str {
+    match mode {
+        RouteMigrationMode::Copy => "/v1/route-migrations/copy",
+        RouteMigrationMode::Move => "/v1/route-migrations/move",
+    }
 }
 
 fn admin_base_url(args: &Args) -> Result<Url, Box<dyn Error>> {
@@ -1529,7 +1536,7 @@ mod tests {
 
         let task = admin_http_post_json::<_, RouteMigrationTaskStatusResponse>(
             &args,
-            "/v1/route-migrations",
+            "/v1/route-migrations/copy",
             &RouteMigrationTaskSubmitRequest {
                 authority: "authority-a".to_string(),
                 tenant: "tenant-a".to_string(),
@@ -1546,9 +1553,76 @@ mod tests {
         .expect("http submit should succeed");
         assert_eq!(task.task_id, "task-1");
         let request = requests.recv().expect("request should capture");
-        assert!(request.starts_with("POST /v1/route-migrations HTTP/1.1\r\n"));
+        assert!(request.starts_with("POST /v1/route-migrations/copy HTTP/1.1\r\n"));
         assert!(request.contains("\"task_executor\":\"executor-a\""));
         handle.join().expect("server thread should join");
+    }
+
+    #[test]
+    fn route_migration_http_client_submits_move_task_to_admin_server() {
+        let response = serde_json::to_string(&RouteMigrationTaskStatusResponse {
+            task_id: "task-move-1".to_string(),
+            namespace: "mooncake/routes".to_string(),
+            authority: "authority-a".to_string(),
+            tenant: "tenant-a".to_string(),
+            domain: None,
+            object_set: None,
+            key: "object-a".to_string(),
+            mode: RouteMigrationMode::Move,
+            source_segment: "segment-a".to_string(),
+            target_segments: vec!["segment-b".to_string()],
+            task_executor: "executor-a".to_string(),
+            state: RouteMigrationTaskState::Pending,
+            attempts: 0,
+            max_retries: 5,
+            execution_id: None,
+            next_retry_at_ms: None,
+            last_error: String::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        })
+        .expect("response json should serialize");
+        let (admin_url, requests, handle) = serve_single_response(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        ));
+        let args = sample_cli_args_with_admin_url(&admin_url);
+
+        let task = admin_http_post_json::<_, RouteMigrationTaskStatusResponse>(
+            &args,
+            route_migration_submit_path(RouteMigrationMode::Move),
+            &RouteMigrationTaskSubmitRequest {
+                authority: "authority-a".to_string(),
+                tenant: "tenant-a".to_string(),
+                domain: None,
+                object_set: None,
+                key: "object-a".to_string(),
+                mode: RouteMigrationMode::Move,
+                source_segment: "segment-a".to_string(),
+                target_segments: vec!["segment-b".to_string()],
+                task_executor: "executor-a".to_string(),
+                max_retries: Some(5),
+            },
+        )
+        .expect("http submit should succeed");
+        assert_eq!(task.task_id, "task-move-1");
+        let request = requests.recv().expect("request should capture");
+        assert!(request.starts_with("POST /v1/route-migrations/move HTTP/1.1\r\n"));
+        assert!(request.contains("\"mode\":\"move\""));
+        handle.join().expect("server thread should join");
+    }
+
+    #[test]
+    fn route_migration_submit_path_matches_mode() {
+        assert_eq!(
+            route_migration_submit_path(RouteMigrationMode::Copy),
+            "/v1/route-migrations/copy"
+        );
+        assert_eq!(
+            route_migration_submit_path(RouteMigrationMode::Move),
+            "/v1/route-migrations/move"
+        );
     }
 
     #[test]

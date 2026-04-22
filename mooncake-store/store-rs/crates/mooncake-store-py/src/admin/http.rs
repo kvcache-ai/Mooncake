@@ -8,7 +8,7 @@ use mooncake_store_core::StoreError;
 use serde::Serialize;
 
 use super::models::{
-    ErrorResponse, PutTenantPolicyRequest, RouteMigrationTaskSubmitRequest,
+    ErrorResponse, PutTenantPolicyRequest, RouteMigrationMode, RouteMigrationTaskSubmitRequest,
     TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
 };
 use super::service::AdminService;
@@ -156,23 +156,46 @@ fn route_request(service: &AdminService, request: HttpRequest) -> String {
         ("GET", "/v1/route-migrations") => {
             http_json_response("200 OK", &service.list_route_migration_tasks())
         }
-        ("POST", "/v1/route-migrations") => {
-            let payload =
-                match serde_json::from_slice::<RouteMigrationTaskSubmitRequest>(&request.body) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return http_error_response(
-                            "400 Bad Request",
-                            &format!("invalid JSON body: {error}"),
-                        )
-                    }
-                };
-            match service.submit_route_migration_task(payload) {
-                Ok(response) => http_json_response("200 OK", &response),
-                Err(error) => http_store_error(error),
-            }
+        ("POST", "/v1/route-migrations/copy") => {
+            submit_route_migration_request(service, &request.body, RouteMigrationMode::Copy)
+        }
+        ("POST", "/v1/route-migrations/move") => {
+            submit_route_migration_request(service, &request.body, RouteMigrationMode::Move)
         }
         _ => route_scoped_request(service, request, path_only.as_str()),
+    }
+}
+
+fn submit_route_migration_request(
+    service: &AdminService,
+    body: &[u8],
+    expected_mode: RouteMigrationMode,
+) -> String {
+    let payload = match serde_json::from_slice::<RouteMigrationTaskSubmitRequest>(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return http_error_response("400 Bad Request", &format!("invalid JSON body: {error}"))
+        }
+    };
+    if payload.mode != expected_mode {
+        let actual = match payload.mode {
+            RouteMigrationMode::Copy => "copy",
+            RouteMigrationMode::Move => "move",
+        };
+        let expected = match expected_mode {
+            RouteMigrationMode::Copy => "copy",
+            RouteMigrationMode::Move => "move",
+        };
+        return http_error_response(
+            "400 Bad Request",
+            &format!(
+                "route migration mode mismatch: endpoint expects {expected} but request body declared {actual}"
+            ),
+        );
+    }
+    match service.submit_route_migration_task(payload) {
+        Ok(response) => http_json_response("200 OK", &response),
+        Err(error) => http_store_error(error),
     }
 }
 
@@ -1352,7 +1375,7 @@ mod tests {
         let submit = http_request(
             &address,
             &format!(
-                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "POST /v1/route-migrations/move HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             ),
@@ -1404,7 +1427,7 @@ mod tests {
         let submit = http_request(
             &address,
             &format!(
-                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "POST /v1/route-migrations/move HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             ),
@@ -1439,7 +1462,7 @@ mod tests {
         let submit = http_request(
             &address,
             &format!(
-                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "POST /v1/route-migrations/move HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             ),
@@ -1470,7 +1493,7 @@ mod tests {
         let copy_submit = http_request(
             &address,
             &format!(
-                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "POST /v1/route-migrations/copy HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 copy_body.len(),
                 copy_body
             ),
@@ -1491,13 +1514,74 @@ mod tests {
         let move_submit = http_request(
             &address,
             &format!(
-                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "POST /v1/route-migrations/move HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 move_body.len(),
                 move_body
             ),
         );
         assert!(move_submit.contains("HTTP/1.1 400 Bad Request"));
         assert!(move_submit.contains("exactly one target_segment"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_rejects_legacy_unified_route_migration_submit_endpoint() {
+        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "move",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b"],
+            "task_executor": "executor-a"
+        })
+        .to_string();
+        let submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(submit.contains("HTTP/1.1 404 Not Found"));
+
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_rejects_route_migration_mode_path_mismatches() {
+        let service = test_migration_service(Arc::new(FakeMigrationRpc::default()));
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let body = serde_json::json!({
+            "authority": "authority-a",
+            "tenant": "tenant-a",
+            "key": "object-a",
+            "mode": "move",
+            "source_segment": "segment-a",
+            "target_segments": ["segment-b"],
+            "task_executor": "executor-a"
+        })
+        .to_string();
+        let submit = http_request(
+            &address,
+            &format!(
+                "POST /v1/route-migrations/copy HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(submit.contains("HTTP/1.1 400 Bad Request"));
+        assert!(submit.contains("mode mismatch"));
 
         server.shutdown().expect("server shutdown");
     }
