@@ -656,21 +656,36 @@ std::optional<ResolvedParallelismWriteRequest> resolve_parallelism_write_request
     };
 }
 
-std::optional<py::list> validate_batch_parallelism_list(
-    const py::object &parallelisms, size_t expected_size,
-    const std::string &error_context) {
-    if (!py::isinstance<py::list>(parallelisms)) {
-        LOG(ERROR) << error_context << ": parallelisms must be a list or None";
+std::optional<py::list> validate_batch_request_list(
+    const py::object &request_list_obj, size_t expected_size,
+    const std::string &error_context, const char *request_name) {
+    if (!py::isinstance<py::list>(request_list_obj)) {
+        LOG(ERROR) << error_context << ": " << request_name
+                   << " must be a list or None";
         return std::nullopt;
     }
 
-    py::list parallelism_list = py::cast<py::list>(parallelisms);
-    if (parallelism_list.size() != expected_size) {
-        LOG(ERROR) << error_context
-                   << ": keys and parallelisms must have the same length";
+    py::list request_list = py::cast<py::list>(request_list_obj);
+    if (request_list.size() != expected_size) {
+        LOG(ERROR) << error_context << ": keys and " << request_name
+                   << " must have the same length";
         return std::nullopt;
     }
-    return parallelism_list;
+    return request_list;
+}
+
+std::optional<py::list> validate_batch_parallelism_list(
+    const py::object &parallelisms, size_t expected_size,
+    const std::string &error_context) {
+    return validate_batch_request_list(parallelisms, expected_size,
+                                       error_context, "parallelisms");
+}
+
+std::optional<py::list> validate_batch_writer_partition_list(
+    const py::object &writer_partitions, size_t expected_size,
+    const std::string &error_context) {
+    return validate_batch_request_list(writer_partitions, expected_size,
+                                       error_context, "writer_partitions");
 }
 
 bool axis_specs_equal(const ParallelAxisSpec &lhs, const ParallelAxisSpec &rhs) {
@@ -1157,14 +1172,16 @@ std::optional<TensorParallelismSpec> parallelism_from_metadata(
 
 bool parallelism_matches_metadata(const TensorParallelismSpec &parallelism,
                                   const TensorMetadata &metadata) {
+    auto requested_parallelism = canonicalize_parallelism_spec(parallelism);
     auto stored_parallelism = parallelism_from_metadata(metadata);
-    if (!stored_parallelism.has_value() ||
-        stored_parallelism->axes.size() != parallelism.axes.size()) {
+    if (!requested_parallelism.has_value() || !stored_parallelism.has_value() ||
+        stored_parallelism->axes.size() != requested_parallelism->axes.size()) {
         return false;
     }
 
-    for (size_t i = 0; i < parallelism.axes.size(); ++i) {
-        if (!axis_specs_equal(parallelism.axes[i], stored_parallelism->axes[i])) {
+    for (size_t i = 0; i < requested_parallelism->axes.size(); ++i) {
+        if (!axis_specs_equal(requested_parallelism->axes[i],
+                              stored_parallelism->axes[i])) {
             return false;
         }
     }
@@ -2951,6 +2968,56 @@ class MooncakeStorePyWrapper {
         return true;
     }
 
+    template <typename DirectWriteFn, typename ParallelismWriteFn,
+              typename WriterPartitionWriteFn>
+    std::vector<int> execute_batch_parallelism_write_requests(
+        const std::vector<std::string> &keys, size_t value_count,
+        const py::object &parallelisms, const py::object &writer_partitions,
+        const char *error_context, DirectWriteFn &&direct_write,
+        ParallelismWriteFn &&parallelism_write,
+        WriterPartitionWriteFn &&writer_partition_write) {
+        if (!parallelisms.is_none() && !writer_partitions.is_none()) {
+            LOG(ERROR) << error_context
+                       << ": writer_partitions cannot be combined with parallelisms";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (value_count != keys.size()) {
+            LOG(ERROR) << error_context << ": values and keys must have the same length";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (parallelisms.is_none() && writer_partitions.is_none()) {
+            return direct_write();
+        }
+
+        std::vector<int> results(keys.size(),
+                                 to_py_ret(ErrorCode::INVALID_PARAMS));
+        if (!parallelisms.is_none()) {
+            auto parallelism_list = validate_batch_parallelism_list(
+                parallelisms, keys.size(), error_context);
+            if (!parallelism_list.has_value()) {
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            for (size_t i = 0; i < keys.size(); ++i) {
+                results[i] = parallelism_write(i, (*parallelism_list)[i]);
+            }
+            return results;
+        }
+
+        auto writer_partition_list = validate_batch_writer_partition_list(
+        writer_partitions, keys.size(), error_context);
+        if (!writer_partition_list.has_value()) {
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = writer_partition_write(i, (*writer_partition_list)[i]);
+        }
+        return results;
+    }
+
     template <typename DirectWriteFn, typename WriterShardWriteFn,
               typename LegacyTpWriteFn, typename TpParallelWriteFn,
               typename GenericShardWriteFn>
@@ -3599,38 +3666,32 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const py::object &parallelisms = py::none(),
-        const ReplicateConfig &config = ReplicateConfig{}) {
-        if (parallelisms.is_none()) {
-            if (!is_client_initialized() || use_dummy_client_) {
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            int validate_result = validate_replicate_config(config);
-            if (validate_result) {
-                return std::vector<int>(keys.size(), validate_result);
-            }
-            return batch_put_tensor_impl(keys, tensors_list, config);
-        }
-        if (tensors_list.size() != keys.size()) {
-            LOG(ERROR) << "keys and tensors_list must have the same length";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        auto parallelism_list = validate_batch_parallelism_list(
-            parallelisms, keys.size(), "batch_put_tensor_with_parallelism");
-        if (!parallelism_list.has_value()) {
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        std::vector<int> results(keys.size(),
-                                 to_py_ret(ErrorCode::INVALID_PARAMS));
-        for (size_t i = 0; i < keys.size(); ++i) {
-            results[i] = put_tensor_with_parallelism(
-                keys[i], tensors_list[i], (*parallelism_list)[i], config);
-        }
-        return results;
+        const ReplicateConfig &config = ReplicateConfig{},
+        const py::object &writer_partitions = py::none()) {
+        return execute_batch_parallelism_write_requests(
+            keys, tensors_list.size(), parallelisms, writer_partitions,
+            "batch_put_tensor_with_parallelism",
+            [this, &keys, &tensors_list, &config]() {
+                if (!is_client_initialized() || use_dummy_client_) {
+                    return std::vector<int>(keys.size(),
+                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                int validate_result = validate_replicate_config(config);
+                if (validate_result) {
+                    return std::vector<int>(keys.size(), validate_result);
+                }
+                return batch_put_tensor_impl(keys, tensors_list, config);
+            },
+            [this, &keys, &tensors_list, &config](size_t i, const py::handle &parallelism) {
+                return put_tensor_with_parallelism(keys[i], tensors_list[i],
+                                                   py::reinterpret_borrow<py::object>(parallelism),
+                                                   config);
+            },
+            [this, &keys, &tensors_list, &config](size_t i, const py::handle &writer_partition) {
+                return put_tensor_with_parallelism(keys[i], tensors_list[i], py::none(),
+                                                   config,
+                                                   py::reinterpret_borrow<py::object>(writer_partition));
+            });
     }
 
     bool is_valid_tensor_object_buffer(uintptr_t buffer_ptr, size_t size,
@@ -3899,62 +3960,57 @@ class MooncakeStorePyWrapper {
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes,
         const py::object &parallelisms = py::none(),
-        const ReplicateConfig &config = ReplicateConfig{}) {
-        if (parallelisms.is_none()) {
-            if (!is_default_replicate_config(config)) {
-                if (!is_client_initialized() || use_dummy_client_) {
-                    return std::vector<int>(
-                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
-                }
-                int validate_result = validate_replicate_config(config);
-                if (validate_result) {
-                    return std::vector<int>(keys.size(), validate_result);
-                }
-                if (keys.size() != buffer_ptrs.size() ||
-                    keys.size() != sizes.size()) {
-                    LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes "
-                                  "must have the same length";
-                    return std::vector<int>(
-                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
-                }
-                for (size_t i = 0; i < sizes.size(); ++i) {
-                    if (!is_valid_tensor_object_buffer(
-                            buffer_ptrs[i], sizes[i],
-                            "tensor object buffer at index " +
-                                std::to_string(i))) {
+        const ReplicateConfig &config = ReplicateConfig{},
+        const py::object &writer_partitions = py::none()) {
+        return execute_batch_parallelism_write_requests(
+            keys, buffer_ptrs.size(), parallelisms, writer_partitions,
+            "batch_put_tensor_with_parallelism_from",
+            [this, &keys, &buffer_ptrs, &sizes, &config]() {
+                if (!is_default_replicate_config(config)) {
+                    if (!is_client_initialized() || use_dummy_client_) {
                         return std::vector<int>(
                             keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                     }
+                    int validate_result = validate_replicate_config(config);
+                    if (validate_result) {
+                        return std::vector<int>(keys.size(), validate_result);
+                    }
+                    if (keys.size() != buffer_ptrs.size() ||
+                        keys.size() != sizes.size()) {
+                        LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes "
+                                      "must have the same length";
+                        return std::vector<int>(
+                            keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                    }
+                    for (size_t i = 0; i < sizes.size(); ++i) {
+                        if (!is_valid_tensor_object_buffer(
+                                buffer_ptrs[i], sizes[i],
+                                "tensor object buffer at index " +
+                                    std::to_string(i))) {
+                            return std::vector<int>(
+                                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                        }
+                    }
+                    std::vector<void *> buffers;
+                    buffers.reserve(buffer_ptrs.size());
+                    for (uintptr_t ptr : buffer_ptrs) {
+                        buffers.push_back(reinterpret_cast<void *>(ptr));
+                    }
+                    py::gil_scoped_release release_gil;
+                    return store_->batch_put_from(keys, buffers, sizes, config);
                 }
-                std::vector<void *> buffers;
-                buffers.reserve(buffer_ptrs.size());
-                for (uintptr_t ptr : buffer_ptrs) {
-                    buffers.push_back(reinterpret_cast<void *>(ptr));
-                }
-                py::gil_scoped_release release_gil;
-                return store_->batch_put_from(keys, buffers, sizes, config);
-            }
-            return batch_put_tensor_from(keys, buffer_ptrs, sizes);
-        }
-        if (buffer_ptrs.size() != keys.size() || sizes.size() != keys.size()) {
-            LOG(ERROR) << "keys, buffer_ptrs, and sizes must have the same length";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        auto parallelism_list = validate_batch_parallelism_list(
-            parallelisms, keys.size(),
-            "batch_put_tensor_with_parallelism_from");
-        if (!parallelism_list.has_value()) {
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        std::vector<int> results(keys.size(),
-                                 to_py_ret(ErrorCode::INVALID_PARAMS));
-        for (size_t i = 0; i < keys.size(); ++i) {
-            results[i] = put_tensor_with_parallelism_from(
-                keys[i], buffer_ptrs[i], sizes[i], (*parallelism_list)[i], config);
-        }
-        return results;
+                return batch_put_tensor_from(keys, buffer_ptrs, sizes);
+            },
+            [this, &keys, &buffer_ptrs, &sizes, &config](size_t i, const py::handle &parallelism) {
+                return put_tensor_with_parallelism_from(
+                    keys[i], buffer_ptrs[i], sizes[i],
+                    py::reinterpret_borrow<py::object>(parallelism), config);
+            },
+            [this, &keys, &buffer_ptrs, &sizes, &config](size_t i, const py::handle &writer_partition) {
+                return put_tensor_with_parallelism_from(
+                    keys[i], buffer_ptrs[i], sizes[i], py::none(), config,
+                    py::reinterpret_borrow<py::object>(writer_partition));
+            });
     }
 
     // --- Upsert tensor methods ---
@@ -4380,72 +4436,67 @@ class MooncakeStorePyWrapper {
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes,
         const py::object &parallelisms = py::none(),
-        const ReplicateConfig &config = ReplicateConfig{}) {
-        if (parallelisms.is_none()) {
-            if (!is_default_replicate_config(config)) {
-                if (!is_client_initialized()) {
-                    LOG(ERROR) << "Client is not initialized";
-                    return std::vector<int>(
-                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
-                }
-                if (use_dummy_client_) {
-                    LOG(ERROR) << "batch_upsert_tensor_with_parallelism_from "
-                                  "is not supported for dummy client";
-                    return std::vector<int>(
-                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
-                }
-                int validate_result = validate_replicate_config(config);
-                if (validate_result) {
-                    return std::vector<int>(keys.size(), validate_result);
-                }
-                if (keys.empty()) {
-                    return std::vector<int>();
-                }
-                if (keys.size() != buffer_ptrs.size() ||
-                    keys.size() != sizes.size()) {
-                    LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes "
-                                  "must have the same length";
-                    return std::vector<int>(
-                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
-                }
-                for (size_t i = 0; i < sizes.size(); ++i) {
-                    if (!is_valid_tensor_object_buffer(
-                            buffer_ptrs[i], sizes[i],
-                            "tensor object buffer at index " +
-                                std::to_string(i))) {
+        const ReplicateConfig &config = ReplicateConfig{},
+        const py::object &writer_partitions = py::none()) {
+        return execute_batch_parallelism_write_requests(
+            keys, buffer_ptrs.size(), parallelisms, writer_partitions,
+            "batch_upsert_tensor_with_parallelism_from",
+            [this, &keys, &buffer_ptrs, &sizes, &config]() {
+                if (!is_default_replicate_config(config)) {
+                    if (!is_client_initialized()) {
+                        LOG(ERROR) << "Client is not initialized";
                         return std::vector<int>(
                             keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                     }
+                    if (use_dummy_client_) {
+                        LOG(ERROR) << "batch_upsert_tensor_with_parallelism_from "
+                                      "is not supported for dummy client";
+                        return std::vector<int>(
+                            keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                    }
+                    int validate_result = validate_replicate_config(config);
+                    if (validate_result) {
+                        return std::vector<int>(keys.size(), validate_result);
+                    }
+                    if (keys.empty()) {
+                        return std::vector<int>();
+                    }
+                    if (keys.size() != buffer_ptrs.size() ||
+                        keys.size() != sizes.size()) {
+                        LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes "
+                                      "must have the same length";
+                        return std::vector<int>(
+                            keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                    }
+                    for (size_t i = 0; i < sizes.size(); ++i) {
+                        if (!is_valid_tensor_object_buffer(
+                                buffer_ptrs[i], sizes[i],
+                                "tensor object buffer at index " +
+                                    std::to_string(i))) {
+                            return std::vector<int>(
+                                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                        }
+                    }
+                    std::vector<void *> buffers;
+                    buffers.reserve(buffer_ptrs.size());
+                    for (uintptr_t ptr : buffer_ptrs) {
+                        buffers.push_back(reinterpret_cast<void *>(ptr));
+                    }
+                    py::gil_scoped_release release_gil;
+                    return store_->batch_upsert_from(keys, buffers, sizes, config);
                 }
-                std::vector<void *> buffers;
-                buffers.reserve(buffer_ptrs.size());
-                for (uintptr_t ptr : buffer_ptrs) {
-                    buffers.push_back(reinterpret_cast<void *>(ptr));
-                }
-                py::gil_scoped_release release_gil;
-                return store_->batch_upsert_from(keys, buffers, sizes, config);
-            }
-            return batch_upsert_tensor_from(keys, buffer_ptrs, sizes);
-        }
-        if (buffer_ptrs.size() != keys.size() || sizes.size() != keys.size()) {
-            LOG(ERROR) << "keys, buffer_ptrs, and sizes must have the same length";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        auto parallelism_list = validate_batch_parallelism_list(
-            parallelisms, keys.size(),
-            "batch_upsert_tensor_with_parallelism_from");
-        if (!parallelism_list.has_value()) {
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        std::vector<int> results(keys.size(),
-                                 to_py_ret(ErrorCode::INVALID_PARAMS));
-        for (size_t i = 0; i < keys.size(); ++i) {
-            results[i] = upsert_tensor_with_parallelism_from(
-                keys[i], buffer_ptrs[i], sizes[i], (*parallelism_list)[i], config);
-        }
-        return results;
+                return batch_upsert_tensor_from(keys, buffer_ptrs, sizes);
+            },
+            [this, &keys, &buffer_ptrs, &sizes, &config](size_t i, const py::handle &parallelism) {
+                return upsert_tensor_with_parallelism_from(
+                    keys[i], buffer_ptrs[i], sizes[i],
+                    py::reinterpret_borrow<py::object>(parallelism), config);
+            },
+            [this, &keys, &buffer_ptrs, &sizes, &config](size_t i, const py::handle &writer_partition) {
+                return upsert_tensor_with_parallelism_from(
+                    keys[i], buffer_ptrs[i], sizes[i], py::none(), config,
+                    py::reinterpret_borrow<py::object>(writer_partition));
+            });
     }
 
     std::vector<int> batch_upsert_tensor_impl(
@@ -4529,38 +4580,32 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const py::object &parallelisms = py::none(),
-        const ReplicateConfig &config = ReplicateConfig{}) {
-        if (parallelisms.is_none()) {
-            if (!is_client_initialized() || use_dummy_client_) {
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            int validate_result = validate_replicate_config(config);
-            if (validate_result) {
-                return std::vector<int>(keys.size(), validate_result);
-            }
-            return batch_upsert_tensor_impl(keys, tensors_list, config);
-        }
-        if (tensors_list.size() != keys.size()) {
-            LOG(ERROR) << "keys and tensors_list must have the same length";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        auto parallelism_list = validate_batch_parallelism_list(
-            parallelisms, keys.size(), "batch_upsert_tensor_with_parallelism");
-        if (!parallelism_list.has_value()) {
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        std::vector<int> results(keys.size(),
-                                 to_py_ret(ErrorCode::INVALID_PARAMS));
-        for (size_t i = 0; i < keys.size(); ++i) {
-            results[i] = upsert_tensor_with_parallelism(
-                keys[i], tensors_list[i], (*parallelism_list)[i], config);
-        }
-        return results;
+        const ReplicateConfig &config = ReplicateConfig{},
+        const py::object &writer_partitions = py::none()) {
+        return execute_batch_parallelism_write_requests(
+            keys, tensors_list.size(), parallelisms, writer_partitions,
+            "batch_upsert_tensor_with_parallelism",
+            [this, &keys, &tensors_list, &config]() {
+                if (!is_client_initialized() || use_dummy_client_) {
+                    return std::vector<int>(keys.size(),
+                                            to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                int validate_result = validate_replicate_config(config);
+                if (validate_result) {
+                    return std::vector<int>(keys.size(), validate_result);
+                }
+                return batch_upsert_tensor_impl(keys, tensors_list, config);
+            },
+            [this, &keys, &tensors_list, &config](size_t i, const py::handle &parallelism) {
+                return upsert_tensor_with_parallelism(keys[i], tensors_list[i],
+                                                      py::reinterpret_borrow<py::object>(parallelism),
+                                                      config);
+            },
+            [this, &keys, &tensors_list, &config](size_t i, const py::handle &writer_partition) {
+                return upsert_tensor_with_parallelism(keys[i], tensors_list[i], py::none(),
+                                                      config,
+                                                      py::reinterpret_borrow<py::object>(writer_partition));
+            });
     }
 
     int upsert_pub_tensor(const std::string &key, pybind11::object tensor,
@@ -5295,8 +5340,9 @@ PYBIND11_MODULE(store, m) {
              py::arg("keys"), py::arg("tensors_list"),
              py::arg("parallelisms") = py::none(),
              py::arg("config") = ReplicateConfig{},
+             py::arg("writer_partitions") = py::none(),
              "Put a batch of PyTorch tensors into the store using "
-             "TensorParallelism requests.")
+             "TensorParallelism requests or writer_partition requests.")
         .def("put_tensor_with_parallelism_from",
              &MooncakeStorePyWrapper::put_tensor_with_parallelism_from,
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
@@ -5310,8 +5356,9 @@ PYBIND11_MODULE(store, m) {
              py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
              py::arg("parallelisms") = py::none(),
              py::arg("config") = ReplicateConfig{},
+             py::arg("writer_partitions") = py::none(),
              "Put a batch of tensors directly from pre-allocated buffers using "
-             "TensorParallelism requests.")
+             "TensorParallelism requests or writer_partition requests.")
         .def("batch_get_tensor", &MooncakeStorePyWrapper::batch_get_tensor,
              py::arg("keys"), "Get a batch of PyTorch tensors from the store")
         .def("batch_put_tensor", &MooncakeStorePyWrapper::batch_put_tensor,
@@ -5462,15 +5509,17 @@ PYBIND11_MODULE(store, m) {
              py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
              py::arg("parallelisms") = py::none(),
              py::arg("config") = ReplicateConfig{},
+             py::arg("writer_partitions") = py::none(),
              "Upsert a batch of tensors directly from pre-allocated buffers "
-             "using TensorParallelism requests.")
+             "using TensorParallelism requests or writer_partition requests.")
         .def("batch_upsert_tensor_with_parallelism",
              &MooncakeStorePyWrapper::batch_upsert_tensor_with_parallelism,
              py::arg("keys"), py::arg("tensors_list"),
              py::arg("parallelisms") = py::none(),
              py::arg("config") = ReplicateConfig{},
+             py::arg("writer_partitions") = py::none(),
              "Upsert a batch of PyTorch tensors into the store using "
-             "TensorParallelism requests.")
+             "TensorParallelism requests or writer_partition requests.")
         .def("batch_upsert_tensor_with_tp",
              &MooncakeStorePyWrapper::batch_upsert_tensor_with_tp,
              py::arg("base_keys"), py::arg("tensors_list"),

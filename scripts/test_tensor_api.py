@@ -830,6 +830,13 @@ class TestMooncakeFunctional(MooncakeTestBase):
             keys, tensors, [parallelism for _ in keys]
         )
         self.assertTrue(all(r == 0 for r in results), f"Batch unified put failed. Results: {results}")
+        invalid_results = self.store.batch_put_tensor_with_parallelism(
+            keys,
+            tensors,
+            [parallelism for _ in keys],
+            writer_partitions=[make_writer_partition(0, 2, split_dim) for _ in keys],
+        )
+        self.assertTrue(all(r != 0 for r in invalid_results), f"expected invalid combined routing request: {invalid_results}")
 
         for rank in range(tp_size):
             wrapper_shards = self.store.batch_get_tensor_with_tp(
@@ -1215,7 +1222,84 @@ class TestMooncakeFunctional(MooncakeTestBase):
         finally:
             self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
 
-    def test_30_batch_unified_parallelism_full_reconstruction(self):
+    def test_30_batch_writer_partition_full_reconstruction(self):
+        require_unified_parallelism_api(self)
+        tensors = [
+            make_deterministic_tensor((8, 10)),
+            make_deterministic_tensor((6, 10, 4)),
+            make_deterministic_tensor((12, 10)),
+        ]
+        keys = [f"func_writer_partition_batch_{i}" for i in range(len(tensors))]
+        writer_partitions = [
+            make_writer_partition(rank=0, size=4, split_dim=1),
+            make_writer_partition(rank=1, size=3, split_dim=0),
+            make_writer_partition(rank=2, size=4, split_dim=1),
+        ]
+
+        for rank in range(4):
+            batch_writer_partitions = [
+                make_writer_partition(rank=min(rank, part.size - 1), size=part.size, split_dim=part.split_dim)
+                for part in writer_partitions
+            ]
+            results = self.store.batch_put_tensor_with_parallelism(
+                keys,
+                tensors,
+                writer_partitions=batch_writer_partitions,
+            )
+            self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
+
+        full_targets = [make_read_target("full") for _ in tensors]
+        full_reads = self.store.batch_get_tensor_with_parallelism(keys, full_targets)
+        self.assertEqual(len(full_reads), len(tensors))
+        for i, tensor in enumerate(tensors):
+            self.assertTrue(torch.equal(full_reads[i], tensor), f"full reconstruction mismatch for tensor {i}")
+
+    def test_31_batch_writer_partition_into_round_trip(self):
+        require_unified_parallelism_api(self)
+        tensors = [
+            make_deterministic_tensor((7, 9)),
+            make_deterministic_tensor((8, 6)),
+        ]
+        keys = [f"func_writer_partition_batch_into_{i}" for i in range(len(tensors))]
+        writer_layouts = [
+            make_writer_partition(rank=0, size=3, split_dim=1),
+            make_writer_partition(rank=0, size=2, split_dim=0),
+        ]
+        for rank in range(3):
+            batch_writer_partitions = [
+                make_writer_partition(rank=min(rank, layout.size - 1), size=layout.size, split_dim=layout.split_dim)
+                for layout in writer_layouts
+            ]
+            results = self.store.batch_put_tensor_with_parallelism(
+                keys,
+                tensors,
+                writer_partitions=batch_writer_partitions,
+            )
+            self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
+
+        buffer_sizes = [max(serialized_tensor_size(tensor) + 4096, 4 * 1024 * 1024) for tensor in tensors]
+        total_buffer_size = sum(buffer_sizes)
+        backing_buffer = (ctypes.c_ubyte * total_buffer_size)()
+        backing_buffer_ptr = ctypes.addressof(backing_buffer)
+        buffer_ptrs = []
+        offset = 0
+        for size in buffer_sizes:
+            buffer_ptrs.append(backing_buffer_ptr + offset)
+            offset += size
+
+        self.assertEqual(self.store.register_buffer(backing_buffer_ptr, total_buffer_size), 0)
+        try:
+            full_reads = self.store.batch_get_tensor_with_parallelism_into(
+                keys, buffer_ptrs, buffer_sizes, [make_read_target("full") for _ in tensors]
+            )
+            self.assertEqual(len(full_reads), len(tensors))
+            for i, tensor in enumerate(tensors):
+                self.assertIsNotNone(full_reads[i], f"batch full into missing for tensor {i}")
+                self.assertTrue(torch.equal(full_reads[i], tensor), f"batch full into mismatch for tensor {i}")
+        finally:
+            self.assertEqual(self.store.unregister_buffer(backing_buffer_ptr), 0)
+
+    def test_32_batch_unified_parallelism_full_reconstruction(self):
         require_unified_parallelism_api(self)
         tp_size = 4
         split_dim = 1

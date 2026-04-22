@@ -568,6 +568,21 @@ class TestUnifiedParallelismUpsert(UpsertTestBase):
             list(self.store.batch_upsert_tensor_with_parallelism(keys, updates, parallelisms)),
             [0, 0],
         )
+        invalid_results = list(
+            self.store.batch_put_tensor_with_parallelism(
+                keys,
+                originals,
+                parallelisms=parallelisms,
+                writer_partitions=[
+                    make_writer_partition(0, 2, 0),
+                    make_writer_partition(1, 2, 0),
+                ],
+            )
+        )
+        self.assertTrue(
+            all(result != 0 for result in invalid_results),
+            f"expected invalid combined routing request: {invalid_results}",
+        )
 
         targets = []
         for parallelism in parallelisms:
@@ -689,6 +704,116 @@ class TestUnifiedParallelismUpsert(UpsertTestBase):
             self.assertTrue(torch.equal(result, tensor))
         finally:
             self.store.unregister_buffer(ptr)
+
+    def test_batch_upsert_tensor_with_writer_partitions(self):
+        require_unified_parallelism_api(self)
+        keys = ["writer_partition_batch_upsert_0", "writer_partition_batch_upsert_1"]
+        originals = [
+            torch.arange(24, dtype=torch.float32).view(4, 6).contiguous(),
+            torch.arange(48, 72, dtype=torch.float32).view(4, 6).contiguous(),
+        ]
+        updates = [(tensor + 100).contiguous() for tensor in originals]
+
+        for rank in range(3):
+            writer_partitions = [
+                make_writer_partition(rank=rank, size=3, split_dim=1),
+                make_writer_partition(rank=rank, size=3, split_dim=1),
+            ]
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_with_parallelism(
+                        keys,
+                        originals,
+                        writer_partitions=writer_partitions,
+                    )
+                ),
+                [0, 0],
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_upsert_tensor_with_parallelism(
+                        keys,
+                        updates,
+                        writer_partitions=writer_partitions,
+                    )
+                ),
+                [0, 0],
+            )
+
+        results = self.store.batch_get_tensor_with_parallelism(
+            keys, [make_read_target("full"), make_read_target("full")]
+        )
+        self.assertEqual(len(results), 2)
+        self.assertTrue(torch.equal(results[0], updates[0]))
+        self.assertTrue(torch.equal(results[1], updates[1]))
+
+    def test_batch_upsert_tensor_with_writer_partitions_from(self):
+        require_unified_parallelism_api(self)
+        keys = ["writer_partition_batch_upsert_from_0", "writer_partition_batch_upsert_from_1"]
+        seed_keys = [f"{key}_seed" for key in keys]
+        tensors = [
+            torch.arange(48, dtype=torch.float32).view(6, 8).contiguous(),
+            torch.arange(96, 144, dtype=torch.float32).view(6, 8).contiguous(),
+        ]
+
+        for seed_key, tensor in zip(seed_keys, tensors):
+            self.assertEqual(self.store.put_tensor(seed_key, tensor), 0)
+
+        for rank in range(4):
+            writer_partitions = [
+                make_writer_partition(rank=rank, size=4, split_dim=0),
+                make_writer_partition(rank=rank, size=4, split_dim=0),
+            ]
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_with_parallelism(
+                        keys,
+                        tensors,
+                        writer_partitions=writer_partitions,
+                    )
+                ),
+                [0, 0],
+            )
+
+        buffer_sizes = [serialized_tensor_size(tensor) for tensor in tensors]
+        backing_buffer = ctypes.create_string_buffer(sum(buffer_sizes))
+        base_ptr = ctypes.addressof(backing_buffer)
+        buffer_ptrs = []
+        offset = 0
+        for size in buffer_sizes:
+            buffer_ptrs.append(base_ptr + offset)
+            offset += size
+        self.assertEqual(self.store.register_buffer(base_ptr, len(backing_buffer)), 0)
+        try:
+            for seed_key, ptr, size in zip(seed_keys, buffer_ptrs, buffer_sizes):
+                got = self.store.get_tensor_into(seed_key, ptr, size)
+                self.assertIsNotNone(got)
+
+            for rank in range(4):
+                writer_partitions = [
+                    make_writer_partition(rank=rank, size=4, split_dim=0),
+                    make_writer_partition(rank=rank, size=4, split_dim=0),
+                ]
+                self.assertEqual(
+                    list(
+                        self.store.batch_upsert_tensor_with_parallelism_from(
+                            keys,
+                            buffer_ptrs,
+                            buffer_sizes,
+                            writer_partitions=writer_partitions,
+                        )
+                    ),
+                    [0, 0],
+                )
+
+            results = self.store.batch_get_tensor_with_parallelism(
+                keys, [make_read_target("full"), make_read_target("full")]
+            )
+            self.assertEqual(len(results), 2)
+            self.assertTrue(torch.equal(results[0], tensors[0]))
+            self.assertTrue(torch.equal(results[1], tensors[1]))
+        finally:
+            self.store.unregister_buffer(base_ptr)
 
 
 class TestUpsertTpTensor(UpsertTestBase):
