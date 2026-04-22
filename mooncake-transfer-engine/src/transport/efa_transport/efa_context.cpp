@@ -586,14 +586,14 @@ int EfaContext::submitPostSend(
     for (auto* slice : slice_list) {
         if (!slice) continue;
 
-        // Fast path: peer info pre-resolved by submitTransferTask's striping
-        // path (dest_rkey and peer_nic_path already set on slice).
+        // Fast path: peer info already filled in by the caller
+        // (dest_rkey and peer_nic_path set on the slice before dispatch).
         if (!slice->peer_nic_path.empty()) {
             slices_by_peer[slice->peer_nic_path].push_back(slice);
             continue;
         }
 
-        // Slow path: resolve peer info per-slice (non-striped transfers).
+        // Slow path: resolve peer info per-slice.
         auto peer_segment_desc =
             engine_.meta()->getSegmentDescByID(slice->target_id);
         if (!peer_segment_desc) {

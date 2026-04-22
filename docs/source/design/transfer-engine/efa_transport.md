@@ -427,32 +427,35 @@ AWS EFA exposes RDMA-like devices through the ibverbs interface, but does not su
 
 ### EFA Transport Architecture
 
+Under the SRD shared-endpoint model every peer is addressed through one `fid_ep` per local NIC — peers are AV-slot entries, not separate endpoints.
+
 ```
-┌─────────────────────────────────────────────────────┐
-│                   EfaTransport                       │
-├─────────────────────────────────────────────────────┤
-│  EfaContext (per device)                            │
-│  ├── fi_info      (fabric info)                     │
-│  ├── fid_fabric   (fabric handle)                   │
-│  ├── fid_domain   (protection domain)               │
-│  ├── fid_av       (address vector for peer lookup)  │
-│  ├── fid_cq       (completion queues)               │
-│  └── fid_mr       (memory regions)                  │
-├─────────────────────────────────────────────────────┤
-│  EfaEndpoint (per connection)                       │
-│  ├── fid_ep       (RDM endpoint)                    │
-│  ├── fi_addr_t    (peer address)                    │
-│  └── local_addr   (local endpoint address)          │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│                   EfaTransport                            │
+├───────────────────────────────────────────────────────────┤
+│  EfaContext (per local NIC)                               │
+│  ├── fid_fabric     (fabric handle)                       │
+│  ├── fid_domain     (protection domain)                   │
+│  ├── fid_av         (address vector — one slot per peer)  │
+│  ├── fid_cq         (completion queues)                   │
+│  ├── fid_mr         (memory regions)                      │
+│  ├── shared_ep_     (the single fid_ep that serves every  │
+│  │                   peer via fi_addr_t lookup in the AV) │
+│  └── peer_map_      (normalized nic_path -> EfaEndPoint)  │
+├───────────────────────────────────────────────────────────┤
+│  EfaEndPoint (per peer)                                   │
+│  └── peer_fi_addr_  (AV slot index for this peer; sends   │
+│                      route through the owning context's    │
+│                      shared_ep_ with this fi_addr_t)      │
+└───────────────────────────────────────────────────────────┘
 ```
 
 ### Thread Safety
 
-The EFA transport requests `FI_THREAD_SAFE` from the libfabric provider and adds per-endpoint spinlocks to serialize `fi_write`/`fi_read` calls. This is necessary because:
+The EFA transport requests `FI_THREAD_SAFE` at the domain level and guards the shared endpoint with a single `post_lock_` spinlock (one per `EfaContext`, i.e. one per local NIC) to serialize `fi_write`/`fi_read` calls. This is necessary because:
 
-- Multiple submission threads may route slices to the same endpoint concurrently
-- libfabric RDM endpoints default to `FI_THREAD_UNSPEC` (no thread safety guarantees)
-- Concurrent `fi_write`/`fi_read` without serialization corrupts provider internals, causing completions to silently vanish
+- Multiple submission threads may route slices through the same shared endpoint concurrently.
+- libfabric's EFA RDM endpoints are not thread-safe for concurrent `fi_write`/`fi_read` even under `FI_THREAD_SAFE` at the domain level — concurrent posts corrupt provider internals and completions silently vanish.
 
 CQ completion queues are polled by dedicated worker threads (one per EFA device) that run independently of submission threads.
 
@@ -464,9 +467,8 @@ CQ completion queues are polled by dedicated worker threads (one per EFA device)
 | Endpoint type | `FI_EP_RDM` (message-based) | Queue Pairs (true RDMA) |
 | Write operation | Software-emulated via messages + ACKs | Hardware-offloaded one-sided RDMA |
 | CPU overhead | Moderate (provider processes ACKs) | Minimal (NIC handles everything) |
-| Throughput CPU-to-CPU (8×400G) | 222 GB/s (tuned) | ~190 GB/s |
-| Throughput GPU-to-GPU (16×200G) | 347 GB/s (tuned) | N/A |
-| Throughput GPU-to-GPU (8×400G) | 313 GB/s (tuned) | N/A |
+| Throughput GPU-to-GPU (16×200G, p5en) | 365 GB/s (tuned) | N/A |
+| Throughput CPU-to-CPU (16×200G, p5en) | 213 GB/s (tuned) | — |
 | AWS availability | All EFA-enabled instances | Not available on AWS |
 
 ### Supported AWS Instance Types
