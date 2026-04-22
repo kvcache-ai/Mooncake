@@ -124,11 +124,7 @@ You can also run the EFA tests via CTest:
 cd build && ctest --output-on-failure -R 'efa'
 ```
 
-> **Note:** `ctest --output-on-failure` without a filter runs every test in
-> the build, including TCP / metadata / master-service suites that require
-> an etcd server or a running `mooncake_master`. Those will fail or hang on
-> a machine that is only provisioned for EFA testing — the failures are not
-> EFA-specific. Use `-R 'efa'` to restrict the run to the EFA tests.
+> **Note:** `ctest --output-on-failure` without a filter runs every test in the build, including TCP / metadata / master-service suites that require an etcd server or a running `mooncake_master`. Those will fail or hang on a machine that is only provisioned for EFA testing — the failures are not EFA-specific. Use `-R 'efa'` to restrict the run to the EFA tests.
 
 ## Performance Benchmark
 
@@ -183,16 +179,9 @@ on the target, so keep these in sync.
 Replace `<target_hostname>:<target_port>` with the target node's
 address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
-> **CPU-to-CPU** (no GPUs): build with `-DUSE_CUDA=OFF`, **or** pass
-> `--use_vram=false` to a CUDA-enabled binary. Drop `--gpu_id=-1` in
-> that case — the bench will spread buffers across NUMA nodes instead.
+> **CPU-to-CPU** (no GPUs): build with `-DUSE_CUDA=OFF`, **or** pass `--use_vram=false` to a CUDA-enabled binary. Drop `--gpu_id=-1` in that case — the bench will spread buffers across NUMA nodes instead.
 
-> **Why `threads=16` and not 32:** the SRD shared endpoint caps
-> outstanding WRs per NIC (default 256 — see `MC_MAX_WR`). With
-> `threads × batch ≤ NICs × max_wr` the CQ never saturates; going
-> higher triggers backoff and times out. 32 threads × 128 batch =
-> 4096 slices chasing 16 × 256 = 4096 WRs has no headroom, so the
-> steady-state config settles at 16 threads.
+> **Why `threads=16` and not 32:** the SRD shared endpoint caps outstanding WRs per NIC (default 256 — see `MC_MAX_WR`). With `threads × batch ≤ NICs × max_wr` the CQ never saturates; going higher triggers backoff and times out. 32 threads × 128 batch = 4096 slices chasing 16 × 256 = 4096 WRs has no headroom, so the steady-state config settles at 16 threads.
 
 ### Key Parameters
 
@@ -228,10 +217,7 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
 
-> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and
-> current EFA tuning work. They are a lower bound for the current
-> code; we will re-sweep and update when a B300 pair is available
-> again.
+> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and current EFA tuning work. They are a lower bound for the current code; we will re-sweep and update when the hardware is available again.
 
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=2147483648`):
 
@@ -289,12 +275,7 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 | block=1MB, threads=32, batch=128 | 364.21 GB/s | 250.90 GB/s |
 | block=1MB, threads=48, batch=64 | 363.47 GB/s | 268.43 GB/s |
 
-> **Peak write: 365 GB/s** at `threads=16, batch=128` — ~91% of the
-> 400 GB/s theoretical line rate (16×200 Gbps). Write saturates on
-> batch size, so `batch=128` outperforms smaller batches as long as
-> `threads × batch ≤ 16 × 256 = 4096` (the shared-endpoint WR cap).
-> **Peak read: 304 GB/s** at `threads=16, batch=32` — reads tolerate
-> smaller in-flight queues, and throughput drops as batch grows.
+> **Peak write: 365 GB/s** at `threads=16, batch=128` — ~91% of the 400 GB/s theoretical line rate (16×200 Gbps). Write saturates on batch size, so `batch=128` outperforms smaller batches as long as `threads × batch ≤ 16 × 256 = 4096` (the shared-endpoint WR cap). **Peak read: 304 GB/s** at `threads=16, batch=32` — reads tolerate smaller in-flight queues, and throughput drops as batch grows.
 
 **CPU-to-CPU** (build with `-DUSE_CUDA=OFF`, or `--use_vram=false` on a CUDA build, `--buffer_size=4294967296`):
 
@@ -306,9 +287,7 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 | block=1MB, threads=32, batch=128 | 212.99 GB/s | 210.33 GB/s |
 | **block=1MB, threads=48, batch=32** | **213.57 GB/s** | 206.92 GB/s |
 
-> CPU-to-CPU is DRAM-bound — throughput is essentially flat (~205–214 GB/s)
-> across every thread / batch combination that doesn't hit the WR cap.
-> Peak write 213.57 GB/s, peak read 212.18 GB/s.
+> CPU-to-CPU is DRAM-bound — throughput is essentially flat (~205–214 GB/s) across every thread / batch combination that doesn't hit the WR cap. Peak write 213.57 GB/s, peak read 212.18 GB/s.
 
 **block_size sweep** (p5en GPU-to-GPU, `threads=16 batch=128 buf=4GB --gpu_id=-1`):
 
@@ -321,11 +300,7 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 | **1 MB (recommended)** | **352.59 GB/s** | **301.14 GB/s** |
 | 2 MB | 366.87 GB/s | 302.25 GB/s |
 
-> The 64 KB default only reaches ~26% of peak. Write throughput
-> climbs steeply up to ~512 KB and plateaus between 1 MB and 2 MB;
-> read saturates at ~256 KB. 1 MB is the recommended value — within
-> a few percent of the 2 MB peak with more headroom for `batch_size`
-> under the shared-endpoint WR cap.
+> The 64 KB default only reaches ~26% of peak. Write throughput climbs steeply up to ~512 KB and plateaus between 1 MB and 2 MB; read saturates at ~256 KB. 1 MB is the recommended value — within a few percent of the 2 MB peak with more headroom for `batch_size` under the shared-endpoint WR cap.
 
 **buffer_size sweep** (p5en GPU-to-GPU, `threads=16 batch=128 block=1MB --gpu_id=-1`):
 
@@ -334,44 +309,22 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 | 2 GB (min: `block × batch × threads`) | 353.51 GB/s | 297.03 GB/s |
 | 4 GB | 364.86 GB/s | 293.79 GB/s |
 
-> `buffer_size` only needs to satisfy `buffer_size ≥ block_size × batch_size × threads`
-> (the bench auto-adjusts if smaller, but silently). Anything larger
-> than that minimum does not change throughput — 2 GB vs 4 GB differs
-> by ~3% on write, read is flat within noise. The example commands
-> use 4 GB because it is safe for any reasonable threads/batch
-> combination without having to recompute the minimum.
+> `buffer_size` only needs to satisfy `buffer_size ≥ block_size × batch_size × threads` (the bench auto-adjusts if smaller, but silently). Anything larger than that minimum does not change throughput — 2 GB vs 4 GB differs by ~3% on write, read is flat within noise. The example commands use 4 GB because it is safe for any reasonable threads/batch combination without having to recompute the minimum.
 
 ### Tuning Tips
 
-- **Use `--block_size=1048576` (1MB)** — the single most important
-  knob. The 64 KB default reaches only ~26% of peak. 1 MB is within
-  a few percent of the 2 MB plateau while leaving headroom for
-  `batch_size` under the shared-endpoint WR cap.
-- **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD
-  shared endpoint each NIC carries one `fid_ep` with a 256 WR cap
-  (`MC_MAX_WR`), giving `16 NICs × 256 = 4096` in-flight slots on a
-  16-NIC host. Exceeding this trips "timed out waiting for CQ drain".
-  In practice `threads=16, batch=128` is a solid baseline; going
-  higher rarely adds throughput and routinely hits the cap.
-- **Write vs read:** write benefits from larger batches (peak at
-  `batch=128`); read prefers smaller in-flight queues (peak at
-  `batch=32` on p5en).
-- For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers
-  fan out across every GPU. Pinning a single GPU halves throughput
-  because half the NICs end up cross-NUMA.
-- For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split
-  (separate initiator/target instances per NUMA node) can help
-  reduce contention when one instance can't saturate both nodes.
+- **Use `--block_size=1048576` (1MB)** — the single most important knob. The 64 KB default reaches only ~26% of peak. 1 MB is within a few percent of the 2 MB plateau while leaving headroom for `batch_size` under the shared-endpoint WR cap.
+- **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD shared endpoint each NIC carries one `fid_ep` with a 256 WR cap (`MC_MAX_WR`), giving `16 NICs × 256 = 4096` in-flight slots on a 16-NIC host. Exceeding this trips "timed out waiting for CQ drain". In practice `threads=16, batch=128` is a solid baseline; going higher rarely adds throughput and routinely hits the cap.
+- **Write vs read:** write benefits from larger batches (peak at `batch=128`); read prefers smaller in-flight queues (peak at `batch=32` on p5en).
+- For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU halves throughput because half the NICs end up cross-NUMA.
+- For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split (separate initiator/target instances per NUMA node) can help reduce contention when one instance can't saturate both nodes.
 - `--buffer_size` only needs `≥ block × batch × threads`; larger
   values do not improve throughput. The example commands use 4 GB
   because that is safe for any reasonable config.
 
 ### First-request latency
 
-Peer addressing resolves lazily: `fi_av_insert()` and the metadata
-handshake fire on the first send to each `(local_NIC, peer_NIC)`
-pair. On 16-NIC hosts, the first few `submitTransfer` calls carry
-this cost before steady state.
+Peer addressing resolves lazily: `fi_av_insert()` and the metadata handshake fire on the first send to each `(local_NIC, peer_NIC)` pair. On 16-NIC hosts, the first few `submitTransfer` calls carry this cost before steady state.
 
 **Measured on p5en (16 × 16 NICs, cross-node, 1 MB write, 3 reps, median):**
 
@@ -381,31 +334,18 @@ this cost before steady state.
 | Per-peer `fid_ep` (upstream main) | 99 ms | 17 s |
 | Speedup | **~4×** | **~15×** |
 
-The SRD shared-endpoint refactor (#1944) speeds up first-request
-latency two different ways:
+The SRD shared-endpoint refactor (#1944) speeds up first-request latency two different ways:
 
-- **Without any code change from callers** — the cold `submitTransfer`
-  is ~4× faster (26 ms vs 99 ms), because the shared endpoint removes
-  the per-peer `fi_endpoint` / `fi_enable` that used to dominate. This
-  is what existing Mooncake callers (vLLM, SGLang, etc.) will see.
-- **For callers that want sub-10 ms first-request latency**, an
-  explicit eager-warmup API lets you pay the handshake cost up front,
-  outside the critical path:
+- **Without any code change from callers** — the cold `submitTransfer` is ~4× faster (26 ms vs 99 ms), because the shared endpoint removes the per-peer `fi_endpoint` / `fi_enable` that used to dominate. This is what existing Mooncake callers (vLLM, SGLang, etc.) will see.
+- **For callers that want sub-10 ms first-request latency**, an explicit eager-warmup API lets you pay the handshake cost up front, outside the critical path:
   - C++: `EfaTransport::warmupSegment(const std::string& segment_name)`
   - C: `int warmupEfaSegment(transfer_engine_t engine, const char *segment_name)`
   - Rust: `TransferEngine::warmup_efa_segment(name: &str)`
   - Python: `engine.warmup_efa_segment(segment_name)`
 
-  Call once per peer right after `openSegment`. The call is idempotent.
-  Under this refactor `warmupSegment` itself is ~15× faster than the
-  pre-#1944 code (1.1 s vs 17 s), bounded by the peer's single-threaded handshake
-  RPC daemon (`accept` + JSON parse serialized on one thread), so it
-  scales linearly with the number of fresh NIC pairs.
+  Call once per peer right after `openSegment`. The call is idempotent. Under this refactor `warmupSegment` itself is ~15× faster than the pre-#1944 code (1.1 s vs 17 s), bounded by the peer's single-threaded handshake RPC daemon (`accept` + JSON parse serialized on one thread), so it scales linearly with the number of fresh NIC pairs.
 
-vLLM and SGLang do not currently call `warmupSegment` — they go
-through the generic `TransferEngine` interface and pick up the 4×
-cold-submit speedup automatically. The API is there for direct
-Mooncake callers that want the larger win.
+vLLM and SGLang do not currently call `warmupSegment` — they go through the generic `TransferEngine` interface and pick up the 4× cold-submit speedup automatically. The API is there for direct Mooncake callers that want the larger win.
 
 Reproducer: `mooncake-transfer-engine/example/efa_first_submit_probe.cpp`.
 
