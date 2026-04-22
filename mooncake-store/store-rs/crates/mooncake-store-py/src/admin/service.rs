@@ -929,6 +929,13 @@ mod tests {
             self.inner.upsert_client_lease(lease)
         }
 
+        fn allocate_client_lease(
+            &self,
+            template: &mooncake_store_core::ClientLease,
+        ) -> mooncake_store_core::Result<ClientRuntimeId> {
+            self.inner.allocate_client_lease(template)
+        }
+
         fn update_client_state(
             &self,
             runtime: &ClientRuntimeId,
