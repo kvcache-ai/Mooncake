@@ -186,9 +186,22 @@ bool initialize_client() {
     // (SimpleAllocator/CacheLib) to avoid fragmentation.
     // Layout: [write_buffer | dst_0 | dst_1 | ... | dst_{batch_size-1}]
     // Stride = (1 + batch_size) * value_size.
+    if (FLAGS_batch_size <= 0) {
+        LOG(ERROR) << "batch_size must be greater than 0";
+        return false;
+    }
+
     g_per_thread_buffer_stride = static_cast<size_t>(FLAGS_value_size) *
                                  (1 + static_cast<size_t>(FLAGS_batch_size));
     size_t total_buffer_size = FLAGS_num_threads * g_per_thread_buffer_stride;
+
+    if (total_buffer_size < 4096) {
+        LOG(ERROR) << "total_buffer_size (" << total_buffer_size
+                   << ") is less than minimum alignment (4096). "
+                      "Consider increasing value_size, batch_size, or "
+                      "num_threads.";
+        return false;
+    }
 
     size_t read_working_set = static_cast<size_t>(FLAGS_num_threads) *
                               static_cast<size_t>(FLAGS_batch_size) *
@@ -207,7 +220,8 @@ bool initialize_client() {
     }
 
     // Align to page boundary for RDMA registration.
-    g_worker_buffer_base = std::aligned_alloc(4096, total_buffer_size);
+    const size_t kAlignment = 4096;
+    g_worker_buffer_base = std::aligned_alloc(kAlignment, total_buffer_size);
     if (!g_worker_buffer_base) {
         LOG(ERROR) << "Failed to allocate worker buffer of size "
                    << total_buffer_size / (1024 * 1024) << "MB";
