@@ -188,10 +188,10 @@ mod tests {
 
     #[test]
     fn parse_legacy_scoped_key_with_unicode_components() {
-        let id = parse_legacy_scoped_key(&ObjectKey::new("租户::模型权重"))
+        let id = parse_legacy_scoped_key(&ObjectKey::new("tenant-αβγ::naïve-path"))
             .expect("unicode key should parse");
-        assert_eq!(id.scope.tenant, "租户");
-        assert_eq!(id.logical_key, "模型权重");
+        assert_eq!(id.scope.tenant, "tenant-αβγ");
+        assert_eq!(id.logical_key, "naïve-path");
     }
 
     #[test]

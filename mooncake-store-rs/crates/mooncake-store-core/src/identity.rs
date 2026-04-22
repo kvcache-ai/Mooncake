@@ -204,8 +204,8 @@ mod tests {
 
     #[test]
     fn client_stable_id_with_unicode() {
-        let id = ClientStableId::new("节点-甲");
-        assert_eq!(format!("{id}"), "节点-甲");
+        let id = ClientStableId::new("naïve-αβγ");
+        assert_eq!(format!("{id}"), "naïve-αβγ");
     }
 
     // -----------------------------------------------------------------------
@@ -464,8 +464,11 @@ mod tests {
 
     #[test]
     fn logical_object_id_canonical_key_with_unicode() {
-        let id = LogicalObjectId::new(NamespaceScope::new("租户", "域", "集合"), "模型/权重");
-        assert_eq!(id.canonical_key(), "租户/域/集合/模型/权重");
+        let id = LogicalObjectId::new(
+            NamespaceScope::new("α-tenant", "β-domain", "γ-set"),
+            "naïve/path",
+        );
+        assert_eq!(id.canonical_key(), "α-tenant/β-domain/γ-set/naïve/path");
     }
 
     #[test]
