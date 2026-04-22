@@ -228,7 +228,7 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
 
-> **Note:** numbers below predate the SRD shared-endpoint refactor and
+> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and
 > current EFA tuning work. They are a lower bound for the current
 > code; we will re-sweep and update when a B300 pair is available
 > again.
@@ -256,7 +256,7 @@ Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 1
 
 Tested on two p6-b200.48xlarge instances in the same AWS placement group.
 
-> **Note:** numbers below predate the SRD shared-endpoint refactor and
+> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and
 > current EFA tuning work. They are a lower bound for the current
 > code; we will re-sweep and update when a B200 pair is available
 > again.
@@ -377,11 +377,12 @@ this cost before steady state.
 
 | | cold submit #0 (no warmup) | `warmupSegment()` (all 256 pairs) |
 |---|---:|---:|
-| SRD shared endpoint (this PR) | **26 ms** | **1.1 s** |
+| SRD shared endpoint (#1944) | **26 ms** | **1.1 s** |
 | Per-peer `fid_ep` (upstream main) | 99 ms | 17 s |
 | Speedup | **~4×** | **~15×** |
 
-So this PR speeds up first-request latency two different ways:
+The SRD shared-endpoint refactor (#1944) speeds up first-request
+latency two different ways:
 
 - **Without any code change from callers** — the cold `submitTransfer`
   is ~4× faster (26 ms vs 99 ms), because the shared endpoint removes
@@ -396,8 +397,8 @@ So this PR speeds up first-request latency two different ways:
   - Python: `engine.warmup_efa_segment(segment_name)`
 
   Call once per peer right after `openSegment`. The call is idempotent.
-  Under this PR `warmupSegment` itself is ~15× faster than on upstream
-  main (1.1 s vs 17 s), bounded by the peer's single-threaded handshake
+  Under this refactor `warmupSegment` itself is ~15× faster than the
+  pre-#1944 code (1.1 s vs 17 s), bounded by the peer's single-threaded handshake
   RPC daemon (`accept` + JSON parse serialized on one thread), so it
   scales linearly with the number of fresh NIC pairs.
 
