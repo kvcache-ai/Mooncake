@@ -116,7 +116,6 @@ impl PyMooncakeDistributedStore {
         use_hugepage = None,
         hugepage_size = None,
         route_control = "embedded_wrh"
-<<<<<<< HEAD
     ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, route_control='embedded_wrh')")]
     #[allow(clippy::too_many_arguments)]
     fn setup(
@@ -188,6 +187,12 @@ impl PyMooncakeDistributedStore {
             compat_scope,
         )
         .map_err(store_error_to_py)?;
+        dispatcher
+            .register_local_memory()
+            .map_err(store_error_to_py)?;
+        if initial_state == ClientLifecycleState::Active {
+            dispatcher.activate().map_err(store_error_to_py)?;
+        }
         self.replace_backend(StoreBackend::Real(dispatcher));
         Ok(0)
     }

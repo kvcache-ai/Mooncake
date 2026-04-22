@@ -23,6 +23,14 @@ use mooncake_store_client::{
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
 };
+
+fn dummy_worker_scope(keyspace: Option<&str>, stable_id: &str) -> String {
+    keyspace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(stable_id)
+        .to_string()
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum RouteControlArg {
     EmbeddedWrh,
@@ -226,11 +234,14 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     )?);
     client.register_local_memory()?;
     let dummy_server = match args.client_server_address.as_deref() {
-        Some(address) => Some(start_dummy_store_server(
-            client.clone(),
-            address,
-            &stable_id,
-        )?),
+        Some(address) => {
+            let worker_scope = dummy_worker_scope(args.keyspace.as_deref(), &stable_id);
+            Some(start_dummy_store_server(
+                client.clone(),
+                address,
+                &worker_scope,
+            )?)
+        }
         None => None,
     };
     if should_activate_after_ready(requested_initial_state, startup_state) {
