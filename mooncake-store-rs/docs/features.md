@@ -107,6 +107,9 @@ For simpler bring-up or debugging, the runtime can store and resolve routes dire
 
 The current implementation also exposes admin-driven explicit route migration tasks for key-level `copy` and `move`.
 
+See [Route Migration 使用手册](./route-migration-usage.md) for
+operator-facing usage, request examples, and task semantics.
+
 What it provides:
 
 - explicit `source_segment -> target_segment(s)` selection
