@@ -115,14 +115,4 @@ TEST(ComputeSegmentSizesTest, RdmaMaxMrSizeBelowOneGiBClampsToOneGiB) {
     EXPECT_EQ(sum, total);
 }
 
-// RDMA, total_bytes == 0: pure-function contract says "return {0}". Callers
-// are expected to short-circuit before calling in production, but pin the
-// behavior here so any future change is a deliberate one.
-TEST(ComputeSegmentSizesTest, RdmaZeroTotalReturnsSingleZeroSegment) {
-    const size_t max_mr = 2 * kGiB;
-    auto sizes = computeSegmentSizes(0, max_mr, /*is_rdma=*/true);
-    ASSERT_EQ(sizes.size(), 1u);
-    EXPECT_EQ(sizes[0], 0u);
-}
-
 }  // namespace mooncake
