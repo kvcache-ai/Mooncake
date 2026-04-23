@@ -705,8 +705,8 @@ impl StoreTransport for HttpStoreTransport {
                     if now >= deadline {
                         return Err(error);
                     }
-                    let delay =
-                        HTTP_TRANSPORT_OPEN_RETRY_DELAY.min(deadline.saturating_duration_since(now));
+                    let delay = HTTP_TRANSPORT_OPEN_RETRY_DELAY
+                        .min(deadline.saturating_duration_since(now));
                     if delay.is_zero() {
                         return Err(error);
                     }
