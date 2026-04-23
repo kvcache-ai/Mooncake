@@ -171,6 +171,7 @@ struct StoreState {
     registered_buffers: BTreeMap<usize, usize>,
     local_transports: BTreeMap<String, Arc<dyn StoreTransport>>,
     remote_segments: BTreeMap<String, u64>,
+    remote_segment_infos: BTreeMap<String, SegmentInfo>,
     pending_reclaims: VecDeque<PendingReclaim>,
     next_local_segment_id: u64,
 }

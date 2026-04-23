@@ -6546,6 +6546,82 @@ fn batch_get_into_falls_back_to_direct_when_value_exceeds_scratch() {
 }
 
 #[test]
+fn batch_get_into_batches_registered_remote_buffers_without_scratch() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let writer_transport = Arc::new(TestTransport::new("writer-batch-registered-segment"));
+    let reader_transport = Arc::new(writer_transport.peer("reader-batch-registered-segment"));
+    let remote_owner = publish_storage_node_with_capacity(
+        &metadata,
+        &writer_transport,
+        "storage-batch-registered",
+        "seg-batch-registered",
+        "pool-a",
+        1024,
+        1,
+    );
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-batch-registered")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "reader-batch-registered")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config_with_layout(4096, 4, 1))
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    wait_for_membership_convergence(&[&writer, &reader]);
+
+    writer
+        .batch_put(&[
+            PutRequest::new("registered-a", b"abcdefgh").replication(
+                ReplicationPolicy::new()
+                    .prefer_local(false)
+                    .preferred_storage_owner(remote_owner.storage_key()),
+            ),
+            PutRequest::new("registered-b", b"ijklmnop").replication(
+                ReplicationPolicy::new()
+                    .prefer_local(false)
+                    .preferred_storage_owner(remote_owner.storage_key()),
+            ),
+        ])
+        .expect("remote batch put should succeed");
+
+    let mut target = [0u8; 32];
+    reader
+        .register_buffer(target.as_mut_ptr().cast(), target.len())
+        .expect("reader register buffer should succeed");
+    {
+        let mut state = writer_transport.state.lock();
+        state.submitted_batch_sizes.clear();
+        state.submitted_batch_bytes.clear();
+        state.submitted_batch_hints.clear();
+    }
+
+    let (first, tail) = target.split_at_mut(8);
+    let (_, second) = tail.split_at_mut(8);
+    let sizes = reader
+        .batch_get_into(&mut [
+            GetRequest::new("registered-a", first),
+            GetRequest::new("registered-b", &mut second[..8]),
+        ])
+        .expect("registered buffers should batch direct remote reads");
+    assert_eq!(sizes, vec![8, 8]);
+    assert_eq!(&target[..8], b"abcdefgh");
+    assert_eq!(&target[16..24], b"ijklmnop");
+    assert_eq!(writer_transport.submitted_batch_sizes(), vec![2]);
+    assert_eq!(writer_transport.submitted_batch_bytes(), vec![16]);
+}
+
+#[test]
 fn registered_buffer_subranges_support_put_from_and_batch_get_into() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let writer_transport = Arc::new(TestTransport::new("writer-subrange-segment"));
@@ -10393,12 +10469,14 @@ fn stale_route_checksum_mismatch_refreshes_to_latest_route() {
     let transport = reader.transport().expect("reader transport should exist");
     let mut resolved = resolved_object_for_route(&reader, "default", key, route_v1.clone());
     let mut buffer = vec![0u8; route_v1.replicas[0].length as usize];
+    let mut checked_runtimes = BTreeSet::new();
     let request_deadline = reader.request_deadline_for_transfer(buffer.len() as u64, 1);
     reader
         .read_single_object_with_failover(
             transport,
             &mut resolved,
             &mut buffer,
+            &mut checked_runtimes,
             request_deadline,
             "overwrite_refresh",
         )
@@ -10521,12 +10599,14 @@ fn stale_route_transport_failure_refreshes_to_republished_route() {
     let mut resolved =
         resolved_object_for_route(&reader, "default", "refresh-route-key", route_v1.clone());
     let mut buffer = vec![0u8; route_v1.replicas[0].length as usize];
+    let mut checked_runtimes = BTreeSet::new();
     let request_deadline = reader.request_deadline_for_transfer(buffer.len() as u64, 1);
     reader
         .read_single_object_with_failover(
             transport,
             &mut resolved,
             &mut buffer,
+            &mut checked_runtimes,
             request_deadline,
             "route_refresh_after_transport_failure",
         )

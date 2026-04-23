@@ -838,14 +838,17 @@ fn helper_now_ms_is_monotonically_non_decreasing() {
 }
 
 // ===========================================================================
-// payload_checksum — FNV-1a boundary behavior
+// payload_checksum invariants
 // ===========================================================================
 
 #[test]
-fn payload_checksum_empty_payload_equals_fnv_offset_basis() {
-    // FNV-1a over no bytes is the offset basis constant
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    assert_eq!(payload_checksum(&[]), FNV_OFFSET);
+fn payload_checksum_empty_payload_is_deterministic() {
+    assert_eq!(payload_checksum(&[]), payload_checksum(&[]));
+}
+
+#[test]
+fn payload_checksum_distinguishes_empty_and_non_empty() {
+    assert_ne!(payload_checksum(&[]), payload_checksum(&[0u8]));
 }
 
 #[test]
@@ -872,7 +875,7 @@ fn payload_checksum_all_0xff_bytes_is_deterministic() {
 fn payload_checksum_is_order_sensitive() {
     let ab = payload_checksum(&[0x01, 0x02]);
     let ba = payload_checksum(&[0x02, 0x01]);
-    assert_ne!(ab, ba, "FNV-1a must be sensitive to byte order");
+    assert_ne!(ab, ba, "checksum must be sensitive to byte order");
 }
 
 #[test]

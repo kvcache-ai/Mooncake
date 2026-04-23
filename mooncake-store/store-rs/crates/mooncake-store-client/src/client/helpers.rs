@@ -21,15 +21,9 @@ fn record_success_metric(operation: &'static str, bytes_in: u64, bytes_out: u64)
 }
 
 fn payload_checksum(payload: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut checksum = FNV_OFFSET;
-    for byte in payload {
-        checksum ^= u64::from(*byte);
-        checksum = checksum.wrapping_mul(FNV_PRIME);
-    }
-    checksum
+    // Keep checksum validation on the hot read/write path cheap enough for
+    // large restore batches. The stored route field remains a stable u64.
+    xxh3_64(payload)
 }
 
 fn validate_replica_checksum(replica: &ReplicaRoute, payload: &[u8]) -> Result<()> {
@@ -123,3 +117,4 @@ impl StoreClient {
         u64::try_from(total).unwrap_or(u64::MAX)
     }
 }
+use xxhash_rust::xxh3::xxh3_64;

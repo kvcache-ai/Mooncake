@@ -18,6 +18,7 @@ tonic = { version = "0.12", features = ["transport"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 is-terminal = "0.4.17"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

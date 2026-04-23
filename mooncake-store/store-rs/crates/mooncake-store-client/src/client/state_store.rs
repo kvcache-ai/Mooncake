@@ -38,6 +38,7 @@ impl StoreState {
 
     fn invalidate_remote_segment(&mut self, segment_name: &str) {
         self.remote_segments.remove(segment_name);
+        self.remote_segment_infos.remove(segment_name);
     }
 
     fn reopen_segment(
@@ -45,6 +46,7 @@ impl StoreState {
         transport: &dyn StoreTransport,
         segment_name: &str,
     ) -> Result<u64> {
+        self.remote_segment_infos.remove(segment_name);
         if let Some(handle) = self.remote_segments.remove(segment_name) {
             let _ = transport.close_segment(handle);
         }
@@ -56,6 +58,12 @@ impl StoreState {
         transport: &dyn StoreTransport,
         segment_name: &str,
     ) -> Result<(u64, SegmentInfo)> {
+        if let (Some(handle), Some(info)) = (
+            self.remote_segments.get(segment_name),
+            self.remote_segment_infos.get(segment_name),
+        ) {
+            return Ok((*handle, info.clone()));
+        }
         let mut refreshed = false;
         loop {
             let handle = if refreshed {
@@ -64,9 +72,14 @@ impl StoreState {
                 self.open_segment(transport, segment_name)?
             };
             match transport.get_segment_info(handle) {
-                Ok(info) => return Ok((handle, info)),
+                Ok(info) => {
+                    self.remote_segment_infos
+                        .insert(segment_name.to_string(), info.clone());
+                    return Ok((handle, info));
+                }
                 Err(error) if !refreshed && remote_segment_cache_refreshable(&error) => {
                     self.remote_segments.remove(segment_name);
+                    self.remote_segment_infos.remove(segment_name);
                     let _ = transport.close_segment(handle);
                     refreshed = true;
                 }
@@ -179,6 +192,137 @@ impl StoreState {
                 .then_with(|| left.qos_tier.cmp(&right.qos_tier))
         });
         ready
+    }
+}
+
+#[cfg(test)]
+mod state_store_tests {
+    use super::*;
+    use mooncake_transport::{SegmentBuffer, SegmentKind, TransferProgress};
+    use parking_lot::Mutex;
+    use std::ffi::c_void;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct CountingTransportState {
+        open_calls: usize,
+        close_calls: usize,
+        info_calls: usize,
+    }
+
+    #[derive(Default, Clone)]
+    struct CountingTransport {
+        state: Arc<Mutex<CountingTransportState>>,
+    }
+
+    impl CountingTransport {
+        fn counts(&self) -> (usize, usize, usize) {
+            let state = self.state.lock();
+            (state.open_calls, state.close_calls, state.info_calls)
+        }
+    }
+
+    impl StoreTransport for CountingTransport {
+        fn segment_name(&self) -> Result<String> {
+            Ok("counting-segment".to_string())
+        }
+
+        fn rpc_server_address(&self) -> Result<(String, u16)> {
+            Ok(("127.0.0.1".to_string(), 0))
+        }
+
+        fn open_segment(&self, _segment_name: &str) -> Result<u64> {
+            let mut state = self.state.lock();
+            state.open_calls += 1;
+            Ok(7)
+        }
+
+        fn close_segment(&self, _handle: u64) -> Result<()> {
+            self.state.lock().close_calls += 1;
+            Ok(())
+        }
+
+        fn get_segment_info(&self, _handle: u64) -> Result<SegmentInfo> {
+            let mut state = self.state.lock();
+            state.info_calls += 1;
+            Ok(SegmentInfo {
+                kind: SegmentKind::Memory,
+                buffers: vec![SegmentBuffer {
+                    base: 64,
+                    length: 4096,
+                    location: "cpu:0".to_string(),
+                }],
+            })
+        }
+
+        fn allocate_memory(&self, _size: usize, _location: &str) -> Result<*mut c_void> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn free_memory(&self, _addr: *mut c_void) -> Result<()> {
+            Ok(())
+        }
+
+        fn register_memory(&self, _addr: *mut c_void, _size: usize) -> Result<()> {
+            Ok(())
+        }
+
+        fn unregister_memory(&self, _addr: *mut c_void, _size: usize) -> Result<()> {
+            Ok(())
+        }
+
+        fn allocate_batch(&self, _batch_size: usize) -> Result<u64> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn free_batch(&self, _batch_id: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn submit(&self, _batch_id: u64, _requests: &[TransferRequest]) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn submit_with_hints(
+            &self,
+            _batch_id: u64,
+            _requests: &[TransferRequest],
+            _hints: &TransferBatchHints,
+        ) -> Result<()> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn task_status(&self, _batch_id: u64, _task_id: usize) -> Result<TransferProgress> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn overall_status(&self, _batch_id: u64) -> Result<TransferProgress> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+    }
+
+    #[test]
+    fn open_segment_with_info_reuses_cached_segment_info() {
+        let transport = CountingTransport::default();
+        let mut state = StoreState::default();
+
+        let (handle_a, info_a) = state
+            .open_segment_with_info(&transport, "remote-a")
+            .expect("first open should succeed");
+        let (handle_b, info_b) = state
+            .open_segment_with_info(&transport, "remote-a")
+            .expect("cached open should succeed");
+
+        assert_eq!(handle_a, handle_b);
+        assert_eq!(info_a, info_b);
+        assert_eq!(transport.counts(), (1, 0, 1));
+
+        state.invalidate_remote_segment("remote-a");
+        let (_handle_c, _info_c) = state
+            .open_segment_with_info(&transport, "remote-a")
+            .expect("reopen after invalidation should succeed");
+
+        assert_eq!(transport.counts(), (2, 0, 2));
     }
 }
 
