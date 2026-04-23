@@ -17,9 +17,6 @@
 
 namespace mooncake {
 
-// Forward declaration
-struct LocalStorageMetric;
-
 /**
  * @struct ReadTaskHandle
  * @brief Handle for a read operation
@@ -215,14 +212,6 @@ class DataManager {
     bool Exist(const std::string& key,
                std::optional<UUID> tier_id = std::nullopt) const;
 
-    /**
-     * @brief Set the local storage metrics pointer for recording operations.
-     * @param metrics Pointer to LocalStorageMetric (non-owning, can be nullptr)
-     */
-    void SetMetrics(LocalStorageMetric* metrics) {
-        local_storage_metrics_ = metrics;
-    }
-
    private:
     std::shared_mutex& GetKeyLock(const std::string& key) {
         size_t hash = std::hash<std::string>{}(key);
@@ -392,9 +381,6 @@ class DataManager {
 
     LocalTransferConfig local_transfer_config_;
     std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
-
-    // Non-owning pointer to local storage metrics (optional)
-    LocalStorageMetric* local_storage_metrics_ = nullptr;
 };
 
 }  // namespace mooncake

@@ -8,6 +8,7 @@
 
 #include "client_config_builder.h"
 #include "client_metric.h"
+#include "p2p_client_metric.h"
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_http/coro_http_client.hpp>
 
@@ -205,6 +206,259 @@ TEST_F(ClientHttpMetricsTest, HttpEndpointsTest) {
     }
 
     // Stop server
+    server.stop();
+}
+
+// Test P2P client metrics HTTP endpoints
+TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
+    const uint16_t test_port = 19004;
+
+    // Create P2PClientMetric instance
+    auto p2p_metrics = std::make_unique<P2PClientMetric>(
+        std::map<std::string, std::string>{{"p2p_label", "p2p_value"}});
+    ASSERT_NE(p2p_metrics, nullptr);
+
+    // Add test data to P2P metrics
+    // Local Put metrics
+    p2p_metrics->local_put_requests.inc(10);
+    p2p_metrics->local_put_bytes.inc(5 * 1024 * 1024);  // 5 MB
+    p2p_metrics->local_put_latency.observe(200);
+    p2p_metrics->local_put_latency.observe(300);
+
+    // Local Get metrics
+    p2p_metrics->local_get_requests.inc(100);
+    p2p_metrics->local_get_hits.inc(80);
+    p2p_metrics->local_get_misses.inc(15);
+    p2p_metrics->local_get_failures.inc(5);
+    p2p_metrics->local_get_bytes.inc(20 * 1024 * 1024);  // 20 MB
+    p2p_metrics->local_get_latency.observe(100);
+    p2p_metrics->local_get_latency.observe(150);
+
+    // Create and start HTTP server
+    coro_http::coro_http_server server(1, test_port);
+
+    using namespace coro_http;
+
+    // Register handlers for P2P metrics
+    server.set_http_handler<GET>("/metrics", [&p2p_metrics](
+                                                 coro_http_request& req,
+                                                 coro_http_response& resp) {
+        std::string metrics_str;
+        p2p_metrics->serialize(metrics_str);
+        resp.add_header("Content-Type", "text/plain; version=0.0.4");
+        resp.set_status_and_content(status_type::ok, std::move(metrics_str));
+    });
+
+    server.set_http_handler<GET>(
+        "/metrics/summary",
+        [&p2p_metrics](coro_http_request& req, coro_http_response& resp) {
+            std::string summary = p2p_metrics->summary_metrics();
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, std::move(summary));
+        });
+
+    server.async_start();
+
+    // Wait for server to start
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Test /metrics endpoint for P2P metrics
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/metrics");
+        EXPECT_EQ(resp.status, 200)
+            << "P2P metrics endpoint returned wrong status";
+
+        // Check P2P Put metrics
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_put_requests_total") !=
+            std::string::npos)
+            << "Metrics should contain P2P put requests metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_put_bytes_total") !=
+                    std::string::npos)
+            << "Metrics should contain P2P put bytes metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_put_latency_us") !=
+                    std::string::npos)
+            << "Metrics should contain P2P put latency metric";
+
+        // Check P2P Get metrics
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_get_requests_total") !=
+            std::string::npos)
+            << "Metrics should contain P2P get requests metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_get_hits_total") !=
+                    std::string::npos)
+            << "Metrics should contain P2P get hits metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_get_misses_total") !=
+            std::string::npos)
+            << "Metrics should contain P2P get misses metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_get_failures_total") !=
+            std::string::npos)
+            << "Metrics should contain P2P get failures metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_get_bytes_total") !=
+                    std::string::npos)
+            << "Metrics should contain P2P get bytes metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_get_latency_us") !=
+                    std::string::npos)
+            << "Metrics should contain P2P get latency metric";
+
+        // Check labels
+        EXPECT_TRUE(resp.resp_body.find("p2p_label") != std::string::npos)
+            << "Metrics should contain P2P label";
+        EXPECT_TRUE(resp.resp_body.find("p2p_value") != std::string::npos)
+            << "Metrics should contain P2P label value";
+
+        // Check actual values (Prometheus format with labels:
+        // metric_name{label="value"} number)
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_put_requests_total") !=
+                std::string::npos &&
+            resp.resp_body.find("} 10\n") != std::string::npos)
+            << "P2P put requests should be 10";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_get_requests_total") !=
+                std::string::npos &&
+            resp.resp_body.find("} 100\n") != std::string::npos)
+            << "P2P get requests should be 100";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_get_hits_total") !=
+                        std::string::npos &&
+                    resp.resp_body.find("} 80\n") != std::string::npos)
+            << "P2P get hits should be 80";
+    }
+
+    // Test /metrics/summary endpoint for P2P metrics
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/metrics/summary");
+        EXPECT_EQ(resp.status, 200)
+            << "P2P metrics summary endpoint returned wrong status";
+
+        // Check summary contains expected P2P metrics
+        EXPECT_TRUE(resp.resp_body.find("P2P Local Storage Metrics") !=
+                    std::string::npos)
+            << "Summary should contain P2P metrics header";
+        EXPECT_TRUE(resp.resp_body.find("Local Put:") != std::string::npos)
+            << "Summary should contain local put section";
+        EXPECT_TRUE(resp.resp_body.find("Local Get:") != std::string::npos)
+            << "Summary should contain local get section";
+        EXPECT_TRUE(resp.resp_body.find("10 requests") != std::string::npos)
+            << "Summary should show 10 put requests";
+        EXPECT_TRUE(resp.resp_body.find("100 requests") != std::string::npos)
+            << "Summary should show 100 get requests";
+        EXPECT_TRUE(resp.resp_body.find("80 hits") != std::string::npos)
+            << "Summary should show 80 get hits";
+        EXPECT_TRUE(resp.resp_body.find("15 misses") != std::string::npos)
+            << "Summary should show 15 get misses";
+        EXPECT_TRUE(resp.resp_body.find("5.00 MB") != std::string::npos)
+            << "Summary should show 5.00 MB written";
+        EXPECT_TRUE(resp.resp_body.find("20.00 MB") != std::string::npos)
+            << "Summary should show 20.00 MB read";
+    }
+
+    server.stop();
+}
+
+// Test combined ClientMetric and P2PClientMetric HTTP endpoints
+TEST_F(ClientHttpMetricsTest, CombinedMetricsHttpEndpointsTest) {
+    const uint16_t test_port = 19005;
+
+    // Create both ClientMetric and P2PClientMetric instances
+    auto metrics = ClientMetric::Create({{"instance", "combined_test"}});
+    ASSERT_NE(metrics, nullptr);
+
+    auto p2p_metrics = std::make_unique<P2PClientMetric>(
+        std::map<std::string, std::string>{{"instance", "combined_test"}});
+    ASSERT_NE(p2p_metrics, nullptr);
+
+    // Add test data to both metrics
+    metrics->transfer_metric.total_read_bytes.inc(1024 * 1024);
+    metrics->transfer_metric.total_write_bytes.inc(2 * 1024 * 1024);
+
+    p2p_metrics->local_get_requests.inc(50);
+    p2p_metrics->local_get_hits.inc(40);
+    p2p_metrics->local_get_bytes.inc(10 * 1024 * 1024);
+    p2p_metrics->local_put_requests.inc(20);
+    p2p_metrics->local_put_bytes.inc(5 * 1024 * 1024);
+
+    // Create and start HTTP server
+    coro_http::coro_http_server server(1, test_port);
+
+    using namespace coro_http;
+
+    // Register combined metrics handler
+    server.set_http_handler<GET>("/metrics", [&metrics, &p2p_metrics](
+                                                 coro_http_request& req,
+                                                 coro_http_response& resp) {
+        std::string metrics_str;
+        metrics->serialize(metrics_str);
+        p2p_metrics->serialize(metrics_str);
+        resp.add_header("Content-Type", "text/plain; version=0.0.4");
+        resp.set_status_and_content(status_type::ok, std::move(metrics_str));
+    });
+
+    server.set_http_handler<GET>(
+        "/metrics/summary", [&metrics, &p2p_metrics](coro_http_request& req,
+                                                     coro_http_response& resp) {
+            std::string summary;
+            summary += metrics->summary_metrics();
+            summary += "\n";
+            summary += p2p_metrics->summary_metrics();
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, std::move(summary));
+        });
+
+    server.async_start();
+
+    // Wait for server to start
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Test combined /metrics endpoint
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/metrics");
+        EXPECT_EQ(resp.status, 200);
+
+        // Check both transfer metrics and P2P metrics are present
+        EXPECT_TRUE(resp.resp_body.find("mooncake_transfer_read_bytes") !=
+                    std::string::npos)
+            << "Should contain transfer read bytes";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_get_requests_total") !=
+            std::string::npos)
+            << "Should contain P2P get requests";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_put_requests_total") !=
+            std::string::npos)
+            << "Should contain P2P put requests";
+    }
+
+    // Test combined /metrics/summary endpoint
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/metrics/summary");
+        EXPECT_EQ(resp.status, 200);
+
+        // Check both transfer and P2P summaries are present
+        EXPECT_TRUE(resp.resp_body.find("Transfer Metrics Summary") !=
+                    std::string::npos)
+            << "Should contain transfer metrics summary";
+        EXPECT_TRUE(resp.resp_body.find("P2P Local Storage Metrics") !=
+                    std::string::npos)
+            << "Should contain P2P metrics summary";
+        EXPECT_TRUE(resp.resp_body.find("Total Read") != std::string::npos)
+            << "Should contain transfer total read";
+        EXPECT_TRUE(resp.resp_body.find("Local Get:") != std::string::npos)
+            << "Should contain local get section";
+        EXPECT_TRUE(resp.resp_body.find("Local Put:") != std::string::npos)
+            << "Should contain local put section";
+    }
+
     server.stop();
 }
 

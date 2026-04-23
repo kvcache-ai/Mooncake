@@ -27,7 +27,10 @@ P2PClientService::P2PClientService(
     : ClientService(local_ip, te_port, metadata_connstring, metrics_port,
                     enable_metrics_http, labels),
       master_client_(client_id_,
-                     metrics_ ? &metrics_->master_client_metric : nullptr) {}
+                     metrics_ ? &metrics_->master_client_metric : nullptr),
+      p2p_metrics_(ClientMetric::IsEnabled()
+                       ? std::make_unique<P2PClientMetric>(merge_labels(labels))
+                       : nullptr) {}
 
 void P2PClientService::Stop() {
     if (!MarkShuttingDown()) {
@@ -248,10 +251,6 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 
     data_manager_ = DataManager(std::move(tiered_backend), transfer_engine_,
                                 config.lock_shard_count, local_transfer_config);
-    // Set metrics for DataManager to record local storage operations
-    if (metrics_) {
-        data_manager_->SetMetrics(&metrics_->local_storage_metric);
-    }
     // Set rectify callback on DataManager to remove stale replicas from master
     data_manager_->SetRectifyCallback([this](const std::string& key,
                                              std::optional<UUID> tier_id) {
@@ -767,10 +766,33 @@ P2PClientService::CreatePutHandle(const std::string& key,
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
 P2PClientService::CreateLocalPutHandle(const std::string& key,
                                        std::vector<Slice>& slices) {
+    Stopwatch sw;
     auto local_handle = data_manager_->Put(key, slices);
+    int64_t elapsed_us = sw.elapsed_us();
+
+    // Calculate total bytes from slices
+    size_t total_bytes = 0;
+    for (const auto& slice : slices) {
+        total_bytes += slice.size;
+    }
+
     if (local_handle) {
+        // Local put success
+        if (p2p_metrics_) {
+            p2p_metrics_->local_put_requests.inc();
+            p2p_metrics_->local_put_bytes.inc(total_bytes);
+            p2p_metrics_->local_put_latency.observe(elapsed_us);
+        }
         return std::move(local_handle.value());
     }
+
+    // Local put failure
+    if (p2p_metrics_) {
+        p2p_metrics_->local_put_requests.inc();
+        p2p_metrics_->local_put_failures.inc();
+        p2p_metrics_->local_put_latency.observe(elapsed_us);
+    }
+
     LOG(ERROR) << "Local write failed for key: " << key
                << ", error: " << local_handle.error();
     return tl::unexpected(local_handle.error());
@@ -801,14 +823,41 @@ P2PClientService::InnerCreatePutHandle(const std::string& key,
                 continue;
             }
             if (data_manager_.has_value()) {
+                Stopwatch sw;
                 auto local_handle = data_manager_->Put(key, slices);
+                int64_t elapsed_us = sw.elapsed_us();
+
+                // Calculate total bytes from slices
+                size_t total_bytes = 0;
+                for (const auto& slice : slices) {
+                    total_bytes += slice.size;
+                }
+
                 if (local_handle) {
+                    // Local put success
+                    if (p2p_metrics_) {
+                        p2p_metrics_->local_put_requests.inc();
+                        p2p_metrics_->local_put_bytes.inc(total_bytes);
+                        p2p_metrics_->local_put_latency.observe(elapsed_us);
+                    }
                     return std::move(local_handle.value());
                 } else if (IsAlreadyExistsError(local_handle.error())) {
                     // The key already exists. Currently, we think this is a
                     // normal case, just ignore the error and return success.
+                    // Note: Don't count bytes since no data was actually
+                    // written.
+                    if (p2p_metrics_) {
+                        p2p_metrics_->local_put_requests.inc();
+                        p2p_metrics_->local_put_latency.observe(elapsed_us);
+                    }
                     return ImmediateHandle<void>::Create();
                 } else {
+                    // Local put failure
+                    if (p2p_metrics_) {
+                        p2p_metrics_->local_put_requests.inc();
+                        p2p_metrics_->local_put_failures.inc();
+                        p2p_metrics_->local_put_latency.observe(elapsed_us);
+                    }
                     LOG(WARNING) << "Local write failed, trying next candidate"
                                  << ", error: " << local_handle.error();
                     continue;
@@ -1072,10 +1121,32 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
     const ReadRouteConfig& config) {
     // 1. Try local first
     if (data_manager_.has_value()) {
+        Stopwatch sw;
         auto local = data_manager_->Get(key, allocator);
+        int64_t elapsed_us = sw.elapsed_us();
+
         if (local.has_value()) {
+            // Local get hit
+            if (p2p_metrics_) {
+                p2p_metrics_->local_get_requests.inc();
+                p2p_metrics_->local_get_hits.inc();
+                p2p_metrics_->local_get_bytes.inc(local->data_size);
+                p2p_metrics_->local_get_latency.observe(elapsed_us);
+            }
             return std::move(local.value());
         }
+
+        // Local get miss or failure
+        if (p2p_metrics_) {
+            p2p_metrics_->local_get_requests.inc();
+            if (local.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                p2p_metrics_->local_get_misses.inc();
+            } else {
+                p2p_metrics_->local_get_failures.inc();
+            }
+            p2p_metrics_->local_get_latency.observe(elapsed_us);
+        }
+
         if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to get from local, key: " << key
                        << ", error: " << local.error();
@@ -1134,10 +1205,32 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
     const ReadRouteConfig& config) {
     // 1. Try local first
     if (data_manager_.has_value()) {
+        Stopwatch sw;
         auto local = data_manager_->Get(key, slices);
+        int64_t elapsed_us = sw.elapsed_us();
+
         if (local.has_value()) {
+            // Local get hit
+            if (p2p_metrics_) {
+                p2p_metrics_->local_get_requests.inc();
+                p2p_metrics_->local_get_hits.inc();
+                p2p_metrics_->local_get_bytes.inc(local->data_size);
+                p2p_metrics_->local_get_latency.observe(elapsed_us);
+            }
             return std::move(local.value());
         }
+
+        // Local get miss or failure
+        if (p2p_metrics_) {
+            p2p_metrics_->local_get_requests.inc();
+            if (local.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                p2p_metrics_->local_get_misses.inc();
+            } else {
+                p2p_metrics_->local_get_failures.inc();
+            }
+            p2p_metrics_->local_get_latency.observe(elapsed_us);
+        }
+
         if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to get from local, key: " << key
                        << ", error: " << local.error();
@@ -1617,6 +1710,36 @@ PeerClient& P2PClientService::GetOrCreatePeerClient(
 
     auto [inserted_it, _] = peer_clients_.emplace(endpoint, std::move(client));
     return *inserted_it->second;
+}
+
+// ============================================================================
+// Metrics
+// ============================================================================
+
+tl::expected<std::string, ErrorCode> P2PClientService::GetSummaryMetrics() {
+    auto result = ClientService::GetSummaryMetrics();
+    if (!result) {
+        return result;
+    }
+
+    if (p2p_metrics_) {
+        *result += "\n" + p2p_metrics_->summary_metrics();
+    }
+
+    return result;
+}
+
+tl::expected<std::string, ErrorCode> P2PClientService::SerializeMetrics() {
+    auto result = ClientService::SerializeMetrics();
+    if (!result) {
+        return result;
+    }
+
+    if (p2p_metrics_) {
+        p2p_metrics_->serialize(*result);
+    }
+
+    return result;
 }
 
 }  // namespace mooncake

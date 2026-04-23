@@ -8,7 +8,6 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
-#include "client_metric.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "tiered_cache/tiered_backend.h"
@@ -83,20 +82,11 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
     // using Te, treat local memory as remote memory
     size_t total_size = 0;
     for (const auto& s : slices) total_size += s.size;
-
-    // Record put request
-    if (local_storage_metrics_) {
-        local_storage_metrics_->put_requests.inc();
-    }
-
     auto src_buffers = SlicesToRemoteBufferDescs(slices);
     auto validate_result = ValidateRemoteBuffers(src_buffers);
     if (!validate_result) {
         LOG(ERROR) << "PutViaTe: Buffer validation failed"
                    << ", error: " << toString(validate_result.error());
-        if (local_storage_metrics_) {
-            local_storage_metrics_->put_failures.inc();
-        }
         return tl::unexpected(validate_result.error());
     }
 
@@ -106,7 +96,6 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
 
         if (tiered_backend_->Exist(key)) {
             LOG(WARNING) << "PutViaTe: key already exists: " << key;
-            // Key already exists is not a failure, just return error
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
 
@@ -119,13 +108,6 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
                 LOG(WARNING)
                     << "PutViaTe: object already exists for key: " << key
                     << ", error code: " << err;
-                // Key/replica already exists is not a failure
-            } else {
-                LOG(ERROR) << "PutViaTe: failed to allocate for key: " << key
-                           << ", error code: " << err;
-                if (local_storage_metrics_) {
-                    local_storage_metrics_->put_failures.inc();
-                }
             }
             return tl::unexpected(err);
         }
@@ -138,27 +120,20 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
         LOG(ERROR) << "PutViaTe: SubmitTeTransferInternal failed"
                    << ", key=" << key
                    << ", error_code=" << toString(submit_result.error());
-        if (local_storage_metrics_) {
-            local_storage_metrics_->put_failures.inc();
-        }
         return tl::unexpected(submit_result.error());
     }
 
     return CallableTaskHandle<void>::Create(
-        [this, ctx = std::move(*submit_result), alloc_handle, key,
-         total_size]() mutable -> tl::expected<void, ErrorCode> {
+        [this, ctx = std::move(*submit_result), alloc_handle,
+         key]() mutable -> tl::expected<void, ErrorCode> {
             ScopedVLogTimer timer(1, "DataManager::PutViaTe");
             timer.LogRequest("key=", key);
-            Stopwatch sw;
 
             auto wait_result = WaitAllTransferBatches(ctx.transfer_batches);
             if (!wait_result) {
                 LOG(ERROR) << "PutViaTe: WaitAllTransferBatches failed"
                            << ", key=" << key
                            << ", error_code=" << toString(wait_result.error());
-                if (local_storage_metrics_) {
-                    local_storage_metrics_->put_failures.inc();
-                }
                 return tl::unexpected(wait_result.error());
             }
 
@@ -175,9 +150,6 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
                         << "PutViaTe: CopyFromDRAMBuffer failed"
                         << ", key=" << key
                         << ", error_code=" << toString(copy_result.error());
-                    if (local_storage_metrics_) {
-                        local_storage_metrics_->put_failures.inc();
-                    }
                     return tl::unexpected(copy_result.error());
                 }
             }
@@ -187,14 +159,6 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
             if (!commit_result) {
                 LOG(WARNING) << "PutViaTe: commit race for key: " << key;
             }
-
-            // Record successful put metrics
-            if (local_storage_metrics_) {
-                local_storage_metrics_->put_bytes.inc(total_size);
-                local_storage_metrics_->put_latency_us.observe(
-                    static_cast<double>(sw.elapsed_us()));
-            }
-
             timer.LogResponse("error_code=", ErrorCode::OK);
             return {};
         });
@@ -207,12 +171,6 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
         return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
     }
     Slice slice = slices[0];
-    size_t total_size = slice.size;
-
-    // Record put request
-    if (local_storage_metrics_) {
-        local_storage_metrics_->put_requests.inc();
-    }
 
     AllocationHandle alloc_handle;
     {
@@ -220,7 +178,6 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
 
         if (tiered_backend_->Exist(key)) {
             LOG(WARNING) << "Key already exists: " << key;
-            // Key already exists is not a failure, just return error
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
 
@@ -228,9 +185,6 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
         if (!handle.has_value()) {
             LOG(ERROR) << "Failed to allocate space for key: " << key
                        << ", error: " << handle.error();
-            if (local_storage_metrics_) {
-                local_storage_metrics_->put_failures.inc();
-            }
             return tl::make_unexpected(handle.error());
         }
         alloc_handle = handle.value();
@@ -274,75 +228,44 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
                           ->SubmitSingleTask<tl::expected<void, ErrorCode>>(
                               std::move(write_fn));
         return CallableTaskHandle<void>::Create(
-            [this, f = std::move(future), commit_fn = std::move(commit_fn), key,
-             total_size]() mutable -> tl::expected<void, ErrorCode> {
+            [f = std::move(future), commit_fn = std::move(commit_fn),
+             key]() mutable -> tl::expected<void, ErrorCode> {
                 ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
                 timer.LogRequest("key=", key);
-                Stopwatch sw;
-
                 auto write_result = f.get();
                 if (!write_result) {
                     LOG(ERROR) << "Failed to write data, error: "
                                << write_result.error();
-                    if (local_storage_metrics_) {
-                        local_storage_metrics_->put_failures.inc();
-                    }
                     return tl::make_unexpected(write_result.error());
                 }
                 auto commit_result = commit_fn();
                 if (!commit_result) {
                     LOG(ERROR) << "Failed to commit data, error: "
                                << commit_result.error();
-                    if (local_storage_metrics_) {
-                        local_storage_metrics_->put_failures.inc();
-                    }
                     return tl::make_unexpected(commit_result.error());
                 }
-
-                if (local_storage_metrics_) {
-                    local_storage_metrics_->put_bytes.inc(total_size);
-                    local_storage_metrics_->put_latency_us.observe(
-                        static_cast<double>(sw.elapsed_us()));
-                }
-
                 timer.LogResponse("error_code=", ErrorCode::OK);
                 return {};
             });
     } else {
         // sync write + sync commit
         return CallableTaskHandle<void>::Create(
-            [this, write_fn = std::move(write_fn),
-             commit_fn = std::move(commit_fn), key,
-             total_size]() mutable -> tl::expected<void, ErrorCode> {
+            [write_fn = std::move(write_fn), commit_fn = std::move(commit_fn),
+             key]() mutable -> tl::expected<void, ErrorCode> {
                 ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
                 timer.LogRequest("key=", key);
-                Stopwatch sw;
-
                 auto write_result = write_fn();
                 if (!write_result) {
                     LOG(ERROR) << "Failed to write data, error: "
                                << write_result.error();
-                    if (local_storage_metrics_) {
-                        local_storage_metrics_->put_failures.inc();
-                    }
                     return tl::make_unexpected(write_result.error());
                 }
                 auto commit_result = commit_fn();
                 if (!commit_result) {
                     LOG(ERROR) << "Failed to commit data, error: "
                                << commit_result.error();
-                    if (local_storage_metrics_) {
-                        local_storage_metrics_->put_failures.inc();
-                    }
                     return tl::make_unexpected(commit_result.error());
                 }
-
-                if (local_storage_metrics_) {
-                    local_storage_metrics_->put_bytes.inc(total_size);
-                    local_storage_metrics_->put_latency_us.observe(
-                        static_cast<double>(sw.elapsed_us()));
-                }
-
                 timer.LogResponse("error_code=", ErrorCode::OK);
                 return {};
             });
@@ -355,33 +278,15 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
 
 tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     const std::string& key, std::shared_ptr<ClientBufferAllocator> allocator) {
-    // Record get request
-    if (local_storage_metrics_) {
-        local_storage_metrics_->get_requests.inc();
-    }
-    // Latency measurement covers the full operation including async transfer.
-    auto sw = std::make_shared<Stopwatch>();
-
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
-        if (handle.error() == ErrorCode::OBJECT_NOT_FOUND) {
-            // Key not found is a miss, not a failure
-            if (local_storage_metrics_) {
-                local_storage_metrics_->get_misses.inc();
-            }
-        } else {
+        if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to get data for key: " << key
                        << ", error_code=" << handle.error();
-            if (local_storage_metrics_) {
-                local_storage_metrics_->get_failures.inc();
-            }
         }
         return tl::unexpected(handle.error());
     } else if (!handle.value()->loc.data.buffer) {
         LOG(ERROR) << "Failed to get data for key: " << key;
-        if (local_storage_metrics_) {
-            local_storage_metrics_->get_failures.inc();
-        }
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     const size_t local_size = handle.value()->loc.data.buffer->size();
@@ -389,9 +294,6 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     auto alloc_result = allocator->allocate(local_size);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate space for key: " << key;
-        if (local_storage_metrics_) {
-            local_storage_metrics_->get_failures.inc();
-        }
         return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
     auto read_buf = std::make_shared<BufferHandle>(std::move(*alloc_result));
@@ -401,62 +303,19 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     if (!result) {
         LOG(ERROR) << "Failed to build data copier for key: " << key
                    << ", error_code=" << result.error();
-        if (local_storage_metrics_) {
-            local_storage_metrics_->get_failures.inc();
-        }
-        return tl::unexpected(result.error());
+    } else {
+        result->read_buf = std::move(read_buf);
     }
-
-    result->read_buf = std::move(read_buf);
-
-    // Wrap the task handle to record metrics after async transfer completes
-    auto original_handle = std::move(result->task_handle);
-    result->task_handle = CallableTaskHandle<void>::Create(
-        [this, original_handle = std::move(original_handle), sw,
-         local_size]() mutable -> tl::expected<void, ErrorCode> {
-            auto wait_result = original_handle->Wait();
-            if (!wait_result) {
-                if (local_storage_metrics_) {
-                    local_storage_metrics_->get_failures.inc();
-                }
-                return tl::unexpected(wait_result.error());
-            }
-            // Record successful get metrics
-            if (local_storage_metrics_) {
-                local_storage_metrics_->get_bytes.inc(local_size);
-                local_storage_metrics_->get_latency_us.observe(
-                    static_cast<double>(sw->elapsed_us()));
-            }
-            return {};
-        });
-
     return result;
 }
 
 tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     const std::string& key, const std::vector<Slice>& slices) {
-    // Record get request
-    if (local_storage_metrics_) {
-        local_storage_metrics_->get_requests.inc();
-    }
-    // Latency measurement covers the full operation including async transfer.
-    auto sw = std::make_shared<Stopwatch>();
-    size_t total_size = 0;
-    for (const auto& s : slices) total_size += s.size;
-
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
-        if (handle.error() == ErrorCode::OBJECT_NOT_FOUND) {
-            // Key not found is a miss, not a failure
-            if (local_storage_metrics_) {
-                local_storage_metrics_->get_misses.inc();
-            }
-        } else {
+        if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to get data for key: " << key
                        << ", error_code=" << handle.error();
-            if (local_storage_metrics_) {
-                local_storage_metrics_->get_failures.inc();
-            }
         }
         return tl::unexpected(handle.error());
     }
@@ -464,33 +323,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     if (!result) {
         LOG(ERROR) << "Failed to build data copier for key: " << key
                    << ", error_code=" << result.error();
-        if (local_storage_metrics_) {
-            local_storage_metrics_->get_failures.inc();
-        }
-        return tl::unexpected(result.error());
     }
-
-    // Wrap the task handle to record metrics after async transfer completes
-    auto original_handle = std::move(result->task_handle);
-    result->task_handle = CallableTaskHandle<void>::Create(
-        [this, original_handle = std::move(original_handle), sw,
-         total_size]() mutable -> tl::expected<void, ErrorCode> {
-            auto wait_result = original_handle->Wait();
-            if (!wait_result) {
-                if (local_storage_metrics_) {
-                    local_storage_metrics_->get_failures.inc();
-                }
-                return tl::unexpected(wait_result.error());
-            }
-            // Record successful get metrics
-            if (local_storage_metrics_) {
-                local_storage_metrics_->get_bytes.inc(total_size);
-                local_storage_metrics_->get_latency_us.observe(
-                    static_cast<double>(sw->elapsed_us()));
-            }
-            return {};
-        });
-
     return result;
 }
 
