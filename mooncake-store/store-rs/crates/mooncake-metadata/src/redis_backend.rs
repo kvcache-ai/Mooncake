@@ -2432,7 +2432,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Condvar, Mutex, OnceLock};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
@@ -2463,6 +2463,7 @@ mod tests {
         child: Child,
         url: String,
         dir: PathBuf,
+        _env_guard: Option<EnvLockGuard>,
     }
 
     impl RedisTestServer {
@@ -2471,13 +2472,22 @@ mod tests {
         }
 
         fn start_with_password(password: Option<&str>) -> Option<Self> {
+            let env_guard = env_lock();
             let listener = TcpListener::bind("127.0.0.1:0").ok()?;
             let port = listener.local_addr().ok()?.port();
             drop(listener);
-            Self::start_on_port(port, password)
+            Self::start_on_port_with_guard(port, password, Some(env_guard))
         }
 
         fn start_on_port(port: u16, password: Option<&str>) -> Option<Self> {
+            Self::start_on_port_with_guard(port, password, None)
+        }
+
+        fn start_on_port_with_guard(
+            port: u16,
+            password: Option<&str>,
+            env_guard: Option<EnvLockGuard>,
+        ) -> Option<Self> {
             let dir = std::env::temp_dir().join(format!("mooncake-store-rs-redis-{port}"));
             let _ = std::fs::create_dir_all(&dir);
             let mut command = Command::new("redis-server");
@@ -2510,7 +2520,12 @@ mod tests {
                     .and_then(|client| client.get_connection().ok())
                     .is_some()
                 {
-                    return Some(Self { child, url, dir });
+                    return Some(Self {
+                        child,
+                        url,
+                        dir,
+                        _env_guard: env_guard,
+                    });
                 }
                 sleep(Duration::from_millis(25));
             }
@@ -2584,11 +2599,27 @@ mod tests {
         }
     }
 
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock should not be poisoned")
+    struct EnvLockGuard;
+
+    impl Drop for EnvLockGuard {
+        fn drop(&mut self) {
+            let (lock, ready) = ENV_LOCK.get_or_init(|| (Mutex::new(false), Condvar::new()));
+            let mut held = lock.lock().expect("env lock should not be poisoned");
+            *held = false;
+            ready.notify_one();
+        }
+    }
+
+    static ENV_LOCK: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
+
+    fn env_lock() -> EnvLockGuard {
+        let (lock, ready) = ENV_LOCK.get_or_init(|| (Mutex::new(false), Condvar::new()));
+        let mut held = lock.lock().expect("env lock should not be poisoned");
+        while *held {
+            held = ready.wait(held).expect("env lock should not be poisoned");
+        }
+        *held = true;
+        EnvLockGuard
     }
 
     #[test]
@@ -3946,7 +3977,6 @@ mod tests {
 
     #[test]
     fn redis_auth_normalization_strips_username_when_password_auth_works() {
-        let _guard = env_lock();
         let Some(server) = RedisTestServer::start_with_password(Some("legacy-pass")) else {
             return;
         };
