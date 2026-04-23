@@ -26,6 +26,7 @@ Use the document that matches what you are doing.
 | understand repository structure | `docs/components.md` |
 | understand implemented capabilities | `docs/features.md` |
 | understand runtime flow and control plane behavior | `docs/architecture.md` |
+| add or review tests, run the suite, understand the fault-injection model | `docs/testing.md` |
 | onboard an AI agent or collaborator to the repo workflow | `docs/skills/mooncake-store-rs-dev/SKILL.md`, `scripts/install-dev-skill.sh` |
 
 ## AI Agent Skill
