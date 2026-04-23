@@ -44,7 +44,7 @@ Operational notes:
 
 ## Admin maintenance
 
-Redis-backed deployments now support a stateless admin maintenance loop for stale segment cleanup.
+Redis-backed and etcd-backed deployments now support a stateless admin maintenance loop for stale segment cleanup.
 The same admin server can also run tenant-quota reservation reconcile for an explicit tenant list.
 
 Relevant surfaces:
@@ -55,10 +55,11 @@ Relevant surfaces:
 
 Operational model:
 
-- client lease keys still use Redis TTL as the liveness signal
-- segment keys still do **not** use TTL
-- lease publish and heartbeat refresh now also update a Redis sorted-set expiry index under the same metadata keyspace
-- the admin maintenance loop consumes due entries from that expiry index, re-checks lease liveness, and only then removes dead-owner segment metadata through the owner segment index
+- Redis lease keys still use TTL as the liveness signal
+- etcd lease keys do not expire automatically; admin re-checks the stored `expires_at_ms` field when due work arrives
+- segment keys still do **not** use TTL in either backend
+- lease publish and heartbeat refresh now also update a backend-native expiry work index under the same metadata keyspace: Redis uses one sorted set, etcd uses `by-runtime` + lexicographically ordered `by-time` keys
+- the admin maintenance loop consumes due entries from that work index, re-checks lease liveness, and only then removes dead-owner segment metadata through owner-scoped segment metadata instead of a hidden global scan in the steady-state worker
 - same-epoch lease reclaim after an expired lease key is allowed when that epoch is still the historical HWM and no higher live epoch exists, so heartbeat repair does not fail with `StaleEpoch` after a TTL gap
 - tenant quota reconcile is intentionally opt-in per tenant because the current metadata model has no bounded global tenant-work index for the admin plane to consume safely
 

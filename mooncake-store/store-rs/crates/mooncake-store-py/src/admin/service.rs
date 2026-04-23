@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{
-    ClientLeaseLiveness, MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig,
+    ClientLeaseLiveness, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace,
+    RedisMetadataBackend, RedisMetadataCleanupReport, RedisMetadataConfig,
 };
 use mooncake_store_client::record_tenant_quota_reconcile;
 use mooncake_store_core::{
@@ -34,18 +35,156 @@ pub struct AdminService {
     keyspace: MetadataKeyspace,
 }
 
+trait AdminMaintenanceBackend {
+    fn cleanup_stale_segments_for_owner(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> AdminResult<RedisMetadataCleanupReport>;
+    fn client_lease_liveness(&self, runtime: &ClientRuntimeId) -> AdminResult<ClientLeaseLiveness>;
+    fn list_due_client_lease_expiries(
+        &self,
+        expires_before_ms: u64,
+        limit: usize,
+    ) -> AdminResult<Vec<String>>;
+    fn refresh_client_lease_expiry(
+        &self,
+        runtime: &ClientRuntimeId,
+        expires_at_ms: u64,
+    ) -> AdminResult<()>;
+    fn remove_client_lease_expiry(&self, runtime: &ClientRuntimeId) -> AdminResult<bool>;
+    fn remove_client_lease_expiry_entry(&self, lease_key: &str) -> AdminResult<bool>;
+}
+
+impl AdminMaintenanceBackend for RedisMetadataBackend {
+    fn cleanup_stale_segments_for_owner(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> AdminResult<RedisMetadataCleanupReport> {
+        Self::cleanup_stale_segments_for_owner(self, runtime)
+    }
+
+    fn client_lease_liveness(&self, runtime: &ClientRuntimeId) -> AdminResult<ClientLeaseLiveness> {
+        Self::client_lease_liveness(self, runtime)
+    }
+
+    fn list_due_client_lease_expiries(
+        &self,
+        expires_before_ms: u64,
+        limit: usize,
+    ) -> AdminResult<Vec<String>> {
+        Self::list_due_client_lease_expiries(self, expires_before_ms, limit)
+    }
+
+    fn refresh_client_lease_expiry(
+        &self,
+        runtime: &ClientRuntimeId,
+        expires_at_ms: u64,
+    ) -> AdminResult<()> {
+        Self::refresh_client_lease_expiry(self, runtime, expires_at_ms)
+    }
+
+    fn remove_client_lease_expiry(&self, runtime: &ClientRuntimeId) -> AdminResult<bool> {
+        Self::remove_client_lease_expiry(self, runtime)
+    }
+
+    fn remove_client_lease_expiry_entry(&self, lease_key: &str) -> AdminResult<bool> {
+        Self::remove_client_lease_expiry_entry(self, lease_key)
+    }
+}
+
+impl AdminMaintenanceBackend for EtcdMetadataBackend {
+    fn cleanup_stale_segments_for_owner(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> AdminResult<RedisMetadataCleanupReport> {
+        Self::cleanup_stale_segments_for_owner(self, runtime)
+    }
+
+    fn client_lease_liveness(&self, runtime: &ClientRuntimeId) -> AdminResult<ClientLeaseLiveness> {
+        Self::client_lease_liveness(self, runtime)
+    }
+
+    fn list_due_client_lease_expiries(
+        &self,
+        expires_before_ms: u64,
+        limit: usize,
+    ) -> AdminResult<Vec<String>> {
+        Self::list_due_client_lease_expiries(self, expires_before_ms, limit)
+    }
+
+    fn refresh_client_lease_expiry(
+        &self,
+        runtime: &ClientRuntimeId,
+        expires_at_ms: u64,
+    ) -> AdminResult<()> {
+        Self::refresh_client_lease_expiry(self, runtime, expires_at_ms)
+    }
+
+    fn remove_client_lease_expiry(&self, runtime: &ClientRuntimeId) -> AdminResult<bool> {
+        Self::remove_client_lease_expiry(self, runtime)
+    }
+
+    fn remove_client_lease_expiry_entry(&self, lease_key: &str) -> AdminResult<bool> {
+        Self::remove_client_lease_expiry_entry(self, lease_key)
+    }
+}
+
+enum MaintenanceBackend {
+    Redis(RedisMetadataBackend),
+    Etcd(EtcdMetadataBackend),
+}
+
+fn normalize_etcd_endpoint(endpoint: &str) -> String {
+    if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
+fn admin_cleanup_report(report: &RedisMetadataCleanupReport) -> AdminCleanupReport {
+    AdminCleanupReport {
+        live_clients: report.live_clients,
+        inspected_segment_keys: report.inspected_segment_keys,
+        removed_segment_keys: report.removed_segment_keys,
+        removed_segment_index_entries: report.removed_segment_index_entries,
+        removed_owner_segment_index_entries: report.removed_owner_segment_index_entries,
+        stale_missing_segment_index_entries: report.stale_missing_segment_index_entries,
+    }
+}
+
 impl AdminService {
-    fn redis_metadata_backend(&self) -> AdminResult<RedisMetadataBackend> {
-        if !self.metadata_url.starts_with("redis://") && !self.metadata_url.starts_with("rediss://")
-        {
-            return Err(StoreError::Unsupported(
-                "stale segment maintenance currently supports redis:// and rediss:// metadata only"
-                    .to_string(),
-            ));
+    fn maintenance_backend(&self) -> AdminResult<MaintenanceBackend> {
+        if self.metadata_url.starts_with("redis://") || self.metadata_url.starts_with("rediss://") {
+            return RedisMetadataBackend::new(
+                RedisMetadataConfig::new(self.metadata_url.clone()).keyspace(self.keyspace.clone()),
+            )
+            .map(MaintenanceBackend::Redis);
         }
-        RedisMetadataBackend::new(
-            RedisMetadataConfig::new(self.metadata_url.clone()).keyspace(self.keyspace.clone()),
-        )
+        if let Some(rest) = self.metadata_url.strip_prefix("etcd://") {
+            let endpoints = rest
+                .split(',')
+                .filter(|entry| !entry.trim().is_empty())
+                .map(|entry| normalize_etcd_endpoint(entry.trim()))
+                .collect::<Vec<_>>();
+            if endpoints.is_empty() {
+                return Err(StoreError::Metadata(
+                    "etcd metadata url must contain at least one endpoint".to_string(),
+                ));
+            }
+            return EtcdMetadataBackend::from_config(
+                EtcdMetadataConfig::new(endpoints).keyspace(self.keyspace.clone()),
+            )
+            .map(MaintenanceBackend::Etcd);
+        }
+        Err(StoreError::Unsupported(
+            "stale segment maintenance currently supports redis://, rediss://, and etcd:// metadata only"
+                .to_string(),
+        ))
+    }
+
+    pub fn supports_stale_segment_maintenance(&self) -> bool {
+        self.maintenance_backend().is_ok()
     }
 
     pub fn from_config(metadata_url: &str, keyspace: Option<String>) -> AdminResult<Self> {
@@ -408,28 +547,32 @@ impl AdminService {
     }
 
     pub fn cleanup_stale_segments(&self) -> AdminResult<AdminCleanupReport> {
-        let backend = self.redis_metadata_backend()?;
-        let report = backend.cleanup_stale_segments()?;
-        Ok(AdminCleanupReport {
-            live_clients: report.live_clients,
-            inspected_segment_keys: report.inspected_segment_keys,
-            removed_segment_keys: report.removed_segment_keys,
-            removed_segment_index_entries: report.removed_segment_index_entries,
-            removed_owner_segment_index_entries: report.removed_owner_segment_index_entries,
-            stale_missing_segment_index_entries: report.stale_missing_segment_index_entries,
-        })
+        match self.maintenance_backend()? {
+            MaintenanceBackend::Redis(backend) => {
+                Ok(admin_cleanup_report(&backend.cleanup_stale_segments()?))
+            }
+            MaintenanceBackend::Etcd(backend) => {
+                Ok(admin_cleanup_report(&backend.cleanup_stale_segments()?))
+            }
+        }
     }
 
     pub fn cleanup_stale_segments_for_owner(
         &self,
         runtime: &ClientRuntimeId,
     ) -> AdminResult<AdminOwnerCleanupReport> {
-        let backend = self.redis_metadata_backend()?;
-        Self::cleanup_stale_segments_for_owner_with_backend(&backend, runtime)
+        match self.maintenance_backend()? {
+            MaintenanceBackend::Redis(backend) => {
+                Self::cleanup_stale_segments_for_owner_with_backend(&backend, runtime)
+            }
+            MaintenanceBackend::Etcd(backend) => {
+                Self::cleanup_stale_segments_for_owner_with_backend(&backend, runtime)
+            }
+        }
     }
 
-    fn cleanup_stale_segments_for_owner_with_backend(
-        backend: &RedisMetadataBackend,
+    fn cleanup_stale_segments_for_owner_with_backend<B: AdminMaintenanceBackend>(
+        backend: &B,
         runtime: &ClientRuntimeId,
     ) -> AdminResult<AdminOwnerCleanupReport> {
         match backend.client_lease_liveness(runtime)? {
@@ -454,16 +597,7 @@ impl AdminService {
                 Ok(AdminOwnerCleanupReport {
                     owner: runtime.clone(),
                     state: AdminOwnerCleanupState::CleanedMissingLease,
-                    cleanup: AdminCleanupReport {
-                        live_clients: cleanup.live_clients,
-                        inspected_segment_keys: cleanup.inspected_segment_keys,
-                        removed_segment_keys: cleanup.removed_segment_keys,
-                        removed_segment_index_entries: cleanup.removed_segment_index_entries,
-                        removed_owner_segment_index_entries: cleanup
-                            .removed_owner_segment_index_entries,
-                        stale_missing_segment_index_entries: cleanup
-                            .stale_missing_segment_index_entries,
-                    },
+                    cleanup: admin_cleanup_report(&cleanup),
                 })
             }
             ClientLeaseLiveness::Expired(lease) => {
@@ -472,16 +606,7 @@ impl AdminService {
                 Ok(AdminOwnerCleanupReport {
                     owner: lease.runtime,
                     state: AdminOwnerCleanupState::CleanedExpiredLease,
-                    cleanup: AdminCleanupReport {
-                        live_clients: cleanup.live_clients,
-                        inspected_segment_keys: cleanup.inspected_segment_keys,
-                        removed_segment_keys: cleanup.removed_segment_keys,
-                        removed_segment_index_entries: cleanup.removed_segment_index_entries,
-                        removed_owner_segment_index_entries: cleanup
-                            .removed_owner_segment_index_entries,
-                        stale_missing_segment_index_entries: cleanup
-                            .stale_missing_segment_index_entries,
-                    },
+                    cleanup: admin_cleanup_report(&cleanup),
                 })
             }
         }
@@ -491,7 +616,21 @@ impl AdminService {
         &self,
         limit: usize,
     ) -> AdminResult<AdminMaintenanceReport> {
-        let backend = self.redis_metadata_backend()?;
+        match self.maintenance_backend()? {
+            MaintenanceBackend::Redis(backend) => {
+                self.reconcile_due_stale_segments_with_backend(&backend, limit)
+            }
+            MaintenanceBackend::Etcd(backend) => {
+                self.reconcile_due_stale_segments_with_backend(&backend, limit)
+            }
+        }
+    }
+
+    fn reconcile_due_stale_segments_with_backend<B: AdminMaintenanceBackend>(
+        &self,
+        backend: &B,
+        limit: usize,
+    ) -> AdminResult<AdminMaintenanceReport> {
         let due_entries = backend.list_due_client_lease_expiries(now_ms(), limit)?;
         let mut report = AdminMaintenanceReport {
             due_entries: due_entries.len(),
@@ -505,7 +644,7 @@ impl AdminService {
                 continue;
             };
             let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(epoch));
-            let outcome = Self::cleanup_stale_segments_for_owner_with_backend(&backend, &runtime)?;
+            let outcome = Self::cleanup_stale_segments_for_owner_with_backend(backend, &runtime)?;
             match outcome.state {
                 AdminOwnerCleanupState::SkippedLive => {
                     report.skipped_live = report.skipped_live.saturating_add(1);
@@ -742,7 +881,10 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use mooncake_metadata::{InMemoryMetadataBackend, RedisMetadataBackend, RedisMetadataConfig};
+    use mooncake_metadata::{
+        EtcdMetadataBackend, EtcdMetadataConfig, InMemoryMetadataBackend, RedisMetadataBackend,
+        RedisMetadataConfig,
+    };
     use mooncake_store_core::{
         ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, MetadataBackend, ObjectRoute,
         ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentAnnouncement,
@@ -823,6 +965,90 @@ mod tests {
     }
 
     impl Drop for RedisTestServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    struct EtcdTestServer {
+        child: Child,
+        endpoint: String,
+        dir: PathBuf,
+    }
+
+    fn etcd_ready(endpoint: &str) -> bool {
+        let Some(port) = endpoint
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+        else {
+            return false;
+        };
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+    }
+
+    impl EtcdTestServer {
+        fn start() -> Option<Self> {
+            let client_listener = TcpListener::bind("127.0.0.1:0").ok()?;
+            let client_port = client_listener.local_addr().ok()?.port();
+            drop(client_listener);
+
+            let peer_listener = TcpListener::bind("127.0.0.1:0").ok()?;
+            let peer_port = peer_listener.local_addr().ok()?.port();
+            drop(peer_listener);
+
+            let dir = std::env::temp_dir().join(format!(
+                "mooncake-admin-etcd-test-{}-{client_port}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).ok()?;
+            let endpoint = format!("http://127.0.0.1:{client_port}");
+            let peer_url = format!("http://127.0.0.1:{peer_port}");
+            let child = Command::new("etcd")
+                .arg("--name")
+                .arg("default")
+                .arg("--data-dir")
+                .arg(&dir)
+                .arg("--listen-client-urls")
+                .arg(&endpoint)
+                .arg("--advertise-client-urls")
+                .arg(&endpoint)
+                .arg("--listen-peer-urls")
+                .arg(&peer_url)
+                .arg("--initial-advertise-peer-urls")
+                .arg(&peer_url)
+                .arg("--initial-cluster")
+                .arg(format!("default={peer_url}"))
+                .arg("--initial-cluster-state")
+                .arg("new")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if etcd_ready(&endpoint) {
+                    sleep(Duration::from_millis(100));
+                    return Some(Self {
+                        child,
+                        endpoint,
+                        dir,
+                    });
+                }
+                sleep(Duration::from_millis(25));
+            }
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            None
+        }
+    }
+
+    impl Drop for EtcdTestServer {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -1155,6 +1381,118 @@ mod tests {
             .expect("redis backend should initialize"),
         );
         let service = AdminService::new(backend.clone(), server.url.clone(), keyspace);
+
+        let live_runtime = ClientRuntimeId::new("live-owner", ClientEpoch(3));
+        backend
+            .upsert_client_lease(&mooncake_store_core::ClientLease {
+                runtime: live_runtime.clone(),
+                state: mooncake_store_core::ClientLifecycleState::Active,
+                compatibility: CompatibilityDescriptor::default(),
+                endpoints: mooncake_store_core::ClientEndpointSet::default(),
+                expires_at_ms: super::now_ms().saturating_add(60_000),
+            })
+            .expect("live lease publish should succeed");
+        let segment = SegmentAnnouncement {
+            owner: live_runtime.clone(),
+            segment_name: SegmentName::new("live-segment"),
+            capacity_bytes: 128,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 16,
+            tags: vec!["dram".to_string()],
+        };
+        backend
+            .publish_segment(&segment)
+            .expect("live segment publish should succeed");
+        backend
+            .refresh_client_lease_expiry(&live_runtime, super::now_ms().saturating_sub(1))
+            .expect("expiry queue seed should succeed");
+
+        let report = service
+            .reconcile_due_stale_segments(8)
+            .expect("maintenance reconcile should succeed");
+        assert_eq!(report.due_entries, 1);
+        assert_eq!(report.skipped_live, 1);
+        assert_eq!(report.removed_segment_keys, 0);
+        assert_eq!(
+            backend
+                .list_segments(None)
+                .expect("segment listing should succeed"),
+            vec![segment]
+        );
+        assert!(backend
+            .list_due_client_lease_expiries(super::now_ms(), 8)
+            .expect("expiry queue should be queryable")
+            .is_empty());
+    }
+
+    #[test]
+    fn admin_service_reconcile_due_stale_segments_cleans_missing_lease_owner_in_etcd() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/admin-stale-maint-missing-etcd");
+        let backend = Arc::new(
+            EtcdMetadataBackend::from_config(
+                EtcdMetadataConfig::new([server.endpoint.clone()]).keyspace(keyspace.clone()),
+            )
+            .expect("etcd backend should initialize"),
+        );
+        let service = AdminService::new(
+            backend.clone(),
+            format!("etcd://{}", server.endpoint),
+            keyspace,
+        );
+
+        let dead_runtime = ClientRuntimeId::new("dead-owner", ClientEpoch(9));
+        backend
+            .publish_segment(&SegmentAnnouncement {
+                owner: dead_runtime.clone(),
+                segment_name: SegmentName::new("dead-segment"),
+                capacity_bytes: 256,
+                used_bytes: 64,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: 16,
+                tags: vec!["dram".to_string()],
+            })
+            .expect("dead segment publish should succeed");
+        backend
+            .refresh_client_lease_expiry(&dead_runtime, super::now_ms().saturating_sub(1))
+            .expect("expiry queue seed should succeed");
+
+        let report = service
+            .reconcile_due_stale_segments(8)
+            .expect("maintenance reconcile should succeed");
+        assert_eq!(report.due_entries, 1);
+        assert_eq!(report.cleaned_missing_lease, 1);
+        assert_eq!(report.removed_segment_keys, 1);
+        assert!(backend
+            .list_segments(None)
+            .expect("segment listing should succeed")
+            .is_empty());
+        assert!(backend
+            .list_due_client_lease_expiries(super::now_ms(), 8)
+            .expect("expiry queue should be queryable")
+            .is_empty());
+    }
+
+    #[test]
+    fn admin_service_reconcile_due_stale_segments_skips_live_owner_in_etcd() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/admin-stale-maint-live-etcd");
+        let backend = Arc::new(
+            EtcdMetadataBackend::from_config(
+                EtcdMetadataConfig::new([server.endpoint.clone()]).keyspace(keyspace.clone()),
+            )
+            .expect("etcd backend should initialize"),
+        );
+        let service = AdminService::new(
+            backend.clone(),
+            format!("etcd://{}", server.endpoint),
+            keyspace,
+        );
 
         let live_runtime = ClientRuntimeId::new("live-owner", ClientEpoch(3));
         backend

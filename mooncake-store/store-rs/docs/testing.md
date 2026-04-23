@@ -22,18 +22,18 @@ and conventions are the contract.
 
 ## Test Inventory
 
-Workspace `cargo test --lib` runs 873 tests across the workspace crates listed
+Workspace `cargo test --lib` runs 877 tests across the workspace crates listed
 below. The Redis-backed integration tests inside `mooncake-metadata` and
 `mooncake-store-py` skip silently when no `redis-server` binary is on `PATH`;
-the etcd backend tests skip when no etcd service is reachable; all other tests
-run unconditionally.
+the etcd-backed integration tests skip when no local `etcd` binary is
+available; all other tests run unconditionally.
 
 | Crate | `--lib` tests | Notes |
 |---|---:|---|
 | `mooncake-store-client` | 535 | Dominant runtime; includes property tests and fault-injection integration |
 | `mooncake-store-core` | 112 | Pure-type contracts: identity, route, compat, error, codec |
-| `mooncake-metadata` | 109 | In-memory backend + keyspace + segment state + Redis / etcd integration |
-| `mooncake-store-py` | 92 | PyO3 bindings, admin service, setup helpers (3 `#[ignore]`, including Redis-backed admin maintenance tests) |
+| `mooncake-metadata` | 111 | In-memory backend + keyspace + segment state + Redis / etcd integration |
+| `mooncake-store-py` | 94 | PyO3 bindings, admin service, setup helpers (3 `#[ignore]`, including Redis-backed and etcd-backed admin maintenance tests) |
 | `mooncake-transport` | 21 | Transport-core trait behaviour |
 | `mooncake-transport-sys` | 4 | FFI shim sanity checks |
 | `mooncake-store-test-utils` | 0 | Test-only crate — no self-tests |
@@ -160,11 +160,12 @@ End-to-end flows that compose ≥2 real components without mocks.
 - `mooncake-metadata::redis_backend::tests::redis_backend_*` — 35 tests
   spin up a local `redis-server` (falling back to no-op if absent), exercise
   the full metadata surface, Lua-script atomicity, transient-error retry.
-- `mooncake-metadata::etcd_backend::tests::etcd_backend_*` — 5 tests gated
-  on a running etcd (same conditional-skip pattern as Redis).
-- `mooncake-store-py::admin::service::tests::*stale_segments*` — 2 Redis-backed
-  admin-maintenance scenarios verify dead-owner segment cleanup and live-owner
-  skip semantics against the real metadata backend.
+- `mooncake-metadata::etcd_backend::tests::etcd_backend_*` — 7 tests gated
+  on a local `etcd` binary, covering round-trip metadata behavior plus expiry
+  work-index and owner-scoped cleanup semantics.
+- `mooncake-store-py::admin::service::tests::*stale_segments*` — 4 backend-integrated
+  admin-maintenance scenarios verify dead-owner cleanup and live-owner skip
+  semantics against both Redis and etcd metadata backends.
 - `mooncake-store-client::client::tests::mod.rs` — 116 scenarios build
   multi-client topologies sharing an `InMemoryMetadataBackend` and verify
   cross-client handoff, drain, evacuation, metrics rendering.
@@ -266,6 +267,25 @@ Admin service scenarios covered:
 - live owners that happen to appear in the expiry queue are re-checked and
   skipped instead of being cleaned speculatively
 
+## Etcd-backed Integration: Conditional Skip
+
+`EtcdTestServer::start()` in `mooncake-metadata/src/etcd_backend.rs` and
+`crates/mooncake-store-py/src/admin/service.rs` spawns a local single-node
+`etcd` child process on ephemeral client/peer ports. The readiness probe waits
+for the server to accept traffic before the test continues.
+
+When the binary is absent the test returns early. This keeps developer laptops
+usable while still exercising the etcd-specific maintenance path anywhere the
+binary is installed.
+
+Etcd scenarios covered:
+
+- same-epoch reclaim after a missing lease key
+- backend-native due-expiry work indexing via `by-runtime` + `by-time` keys
+- owner-scoped stale-segment cleanup without a steady-state full scan
+- admin reconcile against real etcd metadata for both dead-owner cleanup and
+  live-owner skip behavior
+
 ### Transient-error classifier
 
 `should_retry_transient_redis_error` classifies connection-level failures
@@ -363,8 +383,9 @@ ssh sg 'cd /root/mooncake-store-rs && source /root/.cargo/env \
   artifact for downstream E2E jobs.
 
 Redis-backed lib tests inside `mooncake-metadata` and `mooncake-store-py`
-run only if the CI image has a `redis-server` binary. The current CI image
-includes one, so those Redis-backed coverage paths do execute on every MR.
+run only if the CI image has a `redis-server` binary. Etcd-backed tests run
+only if the image also includes a local `etcd` binary. Redis coverage runs on
+the current CI image; etcd coverage depends on the builder image contents.
 
 Property-test case budgets (32 / 64 / 512) are the per-file defaults; they
 do not expand under CI.

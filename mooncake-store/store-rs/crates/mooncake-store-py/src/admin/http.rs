@@ -776,7 +776,7 @@ mod tests {
             ),
         );
         assert!(response.contains("HTTP/1.1 501 Not Implemented"));
-        assert!(response.contains("supports redis:// and rediss:// metadata only"));
+        assert!(response.contains("supports redis://, rediss://, and etcd:// metadata only"));
 
         server.shutdown().expect("server shutdown");
     }
