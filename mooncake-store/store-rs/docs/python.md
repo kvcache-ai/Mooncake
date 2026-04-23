@@ -242,7 +242,7 @@ Useful flags:
 - `--route-control metadata-only|embedded-wrh` as a compatibility fallback for route authority mode; prefer admin-managed tenant policy in metadata
 - `--heartbeat-interval-ms`, `--heartbeat-timeout-ms`, and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
 - `--request-timeout-ms` to set the outer request deadline for routed operations and dispatcher calls
-- `--startup-timeout-ms` to override the compatibility registration timeout used by startup local-memory registration plus real-mode `register_buffer` / `unregister_buffer`; when unset the runtime uses `max(10s, ceil(registration_bytes / 1 GiB))`
+- `--startup-timeout-ms` to override the compatibility registration timeout used by startup local-memory registration plus real-mode `register_buffer` / `unregister_buffer`; when unset the runtime uses `max(20s, ceil(registration_bytes / 1 GiB))`
 - `--transfer-stall-timeout-ms` to set the inner transport stall detector for TENT / classic TE
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
 - `--client-server-address host:port` to expose the standalone compatibility server for dummy clients only
@@ -267,7 +267,7 @@ Heartbeat behavior:
 
 - timeout knobs now come from one shared helper across the standalone client, Python compatibility runtime, and dummy client
 - `--request-timeout-ms` / `MC_STORE_RS_REQUEST_TIMEOUT_MS` sets the outer request deadline
-- `--startup-timeout-ms` / `MC_STORE_RS_STARTUP_TIMEOUT_MS` sets the registration-specific timeout budget; when unset the runtime derives it from the current registration size with a `10s` floor
+- `--startup-timeout-ms` / `MC_STORE_RS_STARTUP_TIMEOUT_MS` sets the registration-specific timeout budget; when unset the runtime derives it from the current registration size with a `20s` floor
 - `--heartbeat-timeout-ms` / `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` sets the dedicated heartbeat publish timeout
 - `--transfer-stall-timeout-ms` / `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` sets the inner transfer stall detector
 - `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` controls dummy gRPC calls and falls back to `MC_STORE_RS_REQUEST_TIMEOUT_MS`
