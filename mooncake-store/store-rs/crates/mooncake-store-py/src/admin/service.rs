@@ -391,10 +391,10 @@ impl AdminService {
     ) -> AdminResult<TenantQuotaAbortResponse> {
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         let root_scope = root_tenant_scope(&scope)?;
-        let reservations = self.backend.list_tenant_quota_reservations(&root_scope)?;
-        let reservation = reservations
-            .into_iter()
-            .find(|entry| entry.reservation_id == reservation_id)
+        let reservation = self
+            .backend
+            .get_tenant_quota_reservation(reservation_id)?
+            .filter(|entry| entry.scope == root_scope)
             .ok_or_else(|| {
                 StoreError::NotFound(format!(
                     "tenant quota reservation {reservation_id} was not found in {}",
@@ -1128,6 +1128,21 @@ mod tests {
             key: &ObjectKey,
         ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
             self.inner.get_tenant_object_accounting(key)
+        }
+
+        fn get_tenant_quota_reservation(
+            &self,
+            reservation_id: &str,
+        ) -> mooncake_store_core::Result<Option<TenantQuotaReservation>> {
+            self.inner.get_tenant_quota_reservation(reservation_id)
+        }
+
+        fn list_tenant_eviction_candidates(
+            &self,
+            scope: &TenantPolicyScope,
+            limit: usize,
+        ) -> mooncake_store_core::Result<Vec<TenantObjectAccounting>> {
+            self.inner.list_tenant_eviction_candidates(scope, limit)
         }
 
         fn list_tenant_quota_reservations(

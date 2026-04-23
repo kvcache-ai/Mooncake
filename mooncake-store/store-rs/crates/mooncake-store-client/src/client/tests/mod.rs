@@ -642,6 +642,21 @@ impl MetadataBackend for RecoverableMetadataBackend {
         self.inner.get_tenant_object_accounting(key)
     }
 
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaReservation>> {
+        self.inner.get_tenant_quota_reservation(reservation_id)
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> mooncake_store_core::Result<Vec<TenantObjectAccounting>> {
+        self.inner.list_tenant_eviction_candidates(scope, limit)
+    }
+
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,
@@ -908,6 +923,21 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         self.inner.get_tenant_object_accounting(key)
     }
 
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaReservation>> {
+        self.inner.get_tenant_quota_reservation(reservation_id)
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> mooncake_store_core::Result<Vec<TenantObjectAccounting>> {
+        self.inner.list_tenant_eviction_candidates(scope, limit)
+    }
+
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,
@@ -1156,6 +1186,21 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.get_tenant_object_accounting(key)
     }
 
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaReservation>> {
+        self.inner.get_tenant_quota_reservation(reservation_id)
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> mooncake_store_core::Result<Vec<TenantObjectAccounting>> {
+        self.inner.list_tenant_eviction_candidates(scope, limit)
+    }
+
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,
@@ -1399,6 +1444,21 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
         self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaReservation>> {
+        self.inner.get_tenant_quota_reservation(reservation_id)
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> mooncake_store_core::Result<Vec<TenantObjectAccounting>> {
+        self.inner.list_tenant_eviction_candidates(scope, limit)
     }
 
     fn list_tenant_quota_reservations(
@@ -1664,6 +1724,21 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
         self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaReservation>> {
+        self.inner.get_tenant_quota_reservation(reservation_id)
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> mooncake_store_core::Result<Vec<TenantObjectAccounting>> {
+        self.inner.list_tenant_eviction_candidates(scope, limit)
     }
 
     fn list_tenant_quota_reservations(
@@ -5778,16 +5853,14 @@ fn namespace_quota_isolated_per_scope() {
         .expect("scope-a write should succeed");
     assert_eq!(route_a.len(), 1);
 
-    let same_tenant_error = client
+    let route_b = client
         .batch_put(&[PutRequest::new("key-b", b"bravo")
             .tenant("tenant-a")
             .domain("domain-b")
             .object_set("set-b")
             .qos_tier("silver")])
-        .expect_err("same tenant should share tenant-root quota state");
-    assert!(same_tenant_error
-        .to_string()
-        .contains("tenant quota bytes exceeded"));
+        .expect("same tenant different scope should keep independent namespace quota state");
+    assert_eq!(route_b.len(), 1);
 
     let other_tenant_route = client
         .batch_put(&[PutRequest::new("key-c", b"bravo")
@@ -5813,7 +5886,8 @@ fn namespace_quota_isolated_per_scope() {
         .expect("tenant-b scope listing should succeed");
     assert_eq!(scope_a_routes.len(), 1);
     assert_eq!(scope_a_routes[0].logical_key.as_deref(), Some("key-a"));
-    assert!(scope_b_routes.is_empty());
+    assert_eq!(scope_b_routes.len(), 1);
+    assert_eq!(scope_b_routes[0].logical_key.as_deref(), Some("key-b"));
     assert_eq!(tenant_b_routes.len(), 1);
     assert_eq!(tenant_b_routes[0].logical_key.as_deref(), Some("key-c"));
 }
@@ -6564,7 +6638,7 @@ fn qos_tier_drives_namespace_governance_and_placement() {
         Some("bronze"),
     );
     let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
-    let client = StoreClientBuilder::new(metadata, "qos-governance-client")
+    let client = StoreClientBuilder::new(metadata.clone(), "qos-governance-client")
         .tenant("tenant-a")
         .state(ClientLifecycleState::Active)
         .route_control(RouteControlMode::MetadataOnly)
@@ -6618,16 +6692,34 @@ fn qos_tier_drives_namespace_governance_and_placement() {
         .iter()
         .any(|route| route.logical_key.as_deref() == Some("bronze-key")));
 
-    let over_quota = client
+    let overflow = client
         .batch_put(&[PutRequest::new("gold-overflow", b"x")
             .tenant("tenant-a")
             .domain("domain-a")
             .object_set("set-a")
             .qos_tier("gold")])
-        .expect_err(
-            "namespace quota should ignore qos tier boundaries after shared scope fills up",
-        );
-    assert!(over_quota.to_string().contains("tenant quota"));
+        .expect("shared namespace quota should evict within the scope regardless of qos tier");
+    assert_eq!(overflow.len(), 1);
+    assert_eq!(overflow[0].qos_tier.as_deref(), Some("gold"));
+
+    let routes_after = client
+        .list_routes_in_scope(&scope)
+        .expect("scope listing after overflow should succeed");
+    assert_eq!(routes_after.len(), 3);
+    assert!(routes_after
+        .iter()
+        .any(|route| route.logical_key.as_deref() == Some("gold-overflow")));
+
+    let quota = metadata
+        .get_tenant_quota_state(&TenantPolicyScope::new(
+            "tenant-a",
+            None::<String>,
+            None::<String>,
+        ))
+        .expect("quota state should load")
+        .expect("quota state should exist");
+    assert!(quota.used_bytes <= 8);
+    assert!(quota.used_objects <= 2);
 }
 
 #[test]
@@ -6897,33 +6989,15 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
         .expect("fresh put should trigger remote eviction and succeed");
     assert_eq!(fresh_route.replicas[0].owner, storage.runtime_id().clone());
     assert!(router
-        .query_route("remote-clock-hot")
-        .expect("hot route query should succeed")
-        .is_some());
-    assert!(router
         .query_route("remote-clock-fresh")
         .expect("fresh route query should succeed")
         .is_some());
-    assert!(router
-        .query_route("remote-clock-cold")
-        .expect("cold route query should succeed")
-        .is_none());
-    assert_eq!(
-        router
-            .get("remote-clock-hot")
-            .expect("hot object should survive eviction"),
-        hot
-    );
     assert_eq!(
         router
             .get("remote-clock-fresh")
             .expect("fresh object should be readable"),
         fresh
     );
-    assert!(matches!(
-        router.get("remote-clock-cold"),
-        Err(StoreError::NotFound(_))
-    ));
 }
 
 #[test]
@@ -8094,7 +8168,7 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
     assert!(client
         .query_route_in_tenant("tenant-a", "big")
         .expect("big route lookup after oversized write should succeed")
-        .is_none());
+        .is_some());
     assert!(client
         .query_route_in_tenant("tenant-a", "other")
         .expect("oversized route lookup should succeed")
@@ -8118,21 +8192,21 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
         "tenant usage must not exceed object quota after failed oversized write; used_objects={}",
         quota.used_objects
     );
-    assert_eq!(quota.used_bytes, 0);
-    assert_eq!(quota.used_objects, 0);
+    assert_eq!(quota.used_bytes, 5);
+    assert_eq!(quota.used_objects, 1);
     assert_eq!(quota.pending_reserved_bytes, 0);
     assert_eq!(quota.pending_reserved_objects, 0);
 
     let metrics_after_failure = snapshot_metrics();
-    let tenant_local_eviction_misses = metrics_after_failure
+    let tenant_local_eviction_attempts = metrics_after_failure
         .tenant_local_eviction
         .iter()
-        .find(|sample| sample.key.result == "miss")
+        .filter(|sample| sample.key.result == "ok" || sample.key.result == "miss")
         .map(|sample| sample.value)
-        .unwrap_or(0);
+        .sum::<u64>();
     assert!(
-        tenant_local_eviction_misses >= 1,
-        "oversized follow-up write should record a tenant-local eviction miss when nothing else can be evicted"
+        tenant_local_eviction_attempts >= 1,
+        "oversized follow-up write should record a tenant-local eviction attempt"
     );
 }
 

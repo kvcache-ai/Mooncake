@@ -5049,10 +5049,9 @@ mod tests {
             .expect("redis connection should succeed")
             .get(&key)
             .expect("updated lease lookup should succeed");
-        let updated: ClientLease = serde_json::from_str(
-            &payload.expect("updated lease should remain stored in redis"),
-        )
-        .expect("updated lease payload should deserialize");
+        let updated: ClientLease =
+            serde_json::from_str(&payload.expect("updated lease should remain stored in redis"))
+                .expect("updated lease payload should deserialize");
         assert_eq!(updated.runtime, runtime);
         assert_eq!(updated.state, ClientLifecycleState::Draining);
     }

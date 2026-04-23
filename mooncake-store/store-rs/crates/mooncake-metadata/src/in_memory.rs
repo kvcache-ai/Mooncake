@@ -617,6 +617,47 @@ impl MetadataBackend for InMemoryMetadataBackend {
         Ok(self.state.read().tenant_object_accounting.get(key).cloned())
     }
 
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> Result<Option<TenantQuotaReservation>> {
+        Ok(self
+            .state
+            .read()
+            .tenant_quota_reservations
+            .get(reservation_id)
+            .cloned())
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> Result<Vec<TenantObjectAccounting>> {
+        let scope = Self::root_scope(scope)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut candidates = self
+            .state
+            .read()
+            .tenant_object_accounting
+            .values()
+            .filter(|object| {
+                object.scope == scope && object.state == TenantObjectAccountingState::Active
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.updated_at_ms
+                .cmp(&right.updated_at_ms)
+                .then_with(|| right.committed_length.cmp(&left.committed_length))
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
+
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,
@@ -1053,7 +1094,7 @@ mod tests {
         TenantQuotaReservationState,
     };
 
-    use super::InMemoryMetadataBackend;
+    use super::{now_ms, InMemoryMetadataBackend};
 
     use mooncake_store_core::{ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion};
 
@@ -1063,7 +1104,7 @@ mod tests {
             state: ClientLifecycleState::Active,
             compatibility: CompatibilityDescriptor::default(),
             endpoints: Default::default(),
-            expires_at_ms: 10_000,
+            expires_at_ms: now_ms() + 10_000,
         }
     }
 
@@ -1113,7 +1154,7 @@ mod tests {
                 state: ClientLifecycleState::Active,
                 compatibility: CompatibilityDescriptor::default(),
                 endpoints: Default::default(),
-                expires_at_ms: 10_000,
+                expires_at_ms: now_ms() + 10_000,
             })
             .expect("lease should upsert");
         metadata
@@ -1603,7 +1644,7 @@ mod tests {
             state: ClientLifecycleState::Active,
             compatibility: CompatibilityDescriptor::default(),
             endpoints: Default::default(),
-            expires_at_ms: 10_000,
+            expires_at_ms: now_ms() + 10_000,
         }
     }
 
