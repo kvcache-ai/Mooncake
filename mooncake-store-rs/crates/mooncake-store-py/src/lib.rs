@@ -4395,6 +4395,63 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_async_shared_requests_do_not_head_of_line_block() {
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client("dispatcher-async-shared"),
+                "dispatcher-async-shared".to_string(),
+            )
+            .expect("dispatcher should spawn"),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-async-shared-holder".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || {
+                    let runtime =
+                        tokio::runtime::Runtime::new().expect("foreign runtime should build");
+                    runtime.block_on(async move {
+                        dispatcher
+                            .run_async(move |_client| {
+                                let _ = entered_tx.send(());
+                                let _ = release_rx.recv();
+                                Ok::<_, StoreError>(())
+                            })
+                            .await
+                    })
+                }
+            })
+            .expect("dispatcher async shared test worker should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first async shared request should enter");
+
+        let started = std::time::Instant::now();
+        let runtime = tokio::runtime::Runtime::new().expect("foreign runtime should build");
+        let second = runtime
+            .block_on(async {
+                dispatcher
+                    .run_async(|_client| Ok::<_, StoreError>(17usize))
+                    .await
+            })
+            .expect("second async shared request should not block behind first");
+        assert_eq!(second, 17);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "second async shared request should complete quickly"
+        );
+
+        let _ = release_tx.send(());
+        worker
+            .join()
+            .expect("dispatcher async shared worker should join")
+            .expect("first async shared request should finish after release");
+    }
+
+    #[test]
     fn dispatcher_worker_runtimes_are_isolated() {
         let dispatcher_a = StoreDispatcher::spawn(
             build_client("dispatcher-runtime-a"),

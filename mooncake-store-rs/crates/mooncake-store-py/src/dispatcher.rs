@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mooncake_store_client::{
     record_heartbeat_health, stable_phase_spread_ms, GetRequest, HealthChannel, HealthUpdate,
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
-    ReplicationPolicy, StoreClient,
+    OperationTracker, ReplicationPolicy, StoreClient,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
@@ -698,15 +698,21 @@ impl StoreDispatcher {
         F: FnOnce() -> Result<T, StoreError> + Send + 'static,
     {
         /*
-         * Keep blocking store operations off the caller runtime.
+         * Async callers already run inside a Tokio runtime. Schedule blocking work on
+         * that current runtime instead of bouncing through the dispatcher's private
+         * runtime first.
          */
-        match tokio::time::timeout(timeout, self.executor.spawn_blocking(f)).await {
+        let tracker = OperationTracker::new("compat_dispatcher_bridge")
+            .scope(dispatcher_metric_scope(context));
+        let result = match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(StoreError::Transport(
                 "store dispatcher worker failed".to_string(),
             )),
             Err(_) => Err(dispatcher_timeout(context, timeout)),
-        }
+        };
+        tracker.finish(&result, 0);
+        result
     }
 
     fn ensure_open(&self) -> Result<(), StoreError> {
@@ -1442,6 +1448,14 @@ fn dispatcher_timeout(context: &'static str, timeout: Duration) -> StoreError {
         "store dispatcher {context} timed out after {}ms",
         timeout.as_millis(),
     ))
+}
+
+fn dispatcher_metric_scope(context: &'static str) -> &'static str {
+    match context {
+        "request execution" => "request",
+        "startup registration" => "startup",
+        _ => "other",
+    }
 }
 
 fn effective_heartbeat_interval(requested_ms: u64, lease_ttl_ms: u64) -> u64 {
