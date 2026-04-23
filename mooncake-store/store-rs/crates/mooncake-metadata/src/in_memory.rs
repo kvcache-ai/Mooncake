@@ -320,14 +320,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
-        Ok(self
-            .state
-            .read()
-            .clients
-            .values()
-            .filter(|lease| Self::is_present_lease(lease))
-            .cloned()
-            .collect())
+        Ok(self.state.read().clients.values().cloned().collect())
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
