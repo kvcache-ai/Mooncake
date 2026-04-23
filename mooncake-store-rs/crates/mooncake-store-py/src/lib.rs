@@ -1926,7 +1926,7 @@ mod tests {
     fn build_client_with_metadata_and_transport(
         name: &str,
         metadata: Arc<dyn MetadataBackend>,
-        transport: Arc<TestTransport>,
+        transport: Arc<dyn StoreTransport>,
         state: ClientLifecycleState,
     ) -> StoreClient {
         let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
@@ -3689,6 +3689,48 @@ mod tests {
             "unexpected error: {error}"
         );
         release.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn dispatcher_buffer_registration_timeout_uses_explicit_override() {
+        let timeouts = CompatTimeoutConfig {
+            request_timeout: Duration::from_millis(50),
+            startup_timeout_override: Some(Duration::from_millis(400)),
+            heartbeat_timeout: Duration::from_secs(1),
+            transfer_stall_timeout: Duration::from_secs(1),
+            dummy_rpc_timeout: Duration::from_millis(50),
+        };
+        let dispatcher = StoreDispatcher::spawn_with_timeout_config(
+            build_client("dispatcher-buffer-timeout-override"),
+            "dispatcher-buffer-timeout-override".to_string(),
+            timeouts,
+        )
+        .expect("dispatcher should spawn");
+        assert_eq!(
+            dispatcher.registration_timeout_for_bytes(64),
+            Duration::from_millis(400)
+        );
+    }
+
+    #[test]
+    fn dispatcher_buffer_registration_timeout_uses_adaptive_floor_without_override() {
+        let timeouts = CompatTimeoutConfig {
+            request_timeout: Duration::from_millis(50),
+            startup_timeout_override: None,
+            heartbeat_timeout: Duration::from_secs(1),
+            transfer_stall_timeout: Duration::from_secs(1),
+            dummy_rpc_timeout: Duration::from_millis(50),
+        };
+        let dispatcher = StoreDispatcher::spawn_with_timeout_config(
+            build_client("dispatcher-buffer-timeout-floor"),
+            "dispatcher-buffer-timeout-floor".to_string(),
+            timeouts,
+        )
+        .expect("dispatcher should spawn");
+        assert_eq!(
+            dispatcher.registration_timeout_for_bytes(64),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]

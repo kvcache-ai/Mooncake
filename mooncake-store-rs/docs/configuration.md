@@ -378,11 +378,12 @@ knobs with the same precedence rules:
 - explicit environment variable
 - built-in default
 
-The compatibility layer exposes four timeout scopes:
+The compatibility layer exposes five timeout scopes:
 
 | Knob | Default | Scope | Meaning |
 |------|---------|-------|---------|
 | `request_timeout_ms` / `--request-timeout-ms` / `MC_STORE_RS_REQUEST_TIMEOUT_MS` | `65000` | dispatcher request budget, routed read/write request budget, dummy fallback | outer per-request deadline shared across replica failover |
+| `startup_timeout_ms` / `--startup-timeout-ms` / `MC_STORE_RS_STARTUP_TIMEOUT_MS` | `max(10000, ceil(registration_bytes / 1 GiB) * 1000)` | startup `register_local_memory`, real-mode `register_buffer`, and compatibility-side buffer unregister | registration-specific timeout budget; explicit override wins over the adaptive default |
 | `heartbeat_timeout_ms` / `--heartbeat-timeout-ms` / `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | `15000` | standalone client heartbeat / state publish | dedicated health-channel publish budget |
 | `transfer_stall_timeout_ms` / `--transfer-stall-timeout-ms` / `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` | `10000` | TENT / classic transfer engine | inner stall detector for one transfer slice or batch wait |
 | `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` | `65000` | dummy gRPC client | dummy RPC budget; falls back to `request_timeout_ms` when unset |
@@ -390,6 +391,7 @@ The compatibility layer exposes four timeout scopes:
 Design intent:
 
 - request timeout is the outer deadline for one logical store request
+- startup timeout is the registration budget for compatibility-managed memory registration work; when unset, the runtime derives it from the current registration size with a conservative `10s` floor so small scratch-only startup does not fail under host-side contention
 - heartbeat timeout is independent, so a slow health publish does not block the shared data path
 - transfer stall timeout is not a whole-request timeout; it only detects no-progress transport stalls
 - dummy RPC timeout follows request timeout unless explicitly overridden, so compatibility scripts do not hang forever on one slow server
@@ -468,6 +470,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |
 | `MC_STORE_RS_EXPIRES_AT_MS` | Python wrapper setup fallback | absolute lease expiry timestamp in milliseconds |
 | `MC_STORE_RS_REQUEST_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | outer per-request deadline for dispatcher requests and routed client operations |
+| `MC_STORE_RS_STARTUP_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | explicit override for compatibility-managed memory registration work; when unset the runtime uses `max(10s, ceil(registration_bytes / 1 GiB))` |
 | `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | dedicated dispatcher timeout for heartbeat publish |
 | `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | inner transfer stall detector for TENT / classic TE |
 | `MC_STORE_RS_TRANSFER_TIMEOUT_MS` | legacy compatibility alias | deprecated alias of `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` |

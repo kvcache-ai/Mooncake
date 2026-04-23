@@ -65,6 +65,7 @@ pub struct StoreDispatcher {
     health_inflight: Arc<AtomicBool>,
     heartbeat_loop: Arc<Mutex<Option<HeartbeatLoopHandle>>>,
     request_timeout: Duration,
+    registration_timeout_override: Option<Duration>,
     startup_timeout: Duration,
     health_timeout: Duration,
     runtime: String,
@@ -126,7 +127,7 @@ impl StoreDispatcher {
             self.client.clone(),
             CompatTimeoutConfig {
                 request_timeout: self.request_timeout,
-                startup_timeout_override: Some(self.startup_timeout),
+                startup_timeout_override: self.registration_timeout_override,
                 heartbeat_timeout: self.health_timeout,
                 transfer_stall_timeout: CompatTimeoutConfig::from_env().transfer_stall_timeout,
                 dummy_rpc_timeout: self.request_timeout,
@@ -140,8 +141,8 @@ impl StoreDispatcher {
         timeouts: CompatTimeoutConfig,
         compat_scope: String,
     ) -> Result<Self, StoreError> {
-        let startup_timeout = timeouts
-            .startup_timeout_for_registration_bytes(client.local_memory_registration_bytes());
+        let startup_timeout =
+            timeouts.registration_timeout_for_bytes(client.local_memory_registration_bytes());
         let runtime = client.runtime_id().to_string();
         let health = Arc::new(client.health_channel());
         let hot_cache = LocalHotCache::from_env()?.map(Arc::new);
@@ -160,6 +161,7 @@ impl StoreDispatcher {
             health_inflight: Arc::new(AtomicBool::new(false)),
             heartbeat_loop: Arc::new(Mutex::new(None)),
             request_timeout: timeouts.request_timeout.max(Duration::from_millis(1)),
+            registration_timeout_override: timeouts.startup_timeout_override,
             startup_timeout: startup_timeout.max(Duration::from_millis(1)),
             health_timeout: timeouts.heartbeat_timeout.max(Duration::from_millis(1)),
             runtime,
@@ -312,11 +314,17 @@ impl StoreDispatcher {
     }
 
     pub fn register_buffer(&self, base_ptr: usize, len: usize) -> Result<(), StoreError> {
-        self.run(move |client| client.register_buffer(base_ptr as *mut c_void, len))
+        let timeout = self.registration_timeout_for_bytes(len);
+        self.run_with_timeout("buffer registration", timeout, move |client| {
+            client.register_buffer(base_ptr as *mut c_void, len)
+        })
     }
 
     pub fn unregister_buffer(&self, base_ptr: usize, len: usize) -> Result<(), StoreError> {
-        self.run(move |client| client.unregister_buffer(base_ptr as *mut c_void, len))
+        let timeout = self.registration_timeout_for_bytes(len);
+        self.run_with_timeout("buffer unregistration", timeout, move |client| {
+            client.unregister_buffer(base_ptr as *mut c_void, len)
+        })
     }
 
     pub async fn unregister_buffer_async(
@@ -324,8 +332,17 @@ impl StoreDispatcher {
         base_ptr: usize,
         len: usize,
     ) -> Result<(), StoreError> {
-        self.run_async(move |client| client.unregister_buffer(base_ptr as *mut c_void, len))
-            .await
+        let timeout = self.registration_timeout_for_bytes(len);
+        self.run_async_with_timeout("buffer unregistration", timeout, move |client| {
+            client.unregister_buffer(base_ptr as *mut c_void, len)
+        })
+        .await
+    }
+
+    pub(crate) fn registration_timeout_for_bytes(&self, registration_bytes: usize) -> Duration {
+        self.registration_timeout_override.unwrap_or_else(|| {
+            CompatTimeoutConfig::default_registration_timeout_for_bytes(registration_bytes as u64)
+        })
     }
 
     pub(crate) fn run<T, F>(&self, f: F) -> Result<T, StoreError>
