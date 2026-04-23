@@ -47,6 +47,14 @@ fn emit_link_searches(search_dirs: &[PathBuf]) {
     }
 }
 
+fn emit_runtime_rpaths(search_dirs: &[PathBuf]) {
+    for dir in search_dirs {
+        let dir_str = dir.display();
+        println!("cargo:rustc-link-arg-tests=-Wl,-rpath,{dir_str}");
+        println!("cargo:rustc-link-arg-examples=-Wl,-rpath,{dir_str}");
+    }
+}
+
 fn compiler_candidates() -> Vec<String> {
     let mut tools = Vec::new();
 
@@ -145,12 +153,23 @@ fn main() {
     push_env_paths(&mut search_dirs, "LD_LIBRARY_PATH");
     push_env_paths(&mut search_dirs, "LIBRARY_PATH");
 
-    let has_asan_runtime = add_compiler_runtime_search_dir(&mut search_dirs, "libasan.so")
+    let asan_runtime_so = compiler_runtime_library("libasan.so");
+    if let Some(path) = asan_runtime_so.as_ref() {
+        if let Some(parent) = path.parent() {
+            push_existing_dir(&mut search_dirs, parent.to_path_buf());
+        }
+    }
+    let has_asan_runtime = asan_runtime_so.is_some()
         || add_compiler_runtime_search_dir(&mut search_dirs, "libasan.a");
     let has_gcov_runtime = add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.a")
         || add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.so");
 
     emit_link_searches(&search_dirs);
+    emit_runtime_rpaths(&search_dirs);
+
+    if has_asan_runtime || has_library(&search_dirs, &["asan"]) {
+        println!("cargo:rustc-link-lib=asan");
+    }
 
     for library in [
         "mooncake_store",
@@ -182,10 +201,6 @@ fn main() {
         if has_library(&search_dirs, candidates) {
             println!("cargo:rustc-link-lib={link_name}");
         }
-    }
-
-    if has_asan_runtime || has_library(&search_dirs, &["asan"]) {
-        println!("cargo:rustc-link-lib=asan");
     }
 
     if has_gcov_runtime || has_library(&search_dirs, &["gcov"]) {
