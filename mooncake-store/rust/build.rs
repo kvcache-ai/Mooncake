@@ -176,6 +176,7 @@ fn main() {
         ("etcd_wrapper", &["etcd_wrapper"] as &[&str]),
         ("hiredis", &["hiredis"]),
         ("curl", &["curl"]),
+        ("cudart", &["cudart"]),
         ("uring", &["uring"]),
     ] {
         if has_library(&search_dirs, candidates) {
