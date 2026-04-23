@@ -904,42 +904,6 @@ bool is_valid_tensor_object_buffer(uintptr_t buffer_ptr, size_t size,
         .has_value();
 }
 
-int put_tensor_with_tp_from(const std::string &key, uintptr_t buffer_ptr,
-                            size_t size, int tp_rank = 0, int tp_size = 1,
-                            int split_dim = 0) {
-    if (!is_client_initialized()) {
-        LOG(ERROR) << "Client is not initialized";
-        return to_py_ret(ErrorCode::INVALID_PARAMS);
-    }
-    if (use_dummy_client_) {
-        LOG(ERROR)
-            << "put_tensor_with_tp_from is not supported for dummy client";
-        return to_py_ret(ErrorCode::INVALID_PARAMS);
-    }
-    if (!is_valid_tensor_object_buffer(buffer_ptr, size,
-                                       "put_tensor_with_tp_from")) {
-        return to_py_ret(ErrorCode::INVALID_PARAMS);
-    }
-    if (tp_size <= 1) {
-        return put_tensor_from(key, buffer_ptr, size);
-    }
-
-    return execute_tp_tensor_write_from_impl(
-        key, buffer_ptr, size, ReplicateConfig{}, tp_size, split_dim, {},
-        "put_tensor_with_tp_from",
-        [this](const std::string &shard_key,
-               const std::vector<std::span<const char>> &values,
-               const ReplicateConfig &write_config) {
-            py::gil_scoped_release release_gil;
-            int ret = store_->put_parts(shard_key, values, write_config);
-            if (ret != 0) {
-                LOG(ERROR) << "put_parts failed for key " << shard_key
-                           << " with code " << ret;
-            }
-            return ret;
-        });
-}
-
 int execute_put_tensor_with_parallelism_from_route(
     const std::string &key, uintptr_t buffer_ptr, size_t size,
     const ResolvedParallelismWriteRequest &request,
@@ -1021,77 +985,6 @@ int put_tensor_with_parallelism_from(
     }
     return execute_put_tensor_with_parallelism_from_route(key, buffer_ptr, size,
                                                           *request, config);
-}
-
-std::vector<int> batch_put_tensor_with_tp_from(
-    const std::vector<std::string> &base_keys,
-    const std::vector<uintptr_t> &buffer_ptrs, const std::vector<size_t> &sizes,
-    int tp_rank = 0, int tp_size = 1, int split_dim = 0) {
-    if (!is_client_initialized()) {
-        LOG(ERROR) << "Client is not initialized";
-        return std::vector<int>(base_keys.size(),
-                                to_py_ret(ErrorCode::INVALID_PARAMS));
-    }
-    if (use_dummy_client_) {
-        LOG(ERROR) << "batch_put_tensor_with_tp_from is not supported for "
-                      "dummy client";
-        return std::vector<int>(base_keys.size(),
-                                to_py_ret(ErrorCode::INVALID_PARAMS));
-    }
-    if (tp_size <= 1) {
-        return batch_put_tensor_from(base_keys, buffer_ptrs, sizes);
-    }
-    if (base_keys.size() != buffer_ptrs.size() ||
-        base_keys.size() != sizes.size() || base_keys.empty()) {
-        if (!base_keys.empty()) {
-            LOG(ERROR) << "Size mismatch: base_keys, buffer_ptrs, and "
-                          "sizes must have the same length";
-        }
-        return std::vector<int>(base_keys.size(),
-                                to_py_ret(ErrorCode::INVALID_PARAMS));
-    }
-
-    py::list tensors_list;
-    std::vector<size_t> processed_indices;
-    std::vector<int> final_results(base_keys.size(), 0);
-
-    for (size_t i = 0; i < base_keys.size(); ++i) {
-        if (!is_valid_tensor_object_buffer(
-                buffer_ptrs[i], sizes[i],
-                "tensor object buffer at index " + std::to_string(i))) {
-            final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-
-        py::object tensor =
-            buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptrs[i]),
-                             static_cast<int64_t>(sizes[i]));
-        if (tensor.is_none()) {
-            LOG(ERROR) << "Failed to decode full tensor buffer at index " << i;
-            final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        tensors_list.append(tensor);
-        processed_indices.push_back(i);
-    }
-
-    if (processed_indices.empty()) {
-        return final_results;
-    }
-
-    std::vector<std::string> valid_keys;
-    valid_keys.reserve(processed_indices.size());
-    for (size_t idx : processed_indices) {
-        valid_keys.push_back(base_keys[idx]);
-    }
-
-    std::vector<int> op_results = batch_put_tensor_with_tp_impl(
-        valid_keys, tensors_list, ReplicateConfig{}, tp_rank, tp_size,
-        split_dim);
-    for (size_t i = 0; i < processed_indices.size(); ++i) {
-        final_results[processed_indices[i]] = op_results[i];
-    }
-    return final_results;
 }
 
 std::vector<int> batch_put_tensor_with_parallelism_from(
@@ -1372,6 +1265,39 @@ int upsert_tensor_with_parallelism_from(
     }
     return execute_upsert_tensor_with_parallelism_from_route(
         key, buffer_ptr, size, *request, config);
+}
+
+std::vector<int> batch_upsert_tensor_with_parallelism(
+    const std::vector<std::string> &keys, const pybind11::list &tensors_list,
+    const py::object &parallelisms = py::none(),
+    const ReplicateConfig &config = ReplicateConfig{},
+    const py::object &writer_partitions = py::none()) {
+    return execute_batch_parallelism_write_requests(
+        keys, tensors_list.size(), parallelisms, writer_partitions,
+        "batch_upsert_tensor_with_parallelism",
+        [this, &keys, &tensors_list, &config]() {
+            if (!is_client_initialized() || use_dummy_client_) {
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            int validate_result = validate_replicate_config(config);
+            if (validate_result) {
+                return std::vector<int>(keys.size(), validate_result);
+            }
+            return batch_upsert_tensor_impl(keys, tensors_list, config);
+        },
+        [this, &keys, &tensors_list, &config](size_t i,
+                                              const py::handle &parallelism) {
+            return upsert_tensor_with_parallelism(
+                keys[i], tensors_list[i],
+                py::reinterpret_borrow<py::object>(parallelism), config);
+        },
+        [this, &keys, &tensors_list, &config](
+            size_t i, const py::handle &writer_partition) {
+            return upsert_tensor_with_parallelism(
+                keys[i], tensors_list[i], py::none(), config,
+                py::reinterpret_borrow<py::object>(writer_partition));
+        });
 }
 
 std::vector<int> batch_upsert_tensor_with_parallelism_from(

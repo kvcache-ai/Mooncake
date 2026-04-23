@@ -343,28 +343,38 @@ std::optional<PyTensorInfo> build_direct_parallelism_shard_info(
     return info;
 }
 
+bool is_uniform_shardable_dim(int64_t dim_size, int shard_count) {
+    return dim_size >= 0 && shard_count > 0 && dim_size % shard_count == 0;
+}
+
+bool validate_uniform_shard_request(const std::vector<int64_t> &shape,
+                                    int split_dim, int shard_count,
+                                    const std::string &error_context) {
+    if (split_dim < 0 || split_dim >= static_cast<int>(shape.size()) ||
+        shard_count <= 0) {
+        LOG(ERROR) << error_context << ": invalid shard parameters";
+        return false;
+    }
+    if (!is_uniform_shardable_dim(shape[split_dim], shard_count)) {
+        LOG(ERROR) << error_context << ": only uniform sharding is supported";
+        return false;
+    }
+    return true;
+}
+
 std::optional<py::object> materialize_shard_tensor(const py::handle &tensor,
                                                    int split_dim, int rank,
                                                    int shard_count) {
     auto shape = tensor_shape_to_vector(tensor);
-    if (split_dim < 0 || split_dim >= static_cast<int>(shape.size()) ||
-        shard_count <= 0 || rank < 0 || rank >= shard_count) {
+    if (rank < 0 || rank >= shard_count ||
+        !validate_uniform_shard_request(shape, split_dim, shard_count,
+                                        "materialize_shard_tensor")) {
         return std::nullopt;
     }
 
     py::object torch_tensor = py::reinterpret_borrow<py::object>(tensor);
     const auto [start, size] =
         calculate_shard_range(shape[split_dim], rank, shard_count);
-    if (size == 0) {
-        py::list local_shape;
-        for (size_t dim = 0; dim < shape.size(); ++dim) {
-            local_shape.append(py::int_(static_cast<int64_t>(
-                dim == static_cast<size_t>(split_dim) ? 0 : shape[dim])));
-        }
-        return torch_module().attr("empty")(
-            py::tuple(local_shape), py::arg("dtype") = tensor.attr("dtype"));
-    }
-
     return torch_tensor.attr("narrow")(split_dim, start, size)
         .attr("contiguous")();
 }
@@ -379,8 +389,8 @@ std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
     }
 
     auto shape = tensor_shape_to_vector(tensor);
-    if (split_dim < 0 || split_dim >= static_cast<int>(shape.size()) ||
-        tp_size <= 0) {
+    if (!validate_uniform_shard_request(shape, split_dim, tp_size,
+                                        "build_tp_shard_infos")) {
         return std::nullopt;
     }
 
@@ -1158,17 +1168,14 @@ resolve_tp_compatible_parallelism_from_metadata(
 
 std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
                                                   int shard_count) {
-    if (shard_count <= 0 || rank < 0) {
+    if (dim_size < 0 || shard_count <= 0 || rank < 0 || rank >= shard_count) {
         return {0, 0};
     }
 
-    const int64_t chunk_size = (dim_size + shard_count - 1) / shard_count;
-    const int64_t start = static_cast<int64_t>(rank) * chunk_size;
-    if (start >= dim_size) {
-        return {dim_size, 0};
-    }
-
-    return {start, std::min(chunk_size, dim_size - start)};
+    const int64_t start = (dim_size * static_cast<int64_t>(rank)) / shard_count;
+    const int64_t end =
+        (dim_size * static_cast<int64_t>(rank + 1)) / shard_count;
+    return {start, end - start};
 }
 
 std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
@@ -1237,10 +1244,10 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
         parsed.metadata.layout.global_shape, parsed.metadata.header.ndim);
     const auto local_shape = TensorShapeToVector(
         parsed.metadata.layout.local_shape, parsed.metadata.header.ndim);
-    if (split_dim < 0 || split_dim >= static_cast<int>(global_shape.size()) ||
-        global_shape.size() != local_shape.size() || shard_count <= 0 ||
-        rank < 0 || rank >= shard_count) {
-        LOG(ERROR) << operation_name << ": invalid shard parameters";
+    if (global_shape.size() != local_shape.size() || rank < 0 ||
+        rank >= shard_count ||
+        !validate_uniform_shard_request(global_shape, split_dim, shard_count,
+                                        operation_name)) {
         return std::nullopt;
     }
 
