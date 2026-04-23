@@ -383,7 +383,7 @@ ADMIN_BIN_OVERRIDE=${MC_STORE_RS_ROUTE_MIGRATION_ADMIN_BIN:-}
 ADMIN_CLI_BIN_OVERRIDE=${MC_STORE_RS_ROUTE_MIGRATION_ADMIN_CLI_BIN:-}
 if [[ -n "${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR:-}" ]]; then
   CLIENT_BIN_OVERRIDE=${CLIENT_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-client}
-  ADMIN_BIN_OVERRIDE=${ADMIN_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-admin-server}
+  ADMIN_BIN_OVERRIDE=${ADMIN_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-admin}
   ADMIN_CLI_BIN_OVERRIDE=${ADMIN_CLI_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-admin}
 fi
 
@@ -404,8 +404,8 @@ fi
 
 TARGET_DIR="${CARGO_TARGET_DIR}"
 BIN="${CLIENT_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-client}"
-ADMIN_BIN="${ADMIN_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-admin-server}"
-ADMIN_CLI_BIN="${ADMIN_CLI_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-admin}"
+ADMIN_BIN="${ADMIN_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-admin}"
+ADMIN_CLI_BIN="${ADMIN_CLI_BIN_OVERRIDE:-${ADMIN_BIN}}"
 
 if [[ ! -x "${BIN}" ]]; then
   echo "expected client binary was not produced at ${BIN}" >&2
@@ -440,7 +440,6 @@ echo "==> starting source store client"
 "${BIN}" \
   "${CLIENT_BASE_ARGS[@]}" \
   --stable-id "${SOURCE_STABLE_ID}" \
-  --epoch 1 \
   --transport-rpc-port "${SOURCE_TRANSPORT_PORT}" \
   --local-segment-name "${SOURCE_SEGMENT}" \
   >"${SOURCE_LOG}" 2>&1 &
@@ -452,7 +451,6 @@ echo "==> starting target store client"
 "${BIN}" \
   "${CLIENT_BASE_ARGS[@]}" \
   --stable-id "${TARGET_STABLE_ID}" \
-  --epoch 1 \
   --transport-rpc-port "${TARGET_TRANSPORT_PORT}" \
   --local-segment-name "${TARGET_SEGMENT}" \
   >"${TARGET_LOG}" 2>&1 &
@@ -465,7 +463,6 @@ if [[ "${MODE}" == "copy-multi" || -n "${SEQUENCE}" ]]; then
   "${BIN}" \
     "${CLIENT_BASE_ARGS[@]}" \
     --stable-id "${EXTRA_TARGET_STABLE_ID}" \
-    --epoch 1 \
     --transport-rpc-port "${EXTRA_TARGET_TRANSPORT_PORT}" \
     --local-segment-name "${EXTRA_TARGET_SEGMENT}" \
     >"${EXTRA_TARGET_LOG}" 2>&1 &
@@ -492,7 +489,6 @@ if [[ "${DEDICATED_EXECUTOR_ENABLED}" == "1" ]]; then
     --label storage=false \
     --label route=false \
     --stable-id "${EXECUTOR_STABLE_ID}" \
-    --epoch 1 \
     --transport-rpc-port "${EXECUTOR_TRANSPORT_PORT}" \
     --local-segment-name "${EXECUTOR_SEGMENT}" \
     >"${EXECUTOR_LOG}" 2>&1 &
@@ -505,6 +501,7 @@ echo "==> starting admin HTTP server"
 "${ADMIN_BIN}" \
   --metadata-url "${REDIS_URL}" \
   --keyspace "${KEYSPACE}" \
+  server \
   --bind-addr "127.0.0.1:${ADMIN_PORT}" \
   >"${ADMIN_LOG}" 2>&1 &
 PIDS+=($!)
