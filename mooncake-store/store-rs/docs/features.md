@@ -150,8 +150,9 @@ The current implementation supports:
 
 Startup behavior for large local storage is explicit:
 
-- initial storage-region planning remains NUMA-aware for host memory by default, so RDMA-capable hosts can start with multiple local storage segments instead of collapsing everything into one CPU location
-- startup registration of extra initial storage segments runs in parallel and the runtime publishes those segments only after the local registration phase completes
+- `classic_te` + RDMA keeps initial storage-region planning NUMA-aware for host memory, so RDMA-capable hosts can start with multiple local storage segments instead of collapsing everything into one CPU location
+- startup registration of extra initial storage segments is transport-gated; non-RDMA and non-opted-in transports keep the historical single-segment startup layout
+- when a transport enables startup fanout, the runtime registers extra initial storage segments in parallel and publishes them only after the local registration phase completes
 - `classic_te` + RDMA pre-touches startup storage pages once total startup storage registration reaches `4 GiB`, reducing cold-page MR registration stalls on very large hosts
 
 ### Remote allocation

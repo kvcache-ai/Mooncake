@@ -36,6 +36,10 @@ pub trait StoreTransport: Send + Sync {
         None
     }
 
+    fn supports_parallel_startup_registration(&self) -> bool {
+        false
+    }
+
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
     fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
 

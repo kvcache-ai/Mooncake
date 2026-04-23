@@ -436,6 +436,9 @@ impl StoreClient {
     ) -> Result<Vec<crate::memory::LocalRegionPlan>> {
         let mut config = self.local_memory.clone();
         config.storage_bytes = storage_bytes;
+        if !self.transport()?.supports_parallel_startup_registration() {
+            config.numa_aware = false;
+        }
         config.storage_region_plans(None)
     }
 

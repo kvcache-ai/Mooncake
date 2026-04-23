@@ -140,8 +140,9 @@ Hugepage behavior:
 
 Startup registration behavior:
 
-- storage-region planning stays NUMA-aware by default when `location` targets host memory and `numa_aware` remains enabled
-- if startup planning produces multiple initial storage segments, the runtime allocates and registers those extra segments in parallel, then publishes the full local segment set after local registration completes
+- `classic_te` + RDMA keeps startup storage-region planning NUMA-aware when `location` targets host memory and `numa_aware` remains enabled
+- only transports that opt into parallel startup registration fan out initial storage into multiple segments; other transports keep the historical single-segment startup layout
+- when startup planning produces multiple initial storage segments, the runtime allocates and registers those extra segments in parallel, then publishes the full local segment set after local registration completes
 - under `classic_te` + RDMA, startup storage registration pre-touches pages before MR registration when the total startup storage registration volume reaches `4 GiB` or more
 - ordinary scratch-region registration still follows the transport registration limit split logic; the startup fast path is only for storage segments
 

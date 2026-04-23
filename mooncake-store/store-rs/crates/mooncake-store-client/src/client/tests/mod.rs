@@ -34,7 +34,7 @@ use crate::{
         control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
         ControlPlaneHandle, ReleaseOp,
     },
-    memory::RegionAllocation,
+    memory::{with_test_numa_locations, RegionAllocation},
     metrics_test_lock, render_prometheus_metrics, reset_metrics,
     route_directory::{authority_get, authority_replace, build_route_directory},
     snapshot_metrics, BandwidthShaping, ExecutionFairness, GetRequest, LocalMemoryConfig,
@@ -2506,30 +2506,37 @@ fn rw_only_client_can_expand_into_primary_segment() {
 
 #[test]
 fn register_local_memory_keeps_initial_storage_single_despite_registration_limit() {
-    let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let transport = Arc::new(TestTransport::new("split-storage-store"));
-    transport.set_max_registration_bytes(Some(64));
-    let client = StoreClientBuilder::new(metadata, "split-storage")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "true")
-        .transport(transport.clone())
-        .transport_factory(transport.factory())
-        .local_memory(storage_config_with_bytes(160).scratch_bytes(16))
-        .build(test_future_expiry_ms())
-        .expect("client build should succeed");
+    with_test_numa_locations(&["cpu:0", "cpu:1"], || {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("split-storage-store"));
+        transport.set_max_registration_bytes(Some(64));
+        let client = StoreClientBuilder::new(metadata, "split-storage")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(transport.clone())
+            .transport_factory(transport.factory())
+            .local_memory(
+                storage_config_with_bytes(160)
+                    .scratch_bytes(16)
+                    .location("cpu:0")
+                    .numa_aware(true),
+            )
+            .build(test_future_expiry_ms())
+            .expect("client build should succeed");
 
-    client
-        .register_local_memory()
-        .expect("local memory registration should succeed");
+        client
+            .register_local_memory()
+            .expect("local memory registration should succeed");
 
-    let capacities = client
-        .list_segments()
-        .expect("segments should list")
-        .into_iter()
-        .map(|segment| segment.capacity_bytes)
-        .collect::<Vec<_>>();
-    assert_eq!(capacities, vec![160]);
+        let capacities = client
+            .list_segments()
+            .expect("segments should list")
+            .into_iter()
+            .map(|segment| segment.capacity_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(capacities, vec![160]);
+    });
 }
 
 #[test]
