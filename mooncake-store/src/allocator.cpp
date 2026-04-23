@@ -18,6 +18,11 @@ std::string AllocatedBuffer::getSegmentName() const noexcept {
     return std::string();
 }
 
+StorageLevel AllocatedBuffer::getStorageLevel() const noexcept {
+    auto alloc = allocator_.lock();
+    return alloc ? alloc->getStorageLevel() : StorageLevel::RAM;
+}
+
 AllocatedBuffer::~AllocatedBuffer() {
     // Note: This is an edge case. If the 'weak_ptr' is released, the segment
     // has already been deallocated at this point, and its memory usage details

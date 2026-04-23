@@ -58,6 +58,8 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    [[nodiscard]] StorageLevel getStorageLevel() const noexcept;
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);

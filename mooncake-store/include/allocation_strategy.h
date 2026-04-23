@@ -232,10 +232,10 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
 
-            auto [buffer, storage_level] = allocateSingle(
-                allocator_manager, names[0], slice_length, generator);
+            auto buffer = allocateSingle(allocator_manager, names[0],
+                                         slice_length, generator);
             if (buffer) {
-                replicas.emplace_back(std::move(buffer), storage_level,
+                replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING);
                 return replicas;
             }
@@ -252,10 +252,10 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 continue;
             }
 
-            auto [buffer, storage_level] = allocateSingle(
-                allocator_manager, preferred_segment, slice_length, generator);
+            auto buffer = allocateSingle(allocator_manager, preferred_segment,
+                                         slice_length, generator);
             if (buffer) {
-                replicas.emplace_back(std::move(buffer), storage_level,
+                replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING);
                 if (replicas.size() == replica_num) {
                     return replicas;
@@ -285,10 +285,10 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 continue;
             }
 
-            auto [buffer, storage_level] = allocateSingle(
-                allocator_manager, names[index], slice_length, generator);
+            auto buffer = allocateSingle(allocator_manager, names[index],
+                                         slice_length, generator);
             if (buffer) {
-                replicas.emplace_back(std::move(buffer), storage_level,
+                replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING);
                 // Nit: no need to insert names[index] into used_segments here
                 // because we only traverse all names once, thus there is no
@@ -319,22 +319,21 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
 
-        auto [buffer, storage_level] = allocateSingle(
-            allocator_manager, segment_name, slice_length, generator);
+        auto buffer = allocateSingle(allocator_manager, segment_name,
+                                     slice_length, generator);
         if (buffer == nullptr) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        return Replica{std::move(buffer), storage_level,
-                       ReplicaStatus::PROCESSING};
+        return Replica{std::move(buffer), ReplicaStatus::PROCESSING};
     }
 
-    std::pair<std::unique_ptr<AllocatedBuffer>, StorageLevel> allocateSingle(
+    std::unique_ptr<AllocatedBuffer> allocateSingle(
         const AllocatorManager& allocator_manager, const std::string& name,
         const size_t slice_length, std::mt19937& generator) {
         const auto allocators = allocator_manager.getAllocators(name);
         if (allocators == nullptr || allocators->size() == 0) {
-            return {nullptr, StorageLevel::NUM_STORAGE_LEVELS};
+            return nullptr;
         }
 
         // Filter allocators to only include RAM storage level
@@ -346,15 +345,12 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         if (ram_allocators.empty()) {
-            return {nullptr, StorageLevel::NUM_STORAGE_LEVELS};
+            return nullptr;
         }
 
         const auto num_segs = ram_allocators.size();
         if (num_segs == 1) {
-            // Fast path for single segment
-            auto buffer = ram_allocators[0]->allocate(slice_length);
-            auto level = ram_allocators[0]->getStorageLevel();
-            return {std::move(buffer), level};
+            return ram_allocators[0]->allocate(slice_length);
         }
 
         // Randomly select a start point to distribute
@@ -364,11 +360,11 @@ class RandomAllocationStrategy : public AllocationStrategy {
         for (size_t i = 0; i < num_segs; i++) {
             auto& allocator = ram_allocators[(i + seg_offset) % num_segs];
             if (auto buffer = allocator->allocate(slice_length)) {
-                return {std::move(buffer), allocator->getStorageLevel()};
+                return buffer;
             }
         }
 
-        return {nullptr, StorageLevel::NUM_STORAGE_LEVELS};
+        return nullptr;
     }
 
    private:
@@ -424,10 +420,10 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
 
-            auto [buffer, storage_level] = allocateSingle(
-                allocator_manager, preferred_segment, slice_length, generator);
+            auto buffer = allocateSingle(allocator_manager, preferred_segment,
+                                         slice_length, generator);
             if (buffer) {
-                replicas.emplace_back(std::move(buffer), storage_level,
+                replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING);
                 used_segments.insert(preferred_segment);
                 if (replicas.size() == replica_num) {
@@ -480,10 +476,10 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
 
-            auto [buffer, storage_level] = allocateSingle(
-                allocator_manager, name, slice_length, generator);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length,
+                                         generator);
             if (buffer) {
-                replicas.emplace_back(std::move(buffer), storage_level,
+                replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING);
                 used_segments.insert(name);
             }
@@ -510,10 +506,10 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
 
-            auto [buffer, storage_level] = allocateSingle(
-                allocator_manager, names[index], slice_length, generator);
+            auto buffer = allocateSingle(allocator_manager, names[index],
+                                         slice_length, generator);
             if (buffer) {
-                replicas.emplace_back(std::move(buffer), storage_level,
+                replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING);
                 used_segments.insert(names[index]);
             }
