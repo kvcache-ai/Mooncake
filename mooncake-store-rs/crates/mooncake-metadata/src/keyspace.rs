@@ -44,7 +44,10 @@ impl MetadataKeyspace {
     }
 
     pub fn client_by_stable_index(&self, stable_id: &ClientStableId) -> String {
-        format!("{}/indexes/clients/by-stable/{}", self.slot_tag, stable_id.0)
+        format!(
+            "{}/indexes/clients/by-stable/{}",
+            self.slot_tag, stable_id.0
+        )
     }
 
     pub fn client_by_stable_index_prefix(&self) -> String {
@@ -127,7 +130,10 @@ impl MetadataKeyspace {
     }
 
     pub fn client_by_stable_marker_prefix(&self, stable_id: &ClientStableId) -> String {
-        format!("{}/indexes/clients/by-stable/{}/", self.slot_tag, stable_id.0)
+        format!(
+            "{}/indexes/clients/by-stable/{}/",
+            self.slot_tag, stable_id.0
+        )
     }
 
     pub fn stable_runtime(&self, stable_id: &ClientStableId) -> String {

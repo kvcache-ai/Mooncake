@@ -2548,6 +2548,21 @@ mod tests {
             Err(StoreError::Unsupported("unused in test".to_string()))
         }
 
+        fn get_tenant_quota_reservation(
+            &self,
+            _reservation_id: &str,
+        ) -> Result<Option<mooncake_store_core::TenantQuotaReservation>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
+        fn list_tenant_eviction_candidates(
+            &self,
+            _scope: &mooncake_store_core::TenantPolicyScope,
+            _limit: usize,
+        ) -> Result<Vec<mooncake_store_core::TenantObjectAccounting>> {
+            Err(StoreError::Unsupported("unused in test".to_string()))
+        }
+
         fn list_tenant_quota_reservations(
             &self,
             _scope: &mooncake_store_core::TenantPolicyScope,
@@ -2734,12 +2749,13 @@ mod tests {
             .expect("http transport should build");
         let handle = transport
             .open_segment("remote-segment")
-            .expect("open_segment should retry until the runtime lease appears");
+            .expect("open_segment should resolve remote runtime through point lookups");
 
         assert!(handle > 0);
-        assert!(
-            list_live_clients_calls.load(Ordering::SeqCst) >= 3,
-            "open_segment should retry transient runtime visibility gaps"
+        assert_eq!(
+            list_live_clients_calls.load(Ordering::SeqCst),
+            0,
+            "open_segment should not fall back to live-client listing when point lookups are available"
         );
     }
 

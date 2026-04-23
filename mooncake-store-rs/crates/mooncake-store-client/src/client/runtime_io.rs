@@ -39,10 +39,6 @@ impl StoreClient {
         TenantPolicyScope::new(object_id.scope.tenant.clone(), None::<String>, None::<String>)
     }
 
-    fn tenant_quota_eviction_scope(&self, object_id: &LogicalObjectId) -> NamespaceScope {
-        NamespaceScope::with_defaults(Some(object_id.scope.tenant.as_str()), None, None)
-    }
-
     fn route_committed_length(route: Option<&ObjectRoute>) -> u64 {
         route
             .and_then(|current| current.replicas.iter().min_by_key(|replica| replica.priority))

@@ -304,6 +304,14 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.get_tenant_quota_reservation(reservation_id)
     }
 
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> Result<Vec<TenantObjectAccounting>> {
+        self.inner.list_tenant_eviction_candidates(scope, limit)
+    }
+
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,
@@ -574,6 +582,15 @@ impl MetadataBackend for FaultyMetadataBackend {
     ) -> Result<Option<TenantQuotaReservation>> {
         self.check()?;
         self.inner.get_tenant_quota_reservation(reservation_id)
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> Result<Vec<TenantObjectAccounting>> {
+        self.check()?;
+        self.inner.list_tenant_eviction_candidates(scope, limit)
     }
 
     fn list_tenant_quota_reservations(
