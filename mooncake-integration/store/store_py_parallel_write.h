@@ -13,7 +13,7 @@
         }
 
         int ret =
-            put_tensor_impl(writer_info->shard_key, writer_info->info, config);
+            put_tensor_info_impl(writer_info->shard_key, writer_info->info, config);
         if (ret != 0) {
             return ret;
         }
@@ -30,8 +30,8 @@
         if (!info.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return put_tensor_impl(get_parallelism_key_name(key, parallelism),
-                               *info, config);
+        return put_tensor_info_impl(get_parallelism_key_name(key, parallelism),
+                                    *info, config);
     }
 
     int put_tensor_with_writer_shards_from(
@@ -93,9 +93,9 @@
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const ReplicateConfig &write_config, int rank, int size,
                    int split_dim, const std::vector<ParallelAxisSpec> &axes) {
-                return put_tensor_with_tp_impl(write_key, write_tensor,
-                                               write_config, rank, size,
-                                               split_dim, axes);
+                return put_tensor_parallelism_tp_impl(write_key, write_tensor,
+                                                        write_config, rank, size,
+                                                        split_dim, axes);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const TensorParallelismSpec &parallelism_spec,
@@ -433,8 +433,8 @@
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        int ret = upsert_tensor_impl(writer_info->shard_key, writer_info->info,
-                                     config);
+        int ret = upsert_tensor_info_impl(writer_info->shard_key, writer_info->info,
+                                          config);
         if (ret != 0) {
             return ret;
         }
@@ -451,8 +451,8 @@
         if (!info.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return upsert_tensor_impl(get_parallelism_key_name(key, parallelism),
-                                  *info, config);
+        return upsert_tensor_info_impl(get_parallelism_key_name(key, parallelism),
+                                       *info, config);
     }
 
     int upsert_tensor_with_writer_shards_from(
@@ -517,9 +517,9 @@
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const ReplicateConfig &write_config, int rank, int size,
                    int split_dim, const std::vector<ParallelAxisSpec> &axes) {
-                return upsert_tensor_with_tp_impl(write_key, write_tensor,
-                                                  write_config, size, split_dim,
-                                                  axes);
+                return upsert_tensor_parallelism_tp_impl(write_key, write_tensor,
+                                                           write_config, size, split_dim,
+                                                           axes);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const TensorParallelismSpec &parallelism_spec,

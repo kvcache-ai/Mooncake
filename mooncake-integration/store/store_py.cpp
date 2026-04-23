@@ -631,7 +631,7 @@ class MooncakeStorePyWrapper {
                                        tp_size, split_dim);
     }
 
-    int put_tensor_with_tp_impl(
+    int put_tensor_parallelism_tp_impl(
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config, int tp_rank, int tp_size, int split_dim,
         const std::vector<ParallelAxisSpec> &axes) {
@@ -640,12 +640,12 @@ class MooncakeStorePyWrapper {
             "Failed to put tensor with tp",
             [this](const std::string &shard_key, const PyTensorInfo &info,
                    const ReplicateConfig &write_config) {
-                return put_tensor_impl(shard_key, info, write_config);
+                return put_tensor_info_impl(shard_key, info, write_config);
             });
     }
 
 
-    std::vector<int> batch_put_tensor_impl(
+    std::vector<int> batch_put_tensor_infos_impl(
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
@@ -667,7 +667,7 @@ class MooncakeStorePyWrapper {
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
         }
-        return batch_put_tensor_impl(keys, infos, config);
+        return batch_put_tensor_infos_impl(keys, infos, config);
     }
 
     std::vector<int> batch_put_tensor(const std::vector<std::string> &keys,
@@ -1021,7 +1021,7 @@ class MooncakeStorePyWrapper {
             nullptr, 0);
     }
 
-    int put_tensor_impl(const std::string &key, const PyTensorInfo &info,
+    int put_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
                         const ReplicateConfig &config) {
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
@@ -2677,7 +2677,7 @@ class MooncakeStorePyWrapper {
 
     // --- Upsert tensor methods ---
 
-    int upsert_tensor_impl(const std::string &key, const PyTensorInfo &info,
+    int upsert_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
                            const ReplicateConfig &config) {
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
@@ -2751,7 +2751,7 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    int upsert_tensor_with_tp_impl(
+    int upsert_tensor_parallelism_tp_impl(
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config, int tp_size, int split_dim,
         const std::vector<ParallelAxisSpec> &axes) {
@@ -2760,7 +2760,7 @@ class MooncakeStorePyWrapper {
             "Failed to upsert tensor with tp",
             [this](const std::string &shard_key, const PyTensorInfo &info,
                    const ReplicateConfig &write_config) {
-                return upsert_tensor_impl(shard_key, info, write_config);
+                return upsert_tensor_info_impl(shard_key, info, write_config);
             });
     }
 
