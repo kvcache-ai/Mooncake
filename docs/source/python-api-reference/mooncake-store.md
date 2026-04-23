@@ -485,6 +485,217 @@ config.prefer_alloc_in_same_node = "True
 ```
 ---
 
+## Unified Parallel Tensor IO API
+
+Mooncake Store also provides a unified tensor IO family for tensors that are stored either as full objects or as explicitly identified parallel shards.
+
+This API family is the long-term interface for TP / DP / EP / PP-aware tensor IO:
+
+- write and upsert use `TensorParallelism`
+- reads use `ReadTarget`
+- legacy TP-only APIs remain available as compatibility wrappers
+
+### ParallelAxis
+
+`ParallelAxis` describes one axis in a shard identity.
+
+```python
+axis = mooncake.store.ParallelAxis()
+axis.kind = "tp"      # one of: "tp", "dp", "ep", "pp"
+axis.rank = 0
+axis.size = 8
+axis.split_dim = 1     # used for layout-sharding axes such as TP
+axis.expert_id = 3     # optional, for EP
+axis.stage_id = 1      # optional, for PP
+```
+
+**Fields:**
+- `kind`: Parallelism axis kind.
+- `rank`: Current shard rank on that axis.
+- `size`: Total number of shards on that axis.
+- `split_dim`: Optional tensor split dimension for layout-sharding axes.
+- `expert_id`: Optional expert identifier for EP layouts.
+- `stage_id`: Optional pipeline stage identifier for PP layouts.
+
+### TensorParallelism
+
+`TensorParallelism` is an ordered list of axes that identifies the stored or requested shard.
+
+```python
+parallelism = mooncake.store.TensorParallelism()
+parallelism.axes = [
+    tp_axis,
+]
+```
+
+Examples:
+- TP shard: `axes=[TP(...)]`
+- DP + TP shard: `axes=[DP(...), TP(...)]`
+- PP + TP shard: `axes=[PP(...), TP(...)]`
+- EP shard: `axes=[EP(...)]`
+
+### ReadTarget
+
+`ReadTarget` tells Mooncake whether the caller wants the stored form, a specific shard view, or the reconstructed full tensor.
+
+```python
+target = mooncake.store.ReadTarget()
+target.mode = "full"          # one of: "as_stored", "shard", "full"
+target.parallelism = None      # required for target shard reads
+```
+
+**Fields:**
+- `mode`: Read materialization mode.
+- `parallelism`: Optional `TensorParallelism`. Required when `mode="shard"`.
+
+### put_tensor_with_parallelism()
+
+Store a tensor using the unified parallelism model.
+
+```python
+def put_tensor_with_parallelism(
+    self,
+    key: str,
+    tensor,
+    parallelism: mooncake.store.TensorParallelism | None = None,
+    config: ReplicateConfig | None = None,
+) -> int
+```
+
+Use `parallelism=None` to store a full tensor object. Provide `TensorParallelism` to store a shard-scoped object.
+
+### batch_put_tensor_with_parallelism()
+
+Batch version of unified tensor writes.
+
+```python
+def batch_put_tensor_with_parallelism(
+    self,
+    keys: list[str],
+    tensors: list,
+    parallelisms: list[mooncake.store.TensorParallelism | None] | None = None,
+    config: ReplicateConfig | None = None,
+    writer_partitions = None,
+) -> list[int]
+```
+
+`writer_partitions` is an optional write-side convenience input for batch full-tensor writes that should be partitioned into stored shards. Each entry describes the target shard write as `(rank, size, split_dim)`.
+
+Use `writer_partitions` when the caller has full tensors and wants Mooncake to derive the stored shard objects from writer-side partition info instead of constructing full `TensorParallelism` objects per element.
+
+### get_tensor_with_parallelism()
+
+Read a tensor through the unified read path.
+
+```python
+def get_tensor_with_parallelism(
+    self,
+    key: str,
+    target: mooncake.store.ReadTarget | None = None,
+)
+```
+
+Typical modes:
+- `target=None` or `mode="as_stored"`: return the stored local object.
+- `mode="shard"`: return the target shard described by `target.parallelism`.
+- `mode="full"`: reconstruct and return the full tensor.
+
+### batch_get_tensor_with_parallelism()
+
+Batch version of unified tensor reads.
+
+```python
+def batch_get_tensor_with_parallelism(
+    self,
+    keys: list[str],
+    targets: list[mooncake.store.ReadTarget | None] | None = None,
+) -> list
+```
+
+### get_tensor_with_parallelism_into() / batch_get_tensor_with_parallelism_into()
+
+Zero-copy unified read forms. The destination buffers must be registered with `register_buffer()` before calling them.
+
+```python
+def get_tensor_with_parallelism_into(
+    self,
+    key: str,
+    buffer_ptr: int,
+    size: int,
+    target: mooncake.store.ReadTarget | None = None,
+)
+```
+
+```python
+def batch_get_tensor_with_parallelism_into(
+    self,
+    keys: list[str],
+    buffer_ptrs: list[int],
+    sizes: list[int],
+    targets: list[mooncake.store.ReadTarget | None] | None = None,
+) -> list
+```
+
+### upsert_tensor_with_parallelism()
+
+Unified upsert form for tensor objects.
+
+```python
+def upsert_tensor_with_parallelism(
+    self,
+    key: str,
+    tensor,
+    parallelism: mooncake.store.TensorParallelism | None = None,
+    config: ReplicateConfig | None = None,
+) -> int
+```
+
+### batch_upsert_tensor_with_parallelism()
+
+Batch unified upsert form.
+
+```python
+def batch_upsert_tensor_with_parallelism(
+    self,
+    keys: list[str],
+    tensors: list,
+    parallelisms: list[mooncake.store.TensorParallelism | None] | None = None,
+    config: ReplicateConfig | None = None,
+    writer_partitions = None,
+) -> list[int]
+```
+
+### *_from zero-copy write variants
+
+The unified write and upsert family also has `_from` variants for registered-memory inputs, including:
+
+- `put_tensor_with_parallelism_from(...)`
+- `batch_put_tensor_with_parallelism_from(...)`
+- `upsert_tensor_with_parallelism_from(...)`
+- `batch_upsert_tensor_with_parallelism_from(...)`
+
+These APIs accept registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
+
+```text
+[TensorObjectHeader + layout metadata][tensor data]
+```
+
+As with other zero-copy APIs, every source pointer must be registered with `register_buffer()` before use.
+
+### Compatibility wrappers
+
+Legacy TP-only methods such as:
+
+- `put_tensor_with_tp(...)`
+- `batch_put_tensor_with_tp(...)`
+- `get_tensor_with_tp(...)`
+- `batch_get_tensor_with_tp(...)`
+- corresponding `_into`, `_from`, and upsert variants
+
+remain supported for compatibility, but they are wrapper-style APIs around the unified parallel tensor IO model. Prefer the unified `*_with_parallelism` family for new code and new documentation examples.
+
+---
+
 ## Non-Zero-Copy API (Simple Usage)
 
 For simpler use cases, use the standard API without memory registration:

@@ -342,9 +342,51 @@ Otherwise it can fall back to the simpler whole-object path.
 
 This keeps the public interface stable while allowing future planner work to add DP / TP / EP / PP remapping and optimized reconstruction without another API redesign.
 
-## Explicit scope boundaries for the next implementation step
+## Current implementation status
 
-The next implementation step should stay within these boundaries:
+The current `store_py.cpp` implementation now reflects the main shape of this design:
+
+- unified write APIs are exposed as `put_tensor_with_parallelism(...)` and `batch_put_tensor_with_parallelism(...)`
+- unified read APIs are exposed as `get_tensor_with_parallelism(...)` and `batch_get_tensor_with_parallelism(...)`
+- unified upsert APIs are exposed as `upsert_tensor_with_parallelism(...)` and `batch_upsert_tensor_with_parallelism(...)`
+- zero-copy `_into` and `_from` variants exist for the unified API family
+- TP-specific APIs remain available as compatibility wrappers and should not be treated as the long-term surface area
+
+### Implemented write-side convenience: `writer_partitions`
+
+Batch write and batch upsert paths also support `writer_partitions` as a convenience input for full tensors that should be written as stored shards.
+
+This is intentionally narrower than the full `TensorParallelism` model:
+
+- it is a write-side convenience, not a replacement for `TensorParallelism`
+- it is primarily for batch full-tensor writes where the caller already knows rank / size / split_dim per item
+- it should not change the unified read-side abstraction
+
+### Implemented read-side behavior
+
+Read-side support includes:
+
+- returning the stored local object (`mode="as_stored"`)
+- returning a target shard (`mode="shard"`)
+- reconstructing the full tensor (`mode="full"`)
+- lowering reconstruction-oriented paths onto existing runtime helpers such as `get_into_ranges(...)` where appropriate
+
+### Compatibility boundary
+
+The project should continue to preserve this boundary:
+
+- keep old TP APIs functional
+- keep them thin
+- do not expand the old TP-specific family as the primary interface
+- document and evolve the unified `*_with_parallelism` family instead
+
+## Scope still intentionally limited
+
+This document describes the stable public API direction, but not every theoretical source-layout to target-layout remap is fully implemented.
+
+In particular, the design should continue to avoid over-promising planner coverage for arbitrary remaps across all DP / TP / EP / PP combinations until those paths are explicitly implemented and tested.
+
+The safe documented contract today is:
 
 1. define the public API structures and signatures clearly
 2. align `store_py.cpp` with `axes + ReadTarget`
