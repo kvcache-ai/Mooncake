@@ -35,6 +35,10 @@ Operational notes:
 - quota state and reservation queries resolve to the tenant-root scope because mutable quota state is tenant-root metadata in Phase 1
 - object-accounting lookups still accept nested selectors so operators can specify the logical object namespace they care about
 - reconcile currently aborts expired pending reservations and finalizes pending reservations whose authoritative route + accounting state is already visible
+- finalized and aborted reservations are retained for a bounded terminal window, then expire from Redis automatically; the default terminal TTL is `24h`
+- `Pending` reservations still rely on reconcile / abort paths rather than Redis TTL so an in-flight write is never deleted out from under finalize
+- `crates/mooncake-metadata` exposes `RedisMetadataConfig::tenant_quota_terminal_ttl(...)` for deployments that want a different terminal retention window
+- reservation listing prunes dangling reservation index entries opportunistically when the backing reservation record is already gone
 - other mismatches remain operator-visible and are reported as skipped rather than repaired speculatively
 - the admin HTTP surface rejects requests whose declared `Content-Length` exceeds `1 MiB` with `413 Payload Too Large`; because the server does not drain the remaining body, it responds with `Connection: close`
 

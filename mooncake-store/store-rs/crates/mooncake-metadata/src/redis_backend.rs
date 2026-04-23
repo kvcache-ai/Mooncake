@@ -454,6 +454,7 @@ const FINALIZE_TENANT_QUOTA_SCRIPT: &str = r#"
 local quota_key = KEYS[1]
 local object_key = KEYS[2]
 local reservation_key = KEYS[3]
+local reservation_index_key = KEYS[4]
 
 local reservation_id = ARGV[1]
 local expected_object_version = ARGV[2]
@@ -462,6 +463,7 @@ local route_version = ARGV[4]
 local object_state = ARGV[5]
 local updated_at_ms = tonumber(ARGV[6])
 local updated_by = ARGV[7]
+local terminal_ttl_ms = tonumber(ARGV[8])
 
 local function parse_optional_number(value)
     if value == '__none__' then
@@ -564,14 +566,20 @@ reservation['version'] = tonumber(reservation['version']) + 1
 local next_reservation_payload = cjson.encode(reservation)
 redis.call('SET', quota_key, next_quota_payload)
 redis.call('SET', reservation_key, next_reservation_payload)
+if terminal_ttl_ms and terminal_ttl_ms > 0 then
+    redis.call('PEXPIRE', reservation_key, terminal_ttl_ms)
+    redis.call('PEXPIRE', reservation_index_key, terminal_ttl_ms)
+end
 return {2, next_quota_payload, next_object_payload, next_reservation_payload}
 "#;
 
 const ABORT_TENANT_QUOTA_SCRIPT: &str = r#"
 local quota_key = KEYS[1]
 local reservation_key = KEYS[2]
+local reservation_index_key = KEYS[3]
 
 local reservation_id = ARGV[1]
+local terminal_ttl_ms = tonumber(ARGV[2])
 
 local function positive(value)
     if value > 0 then
@@ -626,6 +634,10 @@ reservation['version'] = tonumber(reservation['version']) + 1
 local next_reservation_payload = cjson.encode(reservation)
 redis.call('SET', quota_key, next_quota_payload)
 redis.call('SET', reservation_key, next_reservation_payload)
+if terminal_ttl_ms and terminal_ttl_ms > 0 then
+    redis.call('PEXPIRE', reservation_key, terminal_ttl_ms)
+    redis.call('PEXPIRE', reservation_index_key, terminal_ttl_ms)
+end
 return {2, next_quota_payload, next_reservation_payload}
 "#;
 
@@ -639,11 +651,13 @@ const DEFAULT_REDIS_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_REDIS_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REDIS_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_REDIS_RETRY_DELAY: Duration = Duration::from_millis(50);
+const DEFAULT_TENANT_QUOTA_TERMINAL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
 pub struct RedisMetadataConfig {
     pub url: String,
     pub keyspace: MetadataKeyspace,
+    pub tenant_quota_terminal_ttl: Duration,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -710,11 +724,17 @@ impl RedisMetadataConfig {
         Self {
             url: url.into(),
             keyspace: MetadataKeyspace::default(),
+            tenant_quota_terminal_ttl: DEFAULT_TENANT_QUOTA_TERMINAL_TTL,
         }
     }
 
     pub fn keyspace(mut self, keyspace: MetadataKeyspace) -> Self {
         self.keyspace = keyspace;
+        self
+    }
+
+    pub fn tenant_quota_terminal_ttl(mut self, ttl: Duration) -> Self {
+        self.tenant_quota_terminal_ttl = ttl;
         self
     }
 }
@@ -725,6 +745,7 @@ pub struct RedisMetadataBackend {
     prefer_legacy_auth: AtomicBool,
     keyspace: MetadataKeyspace,
     route_namespace: String,
+    tenant_quota_terminal_ttl: Duration,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -758,6 +779,7 @@ impl RedisMetadataBackend {
             prefer_legacy_auth: AtomicBool::new(false),
             keyspace: config.keyspace,
             route_namespace,
+            tenant_quota_terminal_ttl: config.tenant_quota_terminal_ttl,
         })
     }
 
@@ -1725,12 +1747,22 @@ impl MetadataBackend for RedisMetadataBackend {
                     metadata_error("redis get tenant quota reservation index", error)
                 })?;
             let Some(reservation_key) = reservation_key else {
+                connection
+                    .del::<_, ()>(index_key.as_str())
+                    .map_err(|error| {
+                        metadata_error("redis del stale tenant quota reservation index", error)
+                    })?;
                 continue;
             };
             let payload: Option<String> = connection
                 .get(reservation_key.as_str())
                 .map_err(|error| metadata_error("redis get tenant quota reservation", error))?;
             let Some(payload) = payload else {
+                connection
+                    .del::<_, ()>(index_key.as_str())
+                    .map_err(|error| {
+                        metadata_error("redis del dangling tenant quota reservation index", error)
+                    })?;
                 continue;
             };
             let reservation = parse_tenant_quota_reservation_payload(
@@ -1890,10 +1922,14 @@ impl MetadataBackend for RedisMetadataBackend {
         let scope = root_scope(&reservation.scope)?;
         let quota_key = self.keyspace.tenant_quota_state(&scope);
         let object_key = self.keyspace.tenant_object_accounting(&reservation.key);
+        let reservation_index_key = self
+            .keyspace
+            .tenant_quota_reservation_index(&scope, &request.reservation_id);
         let result = Script::new(FINALIZE_TENANT_QUOTA_SCRIPT)
             .key(&quota_key)
             .key(&object_key)
             .key(&reservation_key)
+            .key(&reservation_index_key)
             .arg(&request.reservation_id)
             .arg(
                 request
@@ -1919,6 +1955,7 @@ impl MetadataBackend for RedisMetadataBackend {
             })
             .arg(request.updated_at_ms)
             .arg(&request.updated_by)
+            .arg(self.tenant_quota_terminal_ttl.as_millis().max(1) as u64)
             .invoke::<(i32, String, String, String)>(&mut connection)
             .map_err(|error| metadata_error("redis finalize tenant quota", error))?;
 
@@ -1989,10 +2026,15 @@ impl MetadataBackend for RedisMetadataBackend {
         )?;
         let scope = root_scope(&reservation.scope)?;
         let quota_key = self.keyspace.tenant_quota_state(&scope);
+        let reservation_index_key = self
+            .keyspace
+            .tenant_quota_reservation_index(&scope, reservation_id);
         let result = Script::new(ABORT_TENANT_QUOTA_SCRIPT)
             .key(&quota_key)
             .key(&reservation_key)
+            .key(&reservation_index_key)
             .arg(reservation_id)
+            .arg(self.tenant_quota_terminal_ttl.as_millis().max(1) as u64)
             .invoke::<(i32, String, String)>(&mut connection)
             .map_err(|error| metadata_error("redis abort tenant quota", error))?;
         match result.0 {
@@ -2213,8 +2255,9 @@ mod tests {
         resolve_redis_auth, should_retry_readonly_redis_error, MetadataKeyspace,
         RedisMetadataBackend, RedisMetadataConfig, DEFAULT_REDIS_AUTH_PROBE_TIMEOUT,
         DEFAULT_REDIS_CONNECT_TIMEOUT, DEFAULT_REDIS_IO_TIMEOUT, DEFAULT_REDIS_RETRY_ATTEMPTS,
-        DEFAULT_REDIS_RETRY_DELAY, REDIS_AUTH_PROBE_TIMEOUT_ENV, REDIS_CONNECT_TIMEOUT_ENV,
-        REDIS_IO_TIMEOUT_ENV, REDIS_RETRY_ATTEMPTS_ENV, REDIS_RETRY_DELAY_ENV,
+        DEFAULT_REDIS_RETRY_DELAY, DEFAULT_TENANT_QUOTA_TERMINAL_TTL, REDIS_AUTH_PROBE_TIMEOUT_ENV,
+        REDIS_CONNECT_TIMEOUT_ENV, REDIS_IO_TIMEOUT_ENV, REDIS_RETRY_ATTEMPTS_ENV,
+        REDIS_RETRY_DELAY_ENV,
     };
 
     struct RedisTestServer {
@@ -3051,9 +3094,12 @@ mod tests {
         let Some(server) = RedisTestServer::start() else {
             return;
         };
+        let ttl = Duration::from_secs(60);
+        let keyspace = MetadataKeyspace::new("test/redis-tenant-quota");
         let backend = RedisMetadataBackend::new(
             RedisMetadataConfig::new(server.url())
-                .keyspace(MetadataKeyspace::new("test/redis-tenant-quota")),
+                .keyspace(keyspace.clone())
+                .tenant_quota_terminal_ttl(ttl),
         )
         .expect("redis backend should initialize");
         let scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
@@ -3111,6 +3157,27 @@ mod tests {
         assert_eq!(
             finalized.reservation.state,
             TenantQuotaReservationState::Finalized
+        );
+        let mut connection = backend
+            .connection()
+            .expect("redis connection should succeed");
+        let finalized_reservation_key = keyspace.tenant_quota_reservation("resv-create");
+        let finalized_index_key = keyspace.tenant_quota_reservation_index(&scope, "resv-create");
+        let finalized_reservation_ttl: i64 = redis::cmd("PTTL")
+            .arg(finalized_reservation_key.as_str())
+            .query(&mut connection)
+            .expect("finalized reservation ttl should be readable");
+        let finalized_index_ttl: i64 = redis::cmd("PTTL")
+            .arg(finalized_index_key.as_str())
+            .query(&mut connection)
+            .expect("finalized reservation index ttl should be readable");
+        assert!(
+            finalized_reservation_ttl > 0 && finalized_reservation_ttl <= ttl.as_millis() as i64,
+            "finalized reservation ttl should be set: {finalized_reservation_ttl}"
+        );
+        assert!(
+            finalized_index_ttl > 0 && finalized_index_ttl <= ttl.as_millis() as i64,
+            "finalized reservation index ttl should be set: {finalized_index_ttl}"
         );
 
         let duplicate_finalize = backend
@@ -3178,6 +3245,24 @@ mod tests {
             aborted.reservation.state,
             TenantQuotaReservationState::Aborted
         );
+        let aborted_reservation_key = keyspace.tenant_quota_reservation("resv-overwrite");
+        let aborted_index_key = keyspace.tenant_quota_reservation_index(&scope, "resv-overwrite");
+        let aborted_reservation_ttl: i64 = redis::cmd("PTTL")
+            .arg(aborted_reservation_key.as_str())
+            .query(&mut connection)
+            .expect("aborted reservation ttl should be readable");
+        let aborted_index_ttl: i64 = redis::cmd("PTTL")
+            .arg(aborted_index_key.as_str())
+            .query(&mut connection)
+            .expect("aborted reservation index ttl should be readable");
+        assert!(
+            aborted_reservation_ttl > 0 && aborted_reservation_ttl <= ttl.as_millis() as i64,
+            "aborted reservation ttl should be set: {aborted_reservation_ttl}"
+        );
+        assert!(
+            aborted_index_ttl > 0 && aborted_index_ttl <= ttl.as_millis() as i64,
+            "aborted reservation index ttl should be set: {aborted_index_ttl}"
+        );
 
         let duplicate_abort = backend
             .abort_tenant_quota("resv-overwrite")
@@ -3223,6 +3308,188 @@ mod tests {
             .get_tenant_object_accounting(&key)
             .expect("object accounting lookup should succeed")
             .is_none());
+    }
+
+    #[test]
+    fn redis_backend_uses_default_terminal_ttl_for_tenant_quota_reservations() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-tenant-quota-default-ttl")),
+        )
+        .expect("redis backend should initialize");
+        assert_eq!(
+            backend.tenant_quota_terminal_ttl,
+            DEFAULT_TENANT_QUOTA_TERMINAL_TTL
+        );
+    }
+
+    #[test]
+    fn redis_backend_terminal_reservations_expire_after_short_ttl() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let ttl = Duration::from_millis(75);
+        let keyspace = MetadataKeyspace::new("test/redis-tenant-quota-expire");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(keyspace.clone())
+                .tenant_quota_terminal_ttl(ttl),
+        )
+        .expect("redis backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-expire", None::<String>, None::<String>);
+        let key = ObjectKey::new("tenant-expire::alpha");
+        let writer = ClientRuntimeId::new("writer", ClientEpoch(1));
+
+        backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-expire-finalized".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: None,
+                delta_bytes: 16,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 200,
+                created_at_ms: 100,
+                writer_runtime: writer.clone(),
+            })
+            .expect("reservation should succeed");
+        backend
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: "resv-expire-finalized".to_string(),
+                expected_object_version: None,
+                committed_length: Some(16),
+                route_version: None,
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: 120,
+                updated_by: "writer".to_string(),
+            })
+            .expect("finalize should succeed");
+
+        backend
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "resv-expire-aborted".to_string(),
+                scope: scope.clone(),
+                key: key.clone(),
+                expected_object_version: Some(1),
+                delta_bytes: 8,
+                delta_objects: 0,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(64),
+                    max_objects: Some(2),
+                },
+                expires_at_ms: 260,
+                created_at_ms: 140,
+                writer_runtime: writer,
+            })
+            .expect("overwrite reservation should succeed");
+        backend
+            .abort_tenant_quota("resv-expire-aborted")
+            .expect("abort should succeed");
+
+        sleep(ttl + Duration::from_millis(80));
+
+        let finalized_reservation_key = keyspace.tenant_quota_reservation("resv-expire-finalized");
+        let finalized_index_key =
+            keyspace.tenant_quota_reservation_index(&scope, "resv-expire-finalized");
+        let aborted_reservation_key = keyspace.tenant_quota_reservation("resv-expire-aborted");
+        let aborted_index_key =
+            keyspace.tenant_quota_reservation_index(&scope, "resv-expire-aborted");
+        let mut connection = backend
+            .connection()
+            .expect("redis connection should succeed");
+        for key in [
+            finalized_reservation_key.as_str(),
+            finalized_index_key.as_str(),
+            aborted_reservation_key.as_str(),
+            aborted_index_key.as_str(),
+        ] {
+            let exists: bool = connection
+                .exists(key)
+                .expect("expiration existence lookup should succeed");
+            assert!(!exists, "terminal reservation key should expire: {key}");
+        }
+    }
+
+    #[test]
+    fn redis_backend_tenant_quota_listing_prunes_dangling_indexes() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-tenant-quota-dangling-index");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-z", None::<String>, None::<String>);
+        let index_key = keyspace.tenant_quota_reservation_index(&scope, "dangling");
+        let reservation_key = keyspace.tenant_quota_reservation("dangling");
+        let mut connection = backend
+            .connection()
+            .expect("redis connection should succeed");
+        connection
+            .set::<_, _, ()>(index_key.as_str(), reservation_key.as_str())
+            .expect("should seed dangling index");
+        drop(connection);
+
+        let reservations = backend
+            .list_tenant_quota_reservations(&scope)
+            .expect("reservation listing should succeed");
+        assert!(reservations.is_empty());
+
+        let mut connection = backend
+            .connection()
+            .expect("redis connection should succeed");
+        let dangling_index_exists: bool = connection
+            .exists(index_key.as_str())
+            .expect("index existence lookup should succeed");
+        assert!(
+            !dangling_index_exists,
+            "dangling reservation index should be pruned during listing"
+        );
+    }
+
+    #[test]
+    fn redis_backend_tenant_quota_listing_prunes_empty_index_entries() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-tenant-quota-empty-index");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+        let scope = TenantPolicyScope::new("tenant-empty", None::<String>, None::<String>);
+        let index_key = keyspace.tenant_quota_reservation_index(&scope, "empty");
+        let mut connection = backend
+            .connection()
+            .expect("redis connection should succeed");
+        connection
+            .set::<_, _, ()>(index_key.as_str(), "")
+            .expect("should seed empty index entry");
+        drop(connection);
+
+        let reservations = backend
+            .list_tenant_quota_reservations(&scope)
+            .expect("reservation listing should succeed");
+        assert!(reservations.is_empty());
+
+        let mut connection = backend
+            .connection()
+            .expect("redis connection should succeed");
+        let empty_index_exists: bool = connection
+            .exists(index_key.as_str())
+            .expect("index existence lookup should succeed");
+        assert!(
+            !empty_index_exists,
+            "empty reservation index should be pruned during listing"
+        );
     }
 
     #[test]

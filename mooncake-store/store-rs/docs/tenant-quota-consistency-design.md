@@ -591,6 +591,13 @@ Current reconcile behavior is intentionally conservative:
 - pending reservations whose route and object-accounting state already match an authoritative active object are finalized
 - other mismatches remain inspectable and are reported as skipped for operator review
 
+Reservation retention is now split by lifecycle state:
+
+- `Pending` reservations are kept until they are finalized or aborted by normal write flow or explicit reconcile
+- `Finalized` and `Aborted` reservations are retained only for a bounded terminal window, then expire from Redis automatically
+- the default terminal retention window is `24h`
+- terminal retention uses Redis TTL on both the reservation record and its per-tenant index entry so completed history does not accumulate indefinitely
+
 This matches the existing admin philosophy in `docs/multi-tenant-admin-control-plane-design.md`. Runtimes now also export tenant-quota reservation/finalize/abort/reconcile counters through the built-in Prometheus metrics registry.
 
 ---

@@ -534,6 +534,7 @@ Useful options:
 
 - `--keyspace <prefix>` to target a non-default metadata namespace for either policy management or stale cleanup
 - `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` for Redis ACL authentication
+- terminal tenant-quota reservations (`Finalized` / `Aborted`) expire automatically after `24h` by default; if a deployment needs a different retention window, configure `RedisMetadataConfig::tenant_quota_terminal_ttl(...)`
 
 ### Local e2e validation
 
