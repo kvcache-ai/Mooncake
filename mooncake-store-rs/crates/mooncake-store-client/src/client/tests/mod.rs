@@ -204,6 +204,7 @@ struct RecoverableMetadataBackend {
 
 #[derive(Default)]
 struct BlockingCasGateState {
+    armed: bool,
     entered: bool,
     released: bool,
     blocked_once: bool,
@@ -337,10 +338,24 @@ impl BlockingCasMetadataBackend {
             inner,
             block_key: ObjectKey::new(block_key),
             gate: Arc::new((
-                StdMutex::new(BlockingCasGateState::default()),
+                StdMutex::new(BlockingCasGateState {
+                    armed: false,
+                    entered: false,
+                    released: false,
+                    blocked_once: false,
+                }),
                 Condvar::new(),
             )),
         }
+    }
+
+    fn arm_blocked_cas(&self) {
+        let (lock, _) = &*self.gate;
+        let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
+        state.armed = true;
+        state.entered = false;
+        state.released = false;
+        state.blocked_once = false;
     }
 
     fn wait_until_blocked(&self, timeout: Duration) -> bool {
@@ -1913,7 +1928,7 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         if *key == self.block_key {
             let (lock, condvar) = &*self.gate;
             let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
-            if !state.blocked_once {
+            if state.armed && !state.blocked_once {
                 state.entered = true;
                 condvar.notify_all();
                 while !state.released {
@@ -1922,6 +1937,7 @@ impl MetadataBackend for BlockingCasMetadataBackend {
                         .expect("blocking CAS gate wait should succeed");
                 }
                 state.blocked_once = true;
+                state.armed = false;
             }
         }
         self.inner
