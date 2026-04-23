@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_metadata::{
+    ClientLeaseLiveness, MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig,
+};
 use mooncake_store_client::record_tenant_quota_reconcile;
 use mooncake_store_core::{
     route_logical_object_id, ClientEpoch, ClientRuntimeId, LogicalObjectId, MetadataBackend,
@@ -16,9 +18,10 @@ use url::Url;
 use crate::config::build_metadata_backend;
 
 use super::models::{
-    AdminCleanupReport, DeleteTenantPolicyResponse, GetTenantObjectAccountingResponse,
-    GetTenantPolicyResponse, GetTenantQuotaStateResponse, ListTenantQuotaReservationsResponse,
-    PolicyPatchInput, RoutePolicyResponse, TenantQuotaAbortResponse, TenantQuotaReconcileAction,
+    AdminCleanupReport, AdminMaintenanceReport, AdminOwnerCleanupReport, AdminOwnerCleanupState,
+    DeleteTenantPolicyResponse, GetTenantObjectAccountingResponse, GetTenantPolicyResponse,
+    GetTenantQuotaStateResponse, ListTenantQuotaReservationsResponse, PolicyPatchInput,
+    RoutePolicyResponse, TenantQuotaAbortResponse, TenantQuotaReconcileAction,
     TenantQuotaReconcileReport,
 };
 
@@ -32,6 +35,19 @@ pub struct AdminService {
 }
 
 impl AdminService {
+    fn redis_metadata_backend(&self) -> AdminResult<RedisMetadataBackend> {
+        if !self.metadata_url.starts_with("redis://") && !self.metadata_url.starts_with("rediss://")
+        {
+            return Err(StoreError::Unsupported(
+                "stale segment maintenance currently supports redis:// and rediss:// metadata only"
+                    .to_string(),
+            ));
+        }
+        RedisMetadataBackend::new(
+            RedisMetadataConfig::new(self.metadata_url.clone()).keyspace(self.keyspace.clone()),
+        )
+    }
+
     pub fn from_config(metadata_url: &str, keyspace: Option<String>) -> AdminResult<Self> {
         let keyspace = keyspace.map(MetadataKeyspace::new).unwrap_or_default();
         let (backend, _) = build_metadata_backend(metadata_url, None, keyspace.clone())?;
@@ -392,16 +408,7 @@ impl AdminService {
     }
 
     pub fn cleanup_stale_segments(&self) -> AdminResult<AdminCleanupReport> {
-        if !self.metadata_url.starts_with("redis://") && !self.metadata_url.starts_with("rediss://")
-        {
-            return Err(StoreError::Unsupported(
-                "cleanup-stale-segments currently supports redis:// and rediss:// metadata only"
-                    .to_string(),
-            ));
-        }
-        let backend = RedisMetadataBackend::new(
-            RedisMetadataConfig::new(self.metadata_url.clone()).keyspace(self.keyspace.clone()),
-        )?;
+        let backend = self.redis_metadata_backend()?;
         let report = backend.cleanup_stale_segments()?;
         Ok(AdminCleanupReport {
             live_clients: report.live_clients,
@@ -411,6 +418,120 @@ impl AdminService {
             removed_owner_segment_index_entries: report.removed_owner_segment_index_entries,
             stale_missing_segment_index_entries: report.stale_missing_segment_index_entries,
         })
+    }
+
+    pub fn cleanup_stale_segments_for_owner(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> AdminResult<AdminOwnerCleanupReport> {
+        let backend = self.redis_metadata_backend()?;
+        Self::cleanup_stale_segments_for_owner_with_backend(&backend, runtime)
+    }
+
+    fn cleanup_stale_segments_for_owner_with_backend(
+        backend: &RedisMetadataBackend,
+        runtime: &ClientRuntimeId,
+    ) -> AdminResult<AdminOwnerCleanupReport> {
+        match backend.client_lease_liveness(runtime)? {
+            ClientLeaseLiveness::Live(lease) => {
+                backend.refresh_client_lease_expiry(&lease.runtime, lease.expires_at_ms)?;
+                Ok(AdminOwnerCleanupReport {
+                    owner: lease.runtime,
+                    state: AdminOwnerCleanupState::SkippedLive,
+                    cleanup: AdminCleanupReport {
+                        live_clients: 0,
+                        inspected_segment_keys: 0,
+                        removed_segment_keys: 0,
+                        removed_segment_index_entries: 0,
+                        removed_owner_segment_index_entries: 0,
+                        stale_missing_segment_index_entries: 0,
+                    },
+                })
+            }
+            ClientLeaseLiveness::Missing => {
+                let cleanup = backend.cleanup_stale_segments_for_owner(runtime)?;
+                let _ = backend.remove_client_lease_expiry(runtime)?;
+                Ok(AdminOwnerCleanupReport {
+                    owner: runtime.clone(),
+                    state: AdminOwnerCleanupState::CleanedMissingLease,
+                    cleanup: AdminCleanupReport {
+                        live_clients: cleanup.live_clients,
+                        inspected_segment_keys: cleanup.inspected_segment_keys,
+                        removed_segment_keys: cleanup.removed_segment_keys,
+                        removed_segment_index_entries: cleanup.removed_segment_index_entries,
+                        removed_owner_segment_index_entries: cleanup
+                            .removed_owner_segment_index_entries,
+                        stale_missing_segment_index_entries: cleanup
+                            .stale_missing_segment_index_entries,
+                    },
+                })
+            }
+            ClientLeaseLiveness::Expired(lease) => {
+                let cleanup = backend.cleanup_stale_segments_for_owner(&lease.runtime)?;
+                let _ = backend.remove_client_lease_expiry(&lease.runtime)?;
+                Ok(AdminOwnerCleanupReport {
+                    owner: lease.runtime,
+                    state: AdminOwnerCleanupState::CleanedExpiredLease,
+                    cleanup: AdminCleanupReport {
+                        live_clients: cleanup.live_clients,
+                        inspected_segment_keys: cleanup.inspected_segment_keys,
+                        removed_segment_keys: cleanup.removed_segment_keys,
+                        removed_segment_index_entries: cleanup.removed_segment_index_entries,
+                        removed_owner_segment_index_entries: cleanup
+                            .removed_owner_segment_index_entries,
+                        stale_missing_segment_index_entries: cleanup
+                            .stale_missing_segment_index_entries,
+                    },
+                })
+            }
+        }
+    }
+
+    pub fn reconcile_due_stale_segments(
+        &self,
+        limit: usize,
+    ) -> AdminResult<AdminMaintenanceReport> {
+        let backend = self.redis_metadata_backend()?;
+        let due_entries = backend.list_due_client_lease_expiries(now_ms(), limit)?;
+        let mut report = AdminMaintenanceReport {
+            due_entries: due_entries.len(),
+            ..AdminMaintenanceReport::default()
+        };
+
+        for lease_key in due_entries {
+            let Some((stable_id, epoch)) = self.keyspace.parse_client_key(&lease_key) else {
+                let _ = backend.remove_client_lease_expiry_entry(&lease_key)?;
+                report.invalid_entries = report.invalid_entries.saturating_add(1);
+                continue;
+            };
+            let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(epoch));
+            let outcome = Self::cleanup_stale_segments_for_owner_with_backend(&backend, &runtime)?;
+            match outcome.state {
+                AdminOwnerCleanupState::SkippedLive => {
+                    report.skipped_live = report.skipped_live.saturating_add(1);
+                }
+                AdminOwnerCleanupState::CleanedMissingLease => {
+                    report.cleaned_missing_lease = report.cleaned_missing_lease.saturating_add(1);
+                }
+                AdminOwnerCleanupState::CleanedExpiredLease => {
+                    report.cleaned_expired_lease = report.cleaned_expired_lease.saturating_add(1);
+                }
+            }
+            report.removed_segment_keys = report
+                .removed_segment_keys
+                .saturating_add(outcome.cleanup.removed_segment_keys);
+            report.removed_segment_index_entries = report
+                .removed_segment_index_entries
+                .saturating_add(outcome.cleanup.removed_segment_index_entries);
+            report.removed_owner_segment_index_entries = report
+                .removed_owner_segment_index_entries
+                .saturating_add(outcome.cleanup.removed_owner_segment_index_entries);
+            report.stale_missing_segment_index_entries = report
+                .stale_missing_segment_index_entries
+                .saturating_add(outcome.cleanup.stale_missing_segment_index_entries);
+        }
+
+        Ok(report)
     }
 }
 
@@ -614,14 +735,20 @@ pub fn redact_redis_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
 
-    use mooncake_metadata::InMemoryMetadataBackend;
+    use mooncake_metadata::{InMemoryMetadataBackend, RedisMetadataBackend, RedisMetadataConfig};
     use mooncake_store_core::{
         ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, MetadataBackend, ObjectRoute,
-        ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentName,
-        TenantObjectAccountingState, TenantPolicy, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
-        TenantQuotaReservationRequest, TenantQuotaReservationState,
+        ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentAnnouncement,
+        SegmentLifecycleState, SegmentName, TenantObjectAccountingState, TenantPolicy,
+        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
+        TenantQuotaReservationState,
     };
 
     use super::*;
@@ -629,6 +756,78 @@ mod tests {
     fn test_service() -> AdminService {
         let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
         AdminService::new(backend, "memory://test", MetadataKeyspace::default())
+    }
+
+    struct RedisTestServer {
+        child: Child,
+        url: String,
+        dir: PathBuf,
+    }
+
+    impl RedisTestServer {
+        fn start() -> Option<Self> {
+            if Command::new("redis-server")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .ok()?
+                .success()
+                == false
+            {
+                return None;
+            }
+
+            let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+            let port = listener.local_addr().ok()?.port();
+            drop(listener);
+
+            let dir = std::env::temp_dir().join(format!(
+                "mooncake-admin-redis-test-{}-{port}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).ok()?;
+
+            let child = Command::new("redis-server")
+                .arg("--save")
+                .arg("")
+                .arg("--appendonly")
+                .arg("no")
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--bind")
+                .arg("127.0.0.1")
+                .arg("--dir")
+                .arg(&dir)
+                .arg("--dbfilename")
+                .arg("dump.rdb")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+
+            let url = format!("redis://127.0.0.1:{port}/0");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Some(Self { child, url, dir });
+                }
+                sleep(Duration::from_millis(50));
+            }
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            None
+        }
+    }
+
+    impl Drop for RedisTestServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     fn put_quota_policy(service: &AdminService) {
@@ -895,5 +1094,109 @@ mod tests {
             .find(|reservation| reservation.reservation_id == "res-visible")
             .expect("visible reservation should exist");
         assert_eq!(visible.state, TenantQuotaReservationState::Finalized);
+    }
+
+    #[test]
+    fn admin_service_reconcile_due_stale_segments_cleans_missing_lease_owner() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/admin-stale-maint-missing");
+        let backend = Arc::new(
+            RedisMetadataBackend::new(
+                RedisMetadataConfig::new(server.url.clone()).keyspace(keyspace.clone()),
+            )
+            .expect("redis backend should initialize"),
+        );
+        let service = AdminService::new(backend.clone(), server.url.clone(), keyspace);
+
+        let dead_runtime = ClientRuntimeId::new("dead-owner", ClientEpoch(9));
+        backend
+            .publish_segment(&SegmentAnnouncement {
+                owner: dead_runtime.clone(),
+                segment_name: SegmentName::new("dead-segment"),
+                capacity_bytes: 256,
+                used_bytes: 64,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: 16,
+                tags: vec!["dram".to_string()],
+            })
+            .expect("dead segment publish should succeed");
+        backend
+            .refresh_client_lease_expiry(&dead_runtime, super::now_ms().saturating_sub(1))
+            .expect("expiry queue seed should succeed");
+
+        let report = service
+            .reconcile_due_stale_segments(8)
+            .expect("maintenance reconcile should succeed");
+        assert_eq!(report.due_entries, 1);
+        assert_eq!(report.cleaned_missing_lease, 1);
+        assert_eq!(report.removed_segment_keys, 1);
+        assert!(backend
+            .list_segments(None)
+            .expect("segment listing should succeed")
+            .is_empty());
+        assert!(backend
+            .list_due_client_lease_expiries(super::now_ms(), 8)
+            .expect("expiry queue should be queryable")
+            .is_empty());
+    }
+
+    #[test]
+    fn admin_service_reconcile_due_stale_segments_skips_live_owner() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/admin-stale-maint-live");
+        let backend = Arc::new(
+            RedisMetadataBackend::new(
+                RedisMetadataConfig::new(server.url.clone()).keyspace(keyspace.clone()),
+            )
+            .expect("redis backend should initialize"),
+        );
+        let service = AdminService::new(backend.clone(), server.url.clone(), keyspace);
+
+        let live_runtime = ClientRuntimeId::new("live-owner", ClientEpoch(3));
+        backend
+            .upsert_client_lease(&mooncake_store_core::ClientLease {
+                runtime: live_runtime.clone(),
+                state: mooncake_store_core::ClientLifecycleState::Active,
+                compatibility: CompatibilityDescriptor::default(),
+                endpoints: mooncake_store_core::ClientEndpointSet::default(),
+                expires_at_ms: super::now_ms().saturating_add(60_000),
+            })
+            .expect("live lease publish should succeed");
+        let segment = SegmentAnnouncement {
+            owner: live_runtime.clone(),
+            segment_name: SegmentName::new("live-segment"),
+            capacity_bytes: 128,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 16,
+            tags: vec!["dram".to_string()],
+        };
+        backend
+            .publish_segment(&segment)
+            .expect("live segment publish should succeed");
+        backend
+            .refresh_client_lease_expiry(&live_runtime, super::now_ms().saturating_sub(1))
+            .expect("expiry queue seed should succeed");
+
+        let report = service
+            .reconcile_due_stale_segments(8)
+            .expect("maintenance reconcile should succeed");
+        assert_eq!(report.due_entries, 1);
+        assert_eq!(report.skipped_live, 1);
+        assert_eq!(report.removed_segment_keys, 0);
+        assert_eq!(
+            backend
+                .list_segments(None)
+                .expect("segment listing should succeed"),
+            vec![segment]
+        );
+        assert!(backend
+            .list_due_client_lease_expiries(super::now_ms(), 8)
+            .expect("expiry queue should be queryable")
+            .is_empty());
     }
 }

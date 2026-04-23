@@ -42,6 +42,34 @@ Operational notes:
 - other mismatches remain operator-visible and are reported as skipped rather than repaired speculatively
 - the admin HTTP surface rejects requests whose declared `Content-Length` exceeds `1 MiB` with `413 Payload Too Large`; because the server does not drain the remaining body, it responds with `Connection: close`
 
+## Admin maintenance
+
+Redis-backed deployments now support a stateless admin maintenance loop for stale segment cleanup.
+The same admin server can also run tenant-quota reservation reconcile for an explicit tenant list.
+
+Relevant surfaces:
+
+- `mooncake-store-admin cleanup-stale-segments`
+- `mooncake-store-admin server --cleanup-interval-ms <ms> --cleanup-batch-size <n>`
+- `mooncake-store-admin server --quota-reconcile-interval-ms <ms> --quota-reconcile-tenant <tenant>`
+
+Operational model:
+
+- client lease keys still use Redis TTL as the liveness signal
+- segment keys still do **not** use TTL
+- lease publish and heartbeat refresh now also update a Redis sorted-set expiry index under the same metadata keyspace
+- the admin maintenance loop consumes due entries from that expiry index, re-checks lease liveness, and only then removes dead-owner segment metadata through the owner segment index
+- same-epoch lease reclaim after an expired lease key is allowed when that epoch is still the historical HWM and no higher live epoch exists, so heartbeat repair does not fail with `StaleEpoch` after a TTL gap
+- tenant quota reconcile is intentionally opt-in per tenant because the current metadata model has no bounded global tenant-work index for the admin plane to consume safely
+
+Server maintenance defaults:
+
+- `--cleanup-interval-ms 5000`
+- `--cleanup-batch-size 128`
+- `--cleanup-interval-ms 0` disables the background maintenance worker
+- `--quota-reconcile-interval-ms 0` disables background tenant quota reconcile
+- `--quota-reconcile-tenant <tenant>` can be repeated; when unset, no tenant quota reconcile worker is started
+
 ## `StoreClientBuilder`
 
 `StoreClientBuilder` is the main construction surface for Rust clients.

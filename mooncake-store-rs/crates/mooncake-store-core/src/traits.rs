@@ -21,7 +21,14 @@ pub trait MetadataBackend: Send + Sync {
     /// test setup. Implementations MUST reject writes whose `lease.runtime.epoch`
     /// is not strictly greater than every epoch ever observed for the same
     /// `lease.runtime.stable_id` unless the lease key already exists (refresh).
-    /// Rejection returns `StoreError::StaleEpoch`.
+    ///
+    /// If the exact lease key disappeared after expiry, implementations MAY also
+    /// accept a same-epoch reclaim for the current historical high-water-mark
+    /// epoch when no higher live epoch for that stable id exists. This keeps
+    /// heartbeat repair and predecessor drain pinning from spuriously failing
+    /// after a lease TTL gap while preserving monotonic epoch assignment.
+    ///
+    /// Other stale writes must be rejected with `StoreError::StaleEpoch`.
     ///
     /// Normal registration goes through [`Self::allocate_client_lease`]; callers
     /// SHOULD NOT invent new epoch values here.

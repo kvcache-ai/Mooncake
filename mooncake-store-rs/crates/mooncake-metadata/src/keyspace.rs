@@ -58,6 +58,10 @@ impl MetadataKeyspace {
         format!("{}/state/client-epoch-hwm/{}", self.slot_tag, stable_id.0)
     }
 
+    pub fn client_lease_expiry_index(&self) -> String {
+        format!("{}/system/client-lease-expiry", self.slot_tag)
+    }
+
     pub fn parse_client_key(&self, key: &str) -> Option<(String, u64)> {
         let prefix = format!("{}/clients/", self.slot_tag);
         let rest = key.strip_prefix(&prefix)?;
@@ -370,6 +374,10 @@ mod tests {
             "{tenant-a}/state/client-epoch-hwm/writer"
         );
         assert_eq!(
+            keyspace.client_lease_expiry_index(),
+            "{tenant-a}/system/client-lease-expiry"
+        );
+        assert_eq!(
             keyspace.parse_client_key("{tenant-a}/clients/writer:9"),
             Some(("writer".to_string(), 9))
         );
@@ -534,6 +542,7 @@ mod tests {
             keyspace.client_index(),
             keyspace.client_by_stable_index(&stable),
             keyspace.client_epoch_hwm(&stable),
+            keyspace.client_lease_expiry_index(),
             keyspace.object(&ObjectKey::new("key-1")),
             keyspace.object_index(),
         ];
@@ -553,7 +562,6 @@ mod tests {
             );
         }
     }
-
 
     // -----------------------------------------------------------------------
     // Adversarial: percent-encoding roundtrip + rejection + key-shape

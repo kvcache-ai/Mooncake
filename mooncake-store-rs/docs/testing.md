@@ -16,30 +16,32 @@ and conventions are the contract.
 - Simulate distributed-inference failure modes — transport disconnect,
   metadata unavailability, concurrent CAS, segment exhaustion — in-process
   rather than relying on external fault injectors.
-- Keep the unit-test suite hermetic: no real network, no real Redis or etcd,
-  no stray files. Integration tests that do need real infrastructure skip
-  cleanly when the infrastructure is absent.
+- Keep the default test path hermetic: no real network, no stray files, and
+  live Redis / etcd only in explicitly scoped integration tests that skip
+  cleanly when the required binary or service is absent.
 
 ## Test Inventory
 
-Workspace `cargo test --lib` runs 864 tests across seven crates. The Redis
-integration tests inside `mooncake-metadata` skip silently when no
-`redis-server` binary is on `PATH`; all other tests run unconditionally.
+Workspace `cargo test --lib` runs 873 tests across the workspace crates listed
+below. The Redis-backed integration tests inside `mooncake-metadata` and
+`mooncake-store-py` skip silently when no `redis-server` binary is on `PATH`;
+the etcd backend tests skip when no etcd service is reachable; all other tests
+run unconditionally.
 
 | Crate | `--lib` tests | Notes |
 |---|---:|---|
 | `mooncake-store-client` | 535 | Dominant runtime; includes property tests and fault-injection integration |
 | `mooncake-store-core` | 112 | Pure-type contracts: identity, route, compat, error, codec |
-| `mooncake-metadata` | 105 | In-memory backend + keyspace + segment state + Redis integration |
-| `mooncake-store-py` | 87 | PyO3 bindings, dummy client, setup helpers (3 `#[ignore]`) |
+| `mooncake-metadata` | 109 | In-memory backend + keyspace + segment state + Redis / etcd integration |
+| `mooncake-store-py` | 92 | PyO3 bindings, admin service, setup helpers (3 `#[ignore]`, including Redis-backed admin maintenance tests) |
 | `mooncake-transport` | 21 | Transport-core trait behaviour |
 | `mooncake-transport-sys` | 4 | FFI shim sanity checks |
 | `mooncake-store-test-utils` | 0 | Test-only crate — no self-tests |
 | `mooncake-store-transport-core` | 0 | Trait definitions only |
 
-Wall time on a warm cache: ≈21 s total, with `mooncake-store-client`
-responsible for ≈14 s of that (it owns the fault-injection and property
-suites).
+Wall time on a warm cache stays in the low-20-second range, with
+`mooncake-store-client` still responsible for most of that time because it
+owns the fault-injection and property suites.
 
 ### Per-file breakdown — client tests
 
@@ -160,6 +162,9 @@ End-to-end flows that compose ≥2 real components without mocks.
   the full metadata surface, Lua-script atomicity, transient-error retry.
 - `mooncake-metadata::etcd_backend::tests::etcd_backend_*` — 5 tests gated
   on a running etcd (same conditional-skip pattern as Redis).
+- `mooncake-store-py::admin::service::tests::*stale_segments*` — 2 Redis-backed
+  admin-maintenance scenarios verify dead-owner segment cleanup and live-owner
+  skip semantics against the real metadata backend.
 - `mooncake-store-client::client::tests::mod.rs` — 116 scenarios build
   multi-client topologies sharing an `InMemoryMetadataBackend` and verify
   cross-client handoff, drain, evacuation, metrics rendering.
@@ -223,10 +228,11 @@ two-client topology:
 
 See `store_client_tests::make_faulty_reader` for the pattern.
 
-## Redis Integration: Conditional Skip
+## Redis-backed Integration: Conditional Skip
 
-`RedisTestServer::start()` in `mooncake-metadata/src/redis_backend.rs`
-spawns a local `redis-server` child process on an ephemeral port. Every
+`RedisTestServer::start()` in both `mooncake-metadata/src/redis_backend.rs`
+and `crates/mooncake-store-py/src/admin/service.rs` spawns a local
+`redis-server` child process on an ephemeral port. Every Redis-backed
 integration test begins with:
 
 ```rust
@@ -237,7 +243,7 @@ When the binary is absent the test returns `Ok(())` silently. This lets
 the suite run on a laptop without Redis, while still exercising the
 Redis paths on any CI image that includes it.
 
-Integration scenarios covered (9 new + 26 pre-existing):
+Metadata backend scenarios covered (9 new + 26 pre-existing):
 
 - Backend round-trip for the full metadata surface.
 - Concurrent route CAS — 5-thread race yields exactly one winner.
@@ -252,6 +258,13 @@ Integration scenarios covered (9 new + 26 pre-existing):
 - Stale lease expiry enforcement via TTL.
 - Redis hash-tag slot verification (all keyspace-derived keys map to the
   same cluster slot — critical for Redis Cluster Lua scripts).
+
+Admin service scenarios covered:
+
+- due stale-owner entries remove orphaned segment metadata through the owner
+  index and clear the consumed expiry-queue entries
+- live owners that happen to appear in the expiry queue are re-checked and
+  skipped instead of being cleaned speculatively
 
 ### Transient-error classifier
 
@@ -308,6 +321,8 @@ Matches the command CI runs. Completes in ≈17 s on a warm cache.
 cargo test -p mooncake-store-client --lib
 cargo test -p mooncake-metadata --lib
 cargo test -p mooncake-store-core --lib
+cargo test -p mooncake-store-py --lib
+cargo test -p mooncake-store-py --bin mooncake-store-admin
 ```
 
 ### Single test file or pattern
@@ -347,9 +362,9 @@ ssh sg 'cd /root/mooncake-store-rs && source /root/.cargo/env \
   against the full workspace in the CI Docker image, then uploads the wheel
   artifact for downstream E2E jobs.
 
-Redis integration tests inside `mooncake-metadata` run only if the CI
-image has a `redis-server` binary. The current CI image includes one, so
-those 9 integration tests do execute on every MR.
+Redis-backed lib tests inside `mooncake-metadata` and `mooncake-store-py`
+run only if the CI image has a `redis-server` binary. The current CI image
+includes one, so those Redis-backed coverage paths do execute on every MR.
 
 Property-test case budgets (32 / 64 / 512) are the per-file defaults; they
 do not expand under CI.

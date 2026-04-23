@@ -118,6 +118,21 @@ A request can control placement behavior with:
 - preferred storage owner list
 - `prefer_local`
 - `prefer_alloc_in_same_node`
+
+## Admin Maintenance
+
+### Stateless stale-segment cleanup
+
+The admin plane now supports Redis-backed stale-segment cleanup without reintroducing a master on the request path.
+
+What it provides:
+
+- explicit one-shot stale cleanup through `mooncake-store-admin cleanup-stale-segments`
+- continuous stateless cleanup through `mooncake-store-admin server`
+- optional tenant-quota reservation reconcile in that same admin server for an explicit tenant list
+- Redis-backed lease-expiry indexing for recoverable maintenance scheduling
+- owner-scoped cleanup through `indexes/segments/<owner>` instead of a hidden global segment scan in the steady-state worker
+- same-epoch lease reclaim after a lease TTL gap when no higher live epoch exists, so heartbeat repair and predecessor drain pinning do not fail with stale-epoch rejection
 - `with_soft_pin`
 
 ## Allocation and Segment Management
