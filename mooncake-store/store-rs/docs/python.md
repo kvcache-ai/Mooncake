@@ -67,6 +67,7 @@ This mode:
 
 - constructs a Rust `StoreClient`
 - registers local memory and participates in route / allocator control plane RPC
+- starts a background heartbeat loop after setup so long-lived Python runtimes keep their lease live and repair local metadata after Redis connectivity returns without requiring explicit `heartbeat()` calls
 - participates in the same hit-report and replica-route tracking RPC used by Rust clients
 - supports routed writes, replication policy, segment lifecycle, metrics, and tracing
 - is the normal path for Python clients that should behave like store-rs nodes
@@ -85,6 +86,7 @@ This mode:
 
 - connects to a standalone `mooncake-store-client` process over gRPC
 - registers shm regions by passing file descriptors over a Unix socket
+- derives short hashed Unix socket filenames for dummy shm and hot-cache side channels so long worker scopes stay below AF_UNIX path limits
 - keeps the Python process out of the distributed control plane
 - is the compatibility path used by the HiCache dummy flow
 

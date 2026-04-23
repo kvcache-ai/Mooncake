@@ -274,20 +274,42 @@ fn sanitize_scope_component(value: &str) -> String {
         .collect::<String>()
 }
 
+fn abbreviate_scope_component(value: &str, max_chars: usize) -> String {
+    sanitize_scope_component(value)
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+}
+
+fn stable_socket_hash(server_addr: &str, worker_scope: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in server_addr
+        .bytes()
+        .chain(std::iter::once(0xff))
+        .chain(worker_scope.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn scoped_ipc_socket_path(prefix: &str, server_addr: &str, worker_scope: &str) -> PathBuf {
+    let addr = abbreviate_scope_component(server_addr, 16);
+    let scope = abbreviate_scope_component(worker_scope, 24);
+    let hash = stable_socket_hash(server_addr, worker_scope);
+    std::env::temp_dir().join(format!("{prefix}-{addr}-{scope}-{hash:016x}.sock"))
+}
+
 pub fn dummy_ipc_socket_path(server_addr: &str, worker_scope: &str) -> PathBuf {
-    let sanitized_addr = sanitize_scope_component(server_addr);
-    let sanitized_scope = sanitize_scope_component(worker_scope);
-    std::env::temp_dir().join(format!(
-        "mooncake-store-rs-dummy-{sanitized_addr}-{sanitized_scope}.sock"
-    ))
+    scoped_ipc_socket_path("mc-d", server_addr, worker_scope)
 }
 
 pub fn hot_cache_ipc_socket_path(server_addr: &str, worker_scope: &str) -> PathBuf {
-    let sanitized_addr = sanitize_scope_component(server_addr);
-    let sanitized_scope = sanitize_scope_component(worker_scope);
-    std::env::temp_dir().join(format!(
-        "mooncake-store-rs-dummy-hot-cache-{sanitized_addr}-{sanitized_scope}.sock"
-    ))
+    scoped_ipc_socket_path("mc-dh", server_addr, worker_scope)
 }
 
 pub fn send_shm_register_request(
@@ -674,8 +696,14 @@ mod tests {
         let _guard = test_lock().lock();
         let sanitized = dummy_ipc_socket_path("tcp://127.0.0.1:7000?slot=1", "scope/a");
         let rendered = sanitized.to_string_lossy();
-        assert!(rendered.contains("tcp___127_0_0_1_7000_slot_1"));
+        assert!(rendered.contains("tcp___127_0_0_1"));
         assert!(rendered.contains("scope_a"));
+        assert!(rendered.len() < 108);
+        let hot_cache = hot_cache_ipc_socket_path(
+            "127.0.0.1:35455",
+            "mc/store-rs/e2e/local-hot-cache/1776947883484/dummy",
+        );
+        assert!(hot_cache.to_string_lossy().len() < 108);
         assert!(matches!(
             allocate_shared_region(0),
             Err(StoreError::Allocator(_))

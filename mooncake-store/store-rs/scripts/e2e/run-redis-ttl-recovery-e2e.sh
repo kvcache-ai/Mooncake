@@ -186,27 +186,26 @@ save_redis_snapshot() {
   redis-cli -p "${REDIS_PORT}" SAVE >/dev/null
 }
 
-redis_pattern_count() {
-  local pattern=$1
-  redis-cli -u "${REDIS_URL}" --scan --pattern "${pattern}" | wc -l | tr -d '[:space:]'
+redis_key_exists() {
+  local key=$1
+  redis-cli -u "${REDIS_URL}" EXISTS "${key}" | tr -d '[:space:]'
 }
 
-wait_for_pattern_count() {
-  local pattern=$1
-  local expected=$2
-  local timeout_seconds=$3
+wait_for_key() {
+  local key=$1
+  local timeout_seconds=$2
   local deadline=$((SECONDS + timeout_seconds))
-  local count=0
+  local exists=0
 
   while (( SECONDS < deadline )); do
-    count=$(redis_pattern_count "${pattern}")
-    if (( count >= expected )); then
+    exists=$(redis_key_exists "${key}")
+    if [[ "${exists}" == "1" ]]; then
       return 0
     fi
     sleep 0.2
   done
 
-  echo "pattern ${pattern} reached ${count}, expected at least ${expected}" >&2
+  echo "key did not appear: ${key}" >&2
   exit 1
 }
 
@@ -224,10 +223,10 @@ wait_for_route_policy() {
 }
 
 wait_for_storage_metadata() {
-  wait_for_pattern_count "{${KEYSPACE}}/clients/${STORAGE_A_STABLE}:*" 1 25
-  wait_for_pattern_count "{${KEYSPACE}}/clients/${STORAGE_B_STABLE}:*" 1 25
-  wait_for_pattern_count "{${KEYSPACE}}/segments/${STORAGE_A_STABLE}:*" 1 25
-  wait_for_pattern_count "{${KEYSPACE}}/segments/${STORAGE_B_STABLE}:*" 1 25
+  wait_for_key "{${KEYSPACE}}/clients/${STORAGE_A_STABLE}:1" 25
+  wait_for_key "{${KEYSPACE}}/clients/${STORAGE_B_STABLE}:1" 25
+  wait_for_key "{${KEYSPACE}}/indexes/segments/${STORAGE_A_STABLE}:1" 25
+  wait_for_key "{${KEYSPACE}}/indexes/segments/${STORAGE_B_STABLE}:1" 25
   wait_for_route_policy
 }
 

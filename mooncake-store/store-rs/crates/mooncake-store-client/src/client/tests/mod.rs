@@ -6623,10 +6623,9 @@ fn batch_get_into_batches_registered_remote_buffers_without_scratch() {
     assert_eq!(writer_transport.submitted_batch_bytes(), vec![16]);
     assert_eq!(
         writer_transport.submitted_request_sources(),
-        vec![vec![
-            target.as_mut_ptr() as usize,
-            unsafe { target.as_mut_ptr().add(16) as usize },
-        ]]
+        vec![vec![target.as_mut_ptr() as usize, unsafe {
+            target.as_mut_ptr().add(16) as usize
+        },]]
     );
 
     let opcodes = writer_transport.submitted_request_opcodes();
@@ -6684,14 +6683,12 @@ fn batch_put_from_uses_registered_remote_sources_without_scratch() {
                     .prefer_local(false)
                     .preferred_storage_owner(remote_owner.storage_key()),
             ),
-            PutFromRequest::new("remote-b", unsafe {
-                source.as_ptr().add(16).cast()
-            }, 8)
-            .replication(
-                ReplicationPolicy::new()
-                    .prefer_local(false)
-                    .preferred_storage_owner(remote_owner.storage_key()),
-            ),
+            PutFromRequest::new("remote-b", unsafe { source.as_ptr().add(16).cast() }, 8)
+                .replication(
+                    ReplicationPolicy::new()
+                        .prefer_local(false)
+                        .preferred_storage_owner(remote_owner.storage_key()),
+                ),
         ])
         .expect("batch_put_from should use registered remote sources");
     assert_eq!(routes.len(), 2);
