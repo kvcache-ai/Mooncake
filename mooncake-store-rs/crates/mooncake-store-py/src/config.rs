@@ -15,7 +15,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_DUMMY_RPC_TIMEOUT: Duration = Duration::from_secs(65);
-const DEFAULT_REGISTRATION_TIMEOUT_FLOOR: Duration = Duration::from_secs(10);
+const DEFAULT_REGISTRATION_TIMEOUT_FLOOR: Duration = Duration::from_secs(20);
 const STARTUP_TIMEOUT_BYTES_PER_SECOND: u64 = 1024 * 1024 * 1024;
 const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
 const STARTUP_TIMEOUT_ENV: &str = "MC_STORE_RS_STARTUP_TIMEOUT_MS";
@@ -1095,11 +1095,11 @@ mod tests {
     fn adaptive_registration_timeout_scales_with_registration_bytes() {
         assert_eq!(
             sample_timeouts().registration_timeout_for_bytes(1),
-            Duration::from_secs(10)
+            Duration::from_secs(20)
         );
         assert_eq!(
             sample_timeouts().registration_timeout_for_bytes(1024 * 1024 * 1024),
-            Duration::from_secs(10)
+            Duration::from_secs(20)
         );
         assert_eq!(
             sample_timeouts().registration_timeout_for_bytes(500 * 1024 * 1024 * 1024_u64),

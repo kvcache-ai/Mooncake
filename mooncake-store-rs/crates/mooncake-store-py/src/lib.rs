@@ -3729,7 +3729,7 @@ mod tests {
         .expect("dispatcher should spawn");
         assert_eq!(
             dispatcher.registration_timeout_for_bytes(64),
-            Duration::from_secs(10)
+            Duration::from_secs(20)
         );
     }
 
