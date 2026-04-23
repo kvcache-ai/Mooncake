@@ -72,7 +72,8 @@ RouteCache::RouteCache(size_t max_memory_bytes, uint64_t ttl_ms)
         auto& shard = *shards_[i];
         shard.base_addr_ = static_cast<char*>(base_all_) + i * per_shard_bytes;
         shard.allocator_ = offset_allocator::OffsetAllocator::create(
-            reinterpret_cast<uintptr_t>(shard.base_addr_), per_shard_bytes);
+            reinterpret_cast<uintptr_t>(shard.base_addr_), per_shard_bytes,
+            nodes_per_shard_, 2 * nodes_per_shard_);
 
         shard.buckets_ =
             std::make_unique<std::atomic<Node*>[]>(buckets_per_shard_);
