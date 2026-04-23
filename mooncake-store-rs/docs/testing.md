@@ -51,7 +51,7 @@ The client test suite is split across ten files under
 | File | `#[test]` fns | proptest fns | Focus |
 |---|---:|---:|---|
 | `mod.rs` | 118 | 0 | Large multi-client integration scenarios (membership, drain, hot-upgrade, evacuation, metrics) |
-| `unit_tests.rs` | 101 | 0 | Pure-type contracts: `ObjectRef`/`PutRequest`/`ReplicationPolicy` builder chains, `flatten_slices` / `scatter_into_buffers`, zero-clamp, FNV checksum, error display |
+| `unit_tests.rs` | 101 | 0 | Pure-type contracts: `ObjectRef`/`PutRequest`/`ReplicationPolicy` builder chains, `flatten_slices` / `scatter_into_buffers`, zero-clamp, payload-checksum invariants, error display |
 | `store_client_tests.rs` | 47 | 0 | `StoreClient` lifecycle (put/get/remove), batch APIs, dual-node read path, `FaultyTransport` integration, boundary inputs, benchmark logging |
 | `adversarial.rs` | 35 | 6 | `align_up_u64` property tests, metadata-failure data-integrity scenarios |
 | `fault_injection_prop.rs` | 42 | 8 | `FaultConfig` state machine + `FaultyTransport` contract (disconnect priority, counter semantics, injection roundtrip) |
@@ -94,7 +94,7 @@ bulk of `unit_tests.rs` and the `mod.rs` integration scenarios.
 
 Empty / zero / extreme / Unicode / truncated inputs. Examples:
 
-- `payload_checksum(&[])` returns the FNV offset basis constant.
+- `payload_checksum(...)` remains deterministic and distinguishes order/length changes.
 - `BandwidthShaping::max_remote_batch_bytes(0)` clamps to `Some(1)`.
 - `parse_legacy_scoped_key` handles 10 000-character logical keys.
 - `release_at_u64_max_offset_overflows_gracefully` rejects without panic.

@@ -42,6 +42,12 @@ Main capabilities:
 - `batch_get_into`
 - registered subranges inside a larger caller-owned buffer
 
+Remote read behavior:
+
+- when a `batch_get_into` destination range is already registered, the runtime issues direct remote batch reads into that buffer instead of staging through local scratch first
+- unregistered destination buffers still use the existing scratch-window planner and direct single-object fallback path when needed
+- payload integrity uses a fast stable 64-bit checksum, and large batch validation fans out across multiple CPU workers so registered-buffer restore traffic does not serialize the verification tail on one core
+
 ### Multi-buffer path
 
 For fragmented payloads or caller-managed buffer layouts, the runtime supports multi-buffer request forms.
