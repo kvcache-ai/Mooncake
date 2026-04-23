@@ -141,6 +141,22 @@ impl StoreClient {
             .all(|request| request.policy.clone().unwrap_or_default() == shared)
             .then_some(Some(shared))
     }
+
+    fn shared_batch_put_from_replication_policy(
+        requests: &[PutFromRequest<'_>],
+    ) -> Option<Option<ReplicationPolicy>> {
+        if requests.is_empty() {
+            return Some(None);
+        }
+        if requests.iter().all(|request| request.policy.is_none()) {
+            return Some(None);
+        }
+        let shared = requests[0].policy.clone().unwrap_or_default();
+        requests
+            .iter()
+            .all(|request| request.policy.clone().unwrap_or_default() == shared)
+            .then_some(Some(shared))
+    }
 }
 
 impl MooncakeCompatibilityFacade for StoreClient {
@@ -841,8 +857,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 return result;
             }
         }
-        let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
-        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, None);
+        let result = self.put_object_from_registered(
+            &ObjectRef::new(key).tenant(tenant),
+            buffer.cast_mut(),
+            size,
+            None,
+        );
         tracker.finish(&result, size as u64);
         result
     }
@@ -891,8 +911,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 return result;
             }
         }
-        let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
-        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, Some(policy));
+        let result = self.put_object_from_registered(
+            &ObjectRef::new(key).tenant(tenant),
+            buffer.cast_mut(),
+            size,
+            Some(policy),
+        );
         tracker.finish(&result, size as u64);
         result
     }
@@ -912,7 +936,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let tracker = OperationTracker::new("batch_put").input_bytes(bytes_in);
         if matches!(self.write_mode, WriteMode::Routed { .. }) {
             if let Some(shared_policy) = Self::shared_batch_replication_policy(requests) {
-                let result = self.batch_put_scoped_routed(requests, shared_policy.as_ref());
+                let result = self.batch_put_scoped_routed(requests, None, shared_policy.as_ref());
                 tracker.finish(&result, bytes_in);
                 return result;
             }
@@ -952,6 +976,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("batch_put_from").input_bytes(bytes_in);
+        let mut routed_requests = Vec::with_capacity(requests.len());
+        let mut registered_sources = Vec::with_capacity(requests.len());
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             if request.buffer.is_null() {
@@ -973,7 +999,29 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     return result;
                 }
             }
-            let value = unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
+            if matches!(self.write_mode, WriteMode::Routed { .. }) {
+                let value =
+                    unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
+                let mut routed = PutRequest::new(request.key, value);
+                if let Some(tenant) = request.tenant {
+                    routed = routed.tenant(tenant);
+                }
+                if let Some(domain) = request.domain {
+                    routed = routed.domain(domain);
+                }
+                if let Some(object_set) = request.object_set {
+                    routed = routed.object_set(object_set);
+                }
+                if let Some(qos_tier) = request.qos_tier {
+                    routed = routed.qos_tier(qos_tier);
+                }
+                if let Some(policy) = request.policy.clone() {
+                    routed = routed.replication(policy);
+                }
+                routed_requests.push(routed);
+                registered_sources.push(request.buffer.cast_mut());
+                continue;
+            }
             let mut object = ObjectRef::new(request.key);
             if let Some(tenant) = request.tenant {
                 object = object.tenant(tenant);
@@ -987,7 +1035,44 @@ impl MooncakeCompatibilityFacade for StoreClient {
             if let Some(qos_tier) = request.qos_tier {
                 object = object.qos_tier(qos_tier);
             }
-            routes.push(self.put_object(&object, value, request.policy.as_ref())?);
+            routes.push(self.put_object_from_registered(
+                &object,
+                request.buffer.cast_mut(),
+                request.size,
+                request.policy.as_ref(),
+            )?);
+        }
+        if !routed_requests.is_empty() {
+            if let Some(shared_policy) = Self::shared_batch_put_from_replication_policy(requests) {
+                let result = self.batch_put_scoped_routed(
+                    &routed_requests,
+                    Some(&registered_sources),
+                    shared_policy.as_ref(),
+                );
+                tracker.finish(&result, bytes_in);
+                return result;
+            }
+            for (request, source) in routed_requests.iter().zip(registered_sources.iter()) {
+                let mut object = ObjectRef::new(request.key);
+                if let Some(tenant) = request.tenant {
+                    object = object.tenant(tenant);
+                }
+                if let Some(domain) = request.domain {
+                    object = object.domain(domain);
+                }
+                if let Some(object_set) = request.object_set {
+                    object = object.object_set(object_set);
+                }
+                if let Some(qos_tier) = request.qos_tier {
+                    object = object.qos_tier(qos_tier);
+                }
+                routes.push(self.put_object_from_registered(
+                    &object,
+                    *source,
+                    request.value.len(),
+                    request.policy.as_ref(),
+                )?);
+            }
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);

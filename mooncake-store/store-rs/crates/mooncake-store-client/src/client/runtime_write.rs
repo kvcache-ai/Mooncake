@@ -21,6 +21,7 @@ impl StoreClient {
         targets: &[ReplicaWriteTarget],
         reservations: &[mooncake_store_core::SegmentReservation],
         value: &[u8],
+        registered_source: Option<*mut c_void>,
     ) -> Result<Vec<u64>> {
         if targets.len() != reservations.len() {
             return Err(StoreError::InvalidState(
@@ -96,21 +97,36 @@ impl StoreClient {
                 let tracker =
                     OperationTracker::new("put_remote_batch_write").input_bytes(remote_bytes);
                 let result = (|| {
-                    let scratch = {
-                        let state = self.state.lock();
-                        state.memory_ref()?.plan_scratch(&[value.len()])?
+                    let requests = if let Some(source) = registered_source {
+                        let mut requests = Vec::new();
+                        for (handle, target_offset) in &remote_requests {
+                            requests.extend(Self::direct_buffer_transfer_requests(
+                                Opcode::Write,
+                                *handle,
+                                *target_offset,
+                                source,
+                                value.len() as u64,
+                                transport.max_registration_bytes(),
+                            )?);
+                        }
+                        requests
+                    } else {
+                        let scratch = {
+                            let state = self.state.lock();
+                            state.memory_ref()?.plan_scratch(&[value.len()])?
+                        };
+                        copy_into_region(scratch[0], value);
+                        remote_requests
+                            .iter()
+                            .map(|(handle, target_offset)| TransferRequest {
+                                opcode: Opcode::Write,
+                                source: scratch[0].addr,
+                                target_id: *handle,
+                                target_offset: *target_offset,
+                                length: value.len() as u64,
+                            })
+                            .collect::<Vec<_>>()
                     };
-                    copy_into_region(scratch[0], value);
-                    let requests = remote_requests
-                        .iter()
-                        .map(|(handle, target_offset)| TransferRequest {
-                            opcode: Opcode::Write,
-                            source: scratch[0].addr,
-                            target_id: *handle,
-                            target_offset: *target_offset,
-                            length: value.len() as u64,
-                        })
-                        .collect::<Vec<_>>();
                     let chunk_size = self.remote_write_chunk_limit(value.len(), requests.len());
                     for chunk in requests.chunks(chunk_size) {
                         let batch_id = transport.allocate_batch(chunk.len())?;
@@ -173,11 +189,19 @@ impl StoreClient {
     fn batch_put_scoped_routed(
         &self,
         requests: &[PutRequest<'_>],
+        registered_sources: Option<&[*mut c_void]>,
         policy: Option<&ReplicationPolicy>,
     ) -> Result<Vec<ObjectRoute>> {
         self.ensure_local_memory()?;
         self.flush_due_reclaims()?;
         self.validate_unique_requests(requests)?;
+        if let Some(registered_sources) = registered_sources {
+            if registered_sources.len() != requests.len() {
+                return Err(StoreError::InvalidState(
+                    "registered sources and routed requests length mismatch".to_string(),
+                ));
+            }
+        }
         let transport = self.transport()?;
         let WriteMode::Routed {
             planner,
@@ -538,13 +562,14 @@ impl StoreClient {
             }
 
             let mut prepared = Vec::with_capacity(pending.len());
-            for entry in pending {
+            for (index, entry) in pending.into_iter().enumerate() {
                 prepared.push(PreparedObjectWrite {
                     tenant: entry.tenant,
                     object_id: entry.object_id,
                     qos_tier: entry.qos_tier,
                     scoped_key: entry.scoped_key,
                     value: entry.value,
+                    registered_source: registered_sources.and_then(|sources| sources.get(index).copied()),
                     quota_reservation: entry.quota_reservation,
                     targets: entry.targets,
                     reservations: entry.reservations,
@@ -594,6 +619,7 @@ impl StoreClient {
                     struct RemoteBatchWrite<'a> {
                         tenant: &'a str,
                         value: &'a [u8],
+                        registered_source: Option<*mut c_void>,
                         requests: Vec<TransferRequest>,
                     }
 
@@ -676,6 +702,7 @@ impl StoreClient {
                     remote_writes.push(RemoteBatchWrite {
                         tenant: entry.value_tenant(),
                         value: entry.value,
+                        registered_source: entry.registered_source,
                         requests: remote_requests,
                     });
                 }
@@ -752,35 +779,58 @@ impl StoreClient {
                             break;
                         }
                     }
-                    scratch_lengths.push(write.value.len());
-                    let planned = {
-                        let state = self.state.lock();
-                        state.memory_ref()?.plan_scratch(&scratch_lengths)
-                    };
-                    match planned {
-                        Ok(scratch) => drop(scratch),
-                        Err(StoreError::Allocator(_)) if !selected.is_empty() => {
-                            scratch_lengths.pop();
-                            break;
+                    if write.registered_source.is_none() {
+                        scratch_lengths.push(write.value.len());
+                        let planned = {
+                            let state = self.state.lock();
+                            state.memory_ref()?.plan_scratch(&scratch_lengths)
+                        };
+                        match planned {
+                            Ok(scratch) => drop(scratch),
+                            Err(StoreError::Allocator(_)) if !selected.is_empty() => {
+                                scratch_lengths.pop();
+                                break;
+                            }
+                            Err(error) => return Err(error),
                         }
-                        Err(error) => return Err(error),
                     }
                     selected.push(*index);
                     remote_bytes = remote_bytes.saturating_add(write_remote_bytes);
                 }
-                let scratch = {
+                let scratch = if scratch_lengths.is_empty() {
+                    None
+                } else {
                     let state = self.state.lock();
-                    state.memory_ref()?.plan_scratch(&scratch_lengths)?
+                    Some(state.memory_ref()?.plan_scratch(&scratch_lengths)?)
                 };
                 let mut transfer_requests = Vec::new();
-                for (position, index) in selected.iter().enumerate() {
+                let mut scratch_position = 0usize;
+                for index in &selected {
                     let write = &remote_writes[*index];
-                    copy_into_region(scratch[position], write.value);
-                    transfer_requests.extend(write.requests.iter().map(|request| {
-                        let mut request = *request;
-                        request.source = scratch[position].addr;
-                        request
-                    }));
+                    if let Some(source) = write.registered_source {
+                        for request in &write.requests {
+                            transfer_requests.extend(Self::direct_buffer_transfer_requests(
+                                Opcode::Write,
+                                request.target_id,
+                                request.target_offset,
+                                source,
+                                request.length,
+                                transport.max_registration_bytes(),
+                            )?);
+                        }
+                    } else {
+                        let allocation = scratch
+                            .as_ref()
+                            .expect("scratch reservation should exist for staged writes")
+                            [scratch_position];
+                        copy_into_region(allocation, write.value);
+                        transfer_requests.extend(write.requests.iter().map(|request| {
+                            let mut request = *request;
+                            request.source = allocation.addr;
+                            request
+                        }));
+                        scratch_position += 1;
+                    }
                 }
                 let batch_id = transport.allocate_batch(transfer_requests.len())?;
                 let request_deadline =

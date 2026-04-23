@@ -309,6 +309,7 @@ impl StoreClient {
         object_id: &LogicalObjectId,
         qos_tier: Option<&str>,
         value: &[u8],
+        registered_source: Option<*mut c_void>,
         policy: Option<&ReplicationPolicy>,
         current: Option<&ObjectRoute>,
         reclaim_mode: ReclaimMode,
@@ -364,7 +365,8 @@ impl StoreClient {
             };
             let write_tracker =
                 OperationTracker::new("put_stage_write").input_bytes(value.len() as u64);
-            let write_result = self.write_reserved_replicas(&targets, &reservations, value);
+            let write_result =
+                self.write_reserved_replicas(&targets, &reservations, value, registered_source);
             write_tracker.finish(&write_result, value.len() as u64);
             let offsets = match write_result {
                 Ok(offsets) => offsets,
@@ -500,6 +502,37 @@ impl StoreClient {
             &object_id,
             object.qos_tier,
             value,
+            None,
+            policy,
+            current.as_ref(),
+            ReclaimMode::Scheduled,
+        )
+    }
+
+    fn put_object_from_registered(
+        &self,
+        object: &ObjectRef<'_>,
+        buffer: *mut c_void,
+        size: usize,
+        policy: Option<&ReplicationPolicy>,
+    ) -> Result<ObjectRoute> {
+        let tenant = object.tenant.unwrap_or(self.default_tenant());
+        let object_id = LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+            object.key,
+        );
+        let load_tracker = OperationTracker::new("put_stage_load_route");
+        let current_result = self
+            .route_directory
+            .get_object_route(&self.lease, &ObjectKey::from_logical_id(&object_id));
+        load_tracker.finish(&current_result, 0);
+        let current = current_result?;
+        let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
+        self.put_object_with_policy_current(
+            &object_id,
+            object.qos_tier,
+            value,
+            Some(buffer),
             policy,
             current.as_ref(),
             ReclaimMode::Scheduled,
@@ -699,6 +732,7 @@ impl StoreClient {
                 &object_id,
                 confirmed.qos_tier.as_deref(),
                 &payload,
+                None,
                 Some(&policy),
                 Some(&confirmed),
                 ReclaimMode::Deferred,
@@ -793,6 +827,7 @@ impl StoreClient {
                 &object_id,
                 qos_tier,
                 &payload,
+                None,
                 Some(&policy),
                 Some(&confirmed),
                 ReclaimMode::Deferred,
@@ -2156,6 +2191,7 @@ impl StoreClient {
     }
 
     fn direct_buffer_transfer_requests(
+        opcode: Opcode,
         segment: u64,
         target_offset: u64,
         buffer: *mut c_void,
@@ -2179,7 +2215,7 @@ impl StoreClient {
                 StoreError::Transport("direct read target offset overflow".to_string())
             })?;
             requests.push(TransferRequest {
-                opcode: Opcode::Read,
+                opcode,
                 source: chunk_addr,
                 target_id: segment,
                 target_offset: chunk_target_offset,
@@ -2514,6 +2550,7 @@ impl StoreClient {
                         },
                     )?;
                 Self::direct_buffer_transfer_requests(
+                    Opcode::Read,
                     segment,
                     target_offset,
                     buffer_ptr,
@@ -2756,6 +2793,7 @@ mod runtime_io_tests {
     #[test]
     fn direct_buffer_transfer_requests_split_by_registration_limit() {
         let requests = StoreClient::direct_buffer_transfer_requests(
+            Opcode::Read,
             7,
             900,
             100usize as *mut c_void,

@@ -17,7 +17,7 @@ use mooncake_store_core::{
     TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy,
     TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
 };
-use mooncake_transport::TransferPacingMode;
+use mooncake_transport::{Opcode, TransferPacingMode};
 use parking_lot::Mutex;
 
 use super::{
@@ -6604,6 +6604,8 @@ fn batch_get_into_batches_registered_remote_buffers_without_scratch() {
         state.submitted_batch_sizes.clear();
         state.submitted_batch_bytes.clear();
         state.submitted_batch_hints.clear();
+        state.submitted_request_sources.clear();
+        state.submitted_request_opcodes.clear();
     }
 
     let (first, tail) = target.split_at_mut(8);
@@ -6619,6 +6621,93 @@ fn batch_get_into_batches_registered_remote_buffers_without_scratch() {
     assert_eq!(&target[16..24], b"ijklmnop");
     assert_eq!(writer_transport.submitted_batch_sizes(), vec![2]);
     assert_eq!(writer_transport.submitted_batch_bytes(), vec![16]);
+    assert_eq!(
+        writer_transport.submitted_request_sources(),
+        vec![vec![
+            target.as_mut_ptr() as usize,
+            unsafe { target.as_mut_ptr().add(16) as usize },
+        ]]
+    );
+
+    let opcodes = writer_transport.submitted_request_opcodes();
+    assert_eq!(opcodes.len(), 1);
+    assert!(opcodes[0].iter().all(|opcode| *opcode == Opcode::Read));
+}
+
+#[test]
+fn batch_put_from_uses_registered_remote_sources_without_scratch() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let writer_transport = Arc::new(TestTransport::new("writer-batch-put-from-segment"));
+    writer_transport.set_max_registration_bytes(Some(4));
+    let remote_owner = publish_storage_node_with_capacity(
+        &metadata,
+        &writer_transport,
+        "storage-batch-put-from",
+        "seg-batch-put-from",
+        "pool-a",
+        1024,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "writer-batch-put-from")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport.clone())
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    wait_for_membership_convergence(&[&writer]);
+
+    let mut source = [0u8; 32];
+    source[..8].copy_from_slice(b"abcdefgh");
+    source[16..24].copy_from_slice(b"ijklmnop");
+    writer
+        .register_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("writer register buffer should succeed");
+    {
+        let mut state = writer_transport.state.lock();
+        state.submitted_batch_sizes.clear();
+        state.submitted_batch_bytes.clear();
+        state.submitted_batch_hints.clear();
+        state.submitted_request_sources.clear();
+        state.submitted_request_opcodes.clear();
+    }
+
+    let routes = writer
+        .batch_put_from(&[
+            PutFromRequest::new("remote-a", source.as_ptr().cast(), 8).replication(
+                ReplicationPolicy::new()
+                    .prefer_local(false)
+                    .preferred_storage_owner(remote_owner.storage_key()),
+            ),
+            PutFromRequest::new("remote-b", unsafe {
+                source.as_ptr().add(16).cast()
+            }, 8)
+            .replication(
+                ReplicationPolicy::new()
+                    .prefer_local(false)
+                    .preferred_storage_owner(remote_owner.storage_key()),
+            ),
+        ])
+        .expect("batch_put_from should use registered remote sources");
+    assert_eq!(routes.len(), 2);
+    assert_eq!(writer_transport.submitted_batch_bytes(), vec![16]);
+    assert_eq!(
+        writer_transport.submitted_request_sources(),
+        vec![vec![
+            source.as_mut_ptr() as usize,
+            unsafe { source.as_mut_ptr().add(4) as usize },
+            unsafe { source.as_mut_ptr().add(16) as usize },
+            unsafe { source.as_mut_ptr().add(20) as usize },
+        ]]
+    );
+    let opcodes = writer_transport.submitted_request_opcodes();
+    assert_eq!(opcodes.len(), 1);
+    assert!(opcodes[0].iter().all(|opcode| *opcode == Opcode::Write));
 }
 
 #[test]

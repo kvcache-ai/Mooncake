@@ -46,6 +46,8 @@ Remote read behavior:
 
 - when a `batch_get_into` destination range is already registered, the runtime issues direct remote batch reads into that buffer instead of staging through local scratch first
 - unregistered destination buffers still use the existing scratch-window planner and direct single-object fallback path when needed
+- `put_from` and `batch_put_from` now preserve the same registered-buffer zero-copy contract for remote writes: the transport request sources point at the caller-registered buffer ranges instead of a scratch copy
+- local replicas still copy into owned local segment memory; the zero-copy contract applies to the remote transport source buffer, not to local placement
 - payload integrity uses a fast stable 64-bit checksum, and large batch validation fans out across multiple CPU workers so registered-buffer restore traffic does not serialize the verification tail on one core
 
 ### Multi-buffer path
