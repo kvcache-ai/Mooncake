@@ -592,15 +592,29 @@ class MooncakeStorePyWrapper {
     int put_tensor_with_tp_impl(
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
-        int tp_size = 1, int split_dim = 0,
-        const std::vector<ParallelAxisSpec> &axes = {}) {
-        return execute_tp_tensor_write_impl(
-            key, tensor, config, tp_size, split_dim, axes,
-            "Failed to put tensor with tp",
-            [this](const std::string &shard_key, const PyTensorInfo &info,
-                   const ReplicateConfig &write_config) {
-                return put_tensor_impl(shard_key, info, write_config);
-            });
+        int tp_size = 1, int split_dim = 0) {
+        try {
+            py::tuple chunks =
+                tensor.attr("chunk")(tp_size, split_dim).cast<py::tuple>();
+            if (static_cast<int>(chunks.size()) != tp_size) {
+                LOG(ERROR) << "Chunking failed: got " << chunks.size()
+                           << " chunks, expected " << tp_size;
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+
+            for (int rank = 0; rank < tp_size; ++rank) {
+                pybind11::object chunk = chunks[rank].attr("contiguous")();
+                std::string tp_key = get_tp_key_name(key, rank);
+
+                int ret = put_tensor_impl(tp_key, chunk, config);
+                if (ret != 0) return ret;
+            }
+            return 0;
+
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Failed to put tensor with tp: " << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
@@ -615,6 +629,19 @@ class MooncakeStorePyWrapper {
 
         return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
                                        tp_size, split_dim);
+    }
+
+    int put_tensor_with_tp_impl(
+        const std::string &key, pybind11::object tensor,
+        const ReplicateConfig &config, int tp_rank, int tp_size, int split_dim,
+        const std::vector<ParallelAxisSpec> &axes) {
+        return execute_tp_tensor_write_impl(
+            key, tensor, config, tp_size, split_dim, axes,
+            "Failed to put tensor with tp",
+            [this](const std::string &shard_key, const PyTensorInfo &info,
+                   const ReplicateConfig &write_config) {
+                return put_tensor_impl(shard_key, info, write_config);
+            });
     }
 
 
@@ -2699,7 +2726,35 @@ class MooncakeStorePyWrapper {
     int upsert_tensor_with_tp_impl(
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_size = 1,
-        int split_dim = 0, const std::vector<ParallelAxisSpec> &axes = {}) {
+        int split_dim = 0) {
+        try {
+            py::tuple chunks =
+                tensor.attr("chunk")(tp_size, split_dim).cast<py::tuple>();
+            if (static_cast<int>(chunks.size()) != tp_size) {
+                LOG(ERROR) << "Chunking failed: got " << chunks.size()
+                           << " chunks, expected " << tp_size;
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+
+            for (int rank = 0; rank < tp_size; ++rank) {
+                pybind11::object chunk = chunks[rank].attr("contiguous")();
+                std::string tp_key = get_tp_key_name(key, rank);
+
+                int ret = upsert_tensor_impl(tp_key, chunk, config);
+                if (ret != 0) return ret;
+            }
+            return 0;
+
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Failed to upsert tensor with tp: " << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    int upsert_tensor_with_tp_impl(
+        const std::string &key, pybind11::object tensor,
+        const ReplicateConfig &config, int tp_size, int split_dim,
+        const std::vector<ParallelAxisSpec> &axes) {
         return execute_tp_tensor_write_impl(
             key, tensor, config, tp_size, split_dim, axes,
             "Failed to upsert tensor with tp",
@@ -2760,27 +2815,70 @@ class MooncakeStorePyWrapper {
 
     std::vector<int> batch_upsert_tensor_impl(
         const std::vector<std::string> &keys,
-        const std::vector<PyTensorInfo> &infos,
-        const ReplicateConfig &config = ReplicateConfig{}) {
-        return batch_write_tensor_impl(
-            keys, infos, config, "upsert",
-            [this, &config](const std::vector<std::string> &write_keys,
-                            const std::vector<void *> &buffer_ptrs,
-                            const std::vector<size_t> &buffer_sizes) {
-                return store_->batch_upsert_from(write_keys, buffer_ptrs,
-                                                 buffer_sizes, config);
-            });
-    }
-
-    std::vector<int> batch_upsert_tensor_impl(
-        const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
         std::vector<PyTensorInfo> infos(keys.size());
+        std::vector<int> results(keys.size(), 0);
+
+        // 1. Extract Metadata (GIL Held)
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
+            if (!infos[i].valid())
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return batch_upsert_tensor_impl(keys, infos, config);
+
+        // 2. Prepare Buffers and Execute (GIL Released)
+        {
+            py::gil_scoped_release release_gil;
+
+            std::vector<std::string> valid_keys;
+            std::vector<void *> buffer_ptrs;
+            std::vector<size_t> buffer_sizes;
+            std::vector<size_t> original_indices;
+
+            std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
+
+            for (size_t i = 0; i < infos.size(); ++i) {
+                if (!infos[i].valid()) continue;
+
+                size_t total_size =
+                    sizeof(TensorMetadata) + infos[i].tensor_size;
+                auto alloc_result =
+                    store_->client_buffer_allocator_->allocate(total_size);
+
+                if (!alloc_result) {
+                    LOG(ERROR)
+                        << "Failed to allocate buffer for key: " << keys[i];
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+
+                // Copy Metadata & Data
+                char *dst = static_cast<char *>(alloc_result->ptr());
+                memcpy(dst, &infos[i].metadata, sizeof(TensorMetadata));
+                memcpy(dst + sizeof(TensorMetadata),
+                       reinterpret_cast<void *>(infos[i].data_ptr),
+                       infos[i].tensor_size);
+
+                valid_keys.push_back(keys[i]);
+                buffer_ptrs.push_back(alloc_result->ptr());
+                buffer_sizes.push_back(total_size);
+                original_indices.push_back(i);
+
+                temp_allocations.push_back(
+                    std::make_unique<BufferHandle>(std::move(*alloc_result)));
+            }
+
+            if (!valid_keys.empty()) {
+                std::vector<int> op_results = store_->batch_upsert_from(
+                    valid_keys, buffer_ptrs, buffer_sizes, config);
+                for (size_t i = 0; i < op_results.size(); ++i) {
+                    results[original_indices[i]] = op_results[i];
+                }
+            }
+        }
+
+        return results;
     }
 
     std::vector<int> batch_upsert_tensor(const std::vector<std::string> &keys,
