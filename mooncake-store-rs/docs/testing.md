@@ -22,23 +22,23 @@ and conventions are the contract.
 
 ## Test Inventory
 
-Workspace `cargo test --lib` runs 857 tests across seven crates. The Redis
+Workspace `cargo test --lib` runs 864 tests across seven crates. The Redis
 integration tests inside `mooncake-metadata` skip silently when no
 `redis-server` binary is on `PATH`; all other tests run unconditionally.
 
 | Crate | `--lib` tests | Notes |
 |---|---:|---|
-| `mooncake-store-client` | 533 | Dominant runtime; includes property tests and fault-injection integration |
+| `mooncake-store-client` | 535 | Dominant runtime; includes property tests and fault-injection integration |
 | `mooncake-store-core` | 112 | Pure-type contracts: identity, route, compat, error, codec |
 | `mooncake-metadata` | 105 | In-memory backend + keyspace + segment state + Redis integration |
-| `mooncake-store-py` | 82 | PyO3 bindings, dummy client, setup helpers (3 `#[ignore]`) |
+| `mooncake-store-py` | 87 | PyO3 bindings, dummy client, setup helpers (3 `#[ignore]`) |
 | `mooncake-transport` | 21 | Transport-core trait behaviour |
 | `mooncake-transport-sys` | 4 | FFI shim sanity checks |
 | `mooncake-store-test-utils` | 0 | Test-only crate — no self-tests |
 | `mooncake-store-transport-core` | 0 | Trait definitions only |
 
-Wall time on a warm cache: ≈17 s total, with `mooncake-store-client`
-responsible for ≈13 s of that (it owns the fault-injection and property
+Wall time on a warm cache: ≈21 s total, with `mooncake-store-client`
+responsible for ≈14 s of that (it owns the fault-injection and property
 suites).
 
 ### Per-file breakdown — client tests
@@ -48,16 +48,16 @@ The client test suite is split across ten files under
 
 | File | `#[test]` fns | proptest fns | Focus |
 |---|---:|---:|---|
-| `mod.rs` | 116 | 0 | Large multi-client integration scenarios (membership, drain, hot-upgrade, evacuation, metrics) |
+| `mod.rs` | 118 | 0 | Large multi-client integration scenarios (membership, drain, hot-upgrade, evacuation, metrics) |
 | `unit_tests.rs` | 101 | 0 | Pure-type contracts: `ObjectRef`/`PutRequest`/`ReplicationPolicy` builder chains, `flatten_slices` / `scatter_into_buffers`, zero-clamp, FNV checksum, error display |
 | `store_client_tests.rs` | 47 | 0 | `StoreClient` lifecycle (put/get/remove), batch APIs, dual-node read path, `FaultyTransport` integration, boundary inputs, benchmark logging |
-| `adversarial.rs` | 35 | 7 | `align_up_u64` property tests, metadata-failure data-integrity scenarios |
-| `fault_injection_prop.rs` | 42 | 9 | `FaultConfig` state machine + `FaultyTransport` contract (disconnect priority, counter semantics, injection roundtrip) |
+| `adversarial.rs` | 35 | 6 | `align_up_u64` property tests, metadata-failure data-integrity scenarios |
+| `fault_injection_prop.rs` | 42 | 8 | `FaultConfig` state machine + `FaultyTransport` contract (disconnect priority, counter semantics, injection roundtrip) |
 | `lifecycle_tests.rs` | 33 | 0 | Hot-upgrade handoff flow, lifecycle state machine, segment drain/retire/expand, evacuation |
 | `routing_tests.rs` | 20 | 0 | CAS route conflicts, query_route tenant scope, RouteVersion monotonicity, `get_into`/`get_size` buffer sizing, placement validation |
-| `routing_prop.rs` | 20 | 7 | Route CAS/get property tests against counting and faulty backends |
-| `transport_prop.rs` | 26 | 7 | `TestTransport` batch-id monotonicity, memory-registration idempotence, payload roundtrip |
-| `quota_prop.rs` | 15 | 5 | Tenant quota state machine property tests |
+| `routing_prop.rs` | 20 | 6 | Route CAS/get property tests against counting and faulty backends |
+| `transport_prop.rs` | 26 | 6 | `TestTransport` batch-id monotonicity, memory-registration idempotence, payload roundtrip |
+| `quota_prop.rs` | 15 | 4 | Tenant quota state machine property tests |
 
 Property tests run 32 / 64 / 512 cases depending on per-file
 `ProptestConfig::with_cases(...)`.
@@ -71,6 +71,8 @@ Some `src/` modules carry `#[cfg(test)] mod tests` directly:
 | `mooncake-store-client/src/memory.rs` | 22 | `LocalMemoryConfig` validation, watermark matrix, NUMA region distribution |
 | `mooncake-store-client/src/route_directory.rs` | 14 | Embedded-WRH route selection |
 | `mooncake-store-client/src/transport.rs` | 12 | Transfer request assembly |
+| `mooncake-store-client/src/observability/mod.rs` | 12 | Metrics rendering, prometheus / stats JSON snapshots |
+| `mooncake-store-client/src/control_plane/tests.rs` | 10 | Control-plane RPC dispatch and stream-session reuse |
 | `mooncake-store-client/src/placement.rs` | 4 | Placement planner deterministic ranking |
 | `mooncake-store-client/src/client/runtime_io.rs` | 3 | Local I/O helpers |
 | `mooncake-store-client/src/client/membership_sync.rs` | 1 | Background cache refresh |
@@ -127,7 +129,7 @@ injection, all provided by `mooncake-store-test-utils`:
 1. **Transport layer** — `FaultyTransport` wraps a `TestTransport` and lets
    a test disconnect the wire, fail the next N `open_segment` calls, fail
    the next N `submit_with_hints` calls, or add latency / jitter. Used by
-   `fault_injection_prop.rs` (42 tests + 9 proptests) and the Phase-6 tests
+   `fault_injection_prop.rs` (42 tests + 8 proptests) and the Phase-6 tests
    in `store_client_tests.rs`.
 2. **Metadata layer** — `FaultyMetadataBackend` wraps any backend and
    returns a configured error after N successful calls. Used by
