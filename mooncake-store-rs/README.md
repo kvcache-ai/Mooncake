@@ -244,6 +244,8 @@ mooncake-store-admin \
   --dry-run
 ```
 
+Completed tenant-quota reservations no longer accumulate forever in Redis: `Finalized` and `Aborted` records are retained for `24h` by default, while `Pending` reservations remain reconcile-driven.
+
 Start here when working on this area:
 
 - `docs/deployment.md` for the recommended admin-first workflow

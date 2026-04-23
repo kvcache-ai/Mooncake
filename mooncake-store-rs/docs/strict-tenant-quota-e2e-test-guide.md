@@ -177,8 +177,9 @@ mooncake-store-admin \
 Expected operator interpretation:
 
 - after a clean success, `pending_reserved_*` should be `0`
-- finalized reservations should explain the admitted write and the later refund path
+- finalized reservations should explain the admitted write and the later refund path during the terminal retention window
 - `quota reconcile --dry-run` should usually report no work on a healthy completed run
+- `Finalized` / `Aborted` reservations are retained for `24h` by default and then age out of Redis automatically
 
 ## Optional Follow-Up Checks
 
