@@ -40,6 +40,7 @@ pub(crate) const TENANT_QUOTA_FINALIZE_TOTAL: &str = "mooncake_store_tenant_quot
 pub(crate) const TENANT_QUOTA_ABORT_TOTAL: &str = "mooncake_store_tenant_quota_abort_total";
 pub(crate) const TENANT_QUOTA_RECONCILE_TOTAL: &str = "mooncake_store_tenant_quota_reconcile_total";
 pub(crate) const TENANT_LOCAL_EVICTION_TOTAL: &str = "mooncake_store_tenant_local_eviction_total";
+pub(crate) const PREFERRED_SEGMENT_SKIP_TOTAL: &str = "mooncake_store_preferred_segment_skip_total";
 pub(crate) const REBALANCE_ROUTES_TOTAL: &str = "mooncake_store_rebalance_routes_total";
 pub(crate) const REBALANCE_BYTES_TOTAL: &str = "mooncake_store_rebalance_bytes_total";
 pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecycle_total";
@@ -82,6 +83,7 @@ pub struct MetricsSnapshot {
     pub tenant_quota_abort: Vec<CounterSample<ResultKey>>,
     pub tenant_quota_reconcile: Vec<CounterSample<ResultKey>>,
     pub tenant_local_eviction: Vec<CounterSample<ResultKey>>,
+    pub preferred_segment_skip: Vec<CounterSample<PreferredSegmentSkipKey>>,
     pub rebalance_routes: Vec<CounterSample<PhaseResultKey>>,
     pub rebalance_bytes: Vec<CounterSample<PhaseKey>>,
     pub segment_lifecycle: Vec<CounterSample<ActionResultKey>>,
@@ -143,6 +145,12 @@ pub struct ActionResultKey {
 pub struct TransportBytesKey {
     pub direction: &'static str,
     pub peer_kind: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct PreferredSegmentSkipKey {
+    pub source: &'static str,
+    pub reason: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -351,6 +359,7 @@ struct MetricsRegistry {
     tenant_quota_abort: CounterFamily<ResultKey>,
     tenant_quota_reconcile: CounterFamily<ResultKey>,
     tenant_local_eviction: CounterFamily<ResultKey>,
+    preferred_segment_skip: CounterFamily<PreferredSegmentSkipKey>,
     rebalance_routes: CounterFamily<PhaseResultKey>,
     rebalance_bytes: CounterFamily<PhaseKey>,
     segment_lifecycle: CounterFamily<ActionResultKey>,
@@ -460,6 +469,7 @@ impl MetricsRegistry {
             tenant_quota_abort: self.tenant_quota_abort.snapshot(),
             tenant_quota_reconcile: self.tenant_quota_reconcile.snapshot(),
             tenant_local_eviction: self.tenant_local_eviction.snapshot(),
+            preferred_segment_skip: self.preferred_segment_skip.snapshot(),
             rebalance_routes: self.rebalance_routes.snapshot(),
             rebalance_bytes: self.rebalance_bytes.snapshot(),
             segment_lifecycle: self.segment_lifecycle.snapshot(),
@@ -640,6 +650,13 @@ pub(crate) fn record_tenant_local_eviction(result: &'static str) {
         .lock()
         .tenant_local_eviction
         .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_preferred_segment_skip(source: &'static str, reason: &'static str) {
+    global_metrics_registry()
+        .lock()
+        .preferred_segment_skip
+        .add(PreferredSegmentSkipKey { source, reason }, 1);
 }
 
 pub(crate) fn record_rebalance_route(phase: &'static str, result: &'static str) {

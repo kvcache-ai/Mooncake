@@ -1,15 +1,16 @@
 use super::registry::{
     ActionResultKey, CounterSample, GaugeSample, HistogramSample, MetricsSnapshot, PhaseKey,
-    PhaseResultKey, ReplicaDistributionKey, RequestBytesKey, RequestInflightKey, RequestKey,
-    ResultKey, RuntimeKey, RuntimeStatusKey, TenantKey, TransportBytesKey,
-    CHECKSUM_VALIDATION_TOTAL, EVICTION_DURATION, EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES,
-    HEARTBEAT_LAST_SUCCESS_MS, MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL,
-    OBJECT_ROUTES, REBALANCE_BYTES_TOTAL, REBALANCE_ROUTES_TOTAL, REPLICATION_PUBLISH_DURATION,
-    REPLICA_DISTRIBUTION, REQUEST_BYTES, REQUEST_DURATION, REQUEST_DURATION_BUCKETS,
-    REQUEST_INFLIGHT, REQUEST_TOTAL, ROUTE_CAS_TOTAL, RUNTIME_LEASE_EXPIRES_AT_MS, RUNTIME_STATUS,
-    SEGMENT_CAPACITY_BYTES, SEGMENT_LIFECYCLE_TOTAL, SEGMENT_USED_BYTES,
-    TENANT_LOCAL_EVICTION_TOTAL, TENANT_QUOTA_ABORT_TOTAL, TENANT_QUOTA_FINALIZE_TOTAL,
-    TENANT_QUOTA_RECONCILE_TOTAL, TENANT_QUOTA_RESERVATION_TOTAL, TRANSPORT_BYTES_TOTAL,
+    PhaseResultKey, PreferredSegmentSkipKey, ReplicaDistributionKey, RequestBytesKey,
+    RequestInflightKey, RequestKey, ResultKey, RuntimeKey, RuntimeStatusKey, TenantKey,
+    TransportBytesKey, CHECKSUM_VALIDATION_TOTAL, EVICTION_DURATION, EVICTION_TOTAL,
+    HEARTBEAT_CONSECUTIVE_FAILURES, HEARTBEAT_LAST_SUCCESS_MS, MEMBERSHIP_REFRESH_DURATION,
+    MEMBERSHIP_REFRESH_TOTAL, OBJECT_ROUTES, PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL,
+    REBALANCE_ROUTES_TOTAL, REPLICATION_PUBLISH_DURATION, REPLICA_DISTRIBUTION, REQUEST_BYTES,
+    REQUEST_DURATION, REQUEST_DURATION_BUCKETS, REQUEST_INFLIGHT, REQUEST_TOTAL, ROUTE_CAS_TOTAL,
+    RUNTIME_LEASE_EXPIRES_AT_MS, RUNTIME_STATUS, SEGMENT_CAPACITY_BYTES, SEGMENT_LIFECYCLE_TOTAL,
+    SEGMENT_USED_BYTES, TENANT_LOCAL_EVICTION_TOTAL, TENANT_QUOTA_ABORT_TOTAL,
+    TENANT_QUOTA_FINALIZE_TOTAL, TENANT_QUOTA_RECONCILE_TOTAL, TENANT_QUOTA_RESERVATION_TOTAL,
+    TRANSPORT_BYTES_TOTAL,
 };
 
 pub(crate) fn render_prometheus_metrics(snapshot: &MetricsSnapshot) -> String {
@@ -369,6 +370,22 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
         TENANT_LOCAL_EVICTION_TOTAL,
         &snapshot.tenant_local_eviction,
     );
+
+    counter_family(
+        output,
+        PREFERRED_SEGMENT_SKIP_TOTAL,
+        "Skipped preferred-segment hints by source and reason.",
+    );
+    for CounterSample { key, value } in &snapshot.preferred_segment_skip {
+        let PreferredSegmentSkipKey { source, reason } = key;
+        output.push_str(&format!(
+            "{}{{source=\"{}\",reason=\"{}\"}} {}\n",
+            PREFERRED_SEGMENT_SKIP_TOTAL,
+            escape(source),
+            escape(reason),
+            value
+        ));
+    }
 }
 
 fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {

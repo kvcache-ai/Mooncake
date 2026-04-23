@@ -682,10 +682,26 @@ struct PendingRoutePublish {
 #[derive(Clone, Debug)]
 struct ResolvedReplicationPolicy {
     replica_count: usize,
-    preferred_segments: Vec<SegmentName>,
+    required_preferred_segments: Vec<SegmentName>,
+    hint_preferred_segments: Vec<SegmentName>,
     preferred_storage_runtimes: Vec<ClientRuntimeId>,
     with_soft_pin: bool,
     prefer_local: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreferredSegmentSource {
+    Request,
+    TenantPolicy,
+}
+
+impl PreferredSegmentSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::TenantPolicy => "tenant_policy",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
