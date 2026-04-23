@@ -12,6 +12,7 @@ pub use client::{
     MultiBufferPutRequest, NamespaceQuota, ObjectRef, PutFromRequest, PutRequest,
     ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
+pub use control_plane::{pb as control_plane_pb, MigrationControlClient};
 pub use memory::LocalMemoryConfig;
 pub use mooncake_store_core::RouteControlMode;
 pub use mooncake_transport::{TransferBatchHints, TransferPacingMode};
@@ -23,7 +24,6 @@ pub use observability::{
     OperationTracker,
 };
 pub use placement::{PlacementChoice, PlacementPlanner};
-pub use control_plane::{pb as control_plane_pb, MigrationControlClient};
 pub use transport::{
     http_transport_label, wait_for_batch_completion, ClassicTeTransportFactory,
     HttpStoreTransportFactory, HttpTransportServerHandle, StoreTransport, StoreTransportFactory,

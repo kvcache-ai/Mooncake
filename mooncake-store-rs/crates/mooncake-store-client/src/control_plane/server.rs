@@ -804,14 +804,12 @@ fn validate_get_migration_execution_status_request(
 ) -> mooncake_store_core::Result<()> {
     if request.namespace.trim().is_empty() {
         return Err(StoreError::InvalidState(
-            "control plane get_migration_execution_status request is missing namespace"
-                .to_string(),
+            "control plane get_migration_execution_status request is missing namespace".to_string(),
         ));
     }
     if request.authority.trim().is_empty() {
         return Err(StoreError::InvalidState(
-            "control plane get_migration_execution_status request is missing authority"
-                .to_string(),
+            "control plane get_migration_execution_status request is missing authority".to_string(),
         ));
     }
     if request.execution_id.trim().is_empty() {
