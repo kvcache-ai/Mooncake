@@ -645,6 +645,7 @@ struct PreparedObjectWrite<'a> {
     qos_tier: Option<&'a str>,
     scoped_key: ObjectKey,
     value: &'a [u8],
+    registered_source: Option<*mut c_void>,
     quota_reservation: Option<mooncake_store_core::TenantQuotaReservationRequest>,
     targets: Vec<ReplicaWriteTarget>,
     reservations: Vec<mooncake_store_core::SegmentReservation>,

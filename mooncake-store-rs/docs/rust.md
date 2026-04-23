@@ -181,6 +181,12 @@ The Rust client supports both object-oriented and buffer-oriented paths.
 
 Use the buffer-oriented forms when the application already owns stable memory and wants to avoid extra copies.
 
+Behavior boundary:
+
+- `put_from` and `batch_put_from` send remote writes from the registered source buffer directly
+- `batch_get_into` reads remote payloads directly into registered destination buffers
+- unregistered `get_into` targets and `batch_put_from_multi_buffers` still fall back to the staged copy paths
+
 ## Hugepage-Backed Local Memory
 
 `LocalMemoryConfig` can request hugepage-backed local storage and scratch memory.

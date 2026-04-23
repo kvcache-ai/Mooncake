@@ -38,6 +38,8 @@ pub struct TestTransportState {
     pub submitted_batch_sizes: Vec<usize>,
     pub submitted_batch_bytes: Vec<u64>,
     pub submitted_batch_hints: Vec<(Option<String>, TransferPacingMode, Option<u64>)>,
+    pub submitted_request_sources: Vec<Vec<usize>>,
+    pub submitted_request_opcodes: Vec<Vec<Opcode>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +74,8 @@ impl TestTransport {
                 submitted_batch_sizes: Vec::new(),
                 submitted_batch_bytes: Vec::new(),
                 submitted_batch_hints: Vec::new(),
+                submitted_request_sources: Vec::new(),
+                submitted_request_opcodes: Vec::new(),
             })),
         }
     }
@@ -150,6 +154,14 @@ impl TestTransport {
 
     pub fn submitted_batch_hints(&self) -> Vec<(Option<String>, TransferPacingMode, Option<u64>)> {
         self.state.lock().submitted_batch_hints.clone()
+    }
+
+    pub fn submitted_request_sources(&self) -> Vec<Vec<usize>> {
+        self.state.lock().submitted_request_sources.clone()
+    }
+
+    pub fn submitted_request_opcodes(&self) -> Vec<Vec<Opcode>> {
+        self.state.lock().submitted_request_opcodes.clone()
     }
 
     pub fn republish_local_metadata_calls(&self) -> usize {
@@ -371,6 +383,15 @@ impl StoreTransport for TestTransport {
             hints.mode,
             hints.max_inflight_bytes,
         ));
+        state.submitted_request_sources.push(
+            requests
+                .iter()
+                .map(|request| request.source as usize)
+                .collect(),
+        );
+        state
+            .submitted_request_opcodes
+            .push(requests.iter().map(|request| request.opcode).collect());
 
         for request in requests {
             let segment = state

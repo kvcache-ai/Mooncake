@@ -174,6 +174,10 @@ End-to-end flows that compose ≥2 real components without mocks.
   refresh a stale cached handle once, and transport submit/open failures must
   still bubble into the outer soft-pin retry path instead of being mistaken
   for recoverable stale-cache noise.
+  Registered-buffer regressions also pin the zero-copy data path: remote
+  `batch_put_from` must submit caller buffer addresses directly, while
+  registered-buffer `batch_get_into` must issue remote reads directly into
+  the destination buffers instead of staging through scratch.
 
 ## Test Infrastructure: `mooncake-store-test-utils`
 
