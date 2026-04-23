@@ -15,6 +15,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_DUMMY_RPC_TIMEOUT: Duration = Duration::from_secs(65);
+const DEFAULT_REGISTRATION_TIMEOUT_FLOOR: Duration = Duration::from_secs(10);
 const STARTUP_TIMEOUT_BYTES_PER_SECOND: u64 = 1024 * 1024 * 1024;
 const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
 const STARTUP_TIMEOUT_ENV: &str = "MC_STORE_RS_STARTUP_TIMEOUT_MS";
@@ -42,6 +43,10 @@ pub struct CompatTimeoutConfig {
 }
 
 impl CompatTimeoutConfig {
+    pub fn default_registration_timeout_for_bytes(registration_bytes: u64) -> Duration {
+        adaptive_registration_timeout(registration_bytes)
+    }
+
     pub fn from_env() -> Self {
         let request_timeout =
             duration_from_env_ms(&[REQUEST_TIMEOUT_ENV]).unwrap_or(DEFAULT_REQUEST_TIMEOUT);
@@ -106,17 +111,17 @@ impl CompatTimeoutConfig {
         self
     }
 
-    pub fn startup_timeout_for_registration_bytes(&self, registration_bytes: u64) -> Duration {
+    pub fn registration_timeout_for_bytes(&self, registration_bytes: u64) -> Duration {
         self.startup_timeout_override
-            .unwrap_or_else(|| adaptive_startup_timeout(registration_bytes))
+            .unwrap_or_else(|| Self::default_registration_timeout_for_bytes(registration_bytes))
     }
 }
 
-fn adaptive_startup_timeout(registration_bytes: u64) -> Duration {
+fn adaptive_registration_timeout(registration_bytes: u64) -> Duration {
     let units = registration_bytes
         .max(1)
         .div_ceil(STARTUP_TIMEOUT_BYTES_PER_SECOND);
-    Duration::from_secs(units.max(1))
+    Duration::from_secs(units).max(DEFAULT_REGISTRATION_TIMEOUT_FLOOR)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1087,23 +1092,23 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_startup_timeout_scales_with_registration_bytes() {
+    fn adaptive_registration_timeout_scales_with_registration_bytes() {
         assert_eq!(
-            sample_timeouts().startup_timeout_for_registration_bytes(1),
-            Duration::from_secs(1)
+            sample_timeouts().registration_timeout_for_bytes(1),
+            Duration::from_secs(10)
         );
         assert_eq!(
-            sample_timeouts().startup_timeout_for_registration_bytes(1024 * 1024 * 1024),
-            Duration::from_secs(1)
+            sample_timeouts().registration_timeout_for_bytes(1024 * 1024 * 1024),
+            Duration::from_secs(10)
         );
         assert_eq!(
-            sample_timeouts().startup_timeout_for_registration_bytes(500 * 1024 * 1024 * 1024_u64),
+            sample_timeouts().registration_timeout_for_bytes(500 * 1024 * 1024 * 1024_u64),
             Duration::from_secs(500)
         );
         assert_eq!(
             sample_timeouts()
                 .with_startup_timeout(Duration::from_secs(7))
-                .startup_timeout_for_registration_bytes(500 * 1024 * 1024 * 1024_u64),
+                .registration_timeout_for_bytes(500 * 1024 * 1024 * 1024_u64),
             Duration::from_secs(7)
         );
     }
