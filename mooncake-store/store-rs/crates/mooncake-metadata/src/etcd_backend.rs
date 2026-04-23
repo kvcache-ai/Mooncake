@@ -71,6 +71,46 @@ impl EtcdMetadataBackend {
             .await
             .map_err(etcd_error("etcd connect"))
     }
+
+    async fn collect_live_epochs(
+        &self,
+        client: &mut Client,
+        stable_id: &ClientStableId,
+    ) -> Result<Vec<u64>> {
+        let marker_prefix = self
+            .config
+            .keyspace
+            .client_by_stable_marker_prefix(stable_id);
+        let lease_prefix = self.config.keyspace.client_prefix_for_stable(stable_id);
+        let response = client
+            .get(marker_prefix, Some(GetOptions::new().with_prefix()))
+            .await
+            .map_err(etcd_error("etcd scan client by-stable markers"))?;
+        let mut live_epochs = Vec::with_capacity(response.kvs().len());
+        for kv in response.kvs() {
+            let Some(epoch) = std::str::from_utf8(kv.key())
+                .ok()
+                .and_then(|key| key.rsplit('/').next())
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let lease_key = format!("{lease_prefix}{epoch}");
+            let existing = client
+                .get(lease_key.clone(), None)
+                .await
+                .map_err(etcd_error("etcd get client lease while scanning markers"))?;
+            if existing.kvs().is_empty() {
+                client
+                    .delete(kv.key(), None)
+                    .await
+                    .map_err(etcd_error("etcd delete stale by-stable marker"))?;
+                continue;
+            }
+            live_epochs.push(epoch);
+        }
+        Ok(live_epochs)
+    }
 }
 
 impl MetadataBackend for EtcdMetadataBackend {
@@ -90,10 +130,6 @@ impl MetadataBackend for EtcdMetadataBackend {
             .config
             .keyspace
             .client_by_stable_marker(&stable_id, new_epoch);
-        let marker_prefix = self
-            .config
-            .keyspace
-            .client_by_stable_marker_prefix(&stable_id);
         let hwm_key = self.config.keyspace.client_epoch_hwm(&stable_id);
         let payload = serde_json::to_string(lease).map_err(json_error)?;
         self.block_on(async {
@@ -111,17 +147,10 @@ impl MetadataBackend for EtcdMetadataBackend {
                     return Ok(());
                 }
 
-                let active = client
-                    .get(marker_prefix.clone(), Some(GetOptions::new().with_prefix()))
-                    .await
-                    .map_err(etcd_error("etcd scan client by-stable markers"))?;
-                let active_max = active
-                    .kvs()
-                    .iter()
-                    .filter_map(|kv| {
-                        let key = std::str::from_utf8(kv.key()).ok()?;
-                        key.rsplit('/').next()?.parse::<u64>().ok()
-                    })
+                let active_max = self
+                    .collect_live_epochs(&mut client, &stable_id)
+                    .await?
+                    .into_iter()
                     .max()
                     .unwrap_or(0);
 
@@ -140,7 +169,8 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .unwrap_or((0, 0));
 
                 let floor = active_max.max(hwm_value);
-                if new_epoch <= floor {
+                let allow_same_epoch_reclaim = new_epoch == hwm_value && new_epoch > active_max;
+                if new_epoch <= floor && !allow_same_epoch_reclaim {
                     return Err(StoreError::StaleEpoch(format!(
                         "lease rejected: proposed epoch {new_epoch} <= floor {floor} for stable_id {}",
                         stable_id.0
@@ -149,16 +179,8 @@ impl MetadataBackend for EtcdMetadataBackend {
 
                 let txn = Txn::new()
                     .when(vec![
-                        Compare::mod_revision(
-                            lease_key.clone(),
-                            CompareOp::Equal,
-                            0,
-                        ),
-                        Compare::mod_revision(
-                            marker_key.clone(),
-                            CompareOp::Equal,
-                            0,
-                        ),
+                        Compare::mod_revision(lease_key.clone(), CompareOp::Equal, 0),
+                        Compare::mod_revision(marker_key.clone(), CompareOp::Equal, 0),
                         Compare::mod_revision(
                             hwm_key.clone(),
                             CompareOp::Equal,
@@ -168,7 +190,11 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .and_then(vec![
                         TxnOp::put(lease_key.clone(), payload.clone(), None),
                         TxnOp::put(marker_key.clone(), Vec::<u8>::new(), None),
-                        TxnOp::put(hwm_key.clone(), new_epoch.to_string(), None),
+                        TxnOp::put(
+                            hwm_key.clone(),
+                            hwm_value.max(new_epoch).to_string(),
+                            None,
+                        ),
                     ]);
                 let txn_response = client
                     .txn(txn)
@@ -183,26 +209,15 @@ impl MetadataBackend for EtcdMetadataBackend {
 
     fn allocate_client_lease(&self, template: &ClientLease) -> Result<ClientRuntimeId> {
         let stable_id = template.runtime.stable_id.clone();
-        let marker_prefix = self
-            .config
-            .keyspace
-            .client_by_stable_marker_prefix(&stable_id);
         let hwm_key = self.config.keyspace.client_epoch_hwm(&stable_id);
         let lease_key_prefix = self.config.keyspace.client_prefix_for_stable(&stable_id);
         self.block_on(async {
             let mut client = self.client().await?;
             loop {
-                let active = client
-                    .get(marker_prefix.clone(), Some(GetOptions::new().with_prefix()))
-                    .await
-                    .map_err(etcd_error("etcd scan client by-stable markers"))?;
-                let active_max = active
-                    .kvs()
-                    .iter()
-                    .filter_map(|kv| {
-                        let key = std::str::from_utf8(kv.key()).ok()?;
-                        key.rsplit('/').next()?.parse::<u64>().ok()
-                    })
+                let active_max = self
+                    .collect_live_epochs(&mut client, &stable_id)
+                    .await?
+                    .into_iter()
                     .max()
                     .unwrap_or(0);
 
@@ -1680,7 +1695,7 @@ mod tests {
         TenantQuotaReservationState,
     };
 
-    use super::{EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace};
+    use super::{etcd_error, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace};
 
     struct EtcdTestServer {
         child: Child,
@@ -1969,6 +1984,38 @@ mod tests {
                 .expect("handoff get should succeed"),
             Some(handoff)
         );
+    }
+
+    #[test]
+    fn etcd_backend_reclaims_expired_same_epoch() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/etcd-reclaim-same-epoch");
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()]).keyspace(keyspace.clone()),
+        )
+        .expect("etcd backend should initialize");
+
+        let lease = sample_lease(ClientLifecycleState::Active);
+        backend
+            .upsert_client_lease(&lease)
+            .expect("initial lease publish should succeed");
+
+        backend
+            .block_on(async {
+                let mut client = backend.client().await?;
+                client
+                    .delete(keyspace.client(&lease.runtime), None)
+                    .await
+                    .map_err(etcd_error("etcd delete client lease for reclaim test"))?;
+                Ok(())
+            })
+            .expect("lease delete should succeed");
+
+        backend
+            .upsert_client_lease(&lease)
+            .expect("same epoch should reclaim after the lease key disappears");
     }
 
     #[test]

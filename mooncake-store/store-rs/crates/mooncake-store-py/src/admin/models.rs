@@ -1,7 +1,7 @@
 use mooncake_store_client::RouteControlMode;
 use mooncake_store_core::{
-    RoutePolicy, TenantObjectAccounting, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
-    TenantQuotaReservation, TenantQuotaReservationState, TenantQuotaState,
+    ClientRuntimeId, RoutePolicy, TenantObjectAccounting, TenantPolicy, TenantPolicyScope,
+    TenantPolicySpec, TenantQuotaReservation, TenantQuotaReservationState, TenantQuotaState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +89,33 @@ pub struct PutTenantPolicyRequest {
 pub struct AdminCleanupReport {
     pub live_clients: usize,
     pub inspected_segment_keys: usize,
+    pub removed_segment_keys: usize,
+    pub removed_segment_index_entries: usize,
+    pub removed_owner_segment_index_entries: usize,
+    pub stale_missing_segment_index_entries: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AdminOwnerCleanupState {
+    SkippedLive,
+    CleanedMissingLease,
+    CleanedExpiredLease,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdminOwnerCleanupReport {
+    pub owner: ClientRuntimeId,
+    pub state: AdminOwnerCleanupState,
+    pub cleanup: AdminCleanupReport,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdminMaintenanceReport {
+    pub due_entries: usize,
+    pub invalid_entries: usize,
+    pub cleaned_missing_lease: usize,
+    pub cleaned_expired_lease: usize,
+    pub skipped_live: usize,
     pub removed_segment_keys: usize,
     pub removed_segment_index_entries: usize,
     pub removed_owner_segment_index_entries: usize,

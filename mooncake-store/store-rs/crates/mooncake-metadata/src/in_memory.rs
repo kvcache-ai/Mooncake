@@ -62,6 +62,27 @@ impl InMemoryMetadataBackend {
             None::<String>,
         ))
     }
+
+    fn prune_stale_epochs(state: &mut InMemoryState, stable_id: &str) -> u64 {
+        if !state.client_by_stable.contains_key(stable_id) {
+            return 0;
+        }
+        let active_epochs = state
+            .clients
+            .values()
+            .filter(|lease| lease.runtime.stable_id.0 == stable_id)
+            .map(|lease| lease.runtime.epoch.0)
+            .collect::<BTreeSet<_>>();
+        let active_max = active_epochs.iter().next_back().copied().unwrap_or(0);
+        if active_epochs.is_empty() {
+            state.client_by_stable.remove(stable_id);
+        } else {
+            state
+                .client_by_stable
+                .insert(stable_id.to_string(), active_epochs);
+        }
+        active_max
+    }
 }
 
 fn version_conflict(
@@ -143,14 +164,11 @@ impl MetadataBackend for InMemoryMetadataBackend {
             return Ok(());
         }
 
-        let active_max = state
-            .client_by_stable
-            .get(&stable_id)
-            .and_then(|set| set.iter().next_back().copied())
-            .unwrap_or(0);
+        let active_max = Self::prune_stale_epochs(&mut state, &stable_id);
         let hwm = state.client_epoch_hwm.get(&stable_id).copied().unwrap_or(0);
         let floor = active_max.max(hwm);
-        if new_epoch <= floor {
+        let allow_same_epoch_reclaim = new_epoch == hwm && new_epoch > active_max;
+        if new_epoch <= floor && !allow_same_epoch_reclaim {
             return Err(StoreError::StaleEpoch(format!(
                 "lease rejected: proposed epoch {new_epoch} <= floor {floor} for stable_id {stable_id}"
             )));
@@ -162,7 +180,9 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .entry(stable_id.clone())
             .or_default()
             .insert(new_epoch);
-        state.client_epoch_hwm.insert(stable_id, new_epoch);
+        if new_epoch > hwm {
+            state.client_epoch_hwm.insert(stable_id, new_epoch);
+        }
         Ok(())
     }
 
@@ -170,11 +190,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         let stable_id = template.runtime.stable_id.0.clone();
         let mut state = self.state.write();
 
-        let active_max = state
-            .client_by_stable
-            .get(&stable_id)
-            .and_then(|set| set.iter().next_back().copied())
-            .unwrap_or(0);
+        let active_max = Self::prune_stale_epochs(&mut state, &stable_id);
         let hwm = state.client_epoch_hwm.get(&stable_id).copied().unwrap_or(0);
         let new_epoch = active_max.max(hwm).saturating_add(1);
 
@@ -1473,6 +1489,25 @@ mod tests {
         metadata
             .upsert_client_lease(&make_lease("client-a", 6))
             .expect("strictly greater epoch should succeed");
+    }
+
+    #[test]
+    fn upsert_client_lease_reclaims_expired_same_epoch() {
+        let metadata = InMemoryMetadataBackend::new();
+        metadata
+            .upsert_client_lease(&make_lease("client-a", 5))
+            .expect("first lease should publish");
+
+        {
+            let mut state = metadata.state.write();
+            state
+                .clients
+                .remove(&ClientRuntimeId::new("client-a", ClientEpoch(5)).storage_key());
+        }
+
+        metadata
+            .upsert_client_lease(&make_lease("client-a", 5))
+            .expect("same epoch should reclaim after the exact lease key disappears");
     }
 
     #[test]

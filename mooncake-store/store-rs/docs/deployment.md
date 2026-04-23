@@ -486,9 +486,14 @@ Credentials embedded in `redis://username:password@host:port/db` also work and t
 Redis client leases expire automatically. Segment registration keys do not.
 
 That means a hard-killed storage client can leave stale `segments/...` metadata and
-segment index entries behind even after its lease has disappeared. Store-RS keeps
-this cleanup as an explicit operator action instead of a background guess, so a
-temporary lease blip does not accidentally delete live metadata.
+segment index entries behind even after its lease has disappeared. Strict tenant
+quota reservations can also outlive a killed writer until an explicit reconcile
+repairs the state. Store-RS now supports one-shot repair plus stateless background
+maintenance in the same admin binary:
+
+- a one-shot sweep through `cleanup-stale-segments`
+- a stateless background maintenance loop in `mooncake-store-admin server`
+- optional tenant quota reservation reconcile for an explicit tenant list in that same admin process
 
 Run the admin sweep when you want to remove dead-owner segment metadata:
 
@@ -497,6 +502,31 @@ mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   cleanup-stale-segments
 ```
+
+Run the stateless admin container shape when cleanup should happen continuously:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  server \
+  --bind-addr 0.0.0.0:8080 \
+  --cleanup-interval-ms 5000 \
+  --cleanup-batch-size 128 \
+  --quota-reconcile-interval-ms 10000 \
+  --quota-reconcile-tenant tenant-a \
+  --quota-reconcile-tenant tenant-b
+```
+
+The background maintenance loop works like this:
+
+- lease create and heartbeat refresh both update a Redis lease-expiry sorted set
+- the admin worker polls due entries from that sorted set
+- each due owner is re-checked against the live lease key before cleanup
+- dead-owner segment deletion is scoped through `indexes/segments/<owner>` instead of a hidden full keyspace walk
+- if a lease key disappeared briefly, same-epoch reclaim is accepted as long as that epoch is still the stable-id HWM and no higher live epoch exists
+- tenant quota reconcile remains explicit: the worker only runs for tenants named on the command line, then internally reuses the same repair logic as `mooncake-store-admin quota reconcile`
+
+This keeps the admin pod stateless. If the pod restarts, the next reconcile loop resumes from Redis metadata instead of relying on in-memory work queues.
 
 You can also manage tenant route policy and inspect strict-quota metadata through the same binary:
 
@@ -535,6 +565,8 @@ Useful options:
 - `--keyspace <prefix>` to target a non-default metadata namespace for either policy management or stale cleanup
 - `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` for Redis ACL authentication
 - terminal tenant-quota reservations (`Finalized` / `Aborted`) expire automatically after `24h` by default; if a deployment needs a different retention window, configure `RedisMetadataConfig::tenant_quota_terminal_ttl(...)`
+- `server --cleanup-interval-ms 0` to run the admin HTTP surface without the maintenance worker
+- `server --quota-reconcile-tenant <tenant>` repeated for each tenant whose strict quota reservations should be repaired automatically
 
 ### Local e2e validation
 
