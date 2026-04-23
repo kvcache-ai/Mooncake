@@ -27,7 +27,10 @@ P2PClientService::P2PClientService(
     : ClientService(local_ip, te_port, metadata_connstring, metrics_port,
                     enable_metrics_http, labels),
       master_client_(client_id_,
-                     metrics_ ? &metrics_->master_client_metric : nullptr) {}
+                     metrics_ ? &metrics_->master_client_metric : nullptr),
+      p2p_metrics_(ClientMetric::IsEnabled()
+                       ? std::make_unique<P2PClientMetric>(merge_labels(labels))
+                       : nullptr) {}
 
 void P2PClientService::Stop() {
     if (!MarkShuttingDown()) {
@@ -541,18 +544,43 @@ tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    // Record put request at entry point
+    if (p2p_metrics_) {
+        p2p_metrics_->local_put_requests.inc();
+    }
+
+    Stopwatch sw;
     auto task_handle_ptr = CreatePutHandle(key, slices, *route_config);
     if (!task_handle_ptr) {
         LOG(ERROR) << "Failed to create put handle for key: " << key
                    << ", error: " << task_handle_ptr.error();
         timer.LogResponse("error_code=", task_handle_ptr.error());
+        if (p2p_metrics_) {
+            p2p_metrics_->local_put_failures.inc();
+        }
         return tl::unexpected(task_handle_ptr.error());
     } else if (!task_handle_ptr.value()) {
         LOG(ERROR) << "put task handle is null for key: " << key;
         timer.LogResponse("error_code=", ErrorCode::INTERNAL_ERROR);
+        if (p2p_metrics_) {
+            p2p_metrics_->local_put_failures.inc();
+        }
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
+
     auto result = task_handle_ptr.value()->Wait();
+    int64_t elapsed_us = sw.elapsed_us();
+
+    if (p2p_metrics_) {
+        p2p_metrics_->local_put_latency.observe(elapsed_us);
+        if (result) {
+            p2p_metrics_->local_put_bytes.inc(CalculateSliceSize(slices));
+        } else {
+            p2p_metrics_->local_put_failures.inc();
+        }
+    }
+
     if (!result) {
         LOG(ERROR) << "Failed to put key: " << key
                    << ", error: " << result.error();
@@ -598,6 +626,11 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         return results;
     }
 
+    // Record put requests at entry point
+    if (p2p_metrics_) {
+        p2p_metrics_->local_put_requests.inc(keys.size());
+    }
+
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
         handles;
     handles.reserve(keys.size());
@@ -618,6 +651,9 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
                       tl::unexpected(batch_route_result.error()));
             timer.LogResponse("success=0 fail=", keys.size(),
                               " error_code=", batch_route_result.error());
+            if (p2p_metrics_) {
+                p2p_metrics_->local_put_failures.inc(keys.size());
+            }
             return results;
         }
 
@@ -640,11 +676,30 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
             LOG(ERROR) << "Failed to create put handle for key: " << keys[i]
                        << ", error: " << handles[i].error();
             results[i] = tl::unexpected(handles[i].error());
+            if (p2p_metrics_) {
+                p2p_metrics_->local_put_failures.inc();
+            }
         } else if (!handles[i].value()) {
             LOG(ERROR) << "put task handle is null for key: " << keys[i];
             results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            if (p2p_metrics_) {
+                p2p_metrics_->local_put_failures.inc();
+            }
         } else {
+            Stopwatch sw;
             auto result = handles[i].value()->Wait();
+            int64_t elapsed_us = sw.elapsed_us();
+
+            if (p2p_metrics_) {
+                p2p_metrics_->local_put_latency.observe(elapsed_us);
+                if (result) {
+                    p2p_metrics_->local_put_bytes.inc(
+                        CalculateSliceSize(batched_slices[i]));
+                } else {
+                    p2p_metrics_->local_put_failures.inc();
+                }
+            }
+
             if (!result) {
                 LOG(ERROR) << "Failed to put key: " << keys[i]
                            << ", error: " << result.error();
@@ -764,9 +819,11 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
 P2PClientService::CreateLocalPutHandle(const std::string& key,
                                        std::vector<Slice>& slices) {
     auto local_handle = data_manager_->Put(key, slices);
+
     if (local_handle) {
         return std::move(local_handle.value());
     }
+
     LOG(ERROR) << "Local write failed for key: " << key
                << ", error: " << local_handle.error();
     return tl::unexpected(local_handle.error());
@@ -798,6 +855,7 @@ P2PClientService::InnerCreatePutHandle(const std::string& key,
             }
             if (data_manager_.has_value()) {
                 auto local_handle = data_manager_->Put(key, slices);
+
                 if (local_handle) {
                     return std::move(local_handle.value());
                 } else if (IsAlreadyExistsError(local_handle.error())) {
@@ -805,6 +863,7 @@ P2PClientService::InnerCreatePutHandle(const std::string& key,
                     // normal case, just ignore the error and return success.
                     return ImmediateHandle<void>::Create();
                 } else {
+                    // Local put failure, try next candidate
                     LOG(WARNING) << "Local write failed, trying next candidate"
                                  << ", error: " << local_handle.error();
                     continue;
@@ -870,6 +929,12 @@ tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Record get request at entry point
+    if (p2p_metrics_) {
+        p2p_metrics_->local_get_requests.inc();
+    }
+
+    Stopwatch sw;
     auto handle = CreateGetHandle(key, allocator, config);
     if (!handle) {
         if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -877,9 +942,24 @@ tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
                        << ", error: " << handle.error();
         }
         timer.LogResponse("error_code=", handle.error());
+        if (p2p_metrics_) {
+            p2p_metrics_->local_get_failures.inc();
+        }
         return tl::unexpected(handle.error());
     }
+
     auto result = handle->task_handle->Wait();
+    int64_t elapsed_us = sw.elapsed_us();
+
+    if (p2p_metrics_) {
+        p2p_metrics_->local_get_latency.observe(elapsed_us);
+        if (result) {
+            p2p_metrics_->local_get_bytes.inc(handle->data_size);
+        } else {
+            p2p_metrics_->local_get_failures.inc();
+        }
+    }
+
     if (!result) {
         LOG(ERROR) << "get failed for key: " << key
                    << ", error: " << result.error();
@@ -920,10 +1000,17 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
         return results;
     }
 
+    // Record get requests at entry point
+    if (p2p_metrics_) {
+        p2p_metrics_->local_get_requests.inc(keys.size());
+    }
+
     // Phase 1: create handles for all keys (local + remote).
+    std::vector<Stopwatch> stopwatches(keys.size());
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
     handles.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
+        stopwatches[i] = Stopwatch();  // Start timing for each handle
         handles.push_back(CreateGetHandle(keys[i], allocator, config));
     }
 
@@ -935,9 +1022,24 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
                            << ", error: " << handles[i].error();
             }
             results[i] = tl::unexpected(handles[i].error());
+            if (p2p_metrics_) {
+                p2p_metrics_->local_get_failures.inc();
+            }
             continue;
         }
+
         auto get_result = handles[i]->task_handle->Wait();
+        int64_t elapsed_us = stopwatches[i].elapsed_us();
+
+        if (p2p_metrics_) {
+            p2p_metrics_->local_get_latency.observe(elapsed_us);
+            if (get_result) {
+                p2p_metrics_->local_get_bytes.inc(handles[i]->data_size);
+            } else {
+                p2p_metrics_->local_get_failures.inc();
+            }
+        }
+
         if (!get_result) {
             LOG(ERROR) << "Failed to get key: " << keys[i]
                        << ", error: " << get_result.error();
@@ -973,6 +1075,12 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
         slices.emplace_back(Slice{buffers[i], sizes[i]});
     }
 
+    // Record get request at entry point
+    if (p2p_metrics_) {
+        p2p_metrics_->local_get_requests.inc();
+    }
+
+    Stopwatch sw;
     auto handle = CreateGetHandle(key, slices, config);
     if (!handle) {
         if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -980,9 +1088,24 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
                        << ", error: " << handle.error();
         }
         timer.LogResponse("error_code=", handle.error());
+        if (p2p_metrics_) {
+            p2p_metrics_->local_get_failures.inc();
+        }
         return tl::unexpected(handle.error());
     }
+
     auto result = handle->task_handle->Wait();
+    int64_t elapsed_us = sw.elapsed_us();
+
+    if (p2p_metrics_) {
+        p2p_metrics_->local_get_latency.observe(elapsed_us);
+        if (result) {
+            p2p_metrics_->local_get_bytes.inc(handle->data_size);
+        } else {
+            p2p_metrics_->local_get_failures.inc();
+        }
+    }
+
     if (!result) {
         LOG(ERROR) << "Failed to wait for get handle for key: " << key
                    << ", error: " << result.error();
@@ -1019,8 +1142,14 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
+    // Record get requests at entry point
+    if (p2p_metrics_) {
+        p2p_metrics_->local_get_requests.inc(keys.size());
+    }
+
     // Phase 1: build slices and create handles (local + remote).
     std::vector<std::vector<Slice>> all_slices(keys.size());
+    std::vector<Stopwatch> stopwatches(keys.size());
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
     handles.reserve(keys.size());
 
@@ -1030,6 +1159,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
             all_slices[i].emplace_back(
                 Slice{all_buffers[i][j], all_sizes[i][j]});
         }
+        stopwatches[i] = Stopwatch();  // Start timing for each handle
         handles.push_back(CreateGetHandle(keys[i], all_slices[i], config));
     }
 
@@ -1043,9 +1173,24 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
                            << ", error: " << handles[i].error();
             }
             results.push_back(tl::unexpected(handles[i].error()));
+            if (p2p_metrics_) {
+                p2p_metrics_->local_get_failures.inc();
+            }
             continue;
         }
+
         auto get_result = handles[i]->task_handle->Wait();
+        int64_t elapsed_us = stopwatches[i].elapsed_us();
+
+        if (p2p_metrics_) {
+            p2p_metrics_->local_get_latency.observe(elapsed_us);
+            if (get_result) {
+                p2p_metrics_->local_get_bytes.inc(handles[i]->data_size);
+            } else {
+                p2p_metrics_->local_get_failures.inc();
+            }
+        }
+
         if (!get_result) {
             LOG(ERROR) << "Failed to get key: " << keys[i]
                        << ", error: " << get_result.error();
@@ -1069,10 +1214,22 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
     // 1. Try local first
     if (data_manager_.has_value()) {
         auto local = data_manager_->Get(key, allocator);
+
         if (local.has_value()) {
+            // Local get hit
+            if (p2p_metrics_) {
+                p2p_metrics_->local_get_hits.inc();
+            }
             return std::move(local.value());
         }
-        if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
+
+        // Local get miss
+        if (local.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            if (p2p_metrics_) {
+                p2p_metrics_->local_get_misses.inc();
+            }
+            // Continue to try remote
+        } else {
             LOG(ERROR) << "Failed to get from local, key: " << key
                        << ", error: " << local.error();
             return tl::unexpected(local.error());
@@ -1131,10 +1288,22 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateGetHandle(
     // 1. Try local first
     if (data_manager_.has_value()) {
         auto local = data_manager_->Get(key, slices);
+
         if (local.has_value()) {
+            // Local get hit
+            if (p2p_metrics_) {
+                p2p_metrics_->local_get_hits.inc();
+            }
             return std::move(local.value());
         }
-        if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
+
+        // Local get miss
+        if (local.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            if (p2p_metrics_) {
+                p2p_metrics_->local_get_misses.inc();
+            }
+            // Continue to try remote
+        } else {
             LOG(ERROR) << "Failed to get from local, key: " << key
                        << ", error: " << local.error();
             return tl::unexpected(local.error());
@@ -1613,6 +1782,36 @@ PeerClient& P2PClientService::GetOrCreatePeerClient(
 
     auto [inserted_it, _] = peer_clients_.emplace(endpoint, std::move(client));
     return *inserted_it->second;
+}
+
+// ============================================================================
+// Metrics
+// ============================================================================
+
+tl::expected<std::string, ErrorCode> P2PClientService::GetSummaryMetrics() {
+    auto result = ClientService::GetSummaryMetrics();
+    if (!result) {
+        return result;
+    }
+
+    if (p2p_metrics_) {
+        *result += "\n" + p2p_metrics_->summary_metrics();
+    }
+
+    return result;
+}
+
+tl::expected<std::string, ErrorCode> P2PClientService::SerializeMetrics() {
+    auto result = ClientService::SerializeMetrics();
+    if (!result) {
+        return result;
+    }
+
+    if (p2p_metrics_) {
+        p2p_metrics_->serialize(*result);
+    }
+
+    return result;
 }
 
 }  // namespace mooncake

@@ -10,6 +10,7 @@ set(MOONCAKE_STORE_SOURCES
     client_service.cpp
     centralized_client_service.cpp
     p2p_client_service.cpp
+    p2p_client_metric.cpp
     client_metric.cpp
     types.cpp
     master_client.cpp

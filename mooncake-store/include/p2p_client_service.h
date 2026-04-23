@@ -17,6 +17,7 @@
 #include "client_rpc_service.h"
 #include "ha_recovery_manager.h"
 #include "peer_client.h"
+#include "p2p_client_metric.h"
 #include "p2p_master_client.h"
 #include "route_cache.h"
 #include "task_handle.h"
@@ -172,6 +173,9 @@ class P2PClientService final : public ClientService {
     MasterClient& GetMasterClient() override { return master_client_; }
 
     std::string GetHealthStatus() const override;
+
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() override;
+    tl::expected<std::string, ErrorCode> SerializeMetrics() override;
 
    private:
     /**
@@ -352,6 +356,9 @@ class P2PClientService final : public ClientService {
 
     // HA recovery manager
     std::unique_ptr<HARecoveryManager> ha_manager_;
+
+    // P2P local storage metrics
+    std::unique_ptr<P2PClientMetric> p2p_metrics_;
 };
 
 }  // namespace mooncake

@@ -67,6 +67,8 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
 
 ClientMetric::~ClientMetric() { StopMetricsReportingThread(); }
 
+bool ClientMetric::IsEnabled() { return parseMetricsEnabled(); }
+
 std::unique_ptr<ClientMetric> ClientMetric::Create(
     std::map<std::string, std::string> labels) {
     if (!parseMetricsEnabled()) {

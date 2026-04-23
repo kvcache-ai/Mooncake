@@ -101,12 +101,26 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
     const std::string key = "p2p_local_put_get";
     const std::string data = "Hello P2P world!";
 
+    // Get metrics baseline before operations
+    auto metrics_before = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_before.has_value());
+
     // Put
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
     auto put_result = client_->Put(key, put_slices, WriteRouteRequestConfig{});
     ASSERT_TRUE(put_result.has_value())
         << "Put failed: " << static_cast<int>(put_result.error());
+
+    // Verify Put metrics: should have 1 local put request with correct bytes
+    auto metrics_after_put = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_after_put.has_value());
+    EXPECT_TRUE(metrics_after_put.value().find(
+                    "mooncake_p2p_local_put_requests_total 1") !=
+                std::string::npos);
+    EXPECT_TRUE(metrics_after_put.value().find(
+                    "mooncake_p2p_local_put_bytes_total " +
+                    std::to_string(data.size())) != std::string::npos);
 
     // Get (local mode reads from DataManager directly)
     std::vector<char> buf(data.size(), 0);
@@ -122,6 +136,19 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
         << "Get failed: " << static_cast<int>(get_result.error());
 
     EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+    // Verify Get metrics: should have 1 local get request with 1 hit
+    auto metrics_after_get = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_after_get.has_value());
+    EXPECT_TRUE(metrics_after_get.value().find(
+                    "mooncake_p2p_local_get_requests_total 1") !=
+                std::string::npos);
+    EXPECT_TRUE(
+        metrics_after_get.value().find("mooncake_p2p_local_get_hits_total 1") !=
+        std::string::npos);
+    EXPECT_TRUE(metrics_after_get.value().find(
+                    "mooncake_p2p_local_get_bytes_total " +
+                    std::to_string(data.size())) != std::string::npos);
 }
 
 // ============================================================================
@@ -147,6 +174,32 @@ TEST_F(P2PClientIntegrationTest, IsExist) {
     auto exist_after = client_->IsExist(key);
     ASSERT_TRUE(exist_after.has_value());
     EXPECT_TRUE(exist_after.value());
+}
+
+// ============================================================================
+// Get miss metrics
+// ============================================================================
+
+TEST_F(P2PClientIntegrationTest, GetMissMetrics) {
+    const std::string key = "p2p_nonexistent_key_for_miss_test";
+
+    // Get metrics baseline
+    auto metrics_before = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_before.has_value());
+
+    // Try to get a non-existent key (should be a miss)
+    std::vector<char> buf(100, 0);
+    auto get_result = client_->Get(key, {(void*)buf.data()}, {buf.size()});
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // Verify Get miss metrics
+    auto metrics_after = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_after.has_value());
+    // The miss count should have increased
+    EXPECT_TRUE(
+        metrics_after.value().find("mooncake_p2p_local_get_misses_total") !=
+        std::string::npos);
 }
 
 // ============================================================================

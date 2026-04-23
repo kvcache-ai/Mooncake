@@ -5,6 +5,7 @@
 #include <string>
 
 #include "client_metric.h"
+#include "p2p_client_metric.h"
 
 namespace mooncake::test {
 
@@ -265,6 +266,106 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
         metrics.serialize(serialized);
         verify(serialized);
     }
+}
+
+TEST_F(ClientMetricsTest, P2PClientMetricBasicTest) {
+    P2PClientMetric metrics;
+
+    // Test empty metrics
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Local Get: 0 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Local Put: 0 requests") != std::string::npos);
+
+    // Add put data
+    metrics.local_put_requests.inc();
+    metrics.local_put_requests.inc();
+    metrics.local_put_failures.inc();
+    metrics.local_put_bytes.inc(1024 * 1024);  // 1 MB
+    metrics.local_put_latency.observe(200);
+    metrics.local_put_latency.observe(300);
+
+    // Add get data
+    metrics.local_get_requests.inc();
+    metrics.local_get_requests.inc();
+    metrics.local_get_requests.inc();
+    metrics.local_get_failures.inc();
+    metrics.local_get_misses.inc();
+    metrics.local_get_hits.inc();
+    metrics.local_get_bytes.inc(2 * 1024 * 1024);  // 2 MB
+    metrics.local_get_latency.observe(100);
+    metrics.local_get_latency.observe(150);
+
+    summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Local Put: 2 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("1.00 MB written") != std::string::npos);
+    EXPECT_TRUE(summary.find("Local Get: 3 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("2.00 MB read") != std::string::npos);
+    EXPECT_TRUE(summary.find("1 misses") != std::string::npos);
+    EXPECT_TRUE(summary.find("1 hits") != std::string::npos);
+
+    std::cout << "P2P Client Metrics Summary:\n" << summary << std::endl;
+}
+
+TEST_F(ClientMetricsTest, P2PClientMetricSerializeTest) {
+    P2PClientMetric metrics;
+
+    // Add some data
+    metrics.local_put_requests.inc(100);
+    metrics.local_put_bytes.inc(50 * 1024 * 1024);  // 50 MB
+    metrics.local_get_requests.inc(500);
+    metrics.local_get_misses.inc(20);
+    metrics.local_get_hits.inc(480);
+    metrics.local_get_bytes.inc(100 * 1024 * 1024);  // 100 MB
+
+    // Add latency data to test histogram output
+    metrics.local_put_latency.observe(200);
+    metrics.local_put_latency.observe(300);
+    metrics.local_get_latency.observe(100);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    // Verify Prometheus format output
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_requests_total 100") !=
+                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_local_put_bytes_total 52428800") !=
+        std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total 500") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_misses_total 20") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_hits_total 480") !=
+                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_local_get_bytes_total 104857600") !=
+        std::string::npos);
+
+    // Verify histogram metrics are present (only output when data exists)
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_latency_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_latency_us") !=
+                std::string::npos);
+
+    std::cout << "P2P Client Serialized Metrics:\n" << serialized << std::endl;
+}
+
+TEST_F(ClientMetricsTest, P2PClientMetricWithLabelsTest) {
+    std::map<std::string, std::string> labels = {
+        {"instance_id", "test-instance"}, {"deployment_mode", "p2p"}};
+
+    P2PClientMetric metrics(labels);
+    metrics.local_put_requests.inc();
+    metrics.local_get_requests.inc();
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    // Verify labels are present in output
+    EXPECT_TRUE(serialized.find("instance_id=\"test-instance\"") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("deployment_mode=\"p2p\"") !=
+                std::string::npos);
 }
 
 }  // namespace mooncake::test

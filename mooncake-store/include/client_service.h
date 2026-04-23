@@ -279,7 +279,7 @@ class ClientService {
         const std::vector<std::string>& keys) = 0;
 
     // For human-readable metrics
-    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
+    virtual tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
         if (metrics_ == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -297,7 +297,7 @@ class ClientService {
     }
 
     // For Prometheus-style metrics
-    tl::expected<std::string, ErrorCode> SerializeMetrics() {
+    virtual tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
