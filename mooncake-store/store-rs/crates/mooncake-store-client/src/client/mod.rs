@@ -24,12 +24,12 @@ use mooncake_transport::{
 use parking_lot::Mutex;
 use tracing::{debug, info, info_span, warn};
 
+use crate::control_plane::pb;
 use crate::control_plane::{
     control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
     ControlPlaneHandle, EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp,
     ReserveSpecificOp,
 };
-use crate::control_plane::pb;
 use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, ScratchReservation, StorageExtentInfo,
     StorageSegmentSpec,

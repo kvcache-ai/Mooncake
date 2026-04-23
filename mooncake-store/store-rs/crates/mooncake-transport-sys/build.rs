@@ -88,7 +88,11 @@ fn merged_cmake_prefix_path(yalantinglibs_prefix: &Path) -> String {
     let mut prefixes = vec![yalantinglibs_prefix.display().to_string()];
     if let Some(extra) = env::var_os("MOONCAKE_EXTRA_CMAKE_PREFIX_PATH") {
         let extra = extra.to_string_lossy();
-        for prefix in extra.split(';').map(str::trim).filter(|value| !value.is_empty()) {
+        for prefix in extra
+            .split(';')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             prefixes.push(prefix.to_string());
         }
     }
@@ -235,10 +239,7 @@ fn detect_jsoncpp_from_env() -> Option<JsonCppConfig> {
     }
 
     let prefix = env_path("JSONCPP_PREFIX")?;
-    let include_candidates = [
-        prefix.join("include/jsoncpp"),
-        prefix.join("include"),
-    ];
+    let include_candidates = [prefix.join("include/jsoncpp"), prefix.join("include")];
     let library_candidates = [
         prefix.join("lib/libjsoncpp.so"),
         prefix.join("lib64/libjsoncpp.so"),

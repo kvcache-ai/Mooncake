@@ -474,17 +474,17 @@ impl ControlPlaneClient {
         let tracker = OperationTracker::new("control_migration_submit");
         let result = (|| {
             let channel = self.channel_for(lease)?;
-            let reply = self.rpc(
-                |mut client| async move {
-                    client.submit_migration_task(Request::new(request)).await
-                },
-                channel,
-            )?;
+            let reply =
+                self.rpc(
+                    |mut client| async move {
+                        client.submit_migration_task(Request::new(request)).await
+                    },
+                    channel,
+                )?;
             decode_error(reply.error)?;
             if reply.execution_id.trim().is_empty() {
                 return Err(StoreError::Transport(
-                    "control plane submit_migration_task reply is missing execution_id"
-                        .to_string(),
+                    "control plane submit_migration_task reply is missing execution_id".to_string(),
                 ));
             }
             Ok(reply.execution_id)
@@ -539,14 +539,13 @@ impl ControlPlaneClient {
         authority: &ClientStableId,
         key: &ObjectKey,
     ) -> Result<Option<ObjectRoute>> {
-        let mut replies = self.batch_get_routes(lease, namespace, authority, std::slice::from_ref(key))?;
-        replies
-            .pop()
-            .ok_or_else(|| {
-                StoreError::Transport(
-                    "control plane get_route batch helper returned no replies".to_string(),
-                )
-            })?
+        let mut replies =
+            self.batch_get_routes(lease, namespace, authority, std::slice::from_ref(key))?;
+        replies.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane get_route batch helper returned no replies".to_string(),
+            )
+        })?
     }
 
     pub(crate) fn reserve_any(
