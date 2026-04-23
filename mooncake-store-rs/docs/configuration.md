@@ -239,7 +239,7 @@ Planner behavior:
 |-------|---------|---------|
 | `replica_count` | `None` | use the client default |
 | `with_soft_pin` | `false` | request soft pin behavior |
-| `preferred_segments` | empty | prefer specific segment names |
+| `preferred_segments` | empty | request-scoped segment preference; hard by default, best-effort when `with_soft_pin=true` |
 | `preferred_storage_owners` | empty | prefer specific storage owners |
 | `prefer_alloc_in_same_node` | `false` | bias allocation toward the same node |
 | `prefer_local` | `true` | prefer the local node before remote spillover |
@@ -253,6 +253,9 @@ Keep the distinction clean:
 
 - `replica_count` controls how many data replicas a write publishes
 - `route_topk` controls how many route authorities keep mirrored route metadata
+- request-level `preferred_segments` is the explicit pinning surface for a single write
+- tenant policy `placement.preferred_segments` is only a default hint and falls back when the segment is missing or stale
+- tenant-policy `preferred_segments` must use the exact active `segment_name`; a `stable_id` is not a valid segment identifier
 
 ## Labels and Naming
 

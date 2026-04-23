@@ -201,38 +201,70 @@ impl StoreClient {
         let reserve_result = (|| {
             let mut shared_candidates = Vec::new();
             let mut shared_seen = BTreeSet::new();
-            for segment in &resolved_policy.preferred_segments {
-                match self.lookup_preferred_segment(segment) {
-                    Ok(preferred) => {
-                        if self.runtime_is_suspect(&preferred.owner) {
-                            debug!(
-                                segment = %preferred.segment_name.0,
-                                storage_runtime = %preferred.owner,
-                                "batch put is skipping suspect preferred segment owner"
+            let add_preferred_segments = |
+                this: &Self,
+                segments: &[SegmentName],
+                source: PreferredSegmentSource,
+                soft: bool,
+                shared_seen: &mut BTreeSet<ClientRuntimeId>,
+                shared_candidates: &mut Vec<ReplicaPlacementCandidate>,
+            | -> Result<()> {
+                for segment in segments {
+                    match this.lookup_preferred_segment(segment) {
+                        Ok(preferred) => {
+                            if this.runtime_is_suspect(&preferred.owner) {
+                                this.log_skipped_preferred_segment(
+                                    this.default_tenant(),
+                                    "*",
+                                    segment,
+                                    source,
+                                    "owner_suspect",
+                                    None,
+                                );
+                                continue;
+                            }
+                            if !shared_seen.insert(preferred.owner.clone()) {
+                                continue;
+                            }
+                            shared_candidates.push(ReplicaPlacementCandidate {
+                                target: ReplicaPlacementTarget::Segment {
+                                    storage_runtime: preferred.owner,
+                                    segment_name: preferred.segment_name,
+                                },
+                                soft,
+                            });
+                        }
+                        Err(error) if this.should_skip_candidate(&error, soft) => {
+                            this.log_skipped_preferred_segment(
+                                this.default_tenant(),
+                                "*",
+                                segment,
+                                source,
+                                Self::preferred_segment_skip_reason(&error),
+                                Some(&error),
                             );
-                            continue;
                         }
-                        if !shared_seen.insert(preferred.owner.clone()) {
-                            continue;
-                        }
-                        shared_candidates.push(ReplicaPlacementCandidate {
-                            target: ReplicaPlacementTarget::Segment {
-                                storage_runtime: preferred.owner,
-                                segment_name: preferred.segment_name,
-                            },
-                            soft: resolved_policy.with_soft_pin,
-                        });
+                        Err(error) => return Err(error),
                     }
-                    Err(error) if self.should_skip_candidate(&error, resolved_policy.with_soft_pin) => {
-                        debug!(
-                            segment = %segment.0,
-                            error = %error,
-                            "batch put is skipping preferred segment after lookup failure"
-                        );
-                    }
-                    Err(error) => return Err(error),
                 }
-            }
+                Ok(())
+            };
+            add_preferred_segments(
+                self,
+                &resolved_policy.required_preferred_segments,
+                PreferredSegmentSource::Request,
+                false,
+                &mut shared_seen,
+                &mut shared_candidates,
+            )?;
+            add_preferred_segments(
+                self,
+                &resolved_policy.hint_preferred_segments,
+                PreferredSegmentSource::TenantPolicy,
+                true,
+                &mut shared_seen,
+                &mut shared_candidates,
+            )?;
             for storage_runtime in &resolved_policy.preferred_storage_runtimes {
                 if self.runtime_is_suspect(storage_runtime) {
                     debug!(

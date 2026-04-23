@@ -694,15 +694,17 @@ impl StoreClient {
         policy: Option<&ReplicationPolicy>,
     ) -> Result<ResolvedReplicationPolicy> {
         let mut policy = policy.cloned().unwrap_or_default();
+        let request_preferred_segments = policy.preferred_segments.clone();
+        let mut hint_preferred_segments = Vec::new();
         if let Some(placement) = self.placement_policy.as_ref() {
             if policy.preferred_storage_owners.is_empty() {
                 if let Some(owners) = placement.preferred_storage_owners.as_ref() {
                     policy.preferred_storage_owners = owners.clone();
                 }
             }
-            if policy.preferred_segments.is_empty() {
+            if request_preferred_segments.is_empty() {
                 if let Some(segments) = placement.preferred_segments.as_ref() {
-                    policy.preferred_segments = segments
+                    hint_preferred_segments = segments
                         .iter()
                         .cloned()
                         .map(SegmentName::new)
@@ -725,25 +727,50 @@ impl StoreClient {
             ));
         }
 
-        let preferred_segments = policy.preferred_segments.clone();
-        let mut seen = BTreeSet::new();
-        for segment in &preferred_segments {
-            if !seen.insert(segment.clone()) {
-                return Err(StoreError::Conflict(format!(
-                    "duplicate preferred segment {}",
-                    segment.0
-                )));
-            }
-        }
+        let required_preferred_segments =
+            Self::resolve_preferred_segments(&request_preferred_segments, true)?;
+        let hint_preferred_segments = Self::resolve_preferred_segments(&hint_preferred_segments, false)?;
 
         Ok(ResolvedReplicationPolicy {
             replica_count,
-            preferred_segments,
+            required_preferred_segments: if policy.with_soft_pin {
+                Vec::new()
+            } else {
+                required_preferred_segments.clone()
+            },
+            hint_preferred_segments: if policy.with_soft_pin {
+                let mut segments = required_preferred_segments;
+                segments.extend(hint_preferred_segments);
+                segments
+            } else {
+                hint_preferred_segments
+            },
             preferred_storage_runtimes: self
                 .resolve_preferred_storage_owners(&policy.preferred_storage_owners)?,
             with_soft_pin: policy.with_soft_pin,
             prefer_local: policy.prefer_local || policy.prefer_alloc_in_same_node,
         })
+    }
+
+    fn resolve_preferred_segments(
+        segments: &[SegmentName],
+        reject_duplicates: bool,
+    ) -> Result<Vec<SegmentName>> {
+        let mut resolved = Vec::with_capacity(segments.len());
+        let mut seen = BTreeSet::new();
+        for segment in segments {
+            if !seen.insert(segment.clone()) {
+                if reject_duplicates {
+                    return Err(StoreError::Conflict(format!(
+                        "duplicate preferred segment {}",
+                        segment.0
+                    )));
+                }
+                continue;
+            }
+            resolved.push(segment.clone());
+        }
+        Ok(resolved)
     }
 
     fn resolve_preferred_storage_owners(
@@ -836,62 +863,36 @@ impl StoreClient {
                 let _ = this.release_reserved_allocations(targets, reservations);
             };
 
-        for segment in &policy.preferred_segments {
-            match self.lookup_preferred_segment(segment) {
-                Ok(preferred) => {
-                    if self.runtime_is_suspect(&preferred.owner) {
-                        debug!(
-                            tenant,
-                            key,
-                            storage_runtime = %preferred.owner,
-                            segment = %preferred.segment_name.0,
-                            "skipping suspect preferred segment owner"
-                        );
-                        continue;
-                    }
-                    let candidate = ReplicaPlacementCandidate {
-                        target: ReplicaPlacementTarget::Segment {
-                            storage_runtime: preferred.owner,
-                            segment_name: preferred.segment_name,
-                        },
-                        soft: policy.with_soft_pin,
-                    };
-                    let storage_runtime = candidate.target.storage_runtime().clone();
-                    if excluded.contains(&storage_runtime) {
-                        continue;
-                    }
-                    match self.reserve_candidate(&candidate.target, length_bytes) {
-                        Ok((target, reservation)) => {
-                            excluded.insert(storage_runtime);
-                            targets.push(target);
-                            reservations.push(reservation);
-                            if targets.len() == policy.replica_count {
-                                return Ok((targets, reservations));
-                            }
-                        }
-                        Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
-                            debug!(
-                                tenant,
-                                key,
-                                segment = %segment.0,
-                                error = %error,
-                                "skipping preferred segment after reservation failure"
-                            );
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(error) if self.should_skip_candidate(&error, policy.with_soft_pin) => {
-                    debug!(
-                        tenant,
-                        key,
-                        segment = %segment.0,
-                        error = %error,
-                        "skipping preferred segment after lookup failure"
-                    );
-                }
-                Err(error) => return Err(error),
-            }
+        self.reserve_preferred_segments(
+            tenant,
+            key,
+            &policy.required_preferred_segments,
+            PreferredSegmentSource::Request,
+            false,
+            length_bytes,
+            policy.replica_count,
+            &mut excluded,
+            &mut targets,
+            &mut reservations,
+        )?;
+        if targets.len() == policy.replica_count {
+            return Ok((targets, reservations));
+        }
+
+        self.reserve_preferred_segments(
+            tenant,
+            key,
+            &policy.hint_preferred_segments,
+            PreferredSegmentSource::TenantPolicy,
+            true,
+            length_bytes,
+            policy.replica_count,
+            &mut excluded,
+            &mut targets,
+            &mut reservations,
+        )?;
+        if targets.len() == policy.replica_count {
+            return Ok((targets, reservations));
         }
 
         for storage_runtime in &policy.preferred_storage_runtimes {
@@ -1003,6 +1004,125 @@ impl StoreClient {
             targets.len(),
             policy.replica_count
         )))
+    }
+
+    fn reserve_preferred_segments(
+        &self,
+        tenant: &str,
+        key: &str,
+        segments: &[SegmentName],
+        source: PreferredSegmentSource,
+        soft: bool,
+        length_bytes: usize,
+        replica_count: usize,
+        excluded: &mut BTreeSet<ClientRuntimeId>,
+        targets: &mut Vec<ReplicaWriteTarget>,
+        reservations: &mut Vec<mooncake_store_core::SegmentReservation>,
+    ) -> Result<()> {
+        for segment in segments {
+            match self.lookup_preferred_segment(segment) {
+                Ok(preferred) => {
+                    if self.runtime_is_suspect(&preferred.owner) {
+                        self.log_skipped_preferred_segment(
+                            tenant,
+                            key,
+                            segment,
+                            source,
+                            "owner_suspect",
+                            None,
+                        );
+                        continue;
+                    }
+                    let candidate = ReplicaPlacementCandidate {
+                        target: ReplicaPlacementTarget::Segment {
+                            storage_runtime: preferred.owner,
+                            segment_name: preferred.segment_name,
+                        },
+                        soft,
+                    };
+                    let storage_runtime = candidate.target.storage_runtime().clone();
+                    if excluded.contains(&storage_runtime) {
+                        continue;
+                    }
+                    match self.reserve_candidate(&candidate.target, length_bytes) {
+                        Ok((target, reservation)) => {
+                            excluded.insert(storage_runtime);
+                            targets.push(target);
+                            reservations.push(reservation);
+                            if targets.len() == replica_count {
+                                return Ok(());
+                            }
+                        }
+                        Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                            self.log_skipped_preferred_segment(
+                                tenant,
+                                key,
+                                segment,
+                                source,
+                                Self::preferred_segment_skip_reason(&error),
+                                Some(&error),
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if self.should_skip_candidate(&error, soft) => {
+                    self.log_skipped_preferred_segment(
+                        tenant,
+                        key,
+                        segment,
+                        source,
+                        Self::preferred_segment_skip_reason(&error),
+                        Some(&error),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn log_skipped_preferred_segment(
+        &self,
+        tenant: &str,
+        key: &str,
+        segment: &SegmentName,
+        source: PreferredSegmentSource,
+        reason: &'static str,
+        error: Option<&StoreError>,
+    ) {
+        if source == PreferredSegmentSource::TenantPolicy {
+            registry::record_preferred_segment_skip(source.label(), reason);
+            warn!(
+                tenant,
+                key,
+                segment = %segment.0,
+                source = source.label(),
+                reason,
+                error = error.map(|error| error.to_string()),
+                "skipping tenant-policy preferred segment and falling back"
+            );
+            return;
+        }
+        debug!(
+            tenant,
+            key,
+            segment = %segment.0,
+            source = source.label(),
+            reason,
+            error = error.map(|error| error.to_string()),
+            "skipping preferred segment"
+        );
+    }
+
+    fn preferred_segment_skip_reason(error: &StoreError) -> &'static str {
+        match error {
+            StoreError::NotFound(_) => "not_found",
+            StoreError::InvalidState(_) => "owner_unavailable",
+            StoreError::Allocator(_) => "allocator",
+            StoreError::Transport(_) => "transport",
+            _ => "other",
+        }
     }
 
     fn lookup_preferred_segment(&self, segment_name: &SegmentName) -> Result<SegmentAnnouncement> {

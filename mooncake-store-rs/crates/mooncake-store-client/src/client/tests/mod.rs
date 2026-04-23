@@ -8086,7 +8086,6 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
     let transport = Arc::new(TestTransport::new("quota-segment"));
     let client = StoreClientBuilder::new(metadata.clone(), "quota-client")
         .tenant("tenant-a")
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
@@ -8217,7 +8216,6 @@ fn non_default_tenant_without_policy_inherits_namespace_quota() {
     let client = StoreClientBuilder::new(metadata, "inherited-namespace-quota-client")
         .tenant("default-tenant")
         .namespace_quota(NamespaceQuota::new().max_bytes(4).max_objects(1))
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
@@ -8260,7 +8258,6 @@ fn routing_only_tenant_policy_still_inherits_namespace_quota() {
     let client = StoreClientBuilder::new(metadata.clone(), "routing-only-policy-quota-client")
         .tenant("default-tenant")
         .namespace_quota(NamespaceQuota::new().max_bytes(4).max_objects(1))
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
@@ -8305,7 +8302,6 @@ fn namespace_quota_overwrite_uses_committed_delta() {
     let transport = Arc::new(TestTransport::new("overwrite-quota-segment"));
     let client = StoreClientBuilder::new(metadata.clone(), "overwrite-quota-client")
         .tenant("tenant-a")
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
@@ -8373,7 +8369,6 @@ fn remove_refunds_quota_when_delete_becomes_authoritative() {
     let transport = Arc::new(TestTransport::new("remove-quota-segment"));
     let client = StoreClientBuilder::new(metadata.clone(), "remove-quota-client")
         .tenant("tenant-a")
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
@@ -8516,7 +8511,6 @@ fn tenant_local_quota_eviction_does_not_touch_other_tenants() {
     let transport = Arc::new(TestTransport::new("tenant-local-quota-segment"));
     let client = StoreClientBuilder::new(metadata.clone(), "tenant-local-quota-client")
         .tenant("tenant-a")
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
@@ -8639,7 +8633,6 @@ fn tenant_local_quota_eviction_preserves_other_tenant_same_logical_key() {
     let transport = Arc::new(TestTransport::new("tenant-local-quota-same-key-segment"));
     let client = StoreClientBuilder::new(metadata.clone(), "tenant-local-quota-same-key-client")
         .tenant("tenant-a")
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
@@ -8813,7 +8806,6 @@ fn put_returns_error_when_route_publish_succeeds_but_quota_finalize_fails() {
     let transport = Arc::new(TestTransport::new("finalize-failure-segment"));
     let client = StoreClientBuilder::new(metadata, "quota-client")
         .tenant("tenant-a")
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
@@ -8886,7 +8878,6 @@ fn runtime_uses_metadata_authored_fairness_shaping_and_placement_defaults() {
         .expect("tenant runtime policy should store");
     let client = StoreClientBuilder::new(metadata, "runtime-policy-client")
         .tenant("tenant-a")
-        .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
@@ -8907,11 +8898,186 @@ fn runtime_uses_metadata_authored_fairness_shaping_and_placement_defaults() {
         .resolve_replication_policy(None)
         .expect("default replication policy should resolve");
     assert_eq!(resolved.replica_count, 2);
+    assert!(resolved.required_preferred_segments.is_empty());
     assert!(resolved
-        .preferred_segments
+        .hint_preferred_segments
         .contains(&SegmentName::new("seg-a")));
     assert_eq!(resolved.preferred_storage_runtimes, vec![owner_a]);
     assert!(resolved.prefer_local);
+}
+
+#[test]
+fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("tenant-policy-fallback-writer-segment"));
+    let owner = publish_storage_node(
+        &metadata,
+        &transport,
+        "fallback-owner",
+        "seg-live",
+        "pool-a",
+    );
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    placement: Some(TenantPlacementPolicy {
+                        preferred_segments: Some(vec!["seg-missing".to_string()]),
+                        ..TenantPlacementPolicy::default()
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant policy should store");
+    let client = StoreClientBuilder::new(metadata.clone(), "tenant-policy-fallback-writer")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("writer should build");
+    client
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_runtime_visibility(&client, &owner);
+
+    let single = client
+        .put("single-fallback", b"alpha")
+        .expect("tenant-policy hint should fall back for put");
+    assert_eq!(
+        single.replicas[0].segment_name,
+        SegmentName::new("seg-live")
+    );
+
+    let batch = client
+        .batch_put(&[PutRequest::new("batch-fallback", b"bravo")])
+        .expect("tenant-policy hint should fall back for batch_put");
+    assert_eq!(
+        batch[0].replicas[0].segment_name,
+        SegmentName::new("seg-live")
+    );
+
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains(
+        "mooncake_store_preferred_segment_skip_total{source=\"tenant_policy\",reason=\"not_found\"} 2"
+    ));
+}
+
+#[test]
+fn request_preferred_segments_preserve_hard_and_soft_pin_semantics() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("request-preferred-segment-writer"));
+    let owner = publish_storage_node(&metadata, &transport, "request-owner", "seg-live", "pool-a");
+    let client = StoreClientBuilder::new(metadata.clone(), "request-preferred-segment-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("writer should build");
+    client
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_runtime_visibility(&client, &owner);
+
+    let hard_error = client
+        .put_with_policy(
+            "hard-missing",
+            b"alpha",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_segment("seg-missing"),
+        )
+        .expect_err("hard preferred segment should still fail");
+    assert!(matches!(hard_error, StoreError::NotFound(_)));
+
+    let soft_route = client
+        .put_with_policy(
+            "soft-missing",
+            b"bravo",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .with_soft_pin(true)
+                .preferred_segment("seg-missing"),
+        )
+        .expect("soft preferred segment should fall back");
+    assert_eq!(
+        soft_route.replicas[0].segment_name,
+        SegmentName::new("seg-live")
+    );
+}
+
+#[test]
+fn tenant_policy_preferred_segments_still_prefer_live_segment() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("tenant-policy-preferred-live-writer"));
+    let owner_a = publish_storage_node(&metadata, &transport, "prefer-owner-a", "seg-a", "pool-a");
+    let _owner_b = publish_storage_node(&metadata, &transport, "prefer-owner-b", "seg-b", "pool-a");
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    placement: Some(TenantPlacementPolicy {
+                        preferred_segments: Some(vec!["seg-a".to_string()]),
+                        ..TenantPlacementPolicy::default()
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("tenant policy should store");
+    let client = StoreClientBuilder::new(metadata.clone(), "tenant-policy-preferred-live-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("writer should build");
+    client
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_runtime_visibility(&client, &owner_a);
+
+    let route = client
+        .put("preferred-live", b"payload")
+        .expect("live tenant-policy preferred segment should be used");
+    assert_eq!(route.replicas[0].segment_name, SegmentName::new("seg-a"));
 }
 
 #[test]

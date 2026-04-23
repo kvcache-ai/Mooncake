@@ -15,7 +15,7 @@ Store-RS multi-tenant isolation currently spans these areas:
 
 - tenant-scoped routing defaults such as `route_control` and `route_topk`
 - tenant-scoped quota defaults such as `max_bytes` and `max_objects`
-- placement defaults such as replica count and preferred storage owners
+- placement defaults such as replica count, preferred storage owners, and preferred segment hints
 - QoS-related defaults such as fairness and shaping knobs
 - tenant namespace selection through `tenant`, `domain`, and `object_set`
 - strict quota admission backed by authoritative metadata rather than best-effort request-local checks
@@ -179,6 +179,26 @@ store.setup_dummy(
 ```
 
 Use dummy mode when Python should attach to a standalone `mooncake-store-client` daemon. In dummy mode, clients only share shm-backed hot-cache hits and side channels when they intentionally use the same worker-scoped dummy server boundary.
+
+## Placement policy notes
+
+Tenant placement policy can provide default replica and routing hints, including `preferred_storage_owners` and `preferred_segments`.
+
+Important semantics:
+
+- request-level `ReplicationPolicy.preferred_segments` is still the explicit pinning surface
+- request-level `preferred_segments` stays hard by default and only becomes best-effort when `with_soft_pin=true`
+- tenant policy `placement.preferred_segments` is a default placement hint, not a mandatory constraint
+- tenant-policy preferred segments are tried first when they exist, but missing / stale entries only emit a warning and then fall back to normal placement
+- `preferred_segments` must contain the exact active segment name, not a stable id such as `store-a`
+- because segment names are process-scoped and can churn across restarts, stale tenant-policy segment hints are expected to happen occasionally
+- placement patch merge is sticky: omitting `preferred_segments` from a later policy patch does not clear an older stored value
+
+Operational takeaway:
+
+- prefer `preferred_storage_owners` when you want a more stable long-lived hint
+- use `preferred_segments` only when you intentionally want to bias toward a specific currently active segment
+- clear or overwrite bad `preferred_segments` explicitly if an earlier policy write stored the wrong value
 
 ## QoS and bandwidth policy notes
 
