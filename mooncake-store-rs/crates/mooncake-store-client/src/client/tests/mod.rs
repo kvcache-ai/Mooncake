@@ -7877,6 +7877,73 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
 }
 
 #[test]
+fn non_default_tenant_without_policy_inherits_namespace_quota() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("inherited-namespace-quota-segment"));
+    let client = StoreClientBuilder::new(metadata, "inherited-namespace-quota-client")
+        .tenant("default-tenant")
+        .namespace_quota(NamespaceQuota::new().max_bytes(4).max_objects(1))
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    let error = client
+        .put_in_tenant("tenant-b", "overflow", b"12345")
+        .expect_err("non-default tenant should not bypass inherited namespace quota");
+    assert!(matches!(error, StoreError::QuotaExceeded { .. }));
+    assert!(client
+        .query_route_in_tenant("tenant-b", "overflow")
+        .expect("tenant-b route lookup should succeed")
+        .is_none());
+}
+
+#[test]
+fn routing_only_tenant_policy_still_inherits_namespace_quota() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    metadata
+        .put_tenant_policy(
+            &TenantPolicy {
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                spec: TenantPolicySpec {
+                    quota: None,
+                    routing: Some(TenantRoutePolicy {
+                        route_topk: Some(2),
+                        route_control: Some(RouteControlMode::MetadataOnly),
+                    }),
+                    ..TenantPolicySpec::default()
+                },
+                version: 1,
+                updated_at_ms: 10,
+                updated_by: "admin".to_string(),
+            },
+            None,
+        )
+        .expect("routing-only tenant policy should store");
+    let transport = Arc::new(TestTransport::new("routing-only-policy-quota-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "routing-only-policy-quota-client")
+        .tenant("default-tenant")
+        .namespace_quota(NamespaceQuota::new().max_bytes(4).max_objects(1))
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("quota client should build");
+
+    let error = client
+        .put_in_tenant("tenant-a", "overflow", b"12345")
+        .expect_err("routing-only tenant policy should not disable inherited quota");
+    assert!(matches!(error, StoreError::QuotaExceeded { .. }));
+    assert!(client
+        .query_route_in_tenant("tenant-a", "overflow")
+        .expect("tenant-a route lookup should succeed")
+        .is_none());
+}
+
+#[test]
 fn namespace_quota_overwrite_uses_committed_delta() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     metadata
