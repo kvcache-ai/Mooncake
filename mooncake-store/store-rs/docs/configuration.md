@@ -138,6 +138,13 @@ Hugepage behavior:
 - if `hugepage_size_bytes` is set, hugepage mode is implicitly enabled
 - if both fields are `None`, the runtime falls back to `MC_STORE_USE_HUGEPAGE` and `MC_STORE_HUGEPAGE_SIZE`
 
+Startup registration behavior:
+
+- storage-region planning stays NUMA-aware by default when `location` targets host memory and `numa_aware` remains enabled
+- if startup planning produces multiple initial storage segments, the runtime allocates and registers those extra segments in parallel, then publishes the full local segment set after local registration completes
+- under `classic_te` + RDMA, startup storage registration pre-touches pages before MR registration when the total startup storage registration volume reaches `4 GiB` or more
+- ordinary scratch-region registration still follows the transport registration limit split logic; the startup fast path is only for storage segments
+
 ## Transport Backend Selection
 
 The compatibility layer supports two real data-plane backends:
