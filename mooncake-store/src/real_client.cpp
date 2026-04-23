@@ -2055,7 +2055,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
         context.client_buffer_allocator =
-            ClientBufferAllocator::create(mapped_va, vmm_size, proto_to_use);
+            ClientBufferAllocator::create(mapped_va, vmm_size, this->protocol);
     }
     context.mapped_shms.push_back(std::move(region));
 #endif
@@ -2131,7 +2131,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
         context.client_buffer_allocator =
-            ClientBufferAllocator::create(mapped_va, mem_size, proto_to_use);
+            ClientBufferAllocator::create(mapped_va, mem_size, this->protocol);
     }
 
     context.mapped_shms.push_back(std::move(region));
