@@ -12,7 +12,7 @@ ci:
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+    rev: v4.6.0
     hooks:
       - id: trailing-whitespace
         exclude: '^(build/|extern/|mooncake-wheel/repaired_wheels_.*|.*/build/|FAST25-release/)'
@@ -34,7 +34,7 @@ repos:
         require_serial: true
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.11
+    rev: v0.6.9
     hooks:
       - id: ruff
         args: ['--fix']
@@ -43,14 +43,14 @@ repos:
         exclude: '^(extern/|FAST25-release/)'
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.4.2
+    rev: v2.2.6
     hooks:
       - id: codespell
         exclude: '^(extern/|FAST25-release/)'
         args: ['--ignore-words-list=te,mooncake,KVCache,cann']
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v22.1.3
+    rev: v20.1.8
     hooks:
       - id: clang-format
         files: '\.(c|cc|cpp|cxx|h|hpp)$'

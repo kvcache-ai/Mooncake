@@ -190,16 +190,6 @@ cmake-build-relwithdebinfo
 cmake-build-minsizerel
 cmake-build
 
-# Out-of-tree / developer-local CMake build directories
-build-sunrise/
-build-mc-te/
-
-# Local tooling (machine-specific; not part of upstream sources)
-.clangd
-
-# Temporary local notes (e.g. PR description drafts); keep out of version control
-/tmp_sunrise_pr_description.md
-
 libetcd_wrapper.h
 
 mooncake-wheel/mooncake/allocator.py
