@@ -812,6 +812,13 @@ These runners verify:
 - storage expansion while requests are still served
 - forced storage kill with retry-based recovery instead of persistent request failure
 - graceful storage shrink with retry-based recovery instead of persistent request failure
+- per-phase completion wall time plus gateway-side operation latency breakdowns for TTFT triage
+
+The true e2e runner prints, for each phase:
+
+- completion wall time in milliseconds for both SGLang servers
+- gateway aggregate put/get call counts, total latency, average latency, and peak latency
+- focused gateway operation deltas for `batch_put_from`, `batch_get_into`, hot-cache probes, and the Python compat dispatcher bridge
 
 Portable bundle notes:
 

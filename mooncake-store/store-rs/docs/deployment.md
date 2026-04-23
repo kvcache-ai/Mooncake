@@ -215,6 +215,7 @@ What the script does:
 - starts an extra storage node and verifies SGLang keeps serving requests after expansion
 - hard-kills one storage node and retries completions until recovery, validating that requests do not stay broken after forced shrink
 - gracefully drains one storage node and retries completions until recovery, validating that requests do not stay broken after shrink
+- prints per-phase completion wall time and gateway latency breakdowns so TTFT regressions can be attributed to put/get, hot-cache probe, or compat bridge overhead
 
 Important inputs:
 
