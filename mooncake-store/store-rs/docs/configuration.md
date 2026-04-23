@@ -160,6 +160,7 @@ Notes:
 - explicit CLI or Python values override the environment variable
 - when no explicit selection is present, the compatibility layer defaults to `classic_te`
 - `classic`, `classic-te`, and `te` are accepted as compatibility aliases by the parser
+- set `MC_STORE_RS_GID_INDEX=<n>` when `classic_te` over RDMA must use a non-default RoCE GID index; Store-RS forwards it to upstream `MC_GID_INDEX`
 - low-level Rust transport construction remains explicit; runtime backend selection is only a compatibility-layer feature
 - current upstream SGLang Mooncake integration does not forward `transport_backend` from `--hicache-storage-backend-extra-config`; use `MC_STORE_RS_TRANSPORT_BACKEND` when SGLang real mode must select `tent` or `classic_te`
 
@@ -455,6 +456,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_ROUTE_TOPK` | Python wrapper setup fallback | WRH route-authority fanout; must be `>= 2` |
 | `MC_STORE_RS_ROUTE_CONTROL` | Python wrapper setup fallback | route control mode, usually `embedded_wrh` |
 | `MC_STORE_RS_TRANSPORT_METADATA_URL` | Python wrapper setup fallback | transport Redis URL when store metadata uses etcd |
+| `MC_STORE_RS_GID_INDEX` | compatibility layer, standalone client, Python wrapper, and bench | `classic_te` RDMA GID index override; forwarded to upstream `MC_GID_INDEX` |
 | `MC_STORE_RS_TRANSPORT_RPC_PORT` | Python wrapper setup fallback | fixed real data-plane transport port |
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |
 | `MC_STORE_RS_EXPIRES_AT_MS` | Python wrapper setup fallback | absolute lease expiry timestamp in milliseconds |
@@ -470,6 +472,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRACE` | Python wrapper setup fallback, e2e, and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |
 | `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |
+| `MC_BENCH_TRACE_FILE` | `mooncake-store-bench` | append bench tracing logs to this file; bench otherwise logs to `stderr` and does not use `MC_STORE_RS_TRACE_FILE` for its own output |
 | `MC_STORE_RS_METRICS_ADDR` | Python wrapper setup fallback, e2e, and applications | bind address for the in-process metrics server |
 | `MC_STORE_RS_REDIS_URL` | Rust e2e | metadata Redis URL |
 | `MC_STORE_RS_REDIS_PORT` | local scripts and e2e | local Redis port |
@@ -487,6 +490,11 @@ The current repository uses these environment variables.
 | `MC_STORE_HUGEPAGE_SIZE` | local memory and Python shm allocator | hugepage size; `2MB` or `1GB` |
 | `MOONCAKE_UPSTREAM_DIR` | local scripts | upstream Mooncake source tree |
 | `MOONCAKE_UPSTREAM_BUILD_DIR` | local scripts | upstream Mooncake build output tree |
+
+`mooncake-store-bench` reuses `MC_STORE_RS_TRACE_FILTER` for level control, but
+it has its own trace-file surface. Use `MC_BENCH_TRACE_FILE` for bench logs and
+keep `MC_STORE_RS_TRACE_FILE` for standalone-client or Python real-client
+logging.
 
 ## Observability
 

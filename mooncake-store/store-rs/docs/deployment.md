@@ -358,6 +358,11 @@ Important stress-benchmark inputs:
 | `MC_STORE_RS_STRESS_PHASES` | `put,get,batch-put,batch-get` | comma-separated phase list |
 | `MC_STORE_RS_STRESS_ROUTE_CONTROL` | `metadata_only` | route mode used by the benchmark |
 
+For the shipped operator-facing benchmark, correctness checker, and soak runner,
+use `mooncake-store-bench`; see `docs/bench.md`. Its default mode is scratch-only
+RW benchmarking (`MC_BENCH_STORAGE_BYTES=0`) against separate `storage=true`
+daemons, and it joins `mc/store-rs/v1` when no explicit keyspace is provided.
+
 ### Wheel packaging
 
 Build the Python wheel and stage the standalone client binary:
@@ -382,6 +387,7 @@ Default outputs:
 - `dist/wheels/mooncake-*.whl`
 - `dist/wheels/mooncake_pro-*.whl`
 - `dist/bin/mooncake-store-client`
+- `dist/bin/mooncake-store-bench`
 
 Recommended installation flow:
 
@@ -613,6 +619,7 @@ Runtime selection:
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
 - `mooncake-store-client --transport-backend tent|classic-te`
 - `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
+- `MC_STORE_RS_GID_INDEX=<n>` when `classic_te` over RDMA must pick a non-default RoCE GID index; Store-RS forwards it to upstream `MC_GID_INDEX`
 
 When store metadata uses etcd in the Python compatibility layer, transport metadata still requires Redis through `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL`.
 
