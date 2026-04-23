@@ -35,6 +35,19 @@ enum StoreBackend {
     Dummy(DummySession),
 }
 
+fn finalize_real_dispatcher_setup(
+    dispatcher: &StoreDispatcher,
+    initial_state: ClientLifecycleState,
+    lease_ttl_ms: u64,
+) -> Result<(), StoreError> {
+    dispatcher.register_local_memory()?;
+    if initial_state == ClientLifecycleState::Active {
+        dispatcher.activate()?;
+    }
+    dispatcher.start_heartbeat_loop(lease_ttl_ms, None)?;
+    Ok(())
+}
+
 fn resolve_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
     if let Some(scope) = worker_scope
         .map(str::trim)
@@ -180,6 +193,7 @@ impl PyMooncakeDistributedStore {
         .map_err(store_error_to_py)?;
         let _ = master_server;
         let stable_id = runtime.stable_id.clone();
+        let lease_ttl_ms = runtime.lease_ttl_ms;
         let dispatcher = StoreDispatcher::spawn_with_timeout_config_and_scope(
             runtime.client,
             format!("mooncake-py-dispatcher-{stable_id}-{worker_scope}"),
@@ -187,12 +201,8 @@ impl PyMooncakeDistributedStore {
             compat_scope,
         )
         .map_err(store_error_to_py)?;
-        dispatcher
-            .register_local_memory()
+        finalize_real_dispatcher_setup(&dispatcher, initial_state, lease_ttl_ms)
             .map_err(store_error_to_py)?;
-        if initial_state == ClientLifecycleState::Active {
-            dispatcher.activate().map_err(store_error_to_py)?;
-        }
         self.replace_backend(StoreBackend::Real(dispatcher));
         Ok(0)
     }
@@ -1579,6 +1589,7 @@ fn parse_initial_state_arg(value: &str) -> PyResult<ClientLifecycleState> {
 
 #[cfg(test)]
 mod tests {
+    use crate::finalize_real_dispatcher_setup;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::net::TcpListener;
@@ -1587,7 +1598,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread::sleep;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
@@ -1912,6 +1923,34 @@ mod tests {
 
     fn build_client_with_metadata(name: &str, metadata: Arc<dyn MetadataBackend>) -> StoreClient {
         build_client_with_metadata_and_state(name, metadata, ClientLifecycleState::Active)
+    }
+
+    fn build_client_with_metadata_and_expiry(
+        name: &str,
+        metadata: Arc<dyn MetadataBackend>,
+        state: ClientLifecycleState,
+        expires_at_ms: u64,
+    ) -> StoreClient {
+        let transport = Arc::new(TestTransport::new(&format!("{name}-segment")));
+        let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+        StoreClientBuilder::new(metadata, name)
+            .state(state)
+            .label("storage", "true")
+            .live_client_sync_interval(Duration::from_millis(25))
+            .compatibility(CompatibilityDescriptor::default())
+            .route_control(RouteControlMode::MetadataOnly)
+            .transport(transport)
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .numa_aware(false)
+                    .storage_bytes(4 * 1024)
+                    .scratch_bytes(4 * 1024)
+                    .alignment(1)
+                    .reclaim_grace_ms(0),
+            )
+            .routed_writes(planner, 1)
+            .build(expires_at_ms)
+            .expect("test store client should build")
     }
 
     fn build_client_with_metadata_and_state(
@@ -2630,7 +2669,7 @@ mod tests {
         runtime: &ClientRuntimeId,
         previous_expires_at_ms: u64,
     ) -> bool {
-        for _ in 0..80 {
+        for _ in 0..160 {
             if lease_expires_at_ms(metadata, runtime) > previous_expires_at_ms {
                 return true;
             }
@@ -4705,6 +4744,40 @@ mod tests {
             .find(|lease| lease.runtime == runtime)
             .map(|lease| lease.state);
         assert_eq!(state, Some(ClientLifecycleState::Offline));
+    }
+
+    #[test]
+    fn finalize_real_dispatcher_setup_starts_auto_heartbeat_loop() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let lease_ttl_ms = 1_500;
+        let expires_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_millis() as u64
+            + lease_ttl_ms;
+        let dispatcher = StoreDispatcher::spawn(
+            build_client_with_metadata_and_expiry(
+                "dispatcher-setup-auto-heartbeat",
+                metadata.clone(),
+                ClientLifecycleState::Active,
+                expires_at_ms,
+            ),
+            "dispatcher-setup-auto-heartbeat".to_string(),
+        )
+        .expect("dispatcher should spawn");
+        finalize_real_dispatcher_setup(&dispatcher, ClientLifecycleState::Active, lease_ttl_ms)
+            .expect("setup finalization should succeed");
+
+        let runtime = ClientRuntimeId::new("dispatcher-setup-auto-heartbeat", ClientEpoch(1));
+        let expires_after_setup = lease_expires_at_ms(&metadata, &runtime);
+        let refreshed = wait_until_lease_after(&metadata, &runtime, expires_after_setup);
+        dispatcher.stop_heartbeat_loop();
+
+        assert!(
+            refreshed,
+            "setup finalization should start the background heartbeat loop"
+        );
+        dispatcher.shutdown();
     }
 
     #[test]

@@ -189,6 +189,23 @@ wait_for_pattern_count() {
   exit 1
 }
 
+wait_for_log_line() {
+  local path=$1
+  local needle=$2
+  local timeout_seconds=$3
+  local deadline=$((SECONDS + timeout_seconds))
+
+  while (( SECONDS < deadline )); do
+    if [[ -f "${path}" ]] && grep -Fq "${needle}" "${path}"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "log ${path} did not contain: ${needle}" >&2
+  exit 1
+}
+
 print_log_tail() {
   local label=$1
   local path=$2
@@ -394,8 +411,10 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
       --drain-on-exit \
       >"${DAEMON_LOG}" 2>&1 &
   DAEMON_PID=$!
-  wait_for_pattern_count "{${KEYSPACE}}/dummy/clients/${DUMMY_DAEMON_STABLE_ID}:*" 1 15
-  wait_for_pattern_count "{${KEYSPACE}}/dummy/segments/${DUMMY_DAEMON_STABLE_ID}:*" 1 15
+  wait_for_log_line \
+    "${DAEMON_LOG}" \
+    "mooncake-store-client started stable_id=${DUMMY_DAEMON_STABLE_ID}" \
+    15
 
   "${PYTHON_BIN}" - <<'PY'
 import os
@@ -449,7 +468,14 @@ def connect_dummy(name: str):
     while time.time() < deadline:
         store = MooncakeDistributedStore()
         try:
-            status = int(store.setup_dummy(128 * 1024 * 1024, SCRATCH_BYTES, DUMMY_ADDR))
+            status = int(
+                store.setup_dummy(
+                    128 * 1024 * 1024,
+                    SCRATCH_BYTES,
+                    DUMMY_ADDR,
+                    keyspace=KEYSPACE,
+                )
+            )
             if status != 0:
                 raise RuntimeError(f"setup_dummy status={status}")
             wait_for_dummy_ready(store, timeout_seconds=5.0)

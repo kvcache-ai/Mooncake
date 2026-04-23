@@ -2,6 +2,13 @@ const MAX_TENANT_LOCAL_EVICTION_ATTEMPTS: usize = 8;
 const PARALLEL_CHECKSUM_MIN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARALLEL_CHECKSUM_WORKERS: usize = 16;
 
+struct PutObjectCurrentOptions<'a> {
+    registered_source: Option<*mut c_void>,
+    policy: Option<&'a ReplicationPolicy>,
+    current: Option<&'a ObjectRoute>,
+    reclaim_mode: ReclaimMode,
+}
+
 impl StoreClient {
     fn expect_exactly_one_control_plane_result<T>(
         items: Vec<T>,
@@ -309,16 +316,19 @@ impl StoreClient {
         object_id: &LogicalObjectId,
         qos_tier: Option<&str>,
         value: &[u8],
-        registered_source: Option<*mut c_void>,
-        policy: Option<&ReplicationPolicy>,
-        current: Option<&ObjectRoute>,
-        reclaim_mode: ReclaimMode,
+        options: PutObjectCurrentOptions<'_>,
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
         self.flush_due_reclaims()?;
         let tenant = object_id.scope.tenant.as_str();
         let key = object_id.logical_key.as_str();
         let scoped_key = ObjectKey::from_logical_id(object_id);
+        let PutObjectCurrentOptions {
+            registered_source,
+            policy,
+            current,
+            reclaim_mode,
+        } = options;
         let mut object_ref = ObjectRef::new(key).tenant(tenant);
         if object_id.scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
             object_ref = object_ref.domain(object_id.scope.domain.as_str());
@@ -502,10 +512,12 @@ impl StoreClient {
             &object_id,
             object.qos_tier,
             value,
-            None,
-            policy,
-            current.as_ref(),
-            ReclaimMode::Scheduled,
+            PutObjectCurrentOptions {
+                registered_source: None,
+                policy,
+                current: current.as_ref(),
+                reclaim_mode: ReclaimMode::Scheduled,
+            },
         )
     }
 
@@ -532,10 +544,12 @@ impl StoreClient {
             &object_id,
             object.qos_tier,
             value,
-            Some(buffer),
-            policy,
-            current.as_ref(),
-            ReclaimMode::Scheduled,
+            PutObjectCurrentOptions {
+                registered_source: Some(buffer),
+                policy,
+                current: current.as_ref(),
+                reclaim_mode: ReclaimMode::Scheduled,
+            },
         )
     }
 
@@ -732,10 +746,12 @@ impl StoreClient {
                 &object_id,
                 confirmed.qos_tier.as_deref(),
                 &payload,
-                None,
-                Some(&policy),
-                Some(&confirmed),
-                ReclaimMode::Deferred,
+                PutObjectCurrentOptions {
+                    registered_source: None,
+                    policy: Some(&policy),
+                    current: Some(&confirmed),
+                    reclaim_mode: ReclaimMode::Deferred,
+                },
             ) {
                 Ok(next) => {
                     writer.sync_route_to_live_authorities_excluding(
@@ -827,10 +843,12 @@ impl StoreClient {
                 &object_id,
                 qos_tier,
                 &payload,
-                None,
-                Some(&policy),
-                Some(&confirmed),
-                ReclaimMode::Deferred,
+                PutObjectCurrentOptions {
+                    registered_source: None,
+                    policy: Some(&policy),
+                    current: Some(&confirmed),
+                    reclaim_mode: ReclaimMode::Deferred,
+                },
             ) {
                 Ok(next) => {
                     writer.sync_route_to_live_authorities_excluding(
