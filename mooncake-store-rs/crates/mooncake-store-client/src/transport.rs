@@ -295,6 +295,8 @@ const HTTP_TRANSPORT_PATH_OPEN_SEGMENT: &str = "/v1/transport/open-segment";
 const HTTP_TRANSPORT_PATH_SUBMIT_BATCH: &str = "/v1/transport/submit-batch";
 const HTTP_TRANSPORT_PATH_BATCH_STATUS: &str = "/v1/transport/batch-status";
 const HTTP_TRANSPORT_LABEL: &str = "transport_http_address";
+const HTTP_TRANSPORT_OPEN_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+const HTTP_TRANSPORT_OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
 const HTTP_TRANSPORT_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
@@ -542,6 +544,21 @@ impl HttpStoreTransport {
                 ))
             })
     }
+
+    fn open_segment_once(&self, segment_name: &str) -> Result<String> {
+        let remote_runtime_rpc = self.resolve_remote_runtime_rpc(segment_name)?;
+        let request = HttpOpenSegmentRequest {
+            segment_name: segment_name.to_string(),
+        };
+        let _: HttpJsonResponse<HttpOpenSegmentResponse> = http_json_request(
+            &remote_runtime_rpc,
+            "POST",
+            HTTP_TRANSPORT_PATH_OPEN_SEGMENT,
+            Some(&request),
+            &[],
+        )?;
+        Ok(remote_runtime_rpc)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -679,17 +696,25 @@ impl StoreTransport for HttpStoreTransport {
     }
 
     fn open_segment(&self, segment_name: &str) -> Result<u64> {
-        let remote_runtime_rpc = self.resolve_remote_runtime_rpc(segment_name)?;
-        let request = HttpOpenSegmentRequest {
-            segment_name: segment_name.to_string(),
+        let deadline = Instant::now() + HTTP_TRANSPORT_OPEN_RETRY_TIMEOUT;
+        let remote_runtime_rpc = loop {
+            match self.open_segment_once(segment_name) {
+                Ok(remote_runtime_rpc) => break remote_runtime_rpc,
+                Err(error) if http_transport_open_retryable(&error) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(error);
+                    }
+                    let delay =
+                        HTTP_TRANSPORT_OPEN_RETRY_DELAY.min(deadline.saturating_duration_since(now));
+                    if delay.is_zero() {
+                        return Err(error);
+                    }
+                    thread::sleep(delay);
+                }
+                Err(error) => return Err(error),
+            }
         };
-        let _: HttpJsonResponse<HttpOpenSegmentResponse> = http_json_request(
-            &remote_runtime_rpc,
-            "POST",
-            HTTP_TRANSPORT_PATH_OPEN_SEGMENT,
-            Some(&request),
-            &[],
-        )?;
         let handle = self.next_segment_handle();
         self.segment_handles.lock().insert(
             handle,
@@ -1226,6 +1251,16 @@ fn http_json_request<T: Serialize, R: for<'de> Deserialize<'de>>(
 
 pub fn http_transport_label() -> &'static str {
     HTTP_TRANSPORT_LABEL
+}
+
+fn http_transport_open_retryable(error: &StoreError) -> bool {
+    match error {
+        StoreError::NotFound(_) => true,
+        StoreError::Transport(message) => {
+            message.contains("404 Not Found") || message.contains("failed to connect")
+        }
+        _ => false,
+    }
 }
 
 pub struct HttpTransportServerHandle {
@@ -1898,6 +1933,7 @@ pub(crate) fn wait_for_batch_completion_detailed(
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -2263,6 +2299,8 @@ mod tests {
     struct TestMetadataBackend {
         leases: Vec<ClientLease>,
         segments: Vec<mooncake_store_core::SegmentAnnouncement>,
+        live_client_visibility_after: usize,
+        list_live_clients_calls: Arc<AtomicUsize>,
     }
 
     impl mooncake_store_core::MetadataBackend for TestMetadataBackend {
@@ -2290,6 +2328,10 @@ mod tests {
         }
 
         fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
+            let call = self.list_live_clients_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.live_client_visibility_after {
+                return Ok(Vec::new());
+            }
             Ok(self.leases.clone())
         }
 
@@ -2522,6 +2564,8 @@ mod tests {
                 alignment_bytes: 1,
                 tags: Vec::new(),
             }],
+            live_client_visibility_after: 0,
+            list_live_clients_calls: Arc::new(AtomicUsize::new(0)),
         });
 
         let transport = HttpStoreTransport::new(metadata, "local-segment", "127.0.0.1:17000")
@@ -2578,5 +2622,60 @@ mod tests {
             )
             .expect("http read should succeed");
         assert_eq!(read_buffer, write_payload);
+    }
+
+    #[test]
+    fn http_transport_open_segment_retries_runtime_visibility_gap() {
+        let mut remote_segment = vec![0u8; 64];
+        let server = HttpTransportServerHandle::start("127.0.0.1:0")
+            .expect("http transport server should start");
+        server.publish_segment(
+            "remote-segment",
+            remote_segment.as_mut_ptr().cast::<c_void>(),
+            remote_segment.len(),
+        );
+
+        let runtime = mooncake_store_core::ClientRuntimeId::new(
+            "remote-runtime",
+            mooncake_store_core::ClientEpoch(1),
+        );
+        let mut endpoints = mooncake_store_core::ClientEndpointSet::default();
+        endpoints.labels.insert(
+            super::http_transport_label().to_string(),
+            server.address().to_string(),
+        );
+        let list_live_clients_calls = Arc::new(AtomicUsize::new(0));
+        let metadata = Arc::new(TestMetadataBackend {
+            leases: vec![ClientLease {
+                runtime: runtime.clone(),
+                state: mooncake_store_core::ClientLifecycleState::Active,
+                compatibility: mooncake_store_core::CompatibilityDescriptor::default(),
+                endpoints,
+                expires_at_ms: u64::MAX,
+            }],
+            segments: vec![mooncake_store_core::SegmentAnnouncement {
+                owner: runtime,
+                segment_name: mooncake_store_core::SegmentName::new("remote-segment"),
+                capacity_bytes: remote_segment.len() as u64,
+                used_bytes: 0,
+                state: mooncake_store_core::SegmentLifecycleState::Active,
+                alignment_bytes: 1,
+                tags: Vec::new(),
+            }],
+            live_client_visibility_after: 2,
+            list_live_clients_calls: Arc::clone(&list_live_clients_calls),
+        });
+
+        let transport = HttpStoreTransport::new(metadata, "local-segment", "127.0.0.1:17000")
+            .expect("http transport should build");
+        let handle = transport
+            .open_segment("remote-segment")
+            .expect("open_segment should retry until the runtime lease appears");
+
+        assert!(handle > 0);
+        assert!(
+            list_live_clients_calls.load(Ordering::SeqCst) >= 3,
+            "open_segment should retry transient runtime visibility gaps"
+        );
     }
 }
