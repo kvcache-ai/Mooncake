@@ -33,6 +33,14 @@
 
 namespace mooncake {
 
+namespace {
+bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
+                       uint64_t region_length) {
+    return overlap(reinterpret_cast<void*>(addr), length, region_addr,
+                   region_length);
+}
+}  // namespace
+
 static bool setFilesLimit() {
     struct rlimit filesLimit;
     if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
@@ -367,7 +375,7 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
     // shared lock here. If future modifications allow installTransport() to be
     // invoked concurrently, a std::shared_lock<std::shared_mutex> should be
     // added to ensure thread safety.
-    for (auto& entry : local_memory_regions_) {
+    for (auto& [_, entry] : local_memory_regions_) {
         int ret = transport->registerLocalMemory(
             entry.addr, entry.length, entry.location, entry.remote_accessible);
         if (ret < 0) return nullptr;
@@ -471,13 +479,7 @@ int TransferEngineImpl::removeLocalSegment(const std::string& segment_name) {
 
 bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    for (auto& local_memory_region : local_memory_regions_) {
-        if (overlap(addr, length, local_memory_region.addr,
-                    local_memory_region.length)) {
-            return true;
-        }
-    }
-    return false;
+    return hasOverlapLocked(reinterpret_cast<uintptr_t>(addr), length);
 }
 
 int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
@@ -501,8 +503,7 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    local_memory_regions_.push_back(
-        {addr, length, location, remote_accessible});
+    insertMemoryRegionLocked({addr, length, location, remote_accessible});
     return 0;
 }
 
@@ -514,13 +515,7 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto it = local_memory_regions_.begin();
-         it != local_memory_regions_.end(); ++it) {
-        if (it->addr == addr) {
-            local_memory_regions_.erase(it);
-            break;
-        }
-    }
+    eraseMemoryRegionLocked(addr);
     return 0;
 }
 
@@ -594,9 +589,9 @@ int TransferEngineImpl::mp_registerLocalMemory(
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         for (const auto& record : success_records) {
-            local_memory_regions_.push_back({record.addr, record.length,
-                                             record.location,
-                                             record.remote_accessible});
+            insertMemoryRegionLocked({record.addr, record.length,
+                                      record.location,
+                                      record.remote_accessible});
         }
     }
 
@@ -637,13 +632,7 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
         std::unique_lock<std::shared_mutex> lock(mutex_);
         for (const auto& buffer : buffer_list) {
-            for (auto it = local_memory_regions_.begin();
-                 it != local_memory_regions_.end(); ++it) {
-                if (it->addr == buffer.addr) {
-                    local_memory_regions_.erase(it);
-                    break;
-                }
-            }
+            eraseMemoryRegionLocked(buffer.addr);
         }
     }
     return 0;
@@ -666,8 +655,7 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& buffer : buffer_list) {
-        local_memory_regions_.push_back(
-            {buffer.addr, buffer.length, location, true});
+        insertMemoryRegionLocked({buffer.addr, buffer.length, location, true});
     }
     return 0;
 }
@@ -681,15 +669,72 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& addr : addr_list) {
-        for (auto it = local_memory_regions_.begin();
-             it != local_memory_regions_.end(); ++it) {
-            if (it->addr == addr) {
-                local_memory_regions_.erase(it);
-                break;
-            }
-        }
+        eraseMemoryRegionLocked(addr);
     }
     return 0;
+}
+
+TransferEngineImpl::MemoryRegionMap::iterator
+TransferEngineImpl::findMemoryRegionContaining(uintptr_t addr) {
+    auto upper = local_memory_regions_.upper_bound(addr);
+    if (upper == local_memory_regions_.begin()) {
+        return local_memory_regions_.end();
+    }
+    auto candidate = std::prev(upper);
+    return overlapWithRegion(addr, 1, candidate->second.addr,
+                             candidate->second.length)
+               ? candidate
+               : local_memory_regions_.end();
+}
+
+TransferEngineImpl::MemoryRegionMap::const_iterator
+TransferEngineImpl::findMemoryRegionContaining(uintptr_t addr) const {
+    auto upper = local_memory_regions_.upper_bound(addr);
+    if (upper == local_memory_regions_.begin()) {
+        return local_memory_regions_.end();
+    }
+    auto candidate = std::prev(upper);
+    return overlapWithRegion(addr, 1, candidate->second.addr,
+                             candidate->second.length)
+               ? candidate
+               : local_memory_regions_.end();
+}
+
+bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
+                                          uint64_t length) const {
+    if (length == 0) {
+        return false;
+    }
+
+    auto containing = findMemoryRegionContaining(addr);
+    if (containing != local_memory_regions_.end()) {
+        return true;
+    }
+
+    auto next = local_memory_regions_.lower_bound(addr);
+    if (next != local_memory_regions_.end() &&
+        overlapWithRegion(addr, length, next->second.addr,
+                          next->second.length)) {
+        return true;
+    }
+
+    if (next != local_memory_regions_.begin()) {
+        auto prev = std::prev(next);
+        if (overlapWithRegion(addr, length, prev->second.addr,
+                              prev->second.length)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {
+    local_memory_regions_[reinterpret_cast<uintptr_t>(region.addr)] = region;
+}
+
+void TransferEngineImpl::eraseMemoryRegionLocked(void* addr) {
+    local_memory_regions_.erase(reinterpret_cast<uintptr_t>(addr));
 }
 
 #ifdef WITH_METRICS

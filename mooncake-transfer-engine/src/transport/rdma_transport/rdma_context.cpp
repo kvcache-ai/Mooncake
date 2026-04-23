@@ -39,6 +39,14 @@ static int isNullGid(union ibv_gid *gid) {
     return 1;
 }
 
+namespace {
+bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
+    const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
+    const auto region_length = static_cast<uintptr_t>(region.mr->length);
+    return region_start <= addr && addr - region_start < region_length;
+}
+}  // namespace
+
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
     : device_name_(device_name),
       engine_(engine),
@@ -162,13 +170,13 @@ int RdmaContext::deconstruct() {
 
     endpoint_store_->destroyQPs();
 
-    for (auto &entry : memory_region_list_) {
+    for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister memory region";
         }
     }
-    memory_region_list_.clear();
+    memory_region_map_.clear();
 
     for (size_t i = 0; i < cq_list_.size(); ++i) {
         if (!cq_list_[i].native) continue;
@@ -275,29 +283,21 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
         return ret;
     }
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    memory_region_list_.push_back(mrMeta);
+    memory_region_map_[reinterpret_cast<uintptr_t>(mrMeta.addr)] = mrMeta;
     return 0;
 }
 
 int RdmaContext::unregisterMemoryRegion(void *addr) {
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    bool has_removed;
-    do {
-        has_removed = false;
-        for (auto iter = memory_region_list_.begin();
-             iter != memory_region_list_.end(); ++iter) {
-            if (iter->addr <= addr &&
-                addr < (char *)(iter->addr) + iter->mr->length) {
-                if (ibv_dereg_mr(iter->mr)) {
-                    LOG(ERROR) << "Failed to unregister memory " << addr;
-                    return ERR_CONTEXT;
-                }
-                memory_region_list_.erase(iter);
-                has_removed = true;
-                break;
-            }
-        }
-    } while (has_removed);
+    auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
+    if (iter == memory_region_map_.end()) {
+        return 0;
+    }
+    if (ibv_dereg_mr(iter->second.mr)) {
+        LOG(ERROR) << "Failed to unregister memory " << addr;
+        return ERR_CONTEXT;
+    }
+    memory_region_map_.erase(iter);
     return 0;
 }
 
@@ -313,11 +313,8 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
 
 uint32_t RdmaContext::rkey(void *addr) {
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
-    for (auto iter = memory_region_list_.begin();
-         iter != memory_region_list_.end(); ++iter)
-        if (iter->addr <= addr &&
-            addr < (char *)(iter->addr) + iter->mr->length)
-            return iter->mr->rkey;
+    auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
+    if (iter != memory_region_map_.end()) return iter->second.mr->rkey;
 
     LOG(ERROR) << "Address " << addr << " rkey not found for " << deviceName();
     return 0;
@@ -325,14 +322,33 @@ uint32_t RdmaContext::rkey(void *addr) {
 
 uint32_t RdmaContext::lkey(void *addr) {
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
-    for (auto iter = memory_region_list_.begin();
-         iter != memory_region_list_.end(); ++iter)
-        if (iter->addr <= addr &&
-            addr < (char *)(iter->addr) + iter->mr->length)
-            return iter->mr->lkey;
+    auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
+    if (iter != memory_region_map_.end()) return iter->second.mr->lkey;
 
     LOG(ERROR) << "Address " << addr << " lkey not found for " << deviceName();
     return 0;
+}
+
+RdmaContext::MemoryRegionMap::iterator RdmaContext::findMemoryRegionContaining(
+    uintptr_t addr) {
+    auto upper = memory_region_map_.upper_bound(addr);
+    if (upper == memory_region_map_.begin()) {
+        return memory_region_map_.end();
+    }
+    auto candidate = std::prev(upper);
+    return containsAddress(candidate->second, addr) ? candidate
+                                                    : memory_region_map_.end();
+}
+
+RdmaContext::MemoryRegionMap::const_iterator
+RdmaContext::findMemoryRegionContaining(uintptr_t addr) const {
+    auto upper = memory_region_map_.upper_bound(addr);
+    if (upper == memory_region_map_.begin()) {
+        return memory_region_map_.end();
+    }
+    auto candidate = std::prev(upper);
+    return containsAddress(candidate->second, addr) ? candidate
+                                                    : memory_region_map_.end();
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(

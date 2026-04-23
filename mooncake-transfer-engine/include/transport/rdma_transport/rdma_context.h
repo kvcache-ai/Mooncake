@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -89,6 +90,13 @@ class RdmaContext {
    private:
     int registerMemoryRegionInternal(void *addr, size_t length, int access,
                                      MemoryRegionMeta &mrMeta);
+
+    using MemoryRegionMap = std::map<uintptr_t, MemoryRegionMeta>;
+
+    MemoryRegionMap::iterator findMemoryRegionContaining(uintptr_t addr);
+
+    MemoryRegionMap::const_iterator findMemoryRegionContaining(
+        uintptr_t addr) const;
 
    public:
     bool active() const { return active_; }
@@ -184,7 +192,7 @@ class RdmaContext {
     ibv_gid gid_;
 
     RWSpinlock memory_regions_lock_;
-    std::vector<struct MemoryRegionMeta> memory_region_list_;
+    MemoryRegionMap memory_region_map_;
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
