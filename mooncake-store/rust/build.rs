@@ -111,6 +111,7 @@ fn main() {
 
     for (link_name, candidates) in [
         ("etcd_wrapper", &["etcd_wrapper"] as &[&str]),
+        ("hiredis", &["hiredis"]),
         ("curl", &["curl"]),
         ("uring", &["uring"]),
         ("asan", &["asan"]),
