@@ -80,8 +80,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
         }
 
         buffer->change_to_cxl(cxl_segment_name);
-        replicas.emplace_back(std::move(buffer), StorageLevel::CXL,
-                              ReplicaStatus::PROCESSING);
+        replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING);
 
         VLOG(1) << "Successfully allocated one CXL replica.";
         return replicas;

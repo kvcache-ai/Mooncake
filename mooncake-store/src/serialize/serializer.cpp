@@ -645,6 +645,11 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
                                                     std::move(offsetHandle));
     // buffer->status = status;
 
+    if (allocator->getStorageLevel() == StorageLevel::CXL) {
+        buffer->protocol = "cxl";
+        buffer->segment_name_ = mountedSegment.segment.name;
+    }
+
     return buffer;
 }
 
@@ -771,8 +776,16 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             if (!buffer_result) {
                 return tl::unexpected(buffer_result.error());
             }
+            // storage_level is read from the format for forward compatibility.
+            // The Replica constructor derives it from the buffer's allocator,
+            // which is already set to the correct level during deserialization.
+            DCHECK_EQ(
+                static_cast<int8_t>(storage_level),
+                static_cast<int8_t>(buffer_result.value()->getStorageLevel()))
+                << "storage_level mismatch between serialized data and "
+                   "allocator";
             replica = std::make_shared<Replica>(
-                std::move(buffer_result.value()), storage_level, status);
+                std::move(buffer_result.value()), status);
             break;
         }
         case static_cast<int8_t>(ReplicaType::DISK): {
@@ -837,9 +850,10 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     const MountedSegment &mounted_segment, MsgpackPacker &packer) {
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
-    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data...]
+    // te_endpoint, protocol, status, has_buffer_allocator,
+    // buffer_allocator_data...]
 
-    packer.pack_array(8);
+    packer.pack_array(9);
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -847,6 +861,7 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     packer.pack(static_cast<uint64_t>(mounted_segment.segment.base));
     packer.pack(static_cast<uint64_t>(mounted_segment.segment.size));
     packer.pack(mounted_segment.segment.te_endpoint);
+    packer.pack(mounted_segment.segment.protocol);
 
     // Serialize SegmentStatus
     packer.pack(static_cast<int16_t>(mounted_segment.status));
@@ -880,7 +895,7 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
                                "state: not a msgpack array"));
     }
 
-    if (obj.via.array.size < 8) {
+    if (obj.via.array.size < 9) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize MountedSegment invalid array size"));
@@ -907,16 +922,17 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
         mounted_segment.segment.size =
             static_cast<size_t>(array[3].as<uint64_t>());
         mounted_segment.segment.te_endpoint = array[4].as<std::string>();
+        mounted_segment.segment.protocol = array[5].as<std::string>();
 
         // Deserialize SegmentStatus
         mounted_segment.status =
-            static_cast<SegmentStatus>(array[5].as<int16_t>());
+            static_cast<SegmentStatus>(array[6].as<int16_t>());
 
         // Deserialize BufferAllocator
-        bool has_buffer_allocator = array[6].as<bool>();
+        bool has_buffer_allocator = array[7].as<bool>();
         if (has_buffer_allocator) {
             auto allocatorResult =
-                Serializer<OffsetBufferAllocator>::deserialize(array[7]);
+                Serializer<OffsetBufferAllocator>::deserialize(array[8]);
             if (allocatorResult) {
                 mounted_segment.buf_allocator =
                     std::move(allocatorResult.value());
@@ -938,9 +954,9 @@ Serializer<OffsetBufferAllocator>::serialize(
     const OffsetBufferAllocator &allocator, MsgpackPacker &packer) {
     // Use array structure to pack OffsetBufferAllocator
     // Format: [segment_name, base, total_size, current_size,
-    // transport_endpoint, offset_allocator]
+    // transport_endpoint, storage_level, offset_allocator]
 
-    packer.pack_array(6);
+    packer.pack_array(7);
 
     // Serialize basic properties
     packer.pack(allocator.segment_name_);
@@ -948,6 +964,7 @@ Serializer<OffsetBufferAllocator>::serialize(
     packer.pack(static_cast<uint64_t>(allocator.total_size_));
     packer.pack(static_cast<uint64_t>(allocator.cur_size_.load()));
     packer.pack(allocator.transport_endpoint_);
+    packer.pack(static_cast<int8_t>(allocator.storage_level_));
 
     // Serialize offset_allocator
     auto result =
@@ -970,7 +987,7 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
                                "serialized state: not a msgpack array"));
     }
 
-    if (obj.via.array.size != 6) {
+    if (obj.via.array.size != 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize OffsetBufferAllocator invalid array size"));
@@ -985,17 +1002,18 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
         auto total_size = static_cast<size_t>(array[2].as<uint64_t>());
         auto cur_size = static_cast<size_t>(array[3].as<uint64_t>());
         std::string transport_endpoint = array[4].as<std::string>();
+        auto storage_level = static_cast<StorageLevel>(array[5].as<int8_t>());
 
         // Deserialize offset_allocator
         auto offset_allocator_result = Serializer<
-            mooncake::offset_allocator::OffsetAllocator>::deserialize(array[5]);
+            mooncake::offset_allocator::OffsetAllocator>::deserialize(array[6]);
         if (!offset_allocator_result) {
             return tl::unexpected(offset_allocator_result.error());
         }
 
         // Create OffsetBufferAllocator instance
         auto allocator = std::make_shared<OffsetBufferAllocator>(
-            segment_name, base, total_size, transport_endpoint);
+            segment_name, base, total_size, transport_endpoint, storage_level);
 
         // Set internal member variable values
         allocator->offset_allocator_ = offset_allocator_result.value();

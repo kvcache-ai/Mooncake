@@ -153,11 +153,13 @@ class Replica {
     struct Descriptor;
 
     // memory replica constructor
-    Replica(std::unique_ptr<AllocatedBuffer> buffer, StorageLevel storage_level,
-            ReplicaStatus status)
+    Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status)
         : id_(next_id_.fetch_add(1)),
           data_(MemoryReplicaData{std::move(buffer)}),
-          storage_level_(storage_level),
+          storage_level_(
+              std::get<MemoryReplicaData>(data_).buffer
+                  ? std::get<MemoryReplicaData>(data_).buffer->getStorageLevel()
+                  : StorageLevel::RAM),
           status_(status),
           refcnt_(0) {}
 
