@@ -14,6 +14,7 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn push_existing_dir(search_dirs: &mut Vec<PathBuf>, dir: PathBuf) {
     if dir.is_dir() && !search_dirs.iter().any(|existing| existing == &dir) {
@@ -44,6 +45,63 @@ fn emit_link_searches(search_dirs: &[PathBuf]) {
     for dir in search_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
+}
+
+fn compiler_candidates() -> Vec<String> {
+    let mut tools = Vec::new();
+
+    for env_var in ["CC", "CXX"] {
+        if let Ok(value) = env::var(env_var) {
+            let tool = value.trim();
+            if !tool.is_empty() && !tools.iter().any(|existing| existing == tool) {
+                tools.push(tool.to_string());
+            }
+        }
+    }
+
+    for tool in ["gcc", "cc", "clang", "c++"] {
+        if !tools.iter().any(|existing| existing == tool) {
+            tools.push(tool.to_string());
+        }
+    }
+
+    tools
+}
+
+fn compiler_runtime_library(file_name: &str) -> Option<PathBuf> {
+    for tool in compiler_candidates() {
+        let output = Command::new(&tool)
+            .arg(format!("-print-file-name={file_name}"))
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let path = String::from_utf8(output.stdout).ok()?;
+        let path = PathBuf::from(path.trim());
+        if path.as_os_str().is_empty() || path == PathBuf::from(file_name) || !path.exists() {
+            continue;
+        }
+
+        return Some(path);
+    }
+
+    None
+}
+
+fn add_compiler_runtime_search_dir(search_dirs: &mut Vec<PathBuf>, file_name: &str) -> bool {
+    let Some(path) = compiler_runtime_library(file_name) else {
+        return false;
+    };
+
+    if let Some(parent) = path.parent() {
+        push_existing_dir(search_dirs, parent.to_path_buf());
+        return true;
+    }
+
+    false
 }
 
 fn main() {
@@ -87,6 +145,11 @@ fn main() {
     push_env_paths(&mut search_dirs, "LD_LIBRARY_PATH");
     push_env_paths(&mut search_dirs, "LIBRARY_PATH");
 
+    let has_asan_runtime = add_compiler_runtime_search_dir(&mut search_dirs, "libasan.so")
+        || add_compiler_runtime_search_dir(&mut search_dirs, "libasan.a");
+    let has_gcov_runtime = add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.a")
+        || add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.so");
+
     emit_link_searches(&search_dirs);
 
     for library in [
@@ -114,12 +177,18 @@ fn main() {
         ("hiredis", &["hiredis"]),
         ("curl", &["curl"]),
         ("uring", &["uring"]),
-        ("asan", &["asan"]),
-        ("gcov", &["gcov"]),
     ] {
         if has_library(&search_dirs, candidates) {
             println!("cargo:rustc-link-lib={link_name}");
         }
+    }
+
+    if has_asan_runtime || has_library(&search_dirs, &["asan"]) {
+        println!("cargo:rustc-link-lib=asan");
+    }
+
+    if has_gcov_runtime || has_library(&search_dirs, &["gcov"]) {
+        println!("cargo:rustc-link-lib=gcov");
     }
 
     let include_dir = env::var("MOONCAKE_STORE_INCLUDE_DIR")
@@ -133,6 +202,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_STORE_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
     println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=CXX");
 
     let bindings = bindgen::Builder::default()
         .header(&header)
