@@ -9,6 +9,7 @@ pub(crate) struct ControlPlaneHandle {
 }
 
 impl ControlPlaneHandle {
+    #[cfg(test)]
     pub(crate) fn spawn(
         bind_host: &str,
         authority: Arc<dyn AuthorityService>,

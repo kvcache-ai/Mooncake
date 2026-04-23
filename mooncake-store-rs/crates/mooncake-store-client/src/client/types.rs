@@ -206,6 +206,8 @@ pub enum ExplicitMigrationMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaReadSelector {
     Segment(SegmentName),
+    // 预留给显式 owner+segment 选择；当前生产路径主要由 segment-only 调用。
+    #[allow(dead_code)]
     OwnerAndSegment {
         owner: ClientRuntimeId,
         segment_name: SegmentName,
