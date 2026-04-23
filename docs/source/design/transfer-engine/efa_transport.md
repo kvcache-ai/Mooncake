@@ -347,7 +347,62 @@ The SRD shared-endpoint refactor (#1944) speeds up first-request latency two dif
 
 vLLM and SGLang do not currently call `warmupSegment` — they go through the generic `TransferEngine` interface and pick up the 4× cold-submit speedup automatically. The API is there for direct Mooncake callers that want the larger win.
 
-Reproducer: `mooncake-transfer-engine/example/efa_first_submit_probe.cpp`.
+#### Reproducing the numbers — `efa_first_submit_probe`
+
+`mooncake-transfer-engine/example/efa_first_submit_probe.cpp` is a two-host probe that isolates the two latency costs `transfer_engine_bench` hides inside its 10-second throughput average:
+
+1. **Cold first-submit** — the handshake + `fi_av_insert()` that fires on the first send to each `(local_NIC, peer_NIC)` pair.
+2. **Eager warmup** — how much of that is paid up front by an explicit `warmupSegment()` call.
+
+It is EFA-specific (there is no `warmupSegment` on the RDMA / TCP transports — they establish connections at `connect` time, so "pre-warming" has no meaning there) and intentionally not wired into `ctest`: it needs two hosts.
+
+**Run**:
+
+```bash
+# On the target host:
+./build/mooncake-transfer-engine/example/efa_first_submit_probe \
+    --mode=target \
+    --metadata_server=P2PHANDSHAKE \
+    --local_server_name=$(hostname):12345
+
+# Note the "[target] ready, addr=<ip>:<port>" line, then on the initiator:
+./build/mooncake-transfer-engine/example/efa_first_submit_probe \
+    --mode=initiator \
+    --metadata_server=P2PHANDSHAKE \
+    --local_server_name=$(hostname):12346 \
+    --segment_id=<target_ip>:<target_port> \
+    --warmup=1 \
+    --iters=5
+```
+
+**What it prints**:
+
+```
+warmup:   1094.74 ms (rc=0)           # present only with --warmup=1
+submit #0:   6.95 ms                   # first user-visible submit
+submit #1:   5.45 ms                   # steady state
+submit #2:   5.92 ms
+submit #3:   5.67 ms
+submit #4:   0.09 ms
+```
+
+- `warmup:` is the wall time of `EfaTransport::warmupSegment()` — it opens every `(local_NIC, peer_NIC)` pair (16 × 16 = 256 on p5en) up front.
+- `submit #0` through `#N-1` are the timings of single 1 MB `submitTransfer + poll`. With `--warmup=1` they are all in the steady-state regime. With `--warmup=0`, `#0` pays the handshake cost, `#1+` are steady state.
+
+**Flags**:
+
+| Flag | Default | What it controls |
+|---|---|---|
+| `--warmup` | `true` | Call `warmupSegment()` before the first submit |
+| `--iters` | `5` | How many timed submits after warmup |
+| `--xfer_size` | `1<<20` (1 MB) | Bytes per submit |
+| `--buffer_size` | `1<<30` (1 GB) | Registered buffer size |
+| `--local_server_name` | `hostname:12345` | Local metadata advertise name |
+
+**Use cases**:
+
+- **Deciding whether your application needs `warmupSegment()`**: if `submit #0` in the `--warmup=0` run is acceptable for your use case, you don't need to call `warmupSegment` at all.
+- **Comparing PR branches**: run the probe on the same hardware on this PR's branch vs `main` (or whatever upstream you're benchmarking against) to see per-NIC-pair handshake cost directly, without having the number drowned in a 10-second throughput average.
 
 ## Usage with vLLM
 
