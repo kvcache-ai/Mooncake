@@ -436,7 +436,6 @@ impl StoreClient {
     ) -> Result<Vec<crate::memory::LocalRegionPlan>> {
         let mut config = self.local_memory.clone();
         config.storage_bytes = storage_bytes;
-        config.numa_aware = false;
         config.storage_region_plans(None)
     }
 
@@ -456,62 +455,143 @@ impl StoreClient {
         if let Some(plan) = &primary_segment_plan {
             initial_config.location = plan.location.clone();
         }
-        let memory = LocalMemoryState::register(transport, &primary_segment, &initial_config)?;
-        let primary = memory
-            .storage_segments()
+        let mut memory = LocalMemoryState::register_startup_storage(
+            transport,
+            &primary_segment,
+            &initial_config,
+        )?;
+        let mut initial_transports = Vec::new();
+        if initial_config.storage_bytes > 0 {
+            if let Some(transport) = self.transport.clone() {
+                initial_transports.push((primary_segment.0.clone(), transport));
+            }
+        }
+
+        struct StartupSegmentRegistration {
+            segment_name: SegmentName,
+            transport: Arc<dyn crate::transport::StoreTransport>,
+            region: crate::memory::RegisteredRegion,
+            state: SegmentLifecycleState,
+            tags: Vec<String>,
+        }
+
+        struct StartupSegmentPlan {
+            segment_name: SegmentName,
+            transport: Arc<dyn crate::transport::StoreTransport>,
+            capacity_bytes: usize,
+            location: String,
+            alignment: usize,
+            hugepage_enabled: Option<bool>,
+            hugepage_size_bytes: Option<usize>,
+            state: SegmentLifecycleState,
+            tags: Vec<String>,
+        }
+
+        let extra_names = {
+            let mut state = self.state.lock();
+            state.next_local_segment_id = state.next_local_segment_id.max(1);
+            storage_segments
+                .iter()
+                .skip(1)
+                .map(|_| state.next_segment_name(&primary_segment))
+                .collect::<Vec<_>>()
+        };
+        let mut extra_segments = Vec::with_capacity(extra_names.len());
+        for (plan, segment_name) in storage_segments
             .into_iter()
-            .find(|segment| segment.segment_name == primary_segment);
+            .skip(1)
+            .zip(extra_names.into_iter())
+        {
+            let local_transport = self.transport_factory()?.create(&segment_name.0)?;
+            extra_segments.push(StartupSegmentPlan {
+                segment_name,
+                transport: local_transport,
+                capacity_bytes: plan.capacity_bytes,
+                location: plan.location,
+                alignment: self.local_memory.alignment,
+                hugepage_enabled: self.local_memory.hugepage_enabled,
+                hugepage_size_bytes: self.local_memory.hugepage_size_bytes,
+                state: SegmentLifecycleState::Active,
+                tags: self.local_memory.tags.clone(),
+            });
+        }
+
+        let registrations = match std::thread::scope(|scope| -> Result<Vec<StartupSegmentRegistration>> {
+            let mut handles = Vec::with_capacity(extra_segments.len());
+            for plan in extra_segments {
+                handles.push(scope.spawn(move || {
+                    let region = crate::memory::RegisteredRegion::register_startup_storage(
+                        plan.transport.as_ref(),
+                        plan.capacity_bytes,
+                        &plan.location,
+                        plan.alignment,
+                        mooncake_store_core::HugePageConfig::resolve(
+                            plan.hugepage_enabled,
+                            plan.hugepage_size_bytes,
+                        )?,
+                    )?;
+                    Ok::<StartupSegmentRegistration, StoreError>(StartupSegmentRegistration {
+                        segment_name: plan.segment_name,
+                        transport: plan.transport,
+                        region,
+                        state: plan.state,
+                        tags: plan.tags,
+                    })
+                }));
+            }
+
+            let mut completed = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(registration)) => completed.push(registration),
+                    Ok(Err(error)) => {
+                        for registration in completed {
+                            let _ = registration.region.release(registration.transport.as_ref());
+                        }
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        for registration in completed {
+                            let _ = registration.region.release(registration.transport.as_ref());
+                        }
+                        return Err(StoreError::Transport(
+                            "startup storage registration worker panicked".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(completed)
+        }) {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                if initial_config.storage_bytes > 0 {
+                    let _ = memory.remove_storage_segment(transport, &primary_segment);
+                }
+                let _ = memory.release_scratch(transport);
+                return Err(error);
+            }
+        };
+
+        for registration in registrations {
+            let segment_name = registration.segment_name.clone();
+            memory.insert_registered_storage_segment(
+                segment_name.clone(),
+                registration.region,
+                registration.state,
+                registration.tags,
+            )?;
+            initial_transports.push((segment_name.0, registration.transport));
+        }
+
+        let segment_infos = memory.storage_segments();
         {
             let mut state = self.state.lock();
-            state.next_local_segment_id = 1;
-            if let Some(transport) = self.transport.clone().filter(|_| primary.is_some()) {
-                state
-                    .local_transports
-                    .insert(primary_segment.0.clone(), transport);
+            for (segment_name, transport) in initial_transports {
+                state.local_transports.insert(segment_name, transport);
             }
             state.memory = Some(memory);
         }
-        if let Some(primary) = primary {
-            self.publish_local_segment(&primary, 0)?;
-        }
-        for plan in storage_segments.into_iter().skip(1) {
-            let segment_name = {
-                let mut state = self.state.lock();
-                state.next_segment_name(&primary_segment)
-            };
-            let local_transport = self.transport_factory()?.create(&segment_name.0)?;
-            let segment_info = {
-                let mut state = self.state.lock();
-                state.memory_mut()?.add_storage_segment(
-                    local_transport.as_ref(),
-                    StorageSegmentSpec {
-                        segment_name: segment_name.clone(),
-                        capacity_bytes: plan.capacity_bytes,
-                        state: SegmentLifecycleState::Active,
-                        tags: self.local_memory.tags.clone(),
-                        location: plan.location,
-                        alignment: self.local_memory.alignment,
-                        hugepage_enabled: self.local_memory.hugepage_enabled,
-                        hugepage_size_bytes: self.local_memory.hugepage_size_bytes,
-                    },
-                )?;
-                state
-                    .local_transports
-                    .insert(segment_name.0.clone(), local_transport);
-                state
-                    .memory_ref()?
-                    .storage_segments()
-                    .into_iter()
-                    .find(|entry| entry.segment_name == segment_name)
-                    .ok_or_else(|| {
-                        StoreError::InvalidState(format!(
-                            "initial storage segment {} is missing",
-                            segment_name.0
-                        ))
-                    })?
-            };
-            self.publish_local_segment(&segment_info, 0)?;
-        }
+        self.publish_local_segments(&segment_infos, 0)?;
         Ok(())
     }
 
@@ -539,6 +619,13 @@ impl StoreClient {
         };
         self.allocator.lock().upsert(&announcement);
         self.metadata.publish_segment(&announcement)
+    }
+
+    fn publish_local_segments(&self, segments: &[StorageExtentInfo], used_bytes: u64) -> Result<()> {
+        for segment in segments {
+            self.publish_local_segment(segment, used_bytes)?;
+        }
+        Ok(())
     }
 
     fn reserve_storage_runtime_segment(

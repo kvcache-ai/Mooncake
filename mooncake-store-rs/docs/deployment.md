@@ -30,6 +30,15 @@ git submodule update --init --recursive
 
 The repository expects the upstream sources at `third_party/Mooncake`.
 
+## Large-Memory Classic RDMA Bring-Up
+
+For `classic_te` deployments on RDMA hosts with very large local storage:
+
+- keep `LocalMemoryConfig::numa_aware(true)` unless you have a measured reason to collapse registration onto one CPU location
+- expect startup registration to fan out into multiple initial storage segments when NUMA planning finds multiple host-memory locations
+- the runtime now pre-touches startup storage automatically before RDMA MR registration once the total startup storage registration volume reaches `4 GiB`
+- metadata publication happens after the local startup registration phase finishes, so operators should treat the segment set as appearing in one startup wave rather than one segment at a time
+
 ## Local Validation
 
 ### Rust e2e

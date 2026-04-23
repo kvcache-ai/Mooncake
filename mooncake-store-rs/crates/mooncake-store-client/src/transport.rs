@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{MetadataBackend, Result, StoreError};
+use mooncake_store_transport_core::MemoryRegistration;
 use mooncake_transport::{
     ClassicEngineConfig, ClassicTransferEngine, Opcode, SegmentBuffer, SegmentInfo, SegmentKind,
     TentEngine, TentEngineConfig, TransferBatchHints, TransferProgress, TransferRequest,
@@ -102,6 +103,8 @@ impl From<BatchWaitError> for StoreError {
 
 pub use mooncake_store_transport_core::{StoreTransport, StoreTransportFactory};
 
+const CLASSIC_RDMA_STARTUP_PRETOUCH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
 pub(crate) fn registration_chunks(
     addr: *mut c_void,
     size: usize,
@@ -177,6 +180,113 @@ where
 {
     for (chunk_addr, chunk_len) in registration_chunks(addr, size, max_registration_bytes)? {
         operation(chunk_addr, chunk_len)?;
+    }
+    Ok(())
+}
+
+fn registration_chunks_for_entries(
+    entries: &[MemoryRegistration],
+    max_registration_bytes: Option<usize>,
+) -> Result<Vec<(*mut c_void, usize)>> {
+    let mut chunks = Vec::new();
+    for entry in entries {
+        chunks.extend(registration_chunks(
+            entry.addr,
+            entry.size,
+            max_registration_bytes,
+        )?);
+    }
+    Ok(chunks)
+}
+
+fn total_registration_bytes(entries: &[MemoryRegistration]) -> usize {
+    entries
+        .iter()
+        .fold(0usize, |total, entry| total.saturating_add(entry.size))
+}
+
+fn pretouch_registration_entries(entries: &[MemoryRegistration]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let page_size = system_page_size().max(1);
+    let workers = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, 32);
+    if workers == 1 {
+        for entry in entries {
+            pretouch_registration_entry(entry.addr, entry.size, page_size)?;
+        }
+        return Ok(());
+    }
+
+    let stride_pages = entries
+        .iter()
+        .map(|entry| pages_for_registration(entry.size, page_size))
+        .sum::<usize>();
+    if stride_pages <= 1 {
+        for entry in entries {
+            pretouch_registration_entry(entry.addr, entry.size, page_size)?;
+        }
+        return Ok(());
+    }
+
+    let chunk_count = workers.min(entries.len().max(1));
+    let mut buckets = vec![Vec::<(usize, usize)>::new(); chunk_count];
+    for (index, entry) in entries.iter().enumerate() {
+        buckets[index % chunk_count].push((entry.addr as usize, entry.size));
+    }
+
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::with_capacity(chunk_count);
+        for bucket in buckets.into_iter().filter(|bucket| !bucket.is_empty()) {
+            handles.push(scope.spawn(move || {
+                for (addr, size) in bucket {
+                    pretouch_registration_entry(addr as *mut c_void, size, page_size)?;
+                }
+                Ok::<(), StoreError>(())
+            }));
+        }
+        for handle in handles {
+            handle.join().map_err(|_| {
+                StoreError::Transport("registration pre-touch worker panicked".to_string())
+            })??;
+        }
+        Ok(())
+    })
+}
+
+fn pages_for_registration(size: usize, page_size: usize) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    size.saturating_add(page_size.saturating_sub(1)) / page_size
+}
+
+fn pretouch_registration_entry(addr: *mut c_void, size: usize, page_size: usize) -> Result<()> {
+    if size == 0 {
+        return Ok(());
+    }
+    let base = addr as usize;
+    let mut offset = 0usize;
+    while offset < size {
+        let page_addr = base.checked_add(offset).ok_or_else(|| {
+            StoreError::Transport("registration pre-touch address overflow".to_string())
+        })? as *mut u8;
+        unsafe {
+            let value = std::ptr::read_volatile(page_addr);
+            std::ptr::write_volatile(page_addr, value);
+        }
+        offset = offset.saturating_add(page_size);
+    }
+    let tail_addr = base
+        .checked_add(size.saturating_sub(1))
+        .ok_or_else(|| StoreError::Transport("registration pre-touch tail overflow".to_string()))?
+        as *mut u8;
+    unsafe {
+        let value = std::ptr::read_volatile(tail_addr);
+        std::ptr::write_volatile(tail_addr, value);
     }
     Ok(())
 }
@@ -473,6 +583,9 @@ impl ClassicTeTransport {
         location: &str,
     ) -> Result<()> {
         let chunks = registration_chunks(addr, size, self.max_registration_bytes)?;
+        if let [single] = chunks.as_slice() {
+            return engine.register_local_memory(single.0, single.1, location, true);
+        }
         engine.register_local_memory_batch(&chunks, location)
     }
 
@@ -486,7 +599,46 @@ impl ClassicTeTransport {
             .into_iter()
             .map(|(chunk_addr, _)| chunk_addr)
             .collect::<Vec<_>>();
+        if let [single] = addrs.as_slice() {
+            return engine.unregister_local_memory(*single);
+        }
         engine.unregister_local_memory_batch(&addrs)
+    }
+
+    fn registration_location(&self, addr: *mut c_void, size: usize) -> String {
+        let mut allocations = self.allocations.lock();
+        allocations
+            .entry(addr as usize)
+            .or_insert_with(|| ClassicAllocationRecord {
+                location: "cpu:0".to_string(),
+                size,
+                owner: ClassicAllocationOwner::Borrowed,
+            })
+            .location
+            .clone()
+    }
+
+    fn register_startup_entries_with_engine(
+        &self,
+        engine: &ClassicTransferEngine,
+        entries: &[MemoryRegistration],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let location = self.registration_location(entries[0].addr, entries[0].size);
+        if matches!(
+            self.config.transport_protocol(),
+            mooncake_transport::ClassicTransportProtocol::Rdma
+        ) && total_registration_bytes(entries) >= CLASSIC_RDMA_STARTUP_PRETOUCH_THRESHOLD_BYTES
+        {
+            pretouch_registration_entries(entries)?;
+        }
+        let chunks = registration_chunks_for_entries(entries, self.max_registration_bytes)?;
+        if let [single] = chunks.as_slice() {
+            return engine.register_local_memory(single.0, single.1, &location, true);
+        }
+        engine.register_local_memory_batch(&chunks, &location)
     }
 
     fn buffer_location(&self, base: u64, length: u64) -> String {
@@ -903,20 +1055,14 @@ impl StoreTransport for ClassicTeTransport {
     }
 
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
-        let location = {
-            let mut allocations = self.allocations.lock();
-            allocations
-                .entry(addr as usize)
-                .or_insert_with(|| ClassicAllocationRecord {
-                    location: "cpu:0".to_string(),
-                    size,
-                    owner: ClassicAllocationOwner::Borrowed,
-                })
-                .location
-                .clone()
-        };
+        let location = self.registration_location(addr, size);
         let engine = self.engine.read();
         self.register_memory_with_engine(&engine, addr, size, &location)
+    }
+
+    fn register_startup_memory_batch(&self, entries: &[MemoryRegistration]) -> Result<()> {
+        let engine = self.engine.read();
+        self.register_startup_entries_with_engine(&engine, entries)
     }
 
     fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {

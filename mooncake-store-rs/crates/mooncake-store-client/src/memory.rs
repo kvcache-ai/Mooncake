@@ -9,6 +9,7 @@ use mooncake_store_core::{HugePageConfig, Result, SegmentLifecycleState, Segment
 use parking_lot::Mutex;
 
 use crate::transport::StoreTransport;
+use mooncake_store_transport_core::MemoryRegistration;
 
 const DEFAULT_STORAGE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -251,20 +252,39 @@ pub struct StorageSegmentSpec {
 }
 
 impl LocalMemoryState {
+    #[cfg(test)]
     pub fn register(
         transport: &dyn StoreTransport,
         primary_segment: &SegmentName,
         config: &LocalMemoryConfig,
     ) -> Result<Self> {
+        Self::register_with_storage_mode(transport, primary_segment, config, false)
+    }
+
+    pub fn register_startup_storage(
+        transport: &dyn StoreTransport,
+        primary_segment: &SegmentName,
+        config: &LocalMemoryConfig,
+    ) -> Result<Self> {
+        Self::register_with_storage_mode(transport, primary_segment, config, true)
+    }
+
+    fn register_with_storage_mode(
+        transport: &dyn StoreTransport,
+        primary_segment: &SegmentName,
+        config: &LocalMemoryConfig,
+        startup_storage: bool,
+    ) -> Result<Self> {
         config.validate()?;
         let hugepage = config.hugepage()?;
         let storage = if config.has_storage() {
-            Some(RegisteredRegion::register(
+            Some(RegisteredRegion::register_with_mode(
                 transport,
                 config.storage_bytes,
                 &config.location,
                 config.alignment,
                 hugepage,
+                startup_storage,
             )?)
         } else {
             None
@@ -308,18 +328,28 @@ impl LocalMemoryState {
         transport: &dyn StoreTransport,
         spec: StorageSegmentSpec,
     ) -> Result<()> {
+        self.add_storage_segment_with_mode(transport, spec, false)
+    }
+
+    fn add_storage_segment_with_mode(
+        &mut self,
+        transport: &dyn StoreTransport,
+        spec: StorageSegmentSpec,
+        startup_storage: bool,
+    ) -> Result<()> {
         if self.storage.contains_key(&spec.segment_name) {
             return Err(StoreError::Conflict(format!(
                 "storage segment {} already exists",
                 spec.segment_name.0
             )));
         }
-        let region = RegisteredRegion::register(
+        let region = RegisteredRegion::register_with_mode(
             transport,
             spec.capacity_bytes,
             &spec.location,
             spec.alignment,
             HugePageConfig::resolve(spec.hugepage_enabled, spec.hugepage_size_bytes)?,
+            startup_storage,
         )?;
         self.storage.insert(
             spec.segment_name,
@@ -327,6 +357,30 @@ impl LocalMemoryState {
                 region,
                 state: spec.state,
                 tags: spec.tags,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn insert_registered_storage_segment(
+        &mut self,
+        segment_name: SegmentName,
+        region: RegisteredRegion,
+        state: SegmentLifecycleState,
+        tags: Vec<String>,
+    ) -> Result<()> {
+        if self.storage.contains_key(&segment_name) {
+            return Err(StoreError::Conflict(format!(
+                "storage segment {} already exists",
+                segment_name.0
+            )));
+        }
+        self.storage.insert(
+            segment_name,
+            StorageExtent {
+                region,
+                state,
+                tags,
             },
         );
         Ok(())
@@ -679,7 +733,7 @@ pub struct RegionAllocation {
 }
 
 #[derive(Debug)]
-struct RegisteredRegion {
+pub(crate) struct RegisteredRegion {
     base_addr: usize,
     capacity: usize,
     alignment: usize,
@@ -698,6 +752,27 @@ impl RegisteredRegion {
         alignment: usize,
         hugepage: Option<HugePageConfig>,
     ) -> Result<Self> {
+        Self::register_with_mode(transport, capacity, location, alignment, hugepage, false)
+    }
+
+    pub(crate) fn register_startup_storage(
+        transport: &dyn StoreTransport,
+        capacity: usize,
+        location: &str,
+        alignment: usize,
+        hugepage: Option<HugePageConfig>,
+    ) -> Result<Self> {
+        Self::register_with_mode(transport, capacity, location, alignment, hugepage, true)
+    }
+
+    fn register_with_mode(
+        transport: &dyn StoreTransport,
+        capacity: usize,
+        location: &str,
+        alignment: usize,
+        hugepage: Option<HugePageConfig>,
+        startup_storage: bool,
+    ) -> Result<Self> {
         let alignment = alignment.max(1);
         let (base, capacity, owner) = match hugepage {
             Some(hugepage) => allocate_hugepage_region(capacity, alignment, location, hugepage)?,
@@ -711,7 +786,16 @@ impl RegisteredRegion {
             let _ = owner.release(transport, base);
             return Err(error);
         }
-        if let Err(error) = transport.register_memory(base, capacity) {
+        let registrations = [MemoryRegistration {
+            addr: base,
+            size: capacity,
+        }];
+        let registration_result = if startup_storage {
+            transport.register_startup_memory_batch(&registrations)
+        } else {
+            transport.register_memory(base, capacity)
+        };
+        if let Err(error) = registration_result {
             let _ = owner.release(transport, base);
             return Err(error);
         }
@@ -765,7 +849,7 @@ impl RegisteredRegion {
         Ok(unsafe { (self.base_addr as *mut u8).add(offset).cast::<c_void>() })
     }
 
-    fn release(self, transport: &dyn StoreTransport) -> Result<()> {
+    pub(crate) fn release(self, transport: &dyn StoreTransport) -> Result<()> {
         let base = self.base_ptr();
         transport.unregister_memory(base, self.capacity)?;
         self.owner.release(transport, base)
@@ -1009,7 +1093,7 @@ fn test_numa_locations() -> Option<Vec<String>> {
 }
 
 #[cfg(test)]
-fn with_test_numa_locations<T>(locations: &[&str], f: impl FnOnce() -> T) -> T {
+pub(crate) fn with_test_numa_locations<T>(locations: &[&str], f: impl FnOnce() -> T) -> T {
     let _guard = TEST_NUMA_GUARD
         .lock()
         .expect("test numa guard lock should not be poisoned");
@@ -1045,7 +1129,7 @@ mod tests {
     use super::{
         align_up, allocate_hugepage_region, free_hugepage_region, hugepage_map_flag,
         with_test_numa_locations, LocalMemoryConfig, LocalMemoryState, LocalRegionPlan,
-        RegionOwner, RegisteredRegion, StorageSegmentSpec, StoreTransport,
+        MemoryRegistration, RegionOwner, RegisteredRegion, StorageSegmentSpec, StoreTransport,
     };
 
     struct NoopTransport;
@@ -1060,6 +1144,9 @@ mod tests {
     struct RecordingTransportState {
         allocations: BTreeMap<usize, Box<[u8]>>,
         registered: BTreeMap<usize, usize>,
+        register_calls: usize,
+        startup_batch_calls: usize,
+        startup_batch_entry_sizes: Vec<usize>,
     }
 
     #[derive(Clone)]
@@ -1234,7 +1321,24 @@ mod tests {
             addr: *mut c_void,
             size: usize,
         ) -> mooncake_store_core::Result<()> {
-            self.inner.lock().registered.insert(addr as usize, size);
+            let mut state = self.inner.lock();
+            state.register_calls += 1;
+            state.registered.insert(addr as usize, size);
+            Ok(())
+        }
+
+        fn register_startup_memory_batch(
+            &self,
+            entries: &[MemoryRegistration],
+        ) -> mooncake_store_core::Result<()> {
+            let mut state = self.inner.lock();
+            state.startup_batch_calls += 1;
+            state
+                .startup_batch_entry_sizes
+                .push(entries.iter().map(|entry| entry.size).sum());
+            for entry in entries {
+                state.registered.insert(entry.addr as usize, entry.size);
+            }
             Ok(())
         }
 
@@ -1659,6 +1763,21 @@ mod tests {
             .expect_err("register failures must roll back transport allocations");
         assert!(matches!(error, StoreError::Transport(_)));
         assert!(register_failure.inner.lock().allocations.is_empty());
+    }
+
+    #[test]
+    fn registered_region_startup_storage_uses_startup_batch_hook() {
+        let transport = RecordingTransport::default();
+        let region = RegisteredRegion::register_startup_storage(&transport, 64, "cpu:0", 8, None)
+            .expect("startup registration should succeed");
+        let state = transport.inner.lock();
+        assert_eq!(state.startup_batch_calls, 1);
+        assert_eq!(state.startup_batch_entry_sizes, vec![64]);
+        assert_eq!(state.register_calls, 0);
+        drop(state);
+        region
+            .release(&transport)
+            .expect("startup-registered region should release");
     }
 
     #[test]

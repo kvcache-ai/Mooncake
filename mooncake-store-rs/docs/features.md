@@ -148,6 +148,12 @@ The current implementation supports:
 - hugepage-backed shared memory for Python host buffers
 - background async eviction on storage nodes
 
+Startup behavior for large local storage is explicit:
+
+- initial storage-region planning remains NUMA-aware for host memory by default, so RDMA-capable hosts can start with multiple local storage segments instead of collapsing everything into one CPU location
+- startup registration of extra initial storage segments runs in parallel and the runtime publishes those segments only after the local registration phase completes
+- `classic_te` + RDMA pre-touches startup storage pages once total startup storage registration reaches `4 GiB`, reducing cold-page MR registration stalls on very large hosts
+
 ### Remote allocation
 
 Remote storage reservation uses allocator RPC to the owning client.

@@ -18,7 +18,10 @@ use mooncake_store_core::{
 };
 use mooncake_store_test_utils::transport::TestTransport;
 
-use crate::{MooncakeCompatibilityFacade, StoreClient, StoreClientBuilder};
+use crate::{
+    memory::{with_test_numa_locations, LocalMemoryConfig},
+    MooncakeCompatibilityFacade, StoreClient, StoreClientBuilder,
+};
 
 use super::{storage_config, storage_config_with_bytes, test_future_expiry_ms};
 
@@ -48,6 +51,14 @@ fn build_storage_client(
     stable_id: &str,
     storage_bytes: usize,
 ) -> StoreClient {
+    build_storage_client_with_config(meta, stable_id, storage_config_with_bytes(storage_bytes))
+}
+
+fn build_storage_client_with_config(
+    meta: &Arc<InMemoryMetadataBackend>,
+    stable_id: &str,
+    local_memory: LocalMemoryConfig,
+) -> StoreClient {
     let seg = format!("{stable_id}-seg");
     let transport = Arc::new(TestTransport::new(&seg));
     let factory = transport.factory();
@@ -58,7 +69,7 @@ fn build_storage_client(
         .segment_name(&seg)
         .transport(t)
         .transport_factory(factory)
-        .local_memory(storage_config_with_bytes(storage_bytes))
+        .local_memory(local_memory)
         .build(test_future_expiry_ms())
         .expect("build");
     c.register_local_memory().expect("register");
@@ -531,6 +542,47 @@ fn expand_local_memory_creates_unique_segment_names() {
         primary, second,
         "expanded segment must have a distinct name"
     );
+}
+
+#[test]
+fn startup_multi_segment_registration_preserves_future_segment_names() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    with_test_numa_locations(&["cpu:0", "cpu:1"], || {
+        let client = build_storage_client_with_config(
+            &meta,
+            "seg-startup-pipeline",
+            LocalMemoryConfig::new()
+                .storage_bytes(8 * 1024)
+                .scratch_bytes(4 * 1024)
+                .location("cpu:0")
+                .alignment(1)
+                .numa_aware(true)
+                .reclaim_grace_ms(0),
+        );
+
+        let mut segment_names = client
+            .list_segments()
+            .expect("list")
+            .into_iter()
+            .map(|segment| segment.segment_name.0)
+            .collect::<Vec<_>>();
+        segment_names.sort();
+        assert_eq!(
+            segment_names,
+            vec![
+                "seg-startup-pipeline-seg".to_string(),
+                "seg-startup-pipeline-seg-ext-1".to_string(),
+            ]
+        );
+
+        let expanded = client
+            .expand_local_memory(4 * 1024)
+            .expect("expand after startup pipeline");
+        assert_eq!(
+            expanded.segment_name,
+            SegmentName::new("seg-startup-pipeline-seg-ext-2")
+        );
+    });
 }
 
 #[test]
