@@ -34,6 +34,7 @@ pub struct TestTransportState {
     pub republish_local_metadata_calls: usize,
     pub fail_next_submit_segments: BTreeSet<String>,
     pub max_registration_bytes: Option<usize>,
+    pub supports_parallel_startup_registration: bool,
     pub submitted_batch_sizes: Vec<usize>,
     pub submitted_batch_bytes: Vec<u64>,
     pub submitted_batch_hints: Vec<(Option<String>, TransferPacingMode, Option<u64>)>,
@@ -67,6 +68,7 @@ impl TestTransport {
                 republish_local_metadata_calls: 0,
                 fail_next_submit_segments: BTreeSet::new(),
                 max_registration_bytes: None,
+                supports_parallel_startup_registration: false,
                 submitted_batch_sizes: Vec::new(),
                 submitted_batch_bytes: Vec::new(),
                 submitted_batch_hints: Vec::new(),
@@ -89,6 +91,10 @@ impl TestTransport {
 
     pub fn set_max_registration_bytes(&self, value: Option<usize>) {
         self.state.lock().max_registration_bytes = value;
+    }
+
+    pub fn set_supports_parallel_startup_registration(&self, value: bool) {
+        self.state.lock().supports_parallel_startup_registration = value;
     }
 
     pub fn add_external_segment(&self, segment_name: &str, size: usize) -> u64 {
@@ -250,6 +256,10 @@ impl StoreTransport for TestTransport {
 
     fn max_registration_bytes(&self) -> Option<usize> {
         self.state.lock().max_registration_bytes
+    }
+
+    fn supports_parallel_startup_registration(&self) -> bool {
+        self.state.lock().supports_parallel_startup_registration
     }
 
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {

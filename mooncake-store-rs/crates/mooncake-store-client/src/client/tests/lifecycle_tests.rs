@@ -61,6 +61,16 @@ fn build_storage_client_with_config(
 ) -> StoreClient {
     let seg = format!("{stable_id}-seg");
     let transport = Arc::new(TestTransport::new(&seg));
+    build_storage_client_with_transport(meta, stable_id, local_memory, transport)
+}
+
+fn build_storage_client_with_transport(
+    meta: &Arc<InMemoryMetadataBackend>,
+    stable_id: &str,
+    local_memory: LocalMemoryConfig,
+    transport: Arc<TestTransport>,
+) -> StoreClient {
+    let seg = format!("{stable_id}-seg");
     let factory = transport.factory();
     let t = Arc::new(transport.peer(&seg));
     let c = StoreClientBuilder::new(meta.clone(), stable_id)
@@ -548,7 +558,9 @@ fn expand_local_memory_creates_unique_segment_names() {
 fn startup_multi_segment_registration_preserves_future_segment_names() {
     let meta = Arc::new(InMemoryMetadataBackend::new());
     with_test_numa_locations(&["cpu:0", "cpu:1"], || {
-        let client = build_storage_client_with_config(
+        let transport = Arc::new(TestTransport::new("seg-startup-pipeline-seg"));
+        transport.set_supports_parallel_startup_registration(true);
+        let client = build_storage_client_with_transport(
             &meta,
             "seg-startup-pipeline",
             LocalMemoryConfig::new()
@@ -558,6 +570,7 @@ fn startup_multi_segment_registration_preserves_future_segment_names() {
                 .alignment(1)
                 .numa_aware(true)
                 .reclaim_grace_ms(0),
+            transport,
         );
 
         let mut segment_names = client

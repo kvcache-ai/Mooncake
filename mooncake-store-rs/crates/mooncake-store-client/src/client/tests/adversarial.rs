@@ -558,6 +558,7 @@ fn test_transport_factory_creates_instances_sharing_segment_state() {
         republish_local_metadata_calls: 0,
         fail_next_submit_segments: BTreeSet::new(),
         max_registration_bytes: None,
+        supports_parallel_startup_registration: false,
         submitted_batch_sizes: Vec::new(),
         submitted_batch_bytes: Vec::new(),
         submitted_batch_hints: Vec::new(),

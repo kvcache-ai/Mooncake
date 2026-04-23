@@ -1055,6 +1055,13 @@ impl StoreTransport for ClassicTeTransport {
         self.max_registration_bytes
     }
 
+    fn supports_parallel_startup_registration(&self) -> bool {
+        matches!(
+            self.config.transport_protocol(),
+            mooncake_transport::ClassicTransportProtocol::Rdma
+        )
+    }
+
     fn free_memory(&self, addr: *mut c_void) -> Result<()> {
         let record = self
             .allocations
