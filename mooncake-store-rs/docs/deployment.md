@@ -483,10 +483,12 @@ Credentials embedded in `redis://username:password@host:port/db` also work and t
 
 ### Clean stale Redis segment registrations
 
-Redis client leases expire automatically. Segment registration keys do not.
+Redis client leases expire automatically. etcd client leases do not; admin relies on
+the stored `expires_at_ms` field plus a backend work index. Segment registration keys
+do not expire automatically in either backend.
 
 That means a hard-killed storage client can leave stale `segments/...` metadata and
-segment index entries behind even after its lease has disappeared. Strict tenant
+owner-scoped segment bookkeeping behind even after its lease has disappeared. Strict tenant
 quota reservations can also outlive a killed writer until an explicit reconcile
 repairs the state. Store-RS now supports one-shot repair plus stateless background
 maintenance in the same admin binary:
@@ -495,7 +497,8 @@ maintenance in the same admin binary:
 - a stateless background maintenance loop in `mooncake-store-admin server`
 - optional tenant quota reservation reconcile for an explicit tenant list in that same admin process
 
-Run the admin sweep when you want to remove dead-owner segment metadata:
+Run the admin sweep when you want to remove dead-owner segment metadata. The same
+shape works with either `redis://...` or `etcd://...` metadata URLs:
 
 ```bash
 mooncake-store-admin \
@@ -519,14 +522,15 @@ mooncake-store-admin \
 
 The background maintenance loop works like this:
 
-- lease create and heartbeat refresh both update a Redis lease-expiry sorted set
-- the admin worker polls due entries from that sorted set
+- lease create and heartbeat refresh both update a backend-native lease-expiry work index
+- Redis stores due work in one sorted set; etcd stores a `by-runtime` pointer plus a lexicographically ordered `by-time` queue
+- the admin worker polls due entries from that backend-native work index
 - each due owner is re-checked against the live lease key before cleanup
-- dead-owner segment deletion is scoped through `indexes/segments/<owner>` instead of a hidden full keyspace walk
+- dead-owner segment deletion stays owner-scoped instead of falling back to a hidden full keyspace walk in the steady-state worker
 - if a lease key disappeared briefly, same-epoch reclaim is accepted as long as that epoch is still the stable-id HWM and no higher live epoch exists
 - tenant quota reconcile remains explicit: the worker only runs for tenants named on the command line, then internally reuses the same repair logic as `mooncake-store-admin quota reconcile`
 
-This keeps the admin pod stateless. If the pod restarts, the next reconcile loop resumes from Redis metadata instead of relying on in-memory work queues.
+This keeps the admin pod stateless. If the pod restarts, the next reconcile loop resumes from Redis or etcd metadata instead of relying on in-memory work queues.
 
 You can also manage tenant route policy and inspect strict-quota metadata through the same binary:
 

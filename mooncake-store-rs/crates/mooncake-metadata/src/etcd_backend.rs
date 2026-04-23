@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
+use crate::redis_backend::{ClientLeaseLiveness, RedisMetadataCleanupReport};
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
@@ -111,6 +112,271 @@ impl EtcdMetadataBackend {
         }
         Ok(live_epochs)
     }
+
+    async fn current_expiry_entry_key(
+        &self,
+        client: &mut Client,
+        runtime: &ClientRuntimeId,
+    ) -> Result<(Option<String>, i64)> {
+        let state_key = self.config.keyspace.client_lease_expiry_runtime(runtime);
+        let response = client
+            .get(state_key, None)
+            .await
+            .map_err(etcd_error("etcd get client lease expiry runtime state"))?;
+        let current = response
+            .kvs()
+            .first()
+            .map(|kv| std::str::from_utf8(kv.value()).map(|value| value.to_string()))
+            .transpose()
+            .map_err(etcd_utf8_error(
+                "etcd decode client lease expiry runtime state",
+            ))?;
+        let mod_revision = response
+            .kvs()
+            .first()
+            .map(|kv| kv.mod_revision())
+            .unwrap_or(0);
+        Ok((current, mod_revision))
+    }
+
+    async fn delete_current_expiry_entry(
+        &self,
+        client: &mut Client,
+        runtime: &ClientRuntimeId,
+    ) -> Result<bool> {
+        let state_key = self.config.keyspace.client_lease_expiry_runtime(runtime);
+        loop {
+            let (current_entry, mod_revision) =
+                self.current_expiry_entry_key(client, runtime).await?;
+            let Some(current_entry) = current_entry else {
+                return Ok(false);
+            };
+            let txn = Txn::new()
+                .when([Compare::mod_revision(
+                    state_key.clone(),
+                    CompareOp::Equal,
+                    mod_revision,
+                )])
+                .and_then([
+                    TxnOp::delete(state_key.clone(), None),
+                    TxnOp::delete(current_entry, None),
+                ]);
+            let response = client
+                .txn(txn)
+                .await
+                .map_err(etcd_error("etcd delete client lease expiry entries"))?;
+            if response.succeeded() {
+                return Ok(true);
+            }
+        }
+    }
+
+    async fn update_expiry_entry(
+        &self,
+        client: &mut Client,
+        runtime: &ClientRuntimeId,
+        expires_at_ms: u64,
+    ) -> Result<()> {
+        let state_key = self.config.keyspace.client_lease_expiry_runtime(runtime);
+        let lease_key = self.config.keyspace.client(runtime);
+        let next_entry = self
+            .config
+            .keyspace
+            .client_lease_expiry_time(expires_at_ms, runtime);
+        loop {
+            let (current_entry, mod_revision) =
+                self.current_expiry_entry_key(client, runtime).await?;
+            let mut ops = vec![
+                TxnOp::put(state_key.clone(), next_entry.clone(), None),
+                TxnOp::put(next_entry.clone(), lease_key.clone(), None),
+            ];
+            if let Some(current_entry) = current_entry.filter(|value| value != &next_entry) {
+                ops.push(TxnOp::delete(current_entry, None));
+            }
+            let txn = Txn::new()
+                .when([Compare::mod_revision(
+                    state_key.clone(),
+                    CompareOp::Equal,
+                    mod_revision,
+                )])
+                .and_then(ops);
+            let response = client
+                .txn(txn)
+                .await
+                .map_err(etcd_error("etcd update client lease expiry index"))?;
+            if response.succeeded() {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn cleanup_stale_segments_for_owner_runtime(
+        &self,
+        client: &mut Client,
+        owner: &ClientRuntimeId,
+    ) -> Result<RedisMetadataCleanupReport> {
+        let prefix = self.config.keyspace.segment_prefix(Some(owner));
+        let response = client
+            .get(prefix, Some(GetOptions::new().with_prefix()))
+            .await
+            .map_err(etcd_error("etcd list owner segments for cleanup"))?;
+        let segments = response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                serde_json::from_slice::<StoredSegmentState>(kv.value())
+                    .map(|state| state.announcement)
+                    .map_err(json_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for segment in &segments {
+            client
+                .delete(
+                    self.config.keyspace.segment(owner, &segment.segment_name),
+                    None,
+                )
+                .await
+                .map_err(etcd_error("etcd delete stale segment"))?;
+        }
+        Ok(RedisMetadataCleanupReport {
+            live_clients: 0,
+            inspected_segment_keys: segments.len(),
+            removed_segment_keys: segments.len(),
+            removed_segment_index_entries: 0,
+            removed_owner_segment_index_entries: 0,
+            stale_missing_segment_index_entries: 0,
+        })
+    }
+
+    pub fn cleanup_stale_segments(&self) -> Result<RedisMetadataCleanupReport> {
+        let live_clients = self.list_live_clients()?;
+        let live_runtime_keys = live_clients
+            .iter()
+            .map(|lease| lease.runtime.storage_key())
+            .collect::<std::collections::BTreeSet<_>>();
+        let segments = self.list_segments(None)?;
+        let mut stale_owners = std::collections::BTreeSet::<ClientRuntimeId>::new();
+        for segment in &segments {
+            if !live_runtime_keys.contains(&segment.owner.storage_key()) {
+                stale_owners.insert(segment.owner.clone());
+            }
+        }
+        let mut removed_segment_keys = 0usize;
+        self.block_on(async {
+            let mut client = self.client().await?;
+            for owner in stale_owners {
+                let stats = self
+                    .cleanup_stale_segments_for_owner_runtime(&mut client, &owner)
+                    .await?;
+                removed_segment_keys =
+                    removed_segment_keys.saturating_add(stats.removed_segment_keys);
+            }
+            Ok(())
+        })?;
+        Ok(RedisMetadataCleanupReport {
+            live_clients: live_clients.len(),
+            inspected_segment_keys: segments.len(),
+            removed_segment_keys,
+            removed_segment_index_entries: 0,
+            removed_owner_segment_index_entries: 0,
+            stale_missing_segment_index_entries: 0,
+        })
+    }
+
+    pub fn cleanup_stale_segments_for_owner(
+        &self,
+        owner: &ClientRuntimeId,
+    ) -> Result<RedisMetadataCleanupReport> {
+        self.block_on(async {
+            let mut client = self.client().await?;
+            self.cleanup_stale_segments_for_owner_runtime(&mut client, owner)
+                .await
+        })
+    }
+
+    pub fn client_lease_liveness(&self, runtime: &ClientRuntimeId) -> Result<ClientLeaseLiveness> {
+        let key = self.config.keyspace.client(runtime);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key.clone(), None)
+                .await
+                .map_err(etcd_error("etcd get client lease liveness"))?;
+            let Some(kv) = response.kvs().first() else {
+                return Ok(ClientLeaseLiveness::Missing);
+            };
+            let lease: ClientLease = serde_json::from_slice(kv.value()).map_err(json_error)?;
+            if lease.expires_at_ms >= now_ms() {
+                Ok(ClientLeaseLiveness::Live(lease))
+            } else {
+                Ok(ClientLeaseLiveness::Expired(lease))
+            }
+        })
+    }
+
+    pub fn list_due_client_lease_expiries(
+        &self,
+        expires_before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = self.config.keyspace.client_lease_expiry_time_prefix();
+        let range_end = self
+            .config
+            .keyspace
+            .client_lease_expiry_time_range_end(expires_before_ms.saturating_add(1));
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(
+                    prefix,
+                    Some(
+                        GetOptions::new()
+                            .with_range(range_end)
+                            .with_limit(limit as i64),
+                    ),
+                )
+                .await
+                .map_err(etcd_error("etcd list due client lease expiries"))?;
+            response
+                .kvs()
+                .iter()
+                .map(|kv| {
+                    std::str::from_utf8(kv.value())
+                        .map(|value| value.to_string())
+                        .map_err(etcd_utf8_error("etcd decode client lease expiry entry"))
+                })
+                .collect()
+        })
+    }
+
+    pub fn refresh_client_lease_expiry(
+        &self,
+        runtime: &ClientRuntimeId,
+        expires_at_ms: u64,
+    ) -> Result<()> {
+        self.block_on(async {
+            let mut client = self.client().await?;
+            self.update_expiry_entry(&mut client, runtime, expires_at_ms)
+                .await
+        })
+    }
+
+    pub fn remove_client_lease_expiry(&self, runtime: &ClientRuntimeId) -> Result<bool> {
+        self.block_on(async {
+            let mut client = self.client().await?;
+            self.delete_current_expiry_entry(&mut client, runtime).await
+        })
+    }
+
+    pub fn remove_client_lease_expiry_entry(&self, lease_key: &str) -> Result<bool> {
+        let Some((stable_id, epoch)) = self.config.keyspace.parse_client_key(lease_key) else {
+            return Ok(false);
+        };
+        self.remove_client_lease_expiry(&ClientRuntimeId::new(stable_id, ClientEpoch(epoch)))
+    }
 }
 
 impl MetadataBackend for EtcdMetadataBackend {
@@ -131,6 +397,14 @@ impl MetadataBackend for EtcdMetadataBackend {
             .keyspace
             .client_by_stable_marker(&stable_id, new_epoch);
         let hwm_key = self.config.keyspace.client_epoch_hwm(&stable_id);
+        let expiry_state_key = self
+            .config
+            .keyspace
+            .client_lease_expiry_runtime(&lease.runtime);
+        let expiry_entry_key = self
+            .config
+            .keyspace
+            .client_lease_expiry_time(lease.expires_at_ms, &lease.runtime);
         let payload = serde_json::to_string(lease).map_err(json_error)?;
         self.block_on(async {
             let mut client = self.client().await?;
@@ -140,11 +414,45 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .await
                     .map_err(etcd_error("etcd get client lease"))?;
                 if !existing.kvs().is_empty() {
-                    client
-                        .put(lease_key.clone(), payload.clone(), None)
+                    let lease_mod_rev = existing
+                        .kvs()
+                        .first()
+                        .map(|kv| kv.mod_revision())
+                        .unwrap_or(0);
+                    let (current_expiry_entry, expiry_mod_rev) =
+                        self.current_expiry_entry_key(&mut client, &lease.runtime).await?;
+                    let mut ops = vec![
+                        TxnOp::put(lease_key.clone(), payload.clone(), None),
+                        TxnOp::put(expiry_state_key.clone(), expiry_entry_key.clone(), None),
+                        TxnOp::put(expiry_entry_key.clone(), lease_key.clone(), None),
+                    ];
+                    if let Some(current_expiry_entry) =
+                        current_expiry_entry.filter(|value| value != &expiry_entry_key)
+                    {
+                        ops.push(TxnOp::delete(current_expiry_entry, None));
+                    }
+                    let txn = Txn::new()
+                        .when(vec![
+                            Compare::mod_revision(
+                                lease_key.clone(),
+                                CompareOp::Equal,
+                                lease_mod_rev,
+                            ),
+                            Compare::mod_revision(
+                                expiry_state_key.clone(),
+                                CompareOp::Equal,
+                                expiry_mod_rev,
+                            ),
+                        ])
+                        .and_then(ops);
+                    let txn_response = client
+                        .txn(txn)
                         .await
                         .map_err(etcd_error("etcd refresh client lease"))?;
-                    return Ok(());
+                    if txn_response.succeeded() {
+                        return Ok(());
+                    }
+                    continue;
                 }
 
                 let active_max = self
@@ -167,6 +475,8 @@ impl MetadataBackend for EtcdMetadataBackend {
                         Some((parsed, kv.mod_revision()))
                     })
                     .unwrap_or((0, 0));
+                let (current_expiry_entry, expiry_mod_rev) =
+                    self.current_expiry_entry_key(&mut client, &lease.runtime).await?;
 
                 let floor = active_max.max(hwm_value);
                 let allow_same_epoch_reclaim = new_epoch == hwm_value && new_epoch > active_max;
@@ -186,8 +496,14 @@ impl MetadataBackend for EtcdMetadataBackend {
                             CompareOp::Equal,
                             hwm_mod_rev,
                         ),
+                        Compare::mod_revision(
+                            expiry_state_key.clone(),
+                            CompareOp::Equal,
+                            expiry_mod_rev,
+                        ),
                     ])
-                    .and_then(vec![
+                    .and_then({
+                        let mut ops = vec![
                         TxnOp::put(lease_key.clone(), payload.clone(), None),
                         TxnOp::put(marker_key.clone(), Vec::<u8>::new(), None),
                         TxnOp::put(
@@ -195,7 +511,16 @@ impl MetadataBackend for EtcdMetadataBackend {
                             hwm_value.max(new_epoch).to_string(),
                             None,
                         ),
-                    ]);
+                        TxnOp::put(expiry_state_key.clone(), expiry_entry_key.clone(), None),
+                        TxnOp::put(expiry_entry_key.clone(), lease_key.clone(), None),
+                        ];
+                        if let Some(current_expiry_entry) =
+                            current_expiry_entry.filter(|value| value != &expiry_entry_key)
+                        {
+                            ops.push(TxnOp::delete(current_expiry_entry, None));
+                        }
+                        ops
+                    });
                 let txn_response = client
                     .txn(txn)
                     .await
@@ -242,31 +567,54 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .config
                     .keyspace
                     .client_by_stable_marker(&stable_id, new_epoch);
+                let runtime = ClientRuntimeId {
+                    stable_id: stable_id.clone(),
+                    epoch: ClientEpoch(new_epoch),
+                };
+                let expiry_state_key = self.config.keyspace.client_lease_expiry_runtime(&runtime);
+                let expiry_entry_key = self
+                    .config
+                    .keyspace
+                    .client_lease_expiry_time(template.expires_at_ms, &runtime);
 
                 let mut lease = template.clone();
-                lease.runtime.epoch = ClientEpoch(new_epoch);
+                lease.runtime = runtime.clone();
                 let payload = serde_json::to_string(&lease).map_err(json_error)?;
+                let (current_expiry_entry, expiry_mod_rev) =
+                    self.current_expiry_entry_key(&mut client, &runtime).await?;
 
                 let txn = Txn::new()
                     .when(vec![
                         Compare::mod_revision(lease_key.clone(), CompareOp::Equal, 0),
                         Compare::mod_revision(marker_key.clone(), CompareOp::Equal, 0),
                         Compare::mod_revision(hwm_key.clone(), CompareOp::Equal, hwm_mod_rev),
+                        Compare::mod_revision(
+                            expiry_state_key.clone(),
+                            CompareOp::Equal,
+                            expiry_mod_rev,
+                        ),
                     ])
-                    .and_then(vec![
-                        TxnOp::put(lease_key, payload, None),
-                        TxnOp::put(marker_key, Vec::<u8>::new(), None),
-                        TxnOp::put(hwm_key.clone(), new_epoch.to_string(), None),
-                    ]);
+                    .and_then({
+                        let mut ops = vec![
+                            TxnOp::put(lease_key.clone(), payload, None),
+                            TxnOp::put(marker_key, Vec::<u8>::new(), None),
+                            TxnOp::put(hwm_key.clone(), new_epoch.to_string(), None),
+                            TxnOp::put(expiry_state_key.clone(), expiry_entry_key.clone(), None),
+                            TxnOp::put(expiry_entry_key.clone(), lease_key.clone(), None),
+                        ];
+                        if let Some(current_expiry_entry) =
+                            current_expiry_entry.filter(|value| value != &expiry_entry_key)
+                        {
+                            ops.push(TxnOp::delete(current_expiry_entry, None));
+                        }
+                        ops
+                    });
                 let txn_response = client
                     .txn(txn)
                     .await
                     .map_err(etcd_error("etcd allocate client lease"))?;
                 if txn_response.succeeded() {
-                    return Ok(ClientRuntimeId {
-                        stable_id: stable_id.clone(),
-                        epoch: ClientEpoch(new_epoch),
-                    });
+                    return Ok(runtime);
                 }
             }
         })
@@ -1601,6 +1949,10 @@ fn etcd_error(operation: &'static str) -> impl FnOnce(etcd_client::Error) -> Sto
     move |error| StoreError::Metadata(format!("{operation}: {error}"))
 }
 
+fn etcd_utf8_error(operation: &'static str) -> impl FnOnce(std::str::Utf8Error) -> StoreError {
+    move |error| StoreError::Metadata(format!("{operation}: {error}"))
+}
+
 fn json_error(error: serde_json::Error) -> StoreError {
     StoreError::Metadata(format!("json serialization: {error}"))
 }
@@ -1708,8 +2060,14 @@ mod tests {
             return false;
         };
         runtime
-            .block_on(etcd_client::Client::connect([endpoint.to_string()], None))
-            .is_ok()
+            .block_on(async {
+                let mut client = etcd_client::Client::connect([endpoint.to_string()], None)
+                    .await
+                    .ok()?;
+                client.get("__health__", None).await.ok()?;
+                Some(())
+            })
+            .is_some()
     }
 
     impl EtcdTestServer {
@@ -2016,6 +2374,96 @@ mod tests {
         backend
             .upsert_client_lease(&lease)
             .expect("same epoch should reclaim after the lease key disappears");
+    }
+
+    #[test]
+    fn etcd_backend_tracks_due_client_lease_expiries() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/etcd-lease-expiry");
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()]).keyspace(keyspace.clone()),
+        )
+        .expect("etcd backend should initialize");
+
+        let lease = sample_lease(ClientLifecycleState::Active);
+        backend
+            .upsert_client_lease(&lease)
+            .expect("lease publish should seed expiry index");
+
+        assert!(backend
+            .list_due_client_lease_expiries(super::now_ms(), 8)
+            .expect("future lease should not be due")
+            .is_empty());
+
+        backend
+            .refresh_client_lease_expiry(&lease.runtime, super::now_ms().saturating_sub(1))
+            .expect("expiry queue refresh should succeed");
+        assert_eq!(
+            backend
+                .list_due_client_lease_expiries(super::now_ms(), 8)
+                .expect("due lease should be visible"),
+            vec![keyspace.client(&lease.runtime)]
+        );
+
+        assert!(backend
+            .remove_client_lease_expiry(&lease.runtime)
+            .expect("expiry removal should succeed"));
+        assert!(backend
+            .list_due_client_lease_expiries(super::now_ms(), 8)
+            .expect("due queue should be empty after removal")
+            .is_empty());
+    }
+
+    #[test]
+    fn etcd_backend_cleanup_stale_segments_for_owner_is_scoped() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-cleanup-scoped")),
+        )
+        .expect("etcd backend should initialize");
+
+        let dead_runtime = ClientRuntimeId::new("dead-owner", ClientEpoch(7));
+        let live_runtime = ClientRuntimeId::new("live-owner", ClientEpoch(1));
+        backend
+            .publish_segment(&SegmentAnnouncement {
+                owner: dead_runtime.clone(),
+                segment_name: SegmentName::new("dead-segment"),
+                capacity_bytes: 128,
+                used_bytes: 32,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: 16,
+                tags: vec!["dram".to_string()],
+            })
+            .expect("dead segment publish should succeed");
+        let live_segment = SegmentAnnouncement {
+            owner: live_runtime.clone(),
+            segment_name: SegmentName::new("live-segment"),
+            capacity_bytes: 128,
+            used_bytes: 16,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 16,
+            tags: vec!["dram".to_string()],
+        };
+        backend
+            .publish_segment(&live_segment)
+            .expect("live segment publish should succeed");
+
+        let report = backend
+            .cleanup_stale_segments_for_owner(&dead_runtime)
+            .expect("owner cleanup should succeed");
+        assert_eq!(report.inspected_segment_keys, 1);
+        assert_eq!(report.removed_segment_keys, 1);
+        assert_eq!(
+            backend
+                .list_segments(None)
+                .expect("segment listing should succeed"),
+            vec![live_segment]
+        );
     }
 
     #[test]

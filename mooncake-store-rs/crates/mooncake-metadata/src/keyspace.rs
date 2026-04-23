@@ -62,8 +62,60 @@ impl MetadataKeyspace {
         format!("{}/system/client-lease-expiry", self.slot_tag)
     }
 
+    pub fn client_lease_expiry_runtime(&self, runtime: &ClientRuntimeId) -> String {
+        format!(
+            "{}/system/client-lease-expiry/by-runtime/{}",
+            self.slot_tag,
+            runtime.storage_key()
+        )
+    }
+
+    pub fn client_lease_expiry_runtime_prefix(&self) -> String {
+        format!("{}/system/client-lease-expiry/by-runtime/", self.slot_tag)
+    }
+
+    pub fn client_lease_expiry_time_prefix(&self) -> String {
+        format!("{}/system/client-lease-expiry/by-time/", self.slot_tag)
+    }
+
+    pub fn client_lease_expiry_time(
+        &self,
+        expires_at_ms: u64,
+        runtime: &ClientRuntimeId,
+    ) -> String {
+        format!(
+            "{}{:020}/{}",
+            self.client_lease_expiry_time_prefix(),
+            expires_at_ms,
+            runtime.storage_key()
+        )
+    }
+
+    pub fn client_lease_expiry_time_range_end(&self, expires_before_exclusive_ms: u64) -> String {
+        format!(
+            "{}{:020}/",
+            self.client_lease_expiry_time_prefix(),
+            expires_before_exclusive_ms
+        )
+    }
+
     pub fn parse_client_key(&self, key: &str) -> Option<(String, u64)> {
         let prefix = format!("{}/clients/", self.slot_tag);
+        let rest = key.strip_prefix(&prefix)?;
+        parse_runtime_storage_key(rest)
+    }
+
+    pub fn parse_client_lease_expiry_time_key(&self, key: &str) -> Option<(u64, String, u64)> {
+        let prefix = self.client_lease_expiry_time_prefix();
+        let rest = key.strip_prefix(&prefix)?;
+        let (expires_at_ms, runtime_storage_key) = rest.split_once('/')?;
+        let expires_at_ms = expires_at_ms.parse::<u64>().ok()?;
+        let (stable_id, epoch) = parse_runtime_storage_key(runtime_storage_key)?;
+        Some((expires_at_ms, stable_id, epoch))
+    }
+
+    pub fn parse_client_lease_expiry_runtime_key(&self, key: &str) -> Option<(String, u64)> {
+        let prefix = self.client_lease_expiry_runtime_prefix();
         let rest = key.strip_prefix(&prefix)?;
         let (stable_id, epoch_str) = rest.rsplit_once(':')?;
         let epoch = epoch_str.parse::<u64>().ok()?;
@@ -334,6 +386,12 @@ impl Default for MetadataKeyspace {
     }
 }
 
+fn parse_runtime_storage_key(storage_key: &str) -> Option<(String, u64)> {
+    let (stable_id, epoch_str) = storage_key.rsplit_once(':')?;
+    let epoch = epoch_str.parse::<u64>().ok()?;
+    Some((stable_id.to_string(), epoch))
+}
+
 #[cfg(test)]
 mod tests {
     use mooncake_store_core::{
@@ -378,6 +436,26 @@ mod tests {
             "{tenant-a}/system/client-lease-expiry"
         );
         assert_eq!(
+            keyspace.client_lease_expiry_runtime(&runtime),
+            "{tenant-a}/system/client-lease-expiry/by-runtime/writer:9"
+        );
+        assert_eq!(
+            keyspace.client_lease_expiry_runtime_prefix(),
+            "{tenant-a}/system/client-lease-expiry/by-runtime/"
+        );
+        assert_eq!(
+            keyspace.client_lease_expiry_time_prefix(),
+            "{tenant-a}/system/client-lease-expiry/by-time/"
+        );
+        assert_eq!(
+            keyspace.client_lease_expiry_time(123, &runtime),
+            "{tenant-a}/system/client-lease-expiry/by-time/00000000000000000123/writer:9"
+        );
+        assert_eq!(
+            keyspace.client_lease_expiry_time_range_end(124),
+            "{tenant-a}/system/client-lease-expiry/by-time/00000000000000000124/"
+        );
+        assert_eq!(
             keyspace.parse_client_key("{tenant-a}/clients/writer:9"),
             Some(("writer".to_string(), 9))
         );
@@ -390,6 +468,18 @@ mod tests {
             None
         );
         assert_eq!(keyspace.parse_client_key("other/clients/writer:9"), None);
+        assert_eq!(
+            keyspace.parse_client_lease_expiry_time_key(
+                "{tenant-a}/system/client-lease-expiry/by-time/00000000000000000123/writer:9"
+            ),
+            Some((123, "writer".to_string(), 9))
+        );
+        assert_eq!(
+            keyspace.parse_client_lease_expiry_runtime_key(
+                "{tenant-a}/system/client-lease-expiry/by-runtime/writer:9"
+            ),
+            Some(("writer".to_string(), 9))
+        );
         assert_eq!(
             keyspace.client_by_stable_marker(&stable, 9),
             "{tenant-a}/indexes/clients/by-stable/writer/9"
@@ -543,6 +633,8 @@ mod tests {
             keyspace.client_by_stable_index(&stable),
             keyspace.client_epoch_hwm(&stable),
             keyspace.client_lease_expiry_index(),
+            keyspace.client_lease_expiry_runtime(&runtime),
+            keyspace.client_lease_expiry_time(42, &runtime),
             keyspace.object(&ObjectKey::new("key-1")),
             keyspace.object_index(),
         ];

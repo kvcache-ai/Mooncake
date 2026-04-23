@@ -297,10 +297,8 @@ fn spawn_stale_segment_maintenance_worker(
     server_args: &ServerArgs,
     shutdown: Arc<AtomicBool>,
 ) -> Option<JoinHandle<()>> {
-    if !service.metadata_url().starts_with("redis://")
-        && !service.metadata_url().starts_with("rediss://")
-    {
-        info!("admin stale segment maintenance disabled for non-redis metadata");
+    if !service.supports_stale_segment_maintenance() {
+        info!("admin stale segment maintenance disabled for unsupported metadata backend");
         return None;
     }
     if server_args.cleanup_interval_ms == 0 {
