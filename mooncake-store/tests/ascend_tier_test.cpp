@@ -659,9 +659,9 @@ TEST_F(AscendTierTest, AscendCacheTierInitWithInvalidDeviceId) {
     // Verify basic properties are set correctly
     EXPECT_EQ(tier.GetTierId(), tier_id);
     EXPECT_EQ(tier.GetCapacity(), BASIC_CAPACITY);
+    EXPECT_EQ(tier.GetDeviceId(), INVALID_DEVICE_ID);
     EXPECT_EQ(tier.GetUsage(), 0);
     EXPECT_EQ(tier.GetMemoryType(), MemoryType::ASCEND_NPU);
-    EXPECT_EQ(tier.GetDeviceId(), INVALID_DEVICE_ID);
 
     TieredBackend backend;
 
@@ -840,13 +840,15 @@ TEST_F(AscendTierTest, CopyBetweenAscendTiersSameDevice) {
 TEST_F(AscendTierTest, AscendCacheTierAccessors) {
     UUID tier_id = generate_uuid();
     std::vector<std::string> tags = {"tag1", "tag2", "tag3"};
-    AscendCacheTier tier(tier_id, BASIC_CAPACITY, tags, 1);
+    const int device_id = 1;
+
+    AscendCacheTier tier(tier_id, BASIC_CAPACITY, tags, device_id);
 
     EXPECT_EQ(tier.GetTierId(), tier_id);
     EXPECT_EQ(tier.GetCapacity(), BASIC_CAPACITY);
     EXPECT_EQ(tier.GetUsage(), 0);
     EXPECT_EQ(tier.GetMemoryType(), MemoryType::ASCEND_NPU);
-    EXPECT_EQ(tier.GetDeviceId(), 1);
+    EXPECT_EQ(tier.GetDeviceId(), device_id);
     EXPECT_EQ(tier.GetTags().size(), 3);
     EXPECT_EQ(tier.GetTags()[0], "tag1");
     EXPECT_EQ(tier.GetTags()[1], "tag2");
@@ -864,8 +866,8 @@ TEST_F(AscendTierTest, AscendCacheTierConstructorWithDefaults) {
     EXPECT_EQ(tier.GetCapacity(), BASIC_CAPACITY);
     EXPECT_EQ(tier.GetUsage(), 0);
     EXPECT_EQ(tier.GetMemoryType(), MemoryType::ASCEND_NPU);
-    EXPECT_EQ(tier.GetDeviceId(), 0);
     EXPECT_EQ(tier.GetTags().size(), 0);  // Default empty tags
+    EXPECT_EQ(tier.GetDeviceId(), 0);
 }
 
 // ============================================================================
