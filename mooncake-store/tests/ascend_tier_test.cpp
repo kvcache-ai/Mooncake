@@ -50,52 +50,6 @@ class BufferRef : public BufferBase {
     const BufferBase* ref_;
 };
 
-#ifdef USE_ASCEND_CACHE_TIER
-/**
- * @class AscendBufferRef
- * @brief Non-owning reference to an AscendBuffer for testing.
- * Extends AscendBuffer but does not own the memory - destructor is a no-op.
- */
-class AscendBufferRef : public AscendBuffer {
-   public:
-    // Create a non-owning reference by passing a "dummy" unique_ptr that we
-    // will immediately release and replace with our reference
-    explicit AscendBufferRef(const AscendBuffer* ref)
-        : AscendBuffer(CreateDummyPtr(ref)), ref_(ref) {
-        // The base class now holds the dummy ptr. We override all methods
-        // to delegate to ref_ instead.
-    }
-
-    // Override to prevent memory release (we don't own the memory)
-    ~AscendBufferRef() override = default;
-
-    uint64_t data() const override { return ref_ ? ref_->data() : 0; }
-    std::size_t size() const override { return ref_ ? ref_->size() : 0; }
-    int GetDeviceId() const { return ref_ ? ref_->GetDeviceId() : -1; }
-    void* GetDevicePtr() const { return ref_ ? ref_->GetDevicePtr() : nullptr; }
-    const AscendUnifiedPointer* GetUnifiedPointer() const {
-        return ref_ ? ref_->GetUnifiedPointer() : nullptr;
-    }
-
-   private:
-    const AscendBuffer* ref_;
-
-    // Create a minimal AscendUnifiedPointer for base class construction
-    static std::unique_ptr<AscendUnifiedPointer> CreateDummyPtr(
-        const AscendBuffer* ref) {
-        auto ptr = std::make_unique<AscendUnifiedPointer>();
-        if (ref && ref->GetUnifiedPointer()) {
-            *ptr = *ref->GetUnifiedPointer();  // Copy the data
-        } else {
-            ptr->device_ptr = nullptr;
-            ptr->device_id = -1;
-            ptr->size = 0;
-        }
-        return ptr;
-    }
-};
-#endif
-
 // Test data size constants
 static constexpr size_t SMALL_DATA_SIZE = 4 * 1024;    // 4KB
 static constexpr size_t MEDIUM_DATA_SIZE = 64 * 1024;  // 64KB
@@ -159,21 +113,14 @@ TEST_F(AscendTierTest, MemoryTypeToStringAllTypes) {
 
 // Test AscendBuffer basic lifecycle
 TEST_F(AscendTierTest, AscendBufferLifecycle) {
-    // Create a mock AscendUnifiedPointer with fallback (host memory)
     void* mock_ptr = std::malloc(1024);
     ASSERT_NE(mock_ptr, nullptr);
 
-    auto unified_ptr = std::make_unique<AscendUnifiedPointer>(
-        AscendUnifiedPointer{mock_ptr, -1, 1024});
-    auto* raw_ptr = unified_ptr.get();
-
     {
-        AscendBuffer buffer(std::move(unified_ptr));
+        AscendBuffer buffer(mock_ptr, 1024);
         EXPECT_EQ(buffer.size(), 1024);
-        EXPECT_EQ(buffer.GetDeviceId(), -1);
         EXPECT_NE(buffer.data(), 0);
         EXPECT_EQ(buffer.GetDevicePtr(), mock_ptr);
-        EXPECT_EQ(buffer.GetUnifiedPointer(), raw_ptr);
     }
     // Buffer should be released when going out of scope
 }
@@ -183,9 +130,7 @@ TEST_F(AscendTierTest, AscendBufferMoveConstructor) {
     void* mock_ptr = std::malloc(2048);
     ASSERT_NE(mock_ptr, nullptr);
 
-    auto unified_ptr = std::make_unique<AscendUnifiedPointer>(
-        AscendUnifiedPointer{mock_ptr, 0, 2048});
-    AscendBuffer original(std::move(unified_ptr));
+    AscendBuffer original(mock_ptr, 2048);
 
     EXPECT_EQ(original.size(), 2048);
 
@@ -206,13 +151,8 @@ TEST_F(AscendTierTest, AscendBufferMoveAssignment) {
     ASSERT_NE(mock_ptr1, nullptr);
     ASSERT_NE(mock_ptr2, nullptr);
 
-    auto unified_ptr1 = std::make_unique<AscendUnifiedPointer>(
-        AscendUnifiedPointer{mock_ptr1, 0, 1024});
-    auto unified_ptr2 = std::make_unique<AscendUnifiedPointer>(
-        AscendUnifiedPointer{mock_ptr2, 1, 2048});
-
-    AscendBuffer buffer1(std::move(unified_ptr1));
-    AscendBuffer buffer2(std::move(unified_ptr2));
+    AscendBuffer buffer1(mock_ptr1, 1024);
+    AscendBuffer buffer2(mock_ptr2, 2048);
 
     EXPECT_EQ(buffer1.size(), 1024);
     EXPECT_EQ(buffer2.size(), 2048);
@@ -220,7 +160,6 @@ TEST_F(AscendTierTest, AscendBufferMoveAssignment) {
     // Move assign
     buffer1 = std::move(buffer2);
     EXPECT_EQ(buffer1.size(), 2048);
-    EXPECT_EQ(buffer1.GetDeviceId(), 1);
     EXPECT_EQ(buffer2.size(), 0);
 }
 
@@ -630,12 +569,9 @@ TEST_F(AscendTierTest, CopyAscendToDramWithVerification) {
 
     // 4. Copy from Ascend to DRAM using DataCopier (this should invoke
     // CopyAscendToDram)
-    const AscendBuffer* ascend_buf = static_pointer_cast<const AscendBuffer*>(
-        ascend_handle->loc.data.buffer.get());
-    ASSERT_NE(ascend_buf, nullptr) << "Buffer should be AscendBuffer";
-
     DataSource ascend_source;
-    ascend_source.buffer = std::make_unique<AscendBufferRef>(ascend_buf);
+    ascend_source.buffer =
+        std::make_unique<BufferRef>(ascend_handle->loc.data.buffer.get());
     ascend_source.type = MemoryType::ASCEND_NPU;
 
     auto copy_result = backend.GetDataCopier().Copy(ascend_source, dram_dest);
@@ -723,9 +659,9 @@ TEST_F(AscendTierTest, AscendCacheTierInitWithInvalidDeviceId) {
     // Verify basic properties are set correctly
     EXPECT_EQ(tier.GetTierId(), tier_id);
     EXPECT_EQ(tier.GetCapacity(), BASIC_CAPACITY);
-    EXPECT_EQ(tier.GetDeviceId(), INVALID_DEVICE_ID);
     EXPECT_EQ(tier.GetUsage(), 0);
     EXPECT_EQ(tier.GetMemoryType(), MemoryType::ASCEND_NPU);
+    EXPECT_EQ(tier.GetDeviceId(), INVALID_DEVICE_ID);
 
     TieredBackend backend;
 
@@ -904,15 +840,13 @@ TEST_F(AscendTierTest, CopyBetweenAscendTiersSameDevice) {
 TEST_F(AscendTierTest, AscendCacheTierAccessors) {
     UUID tier_id = generate_uuid();
     std::vector<std::string> tags = {"tag1", "tag2", "tag3"};
-    const int device_id = 1;
-
-    AscendCacheTier tier(tier_id, BASIC_CAPACITY, tags, device_id);
+    AscendCacheTier tier(tier_id, BASIC_CAPACITY, tags, 1);
 
     EXPECT_EQ(tier.GetTierId(), tier_id);
     EXPECT_EQ(tier.GetCapacity(), BASIC_CAPACITY);
     EXPECT_EQ(tier.GetUsage(), 0);
     EXPECT_EQ(tier.GetMemoryType(), MemoryType::ASCEND_NPU);
-    EXPECT_EQ(tier.GetDeviceId(), device_id);
+    EXPECT_EQ(tier.GetDeviceId(), 1);
     EXPECT_EQ(tier.GetTags().size(), 3);
     EXPECT_EQ(tier.GetTags()[0], "tag1");
     EXPECT_EQ(tier.GetTags()[1], "tag2");
@@ -930,8 +864,8 @@ TEST_F(AscendTierTest, AscendCacheTierConstructorWithDefaults) {
     EXPECT_EQ(tier.GetCapacity(), BASIC_CAPACITY);
     EXPECT_EQ(tier.GetUsage(), 0);
     EXPECT_EQ(tier.GetMemoryType(), MemoryType::ASCEND_NPU);
-    EXPECT_EQ(tier.GetTags().size(), 0);  // Default empty tags
     EXPECT_EQ(tier.GetDeviceId(), 0);
+    EXPECT_EQ(tier.GetTags().size(), 0);  // Default empty tags
 }
 
 // ============================================================================

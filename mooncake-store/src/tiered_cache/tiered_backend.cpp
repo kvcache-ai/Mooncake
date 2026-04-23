@@ -109,6 +109,10 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+#ifdef USE_ASCEND_CACHE_TIER
+    bool ascend_tier_initialized = false;
+#endif
+
     for (const auto& tier_config : root["tiers"]) {
         // Parse required fields
         if (!tier_config.isMember("type")) {
@@ -195,6 +199,11 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         }
 #ifdef USE_ASCEND_CACHE_TIER
         else if (type == "ASCEND_NPU" || type == "ASCEND") {
+            if (ascend_tier_initialized) {
+                LOG(ERROR) << "Multiple Ascend tiers are not allowed, skipping "
+                              "this tier";
+                continue;
+            }
             // Parse device_id
             int device_id = 0;
             if (tier_config.isMember("device_id")) {
@@ -218,6 +227,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             tier_info_[id] = {priority, tags};
             memory_type = MemoryType::ASCEND_NPU;
             LOG(INFO) << "Successfully initialized ASCEND_NPU tier: id=" << id;
+            ascend_tier_initialized = true;
         }
 #endif
         else if (type == "STORAGE" || type == "DISK") {

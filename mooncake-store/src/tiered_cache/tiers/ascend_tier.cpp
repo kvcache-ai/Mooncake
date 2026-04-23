@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 
@@ -19,6 +20,30 @@ namespace mooncake {
 // ============================================================================
 
 #ifdef USE_ASCEND_CACHE_TIER
+
+namespace {
+constexpr const char* kAscendDeviceIdEnv = "MOONCAKE_ASCEND_DEVICE_ID";
+
+inline int GetSingleAscendDeviceId() {
+    const char* value = std::getenv(kAscendDeviceIdEnv);
+    if (!value || std::string(value).empty()) {
+        return 0;
+    }
+    try {
+        return std::stoi(value);
+    } catch (...) {
+        return 0;
+    }
+}
+
+inline void SetSingleAscendDeviceId(int device_id) {
+#ifdef _WIN32
+    _putenv_s(kAscendDeviceIdEnv, std::to_string(device_id).c_str());
+#else
+    setenv(kAscendDeviceIdEnv, std::to_string(device_id).c_str(), 1);
+#endif
+}
+}  // namespace
 
 // Helper function to set device context
 inline bool AclSetDevice(int device_id, const char* operation_name) {
@@ -85,56 +110,50 @@ inline bool AclMemcpyWithDevice(int device_id, void* dst, size_t dst_size,
 // AscendBuffer Implementation
 // ============================================================================
 
-AscendBuffer::AscendBuffer(std::unique_ptr<AscendUnifiedPointer> unified_ptr)
-    : unified_ptr_(std::move(unified_ptr)) {}
+AscendBuffer::AscendBuffer(void* device_ptr, size_t size)
+    : device_ptr_(device_ptr), size_(size) {}
 
 AscendBuffer::~AscendBuffer() { ReleaseMemory(); }
 
 AscendBuffer::AscendBuffer(AscendBuffer&& other) noexcept
-    : unified_ptr_(std::move(other.unified_ptr_)) {}
+    : device_ptr_(other.device_ptr_), size_(other.size_) {
+    other.device_ptr_ = nullptr;
+    other.size_ = 0;
+}
 
 AscendBuffer& AscendBuffer::operator=(AscendBuffer&& other) noexcept {
     if (this != &other) {
         ReleaseMemory();
-        unified_ptr_ = std::move(other.unified_ptr_);
+        device_ptr_ = other.device_ptr_;
+        size_ = other.size_;
+        other.device_ptr_ = nullptr;
+        other.size_ = 0;
     }
     return *this;
 }
 
 void AscendBuffer::ReleaseMemory() {
-    if (unified_ptr_) {
+    if (device_ptr_) {
 #ifdef USE_ASCEND_CACHE_TIER
-        AclFreeWithDevice(unified_ptr_->device_id, unified_ptr_->device_ptr,
+        AclFreeWithDevice(GetSingleAscendDeviceId(), device_ptr_,
                           "AscendBuffer::ReleaseMemory");
 #else
         // This should not happen as Init fails without USE_ASCEND_CACHE_TIER
         LOG(ERROR) << "AscendBuffer::ReleaseMemory called but "
                       "USE_ASCEND_CACHE_TIER is not enabled";
 #endif
-        unified_ptr_.reset();
+        device_ptr_ = nullptr;
+        size_ = 0;
     }
 }
 
 uint64_t AscendBuffer::data() const {
-    return unified_ptr_ ? reinterpret_cast<uint64_t>(unified_ptr_->device_ptr)
-                        : 0;
+    return reinterpret_cast<uint64_t>(device_ptr_);
 }
 
-std::size_t AscendBuffer::size() const {
-    return unified_ptr_ ? unified_ptr_->size : 0;
-}
+std::size_t AscendBuffer::size() const { return size_; }
 
-int AscendBuffer::GetDeviceId() const {
-    return unified_ptr_ ? unified_ptr_->device_id : -1;
-}
-
-void* AscendBuffer::GetDevicePtr() const {
-    return unified_ptr_ ? unified_ptr_->device_ptr : nullptr;
-}
-
-const AscendUnifiedPointer* AscendBuffer::GetUnifiedPointer() const {
-    return unified_ptr_.get();
-}
+void* AscendBuffer::GetDevicePtr() const { return device_ptr_; }
 
 // ============================================================================
 // AscendCacheTier Implementation
@@ -224,6 +243,7 @@ tl::expected<void, ErrorCode> AscendCacheTier::Init(TieredBackend* backend,
     if (!AclSetDevice(device_id_, "AscendCacheTier::Init")) {
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
+    SetSingleAscendDeviceId(device_id_);
 
     LOG(INFO) << "AscendCacheTier initialized: tier_id=" << tier_id_
               << ", capacity=" << capacity_ << " bytes"
@@ -265,8 +285,8 @@ tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
                                                    std::memory_order_acquire));
 
     // Space reserved, now allocate device memory
-    auto unified_ptr = AllocateDeviceMemory(size);
-    if (!unified_ptr) {
+    void* device_ptr = AllocateDeviceMemory(size);
+    if (!device_ptr) {
         // Allocation failed, rollback the reserved space
         current_usage_.fetch_sub(size, std::memory_order_release);
         LOG(ERROR) << "Failed to allocate device memory for tier " << tier_id_;
@@ -274,7 +294,7 @@ tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
     }
 
     // Create AscendBuffer and wrap in DataSource
-    auto ascend_buffer = std::make_unique<AscendBuffer>(std::move(unified_ptr));
+    auto ascend_buffer = std::make_unique<AscendBuffer>(device_ptr, size);
     data.buffer = std::move(ascend_buffer);
     data.type = MemoryType::ASCEND_NPU;
 
@@ -312,8 +332,7 @@ size_t AscendCacheTier::GetUsage() const {
     return current_usage_.load(std::memory_order_acquire);
 }
 
-std::unique_ptr<AscendUnifiedPointer> AscendCacheTier::AllocateDeviceMemory(
-    size_t size) {
+void* AscendCacheTier::AllocateDeviceMemory(size_t size) {
     if (size == 0) {
         LOG(ERROR) << "AllocateDeviceMemory called with size 0";
         return nullptr;
@@ -322,19 +341,7 @@ std::unique_ptr<AscendUnifiedPointer> AscendCacheTier::AllocateDeviceMemory(
 #ifdef USE_ASCEND_CACHE_TIER
     void* device_ptr =
         AclMallocWithDevice(device_id_, size, "AllocateDeviceMemory");
-    if (!device_ptr) {
-        return nullptr;
-    }
-
-    try {
-        return std::make_unique<AscendUnifiedPointer>(
-            AscendUnifiedPointer{device_ptr, device_id_, size});
-    } catch (const std::bad_alloc& e) {
-        LOG(ERROR) << "Failed to allocate AscendUnifiedPointer: " << e.what();
-        AclFreeWithDevice(device_id_, device_ptr,
-                          "AllocateDeviceMemory cleanup");
-        return nullptr;
-    }
+    return device_ptr;
 #else
     // USE_ASCEND_CACHE_TIER not defined - Init should have failed already
     LOG(ERROR)
@@ -355,8 +362,7 @@ bool AscendCacheTier::HasSpace(size_t size) const {
 /**
  * @brief Copy data from Ascend NPU to DRAM.
  *
- * Extracts AscendUnifiedPointer from source buffer to get device context,
- * then performs device-to-host memory copy.
+ * Uses the active Ascend device context to perform device-to-host copy.
  */
 tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
                                                const DataSource& dst) {
@@ -372,23 +378,12 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Get AscendUnifiedPointer from source using type-safe cast
-    const AscendBuffer* ascend_src_buffer =
-        static_cast<const AscendBuffer*>(src.buffer.get());
-    if (!ascend_src_buffer) {
-        LOG(ERROR) << "CopyAscendToDram: source buffer is not an AscendBuffer";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const AscendUnifiedPointer* ascend_ptr =
-        ascend_src_buffer->GetUnifiedPointer();
-
-    if (!ascend_ptr || !ascend_ptr->device_ptr) {
-        LOG(ERROR) << "CopyAscendToDram: invalid Ascend pointer";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Get destination DRAM address
     size_t copy_size = src.buffer->size();
+    void* src_ptr = reinterpret_cast<void*>(src.buffer->data());
+    if (!src_ptr) {
+        LOG(ERROR) << "CopyAscendToDram: source pointer is null";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
 
     // Validate destination buffer size
     if (dst.buffer->size() < copy_size) {
@@ -399,16 +394,20 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
 
 #ifdef USE_ASCEND_CACHE_TIER
     void* dest_ptr = reinterpret_cast<void*>(dst.buffer->data());
+    if (!dest_ptr) {
+        LOG(ERROR) << "CopyAscendToDram: destination pointer is null";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // Perform copy with device context management
-    if (!AclMemcpyWithDevice(ascend_ptr->device_id, dest_ptr,
-                             dst.buffer->size(), ascend_ptr->device_ptr,
+    int device_id = GetSingleAscendDeviceId();
+    if (!AclMemcpyWithDevice(device_id, dest_ptr, dst.buffer->size(), src_ptr,
                              copy_size, ACL_MEMCPY_DEVICE_TO_HOST,
                              "CopyAscendToDram")) {
         return tl::unexpected(ErrorCode::DATA_COPY_FAILED);
     }
 
     VLOG(1) << "CopyAscendToDram: copied " << copy_size << " bytes from device "
-            << ascend_ptr->device_id;
+            << device_id;
     return tl::expected<void, ErrorCode>{};
 #else
     LOG(ERROR)
@@ -420,8 +419,7 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
 /**
  * @brief Copy data from DRAM to Ascend NPU.
  *
- * Extracts AscendUnifiedPointer from destination buffer to get device context,
- * then performs host-to-device memory copy.
+ * Uses the active Ascend device context to perform host-to-device copy.
  */
 tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
                                                const DataSource& dst) {
@@ -439,41 +437,36 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
 
     // Get source DRAM address
     size_t copy_size = src.buffer->size();
-
-    // Get AscendUnifiedPointer from destination using type-safe cast
-    const AscendBuffer* ascend_dst_buffer =
-        static_cast<const AscendBuffer*>(dst.buffer.get());
-    if (!ascend_dst_buffer) {
-        LOG(ERROR)
-            << "CopyDramToAscend: destination buffer is not an AscendBuffer";
+    const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
+    if (!src_ptr) {
+        LOG(ERROR) << "CopyDramToAscend: source pointer is null";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const AscendUnifiedPointer* ascend_ptr =
-        ascend_dst_buffer->GetUnifiedPointer();
 
-    if (!ascend_ptr || !ascend_ptr->device_ptr) {
-        LOG(ERROR) << "CopyDramToAscend: invalid Ascend pointer";
+    void* dst_ptr = reinterpret_cast<void*>(dst.buffer->data());
+    if (!dst_ptr) {
+        LOG(ERROR) << "CopyDramToAscend: destination pointer is null";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Validate destination buffer size
-    if (ascend_ptr->size < copy_size) {
+    if (dst.buffer->size() < copy_size) {
         LOG(ERROR) << "CopyDramToAscend: destination buffer too small ("
-                   << ascend_ptr->size << " < " << copy_size << ")";
+                   << dst.buffer->size() << " < " << copy_size << ")";
         return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
 
 #ifdef USE_ASCEND_CACHE_TIER
-    const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
     // Perform copy with device context management
-    if (!AclMemcpyWithDevice(ascend_ptr->device_id, ascend_ptr->device_ptr,
-                             ascend_ptr->size, src_ptr, copy_size,
-                             ACL_MEMCPY_HOST_TO_DEVICE, "CopyDramToAscend")) {
+    int device_id = GetSingleAscendDeviceId();
+    if (!AclMemcpyWithDevice(device_id, dst_ptr, dst.buffer->size(), src_ptr,
+                             copy_size, ACL_MEMCPY_HOST_TO_DEVICE,
+                             "CopyDramToAscend")) {
         return tl::unexpected(ErrorCode::DATA_COPY_FAILED);
     }
 
     VLOG(1) << "CopyDramToAscend: copied " << copy_size << " bytes to device "
-            << ascend_ptr->device_id;
+            << device_id;
     return tl::expected<void, ErrorCode>{};
 #else
     LOG(ERROR)
