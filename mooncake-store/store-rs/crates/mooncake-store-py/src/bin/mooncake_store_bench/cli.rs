@@ -33,7 +33,7 @@ pub struct GlobalArgs {
     pub scratch_bytes: usize,
     #[arg(long, default_value = "bench", env = "MC_STORE_RS_TENANT")]
     pub tenant: String,
-    #[arg(long, default_value = "info", env = "MC_STORE_RS_TRACE_FILTER")]
+    #[arg(long, env = "MC_STORE_RS_TRACE_FILTER")]
     pub trace_filter: Option<String>,
     #[arg(long, env = "MC_STORE_RS_METRICS_ADDR")]
     pub metrics_addr: Option<String>,
@@ -258,7 +258,7 @@ mod tests {
             "bench",
         ]);
         assert_eq!(cli.global.metadata_url, "redis://127.0.0.1:6379/0");
-        assert_eq!(cli.global.trace_filter.as_deref(), Some("info"));
+        assert_eq!(cli.global.trace_filter.as_deref(), None);
         assert!(matches!(
             cli.global.transport_backend,
             TransportBackend::ClassicTe

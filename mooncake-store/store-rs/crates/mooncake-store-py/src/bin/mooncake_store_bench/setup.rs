@@ -102,6 +102,9 @@ fn log_bench_startup_context(
 fn log_relevant_env() {
     const KEYS: &[&str] = &[
         "MC_STORE_RS_TRANSPORT_METADATA_URL",
+        "MC_STORE_RS_TRACE_FILTER",
+        "MC_STORE_RS_TRACE_FILE",
+        "MC_BENCH_TRACE_FILE",
         "MC_STORE_RS_KEYSPACE",
         "MC_STORE_RS_TRANSPORT_BACKEND",
         "MOONCAKE_PROTOCOL",
