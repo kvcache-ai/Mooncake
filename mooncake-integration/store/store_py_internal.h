@@ -1318,4 +1318,3 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
     }
     return plan;
 }
-

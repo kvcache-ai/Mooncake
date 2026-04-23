@@ -59,7 +59,8 @@
         const ReplicateConfig &config) {
         return execute_direct_parallelism_shard_write_from(
             key, buffer_ptr, size, parallelism, config,
-            "put_tensor_with_parallelism_from", TensorWriteStoreOps{"put_parts"},
+            "put_tensor_with_parallelism_from",
+            TensorWriteStoreOps{"put_parts"},
             [this](const std::string &shard_key,
                    const std::vector<std::span<const char>> &values,
                    const ReplicateConfig &write_config) {
@@ -87,8 +88,7 @@
                    const ReplicateConfig &write_config, int rank, int size,
                    int split_dim) {
                 return put_tensor_with_tp_impl(write_key, write_tensor,
-                                               write_config, rank, size,
-                                               split_dim);
+                                               write_config, size, split_dim);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const ReplicateConfig &write_config, int rank, int size,
@@ -117,6 +117,40 @@
         }
         return execute_put_tensor_with_parallelism_route(key, tensor, *request,
                                                          config);
+    }
+
+    std::vector<int> batch_put_tensor_with_parallelism(
+        const std::vector<std::string> &keys,
+        const pybind11::list &tensors_list,
+        const py::object &parallelisms = py::none(),
+        const ReplicateConfig &config = ReplicateConfig{},
+        const py::object &writer_partitions = py::none()) {
+        return execute_batch_parallelism_write_requests(
+            keys, tensors_list.size(), parallelisms, writer_partitions,
+            "batch_put_tensor_with_parallelism",
+            [this, &keys, &tensors_list, &config]() {
+                if (!is_client_initialized() || use_dummy_client_) {
+                    return std::vector<int>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                int validate_result = validate_replicate_config(config);
+                if (validate_result) {
+                    return std::vector<int>(keys.size(), validate_result);
+                }
+                return batch_put_tensor_impl(keys, tensors_list, config);
+            },
+            [this, &keys, &tensors_list, &config](
+                size_t i, const py::handle &parallelism) {
+                return put_tensor_with_parallelism(
+                    keys[i], tensors_list[i],
+                    py::reinterpret_borrow<py::object>(parallelism), config);
+            },
+            [this, &keys, &tensors_list, &config](
+                size_t i, const py::handle &writer_partition) {
+                return put_tensor_with_parallelism(
+                    keys[i], tensors_list[i], py::none(), config,
+                    py::reinterpret_borrow<py::object>(writer_partition));
+            });
     }
 
     bool is_valid_tensor_object_buffer(uintptr_t buffer_ptr, size_t size,
@@ -425,150 +459,36 @@
         const std::string &key, uintptr_t buffer_ptr, size_t size,
         const WriterPartitionSpec &writer,
         const ReplicateConfig &config = ReplicateConfig{}) {
-        auto parsed = parse_tensor_metadata_from_raw_buffer(
-            buffer_ptr, size, "upsert_tensor_with_parallelism_from");
-        if (!parsed.has_value()) {
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-
-        auto plan = build_raw_tensor_shard_write_plan(
-            *parsed, writer.split_dim, writer.rank, writer.size,
-            "upsert_tensor_with_parallelism_from");
-        if (!plan.has_value()) {
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-
-        ParallelAxisSpec axis_spec{"tp",         writer.rank,
-                                   writer.size,  writer.split_dim,
-                                   std::nullopt, std::nullopt};
-        auto metadata = build_shard_metadata_from_shapes(
-            parsed->metadata.header.dtype,
-            TensorShapeToVector(parsed->metadata.layout.global_shape,
-                                parsed->metadata.header.ndim),
-            TensorShapeToVector(plan->metadata.layout.local_shape,
-                                plan->metadata.header.ndim),
-            {axis_spec}, plan->metadata.header.data_bytes);
-        if (!metadata.has_value()) {
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        plan->metadata = *metadata;
-
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&plan->metadata),
-                            plan->metadata.header.data_offset);
-        for (const auto &[src_offset, part_size] : plan->data_ranges) {
-            values.emplace_back(
-                reinterpret_cast<const char *>(buffer_ptr + src_offset),
-                part_size);
-        }
-
-        int ret;
-        {
-            py::gil_scoped_release release_gil;
-            ret = store_->upsert_parts(get_writer_shard_key_name(key, writer),
-                                       values, config);
-        }
-        if (ret != 0) {
-            LOG(ERROR) << "upsert_parts failed for writer shard key "
-                       << get_writer_shard_key_name(key, writer)
-                       << " with code " << ret;
-            return ret;
-        }
-        return upsert_manifest_impl(
-            get_writer_manifest_key_name(key),
-            build_writer_shard_manifest_from_shape(
-                TensorShapeToVector(parsed->metadata.layout.global_shape,
-                                    parsed->metadata.header.ndim),
-                parsed->metadata.header.dtype, writer),
-            config);
+        return execute_writer_partition_shard_write_from(
+            key, buffer_ptr, size, writer, config,
+            "upsert_tensor_with_parallelism_from",
+            TensorWriteStoreOps{"upsert_parts"},
+            [this](const std::string &shard_key,
+                   const std::vector<std::span<const char>> &values,
+                   const ReplicateConfig &write_config) {
+                return store_->upsert_parts(shard_key, values, write_config);
+            },
+            [this](const std::string &manifest_key,
+                   const WriterShardManifest &manifest,
+                   const ReplicateConfig &write_config) {
+                return upsert_manifest_impl(manifest_key, manifest,
+                                            write_config);
+            });
     }
 
     int upsert_direct_parallelism_shard_from(
         const std::string &key, uintptr_t buffer_ptr, size_t size,
         const TensorParallelismSpec &parallelism,
         const ReplicateConfig &config) {
-        auto parsed = parse_tensor_metadata_from_raw_buffer(
-            buffer_ptr, size, "upsert_tensor_with_parallelism_from");
-        if (!parsed.has_value()) {
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-
-        std::vector<LayoutAxis> layout_axes;
-        layout_axes.reserve(parallelism.axes.size());
-        for (size_t i = 0; i < parallelism.axes.size(); ++i) {
-            int64_t local_split_extent = -1;
-            if (parallelism.axes[i].split_dim.has_value()) {
-                int split_dim = parallelism.axes[i].split_dim.value();
-                if (split_dim < 0 ||
-                    split_dim >=
-                        static_cast<int>(parsed->metadata.header.ndim)) {
-                    return to_py_ret(ErrorCode::INVALID_PARAMS);
-                }
-                local_split_extent =
-                    parsed->metadata.layout.local_shape.dims[split_dim];
-            }
-            auto layout_axis = build_layout_axis_from_spec(
-                parallelism.axes[i], i, local_split_extent);
-            if (!layout_axis.has_value()) {
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-            layout_axes.push_back(*layout_axis);
-        }
-
-        TensorMetadata metadata = BuildTensorMetadata(
-            parsed->metadata.header.dtype,
-            TensorShapeToVector(parsed->metadata.layout.global_shape,
-                                parsed->metadata.header.ndim),
-            TensorShapeToVector(parsed->metadata.layout.local_shape,
-                                parsed->metadata.header.ndim),
-            TensorLayoutKind::SHARD,
-            std::span<const LayoutAxis>(layout_axes.data(),
-                                        layout_axes.size()));
-        metadata.header.data_bytes = parsed->data_bytes;
-
-        std::string shard_key = get_parallelism_key_name(key, parallelism);
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&metadata),
-                            metadata.header.data_offset);
-        values.emplace_back(
-            reinterpret_cast<const char *>(buffer_ptr + parsed->data_offset),
-            parsed->data_bytes);
-
-        py::gil_scoped_release release_gil;
-        int ret = store_->upsert_parts(shard_key, values, config);
-        if (ret != 0) {
-            LOG(ERROR) << "upsert_parts failed for key " << shard_key
-                       << " with code " << ret;
-        }
-        return ret;
-    }
-
-    int upsert_tensor_with_tp_impl(
-        const std::string &key, pybind11::object tensor,
-        const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
-        int tp_size = 1, int split_dim = 0,
-        const std::vector<ParallelAxisSpec> &axes = {}) {
-        return execute_tp_tensor_write_impl(
-            key, tensor, config, tp_size, split_dim, axes,
-            "Failed to upsert tensor with tp",
-            [this](const std::string &shard_key, const PyTensorInfo &info,
+        return execute_direct_parallelism_shard_write_from(
+            key, buffer_ptr, size, parallelism, config,
+            "upsert_tensor_with_parallelism_from",
+            TensorWriteStoreOps{"upsert_parts"},
+            [this](const std::string &shard_key,
+                   const std::vector<std::span<const char>> &values,
                    const ReplicateConfig &write_config) {
-                return upsert_tensor_impl(shard_key, info, write_config);
+                return store_->upsert_parts(shard_key, values, write_config);
             });
-    }
-
-    int upsert_tensor_with_tp(const std::string &key, pybind11::object tensor,
-                              int tp_rank = 0, int tp_size = 1,
-                              int split_dim = 0) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (tp_size <= 1) return upsert_tensor(key, tensor);
-
-        return upsert_tensor_with_tp_impl(key, tensor, ReplicateConfig{},
-                                          tp_rank, tp_size, split_dim);
     }
 
     int execute_upsert_tensor_with_parallelism_route(
@@ -592,15 +512,14 @@
                    const ReplicateConfig &write_config, int rank, int size,
                    int split_dim) {
                 return upsert_tensor_with_tp_impl(write_key, write_tensor,
-                                                  write_config, rank, size,
-                                                  split_dim);
+                                                  write_config, size, split_dim);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const ReplicateConfig &write_config, int rank, int size,
                    int split_dim, const std::vector<ParallelAxisSpec> &axes) {
                 return upsert_tensor_with_tp_impl(write_key, write_tensor,
-                                                  write_config, rank, size,
-                                                  split_dim, axes);
+                                                  write_config, size, split_dim,
+                                                  axes);
             },
             [this](const std::string &write_key, pybind11::object write_tensor,
                    const TensorParallelismSpec &parallelism_spec,
