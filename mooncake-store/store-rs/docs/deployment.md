@@ -644,6 +644,8 @@ Backend reconnect behavior:
 - when Redis metadata connectivity returns, the heartbeat recovery path republishes both store metadata and transport metadata
 - `classic_te` repairs fresh Redis restarts by recreating its engine and republishing local buffers
 - `tent` repairs fresh Redis restarts by recreating its engine and re-registering the local buffers it still owns
+- if a live peer restart leaves callers with a stale cached remote segment handle, reads and routed writes refresh that handle by segment name before treating the peer as dead
+- runtime quarantine still applies to true reopen or transfer failures; stale cached handles alone do not demote an otherwise live peer
 - the process must remain alive across the outage for automatic recovery; a dead client still needs normal restart and lease takeover semantics
 
 ## Routing Modes

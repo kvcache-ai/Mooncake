@@ -1,4 +1,13 @@
 impl StoreClient {
+    fn invalidate_remote_write_segments(&self, targets: &[ReplicaWriteTarget]) {
+        let mut state = self.state.lock();
+        for target in targets {
+            if target.storage_runtime != self.lease.runtime {
+                state.invalidate_remote_segment(&target.segment_name.0);
+            }
+        }
+    }
+
     fn segment_name(&self) -> Result<SegmentName> {
         self.lease
             .endpoints
@@ -19,112 +28,146 @@ impl StoreClient {
             ));
         }
         let transport = self.transport()?;
-        let mut absolute_offsets = vec![0u64; targets.len()];
-        let mut remote_requests = Vec::new();
-        let mut local_writes = 0usize;
+        let mut refreshed = false;
+        loop {
+            let mut absolute_offsets = vec![0u64; targets.len()];
+            let mut remote_requests = Vec::new();
+            let mut local_writes = 0usize;
 
-        for (index, (target, reservation)) in targets.iter().zip(reservations.iter()).enumerate() {
-            if target.storage_runtime == self.lease.runtime
-                && self
-                    .state
-                    .lock()
-                    .memory_ref()
-                    .map(|memory| memory.has_storage_segment(&target.segment_name))
-                    .unwrap_or(false)
+            for (index, (target, reservation)) in
+                targets.iter().zip(reservations.iter()).enumerate()
             {
-                let addr = {
-                    let state = self.state.lock();
-                    state
-                        .memory_ref()?
-                        .storage_address(&target.segment_name, reservation.offset_bytes as usize)?
-                };
-                unsafe {
-                    ptr::copy_nonoverlapping(value.as_ptr(), addr.cast::<u8>(), value.len());
+                if target.storage_runtime == self.lease.runtime
+                    && self
+                        .state
+                        .lock()
+                        .memory_ref()
+                        .map(|memory| memory.has_storage_segment(&target.segment_name))
+                        .unwrap_or(false)
+                {
+                    let addr = {
+                        let state = self.state.lock();
+                        state.memory_ref()?.storage_address(
+                            &target.segment_name,
+                            reservation.offset_bytes as usize,
+                        )?
+                    };
+                    unsafe {
+                        ptr::copy_nonoverlapping(value.as_ptr(), addr.cast::<u8>(), value.len());
+                    }
+                    absolute_offsets[index] = addr as u64;
+                    local_writes += 1;
+                    continue;
                 }
-                absolute_offsets[index] = addr as u64;
-                local_writes += 1;
-                continue;
+
+                self.ensure_remote_runtime_reachable(
+                    &target.storage_runtime,
+                    &target.segment_name.0,
+                )?;
+                let (handle, info) = {
+                    let mut state = self.state.lock();
+                    state.open_segment_with_info(transport, &target.segment_name.0)?
+                };
+                let target_offset = Self::segment_relative_target_offset(
+                    &info,
+                    &target.segment_name,
+                    reservation.offset_bytes,
+                    value.len() as u64,
+                )?;
+                remote_requests.push((handle, target_offset));
+                absolute_offsets[index] = target_offset;
             }
 
-            self.ensure_remote_runtime_reachable(&target.storage_runtime, &target.segment_name.0)?;
-            let (handle, info) = {
-                let mut state = self.state.lock();
-                state.open_segment_with_info(transport, &target.segment_name.0)?
-            };
-            let target_offset = Self::segment_relative_target_offset(
-                &info,
-                &target.segment_name,
-                reservation.offset_bytes,
-                value.len() as u64,
-            )?;
-            remote_requests.push((index, handle, target_offset));
-            absolute_offsets[index] = target_offset;
-        }
-        if local_writes != 0 {
-            record_success_metric("put_local_copy", (local_writes * value.len()) as u64, 0);
-        }
-        debug!(
-            runtime = %self.lease.runtime,
-            replicas = targets.len(),
-            local_writes,
-            remote_writes = remote_requests.len(),
-            value_bytes = value.len(),
-            "writing reserved replicas"
-        );
+            debug!(
+                runtime = %self.lease.runtime,
+                replicas = targets.len(),
+                local_writes,
+                remote_writes = remote_requests.len(),
+                value_bytes = value.len(),
+                refreshed,
+                "writing reserved replicas"
+            );
 
-        if !remote_requests.is_empty() {
-            let remote_bytes = (remote_requests.len() * value.len()) as u64;
-            let request_deadline = self.request_deadline_for_transfer(remote_bytes, 1);
-            let tracker = OperationTracker::new("put_remote_batch_write")
-                .input_bytes(remote_bytes);
-            let result = (|| {
-                let scratch = {
-                    let state = self.state.lock();
-                    state.memory_ref()?.plan_scratch(&[value.len()])?
-                };
-                copy_into_region(scratch[0], value);
-                let requests = remote_requests
-                    .iter()
-                    .map(|(_, handle, target_offset)| TransferRequest {
-                        opcode: Opcode::Write,
-                        source: scratch[0].addr,
-                        target_id: *handle,
-                        target_offset: *target_offset,
-                        length: value.len() as u64,
-                    })
-                    .collect::<Vec<_>>();
-                let chunk_size = self.remote_write_chunk_limit(value.len(), requests.len());
-                for chunk in requests.chunks(chunk_size) {
-                    let batch_id = transport.allocate_batch(chunk.len())?;
-                    let hints = self.remote_batch_hints(
-                        self.default_tenant(),
-                        (chunk.len() * value.len()) as u64,
-                        TransferPacingMode::ThroughputOptimized,
-                    );
-                    let submit_result = transport.submit_with_hints(batch_id, chunk, &hints);
-                    if let Err(error) = submit_result {
-                        let _ = transport.free_batch(batch_id);
-                        return Err(error);
-                    }
-                    let wait_result = wait_for_batch_completion_detailed(
-                        transport,
-                        batch_id,
-                        self.transfer_stall_timeout,
-                        request_deadline.instant(),
-                    )
-                    .map_err(StoreError::from);
-                    let free_result = transport.free_batch(batch_id);
-                    wait_result?;
-                    free_result?;
-                }
+            let result = if remote_requests.is_empty() {
                 Ok(())
-            })();
-            tracker.finish(&result, 0);
-            result?;
-            registry::record_transport_bytes("write", "storage", remote_bytes);
-        }
+            } else {
+                let remote_bytes = (remote_requests.len() * value.len()) as u64;
+                let request_deadline = self.request_deadline_for_transfer(remote_bytes, 1);
+                let tracker =
+                    OperationTracker::new("put_remote_batch_write").input_bytes(remote_bytes);
+                let result = (|| {
+                    let scratch = {
+                        let state = self.state.lock();
+                        state.memory_ref()?.plan_scratch(&[value.len()])?
+                    };
+                    copy_into_region(scratch[0], value);
+                    let requests = remote_requests
+                        .iter()
+                        .map(|(handle, target_offset)| TransferRequest {
+                            opcode: Opcode::Write,
+                            source: scratch[0].addr,
+                            target_id: *handle,
+                            target_offset: *target_offset,
+                            length: value.len() as u64,
+                        })
+                        .collect::<Vec<_>>();
+                    let chunk_size = self.remote_write_chunk_limit(value.len(), requests.len());
+                    for chunk in requests.chunks(chunk_size) {
+                        let batch_id = transport.allocate_batch(chunk.len())?;
+                        let hints = self.remote_batch_hints(
+                            self.default_tenant(),
+                            (chunk.len() * value.len()) as u64,
+                            TransferPacingMode::ThroughputOptimized,
+                        );
+                        let submit_result = transport.submit_with_hints(batch_id, chunk, &hints);
+                        if let Err(error) = submit_result {
+                            let _ = transport.free_batch(batch_id);
+                            return Err(error);
+                        }
+                        let wait_result = wait_for_batch_completion_detailed(
+                            transport,
+                            batch_id,
+                            self.transfer_stall_timeout,
+                            request_deadline.instant(),
+                        )
+                        .map_err(StoreError::from);
+                        let free_result = transport.free_batch(batch_id);
+                        wait_result?;
+                        free_result?;
+                    }
+                    Ok(())
+                })();
+                tracker.finish(&result, 0);
+                if result.is_ok() {
+                    registry::record_transport_bytes("write", "storage", remote_bytes);
+                }
+                result
+            };
 
-        Ok(absolute_offsets)
+            match result {
+                Ok(()) => {
+                    if local_writes != 0 {
+                        record_success_metric(
+                            "put_local_copy",
+                            (local_writes * value.len()) as u64,
+                            0,
+                        );
+                    }
+                    return Ok(absolute_offsets);
+                }
+                Err(error) if !refreshed && remote_segment_cache_stale(&error) => {
+                    self.invalidate_remote_write_segments(targets);
+                    refreshed = true;
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        replicas = targets.len(),
+                        error = %error,
+                        "retrying remote write after refreshing cached remote segment handle"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn batch_put_scoped_routed(
@@ -544,17 +587,20 @@ impl StoreClient {
                 .map(|entry| entry.value.len())
                 .sum::<usize>() as u64,
         );
-        let write_result = (|| {
-            struct RemoteBatchWrite<'a> {
-                tenant: &'a str,
-                value: &'a [u8],
-                requests: Vec<TransferRequest>,
-            }
+        let write_result = {
+            let mut refreshed = false;
+            loop {
+                let attempt_result = (|| {
+                    struct RemoteBatchWrite<'a> {
+                        tenant: &'a str,
+                        value: &'a [u8],
+                        requests: Vec<TransferRequest>,
+                    }
 
-            let mut routes = Vec::with_capacity(prepared.len());
-            let mut remote_writes = Vec::new();
-            let mut checked_runtimes = BTreeSet::new();
-            for (entry, current) in prepared.iter().zip(current_routes.into_iter()) {
+                    let mut routes = Vec::with_capacity(prepared.len());
+                    let mut remote_writes = Vec::new();
+                    let mut checked_runtimes = BTreeSet::new();
+                    for (entry, current) in prepared.iter().zip(current_routes.iter().cloned()) {
                 let checksum = payload_checksum(entry.value);
                 let mut replicas = Vec::with_capacity(entry.targets.len());
                 let mut remote_requests = Vec::new();
@@ -763,8 +809,26 @@ impl StoreClient {
                 registry::record_transport_bytes("write", "storage", remote_bytes);
                 cursor += selected.len();
             }
-            Ok(routes)
-        })();
+                    Ok(routes)
+                })();
+                match attempt_result {
+                    Ok(routes) => break Ok(routes),
+                    Err(error) if !refreshed && remote_segment_cache_stale(&error) => {
+                        for entry in &prepared {
+                            self.invalidate_remote_write_segments(&entry.targets);
+                        }
+                        refreshed = true;
+                        debug!(
+                            runtime = %self.lease.runtime,
+                            items = prepared.len(),
+                            error = %error,
+                            "retrying batch put after refreshing cached remote segment handles"
+                        );
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        };
         write_tracker.finish(&write_result, 0);
         let routes = match write_result {
             Ok(routes) => routes,

@@ -23,11 +23,11 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, encode_lifecycle_state, flatten_slices, now_ms,
-    record_success_metric, refresh_live_client_cache, resolve_effective_route_policy,
-    scatter_into_buffers, shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan,
-    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
-    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
-    StoreState, SuspectRuntimeCache,
+    record_success_metric, resolve_effective_route_policy, scatter_into_buffers,
+    shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan, LiveClientCache,
+    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
+    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
+    SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -3679,7 +3679,7 @@ fn routed_read_probes_cached_remote_segment_before_reuse() {
         .label("storage", "true")
         .route_control(RouteControlMode::MetadataOnly)
         .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(store_a_transport)
+        .transport(store_a_transport.clone())
         .local_memory(storage_config())
         .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
@@ -3750,20 +3750,20 @@ fn routed_read_probes_cached_remote_segment_before_reuse() {
         b"cached-probe-payload"
     );
 
-    let mut stale_lease = store_a.lease().clone();
-    stale_lease.endpoints.labels.insert(
-        control_address_label().to_string(),
-        "127.0.0.1:1".to_string(),
-    );
-    metadata
-        .upsert_client_lease(&stale_lease)
-        .expect("stale lease update should succeed");
-    refresh_live_client_cache(
-        metadata.as_ref(),
-        &reader.live_client_cache,
-        "cached_probe_reader_refresh",
-    )
-    .expect("reader cache refresh should succeed");
+    let primary_segment = store_a
+        .segment_name()
+        .expect("store-a segment should exist");
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove(&primary_segment.0)
+            .expect("primary segment handle should exist");
+        state
+            .segments_by_handle
+            .remove(&handle)
+            .expect("primary segment body should exist");
+    }
 
     assert_eq!(
         reader

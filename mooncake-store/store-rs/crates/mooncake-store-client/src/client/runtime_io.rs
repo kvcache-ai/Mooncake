@@ -2000,19 +2000,33 @@ impl StoreClient {
         ) {
             return;
         }
-        let mut failed_runtimes = BTreeSet::new();
+        let mut failed_segments_by_runtime = BTreeMap::<ClientRuntimeId, BTreeSet<String>>::new();
         {
             let mut state = self.state.lock();
             for entry in entries {
                 state.invalidate_remote_segment(&entry.replica.segment_name.0);
                 if entry.replica.owner != self.lease.runtime {
-                    failed_runtimes.insert(entry.replica.owner.clone());
+                    failed_segments_by_runtime
+                        .entry(entry.replica.owner.clone())
+                        .or_default()
+                        .insert(entry.replica.segment_name.0.clone());
                 }
             }
         }
         if mark_runtime_suspect {
-            for runtime in failed_runtimes {
-                self.mark_runtime_suspect(&runtime, context);
+            let transport = self.transport().ok();
+            for (runtime, segments) in failed_segments_by_runtime {
+                let should_mark = transport.as_ref().is_none_or(|transport| {
+                    segments.iter().all(|segment_name| {
+                        let mut state = self.state.lock();
+                        state
+                            .open_segment_with_info(*transport, segment_name)
+                            .is_err()
+                    })
+                });
+                if should_mark {
+                    self.mark_runtime_suspect(&runtime, context);
+                }
             }
         }
         let _ = refresh_live_client_cache(

@@ -177,6 +177,8 @@ Reconnect behavior:
 - both backends repair local transport metadata after Redis connectivity returns and the heartbeat repair path runs
 - `classic_te` recreates its transport runtime before republishing local buffers
 - `tent` also recreates its transport runtime before re-registering the local buffers it still owns
+- peer restarts that invalidate a cached remote segment handle are repaired on demand: the read path drops the stale handle, reopens by segment name, and only quarantines that runtime if the fresh reopen still fails
+- routed writes apply the same stale-handle refresh once before escalating to outer soft-pin retry or failover, so a restarted live peer does not poison the cached remote-segment state
 - if Redis restarts from an empty dataset, surviving storage clients republish both lease state and segment metadata during recovery
 - requests that arrive while Redis is unavailable can still fail fast; recovery is designed for self-healing after metadata service returns, not for serving through a metadata blackout
 

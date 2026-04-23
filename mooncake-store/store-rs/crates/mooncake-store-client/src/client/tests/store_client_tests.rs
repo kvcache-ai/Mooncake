@@ -537,7 +537,7 @@ fn faulty_transport_open_failure_prevents_remote_read() {
     wait_for_runtime_visibility(&reader, writer.runtime_id());
 
     // Inject open failures — reader cannot open writer's segment
-    faults.fail_next_opens(10);
+    faults.fail_next_opens(1_000_000);
 
     let err = reader
         .get("fault-key")
@@ -578,7 +578,7 @@ fn faulty_transport_submit_failure_prevents_remote_read() {
     wait_for_runtime_visibility(&reader, writer.runtime_id());
 
     // Inject submit failures — reader cannot fetch data
-    faults.fail_next_submits(10);
+    faults.fail_next_submits(1_000_000);
 
     let err = reader
         .get("submit-key")

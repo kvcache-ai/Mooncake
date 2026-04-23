@@ -716,3 +716,12 @@ fn remote_segment_cache_refreshable(error: &StoreError) -> bool {
         StoreError::Transport(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
     )
 }
+
+fn remote_segment_cache_stale(error: &StoreError) -> bool {
+    match error {
+        StoreError::Transport(message)
+        | StoreError::NotFound(message)
+        | StoreError::InvalidState(message) => message.contains("segment handle"),
+        _ => false,
+    }
+}
