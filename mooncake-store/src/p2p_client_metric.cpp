@@ -2,8 +2,10 @@
 
 namespace mooncake {
 
-P2PClientMetric::P2PClientMetric(std::map<std::string, std::string> labels)
-    : local_get_requests("mooncake_p2p_local_get_requests_total",
+P2PClientMetric::P2PClientMetric(uint64_t interval_seconds,
+                                 std::map<std::string, std::string> labels)
+    : ClientMetric(interval_seconds, labels),
+      local_get_requests("mooncake_p2p_local_get_requests_total",
                          "Total number of local Get requests", labels),
       local_get_hits("mooncake_p2p_local_get_hits_total",
                      "Total number of local Get hits (found in local storage)",
@@ -27,6 +29,10 @@ P2PClientMetric::P2PClientMetric(std::map<std::string, std::string> labels)
                         "Local Put latency (us)", kLatencyBucket, labels) {}
 
 void P2PClientMetric::serialize(std::string& str) {
+    // Call base class serialize first
+    ClientMetric::serialize(str);
+
+    // Then serialize P2P-specific metrics
     local_get_requests.serialize(str);
     local_get_hits.serialize(str);
     local_get_misses.serialize(str);
@@ -41,6 +47,10 @@ void P2PClientMetric::serialize(std::string& str) {
 
 std::string P2PClientMetric::summary_metrics() {
     std::stringstream ss;
+    // Include base class metrics first
+    ss << ClientMetric::summary_metrics();
+
+    // Then add P2P-specific metrics
     ss << "=== P2P Local Storage Metrics ===\n";
 
     ss << "Local Get: " << local_get_requests.value() << " requests, "

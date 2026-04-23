@@ -5,7 +5,7 @@
 namespace mooncake {
 
 // P2P client metrics for local storage operations
-struct P2PClientMetric {
+struct P2PClientMetric : public ClientMetric {
     // Local Get metrics
     ylt::metric::counter_t local_get_requests;
     ylt::metric::counter_t local_get_hits;
@@ -20,10 +20,21 @@ struct P2PClientMetric {
     ylt::metric::counter_t local_put_bytes;
     ylt::metric::histogram_t local_put_latency;
 
-    explicit P2PClientMetric(std::map<std::string, std::string> labels = {});
+    /**
+     * @brief Creates a P2PClientMetric instance based on environment variables
+     * @return std::unique_ptr<P2PClientMetric> containing the instance if
+     * enabled, nullptr if disabled
+     */
+    static std::unique_ptr<P2PClientMetric> Create(
+        std::map<std::string, std::string> labels) {
+        return CreatePtr<P2PClientMetric>(labels);
+    }
 
-    void serialize(std::string& str);
-    std::string summary_metrics();
+    explicit P2PClientMetric(uint64_t interval_seconds = 0,
+                             std::map<std::string, std::string> labels = {});
+
+    void serialize(std::string& str) override;
+    std::string summary_metrics() override;
 };
 
 }  // namespace mooncake

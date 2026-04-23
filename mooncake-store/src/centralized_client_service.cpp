@@ -25,9 +25,13 @@ CentralizedClientService::CentralizedClientService(
     bool enable_metrics_http, const std::map<std::string, std::string>& labels)
     : ClientService(local_ip, te_port, metadata_connstring, metrics_port,
                     enable_metrics_http, labels),
+      metrics_(ClientMetric::Create(labels)),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
-      write_thread_pool_(2) {}
+      write_thread_pool_(2) {
+    // Start metrics HTTP server after metrics_ is initialized
+    StartMetricsHttpServer();
+}
 
 CentralizedClientService::~CentralizedClientService() {
     Stop();

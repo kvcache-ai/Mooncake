@@ -69,20 +69,7 @@ ClientMetric::~ClientMetric() { StopMetricsReportingThread(); }
 
 bool ClientMetric::IsEnabled() { return parseMetricsEnabled(); }
 
-std::unique_ptr<ClientMetric> ClientMetric::Create(
-    std::map<std::string, std::string> labels) {
-    if (!parseMetricsEnabled()) {
-        LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=0 to "
-                     "disable)";
-        return nullptr;
-    }
-
-    uint64_t interval = parseMetricsInterval();
-
-    LOG(INFO) << "Client metrics enabled (default enabled)";
-
-    return std::make_unique<ClientMetric>(interval, labels);
-}
+uint64_t ClientMetric::GetDefaultInterval() { return parseMetricsInterval(); }
 
 void ClientMetric::serialize(std::string& str) {
     transfer_metric.serialize(str);

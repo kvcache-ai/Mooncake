@@ -172,10 +172,9 @@ class P2PClientService final : public ClientService {
 
     MasterClient& GetMasterClient() override { return master_client_; }
 
-    std::string GetHealthStatus() const override;
+    ClientMetric* GetMetrics() override { return metrics_.get(); }
 
-    tl::expected<std::string, ErrorCode> GetSummaryMetrics() override;
-    tl::expected<std::string, ErrorCode> SerializeMetrics() override;
+    std::string GetHealthStatus() const override;
 
    private:
     /**
@@ -336,6 +335,7 @@ class P2PClientService final : public ClientService {
     void OnHAEvent(HAEvent event) override;
 
    private:
+    std::unique_ptr<P2PClientMetric> metrics_;
     P2PMasterClient master_client_;
     uint16_t client_rpc_port_ = 12345;
 
@@ -356,9 +356,6 @@ class P2PClientService final : public ClientService {
 
     // HA recovery manager
     std::unique_ptr<HARecoveryManager> ha_manager_;
-
-    // P2P local storage metrics
-    std::unique_ptr<P2PClientMetric> p2p_metrics_;
 };
 
 }  // namespace mooncake

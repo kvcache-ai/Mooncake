@@ -51,29 +51,15 @@ ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
                              uint16_t metrics_port, bool enable_metrics_http,
                              const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
-      metrics_(ClientMetric::Create(merge_labels(labels))),
       local_ip_(local_ip),
       te_port_(te_port),
       metadata_connstring_(metadata_connstring),
+      metrics_port_(metrics_port),
       enable_metrics_http_(enable_metrics_http) {
     LOG(INFO) << "client_id=" << client_id_;
-
-    if (metrics_) {
-        if (metrics_->GetReportingInterval() > 0) {
-            LOG(INFO) << "Client metrics enabled with reporting thread started "
-                         "(interval: "
-                      << metrics_->GetReportingInterval() << "s)";
-        } else {
-            LOG(INFO)
-                << "Client metrics enabled but reporting disabled (interval=0)";
-        }
-    } else {
-        LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
-                     "enable)";
-    }
-
-    // Start metrics HTTP server
-    metrics_port_ = StartMetricsHttpServer(enable_metrics_http, metrics_port);
+    // Note: metrics_ initialization and metrics HTTP server start are now
+    // handled by subclasses to avoid calling pure virtual function in
+    // constructor
 }
 
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
@@ -639,7 +625,8 @@ uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
     }
 
     // Check if metrics are enabled
-    if (!metrics_) {
+    ClientMetric* metrics = GetMetrics();
+    if (!metrics) {
         LOG(INFO) << "Client metrics disabled, skipping HTTP server start";
         return 0;
     }
@@ -655,14 +642,15 @@ uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
         metrics_http_server_->set_http_handler<GET>(
             "/metrics",
             [this](coro_http_request& req, coro_http_response& resp) {
-                if (!metrics_) {
+                ClientMetric* metrics = GetMetrics();
+                if (!metrics) {
                     resp.set_status_and_content(
                         status_type::service_unavailable,
                         "Metrics not available");
                     return;
                 }
                 std::string metrics_str;
-                metrics_->serialize(metrics_str);
+                metrics->serialize(metrics_str);
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 resp.set_status_and_content(status_type::ok,
                                             std::move(metrics_str));
@@ -672,13 +660,14 @@ uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
         metrics_http_server_->set_http_handler<GET>(
             "/metrics/summary",
             [this](coro_http_request& req, coro_http_response& resp) {
-                if (!metrics_) {
+                ClientMetric* metrics = GetMetrics();
+                if (!metrics) {
                     resp.set_status_and_content(
                         status_type::service_unavailable,
                         "Metrics not available");
                     return;
                 }
-                std::string summary = metrics_->summary_metrics();
+                std::string summary = metrics->summary_metrics();
                 resp.add_header("Content-Type", "text/plain; version=0.0.4");
                 resp.set_status_and_content(status_type::ok,
                                             std::move(summary));
