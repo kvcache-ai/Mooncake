@@ -19,6 +19,7 @@ Use the document that matches what you are doing.
 | If You Want To | Read |
 |----------------|------|
 | run the project locally | `README.md`, `docs/deployment.md` |
+| run `mooncake-store-bench` for verify / benchmark / soak | `README.md`, `docs/bench.md`, `docs/deployment.md` |
 | run the multi-client stress benchmark | `README.md`, `docs/deployment.md` |
 | integrate the client into a Rust service | `docs/rust.md` |
 | configure routing, memory, placement, or observability | `docs/configuration.md` |
@@ -145,8 +146,10 @@ The `/metrics` surface is now split by metric family instead of one flat operati
 - wheel packaging with bundled native runtime libraries
 - wheel-installed `mooncake-store-client` console command
 - wheel-installed `mooncake-store-admin` maintenance command
+- wheel-installed `mooncake-store-bench` benchmark / verify / soak command
 - standalone `mooncake-store-client` binary artifact in `dist/bin/`
 - standalone `mooncake-store-admin` binary artifact in `dist/bin/`
+- standalone `mooncake-store-bench` binary artifact in `dist/bin/`
 - hugepage-aware allocator options
 - `ReplicateConfig` request policy mapping
 - batch APIs, route query, metrics helpers, lifecycle helpers
@@ -427,6 +430,52 @@ steady-state bandwidth:
 ```
 
 Treat this summary as the primary throughput signal. The per-phase `stress phase=...` lines remain in the log for latency breakdowns and setup debugging.
+
+### Run `mooncake-store-bench`
+
+Use the shipped benchmark binary when you want a first-party verify / benchmark /
+soak surface against the same runtime that the wheel packages.
+
+Correctness smoke check:
+
+```bash
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  verify
+```
+
+Scratch-only remote-store benchmark:
+
+```bash
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  bench \
+  --mode mixed \
+  --concurrency 8 \
+  --duration 30
+```
+
+Longer soak run:
+
+```bash
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  soak \
+  --duration 3600 \
+  --fault redis-jitter:5:50 \
+  --verify-reads
+```
+
+Important runtime behavior:
+
+- `MC_BENCH_STORAGE_BYTES=0` by default, so the bench expects separate active `storage=true` daemons in the same metadata keyspace
+- when `--keyspace` is omitted in scratch-only mode, bench joins `mc/store-rs/v1`
+- when `--storage-bytes > 0` and `--keyspace` is omitted, bench generates an isolated `mc/store-rs/bench/<unique>` keyspace
+- bench tracing goes to `stderr` by default, honors `--trace-filter` / `MC_STORE_RS_TRACE_FILTER` / `RUST_LOG`, and falls back to `info`
+- use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for a dedicated bench log file; `MC_STORE_RS_TRACE_FILE` does not redirect bench output
+- for `classic_te` over RDMA, set `MC_STORE_RS_GID_INDEX=<n>` when the host requires a non-default RoCE GID index
+
+See `docs/bench.md` for the full CLI reference.
 
 ### Run the Python compatibility e2e
 
@@ -789,6 +838,7 @@ The default output layout is:
 - `dist/wheels/mooncake-*.whl` for the real runtime package
 - `dist/wheels/mooncake_pro-*.whl` for the user-facing Pro metapackage
 - `dist/bin/mooncake-store-client` for the standalone client runtime
+- `dist/bin/mooncake-store-bench` for the standalone benchmark / verify / soak runtime
 
 Recommended installation flow:
 
@@ -800,6 +850,7 @@ python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
 python -c "import mooncake; print(mooncake.__build_info__)"
 mooncake-store-client --version
 mooncake-store-client -v
+mooncake-store-bench --help
 ```
 
 For local wheelhouse installs, `scripts/build/install-pro-wheel.sh` wraps the same flow.
@@ -895,6 +946,9 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 - `MC_STORE_RS_TRACE=1`
 - `MC_STORE_RS_TRACE_FILTER=info` or any `tracing_subscriber` filter string
 - Python real clients auto-initialize Rust tracing before `setup(...)` when `MC_STORE_RS_TRACE=1`
+- `mooncake-store-bench` uses its own tracing init, writes to `stderr` by default, and falls back to `info` when neither `--trace-filter`, `MC_STORE_RS_TRACE_FILTER`, nor `RUST_LOG` is set
+- use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for bench logs; keep `MC_STORE_RS_TRACE_FILE` for standalone-client and Python real-client logging
+- bench disables tracing span-close events so hot-path `close time.busy=...` noise does not flood benchmark output
 
 ### Metrics
 
@@ -908,6 +962,7 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 
 - `README.md` — project entry and first run
 - `docs/deployment.md` — environment setup, local scripts, and deployment roles
+- `docs/bench.md` — standalone benchmark / verify / soak tool
 - `docs/rust.md` — Rust integration and API usage
 - `docs/configuration.md` — builder defaults, request policies, labels, and environment variables
 - `docs/components.md` — component guide

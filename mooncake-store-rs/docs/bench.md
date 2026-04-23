@@ -12,17 +12,20 @@ mooncake-store-bench [global options] <COMMAND>
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metadata-url <URL>` | required | Redis metadata URL |
-| `--keyspace <PREFIX>` | auto-generated | Metadata keyspace prefix |
+| `--metadata-url <URL>` | required | Redis URL used by the bench metadata backend; also read from `MC_STORE_RS_TRANSPORT_METADATA_URL` |
+| `--keyspace <PREFIX>` | `mc/store-rs/v1` when `storage_bytes=0`; otherwise auto-generated | Metadata keyspace prefix |
 | `--transport-backend <classic-te\|tent>` | `classic-te` | Data-plane transport backend |
 | `--protocol <tcp\|rdma>` | `tcp` | Transport protocol |
 | `--local-hostname <HOST>` | `127.0.0.1` | Transport bind hostname |
 | `--storage-bytes <BYTES>` | 0 | Per-client storage allocation for bench RW clients |
 | `--scratch-bytes <BYTES>` | 16 MiB | Per-client scratch allocation |
 | `--tenant <NAME>` | `bench` | Default tenant scope |
-| `--trace-filter <FILTER>` | off | `tracing-subscriber` filter |
+| `--trace-filter <FILTER>` | `MC_STORE_RS_TRACE_FILTER`, then `RUST_LOG`, otherwise `info` | `tracing-subscriber` filter |
 | `--metrics-addr <ADDR>` | off | Prometheus metrics bind address |
 | `--seed <N>` | `42` | Global RNG seed for deterministic data |
+| `--route-control <embedded-wrh\|metadata-only>` | `embedded-wrh` | Route control mode used by bench runtimes |
+| `--route-topk <N>` | `2` | WRH route-authority fanout |
+| `--replica-count <N>` | `1` | Replication factor for writes |
 
 The default bench topology is scratch-only for RW clients
 (`MC_BENCH_STORAGE_BYTES=0`). Start separate `storage=true` daemons with
@@ -30,7 +33,20 @@ matching metadata, transport, and `--keyspace` settings before running the
 benchmark. This is the same storage/RW role split used by
 `scripts/tests/client/test-client-rw-cli.sh`. When `--keyspace` is omitted in
 scratch-only mode, bench joins the same default metadata namespace as
-`mooncake-store-client`: `mc/store-rs/v1`.
+`mooncake-store-client`: `mc/store-rs/v1`. When `--storage-bytes > 0` and
+`--keyspace` is omitted, bench generates an isolated
+`mc/store-rs/bench/<unique>` keyspace for that run.
+
+### Tracing behavior
+
+`mooncake-store-bench` initializes its own tracing subscriber.
+
+- default sink: `stderr`
+- effective filter: `--trace-filter`, then `MC_STORE_RS_TRACE_FILTER`, then `RUST_LOG`, then `info`
+- dedicated trace file: `MC_BENCH_TRACE_FILE=/path/to/bench.log`
+- `MC_STORE_RS_TRACE_FILE` remains the real-client / standalone-client trace-file surface and does not redirect bench output
+- ANSI colors are enabled only when `stderr` is a TTY and no bench trace file is selected
+- span close events are disabled, so per-request `close time.busy=...` subscriber noise does not flood benchmark output
 
 ### `bench` — throughput and latency
 
@@ -50,17 +66,16 @@ mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 bench \
 | `--mode <put\|get\|mixed>` | `mixed` | Operation mix |
 | `--concurrency <N>` | `4` | Concurrent worker threads |
 | `--value-size <BYTES>` | `4096` | Payload size per object |
-| `--batch-size <N>` | `8` | Requests per `batch_put` / `batch_get` call |
+| `--batch-size <N>` | `8` | Objects per `batch_put` call; read-side traffic still uses single-key `get` |
 | `--iterations <N>` | `1024` | Total operations per worker |
 | `--duration <SECONDS>` | off | Run for fixed wall time instead of iteration count |
 | `--warmup <N>` | `32` | Warmup operations excluded from stats |
 | `--read-ratio <PERCENT>` | `70` | Read fraction in mixed mode |
 | `--report-interval <SECONDS>` | `5` | Periodic progress interval |
 | `--key-space-size <N>` | `10000` | Distinct key count |
-| `--replica-count <N>` | `1` | Replication factor for writes |
 | `--writers <N>` | `1` | Writer `StoreClient` instances |
 | `--readers <N>` | `1` | Reader `StoreClient` instances |
-| `--output-format <text\|json\|csv>` | `text` | Report format |
+| `--output-format <text\|json\|csv>` | `text` | Report body format emitted through tracing |
 
 Output at the end of a run:
 
@@ -80,6 +95,14 @@ Mode: mixed | Duration: 30.12s | Workers: 8 | Value size: 65536 B | Batch size: 
   Latency max      18.7ms           11.3ms
   Errors           0                0
 ```
+
+`--output-format` changes the report body only. The final text, JSON, or CSV
+payload is still emitted as `INFO` tracing events, so the normal tracing prefix
+remains around the report in `stderr` or `MC_BENCH_TRACE_FILE`.
+
+PUT-side counters count `batch_put` calls, not individual objects. Throughput
+still includes the bytes for every object in the batch. GET-side counters count
+single-key `get` calls.
 
 ### `verify` — correctness checks
 
@@ -128,7 +151,7 @@ mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 soak \
 | `--report-interval <SECONDS>` | `30` | Progress report cadence |
 | `--fault <SPEC>` | none | Fault injection spec (repeatable) |
 | `--verify-reads` | `true` | Verify every read against expected payload |
-| `--heartbeat-interval-ms <MS>` | `30000` | Heartbeat interval |
+| `--heartbeat-interval-ms <MS>` | `30000` | Compatibility flag accepted by the CLI; the current soak loop still heartbeats every 64 iterations |
 | `--read-ratio <PERCENT>` | `70` | Read fraction |
 | `--key-space-size <N>` | `10000` | Distinct key count |
 
@@ -136,10 +159,10 @@ Fault spec format:
 
 | Spec | Effect |
 |------|--------|
-| `redis-jitter:<min_ms>:<max_ms>` | Sleep a random interval before each metadata-touching operation |
-| `metadata-drop:<percent>` | Return an injected error for N% of operations |
-| `transport-delay:<min_ms>:<max_ms>` | Sleep a random interval after each data-plane operation |
-| `transport-error:<percent>` | Treat N% of operations as failed |
+| `redis-jitter:<min_ms>:<max_ms>` | Sleep a deterministic random interval before the next store operation |
+| `metadata-drop:<percent>` | Inject a synthetic pre-op failure for N% of operations |
+| `transport-delay:<min_ms>:<max_ms>` | Sleep a deterministic random interval before the next store operation |
+| `transport-error:<percent>` | Inject a synthetic pre-op failure for N% of operations |
 
 Multiple `--fault` flags are applied in order before each operation.
 
@@ -155,12 +178,12 @@ Progress is reported on a single line per interval:
 
 ```
 crates/mooncake-store-py/src/bin/mooncake_store_bench/
-  main.rs      entry point: parse args, init tracing, install ctrlc, dispatch
+  main.rs      entry point: parse args, init bench-local tracing, install ctrlc, dispatch
   cli.rs       clap structs: GlobalArgs, BenchArgs, VerifyArgs, SoakArgs, FaultSpec
   datagen.rs   deterministic LCG payload generation; key naming helpers
   latency.rs   LatencyRecorder: raw-sample p50/p90/p99/p999 percentile tracker
-  reporter.rs  text/json/csv report formatting; one-line progress printer
-  setup.rs     BenchCluster: metadata backend, selected transport, StoreClient construction
+  reporter.rs  text/json/csv report-body formatting via tracing; interval progress printer
+  setup.rs     BenchCluster: metadata backend, compat runtime construction, startup snapshots
   bench.rs     concurrent worker threads (std::thread::scope)
   verify.rs    sequential correctness checks
   soak.rs      long-running loop with per-iteration fault injection and read verification
@@ -181,7 +204,19 @@ All payloads are deterministic. The seed string is `{global_seed}-{key}-{generat
 
 ### Client construction
 
-`BenchCluster` wraps one or more `StoreClient` instances for writer and reader roles. Each client gets its own selected transport factory (`classic-te` by default, optional `tent`) with a unique segment name, registered against the same `RedisMetadataBackend`. The keyspace is auto-generated per run using `now_ms ^ process_id`, so parallel runs do not interfere.
+`BenchCluster` wraps one or more `StoreClient` instances for writer and reader
+roles. It uses the same `CompatRuntimeArgs` / `CompatSetupArgs` path as
+`mooncake-store-client`, so transport backend selection, RDMA env passthrough,
+and compatibility defaults stay aligned with the normal runtime.
+
+Each client gets its own selected transport factory (`classic-te` by default,
+optional `tent`) with a unique segment name, registered against the same
+`RedisMetadataBackend`.
+
+Keyspace behavior is conditional:
+
+- scratch-only mode (`storage_bytes=0`) reuses the configured keyspace, or `mc/store-rs/v1` when `--keyspace` is omitted
+- storage-owning mode (`storage_bytes>0`) auto-generates `mc/store-rs/bench/<unique>` when `--keyspace` is omitted
 
 ## Wheel packaging
 
