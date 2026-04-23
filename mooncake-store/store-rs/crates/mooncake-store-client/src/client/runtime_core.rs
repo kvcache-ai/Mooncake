@@ -498,7 +498,11 @@ impl StoreClient {
     }
 
     fn lookup_runtime_lease(&self, runtime: &ClientRuntimeId) -> Result<ClientLease> {
-        self.lookup_runtime_lease_once(runtime, false)
+        match self.lookup_runtime_lease_once(runtime, false) {
+            Ok(lease) => Ok(lease),
+            Err(StoreError::NotFound(_)) => self.lookup_runtime_lease_once(runtime, true),
+            Err(error) => Err(error),
+        }
     }
 
     fn lookup_runtime_leases_once(
@@ -535,7 +539,11 @@ impl StoreClient {
         if wanted.is_empty() {
             return Ok(BTreeMap::new());
         }
-        self.lookup_runtime_leases_once(&wanted, false)
+        match self.lookup_runtime_leases_once(&wanted, false) {
+            Ok(leases) => Ok(leases),
+            Err(StoreError::NotFound(_)) => self.lookup_runtime_leases_once(&wanted, true),
+            Err(error) => Err(error),
+        }
     }
 
     fn resolve_preferred_storage_owners_once(

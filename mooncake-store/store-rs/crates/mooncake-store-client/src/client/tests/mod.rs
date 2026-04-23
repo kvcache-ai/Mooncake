@@ -2419,6 +2419,49 @@ fn lookup_runtime_lease_reuses_live_client_snapshot() {
 }
 
 #[test]
+fn lookup_runtime_lease_refreshes_when_snapshot_misses_runtime() {
+    let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let storage_transport = Arc::new(TestTransport::new("storage-refresh-segment"));
+    let client_transport = Arc::new(storage_transport.peer("client-refresh-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "storage-refresh")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let client = StoreClientBuilder::new(metadata.clone(), "client-refresh")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(client_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+
+    client
+        .live_client_cache
+        .lock()
+        .store(vec![client.lease().clone()]);
+
+    let runtime = storage.runtime_id().clone();
+    let after_clobber = metadata.list_live_clients_calls();
+    let lease = client
+        .lookup_runtime_lease(&runtime)
+        .expect("runtime lookup should refresh when the cached snapshot misses a live runtime");
+    assert_eq!(lease.runtime, runtime);
+    assert!(
+        metadata.list_live_clients_calls() > after_clobber,
+        "runtime lookup should force-refresh membership after a snapshot miss"
+    );
+}
+
+#[test]
 fn rw_only_client_can_expand_into_primary_segment() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("rw-expand-segment"));
