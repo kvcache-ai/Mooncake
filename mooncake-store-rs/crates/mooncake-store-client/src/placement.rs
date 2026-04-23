@@ -10,6 +10,14 @@ use crate::{ObjectRef, StoreClient};
 
 const DEFAULT_SCOPE_LABEL: &str = "pool";
 
+fn is_present_lease(lease: &ClientLease) -> bool {
+    lease.expires_at_ms
+        >= std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should advance")
+            .as_millis() as u64
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlacementChoice {
     pub tenant: String,
@@ -224,6 +232,7 @@ impl PlacementPlanner {
             .metadata
             .list_live_clients()?
             .into_iter()
+            .filter(is_present_lease)
             .filter(|lease| lease.state == ClientLifecycleState::Active)
             .filter(|lease| is_compatible(observer, lease))
             .filter(|lease| {
