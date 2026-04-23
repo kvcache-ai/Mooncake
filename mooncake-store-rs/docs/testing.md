@@ -169,6 +169,11 @@ End-to-end flows that compose ≥2 real components without mocks.
 - `mooncake-store-client::client::tests::mod.rs` — 116 scenarios build
   multi-client topologies sharing an `InMemoryMetadataBackend` and verify
   cross-client handoff, drain, evacuation, metrics rendering.
+  Restart-recovery regressions now also pin the stale cached remote-segment
+  path: cached-handle reads must reopen by segment name, remote writes must
+  refresh a stale cached handle once, and transport submit/open failures must
+  still bubble into the outer soft-pin retry path instead of being mistaken
+  for recoverable stale-cache noise.
 
 ## Test Infrastructure: `mooncake-store-test-utils`
 
