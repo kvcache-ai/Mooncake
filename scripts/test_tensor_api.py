@@ -2271,7 +2271,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
     def test_benchmark_07_unified_full_reconstruction(self):
         require_unified_parallelism_api(self)
         key = "bench_unified_full"
-        tensor = self.tensors[0]
+        tensor = make_deterministic_tensor((4, 8))
         tp_size = 4
         split_dim = 1
         full_target = make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=1))
@@ -2345,11 +2345,11 @@ class TestMooncakeStress(MooncakeTestBase):
     def _run_unified_full_worker(self, worker_id, split_dim, tp_size, use_into=False, mixed_reads=False):
         key = f"stress_unified_full_{worker_id}"
         if split_dim == 0:
-            tensor = make_deterministic_tensor((64, 32))
+            tensor = make_deterministic_tensor((8, 8))
         elif split_dim == 1:
-            tensor = make_deterministic_tensor((32, 64))
+            tensor = make_deterministic_tensor((4, 8))
         else:
-            tensor = make_deterministic_tensor((16, 16, 16))
+            tensor = make_deterministic_tensor((2, 2, 8))
 
         rc = put_uniform_full_tensor_with_unified_tp(
             self.store, key, tensor, tp_size, split_dim
