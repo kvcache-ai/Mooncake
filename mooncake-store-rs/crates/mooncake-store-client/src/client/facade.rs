@@ -126,6 +126,22 @@ impl StoreClient {
         }
     }
 
+    fn query_routes_by_object_ids(
+        &self,
+        object_ids: &[LogicalObjectId],
+    ) -> Result<Vec<Option<ObjectRoute>>> {
+        let keys = object_ids
+            .iter()
+            .map(ObjectKey::from_logical_id)
+            .collect::<Vec<_>>();
+        Ok(self
+            .route_directory
+            .get_object_routes(&self.lease, &keys)?
+            .into_iter()
+            .map(|route| route.filter(|route| route.state == RouteState::Active))
+            .collect())
+    }
+
     fn shared_batch_replication_policy(
         requests: &[PutRequest<'_>],
     ) -> Option<Option<ReplicationPolicy>> {
@@ -612,16 +628,21 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
-        let mut results = Vec::with_capacity(objects.len());
-        for object in objects {
-            let tenant = object.tenant.unwrap_or(self.default_tenant());
-            let object_id = LogicalObjectId::new(
-                NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
-                object.key,
-            );
-            results.push(self.query_route_by_object_id(&object_id)?.is_some());
-        }
-        Ok(results)
+        let object_ids = objects
+            .iter()
+            .map(|object| {
+                let tenant = object.tenant.unwrap_or(self.default_tenant());
+                LogicalObjectId::new(
+                    NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+                    object.key,
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(self
+            .query_routes_by_object_ids(&object_ids)?
+            .into_iter()
+            .map(|route| route.is_some())
+            .collect())
     }
 
     fn remove(&self, key: &str, force: bool) -> Result<()> {

@@ -10,12 +10,18 @@
 //   Phase 5 — performance benchmarks (latency and throughput logging)
 //   Phase 6 — FaultyTransport network-fault integration
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use mooncake_metadata::InMemoryMetadataBackend;
-use mooncake_store_core::{ClientLifecycleState, MetadataBackend, StoreError};
+use mooncake_store_core::{
+    CasResult, ClientLease, ClientLifecycleState, CompatibilityDescriptor, MetadataBackend,
+    ObjectKey, ObjectRoute, RouteDirectory, RouteState, RouteVersion, StoreError,
+};
 use mooncake_store_test_utils::transport::{FaultyTransport, TestTransport};
 
 use crate::{
@@ -219,6 +225,85 @@ fn batch_is_exist_reflects_put_and_remove() {
         .batch_is_exist(&refs)
         .expect("batch_is_exist after remove");
     assert_eq!(exists2, vec![false, true, false]);
+}
+
+#[derive(Default)]
+struct RecordingRouteDirectory {
+    single_calls: AtomicUsize,
+    batch_calls: AtomicUsize,
+    last_batch_len: AtomicUsize,
+}
+
+impl RecordingRouteDirectory {
+    fn route_for(key: &ObjectKey) -> Option<ObjectRoute> {
+        (!key.0.contains("absent")).then(|| ObjectRoute {
+            key: key.clone(),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::new(),
+        })
+    }
+}
+
+impl RouteDirectory for RecordingRouteDirectory {
+    fn get_object_route(
+        &self,
+        _observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        self.single_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Self::route_for(key))
+    }
+
+    fn get_object_routes(
+        &self,
+        _observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.batch_calls.fetch_add(1, Ordering::Relaxed);
+        self.last_batch_len.store(keys.len(), Ordering::Relaxed);
+        Ok(keys.iter().map(Self::route_for).collect())
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        _observer: &ClientLease,
+        _key: &ObjectKey,
+        _expected: Option<RouteVersion>,
+        _next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<CasResult> {
+        Err(StoreError::Unsupported(
+            "recording route directory does not support CAS".to_string(),
+        ))
+    }
+}
+
+#[test]
+fn batch_is_exist_uses_batched_route_lookup() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("bie-batch-route-seg"));
+    let mut client = make_writer(&meta, &transport);
+    let directory = Arc::new(RecordingRouteDirectory::default());
+    client.route_directory = directory.clone();
+
+    let exists = client
+        .batch_is_exist(&[
+            ObjectRef::new("present-a"),
+            ObjectRef::new("absent"),
+            ObjectRef::new("present-b").tenant("tenant-b"),
+        ])
+        .expect("batch_is_exist should succeed");
+
+    assert_eq!(exists, vec![true, false, true]);
+    assert_eq!(directory.batch_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(directory.last_batch_len.load(Ordering::Relaxed), 3);
+    assert_eq!(directory.single_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
