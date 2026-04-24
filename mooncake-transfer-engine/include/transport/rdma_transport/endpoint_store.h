@@ -42,6 +42,8 @@ class EndpointStore {
         const std::string &peer_nic_path, RdmaContext *context) = 0;
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
     virtual void evictEndpoint() = 0;
+    // Takes endpoint_map_lock_; caller must not hold it (RWSpinlock is
+    // non-reentrant, so recursive acquisition deadlocks).
     virtual void reclaimEndpoint() = 0;
     virtual size_t getSize() = 0;
 
