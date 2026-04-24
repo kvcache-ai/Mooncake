@@ -647,10 +647,12 @@ Credentials embedded in `redis://username:password@host:port/db` are also accept
 
 ### Important note for etcd
 
-When the store metadata backend is etcd, transport metadata still uses Redis. Provide that Redis endpoint through:
+When the store metadata backend is etcd, TENT transport metadata still uses Redis. Provide that Redis endpoint through:
 
 - `transport_metadata_url=...`, or
 - `MC_STORE_RS_TENT_REDIS_URL`
+
+For `classic_te`, `transport_metadata_url=P2PHANDSHAKE` uses the upstream transfer-engine peer handshake path while Store-RS metadata continues to use `metadata_url`.
 
 ## Transport Backend Selection
 
@@ -677,7 +679,7 @@ Current upstream SGLang only forwards legacy Mooncake setup fields. When SGLang 
 - `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
 - `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
-- `MC_STORE_RS_TRANSPORT_METADATA_URL`, `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
+- `MC_STORE_RS_TRANSPORT_METADATA_URL` (`redis://...` by default, or `P2PHANDSHAKE` with `classic_te`), `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port`
 - `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC capacity; default `2`
@@ -872,6 +874,7 @@ python -m sglang.launch_server \
   Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. For real-mode compatibility today:
 
 - use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the backend; the default is `classic_te`
+- use `MC_STORE_RS_TRANSPORT_METADATA_URL=P2PHANDSHAKE` only with `classic_te` when the transfer engine should use peer handshake instead of Redis-backed transport metadata
 - keep SGLang real clients and storage peers on the default metadata keyspace `mc/store-rs/v1`
 - treat `--hicache-storage-backend-extra-config` as a legacy field bridge, not a full Store-RS setup dictionary
 - if a deployment needs custom `keyspace`, explicit `stable_id`, or per-process route labels, use the dummy gateway path or a patched SGLang fork

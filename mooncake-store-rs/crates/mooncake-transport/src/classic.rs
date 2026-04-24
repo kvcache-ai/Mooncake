@@ -78,6 +78,10 @@ impl ClassicEngineConfig {
         &self.metadata_uri
     }
 
+    pub fn uses_p2p_handshake_metadata(&self) -> bool {
+        self.metadata_uri.eq_ignore_ascii_case("P2PHANDSHAKE")
+    }
+
     pub fn rpc_bind_host(&self) -> &str {
         &self.rpc_bind_host
     }
@@ -559,6 +563,13 @@ mod tests {
         assert_eq!(config.redis_password_value(), Some("pass"));
         assert_eq!(config.redis_db_index_value(), Some("4"));
         assert_eq!(config.gid_index_value(), Some("1"));
+        assert!(!config.uses_p2p_handshake_metadata());
+    }
+
+    #[test]
+    fn classic_engine_config_detects_p2p_handshake_metadata() {
+        let config = ClassicEngineConfig::new("p2phandshake", "127.0.0.1");
+        assert!(config.uses_p2p_handshake_metadata());
     }
 
     #[test]

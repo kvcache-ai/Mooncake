@@ -646,7 +646,7 @@ Use these environment variables for SGLang real mode:
 - `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
 - `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
-- `MC_STORE_RS_TRANSPORT_METADATA_URL`, `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
+- `MC_STORE_RS_TRANSPORT_METADATA_URL` (`redis://...` by default, or `P2PHANDSHAKE` with `classic_te`), `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
 - `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC capacity; default `2`
@@ -787,7 +787,7 @@ The runtime transport switch belongs to the compatibility layer:
 
 Both real transport backends self-heal after Redis metadata connectivity returns:
 
-- transient Redis outages keep the process alive; heartbeat recovery republishes store metadata and transport metadata after Redis is reachable again
+- transient Redis outages keep the process alive; heartbeat recovery republishes store metadata and Redis-backed transport metadata after Redis is reachable again
 - fresh Redis restarts are supported as long as the storage clients survive long enough to renew their lease and repair local metadata
 - `classic-te` rebuilds the transport engine and republishes its local buffers
 - `tent` rebuilds the transport engine and re-registers its local buffers back into transport metadata
@@ -912,7 +912,7 @@ For the complete configuration reference, read `docs/configuration.md`.
 | `EtcdMetadataBackend` | Store metadata on etcd | Supported |
 | `InMemoryMetadataBackend` | Unit tests and local-only testing | Test-only |
 
-If store metadata uses etcd in the Python compatibility layer, transport metadata still uses Redis. Set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint.
+If store metadata uses etcd in the Python compatibility layer, TENT transport metadata still uses Redis. Set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint. With `classic_te`, `transport_metadata_url=P2PHANDSHAKE` keeps Store-RS metadata on `metadata_url` and lets the transfer engine use peer handshake metadata.
 
 For Redis authentication, use URL-embedded credentials or set `MC_REDIS_PASSWORD`; set `MC_REDIS_USERNAME` as well when Redis ACLs require a named user. Environment variables are preferred for passwords that contain URL-reserved characters such as `@`.
 

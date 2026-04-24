@@ -16,7 +16,7 @@ use mooncake_store_core::{
 };
 use url::Url;
 
-use crate::config::build_metadata_backend;
+use crate::config::build_store_metadata_backend;
 
 use super::models::{
     AdminCleanupReport, AdminMaintenanceReport, AdminOwnerCleanupReport, AdminOwnerCleanupState,
@@ -189,7 +189,7 @@ impl AdminService {
 
     pub fn from_config(metadata_url: &str, keyspace: Option<String>) -> AdminResult<Self> {
         let keyspace = keyspace.map(MetadataKeyspace::new).unwrap_or_default();
-        let (backend, _) = build_metadata_backend(metadata_url, None, keyspace.clone())?;
+        let backend = build_store_metadata_backend(metadata_url, keyspace.clone())?;
         Ok(Self {
             backend,
             metadata_url: metadata_url.to_string(),
