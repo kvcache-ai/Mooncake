@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::error::Error;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::error::QuotaKind;
@@ -814,6 +815,7 @@ pub struct RedisMetadataBackend {
     client: redis::Client,
     legacy_auth_client: Option<redis::Client>,
     prefer_legacy_auth: AtomicBool,
+    connection_diagnostic_events: AtomicU64,
     keyspace: MetadataKeyspace,
     route_namespace: String,
     tenant_quota_terminal_ttl: Duration,
@@ -864,6 +866,7 @@ impl RedisMetadataBackend {
             client,
             legacy_auth_client,
             prefer_legacy_auth: AtomicBool::new(false),
+            connection_diagnostic_events: AtomicU64::new(0),
             keyspace: config.keyspace,
             route_namespace,
             tenant_quota_terminal_ttl: config.tenant_quota_terminal_ttl,
@@ -903,9 +906,11 @@ impl RedisMetadataBackend {
         }
     }
 
-    fn connection(&self) -> Result<redis::Connection> {
-        self.connection_raw()
-            .map_err(|error| metadata_error("redis get_connection", error))
+    fn connection(&self, operation: &str) -> Result<redis::Connection> {
+        self.connection_raw().map_err(|error| {
+            self.log_redis_diagnostic("connect", operation, &error, 1, 1);
+            metadata_error(operation, error)
+        })
     }
 
     fn query_with_retry<T, F>(&self, operation: &str, mut query: F) -> Result<T>
@@ -920,22 +925,64 @@ impl RedisMetadataBackend {
                 Err(error)
                     if attempt + 1 < attempts && should_retry_transient_redis_error(&error) =>
                 {
+                    self.log_redis_diagnostic("connect", operation, &error, attempt + 1, attempts);
                     std::thread::sleep(delay);
                     continue;
                 }
-                Err(error) => return Err(metadata_error(operation, error)),
+                Err(error) => {
+                    self.log_redis_diagnostic("connect", operation, &error, attempt + 1, attempts);
+                    return Err(metadata_error(operation, error));
+                }
             };
             match query(&mut connection) {
                 Ok(value) => return Ok(value),
                 Err(error)
                     if attempt + 1 < attempts && should_retry_transient_redis_error(&error) =>
                 {
+                    self.log_redis_diagnostic("query", operation, &error, attempt + 1, attempts);
                     std::thread::sleep(delay);
                 }
-                Err(error) => return Err(metadata_error(operation, error)),
+                Err(error) => {
+                    self.log_redis_diagnostic("query", operation, &error, attempt + 1, attempts);
+                    return Err(metadata_error(operation, error));
+                }
             }
         }
         unreachable!("redis query either returns or exhausts retries");
+    }
+
+    fn log_redis_diagnostic(
+        &self,
+        phase: &'static str,
+        operation: &str,
+        error: &redis::RedisError,
+        attempt: usize,
+        attempts: usize,
+    ) {
+        let occurrence = self
+            .connection_diagnostic_events
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if !should_log_redis_diagnostic_occurrence(occurrence) {
+            return;
+        }
+        let hint = redis_error_diagnostic_hint(error);
+        tracing::warn!(
+            phase,
+            operation,
+            route_namespace = %self.route_namespace,
+            occurrence,
+            attempt,
+            attempts,
+            retryable = should_retry_transient_redis_error(error),
+            connect_timeout_ms = redis_connect_timeout().as_millis() as u64,
+            io_timeout_ms = redis_io_timeout().as_millis() as u64,
+            retry_delay_ms = redis_retry_delay().as_millis() as u64,
+            prefer_legacy_auth = self.prefer_legacy_auth.load(Ordering::Relaxed),
+            diagnostic_hint = hint.unwrap_or(""),
+            error = %error,
+            "redis metadata operation failed"
+        );
     }
 
     fn query_readonly<T, F>(&self, operation: &str, mut query: F) -> Result<T>
@@ -958,7 +1005,7 @@ impl RedisMetadataBackend {
     ) -> Result<RedisSegmentCleanupStats> {
         let owner_index = self.keyspace.segment_index_for_owner_key(owner_storage_key);
         let global_index = self.keyspace.segment_index(None);
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis cleanup stale segments")?;
         let keys: Vec<String> = connection
             .smembers(&owner_index)
             .map_err(|error| metadata_error("redis smembers owner segment index", error))?;
@@ -1084,7 +1131,7 @@ impl RedisMetadataBackend {
             .iter()
             .map(|lease| lease.runtime.storage_key())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis cleanup stale segments")?;
         let global_index = self.keyspace.segment_index(None);
         let mut keys: Vec<String> = connection
             .smembers(&global_index)
@@ -1529,7 +1576,7 @@ impl MetadataBackend for RedisMetadataBackend {
                 Ok((keys, backfill_index))
             })?;
         if backfill_index && !keys.is_empty() {
-            let mut connection = self.connection()?;
+            let mut connection = self.connection("redis sadd legacy client index")?;
             connection
                 .sadd::<_, _, ()>(&index, keys.clone())
                 .map_err(|error| metadata_error("redis sadd legacy client index", error))?;
@@ -1584,7 +1631,7 @@ impl MetadataBackend for RedisMetadataBackend {
             }
         }
         if !stale.is_empty() || !stale_by_stable.is_empty() || !stale_expiry_entries.is_empty() {
-            let mut connection = self.connection()?;
+            let mut connection = self.connection("redis prune stale client metadata")?;
             if !stale.is_empty() {
                 connection
                     .srem::<_, _, ()>(&index, stale)
@@ -1786,7 +1833,7 @@ impl MetadataBackend for RedisMetadataBackend {
             }
         }
         if !stale.is_empty() {
-            let mut connection = self.connection()?;
+            let mut connection = self.connection("redis srem stale segment index")?;
             connection
                 .srem::<_, _, ()>(&index, stale)
                 .map_err(|error| metadata_error("redis srem stale segment index", error))?;
@@ -1816,7 +1863,7 @@ impl MetadataBackend for RedisMetadataBackend {
         segment: &SegmentName,
         length_bytes: u64,
     ) -> Result<SegmentReservation> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis reserve segment")?;
         let key = self.keyspace.segment(owner, segment);
         let result = Script::new(RESERVE_SEGMENT_SCRIPT)
             .key(&key)
@@ -1849,7 +1896,7 @@ impl MetadataBackend for RedisMetadataBackend {
         offset_bytes: u64,
         length_bytes: u64,
     ) -> Result<()> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis release segment")?;
         let key = self.keyspace.segment(owner, segment);
         let result = Script::new(RELEASE_SEGMENT_SCRIPT)
             .key(&key)
@@ -1917,13 +1964,13 @@ impl MetadataBackend for RedisMetadataBackend {
             }
         }
         if backfill_index && !live_keys.is_empty() {
-            let mut connection = self.connection()?;
+            let mut connection = self.connection("redis sadd legacy object index")?;
             connection
                 .sadd::<_, _, ()>(&index, live_keys)
                 .map_err(|error| metadata_error("redis sadd legacy object index", error))?;
         }
         if !stale.is_empty() {
-            let mut connection = self.connection()?;
+            let mut connection = self.connection("redis srem stale object index")?;
             connection
                 .srem::<_, _, ()>(&index, stale)
                 .map_err(|error| metadata_error("redis srem stale object index", error))?;
@@ -1937,7 +1984,7 @@ impl MetadataBackend for RedisMetadataBackend {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis cas object route")?;
         let payload = next
             .map(|route| serde_json::to_string(route).map_err(json_error))
             .transpose()?;
@@ -1999,7 +2046,7 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn put_route_policy(&self, domain: &RoutePolicyDomain, policy: &RoutePolicy) -> Result<()> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis set route policy")?;
         let key = self.keyspace.route_policy(domain);
         let payload = serde_json::to_string(policy).map_err(json_error)?;
         connection
@@ -2008,7 +2055,7 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> Result<bool> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis del route policy")?;
         let key = self.keyspace.route_policy(domain);
         let removed: usize = connection
             .del(key)
@@ -2017,7 +2064,7 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn list_route_policies(&self) -> Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis list route policies")?;
         let prefix = self.keyspace.route_policy_prefix();
         let keys = scan_keys(&mut connection, &format!("{}*", prefix))?;
         let mut policies = Vec::new();
@@ -2038,7 +2085,7 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis get tenant policy")?;
         let key = self.keyspace.tenant_policy(scope);
         let payload: Option<String> = connection
             .get(&key)
@@ -2055,7 +2102,7 @@ impl MetadataBackend for RedisMetadataBackend {
         if scopes.is_empty() {
             return Ok(Vec::new());
         }
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis mget tenant policies")?;
         let keys = scopes
             .iter()
             .map(|scope| self.keyspace.tenant_policy(scope))
@@ -2075,7 +2122,7 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis list tenant policies")?;
         let prefix = self.keyspace.tenant_policy_prefix(None);
         let keys = scan_keys(&mut connection, &format!("{}*", prefix))?;
         let mut policies: Vec<TenantPolicy> = Vec::new();
@@ -2101,7 +2148,7 @@ impl MetadataBackend for RedisMetadataBackend {
         expected_version: Option<u64>,
     ) -> Result<TenantPolicy> {
         policy.validate()?;
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis cas tenant policy")?;
         let key = self.keyspace.tenant_policy(&policy.scope);
         let payload = serde_json::to_string(policy).map_err(json_error)?;
         let result = Script::new(CAS_TENANT_POLICY_SCRIPT)
@@ -2150,7 +2197,7 @@ impl MetadataBackend for RedisMetadataBackend {
         scope: &TenantPolicyScope,
         expected_version: Option<u64>,
     ) -> Result<bool> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis delete tenant policy")?;
         let key = self.keyspace.tenant_policy(scope);
         let result = Script::new(CAS_TENANT_POLICY_SCRIPT)
             .key(&key)
@@ -2195,7 +2242,7 @@ impl MetadataBackend for RedisMetadataBackend {
         scope: &TenantPolicyScope,
     ) -> Result<Option<TenantQuotaState>> {
         let scope = root_scope(scope)?;
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis get tenant quota state")?;
         let key = self.keyspace.tenant_quota_state(&scope);
         let payload: Option<String> = connection
             .get(&key)
@@ -2211,7 +2258,7 @@ impl MetadataBackend for RedisMetadataBackend {
         &self,
         key: &ObjectKey,
     ) -> Result<Option<TenantObjectAccounting>> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis get tenant object accounting")?;
         let storage_key = self.keyspace.tenant_object_accounting(key);
         let payload: Option<String> = connection
             .get(&storage_key)
@@ -2230,7 +2277,7 @@ impl MetadataBackend for RedisMetadataBackend {
         &self,
         reservation_id: &str,
     ) -> Result<Option<TenantQuotaReservation>> {
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis get tenant quota reservation")?;
         let reservation_key = self.keyspace.tenant_quota_reservation(reservation_id);
         let payload: Option<String> = connection
             .get(&reservation_key)
@@ -2255,7 +2302,7 @@ impl MetadataBackend for RedisMetadataBackend {
         if read_limit == 0 {
             return Ok(Vec::new());
         }
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis list tenant eviction frontier")?;
         let frontier_key = self.keyspace.tenant_eviction_frontier(&scope.tenant);
         let members: Vec<String> = cmd("ZRANGE")
             .arg(&frontier_key)
@@ -2301,7 +2348,7 @@ impl MetadataBackend for RedisMetadataBackend {
         scope: &TenantPolicyScope,
     ) -> Result<Vec<TenantQuotaReservation>> {
         let scope = root_scope(scope)?;
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis list tenant quota reservations")?;
         let index_prefix = self
             .keyspace
             .tenant_quota_reservation_prefix(Some(&scope.tenant));
@@ -2351,7 +2398,7 @@ impl MetadataBackend for RedisMetadataBackend {
         let scope = root_scope(&request.scope)?;
         let mut normalized = request.clone();
         normalized.scope = scope.clone();
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis reserve tenant quota")?;
         let quota_key = self.keyspace.tenant_quota_state(&scope);
         let object_key = self.keyspace.tenant_object_accounting(&normalized.key);
         let reservation_key = self
@@ -2471,7 +2518,7 @@ impl MetadataBackend for RedisMetadataBackend {
         request: &TenantQuotaFinalizeRequest,
     ) -> Result<TenantQuotaFinalizeOutcome> {
         request.validate()?;
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis finalize tenant quota")?;
         let reservation_key = self
             .keyspace
             .tenant_quota_reservation(&request.reservation_id);
@@ -2605,7 +2652,7 @@ impl MetadataBackend for RedisMetadataBackend {
                 "tenant quota abort reservation_id must not be empty".to_string(),
             ));
         }
-        let mut connection = self.connection()?;
+        let mut connection = self.connection("redis abort tenant quota")?;
         let reservation_key = self.keyspace.tenant_quota_reservation(reservation_id);
         let reservation_payload: Option<String> =
             connection.get(&reservation_key).map_err(|error| {
@@ -2682,7 +2729,43 @@ fn now_ms() -> u64 {
 }
 
 fn metadata_error(operation: &str, error: redis::RedisError) -> StoreError {
-    StoreError::Metadata(format!("{operation}: {error}"))
+    let mut message = format!("{operation}: {error}");
+    if let Some(hint) = redis_error_diagnostic_hint(&error) {
+        message.push_str(" (");
+        message.push_str(hint);
+        message.push(')');
+    }
+    StoreError::Metadata(message)
+}
+
+fn redis_error_diagnostic_hint(error: &redis::RedisError) -> Option<&'static str> {
+    let detail = error.to_string().to_ascii_lowercase();
+    let mut source: Option<&(dyn Error + 'static)> = error.source();
+    while let Some(current) = source {
+        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
+            if io_error.kind() == std::io::ErrorKind::AddrNotAvailable
+                || io_error.raw_os_error() == Some(99)
+            {
+                return Some(
+                    "possible local ephemeral/source-port exhaustion while opening Redis metadata connections",
+                );
+            }
+        }
+        source = current.source();
+    }
+    if detail.contains("cannot assign requested address")
+        || detail.contains("os error 99")
+        || detail.contains("addrnotavailable")
+    {
+        return Some(
+            "possible local ephemeral/source-port exhaustion while opening Redis metadata connections",
+        );
+    }
+    None
+}
+
+fn should_log_redis_diagnostic_occurrence(occurrence: u64) -> bool {
+    occurrence <= 8 || occurrence.is_power_of_two()
 }
 
 pub fn is_legacy_redis_auth_arity_error(message: &str) -> bool {
@@ -2842,15 +2925,15 @@ mod tests {
     use redis::Commands;
 
     use super::{
-        is_legacy_redis_auth_arity_error, legacy_auth_connection_info,
+        is_legacy_redis_auth_arity_error, legacy_auth_connection_info, metadata_error,
         redacted_route_namespace_source, redis_auth_probe_timeout, redis_connect_timeout,
-        redis_connection_info, redis_io_timeout, redis_retry_attempts, redis_retry_delay,
-        resolve_redis_auth, should_retry_readonly_redis_error, MetadataKeyspace,
-        RedisMetadataBackend, RedisMetadataConfig, DEFAULT_REDIS_AUTH_PROBE_TIMEOUT,
-        DEFAULT_REDIS_CONNECT_TIMEOUT, DEFAULT_REDIS_IO_TIMEOUT, DEFAULT_REDIS_RETRY_ATTEMPTS,
-        DEFAULT_REDIS_RETRY_DELAY, DEFAULT_TENANT_QUOTA_TERMINAL_TTL, REDIS_AUTH_PROBE_TIMEOUT_ENV,
-        REDIS_CONNECT_TIMEOUT_ENV, REDIS_IO_TIMEOUT_ENV, REDIS_RETRY_ATTEMPTS_ENV,
-        REDIS_RETRY_DELAY_ENV,
+        redis_connection_info, redis_error_diagnostic_hint, redis_io_timeout, redis_retry_attempts,
+        redis_retry_delay, resolve_redis_auth, should_log_redis_diagnostic_occurrence,
+        should_retry_readonly_redis_error, MetadataKeyspace, RedisMetadataBackend,
+        RedisMetadataConfig, DEFAULT_REDIS_AUTH_PROBE_TIMEOUT, DEFAULT_REDIS_CONNECT_TIMEOUT,
+        DEFAULT_REDIS_IO_TIMEOUT, DEFAULT_REDIS_RETRY_ATTEMPTS, DEFAULT_REDIS_RETRY_DELAY,
+        DEFAULT_TENANT_QUOTA_TERMINAL_TTL, REDIS_AUTH_PROBE_TIMEOUT_ENV, REDIS_CONNECT_TIMEOUT_ENV,
+        REDIS_IO_TIMEOUT_ENV, REDIS_RETRY_ATTEMPTS_ENV, REDIS_RETRY_DELAY_ENV,
     };
 
     struct RedisTestServer {
@@ -4011,7 +4094,7 @@ mod tests {
             TenantQuotaReservationState::Finalized
         );
         let mut connection = backend
-            .connection()
+            .connection("redis test inspect finalized reservation ttl")
             .expect("redis connection should succeed");
         let finalized_reservation_key = keyspace.tenant_quota_reservation("resv-create");
         let finalized_index_key = keyspace.tenant_quota_reservation_index(&scope, "resv-create");
@@ -4254,7 +4337,7 @@ mod tests {
         let aborted_index_key =
             keyspace.tenant_quota_reservation_index(&scope, "resv-expire-aborted");
         let mut connection = backend
-            .connection()
+            .connection("redis test inspect reservation expiration")
             .expect("redis connection should succeed");
         for key in [
             finalized_reservation_key.as_str(),
@@ -4283,7 +4366,7 @@ mod tests {
         let index_key = keyspace.tenant_quota_reservation_index(&scope, "dangling");
         let reservation_key = keyspace.tenant_quota_reservation("dangling");
         let mut connection = backend
-            .connection()
+            .connection("redis test seed dangling reservation index")
             .expect("redis connection should succeed");
         connection
             .set::<_, _, ()>(index_key.as_str(), reservation_key.as_str())
@@ -4296,7 +4379,7 @@ mod tests {
         assert!(reservations.is_empty());
 
         let mut connection = backend
-            .connection()
+            .connection("redis test inspect dangling reservation index")
             .expect("redis connection should succeed");
         let dangling_index_exists: bool = connection
             .exists(index_key.as_str())
@@ -4320,7 +4403,7 @@ mod tests {
         let scope = TenantPolicyScope::new("tenant-empty", None::<String>, None::<String>);
         let index_key = keyspace.tenant_quota_reservation_index(&scope, "empty");
         let mut connection = backend
-            .connection()
+            .connection("redis test seed empty reservation index")
             .expect("redis connection should succeed");
         connection
             .set::<_, _, ()>(index_key.as_str(), "")
@@ -4333,7 +4416,7 @@ mod tests {
         assert!(reservations.is_empty());
 
         let mut connection = backend
-            .connection()
+            .connection("redis test inspect empty reservation index")
             .expect("redis connection should succeed");
         let empty_index_exists: bool = connection
             .exists(index_key.as_str())
@@ -4834,6 +4917,41 @@ mod tests {
         std::env::remove_var(REDIS_RETRY_DELAY_ENV);
     }
 
+    #[test]
+    fn redis_error_diagnostic_hint_flags_addr_not_available() {
+        let err = redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "test",
+            "Cannot assign requested address (os error 99)".to_string(),
+        ));
+        assert_eq!(
+            redis_error_diagnostic_hint(&err),
+            Some(
+                "possible local ephemeral/source-port exhaustion while opening Redis metadata connections"
+            )
+        );
+    }
+
+    #[test]
+    fn metadata_error_appends_addr_not_available_hint() {
+        let err = redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "test",
+            "Cannot assign requested address (os error 99)".to_string(),
+        ));
+        let rendered = metadata_error("redis list live clients", err).to_string();
+        assert!(rendered.contains("redis list live clients"));
+        assert!(rendered.contains("possible local ephemeral/source-port exhaustion"));
+    }
+
+    #[test]
+    fn redis_diagnostic_occurrence_rate_limit_logs_early_and_powers_of_two() {
+        assert!(should_log_redis_diagnostic_occurrence(1));
+        assert!(should_log_redis_diagnostic_occurrence(8));
+        assert!(should_log_redis_diagnostic_occurrence(16));
+        assert!(!should_log_redis_diagnostic_occurrence(15));
+    }
+
     // -----------------------------------------------------------------------
     // Adversarial: Redis integration (skipped if redis-server unavailable)
     // -----------------------------------------------------------------------
@@ -5079,7 +5197,7 @@ mod tests {
 
         let key = backend.keyspace.client(&runtime);
         let payload: Option<String> = backend
-            .connection()
+            .connection("redis test inspect updated client lease")
             .expect("redis connection should succeed")
             .get(&key)
             .expect("updated lease lookup should succeed");
