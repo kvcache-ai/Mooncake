@@ -39,6 +39,13 @@ def resolve_first(candidates: list[pathlib.Path]) -> pathlib.Path | None:
     return None
 
 
+def safe_resolve(path: pathlib.Path) -> pathlib.Path | None:
+    try:
+        return path.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
 def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]:
     root = package_root if package_root is not None else package_dir()
     repository = repo_root(root)
@@ -136,8 +143,8 @@ def native_library_candidates(
         if env_override:
             configured = os.environ.get(env_override)
             if configured:
-                resolved = pathlib.Path(configured).expanduser().resolve()
-                if resolved.exists():
+                resolved = safe_resolve(pathlib.Path(configured))
+                if resolved is not None and resolved.exists():
                     selected.append(resolved)
                     continue
         candidate_path: pathlib.Path | None = None
@@ -148,8 +155,8 @@ def native_library_candidates(
                 candidate = library_dir / library_name
             if candidate is None:
                 continue
-            resolved = candidate.resolve()
-            if not resolved.exists():
+            resolved = safe_resolve(candidate)
+            if resolved is None or not resolved.exists():
                 continue
             candidate_path = resolved
             break

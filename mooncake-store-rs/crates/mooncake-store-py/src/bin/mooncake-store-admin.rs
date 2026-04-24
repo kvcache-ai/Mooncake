@@ -674,6 +674,9 @@ where
     let port = base
         .port_or_known_default()
         .ok_or("admin_url is missing port")?;
+    if path.contains('\r') || path.contains('\n') {
+        return Err("admin http path contains invalid newline characters".into());
+    }
     let base_path = base.path().trim_end_matches('/');
     let full_path = if base_path.is_empty() || base_path == "/" {
         path.to_string()
