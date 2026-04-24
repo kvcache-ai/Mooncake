@@ -5,6 +5,7 @@ pub(crate) type SharedSuspectRuntimeCache = Arc<Mutex<SuspectRuntimeCache>>;
 pub(crate) struct LiveClientCache {
     refreshed_at: Option<Instant>,
     leases: Vec<ClientLease>,
+    tenant_quota_policies: BTreeMap<String, TenantQuotaPolicyCacheEntry>,
 }
 
 impl LiveClientCache {
@@ -16,6 +17,58 @@ impl LiveClientCache {
     pub(crate) fn store(&mut self, leases: Vec<ClientLease>) {
         self.refreshed_at = Some(Instant::now());
         self.leases = filter_live_client_leases(&leases);
+    }
+
+    pub(crate) fn tenant_quota_policy(
+        &mut self,
+        tenant: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Option<Option<TenantQuotaPolicy>> {
+        let entry = self.tenant_quota_policies.get_mut(tenant)?;
+        entry.last_accessed_ms = now_ms;
+        (now_ms.saturating_sub(entry.refreshed_at_ms) <= ttl_ms).then(|| entry.quota.clone())
+    }
+
+    pub(crate) fn store_tenant_quota_policy(
+        &mut self,
+        tenant: String,
+        version: Option<u64>,
+        quota: Option<TenantQuotaPolicy>,
+        now_ms: u64,
+    ) {
+        self.tenant_quota_policies.insert(
+            tenant,
+            TenantQuotaPolicyCacheEntry {
+                version,
+                quota,
+                refreshed_at_ms: now_ms,
+                last_accessed_ms: now_ms,
+            },
+        );
+    }
+
+    pub(crate) fn due_tenant_quota_policy_refreshes(
+        &mut self,
+        now_ms: u64,
+        refresh_ttl_ms: u64,
+        idle_ttl_ms: u64,
+    ) -> Vec<String> {
+        self.tenant_quota_policies.retain(|_, entry| {
+            now_ms.saturating_sub(entry.last_accessed_ms) <= idle_ttl_ms
+        });
+        self.tenant_quota_policies
+            .iter_mut()
+            .filter_map(|(tenant, entry)| {
+                let _ = entry.version;
+                (now_ms.saturating_sub(entry.refreshed_at_ms) > refresh_ttl_ms
+                    && now_ms.saturating_sub(entry.last_accessed_ms) <= refresh_ttl_ms)
+                    .then(|| {
+                        entry.last_accessed_ms = now_ms;
+                        tenant.clone()
+                    })
+            })
+            .collect()
     }
 }
 
