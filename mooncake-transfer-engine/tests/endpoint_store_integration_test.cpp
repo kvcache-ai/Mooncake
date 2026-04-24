@@ -20,10 +20,8 @@
 // verifies that the scheduler invokes it.
 //
 // Requires an RDMA device. Passes on soft-RoCE (`rdma_rxe`) as well as real
-// NICs. Not registered with ctest by default because CI runners don't have
-// devices; invoke manually:
-//
-//     ./build/mooncake-transfer-engine/tests/endpoint_store_integration_test
+// NICs. Self-skips (GTEST_SKIP) when no device is present, so it is safe to
+// register with ctest on CI runners without RDMA.
 //
 // Environment override: set MC_TEST_DEVICE_NAME to force a specific device;
 // otherwise the first device returned by ibv_get_device_list is used.
@@ -84,9 +82,11 @@ std::shared_ptr<RdmaEndPoint> makeQuiescentEndpoint(RdmaContext &ctx) {
 // scheduler within ~1.5 s with no further insertion traffic.
 TEST(EndpointStoreIntegration, MonitorWorkerTickDrainsWaitingList) {
     const std::string device = pickRdmaDevice();
-    ASSERT_FALSE(device.empty())
-        << "no RDMA device available — integration test requires rxe0, mlx5, "
-           "or similar. Set MC_TEST_DEVICE_NAME to override.";
+    if (device.empty()) {
+        GTEST_SKIP() << "no RDMA device available — integration test requires "
+                        "rxe0, mlx5, or similar. Set MC_TEST_DEVICE_NAME to "
+                        "override.";
+    }
 
     // RdmaTransport's destructor dereferences metadata_ which is null until
     // init(); leak the engine to avoid touching that path. Marked ignored so

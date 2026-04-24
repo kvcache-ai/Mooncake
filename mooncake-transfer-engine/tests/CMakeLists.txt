@@ -21,10 +21,11 @@ target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest gtest_mai
 add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 
 # Integration test for the monitorWorker reclaim tick (issue #1845).
-# Requires an RDMA device (rxe0, mlx5, etc.) — invoked manually, not via ctest.
+# Self-skips when no RDMA device is present, so safe to register with ctest.
 add_executable(endpoint_store_integration_test ${WORKSPACE}/endpoint_store_integration_test.cpp)
 target_link_libraries(endpoint_store_integration_test PUBLIC transfer_engine gtest gtest_main)
-# add_test(NAME endpoint_store_integration_test COMMAND endpoint_store_integration_test)
+add_test(NAME endpoint_store_integration_test COMMAND endpoint_store_integration_test)
+set_tests_properties(endpoint_store_integration_test PROPERTIES LABELS "rdma")
 
 add_executable(rdma_transport_test2 ${WORKSPACE}/rdma_transport_test2.cpp)
 target_link_libraries(rdma_transport_test2 PUBLIC transfer_engine gtest gtest_main )
