@@ -66,21 +66,21 @@ class CallableTaskHandle : public TaskHandle<V> {
 };
 
 template <typename V>
-class RemoteRpcHandle : public TaskHandle<V> {
+class FutureHandle : public TaskHandle<V> {
    public:
-    RemoteRpcHandle(std::shared_ptr<void> request_storage,
-                    std::future<tl::expected<V, ErrorCode>> future)
+    FutureHandle(std::shared_ptr<void> request_storage,
+                 std::future<tl::expected<V, ErrorCode>> future)
         : request_storage_(std::move(request_storage)),
           future_(std::move(future)) {}
 
     tl::expected<V, ErrorCode> Wait() override { return future_.get(); }
 
     template <typename T>
-    static std::unique_ptr<RemoteRpcHandle<V>> Create(
+    static std::unique_ptr<FutureHandle<V>> Create(
         std::shared_ptr<T> request_storage,
         std::future<tl::expected<V, ErrorCode>> future) {
-        return std::make_unique<RemoteRpcHandle<V>>(std::move(request_storage),
-                                                    std::move(future));
+        return std::make_unique<FutureHandle<V>>(std::move(request_storage),
+                                                 std::move(future));
     }
 
    private:

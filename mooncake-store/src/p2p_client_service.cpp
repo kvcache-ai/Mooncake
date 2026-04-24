@@ -11,6 +11,7 @@
 
 #include <async_simple/Try.h>
 #include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
 
 #include "utils/scoped_vlog_timer.h"
 
@@ -523,6 +524,12 @@ std::string P2PClientService::GetHealthStatus() const {
 // Put Operations
 // ============================================================================
 
+inline bool IsAlreadyExistsError(ErrorCode err) {
+    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
+           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
+           err == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
 tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
                                                     std::vector<Slice>& slices,
                                                     const WriteConfig& config) {
@@ -610,7 +617,8 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
     if (ha_manager_ && ha_manager_->IsDegraded()) {
         // DEGRADED: skip master RPC, write locally for each key.
         for (size_t i = 0; i < keys.size(); ++i) {
-            handles.push_back(CreateLocalPutHandle(keys[i], batched_slices[i]));
+            handles.push_back(
+                CreatePutHandleFromLocal(keys[i], batched_slices[i]));
         }
     } else {
         // NORMAL: fetch routes from master, write based on routes.
@@ -629,7 +637,7 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
             if (batch_resp.error_codes[i] != ErrorCode::OK) {
                 handles.push_back(tl::unexpected(batch_resp.error_codes[i]));
             } else {
-                handles.push_back(InnerCreatePutHandle(
+                handles.push_back(CreatePutHandleViaRoute(
                     keys[i], batched_slices[i], route_config,
                     std::move(batch_resp.responses[i].candidates)));
             }
@@ -647,24 +655,41 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
                        << ", error: " << handles[i].error();
             results[i] = tl::unexpected(handles[i].error());
         } else if (!handles[i].value()) {
-            LOG(ERROR) << "put task handle is null for key: " << keys[i];
-            results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            if (!IsAlreadyExistsError(handles[i].error())) {
+                LOG(ERROR) << "put task handle is null for key: " << keys[i];
+                results[i] = tl::unexpected(handles[i].error());
+            } else {
+                results[i] = {};
+            }
         } else {
             auto wait_result = handles[i].value()->Wait();
-            if (!wait_result) {
-                LOG(ERROR) << "Failed to put key: " << keys[i]
-                           << ", error: " << wait_result.error();
+            if (wait_result || !IsAlreadyExistsError(wait_result.error())) {
+                if (!wait_result) {
+                    LOG(ERROR) << "Failed to put key: " << keys[i]
+                               << ", error: " << wait_result.error();
+                }
+                results[i] = wait_result;
+            } else {
+                results[i] = {};
             }
-            results[i] = wait_result;
         }
     }
     return results;
 }
 
-inline bool IsAlreadyExistsError(ErrorCode err) {
-    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
-           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
-           err == ErrorCode::OBJECT_ALREADY_EXISTS;
+tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
+P2PClientService::CreatePutHandleFromLocal(const std::string& key,
+                                           std::vector<Slice>& slices) {
+    auto local_handle = data_manager_->Put(key, slices);
+
+    if (local_handle) {
+        return std::move(local_handle.value());
+    } else if (!IsAlreadyExistsError(local_handle.error())) {
+        LOG(ERROR) << "Local write failed for key: " << key
+                   << ", error: " << local_handle.error();
+    }
+
+    return tl::unexpected(local_handle.error());
 }
 
 tl::expected<BatchGetWriteRouteResponse, ErrorCode>
@@ -692,93 +717,12 @@ P2PClientService::BatchFetchWriteRoutes(
 }
 
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-P2PClientService::CreatePutHandle(const std::string& key,
-                                  std::vector<Slice>& slices,
-                                  const WriteRouteRequestConfig& config) {
-    // DEGRADED: Master unreachable, only allow local writes
-    if (ha_manager_ && ha_manager_->IsDegraded()) {
-        return CreateLocalPutHandle(key, slices);
-    }
-
-    WriteRouteRequest route_req;
-    route_req.key = key;
-    route_req.client_id = client_id_;
-    route_req.size = ClientService::CalculateSliceSize(slices);
-    route_req.config = config;
-
-    auto route_result = master_client_.GetWriteRoute(route_req);
-    if (!route_result) {
-        LOG(WARNING) << "Failed to get write route for key: " << key
-                     << " error: " << route_result.error();
-        return tl::unexpected(route_result.error());
-    }
-
-    return InnerCreatePutHandle(key, slices, config,
-                                std::move(route_result.value().candidates));
-}
-
-tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-P2PClientService::CreateLocalPutHandle(const std::string& key,
-                                       std::vector<Slice>& slices) {
-    auto local_handle = data_manager_->Put(key, slices);
-
-    if (local_handle) {
-        return std::move(local_handle.value());
-    }
-
-    LOG(ERROR) << "Local write failed for key: " << key
-               << ", error: " << local_handle.error();
-    return tl::unexpected(local_handle.error());
-}
-
-tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-P2PClientService::InnerCreatePutHandle(const std::string& key,
-                                       std::vector<Slice>& slices,
-                                       const WriteRouteRequestConfig& config,
-                                       std::vector<WriteCandidate> candidates) {
+P2PClientService::CreatePutHandleViaRoute(
+    const std::string& key, std::vector<Slice>& slices,
+    const WriteRouteRequestConfig& config,
+    std::vector<WriteCandidate> candidates) {
     if (candidates.empty()) {
         LOG(ERROR) << "No write candidates for key: " << key;
-        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-
-    // 1. Generate a retry list based on the recommended order of master.
-    // If there is a local candidate among them, generate a local task handle.
-    std::vector<P2PProxyDescriptor> remote_proxies;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        auto& proxy = candidates[i].replica;
-
-        if (proxy.client_id == client_id_) {
-            // Defensive check: master should not return local candidates when
-            // allow_local=false, but if it does, just skip it.
-            if (!config.allow_local) {
-                LOG(WARNING) << "Master returned local candidate but "
-                                "allow_local=false, skipping";
-                continue;
-            }
-            if (data_manager_.has_value()) {
-                auto local_handle = data_manager_->Put(key, slices);
-
-                if (local_handle) {
-                    return std::move(local_handle.value());
-                } else if (IsAlreadyExistsError(local_handle.error())) {
-                    // The key already exists. Currently, we think this is a
-                    // normal case, just ignore the error and return success.
-                    return ImmediateHandle<void>::Create();
-                } else {
-                    // Local put failure, try next candidate
-                    LOG(WARNING) << "Local write failed, trying next candidate"
-                                 << ", error: " << local_handle.error();
-                    continue;
-                }
-            }
-        } else {
-            remote_proxies.push_back(proxy);
-        }
-    }
-
-    // 2. Chain async RPCs over remote candidates via continuation
-    if (remote_proxies.empty()) {
-        LOG(ERROR) << "No remote candidates for key: " << key;
         return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
@@ -792,59 +736,101 @@ P2PClientService::InnerCreatePutHandle(const std::string& key,
         write_req->src_buffers.push_back(buf);
     }
 
-    // Resolve proxies to PeerClient* before entering the coroutine so that
-    // RunWriteRetry needs no back-reference to the service (mirrors how
-    // RunReadRetry receives already-resolved PeerClient* via RouteIterator).
-    std::vector<std::pair<PeerClient*, P2PProxyDescriptor>> peers;
-    peers.reserve(remote_proxies.size());
-    for (auto& proxy : remote_proxies) {
-        std::string ep =
-            proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
-        peers.emplace_back(&GetOrCreatePeerClient(ep), std::move(proxy));
+    std::vector<WriteOp> write_ops;
+    for (auto& candidate : candidates) {
+        auto& proxy = candidate.replica;
+        if (proxy.client_id == client_id_) {
+            // Defensive check: master should not return local candidates when
+            // allow_local=false, but if it does, just skip it.
+            if (!config.allow_local) {
+                LOG(WARNING) << "Master returned local candidate but "
+                                "allow_local=false, skipping";
+                continue;
+            } else if (!data_manager_.has_value()) {
+                LOG(ERROR) << "Data manager not initialized";
+                continue;
+            }
+            write_ops.push_back(MakeLocalWriteOp(key, &slices));
+        } else {
+            std::string endpoint =
+                proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+            write_ops.push_back(MakeRemoteWriteOp(
+                GetOrCreatePeerClient(endpoint), write_req, proxy));
+        }
+    }
+
+    if (write_ops.empty()) {
+        LOG(ERROR) << "No valid candidates for key: " << key;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
     auto promise =
         std::make_shared<std::promise<tl::expected<void, ErrorCode>>>();
     auto future = promise->get_future();
 
-    RunWriteRetry(std::move(peers), write_req, promise,
-                  route_cache_ ? &(*route_cache_) : nullptr, key)
-        .start([](auto&&) {});
+    RunWriteRetry(std::move(write_ops), promise).start([](auto&&) {});
 
-    return RemoteRpcHandle<void>::Create(std::move(write_req),
-                                         std::move(future));
+    return FutureHandle<void>::Create(std::move(write_req), std::move(future));
+}
+
+P2PClientService::WriteOp P2PClientService::MakeLocalWriteOp(
+    const std::string& key, std::vector<Slice>* slices) {
+    return WriteOp(
+        [this, key,
+         slices]() -> async_simple::coro::Lazy<tl::expected<void, ErrorCode>> {
+            auto handle = data_manager_->Put(key, *slices);
+            if (!handle) {
+                if (!IsAlreadyExistsError(handle.error())) {
+                    LOG(ERROR) << "Local write failed, key: " << key
+                               << ", error: " << handle.error();
+                }
+                co_return tl::unexpected(handle.error());
+            }
+            co_return handle.value()->Wait();
+        });
+}
+
+P2PClientService::WriteOp P2PClientService::MakeRemoteWriteOp(
+    PeerClient& peer, std::shared_ptr<RemoteWriteRequest> write_req,
+    P2PProxyDescriptor proxy) {
+    RouteCache* route_cache = route_cache_ ? &(*route_cache_) : nullptr;
+    return WriteOp(
+        [peer_ptr = &peer, write_req = std::move(write_req), proxy,
+         route_cache]()
+            -> async_simple::coro::Lazy<tl::expected<void, ErrorCode>> {
+            auto result = co_await peer_ptr->AsyncWriteRemoteData(*write_req);
+            if (result.has_value()) {
+                if (route_cache) {
+                    P2PProxyDescriptor np = proxy;
+                    np.segment_id = result.value();
+                    route_cache->Upsert(write_req->key, {np});
+                }
+                co_return tl::expected<void, ErrorCode>{};
+            }
+            if (!IsAlreadyExistsError(result.error())) {
+                LOG(ERROR) << "Failed to write to remote, key: "
+                           << write_req->key << ", error: " << result.error();
+            }
+            co_return tl::unexpected(result.error());
+        });
 }
 
 async_simple::coro::Lazy<void> P2PClientService::RunWriteRetry(
-    std::vector<std::pair<PeerClient*, P2PProxyDescriptor>> peers,
-    std::shared_ptr<RemoteWriteRequest> write_req,
-    std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise,
-    RouteCache* route_cache, std::string key) {
+    std::vector<WriteOp> write_ops,
+    std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise) {
     try {
-        for (auto& [peer, proxy] : peers) {
+        for (auto& op : write_ops) {
             try {
-                auto result = co_await peer->AsyncWriteRemoteData(*write_req);
-                if (result.has_value()) {
-                    if (route_cache) {
-                        P2PProxyDescriptor np = proxy;
-                        np.segment_id = result.value();
-                        route_cache->Upsert(key, {np});
-                    }
+                auto result = co_await op();
+                if (result.has_value() ||
+                    IsAlreadyExistsError(result.error())) {
                     promise->set_value({});
                     co_return;
-                } else if (IsAlreadyExistsError(result.error())) {
-                    promise->set_value({});
-                    co_return;
-                } else {
-                    LOG(ERROR) << "Failed to write to remote, key: " << key
-                               << ", error: " << result.error();
                 }
             } catch (const std::exception& e) {
-                LOG(ERROR) << "Failed to write to remote, key: " << key
-                           << ", exception: " << e.what();
+                LOG(ERROR) << "Write candidate failed, exception: " << e.what();
             } catch (...) {
-                LOG(ERROR) << "Failed to write to remote, key: " << key
-                           << ", unknown exception";
+                LOG(ERROR) << "Write candidate failed, unknown exception";
             }
         }
         promise->set_value(tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
@@ -1275,7 +1261,7 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
     ReadTaskHandle res;
     res.data_size = object_size;
     res.task_handle =
-        RemoteRpcHandle<void>::Create(std::move(req), std::move(future));
+        FutureHandle<void>::Create(std::move(req), std::move(future));
     return res;
 }
 
