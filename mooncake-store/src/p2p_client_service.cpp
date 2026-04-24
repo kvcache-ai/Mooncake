@@ -526,118 +526,121 @@ std::string P2PClientService::GetHealthStatus() const {
 tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
                                                     std::vector<Slice>& slices,
                                                     const WriteConfig& config) {
+    ErrorCode result = ErrorCode::OK;
     ScopedVLogTimer timer(1, "P2PClientService::Put");
     timer.LogRequest("key=", key, "slice_count=", slices.size());
 
-    // Add metric for put requests
+    Stopwatch stopwatch;
     if (metrics_) {
         metrics_->local_put_requests.inc();
     }
 
     auto guard = AcquireInflightGuard();
+    const auto* route_config = std::get_if<WriteRouteRequestConfig>(&config);
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
-        timer.LogResponse("error_code=", ErrorCode::SHUTTING_DOWN);
-        if (metrics_) {
-            metrics_->local_put_failures.inc();
-        }
-        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
-    }
-    const auto* route_config = std::get_if<WriteRouteRequestConfig>(&config);
-    if (!route_config) {
+        result = ErrorCode::SHUTTING_DOWN;
+    } else if (!route_config) {
         LOG(ERROR) << "P2PClientService currently only supports "
                       "WriteRouteRequestConfig";
-        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
-        if (metrics_) {
-            metrics_->local_put_failures.inc();
-        }
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    Stopwatch stopwatch;
-    auto task_handle_ptr = CreatePutHandle(key, slices, *route_config);
-    if (!task_handle_ptr) {
-        LOG(ERROR) << "Failed to create put handle for key: " << key
-                   << ", error: " << task_handle_ptr.error();
-        timer.LogResponse("error_code=", task_handle_ptr.error());
-        if (metrics_) {
-            metrics_->local_put_failures.inc();
-            metrics_->local_put_latency.observe(stopwatch.elapsed_us());
-        }
-        return tl::unexpected(task_handle_ptr.error());
-    } else if (!task_handle_ptr.value()) {
-        LOG(ERROR) << "put task handle is null for key: " << key;
-        timer.LogResponse("error_code=", ErrorCode::INTERNAL_ERROR);
-        if (metrics_) {
-            metrics_->local_put_failures.inc();
-            metrics_->local_put_latency.observe(stopwatch.elapsed_us());
-        }
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    auto result = task_handle_ptr.value()->Wait();
-    int64_t elapsed_us = stopwatch.elapsed_us();
-    if (!result) {
-        LOG(ERROR) << "Failed to put key: " << key
-                   << ", error: " << result.error();
-        if (metrics_) {
-            metrics_->local_put_failures.inc();
-            metrics_->local_put_latency.observe(elapsed_us);
-        }
+        result = ErrorCode::INVALID_PARAMS;
     } else {
-        if (metrics_) {
-            metrics_->local_put_latency.observe(elapsed_us);
+        auto task_handle_ptr = CreatePutHandle(key, slices, *route_config);
+        if (!task_handle_ptr) {
+            LOG(ERROR) << "Failed to create put handle for key: " << key
+                       << ", error: " << task_handle_ptr.error();
+            result = task_handle_ptr.error();
+        } else if (!task_handle_ptr.value()) {
+            LOG(ERROR) << "put task handle is null for key: " << key;
+            result = ErrorCode::INTERNAL_ERROR;
+        } else {
+            auto wait_result = task_handle_ptr.value()->Wait();
+            if (!wait_result) {
+                LOG(ERROR) << "Failed to put key: " << key
+                           << ", error: " << wait_result.error();
+                result = wait_result.error();
+            }
+        }
+    }
+
+    if (metrics_) {
+        metrics_->local_put_latency.observe(stopwatch.elapsed_us());
+        if (result == ErrorCode::OK) {
             metrics_->local_put_bytes.inc(
                 ClientService::CalculateSliceSize(slices));
+        } else {
+            metrics_->local_put_failures.inc();
         }
     }
-    timer.LogResponseExpected(result);
-    return result;
+    timer.LogResponse("error_code=", result);
+    return result == ErrorCode::OK ? tl::expected<void, ErrorCode>{}
+                                   : tl::unexpected(result);
 }
 
 std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const WriteConfig& config) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
     ScopedVLogTimer timer(1, "P2PClientService::BatchPut");
     timer.LogRequest("batch_size=", keys.size());
 
+    Stopwatch stopwatch;
+    if (metrics_) {
+        metrics_->local_put_requests.inc(keys.size());
+    }
+
     auto guard = AcquireInflightGuard();
+    const auto* route_config = std::get_if<WriteRouteRequestConfig>(&config);
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
-        timer.LogResponse("success=0 fail=", keys.size(),
-                          " error_code=", ErrorCode::SHUTTING_DOWN);
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::make_unexpected(ErrorCode::SHUTTING_DOWN));
-    }
-    std::vector<tl::expected<void, ErrorCode>> results(
-        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
-    if (keys.size() != batched_slices.size()) {
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::SHUTTING_DOWN));
+    } else if (keys.size() != batched_slices.size()) {
         LOG(ERROR) << "BatchPut input size mismatch";
         std::fill(results.begin(), results.end(),
                   tl::unexpected(ErrorCode::INVALID_PARAMS));
-        timer.LogResponse("success=0 fail=", keys.size(),
-                          " error_code=", ErrorCode::INVALID_PARAMS);
-        return results;
-    }
-
-    const auto* route_config = std::get_if<WriteRouteRequestConfig>(&config);
-    if (!route_config) {
+    } else if (!route_config) {
         LOG(ERROR) << "P2PClientService currently only supports "
                       "WriteRouteRequestConfig";
         std::fill(results.begin(), results.end(),
                   tl::unexpected(ErrorCode::INVALID_PARAMS));
-        timer.LogResponse("success=0 fail=", keys.size(),
-                          " error_code=", ErrorCode::INVALID_PARAMS);
-        return results;
+    } else {
+        results = InnerBatchPut(keys, batched_slices, *route_config);
     }
 
-    // Initialize stopwatches for latency measurement
-    std::vector<Stopwatch> stopwatches;
+    size_t success_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value()) {
+            success_count++;
+            if (metrics_) {
+                metrics_->local_put_bytes.inc(
+                    ClientService::CalculateSliceSize(batched_slices[i]));
+            }
+        }
+    }
     if (metrics_) {
-        stopwatches.resize(keys.size());
+        size_t failure_count = keys.size() - success_count;
+        if (failure_count > 0) {
+            metrics_->local_put_failures.inc(failure_count);
+        }
+        metrics_->local_put_latency.observe(stopwatch.elapsed_us());
     }
 
+    timer.LogResponse("success=", success_count,
+                      " fail=", keys.size() - success_count);
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const WriteRouteRequestConfig& route_config) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+
+    // Phase 1: create task handles for each key.
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
         handles;
     handles.reserve(keys.size());
@@ -648,81 +651,51 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
             handles.push_back(CreateLocalPutHandle(keys[i], batched_slices[i]));
         }
     } else {
-        // Phase 1: single RPC to fetch all routes.
+        // NORMAL: fetch routes from master, write based on routes.
         auto batch_route_result =
-            BatchFetchWriteRoutes(keys, batched_slices, *route_config);
+            BatchFetchWriteRoutes(keys, batched_slices, route_config);
         if (!batch_route_result) {
             LOG(ERROR) << "BatchGetWriteRoute RPC failed: "
                        << batch_route_result.error();
             std::fill(results.begin(), results.end(),
                       tl::unexpected(batch_route_result.error()));
-            timer.LogResponse("success=0 fail=", keys.size(),
-                              " error_code=", batch_route_result.error());
-            if (metrics_) {
-                metrics_->local_put_failures.inc(keys.size());
-            }
             return results;
         }
 
-        // Phase 2: per-key handle creation using pre-fetched candidates.
         auto& batch_resp = batch_route_result.value();
         for (size_t i = 0; i < keys.size(); ++i) {
             if (batch_resp.error_codes[i] != ErrorCode::OK) {
                 handles.push_back(tl::unexpected(batch_resp.error_codes[i]));
-                continue;
+            } else {
+                handles.push_back(InnerCreatePutHandle(
+                    keys[i], batched_slices[i], route_config,
+                    std::move(batch_resp.responses[i].candidates)));
             }
-            handles.push_back(InnerCreatePutHandle(
-                keys[i], batched_slices[i], *route_config,
-                std::move(batch_resp.responses[i].candidates)));
         }
     }
 
-    // Phase 3: collect results.
-    for (size_t i = 0; i < keys.size(); ++i) {
+    // Phase 2: wait every handle and collect results.
+    if (handles.size() != keys.size()) {
+        LOG(ERROR) << "handles size mismatch";
+        return results;
+    }
+    for (size_t i = 0; i < handles.size(); ++i) {
         if (!handles[i]) {
             LOG(ERROR) << "Failed to create put handle for key: " << keys[i]
                        << ", error: " << handles[i].error();
             results[i] = tl::unexpected(handles[i].error());
-            if (metrics_) {
-                metrics_->local_put_failures.inc();
-                metrics_->local_put_latency.observe(
-                    stopwatches[i].elapsed_us());
-            }
         } else if (!handles[i].value()) {
             LOG(ERROR) << "put task handle is null for key: " << keys[i];
             results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
-            if (metrics_) {
-                metrics_->local_put_failures.inc();
-                metrics_->local_put_latency.observe(
-                    stopwatches[i].elapsed_us());
-            }
         } else {
-            auto result = handles[i].value()->Wait();
-            int64_t elapsed_us = stopwatches[i].elapsed_us();
-            if (!result) {
+            auto wait_result = handles[i].value()->Wait();
+            if (!wait_result) {
                 LOG(ERROR) << "Failed to put key: " << keys[i]
-                           << ", error: " << result.error();
-                results[i] = result;
-                if (metrics_) {
-                    metrics_->local_put_failures.inc();
-                    metrics_->local_put_latency.observe(elapsed_us);
-                }
-            } else {
-                results[i] = result;
-                if (metrics_) {
-                    metrics_->local_put_latency.observe(elapsed_us);
-                    metrics_->local_put_bytes.inc(
-                        ClientService::CalculateSliceSize(batched_slices[i]));
-                }
+                           << ", error: " << wait_result.error();
             }
+            results[i] = wait_result;
         }
     }
-    size_t success_count = 0;
-    for (const auto& r : results) {
-        if (r) ++success_count;
-    }
-    timer.LogResponse("success=", success_count,
-                      " fail=", keys.size() - success_count);
     return results;
 }
 
@@ -730,49 +703,6 @@ inline bool IsAlreadyExistsError(ErrorCode err) {
     return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
            err == ErrorCode::REPLICA_ALREADY_EXISTS ||
            err == ErrorCode::OBJECT_ALREADY_EXISTS;
-}
-
-// Coroutine tries remote write candidates one at a time, retrying on failure.
-static async_simple::coro::Lazy<void> RunWriteRetry(
-    std::vector<P2PProxyDescriptor> proxies,
-    std::shared_ptr<RemoteWriteRequest> write_req,
-    std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise,
-    RouteCache* route_cache,
-    std::function<PeerClient&(const std::string&)> get_peer, std::string key) {
-    try {
-        for (auto& proxy : proxies) {
-            try {
-                std::string endpoint =
-                    proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
-                auto& peer = get_peer(endpoint);
-                auto result = co_await peer.AsyncWriteRemoteData(*write_req);
-                if (result.has_value()) {
-                    if (route_cache) {
-                        P2PProxyDescriptor np = proxy;
-                        np.segment_id = result.value();
-                        route_cache->Upsert(key, {np});
-                    }
-                    promise->set_value({});
-                    co_return;
-                } else if (IsAlreadyExistsError(result.error())) {
-                    promise->set_value({});
-                    co_return;
-                } else {
-                    LOG(ERROR) << "Failed to write to remote, key: " << key
-                               << ", error: " << result.error();
-                }
-            } catch (const std::exception& e) {
-                LOG(ERROR) << "Failed to write to remote, key: " << key
-                           << ", exception: " << e.what();
-            } catch (...) {
-                LOG(ERROR) << "Failed to write to remote, key: " << key
-                           << ", unknown exception";
-            }
-        }
-        promise->set_value(tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
-    } catch (...) {
-        promise->set_value(tl::unexpected(ErrorCode::INTERNAL_ERROR));
-    }
 }
 
 tl::expected<BatchGetWriteRouteResponse, ErrorCode>
@@ -900,21 +830,65 @@ P2PClientService::InnerCreatePutHandle(const std::string& key,
         write_req->src_buffers.push_back(buf);
     }
 
+    // Resolve proxies to PeerClient* before entering the coroutine so that
+    // RunWriteRetry needs no back-reference to the service (mirrors how
+    // RunReadRetry receives already-resolved PeerClient* via RouteIterator).
+    std::vector<std::pair<PeerClient*, P2PProxyDescriptor>> peers;
+    peers.reserve(remote_proxies.size());
+    for (auto& proxy : remote_proxies) {
+        std::string ep =
+            proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+        peers.emplace_back(&GetOrCreatePeerClient(ep), std::move(proxy));
+    }
+
     auto promise =
         std::make_shared<std::promise<tl::expected<void, ErrorCode>>>();
     auto future = promise->get_future();
 
-    RunWriteRetry(
-        std::move(remote_proxies), write_req, promise,
-        route_cache_ ? &(*route_cache_) : nullptr,
-        [this](const std::string& ep) -> PeerClient& {
-            return GetOrCreatePeerClient(ep);
-        },
-        key)
+    RunWriteRetry(std::move(peers), write_req, promise,
+                  route_cache_ ? &(*route_cache_) : nullptr, key)
         .start([](auto&&) {});
 
     return RemoteRpcHandle<void>::Create(std::move(write_req),
                                          std::move(future));
+}
+
+async_simple::coro::Lazy<void> P2PClientService::RunWriteRetry(
+    std::vector<std::pair<PeerClient*, P2PProxyDescriptor>> peers,
+    std::shared_ptr<RemoteWriteRequest> write_req,
+    std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise,
+    RouteCache* route_cache, std::string key) {
+    try {
+        for (auto& [peer, proxy] : peers) {
+            try {
+                auto result = co_await peer->AsyncWriteRemoteData(*write_req);
+                if (result.has_value()) {
+                    if (route_cache) {
+                        P2PProxyDescriptor np = proxy;
+                        np.segment_id = result.value();
+                        route_cache->Upsert(key, {np});
+                    }
+                    promise->set_value({});
+                    co_return;
+                } else if (IsAlreadyExistsError(result.error())) {
+                    promise->set_value({});
+                    co_return;
+                } else {
+                    LOG(ERROR) << "Failed to write to remote, key: " << key
+                               << ", error: " << result.error();
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Failed to write to remote, key: " << key
+                           << ", exception: " << e.what();
+            } catch (...) {
+                LOG(ERROR) << "Failed to write to remote, key: " << key
+                           << ", unknown exception";
+            }
+        }
+        promise->set_value(tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+    } catch (...) {
+        promise->set_value(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    }
 }
 
 // ============================================================================
@@ -988,73 +962,66 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
     ScopedVLogTimer timer(1, "P2PClientService::BatchGet");
     timer.LogRequest("batch_size=", keys.size());
 
-    // Add metric for get requests
     if (metrics_) {
         metrics_->local_get_requests.inc(keys.size());
     }
 
+    std::vector<tl::expected<ResultT, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
+
+    Stopwatch stopwatch;
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
-        timer.LogResponse("success=0 fail=", keys.size(),
-                          " error_code=", ErrorCode::SHUTTING_DOWN);
-        // Count as failures for metric
-        if (metrics_) {
-            metrics_->local_get_failures.inc(keys.size());
-        }
-        return std::vector<tl::expected<ResultT, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::SHUTTING_DOWN));
-    }
-
-    auto handles = create_handles();
-    size_t success_count = 0;
-
-    // Initialize stopwatches for latency measurement
-    std::vector<Stopwatch> stopwatches;
-    if (metrics_) {
-        stopwatches.resize(keys.size());
-    }
-
-    std::vector<tl::expected<ResultT, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (!handles[i]) {
-            if (handles[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
-                LOG(ERROR) << "Failed to create get handle for key: " << keys[i]
-                           << ", error: " << handles[i].error();
-            }
-            results.push_back(tl::unexpected(handles[i].error()));
-            // Count handle creation failures
-            if (metrics_) {
-                metrics_->local_get_failures.inc();
-            }
-            continue;
-        }
-        auto r = handles[i]->task_handle->Wait();
-        int64_t elapsed_us = 0;
-        if (metrics_ && !stopwatches.empty()) {
-            elapsed_us = stopwatches[i].elapsed_us();
-        }
-
-        if (!r) {
-            LOG(ERROR) << "Failed to get key: " << keys[i]
-                       << ", error: " << r.error();
-            results.push_back(tl::unexpected(r.error()));
-            // Count get failures
-            if (metrics_) {
-                metrics_->local_get_failures.inc();
-                metrics_->local_get_latency.observe(elapsed_us);
-            }
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::SHUTTING_DOWN));
+    } else {
+        handles = create_handles();
+        if (handles.size() != keys.size()) {
+            LOG(ERROR) << "handles size mismatch";
+            std::fill(results.begin(), results.end(),
+                      tl::unexpected(ErrorCode::INTERNAL_ERROR));
         } else {
-            results.push_back(extract(handles[i].value()));
+            for (size_t i = 0; i < handles.size(); ++i) {
+                if (!handles[i]) {
+                    if (handles[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                        LOG(ERROR)
+                            << "Failed to create get handle for key: "
+                            << keys[i] << ", error: " << handles[i].error();
+                    }
+                    results[i] = tl::unexpected(handles[i].error());
+                } else {
+                    auto wait_result = handles[i]->task_handle->Wait();
+                    if (!wait_result) {
+                        LOG(ERROR) << "Failed to get key: " << keys[i]
+                                   << ", error: " << wait_result.error();
+                        results[i] = tl::unexpected(wait_result.error());
+                    } else {
+                        results[i] = extract(handles[i].value());
+                    }
+                }
+            }  // end for
+        }
+    }
+
+    size_t success_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value()) {
             success_count++;
-            // Record successful get metrics
             if (metrics_) {
-                metrics_->local_get_latency.observe(elapsed_us);
                 metrics_->local_get_bytes.inc(handles[i]->data_size);
             }
         }
     }
+    if (metrics_) {
+        size_t failure_count = keys.size() - success_count;
+        if (failure_count > 0) {
+            metrics_->local_get_failures.inc(failure_count);
+        }
+        metrics_->local_get_latency.observe(stopwatch.elapsed_us());
+    }
+
     timer.LogResponse("success=", success_count,
                       " fail=", keys.size() - success_count);
     return results;

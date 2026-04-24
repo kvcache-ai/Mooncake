@@ -297,12 +297,16 @@ class P2PClientService final : public ClientService {
     AsyncResolveRoutesFromMaster(const std::string& key,
                                  const ReadRouteConfig& config);
 
-    static async_simple::coro::Lazy<void> RunReadRetry(
+    async_simple::coro::Lazy<void> RunReadRetry(
         RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
         std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise);
 
    private:
-    // Fetch write routes for all keys in one master RPC.
+    std::vector<tl::expected<void, ErrorCode>> InnerBatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const WriteRouteRequestConfig& route_config);
+
     tl::expected<BatchGetWriteRouteResponse, ErrorCode> BatchFetchWriteRoutes(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices,
@@ -319,8 +323,12 @@ class P2PClientService final : public ClientService {
     InnerCreatePutHandle(const std::string& key, std::vector<Slice>& slices,
                          const WriteRouteRequestConfig& config,
                          std::vector<WriteCandidate> candidates);
+    async_simple::coro::Lazy<void> RunWriteRetry(
+        std::vector<std::pair<PeerClient*, P2PProxyDescriptor>> peers,
+        std::shared_ptr<RemoteWriteRequest> write_req,
+        std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise,
+        RouteCache* route_cache, std::string key);
 
-    // Shared skeleton for both BatchGet overloads: guard, validate, wait, log.
     template <typename ResultT, typename CreateHandlesFn, typename ExtractFn>
     std::vector<tl::expected<ResultT, ErrorCode>> BatchGetImpl(
         const std::vector<std::string>& keys, CreateHandlesFn&& create_handles,
