@@ -132,9 +132,15 @@ impl MigrationRpc for ControlPlaneMigrationRpc {
     ) -> AdminResult<MigrationExecutionProbe> {
         let reply =
             MigrationControlClient::new()?.get_migration_execution_status_detail(lease, request)?;
+        let state =
+            control_plane_pb::MigrationExecutionState::try_from(reply.state).map_err(|_| {
+                StoreError::Transport(format!(
+                    "admin migration status reply has invalid execution state: {}",
+                    reply.state
+                ))
+            })?;
         Ok(MigrationExecutionProbe {
-            state: control_plane_pb::MigrationExecutionState::try_from(reply.state)
-                .unwrap_or(control_plane_pb::MigrationExecutionState::Unspecified),
+            state,
             attempts: reply.attempts,
             last_error: reply.last_error,
         })
@@ -3425,6 +3431,60 @@ mod tests {
             RouteMigrationTaskState::Failed,
         );
         assert!(status.last_error.contains("requires source visibility"));
+    }
+
+    #[test]
+    fn admin_service_route_migration_fails_on_route_conflict_after_executor_loss() {
+        let backend: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        backend
+            .upsert_client_lease(&live_lease("authority-a", 1))
+            .expect("authority lease should store");
+        backend
+            .upsert_client_lease(&live_lease("executor-a", 1))
+            .expect("executor lease should store");
+        let rpc = Arc::new(FakeMigrationRpc {
+            submit_results: Arc::new(Mutex::new(vec![Ok("execution-1".to_string())].into())),
+            status_results: Arc::new(Mutex::new(
+                vec![Err(StoreError::Transport("executor lost".to_string()))].into(),
+            )),
+            route_results: Arc::new(Mutex::new(
+                vec![Ok(Some(sample_active_route(
+                    "object-a",
+                    "segment-a",
+                    &["segment-b"],
+                )))]
+                .into(),
+            )),
+            submit_calls: Arc::new(AtomicUsize::new(0)),
+            status_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let service = test_migration_service_with_rpc(
+            backend,
+            rpc.clone(),
+            MigrationQueueConfig {
+                default_max_retries: 3,
+                retry_base_delay: Duration::from_millis(5),
+                retry_max_delay: Duration::from_millis(5),
+                poll_interval: Duration::from_millis(5),
+            },
+        );
+
+        let submitted = service
+            .submit_route_migration_task(
+                RouteMigrationMode::Copy,
+                sample_copy_request_with_targets(&["segment-b", "segment-c"]),
+            )
+            .expect("migration task submit should succeed");
+        let status = wait_for_task_state(
+            &service,
+            &submitted.task_id,
+            RouteMigrationTaskState::Failed,
+        );
+        assert_eq!(status.attempts, 1);
+        assert_eq!(status.execution_id.as_deref(), Some("execution-1"));
+        assert!(status.last_error.contains("all requested targets"));
+        assert_eq!(rpc.submit_calls(), 1);
+        assert_eq!(rpc.status_calls(), 1);
     }
 
     #[test]
