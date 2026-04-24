@@ -15,8 +15,9 @@ use mooncake_store_core::{
     MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result,
     RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState,
     RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
-    TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicyScope, TenantPolicySpec,
-    TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
+    TenantObjectAccounting, TenantObjectAccountingState, TenantPlacementPolicy,
+    TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
+    TenantQuotaReservationRequest,
 };
 use mooncake_transport::{
     Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
@@ -56,6 +57,8 @@ const DEFAULT_REQUEST_THROUGHPUT_FLOOR_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 const DEFAULT_ROUTE_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DEFAULT_PUT_WRITE_RETRY_LIMIT: usize = 4;
 const DEFAULT_TENANT_QUOTA_RESERVATION_TTL_MS: u64 = 60_000;
+const DEFAULT_TENANT_POLICY_CACHE_TTL_MS: u64 = 1_000;
+const DEFAULT_TENANT_POLICY_CACHE_IDLE_TTL_MS: u64 = 30_000;
 const STABLE_PHASE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const STABLE_PHASE_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
@@ -64,6 +67,14 @@ const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
 
 type SharedLifecycleState = Arc<AtomicU8>;
 type SharedRouteWriteGate = Arc<Mutex<()>>;
+
+#[derive(Clone, Debug)]
+struct TenantQuotaPolicyCacheEntry {
+    version: Option<u64>,
+    quota: Option<TenantQuotaPolicy>,
+    refreshed_at_ms: u64,
+    last_accessed_ms: u64,
+}
 
 include!("types.rs");
 include!("builder.rs");

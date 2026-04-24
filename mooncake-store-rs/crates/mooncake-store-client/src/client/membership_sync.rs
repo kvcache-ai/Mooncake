@@ -41,6 +41,15 @@ impl MembershipSyncHandle {
                                     "background live-client refresh failed"
                                 );
                             }
+                            if let Err(error) = refresh_due_tenant_quota_policy_cache(
+                                metadata.as_ref(),
+                                &live_client_cache,
+                            ) {
+                                tracing::warn!(
+                                    error = %error,
+                                    "background tenant policy cache refresh failed"
+                                );
+                            }
                             wait = interval;
                         }
                     }
@@ -161,6 +170,36 @@ pub(crate) fn refresh_live_client_cache(
         return Ok(live_leases);
     }
     result
+}
+
+pub(crate) fn refresh_due_tenant_quota_policy_cache(
+    metadata: &dyn MetadataBackend,
+    live_client_cache: &SharedLiveClientCache,
+) -> Result<()> {
+    let now = current_time_ms();
+    let tenants = live_client_cache.lock().due_tenant_quota_policy_refreshes(
+        now,
+        DEFAULT_TENANT_POLICY_CACHE_TTL_MS,
+        DEFAULT_TENANT_POLICY_CACHE_IDLE_TTL_MS,
+    );
+    if tenants.is_empty() {
+        return Ok(());
+    }
+    let scopes = tenants
+        .iter()
+        .map(|tenant| TenantPolicyScope::new(tenant.as_str(), None::<String>, None::<String>))
+        .collect::<Vec<_>>();
+    let tracker = OperationTracker::new("tenant_policy_cache_refresh");
+    let result = metadata.get_tenant_policies(&scopes);
+    tracker.finish(&result, 0);
+    let policies = result?;
+    let mut cache = live_client_cache.lock();
+    for (tenant, policy) in tenants.into_iter().zip(policies.into_iter()) {
+        let version = policy.as_ref().map(|policy| policy.version);
+        let quota = policy.and_then(|policy| policy.spec.quota);
+        cache.store_tenant_quota_policy(tenant, version, quota, now);
+    }
+    Ok(())
 }
 
 fn membership_initial_refresh_delay(runtime: &ClientRuntimeId, interval: Duration) -> Duration {

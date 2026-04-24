@@ -1188,6 +1188,21 @@ impl MetadataBackend for HotPathBlockedMetadataBackend {
         self.inner.get_tenant_object_accounting(key)
     }
 
+    fn get_tenant_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaReservation>> {
+        self.inner.get_tenant_quota_reservation(reservation_id)
+    }
+
+    fn list_tenant_eviction_candidates(
+        &self,
+        scope: &TenantPolicyScope,
+        limit: usize,
+    ) -> mooncake_store_core::Result<Vec<TenantObjectAccounting>> {
+        self.inner.list_tenant_eviction_candidates(scope, limit)
+    }
+
     fn list_tenant_quota_reservations(
         &self,
         scope: &TenantPolicyScope,
