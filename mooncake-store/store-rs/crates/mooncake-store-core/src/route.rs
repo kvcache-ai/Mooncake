@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::compat::CompatibilityDescriptor;
-use crate::identity::{ClientEndpointSet, ClientRuntimeId, LogicalObjectId, NamespaceScope};
+use crate::identity::{
+    ClientEndpointSet, ClientRuntimeId, LogicalObjectId, NamespaceScope, DEFAULT_DOMAIN,
+    DEFAULT_OBJECT_SET,
+};
 use crate::lifecycle::ClientLifecycleState;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -15,12 +18,37 @@ impl ObjectKey {
     }
 
     pub fn from_scope(scope: &NamespaceScope, logical_key: &str) -> Self {
-        Self::new(format!("{}::{}", scope.tenant, logical_key))
+        if scope.domain == DEFAULT_DOMAIN && scope.object_set == DEFAULT_OBJECT_SET {
+            return Self::new(format!("{}::{}", scope.tenant, logical_key));
+        }
+        Self::new(format!(
+            "{}::ns/{}/{}/{}",
+            encode_key_component(&scope.tenant),
+            encode_key_component(&scope.domain),
+            encode_key_component(&scope.object_set),
+            encode_key_component(logical_key)
+        ))
     }
 
     pub fn from_logical_id(id: &LogicalObjectId) -> Self {
         Self::from_scope(&id.scope, &id.logical_key)
     }
+}
+
+fn encode_key_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        match byte {
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-' | b'_' | b'.' => {
+                encoded.push(*byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -699,11 +727,40 @@ mod tests {
         let scope = NamespaceScope::new("tenant-a", "domain-a", "set-a");
         assert_eq!(
             ObjectKey::from_scope(&scope, "logical-a").0,
-            "tenant-a::logical-a"
+            "tenant-a::ns/domain-a/set-a/logical-a"
         );
         assert_eq!(
             ObjectKey::from_logical_id(&scoped_logical_object_id("tenant-a", "logical-a")),
             scoped_object_key("tenant-a", "logical-a")
+        );
+    }
+
+    #[test]
+    fn default_namespace_object_key_keeps_legacy_format() {
+        let scope = NamespaceScope::with_defaults(Some("tenant-a"), None, None);
+        assert_eq!(
+            ObjectKey::from_scope(&scope, "logical-a").0,
+            "tenant-a::logical-a"
+        );
+    }
+
+    #[test]
+    fn non_default_namespace_object_key_includes_full_scope() {
+        let scope_a = NamespaceScope::new("tenant-a", "domain-a", "set-a");
+        let scope_b = NamespaceScope::new("tenant-a", "domain-b", "set-b");
+        let key_a = ObjectKey::from_scope(&scope_a, "logical-a");
+        let key_b = ObjectKey::from_scope(&scope_b, "logical-a");
+        assert_ne!(key_a, key_b);
+        assert_eq!(key_a.0, "tenant-a::ns/domain-a/set-a/logical-a");
+        assert_eq!(key_b.0, "tenant-a::ns/domain-b/set-b/logical-a");
+    }
+
+    #[test]
+    fn non_default_namespace_object_key_percent_encodes_components() {
+        let scope = NamespaceScope::new("tenant/a", "domain b", "set::c");
+        assert_eq!(
+            ObjectKey::from_scope(&scope, "logical/key").0,
+            "tenant%2Fa::ns/domain%20b/set%3A%3Ac/logical%2Fkey"
         );
     }
 

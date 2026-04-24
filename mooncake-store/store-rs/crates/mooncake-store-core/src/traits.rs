@@ -226,7 +226,7 @@ pub trait MetadataBackend: Send + Sync {
             .collect()
     }
 
-    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>>;
+    fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>>;
 
     fn put_tenant_policy(
         &self,
@@ -331,6 +331,26 @@ pub trait RouteDirectory: Send + Sync {
     ) -> Result<Vec<ObjectRoute>> {
         Err(crate::error::StoreError::Unsupported(
             "route directory does not support list_routes_by_replica_owner".to_string(),
+        ))
+    }
+
+    fn list_routes_in_scope(
+        &self,
+        _observer: &ClientLease,
+        _scope: &NamespaceScope,
+    ) -> Result<Vec<ObjectRoute>> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not support list_routes_in_scope".to_string(),
+        ))
+    }
+
+    fn list_reuse_candidates(
+        &self,
+        _observer: &ClientLease,
+        _reuse: &ReuseIdentity,
+    ) -> Result<Vec<ObjectRoute>> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not support list_reuse_candidates".to_string(),
         ))
     }
 }

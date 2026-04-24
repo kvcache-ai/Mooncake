@@ -2564,7 +2564,10 @@ mod tests {
             Err(StoreError::Unsupported("unused in test".to_string()))
         }
 
-        fn list_tenant_policies(&self) -> Result<Vec<mooncake_store_core::TenantPolicy>> {
+        fn list_tenant_policies(
+            &self,
+            _tenant: Option<&str>,
+        ) -> Result<Vec<mooncake_store_core::TenantPolicy>> {
             Err(StoreError::Unsupported("unused in test".to_string()))
         }
 

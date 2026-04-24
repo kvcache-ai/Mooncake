@@ -72,7 +72,7 @@ proptest! {
         let mut success = 0u64;
         let mut failures = 0u64;
         for _ in 0..fail_after + 3 {
-            match faulty.list_tenant_policies() {
+            match faulty.list_tenant_policies(None) {
                 Ok(_) => success += 1,
                 Err(StoreError::Metadata(_)) => failures += 1,
                 Err(other) => panic!("unexpected: {other:?}"),
@@ -208,7 +208,7 @@ fn quota_policy_list_returns_all_installed() {
         };
         meta.put_tenant_policy(&policy, None).expect("put");
     }
-    let all = meta.list_tenant_policies().expect("list");
+    let all = meta.list_tenant_policies(None).expect("list");
     assert_eq!(all.len(), scopes.len());
 }
 
@@ -284,8 +284,8 @@ fn counting_backend_list_tenant_policies_increments() {
     let inner = Arc::new(InMemoryMetadataBackend::new());
     let (backend, counts) = CountingMetadataBackend::wrap(inner);
 
-    backend.list_tenant_policies().expect("list 1");
-    backend.list_tenant_policies().expect("list 2");
+    backend.list_tenant_policies(None).expect("list 1");
+    backend.list_tenant_policies(None).expect("list 2");
     assert_eq!(counts.list_tenant_policies.load(Ordering::Relaxed), 2);
     assert_eq!(counts.get_tenant_policy.load(Ordering::Relaxed), 0);
 }

@@ -2121,10 +2121,21 @@ impl MetadataBackend for RedisMetadataBackend {
             .collect()
     }
 
-    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
+    fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
         let mut connection = self.connection("redis list tenant policies")?;
-        let prefix = self.keyspace.tenant_policy_prefix(None);
-        let keys = scan_keys(&mut connection, &format!("{}*", prefix))?;
+        let keys = if let Some(tenant) = tenant {
+            let root_key = self.keyspace.tenant_policy(&TenantPolicyScope::new(
+                tenant,
+                None::<String>,
+                None::<String>,
+            ));
+            let mut keys = vec![root_key.clone()];
+            keys.extend(scan_keys(&mut connection, &format!("{}/*", root_key))?);
+            keys
+        } else {
+            let prefix = self.keyspace.tenant_policy_prefix(None);
+            scan_keys(&mut connection, &format!("{}*", prefix))?
+        };
         let mut policies: Vec<TenantPolicy> = Vec::new();
         for key in keys {
             let payload: Option<String> = connection
@@ -4007,11 +4018,38 @@ mod tests {
         backend
             .put_tenant_policy(&updated, Some(1))
             .expect("tenant policy update should succeed");
+        let other_scope = TenantPolicyScope::new("tenant-b", None::<String>, None::<String>);
+        let other_policy = TenantPolicy {
+            scope: other_scope,
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 30,
+            updated_by: "admin".to_string(),
+        };
+        backend
+            .put_tenant_policy(&other_policy, None)
+            .expect("other tenant policy insert should succeed");
         assert_eq!(
             backend
-                .list_tenant_policies()
-                .expect("tenant policy listing should succeed"),
+                .list_tenant_policies(Some("tenant/a"))
+                .expect("tenant-scoped policy listing should succeed"),
             vec![updated.clone()]
+        );
+        assert_eq!(
+            backend
+                .list_tenant_policies(Some("tenant-b"))
+                .expect("other tenant-scoped policy listing should succeed"),
+            vec![other_policy.clone()]
+        );
+        assert!(backend
+            .list_tenant_policies(Some("missing"))
+            .expect("missing tenant policy listing should succeed")
+            .is_empty());
+        assert_eq!(
+            backend
+                .list_tenant_policies(None)
+                .expect("tenant policy listing should succeed"),
+            vec![other_policy, updated.clone()]
         );
         assert!(backend
             .delete_tenant_policy(&scope, Some(2))

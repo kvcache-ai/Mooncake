@@ -626,8 +626,11 @@ impl MetadataBackend for RecoverableMetadataBackend {
         self.inner.get_tenant_policy(scope)
     }
 
-    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
-        self.inner.list_tenant_policies()
+    fn list_tenant_policies(
+        &self,
+        tenant: Option<&str>,
+    ) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies(tenant)
     }
 
     fn put_tenant_policy(
@@ -848,7 +851,9 @@ impl MetadataBackend for NoHotPathMetadataBackend {
     fn list_object_routes(
         &self,
     ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ObjectRoute>> {
-        self.inner.list_object_routes()
+        Err(StoreError::Unsupported(
+            "metadata route listing hot path is disabled in this test".to_string(),
+        ))
     }
 
     fn compare_and_swap_object_route(
@@ -902,13 +907,16 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         self.inner.get_tenant_policy(scope)
     }
 
-    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+    fn list_tenant_policies(
+        &self,
+        tenant: Option<&str>,
+    ) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
         if self.deny_tenant_policy_list {
             return Err(StoreError::Unsupported(
                 "tenant policy listing is disabled in this test".to_string(),
             ));
         }
-        self.inner.list_tenant_policies()
+        self.inner.list_tenant_policies(tenant)
     }
 
     fn put_tenant_policy(
@@ -1411,8 +1419,11 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.get_tenant_policy(scope)
     }
 
-    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
-        self.inner.list_tenant_policies()
+    fn list_tenant_policies(
+        &self,
+        tenant: Option<&str>,
+    ) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies(tenant)
     }
 
     fn put_tenant_policy(
@@ -1671,8 +1682,11 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
         self.inner.get_tenant_policy(scope)
     }
 
-    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
-        self.inner.list_tenant_policies()
+    fn list_tenant_policies(
+        &self,
+        tenant: Option<&str>,
+    ) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies(tenant)
     }
 
     fn put_tenant_policy(
@@ -1951,8 +1965,11 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         self.inner.get_tenant_policy(scope)
     }
 
-    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
-        self.inner.list_tenant_policies()
+    fn list_tenant_policies(
+        &self,
+        tenant: Option<&str>,
+    ) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies(tenant)
     }
 
     fn put_tenant_policy(
@@ -6705,6 +6722,103 @@ fn namespace_scoped_placement_and_route_views_stay_isolated() {
     assert_eq!(reuse_a[0].logical_key.as_deref(), Some("key-a"));
     assert_eq!(reuse_b.len(), 1);
     assert_eq!(reuse_b[0].logical_key.as_deref(), Some("key-b"));
+}
+
+#[test]
+fn same_tenant_scoped_logical_key_coexists_across_domains() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("same-logical-key-segment"));
+    let client = StoreClientBuilder::new(metadata, "same-logical-key-client")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("client build should succeed");
+
+    let routes = client
+        .batch_put(&[
+            PutRequest::new("shared-key", b"payload-a")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a"),
+            PutRequest::new("shared-key", b"payload-b")
+                .tenant("tenant-a")
+                .domain("domain-b")
+                .object_set("set-b"),
+        ])
+        .expect("same logical key in different scopes should coexist");
+    assert_eq!(routes.len(), 2);
+    assert_ne!(routes[0].key, routes[1].key);
+
+    let scope_a = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-a"), Some("set-a"));
+    let scope_b = NamespaceScope::with_defaults(Some("tenant-a"), Some("domain-b"), Some("set-b"));
+    assert_eq!(
+        client
+            .query_route_by_object_id(&LogicalObjectId::new(scope_a.clone(), "shared-key"))
+            .expect("scope-a query should succeed")
+            .expect("scope-a route should exist")
+            .canonical_key
+            .as_deref(),
+        Some("tenant-a/domain-a/set-a/shared-key")
+    );
+    assert_eq!(
+        client
+            .query_route_by_object_id(&LogicalObjectId::new(scope_b.clone(), "shared-key"))
+            .expect("scope-b query should succeed")
+            .expect("scope-b route should exist")
+            .canonical_key
+            .as_deref(),
+        Some("tenant-a/domain-b/set-b/shared-key")
+    );
+
+    let payloads = client
+        .batch_get(&[
+            ObjectRef::new("shared-key")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a"),
+            ObjectRef::new("shared-key")
+                .tenant("tenant-a")
+                .domain("domain-b")
+                .object_set("set-b"),
+        ])
+        .expect("scoped gets should succeed");
+    assert_eq!(payloads, vec![b"payload-a".to_vec(), b"payload-b".to_vec()]);
+
+    let scope_a_routes = client
+        .list_routes_in_scope(&scope_a)
+        .expect("scope-a listing should succeed");
+    let scope_b_routes = client
+        .list_routes_in_scope(&scope_b)
+        .expect("scope-b listing should succeed");
+    assert_eq!(scope_a_routes.len(), 1);
+    assert_eq!(scope_b_routes.len(), 1);
+    assert_eq!(scope_a_routes[0].key, routes[0].key);
+    assert_eq!(scope_b_routes[0].key, routes[1].key);
+
+    client
+        .batch_remove(
+            &[ObjectRef::new("shared-key")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")],
+            false,
+        )
+        .expect("scoped remove should succeed");
+    assert!(client
+        .query_route_by_object_id(&LogicalObjectId::new(scope_a, "shared-key"))
+        .expect("scope-a query after remove should succeed")
+        .is_none());
+    assert_eq!(
+        client
+            .batch_get(&[ObjectRef::new("shared-key")
+                .tenant("tenant-a")
+                .domain("domain-b")
+                .object_set("set-b")])
+            .expect("scope-b get should still succeed"),
+        vec![b"payload-b".to_vec()]
+    );
 }
 
 #[test]

@@ -245,11 +245,11 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.get_tenant_policy(scope)
     }
 
-    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
+    fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
         self.counts
             .list_tenant_policies
             .fetch_add(1, Ordering::Relaxed);
-        self.inner.list_tenant_policies()
+        self.inner.list_tenant_policies(tenant)
     }
 
     fn put_tenant_policy(
@@ -537,9 +537,9 @@ impl MetadataBackend for FaultyMetadataBackend {
         self.inner.get_tenant_policy(scope)
     }
 
-    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
+    fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
         self.check()?;
-        self.inner.list_tenant_policies()
+        self.inner.list_tenant_policies(tenant)
     }
 
     fn put_tenant_policy(
