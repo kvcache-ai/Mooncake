@@ -330,11 +330,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<dyn Error>> {
     let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
     let maintenance_shutdown = Arc::new(AtomicBool::new(false));
-    let maintenance_thread = spawn_stale_segment_maintenance_worker(
-        service.clone(),
-        server_args,
-        maintenance_shutdown.clone(),
-    );
     let quota_thread =
         spawn_quota_reconcile_worker(service.clone(), server_args, maintenance_shutdown.clone());
     let mut server = AdminHttpServerHandle::start(&server_args.bind_addr, service)?;
@@ -348,40 +343,12 @@ fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<d
 
     maintenance_shutdown.store(true, Ordering::Relaxed);
     server.shutdown()?;
-    if let Some(thread) = maintenance_thread {
-        thread
-            .join()
-            .map_err(|_| std::io::Error::other("admin maintenance worker panicked"))?;
-    }
     if let Some(thread) = quota_thread {
         thread
             .join()
             .map_err(|_| std::io::Error::other("admin quota reconcile worker panicked"))?;
     }
     Ok(())
-}
-
-fn spawn_stale_segment_maintenance_worker(
-    service: AdminService,
-    server_args: &ServerArgs,
-    shutdown: Arc<AtomicBool>,
-) -> Option<JoinHandle<()>> {
-    if !service.supports_stale_segment_maintenance() {
-        info!("admin stale segment maintenance disabled for unsupported metadata backend");
-        return None;
-    }
-    if server_args.cleanup_interval_ms == 0 {
-        info!("admin stale segment maintenance disabled");
-        return None;
-    }
-    let interval = Duration::from_millis(server_args.cleanup_interval_ms);
-    let batch_size = server_args.cleanup_batch_size.max(1);
-    Some(
-        thread::Builder::new()
-            .name("mooncake-store-admin-stale-maintenance".to_string())
-            .spawn(move || run_maintenance_loop(service, interval, batch_size, shutdown))
-            .expect("admin maintenance worker thread should spawn"),
-    )
 }
 
 fn spawn_quota_reconcile_worker(
@@ -405,50 +372,6 @@ fn spawn_quota_reconcile_worker(
             .spawn(move || run_quota_reconcile_loop(service, interval, tenants, shutdown))
             .expect("admin quota reconcile worker thread should spawn"),
     )
-}
-
-fn run_maintenance_loop(
-    service: AdminService,
-    interval: Duration,
-    batch_size: usize,
-    shutdown: Arc<AtomicBool>,
-) {
-    info!(
-        interval_ms = interval.as_millis() as u64,
-        batch_size,
-        "admin stale segment maintenance worker started"
-    );
-    while !shutdown.load(Ordering::Relaxed) {
-        match service.reconcile_due_stale_segments(batch_size) {
-            Ok(report) => {
-                if report.due_entries > 0
-                    || report.invalid_entries > 0
-                    || report.cleaned_missing_lease > 0
-                    || report.cleaned_expired_lease > 0
-                {
-                    info!(
-                        due_entries = report.due_entries,
-                        invalid_entries = report.invalid_entries,
-                        cleaned_missing_lease = report.cleaned_missing_lease,
-                        cleaned_expired_lease = report.cleaned_expired_lease,
-                        skipped_live = report.skipped_live,
-                        removed_segment_keys = report.removed_segment_keys,
-                        removed_segment_index_entries = report.removed_segment_index_entries,
-                        removed_owner_segment_index_entries =
-                            report.removed_owner_segment_index_entries,
-                        stale_missing_segment_index_entries =
-                            report.stale_missing_segment_index_entries,
-                        "admin stale segment maintenance batch finished"
-                    );
-                }
-            }
-            Err(error) => {
-                warn!(error = %error, "admin stale segment maintenance batch failed");
-            }
-        }
-        thread::sleep(interval);
-    }
-    info!("admin stale segment maintenance worker stopped");
 }
 
 fn run_quota_reconcile_loop(
