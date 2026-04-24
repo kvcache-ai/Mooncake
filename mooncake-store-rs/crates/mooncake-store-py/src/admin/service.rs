@@ -309,10 +309,7 @@ impl AdminService {
     }
 
     pub fn list_tenant_policies(&self, tenant: Option<&str>) -> AdminResult<Vec<TenantPolicy>> {
-        let mut policies = self.backend.list_tenant_policies()?;
-        if let Some(tenant) = tenant {
-            policies.retain(|policy| policy.scope.tenant == tenant);
-        }
+        let mut policies = self.backend.list_tenant_policies(tenant)?;
         policies.sort_by(|left, right| left.scope.cmp(&right.scope));
         Ok(policies)
     }
@@ -1094,7 +1091,10 @@ mod tests {
             self.inner.get_tenant_policy(scope)
         }
 
-        fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        fn list_tenant_policies(
+            &self,
+            _tenant: Option<&str>,
+        ) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
             Err(StoreError::Unsupported(
                 "tenant policy listing is disabled in this test".to_string(),
             ))
@@ -1402,6 +1402,67 @@ mod tests {
     }
 
     #[test]
+    fn admin_service_lists_tenant_policies_with_backend_filter() {
+        let service = test_service();
+        let tenant_a_root = TenantPolicy {
+            scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "admin".to_string(),
+        };
+        let tenant_a_domain = TenantPolicy {
+            scope: TenantPolicyScope::new("tenant-a", Some("domain-a"), None::<String>),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 20,
+            updated_by: "admin".to_string(),
+        };
+        let tenant_b = TenantPolicy {
+            scope: TenantPolicyScope::new("tenant-b", None::<String>, None::<String>),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 30,
+            updated_by: "admin".to_string(),
+        };
+        service
+            .backend()
+            .put_tenant_policy(&tenant_a_domain, None)
+            .expect("tenant-a domain policy should store");
+        service
+            .backend()
+            .put_tenant_policy(&tenant_b, None)
+            .expect("tenant-b policy should store");
+        service
+            .backend()
+            .put_tenant_policy(&tenant_a_root, None)
+            .expect("tenant-a root policy should store");
+
+        assert_eq!(
+            service
+                .list_tenant_policies(Some("tenant-a"))
+                .expect("tenant-scoped policy list should succeed"),
+            vec![tenant_a_root.clone(), tenant_a_domain.clone()]
+        );
+        assert_eq!(
+            service
+                .list_tenant_policies(Some("tenant-b"))
+                .expect("tenant-b policy list should succeed"),
+            vec![tenant_b.clone()]
+        );
+        assert!(service
+            .list_tenant_policies(Some("missing"))
+            .expect("missing tenant policy list should succeed")
+            .is_empty());
+        assert_eq!(
+            service
+                .list_tenant_policies(None)
+                .expect("full policy list should succeed"),
+            vec![tenant_a_root, tenant_a_domain, tenant_b]
+        );
+    }
+
+    #[test]
     fn admin_service_resolves_effective_policy_without_listing_all_policies() {
         let inner = Arc::new(InMemoryMetadataBackend::new());
         inner
@@ -1517,7 +1578,12 @@ mod tests {
     fn admin_service_reads_object_accounting_from_scoped_key() {
         let service = test_service();
         put_quota_policy(&service);
-        reserve_quota(&service, "res-a", "tenant-a::object-a", 10);
+        reserve_quota(
+            &service,
+            "res-a",
+            "tenant-a::ns/domain-a/set-a/object-a",
+            10,
+        );
         service
             .backend()
             .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
@@ -1535,7 +1601,7 @@ mod tests {
             .get_tenant_object_accounting("tenant-a", Some("domain-a"), Some("set-a"), "object-a")
             .expect("object accounting should read");
         assert_eq!(accounting.scope.tenant, "tenant-a");
-        assert_eq!(accounting.key, "tenant-a::object-a");
+        assert_eq!(accounting.key, "tenant-a::ns/domain-a/set-a/object-a");
         assert_eq!(
             accounting
                 .accounting

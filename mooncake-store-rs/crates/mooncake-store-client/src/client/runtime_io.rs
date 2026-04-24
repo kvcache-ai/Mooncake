@@ -354,7 +354,7 @@ impl StoreClient {
         self.flush_due_reclaims()?;
         let tenant = object_id.scope.tenant.as_str();
         let key = object_id.logical_key.as_str();
-        let scoped_key = ObjectKey::from_logical_id(object_id);
+        let scoped_key = mooncake_store_core::ObjectKey::from_logical_id(object_id);
         let PutObjectCurrentOptions {
             registered_source,
             policy,
@@ -537,7 +537,7 @@ impl StoreClient {
         let load_tracker = OperationTracker::new("put_stage_load_route");
         let current_result = self
             .route_directory
-            .get_object_route(&self.lease, &ObjectKey::from_logical_id(&object_id));
+            .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(&object_id));
         load_tracker.finish(&current_result, 0);
         let current = current_result?;
         self.put_object_with_policy_current(
@@ -568,7 +568,7 @@ impl StoreClient {
         let load_tracker = OperationTracker::new("put_stage_load_route");
         let current_result = self
             .route_directory
-            .get_object_route(&self.lease, &ObjectKey::from_logical_id(&object_id));
+            .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(&object_id));
         load_tracker.finish(&current_result, 0);
         let current = current_result?;
         let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
@@ -1792,7 +1792,7 @@ impl StoreClient {
                         NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
                         object.key,
                     );
-                    (tenant.to_string(), ObjectKey::from_logical_id(&object_id))
+                    (tenant.to_string(), mooncake_store_core::ObjectKey::from_logical_id(&object_id))
                 })
                 .collect::<Vec<_>>();
             let routes = self.route_directory.get_object_routes(

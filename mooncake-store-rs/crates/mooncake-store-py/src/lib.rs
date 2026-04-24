@@ -2274,8 +2274,11 @@ mod tests {
             self.inner.get_tenant_policy(scope)
         }
 
-        fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
-            self.inner.list_tenant_policies()
+        fn list_tenant_policies(
+            &self,
+            tenant: Option<&str>,
+        ) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+            self.inner.list_tenant_policies(tenant)
         }
 
         fn put_tenant_policy(
@@ -2542,8 +2545,11 @@ mod tests {
             self.inner.get_tenant_policy(scope)
         }
 
-        fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
-            self.inner.list_tenant_policies()
+        fn list_tenant_policies(
+            &self,
+            tenant: Option<&str>,
+        ) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+            self.inner.list_tenant_policies(tenant)
         }
 
         fn put_tenant_policy(

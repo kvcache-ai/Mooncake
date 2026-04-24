@@ -1388,17 +1388,43 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
-    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
-        let prefix = self.config.keyspace.tenant_policy_prefix(None);
+    fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
         self.block_on(async {
             let mut client = self.client().await?;
-            let response = client
-                .get(prefix, Some(GetOptions::new().with_prefix()))
-                .await
-                .map_err(etcd_error("etcd list tenant policies"))?;
-            let mut policies = response
-                .kvs()
+            let mut responses = Vec::new();
+            if let Some(tenant) = tenant {
+                let root_key = self.config.keyspace.tenant_policy(&TenantPolicyScope::new(
+                    tenant,
+                    None::<String>,
+                    None::<String>,
+                ));
+                responses.push(
+                    client
+                        .get(root_key.clone(), None)
+                        .await
+                        .map_err(etcd_error("etcd get root tenant policy"))?,
+                );
+                responses.push(
+                    client
+                        .get(
+                            format!("{root_key}/"),
+                            Some(GetOptions::new().with_prefix()),
+                        )
+                        .await
+                        .map_err(etcd_error("etcd list tenant policies"))?,
+                );
+            } else {
+                let prefix = self.config.keyspace.tenant_policy_prefix(None);
+                responses.push(
+                    client
+                        .get(prefix, Some(GetOptions::new().with_prefix()))
+                        .await
+                        .map_err(etcd_error("etcd list tenant policies"))?,
+                );
+            }
+            let mut policies = responses
                 .iter()
+                .flat_map(|response| response.kvs().iter())
                 .filter_map(|kv| {
                     let key = std::str::from_utf8(kv.key()).ok()?;
                     parse_tenant_policy_scope(&self.config.keyspace, key)?;
@@ -3069,11 +3095,38 @@ mod tests {
         backend
             .put_tenant_policy(&updated, Some(1))
             .expect("tenant policy update should succeed");
+        let other_scope = TenantPolicyScope::new("tenant-b", None::<String>, None::<String>);
+        let other_policy = TenantPolicy {
+            scope: other_scope,
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 30,
+            updated_by: "admin".to_string(),
+        };
+        backend
+            .put_tenant_policy(&other_policy, None)
+            .expect("other tenant policy insert should succeed");
         assert_eq!(
             backend
-                .list_tenant_policies()
-                .expect("tenant policy listing should succeed"),
+                .list_tenant_policies(Some("tenant/a"))
+                .expect("tenant-scoped policy listing should succeed"),
             vec![updated.clone()]
+        );
+        assert_eq!(
+            backend
+                .list_tenant_policies(Some("tenant-b"))
+                .expect("other tenant-scoped policy listing should succeed"),
+            vec![other_policy.clone()]
+        );
+        assert!(backend
+            .list_tenant_policies(Some("missing"))
+            .expect("missing tenant policy listing should succeed")
+            .is_empty());
+        assert_eq!(
+            backend
+                .list_tenant_policies(None)
+                .expect("tenant policy listing should succeed"),
+            vec![other_policy, updated.clone()]
         );
         assert!(backend
             .delete_tenant_policy(&scope, Some(2))

@@ -1,7 +1,8 @@
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, MetadataBackend,
-    ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteControlMode,
-    RouteDirectory, RouteState, RouteVersion, StoreError,
+    route_reuse_identity, CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId,
+    ClientStableId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
+    ReplicaTier, Result, ReuseIdentity, RouteCasRequest, RouteControlMode, RouteDirectory,
+    RouteState, RouteVersion, StoreError,
 };
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -102,6 +103,22 @@ impl RouteDirectory for MetadataRouteDirectory {
             .into_iter()
             .filter(|route| route.replicas.iter().any(|replica| replica.owner == *owner))
             .collect())
+    }
+
+    fn list_routes_in_scope(
+        &self,
+        _observer: &ClientLease,
+        scope: &NamespaceScope,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.metadata.list_object_routes_in_scope(scope)
+    }
+
+    fn list_reuse_candidates(
+        &self,
+        _observer: &ClientLease,
+        reuse: &ReuseIdentity,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.metadata.list_reuse_candidates(reuse)
     }
 }
 
@@ -461,6 +478,40 @@ impl EmbeddedWrhRouteDirectory {
             &authority.runtime.stable_id,
             owner,
         )
+    }
+
+    fn list_routes_in_scope_from_authority(
+        &self,
+        authority: &ClientLease,
+        scope: &NamespaceScope,
+    ) -> Result<Vec<ObjectRoute>> {
+        if self.authority_is_local(authority) {
+            return authority_list_routes_in_scope(
+                &self.namespace,
+                &authority.runtime.stable_id,
+                scope,
+            );
+        }
+        Err(StoreError::Unsupported(
+            "remote route authority does not support list_routes_in_scope".to_string(),
+        ))
+    }
+
+    fn list_reuse_candidates_from_authority(
+        &self,
+        authority: &ClientLease,
+        reuse: &ReuseIdentity,
+    ) -> Result<Vec<ObjectRoute>> {
+        if self.authority_is_local(authority) {
+            return authority_list_reuse_candidates(
+                &self.namespace,
+                &authority.runtime.stable_id,
+                reuse,
+            );
+        }
+        Err(StoreError::Unsupported(
+            "remote route authority does not support list_reuse_candidates".to_string(),
+        ))
     }
 
     fn read_ranked_authorities(
@@ -1146,6 +1197,103 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         }
         Ok(routes.into_values().collect())
     }
+
+    fn list_routes_in_scope(
+        &self,
+        observer: &ClientLease,
+        scope: &NamespaceScope,
+    ) -> Result<Vec<ObjectRoute>> {
+        let mut routes = BTreeMap::<String, ObjectRoute>::new();
+        let mut attempted = 0usize;
+        let mut successful_queries = 0usize;
+        let mut last_error = None;
+        for authority in self.authority_candidates(observer)? {
+            attempted = attempted.saturating_add(1);
+            match self.list_routes_in_scope_from_authority(&authority, scope) {
+                Ok(found) => {
+                    successful_queries = successful_queries.saturating_add(1);
+                    for route in found {
+                        Self::merge_route_listing(
+                            &mut routes,
+                            route,
+                            &authority.runtime.to_string(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_list_in_scope_failed",
+                    );
+                    warn!(
+                        authority = %authority.runtime,
+                        tenant = %scope.tenant,
+                        domain = %scope.domain,
+                        object_set = %scope.object_set,
+                        error = %error,
+                        "route scope listing failed on authority"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        if successful_queries == 0 && attempted > 0 {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+        Ok(routes.into_values().collect())
+    }
+
+    fn list_reuse_candidates(
+        &self,
+        observer: &ClientLease,
+        reuse: &ReuseIdentity,
+    ) -> Result<Vec<ObjectRoute>> {
+        let mut routes = BTreeMap::<String, ObjectRoute>::new();
+        let mut attempted = 0usize;
+        let mut successful_queries = 0usize;
+        let mut last_error = None;
+        for authority in self.authority_candidates(observer)? {
+            attempted = attempted.saturating_add(1);
+            match self.list_reuse_candidates_from_authority(&authority, reuse) {
+                Ok(found) => {
+                    successful_queries = successful_queries.saturating_add(1);
+                    for route in found {
+                        Self::merge_route_listing(
+                            &mut routes,
+                            route,
+                            &authority.runtime.to_string(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_list_reuse_candidates_failed",
+                    );
+                    warn!(
+                        authority = %authority.runtime,
+                        tenant = %reuse.tenant,
+                        domain = %reuse.domain,
+                        sharing_scope = %reuse.sharing_scope,
+                        canonical_key = %reuse.canonical_key,
+                        error = %error,
+                        "route reuse listing failed on authority"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        if successful_queries == 0 && attempted > 0 {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+        Ok(routes.into_values().collect())
+    }
 }
 
 pub(crate) fn authority_get(
@@ -1228,6 +1376,56 @@ pub(crate) fn authority_list_routes(
         .get(&authority.0)
         .into_iter()
         .flat_map(|routes| routes.values())
+        .cloned()
+        .collect())
+}
+
+pub(crate) fn authority_list_routes_in_scope(
+    namespace: &str,
+    authority: &ClientStableId,
+    scope: &NamespaceScope,
+) -> Result<Vec<ObjectRoute>> {
+    let mesh = route_mesh(namespace);
+    let guard = mesh.lock();
+    if !guard.is_local(authority) {
+        return Err(StoreError::NotFound(format!(
+            "route authority {} is not attached locally",
+            authority
+        )));
+    }
+    Ok(guard
+        .routes_by_authority
+        .get(&authority.0)
+        .into_iter()
+        .flat_map(|routes| routes.values())
+        .filter(|route| route.namespace.as_ref() == Some(scope))
+        .cloned()
+        .collect())
+}
+
+pub(crate) fn authority_list_reuse_candidates(
+    namespace: &str,
+    authority: &ClientStableId,
+    reuse: &ReuseIdentity,
+) -> Result<Vec<ObjectRoute>> {
+    let mesh = route_mesh(namespace);
+    let guard = mesh.lock();
+    if !guard.is_local(authority) {
+        return Err(StoreError::NotFound(format!(
+            "route authority {} is not attached locally",
+            authority
+        )));
+    }
+    Ok(guard
+        .routes_by_authority
+        .get(&authority.0)
+        .into_iter()
+        .flat_map(|routes| routes.values())
+        .filter(|route| {
+            route_reuse_identity(route)
+                .map(|candidate| candidate == *reuse)
+                .unwrap_or(false)
+        })
         .cloned()
         .collect())
 }

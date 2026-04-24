@@ -526,12 +526,13 @@ impl MetadataBackend for InMemoryMetadataBackend {
         Ok(self.state.read().tenant_policies.get(scope).cloned())
     }
 
-    fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
+    fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
         let mut policies = self
             .state
             .read()
             .tenant_policies
             .values()
+            .filter(|policy| tenant.map_or(true, |tenant| policy.scope.tenant == tenant))
             .cloned()
             .collect::<Vec<_>>();
         policies.sort_by(|left, right| left.scope.cmp(&right.scope));
@@ -1365,10 +1366,20 @@ mod tests {
             .expect("matching version should succeed");
         assert_eq!(
             metadata
-                .list_tenant_policies()
+                .list_tenant_policies(None)
                 .expect("tenant policy listing should succeed"),
             vec![updated.clone()]
         );
+        assert_eq!(
+            metadata
+                .list_tenant_policies(Some("tenant-a"))
+                .expect("tenant-scoped policy listing should succeed"),
+            vec![updated.clone()]
+        );
+        assert!(metadata
+            .list_tenant_policies(Some("tenant-b"))
+            .expect("missing tenant policy listing should succeed")
+            .is_empty());
         assert!(metadata
             .delete_tenant_policy(&scope, Some(2))
             .expect("delete should succeed"));

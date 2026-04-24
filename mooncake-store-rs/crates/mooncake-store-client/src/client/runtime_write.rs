@@ -370,7 +370,7 @@ impl StoreClient {
                         ),
                         object_ref.key,
                     );
-                    ObjectKey::from_logical_id(&object_id)
+                    mooncake_store_core::ObjectKey::from_logical_id(&object_id)
                 })
                 .collect::<Vec<_>>();
             let current_routes_result =
@@ -422,7 +422,7 @@ impl StoreClient {
                     tenant,
                     object_id,
                     qos_tier: request.qos_tier,
-                    scoped_key: ObjectKey::from_logical_id(&LogicalObjectId::new(
+                    scoped_key: mooncake_store_core::ObjectKey::from_logical_id(&LogicalObjectId::new(
                         NamespaceScope::with_defaults(
                             object_ref.tenant,
                             object_ref.domain,

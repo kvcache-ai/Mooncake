@@ -61,8 +61,8 @@ pub fn route_reuse_identity(route: &ObjectRoute) -> Result<ReuseIdentity> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        CompatibilityDescriptor, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState,
-        RouteVersion, StoreError,
+        CompatibilityDescriptor, LogicalObjectId, NamespaceScope, ObjectKey, ObjectRoute,
+        ReplicaRoute, ReplicaTier, RouteState, RouteVersion, StoreError,
     };
 
     use super::{
@@ -101,6 +101,17 @@ mod tests {
     }
 
     #[test]
+    fn non_default_scope_object_key_distinguishes_shared_logical_key() {
+        let scope_a = NamespaceScope::new("tenant-a", "domain-a", "set-a");
+        let scope_b = NamespaceScope::new("tenant-a", "domain-b", "set-b");
+        let key_a = ObjectKey::from_logical_id(&LogicalObjectId::new(scope_a, "shared-key"));
+        let key_b = ObjectKey::from_logical_id(&LogicalObjectId::new(scope_b, "shared-key"));
+        assert_ne!(key_a, key_b);
+        assert_eq!(key_a.0, "tenant-a::ns/domain-a/set-a/shared-key");
+        assert_eq!(key_b.0, "tenant-a::ns/domain-b/set-b/shared-key");
+    }
+
+    #[test]
     fn apply_route_identity_populates_route_metadata() {
         let mut route = ObjectRoute {
             key: scoped_object_key("tenant-a", "old"),
@@ -132,6 +143,34 @@ mod tests {
         );
         assert_eq!(route.sharing_scope.as_deref(), Some("tenant-b"));
         assert_eq!(route.qos_tier.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn apply_route_identity_uses_full_scope_key_for_non_default_scope() {
+        let mut route = ObjectRoute {
+            key: scoped_object_key("tenant-a", "old"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::<ReplicaRoute>::new(),
+        };
+        let id = LogicalObjectId::new(
+            NamespaceScope::new("tenant-a", "domain-a", "set-a"),
+            "shared-key",
+        );
+        apply_route_identity(&mut route, &id);
+        assert_eq!(route.key.0, "tenant-a::ns/domain-a/set-a/shared-key");
+        assert_eq!(route.namespace.as_ref(), Some(&id.scope));
+        assert_eq!(route.logical_key.as_deref(), Some("shared-key"));
+        assert_eq!(
+            route.canonical_key.as_deref(),
+            Some("tenant-a/domain-a/set-a/shared-key")
+        );
     }
 
     #[test]

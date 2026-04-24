@@ -511,16 +511,16 @@ impl MooncakeCompatibilityFacade for StoreClient {
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
         Ok(self
             .route_directory
-            .get_object_route(&self.lease, &ObjectKey::from_logical_id(object_id))?
+            .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(object_id))?
             .filter(|route| route.state == RouteState::Active))
     }
 
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
-        self.metadata.list_object_routes_in_scope(scope)
+        self.route_directory.list_routes_in_scope(&self.lease, scope)
     }
 
     fn list_reuse_candidates(&self, reuse: &mooncake_store_core::ReuseIdentity) -> Result<Vec<ObjectRoute>> {
-        self.metadata.list_reuse_candidates(reuse)
+        self.route_directory.list_reuse_candidates(&self.lease, reuse)
     }
 
     fn cas_route(
@@ -540,7 +540,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
-        let object_key = ObjectKey::from_logical_id(&object_id);
+        let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
         self.route_directory.compare_and_swap_object_route(
             &self.lease,
             &object_key,
@@ -660,7 +660,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         .entered();
         let tracker = OperationTracker::new("remove");
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
-        let object_key = ObjectKey::from_logical_id(&object_id);
+        let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
         let Some(route) = self
             .route_directory
             .get_object_route(&self.lease, &object_key)?
@@ -734,7 +734,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
                 object.key,
             );
-            let object_key = ObjectKey::from_logical_id(&object_id);
+            let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
             let Some(route) = self
                 .route_directory
                 .get_object_route(&self.lease, &object_key)?
