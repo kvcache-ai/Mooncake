@@ -277,8 +277,21 @@ class P2PClientService final : public ClientService {
         MasterFetch master_fetch_;
     };
 
+    std::vector<ResolvedRoute> LoadCachedRoutes(std::string_view key);
+
+    std::vector<ResolvedRoute> ReplicasToRoutes(
+        const std::vector<Replica::Descriptor>& replicas);
+
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
         const std::string& key, const ReadRouteConfig& config);
+
+    tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
+        const std::string& key, const ReadRouteConfig& config,
+        std::vector<ResolvedRoute> pre_fetched);
+
+    std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>>
+    BatchFetchReadRoutes(const std::vector<std::string_view>& keys,
+                         const ReadRouteConfig& config);
 
     async_simple::coro::Lazy<std::vector<ResolvedRoute>>
     AsyncResolveRoutesFromMaster(const std::string& key,
@@ -307,14 +320,36 @@ class P2PClientService final : public ClientService {
                          const WriteRouteRequestConfig& config,
                          std::vector<WriteCandidate> candidates);
 
-    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
-        const std::string& key,
+    // Shared skeleton for both BatchGet overloads: guard, validate, wait, log.
+    template <typename ResultT, typename CreateHandlesFn, typename ExtractFn>
+    std::vector<tl::expected<ResultT, ErrorCode>> BatchGetImpl(
+        const std::vector<std::string>& keys, CreateHandlesFn&& create_handles,
+        ExtractFn&& extract);
+
+    std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
+        const std::vector<std::string>& keys,
         std::shared_ptr<ClientBufferAllocator> allocator,
         const ReadRouteConfig& config);
 
-    tl::expected<ReadTaskHandle, ErrorCode> CreateGetHandle(
-        const std::string& key, std::vector<Slice>& slices,
+    std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
+        const std::vector<std::string>& keys,
+        std::vector<std::vector<Slice>>& all_slices,
         const ReadRouteConfig& config);
+
+    template <typename LocalGetFn, typename RemoteGetFn>
+    std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
+    BatchCreateGetHandlesImpl(const std::vector<std::string>& keys,
+                              const ReadRouteConfig& config,
+                              LocalGetFn&& local_get, RemoteGetFn&& remote_get);
+
+    tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator,
+        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched);
+
+    tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
+        const std::string& key, std::vector<Slice>& slices,
+        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched);
 
     /**
      * @brief Launch async reads driven by a RouteIterator.
