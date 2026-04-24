@@ -94,6 +94,7 @@ void FIFOEndpointStore::evictEndpoint() {
 }
 
 void FIFOEndpointStore::reclaimEndpoint() {
+    if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
     for (auto &endpoint : waiting_list_)
