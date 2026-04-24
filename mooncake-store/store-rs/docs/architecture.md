@@ -10,6 +10,15 @@ This document describes the runtime architecture implemented in `mooncake-store-
 - Keep metadata backends responsible for leases, segments, route policy, handoff, and `MetadataOnly` route persistence
 - Make lifecycle changes, reclaim, and routing explicit in the client
 
+## Hot-Path Invariant
+
+Steady-state request hot paths must not depend on backend round trips.
+
+- Redis, etcd, admin RPC, and other backend-owned control surfaces must stay off normal per-request read and write latency paths
+- hot paths may use local snapshots, maintained caches, authority indirection, or exact maintained indexes instead
+- `MetadataOnly` remains a bring-up and debugging mode rather than the normal performance target
+- if a feature proposal would reintroduce direct backend reads or writes on every request, the design is wrong until the hot-path dependency is removed
+
 ## Component Model
 
 | Component | Responsibility | Hot Path |
