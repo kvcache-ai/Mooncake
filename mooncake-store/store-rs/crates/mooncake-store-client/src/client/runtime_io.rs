@@ -21,27 +21,59 @@ impl StoreClient {
             })
     }
 
+    fn load_tenant_quota_policies(
+        &self,
+        tenants: &[String],
+    ) -> Result<BTreeMap<String, Option<TenantQuotaPolicy>>> {
+        let mut resolved = BTreeMap::new();
+        let now = now_ms();
+        let mut refresh_tenants = Vec::new();
+        {
+            let mut cache = self.live_client_cache.lock();
+            for tenant in tenants {
+                if let Some(quota) =
+                    cache.tenant_quota_policy(tenant, now, DEFAULT_TENANT_POLICY_CACHE_TTL_MS)
+                {
+                    resolved.insert(tenant.clone(), quota);
+                } else {
+                    refresh_tenants.push(tenant.clone());
+                }
+            }
+        }
+        if refresh_tenants.is_empty() {
+            return Ok(resolved);
+        }
+        let mut cache = self.live_client_cache.lock();
+        for tenant in refresh_tenants {
+            let scope = TenantPolicyScope::new(tenant.as_str(), None::<String>, None::<String>);
+            let policy = self.metadata.get_tenant_policy(&scope)?;
+            let version = policy.as_ref().map(|policy| policy.version);
+            let quota = policy.and_then(|policy| policy.spec.quota);
+            cache.store_tenant_quota_policy(tenant.clone(), version, quota.clone(), now);
+            resolved.insert(tenant, quota);
+        }
+        Ok(resolved)
+    }
+
     fn tenant_quota_policy_for_object(
         &self,
         object_id: &LogicalObjectId,
     ) -> Result<Option<TenantQuotaPolicy>> {
-        let scope = NamespaceScope::with_defaults(
-            Some(object_id.scope.tenant.as_str()),
-            Some(object_id.scope.domain.as_str()),
-            Some(object_id.scope.object_set.as_str()),
-        );
-        let mut resolved = TenantPolicySpec::default();
-        for policy_scope in TenantPolicyScope::ancestors(&scope) {
-            if let Some(policy) = self.metadata.get_tenant_policy(&policy_scope)? {
-                resolved = resolved.merged_with(&policy.spec);
-            }
+        let tenant = object_id.scope.tenant.clone();
+        if let Some(quota) = self
+            .load_tenant_quota_policies(std::slice::from_ref(&tenant))?
+            .remove(&tenant)
+            .flatten()
+        {
+            return Ok(Some(quota));
         }
-        Ok(resolved.quota.or_else(|| {
-            self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
+        if object_id.scope.tenant == self.default_tenant() {
+            return Ok(self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
                 max_bytes: quota.max_bytes,
                 max_objects: quota.max_objects,
-            })
-        }))
+            }));
+        }
+        Ok(None)
     }
 
     fn tenant_quota_scope(&self, object_id: &LogicalObjectId) -> TenantPolicyScope {
