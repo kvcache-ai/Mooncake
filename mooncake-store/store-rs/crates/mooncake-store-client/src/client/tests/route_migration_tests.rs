@@ -436,3 +436,129 @@ fn control_plane_submit_migration_task_recovers_after_executor_panic() {
         payload
     );
 }
+
+#[test]
+fn control_plane_submit_migration_task_executes_explicit_move() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("cp-move-store-a-segment"));
+    let executor_factory = store_a_transport.factory();
+    let store_b_transport = Arc::new(store_a_transport.peer("cp-move-store-b-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("cp-move-reader-segment"));
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "cp-move-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "cp-move-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .transport_factory(executor_factory)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "cp-move-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &reader]);
+
+    let key = "cp-move-key";
+    let payload = b"cp-move-payload";
+    store_a.put(key, payload).expect("seed put should succeed");
+    let current = store_a
+        .query_route(key)
+        .expect("initial route query should succeed")
+        .expect("initial route should exist");
+    let source_segment = current.replicas[0].segment_name.0.clone();
+    let target_segment = store_b
+        .segment_name()
+        .expect("store-b should expose a primary segment")
+        .0;
+    let executor_lease = store_b.lease();
+    let execution_id = reader
+        .control_client
+        .submit_migration_task(
+            &executor_lease,
+            pb::SubmitMigrationTaskRequest {
+                namespace: metadata.route_namespace(),
+                authority: store_b.runtime_id().stable_id.0.clone(),
+                tenant: "default".to_string(),
+                key: key.to_string(),
+                mode: pb::MigrationMode::Move as i32,
+                source_segment,
+                target_segments: vec![target_segment.clone()],
+                task_executor: store_b.runtime_id().stable_id.0.clone(),
+                max_retries: 1,
+            },
+        )
+        .expect("migration task submit should succeed");
+    assert!(!execution_id.is_empty());
+
+    let started = Instant::now();
+    loop {
+        let state = reader
+            .control_client
+            .get_migration_execution_status(
+                &executor_lease,
+                pb::GetMigrationExecutionStatusRequest {
+                    namespace: metadata.route_namespace(),
+                    authority: store_b.runtime_id().stable_id.0.clone(),
+                    execution_id: execution_id.clone(),
+                },
+            )
+            .expect("migration status query should succeed");
+        match state {
+            pb::MigrationExecutionState::Succeeded => break,
+            pb::MigrationExecutionState::Failed => {
+                panic!("migration task should not fail")
+            }
+            _ => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "migration task should complete quickly"
+                );
+                sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let route = reader
+        .query_route(key)
+        .expect("post-migration route query should succeed")
+        .expect("post-migration route should exist");
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(route.replicas[0].owner, *store_b.runtime_id());
+    assert_eq!(
+        route.replicas[0].segment_name,
+        SegmentName::new(target_segment)
+    );
+    assert_eq!(
+        reader
+            .get(key)
+            .expect("reader get after control-plane move should succeed"),
+        payload
+    );
+}
