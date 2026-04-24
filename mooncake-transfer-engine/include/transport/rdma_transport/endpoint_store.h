@@ -86,7 +86,7 @@ class FIFOEndpointStore : public EndpointStore {
     std::list<std::string> fifo_list_;
 
     std::unordered_set<std::shared_ptr<RdmaEndPoint>> waiting_list_;
-    std::atomic<int> waiting_list_len_;
+    std::atomic<size_t> waiting_list_len_;
 
     size_t max_size_;
 };
@@ -129,7 +129,7 @@ class SIEVEEndpointStore : public EndpointStore {
     std::optional<std::list<std::string>::iterator> hand_;
 
     std::unordered_set<std::shared_ptr<RdmaEndPoint>> waiting_list_;
-    std::atomic<int> waiting_list_len_;
+    std::atomic<size_t> waiting_list_len_;
 
     size_t max_size_;
 };
