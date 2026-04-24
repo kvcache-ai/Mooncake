@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -60,6 +60,11 @@ struct NoHotPathMetadataBackend {
     deny_segment_list: bool,
 }
 
+struct HotPathBlockedMetadataBackend {
+    inner: Arc<InMemoryMetadataBackend>,
+    block_hot_path: AtomicBool,
+}
+
 impl NoHotPathMetadataBackend {
     fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
         Self {
@@ -86,6 +91,28 @@ impl NoHotPathMetadataBackend {
             deny_live_client_list: true,
             deny_segment_list: true,
         }
+    }
+}
+
+impl HotPathBlockedMetadataBackend {
+    fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
+        Self {
+            inner,
+            block_hot_path: AtomicBool::new(false),
+        }
+    }
+
+    fn block_hot_path(&self) {
+        self.block_hot_path.store(true, Ordering::Relaxed);
+    }
+
+    fn hot_path_error(&self, op: &str) -> mooncake_store_core::Result<()> {
+        if self.block_hot_path.load(Ordering::Relaxed) {
+            return Err(StoreError::Unsupported(format!(
+                "metadata hot path is disabled in this test: {op}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -963,6 +990,232 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         &self,
         reservation_id: &str,
     ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.inner.abort_tenant_quota(reservation_id)
+    }
+
+    fn put_handoff(
+        &self,
+        handoff: &mooncake_store_core::HandoffPlan,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_handoff(handoff)
+    }
+
+    fn get_handoff(
+        &self,
+        stable_id: &mooncake_store_core::ClientStableId,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
+        self.inner.get_handoff(stable_id)
+    }
+}
+
+impl MetadataBackend for HotPathBlockedMetadataBackend {
+    fn route_namespace(&self) -> String {
+        self.inner.route_namespace()
+    }
+
+    fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+        self.inner.upsert_client_lease(lease)
+    }
+
+    fn allocate_client_lease(
+        &self,
+        template: &ClientLease,
+    ) -> mooncake_store_core::Result<ClientRuntimeId> {
+        self.inner.allocate_client_lease(template)
+    }
+
+    fn update_client_state(
+        &self,
+        runtime: &ClientRuntimeId,
+        next: ClientLifecycleState,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.update_client_state(runtime, next)
+    }
+
+    fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+        self.hot_path_error("list_live_clients")?;
+        self.inner.list_live_clients()
+    }
+
+    fn publish_segment(&self, segment: &SegmentAnnouncement) -> mooncake_store_core::Result<()> {
+        self.inner.publish_segment(segment)
+    }
+
+    fn unpublish_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.unpublish_segment(owner, segment)
+    }
+
+    fn list_segments(
+        &self,
+        owner: Option<&ClientRuntimeId>,
+    ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+        self.inner.list_segments(owner)
+    }
+
+    fn update_segment_state(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.update_segment_state(owner, segment, next)
+    }
+
+    fn reserve_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+        self.hot_path_error("reserve_segment")?;
+        self.inner.reserve_segment(owner, segment, length_bytes)
+    }
+
+    fn release_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<()> {
+        self.hot_path_error("release_segment")?;
+        self.inner
+            .release_segment(owner, segment, offset_bytes, length_bytes)
+    }
+
+    fn get_object_route(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
+        self.hot_path_error("get_object_route")?;
+        self.inner.get_object_route(key)
+    }
+
+    fn list_object_routes(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ObjectRoute>> {
+        self.inner.list_object_routes()
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        key: &ObjectKey,
+        expected: Option<mooncake_store_core::RouteVersion>,
+        next: Option<&mooncake_store_core::ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        self.hot_path_error("compare_and_swap_object_route")?;
+        self.inner
+            .compare_and_swap_object_route(key, expected, next)
+    }
+
+    fn get_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+    ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+        self.inner.get_route_policy(domain)
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.put_route_policy_if_absent(domain, policy)
+    }
+
+    fn put_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.put_route_policy(domain, policy)
+    }
+
+    fn delete_route_policy(&self, domain: &RoutePolicyDomain) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_route_policy(domain)
+    }
+
+    fn list_route_policies(
+        &self,
+    ) -> mooncake_store_core::Result<Vec<(RoutePolicyDomain, RoutePolicy)>> {
+        self.inner.list_route_policies()
+    }
+
+    fn get_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantPolicy>> {
+        self.hot_path_error("get_tenant_policy")?;
+        self.inner.get_tenant_policy(scope)
+    }
+
+    fn list_tenant_policies(&self) -> mooncake_store_core::Result<Vec<TenantPolicy>> {
+        self.inner.list_tenant_policies()
+    }
+
+    fn put_tenant_policy(
+        &self,
+        policy: &TenantPolicy,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<TenantPolicy> {
+        self.inner.put_tenant_policy(policy, expected_version)
+    }
+
+    fn delete_tenant_policy(
+        &self,
+        scope: &TenantPolicyScope,
+        expected_version: Option<u64>,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.delete_tenant_policy(scope, expected_version)
+    }
+
+    fn get_tenant_quota_state(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Option<TenantQuotaState>> {
+        self.inner.get_tenant_quota_state(scope)
+    }
+
+    fn get_tenant_object_accounting(
+        &self,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<TenantObjectAccounting>> {
+        self.hot_path_error("get_tenant_object_accounting")?;
+        self.inner.get_tenant_object_accounting(key)
+    }
+
+    fn list_tenant_quota_reservations(
+        &self,
+        scope: &TenantPolicyScope,
+    ) -> mooncake_store_core::Result<Vec<TenantQuotaReservation>> {
+        self.inner.list_tenant_quota_reservations(scope)
+    }
+
+    fn reserve_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaReservationRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaReservationOutcome> {
+        self.hot_path_error("reserve_tenant_quota")?;
+        self.inner.reserve_tenant_quota(request)
+    }
+
+    fn finalize_tenant_quota(
+        &self,
+        request: &mooncake_store_core::TenantQuotaFinalizeRequest,
+    ) -> mooncake_store_core::Result<TenantQuotaFinalizeOutcome> {
+        self.hot_path_error("finalize_tenant_quota")?;
+        self.inner.finalize_tenant_quota(request)
+    }
+
+    fn abort_tenant_quota(
+        &self,
+        reservation_id: &str,
+    ) -> mooncake_store_core::Result<TenantQuotaAbortOutcome> {
+        self.hot_path_error("abort_tenant_quota")?;
         self.inner.abort_tenant_quota(reservation_id)
     }
 
@@ -5602,6 +5855,415 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
     assert_eq!(&buf_a, b"alpha-1");
     assert_eq!(&buf_b, b"beta-11");
     assert_eq!(&buf_c, b"gamma-1");
+}
+
+#[test]
+fn routed_batch_put_from_works_when_metadata_hot_paths_are_disabled() {
+    let metadata = Arc::new(NoHotPathMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let storage_transport = Arc::new(TestTransport::new("storage-hot-batch-from-segment"));
+    let router_transport = Arc::new(storage_transport.peer("router-hot-batch-from-segment"));
+    let reader_transport = Arc::new(storage_transport.peer("reader-hot-batch-from-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "storage-hot-batch-from")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let router = StoreClientBuilder::new(metadata.clone(), "router-hot-batch-from")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(storage_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+
+    let reader = StoreClientBuilder::new(metadata.clone(), "reader-hot-batch-from")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    wait_for_membership_convergence(&[&storage, &router, &reader]);
+
+    let mut source = [0u8; 32];
+    source[..7].copy_from_slice(b"alpha-0");
+    source[16..23].copy_from_slice(b"beta-00");
+    router
+        .register_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("router register buffer should succeed");
+
+    let routes = router
+        .batch_put_from(&[
+            PutFromRequest::new("hot-batch-from-a", source.as_ptr().cast(), 7)
+                .tenant("tenant-a")
+                .replication(ReplicationPolicy::new().prefer_local(false)),
+            PutFromRequest::new(
+                "hot-batch-from-b",
+                unsafe { source.as_ptr().add(16).cast() },
+                7,
+            )
+            .tenant("tenant-a")
+            .replication(ReplicationPolicy::new().prefer_local(false)),
+        ])
+        .expect("batch_put_from should succeed without metadata hot paths");
+    assert_eq!(routes.len(), 2);
+    for key in ["hot-batch-from-a", "hot-batch-from-b"] {
+        assert!(
+            metadata
+                .inner
+                .get_object_route(&ObjectKey::new(format!("tenant-a::{key}")))
+                .expect("metadata query should succeed")
+                .is_none(),
+            "embedded WRH route directory should keep batch_put_from routes off metadata backend"
+        );
+    }
+
+    let mut buf_a = [0u8; 7];
+    let mut buf_b = [0u8; 7];
+    let sizes = reader
+        .batch_get_into(&mut [
+            GetRequest::new("hot-batch-from-a", &mut buf_a).tenant("tenant-a"),
+            GetRequest::new("hot-batch-from-b", &mut buf_b).tenant("tenant-a"),
+        ])
+        .expect("reader batch_get_into should succeed");
+    assert_eq!(sizes, vec![7, 7]);
+    assert_eq!(&buf_a, b"alpha-0");
+    assert_eq!(&buf_b, b"beta-00");
+}
+
+#[test]
+fn put_get_family_stays_off_backend_hot_path_after_build() {
+    let metadata = Arc::new(HotPathBlockedMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let storage_transport = Arc::new(TestTransport::new("storage-hot-family-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("writer-hot-family-segment"));
+    let reader_transport = Arc::new(storage_transport.peer("reader-hot-family-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "storage-hot-family")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(Duration::ZERO)
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-hot-family")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(Duration::ZERO)
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+
+    let reader = StoreClientBuilder::new(metadata.clone(), "reader-hot-family")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(Duration::ZERO)
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    {
+        let seeded_at_ms = now_ms();
+        let mut cache = writer.live_client_cache.lock();
+        for tenant in [
+            "tenant-explicit",
+            "tenant-policy",
+            "tenant-batch",
+            "tenant-from",
+            "tenant-from-policy",
+            "tenant-batch-from",
+            "tenant-multi",
+        ] {
+            cache.store_tenant_quota_policy(tenant.to_string(), None, None, seeded_at_ms);
+        }
+    }
+
+    metadata.block_hot_path();
+
+    let policy = ReplicationPolicy::new().prefer_local(false);
+    writer.put("plain", b"alpha").expect("put should succeed");
+    writer
+        .put_in_tenant("tenant-explicit", "tenant-key", b"bravo")
+        .expect("put_in_tenant should succeed");
+    writer
+        .put_with_policy("policy", b"charlie", &policy)
+        .expect("put_with_policy should succeed");
+    writer
+        .put_in_tenant_with_policy("tenant-policy", "policy-tenant", b"deltaaa", &policy)
+        .expect("put_in_tenant_with_policy should succeed");
+    writer
+        .batch_put(&[
+            PutRequest::new("batch-a", b"delta"),
+            PutRequest::new("batch-b", b"echoo"),
+            PutRequest::new("batch-tenant", b"foxten").tenant("tenant-batch"),
+        ])
+        .expect("batch_put should succeed");
+
+    let mut source = [0u8; 160];
+    source[..5].copy_from_slice(b"foxtt");
+    source[16..22].copy_from_slice(b"golf!!");
+    source[32..37].copy_from_slice(b"hotel");
+    source[48..53].copy_from_slice(b"india");
+    source[64..70].copy_from_slice(b"juliet");
+    source[80..87].copy_from_slice(b"kilo123");
+    source[96..103].copy_from_slice(b"mike999");
+    writer
+        .register_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("register_buffer should succeed");
+    writer
+        .put_from("from-one", source.as_ptr().cast(), 5)
+        .expect("put_from should succeed");
+    writer
+        .put_from_in_tenant(
+            "tenant-from",
+            "from-tenant",
+            unsafe { source.as_ptr().add(48).cast() },
+            5,
+        )
+        .expect("put_from_in_tenant should succeed");
+    writer
+        .put_from_with_policy(
+            "from-policy",
+            unsafe { source.as_ptr().add(64).cast() },
+            6,
+            &policy,
+        )
+        .expect("put_from_with_policy should succeed");
+    writer
+        .put_from_in_tenant_with_policy(
+            "tenant-from-policy",
+            "from-tenant-policy",
+            unsafe { source.as_ptr().add(80).cast() },
+            7,
+            &policy,
+        )
+        .expect("put_from_in_tenant_with_policy should succeed");
+    writer
+        .batch_put_from(&[
+            PutFromRequest::new("from-batch-a", unsafe { source.as_ptr().add(16).cast() }, 6),
+            PutFromRequest::new("from-batch-b", unsafe { source.as_ptr().add(32).cast() }, 5),
+            PutFromRequest::new(
+                "from-batch-tenant",
+                unsafe { source.as_ptr().add(96).cast() },
+                7,
+            )
+            .tenant("tenant-batch-from"),
+        ])
+        .expect("batch_put_from should succeed");
+    let multi_buffers = [b"jul".as_slice(), b"iet".as_slice()];
+    let tenant_multi_buffers = [b"nov".as_slice(), b"ember".as_slice()];
+    writer
+        .batch_put_from_multi_buffers(&[
+            MultiBufferPutRequest::new("from-multi", &multi_buffers),
+            MultiBufferPutRequest::new("from-multi-tenant", &tenant_multi_buffers)
+                .tenant("tenant-multi")
+                .replication(policy.clone()),
+        ])
+        .expect("batch_put_from_multi_buffers should succeed");
+
+    assert_eq!(reader.get("plain").expect("get should succeed"), b"alpha");
+    assert_eq!(
+        reader
+            .get_in_tenant("tenant-explicit", "tenant-key")
+            .expect("get_in_tenant should succeed"),
+        b"bravo"
+    );
+    assert!(
+        reader.is_exist("policy").expect("is_exist should succeed"),
+        "is_exist should report true"
+    );
+    assert!(
+        reader
+            .is_exist_in_tenant("tenant-policy", "policy-tenant")
+            .expect("is_exist_in_tenant should succeed"),
+        "is_exist_in_tenant should report true"
+    );
+    assert_eq!(
+        reader
+            .batch_is_exist(&[
+                ObjectRef::new("plain"),
+                ObjectRef::new("policy-tenant").tenant("tenant-policy"),
+                ObjectRef::new("missing"),
+            ])
+            .expect("batch_is_exist should succeed"),
+        vec![true, true, false]
+    );
+    assert_eq!(
+        reader.get_size("policy").expect("get_size should succeed"),
+        7
+    );
+    assert_eq!(
+        reader
+            .get_size_in_tenant("tenant-policy", "policy-tenant")
+            .expect("get_size_in_tenant should succeed"),
+        7
+    );
+    assert!(
+        reader
+            .query_route("plain")
+            .expect("query_route should succeed")
+            .is_some(),
+        "query_route should see authoritative route"
+    );
+    let tenant_scope = NamespaceScope::with_defaults(Some("tenant-policy"), None, None);
+    let tenant_policy_route = reader
+        .query_route_in_tenant("tenant-policy", "policy-tenant")
+        .expect("query_route_in_tenant should succeed")
+        .expect("tenant route should exist");
+    assert_eq!(
+        tenant_policy_route.key,
+        reader
+            .query_route_in_scope(&tenant_scope, "policy-tenant")
+            .expect("query_route_in_scope should succeed")
+            .expect("scoped route should exist")
+            .key
+    );
+    assert_eq!(
+        tenant_policy_route.key,
+        reader
+            .query_route_by_object_id(&LogicalObjectId::new(tenant_scope.clone(), "policy-tenant",))
+            .expect("query_route_by_object_id should succeed")
+            .expect("object-id route should exist")
+            .key
+    );
+
+    let mut single = [0u8; 7];
+    assert_eq!(
+        reader
+            .get_into("policy", &mut single)
+            .expect("get_into should succeed"),
+        7
+    );
+    assert_eq!(&single, b"charlie");
+    let mut tenant_single = [0u8; 8];
+    assert_eq!(
+        reader
+            .get_into_in_tenant(
+                "tenant-from-policy",
+                "from-tenant-policy",
+                &mut tenant_single
+            )
+            .expect("get_into_in_tenant should succeed"),
+        7
+    );
+    assert_eq!(&tenant_single[..7], b"kilo123");
+
+    let values = reader
+        .batch_get(&[
+            ObjectRef::new("batch-a"),
+            ObjectRef::new("batch-b"),
+            ObjectRef::new("batch-tenant").tenant("tenant-batch"),
+            ObjectRef::new("from-one"),
+            ObjectRef::new("from-tenant").tenant("tenant-from"),
+            ObjectRef::new("from-policy"),
+            ObjectRef::new("from-tenant-policy").tenant("tenant-from-policy"),
+            ObjectRef::new("from-batch-a"),
+            ObjectRef::new("from-batch-b"),
+            ObjectRef::new("from-batch-tenant").tenant("tenant-batch-from"),
+            ObjectRef::new("from-multi"),
+            ObjectRef::new("from-multi-tenant").tenant("tenant-multi"),
+        ])
+        .expect("batch_get should succeed");
+    assert_eq!(
+        values,
+        vec![
+            b"delta".to_vec(),
+            b"echoo".to_vec(),
+            b"foxten".to_vec(),
+            b"foxtt".to_vec(),
+            b"india".to_vec(),
+            b"juliet".to_vec(),
+            b"kilo123".to_vec(),
+            b"golf!!".to_vec(),
+            b"hotel".to_vec(),
+            b"mike999".to_vec(),
+            b"juliet".to_vec(),
+            b"november".to_vec(),
+        ]
+    );
+    let buffered = reader
+        .batch_get_buffer(&[
+            ObjectRef::new("policy"),
+            ObjectRef::new("policy-tenant").tenant("tenant-policy"),
+            ObjectRef::new("from-policy"),
+        ])
+        .expect("batch_get_buffer should succeed");
+    assert_eq!(buffered[0], b"charlie");
+    assert_eq!(buffered[1], b"deltaaa");
+    assert_eq!(buffered[2], b"juliet");
+
+    let mut batch_a = [0u8; 5];
+    let mut batch_tenant = [0u8; 7];
+    let batch_sizes = reader
+        .batch_get_into(&mut [
+            GetRequest::new("batch-a", &mut batch_a),
+            GetRequest::new("policy-tenant", &mut batch_tenant).tenant("tenant-policy"),
+        ])
+        .expect("batch_get_into should succeed");
+    assert_eq!(batch_sizes, vec![5, 7]);
+    assert_eq!(&batch_a, b"delta");
+    assert_eq!(&batch_tenant, b"deltaaa");
+
+    let mut multi_a = [0u8; 3];
+    let mut multi_b = [0u8; 5];
+    let mut shards = [&mut multi_a[..], &mut multi_b[..]];
+    let multi_sizes = reader
+        .batch_get_into_multi_buffers(&mut [MultiBufferGetRequest::new(
+            "from-multi-tenant",
+            &mut shards,
+        )
+        .tenant("tenant-multi")])
+        .expect("batch_get_into_multi_buffers should succeed");
+    assert_eq!(multi_sizes, vec![8]);
+    assert_eq!(&multi_a, b"nov");
+    assert_eq!(&multi_b, b"ember");
 }
 
 #[test]

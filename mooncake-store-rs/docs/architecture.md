@@ -103,6 +103,16 @@ The shared snapshot is the membership truth used by the hot request path.
 
 This keeps `list_live_clients()` off the normal request path. Metadata still owns the durable lease set, but request-path consumers read a locally cached view that is refreshed asynchronously.
 
+The same background worker now also maintains the tenant-root quota-policy hot cache used by write admission:
+
+- tenant quota policy is cached per tenant root instead of being re-read from metadata for every object write
+- the default tenant's root quota policy or cached absence is seeded during client build, so the first steady-state request does not need a backend lookup just to learn that default-tenant policy state
+- the cache shares the same worker thread and timer as membership refresh
+- the worker prunes idle tenant-policy entries and opportunistically refreshes recently used stale entries
+- hot writes still refresh a missing or stale tenant policy on demand when needed
+
+This keeps membership and tenant-policy maintenance on one metadata-cache loop without turning tenant policy into a global full-scan snapshot.
+
 The membership snapshot is runtime cache, not protocol configuration:
 
 - membership snapshots are refreshed in the background
