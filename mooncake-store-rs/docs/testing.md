@@ -218,11 +218,33 @@ Semantics:
 - `reset_counters()` zeros call counts but preserves injection state;
   `reset_all()` clears everything back to default.
 
-## Route Migration Coverage
+## Route Migration Layered E2E
 
 Route-migration verification is split across three layers so that runtime,
 control-plane, and operator regressions are caught at the narrowest possible
 scope first.
+
+### Runtime / control-plane layer
+
+Use
+[scripts/tests/route-migration/test-route-migration-runtime-e2e.sh](../scripts/tests/route-migration/test-route-migration-runtime-e2e.sh)
+for the runtime PR layer.
+
+It validates:
+
+- control-plane submit -> executor worker -> explicit move completion
+- worker panic recovery without involving the admin queue
+
+### Admin / operator layer
+
+Use
+[scripts/tests/route-migration/test-route-migration-admin-e2e.sh](../scripts/tests/route-migration/test-route-migration-admin-e2e.sh)
+for the admin PR layer.
+
+It validates:
+
+- admin HTTP submit -> list -> status transitions
+- `mooncake-store-admin` as the operator-side HTTP client for route migration
 
 ### Unit and in-process integration
 
@@ -490,30 +512,3 @@ Decision tree:
 - `docs/architecture.md` for the runtime architecture under test.
 - `docs/rust.md` for the public Rust API that tests exercise.
 - `crates/mooncake-store-test-utils/src/` for the injection primitives.
-
-## Route Migration Layered E2E
-
-Route migration is validated in stacked layers so each PR can carry its own
-executable acceptance check.
-
-### Runtime / control-plane layer
-
-Use
-[scripts/tests/route-migration/test-route-migration-runtime-e2e.sh](../scripts/tests/route-migration/test-route-migration-runtime-e2e.sh)
-for the runtime PR layer.
-
-It validates:
-
-- control-plane submit -> executor worker -> explicit move completion
-- worker panic recovery without involving the admin queue
-
-### Admin / operator layer
-
-Use
-[scripts/tests/route-migration/test-route-migration-admin-e2e.sh](../scripts/tests/route-migration/test-route-migration-admin-e2e.sh)
-for the admin PR layer.
-
-It validates:
-
-- admin HTTP submit -> list -> status transitions
-- `mooncake-store-admin` as the operator-side HTTP client for route migration
