@@ -902,12 +902,18 @@ impl StoreClient {
             }
         };
 
-        let cas = self.route_directory.compare_and_swap_object_route(
+        let cas = match self.route_directory.compare_and_swap_object_route(
             &self.lease,
             &current.key,
             Some(current.version),
             Some(&next_route),
-        )?;
+        ) {
+            Ok(cas) => cas,
+            Err(error) => {
+                let _ = self.release_reserved_allocations(&targets, &reservations);
+                return Err(error);
+            }
+        };
         if !cas.applied {
             let _ = self.release_reserved_allocations(&targets, &reservations);
             return Err(StoreError::Conflict(format!(

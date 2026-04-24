@@ -76,12 +76,17 @@ enum MigrationMode {
 
 enum MigrationExecutionState {
   MIGRATION_EXECUTION_STATE_UNSPECIFIED = 0;
+  // Executor-local queue state before the worker dequeues the task.
   MIGRATION_EXECUTION_STATE_PENDING = 1;
+  // Executor worker accepted the task and is preparing the helper runtime.
   MIGRATION_EXECUTION_STATE_DISPATCHING = 2;
+  // Executor helper runtime is actively executing migration work.
   MIGRATION_EXECUTION_STATE_RUNNING = 3;
+  // Reserved for future executor-local retry support. P1 retries are admin-owned.
   MIGRATION_EXECUTION_STATE_RETRY_WAIT = 4;
   MIGRATION_EXECUTION_STATE_SUCCEEDED = 5;
   MIGRATION_EXECUTION_STATE_FAILED = 6;
+  // Reserved for future cancellation support. P1 does not expose cancel.
   MIGRATION_EXECUTION_STATE_CANCELLED = 7;
 }
 
@@ -307,6 +312,7 @@ message SubmitMigrationTaskRequest {
   string source_segment = 6;
   repeated string target_segments = 7;
   string task_executor = 8;
+  // Admin-owned retry budget. P1 executor implementations do not retry a submitted execution.
   uint64 max_retries = 9;
 }
 
@@ -324,6 +330,7 @@ message GetMigrationExecutionStatusRequest {
 message GetMigrationExecutionStatusReply {
   string execution_id = 1;
   MigrationExecutionState state = 2;
+  // Executor-local attempt count. P1 reports 0 before dispatch and 1 after dispatch.
   uint32 attempts = 3;
   string last_error = 4;
   ErrorDetail error = 5;

@@ -12537,6 +12537,7 @@ mod adversarial;
 mod fault_injection_prop;
 mod lifecycle_tests;
 mod quota_prop;
+mod route_migration_tests;
 mod routing_prop;
 mod routing_tests;
 mod store_client_tests;
