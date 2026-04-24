@@ -2048,6 +2048,32 @@ impl MetadataBackend for RedisMetadataBackend {
             .transpose()
     }
 
+    fn get_tenant_policies(
+        &self,
+        scopes: &[TenantPolicyScope],
+    ) -> Result<Vec<Option<TenantPolicy>>> {
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.connection()?;
+        let keys = scopes
+            .iter()
+            .map(|scope| self.keyspace.tenant_policy(scope))
+            .collect::<Vec<_>>();
+        let payloads: Vec<Option<String>> = redis::cmd("MGET")
+            .arg(&keys)
+            .query(&mut connection)
+            .map_err(|error| metadata_error("redis mget tenant policies", error))?;
+        payloads
+            .into_iter()
+            .map(|payload| {
+                payload
+                    .map(|payload| serde_json::from_str(&payload).map_err(json_error))
+                    .transpose()
+            })
+            .collect()
+    }
+
     fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
         let mut connection = self.connection()?;
         let prefix = self.keyspace.tenant_policy_prefix(None);
@@ -3875,6 +3901,14 @@ mod tests {
                 .get_tenant_policy(&scope)
                 .expect("tenant policy read should succeed"),
             Some(policy.clone())
+        );
+        let missing_scope =
+            TenantPolicyScope::new("tenant-missing", None::<String>, None::<String>);
+        assert_eq!(
+            backend
+                .get_tenant_policies(&[scope.clone(), missing_scope.clone()])
+                .expect("tenant policy batch read should succeed"),
+            vec![Some(policy.clone()), None]
         );
 
         let mut updated = policy.clone();

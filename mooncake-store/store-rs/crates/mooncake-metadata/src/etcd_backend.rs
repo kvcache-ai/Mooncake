@@ -1348,6 +1348,45 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
+    fn get_tenant_policies(
+        &self,
+        scopes: &[TenantPolicyScope],
+    ) -> Result<Vec<Option<TenantPolicy>>> {
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = scopes
+            .iter()
+            .map(|scope| self.config.keyspace.tenant_policy(scope))
+            .collect::<Vec<_>>();
+        self.block_on(async {
+            let ops = keys
+                .iter()
+                .cloned()
+                .map(|key| TxnOp::get(key, None))
+                .collect::<Vec<_>>();
+            let mut client = self.client().await?;
+            let response = client
+                .txn(Txn::new().and_then(ops))
+                .await
+                .map_err(etcd_error("etcd batch get tenant policies"))?;
+            response
+                .op_responses()
+                .into_iter()
+                .map(|op| match op {
+                    etcd_client::TxnOpResponse::Get(get) => get
+                        .kvs()
+                        .first()
+                        .map(|kv| serde_json::from_slice(kv.value()).map_err(json_error))
+                        .transpose(),
+                    other => Err(StoreError::Metadata(format!(
+                        "etcd batch get tenant policies returned unexpected response: {other:?}"
+                    ))),
+                })
+                .collect()
+        })
+    }
+
     fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>> {
         let prefix = self.config.keyspace.tenant_policy_prefix(None);
         self.block_on(async {
@@ -2993,6 +3032,14 @@ mod tests {
                 .get_tenant_policy(&scope)
                 .expect("tenant policy read should succeed"),
             Some(policy.clone())
+        );
+        let missing_scope =
+            TenantPolicyScope::new("tenant-missing", None::<String>, None::<String>);
+        assert_eq!(
+            backend
+                .get_tenant_policies(&[scope.clone(), missing_scope.clone()])
+                .expect("tenant policy batch read should succeed"),
+            vec![Some(policy.clone()), None]
         );
 
         let mut updated = policy.clone();

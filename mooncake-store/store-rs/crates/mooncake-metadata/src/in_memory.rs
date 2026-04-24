@@ -1341,6 +1341,14 @@ mod tests {
                 .expect("tenant policy read should succeed"),
             Some(policy.clone())
         );
+        let missing_scope =
+            TenantPolicyScope::new("tenant-missing", None::<String>, None::<String>);
+        assert_eq!(
+            metadata
+                .get_tenant_policies(&[scope.clone(), missing_scope.clone()])
+                .expect("tenant policy batch read should succeed"),
+            vec![Some(policy.clone()), None]
+        );
 
         let mut updated = policy.clone();
         updated.version = 2;

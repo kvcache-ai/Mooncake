@@ -209,6 +209,23 @@ pub trait MetadataBackend: Send + Sync {
 
     fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>>;
 
+    /// Looks up tenant policies by exact scopes.
+    ///
+    /// # Performance
+    /// The default implementation performs one exact lookup per scope and is
+    /// intended for tests or small batches. Production backends should
+    /// override this when they can batch exact reads without falling back to
+    /// scans.
+    fn get_tenant_policies(
+        &self,
+        scopes: &[TenantPolicyScope],
+    ) -> Result<Vec<Option<TenantPolicy>>> {
+        scopes
+            .iter()
+            .map(|scope| self.get_tenant_policy(scope))
+            .collect()
+    }
+
     fn list_tenant_policies(&self) -> Result<Vec<TenantPolicy>>;
 
     fn put_tenant_policy(
