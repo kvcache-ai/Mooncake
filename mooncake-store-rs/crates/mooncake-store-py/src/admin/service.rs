@@ -881,6 +881,7 @@ pub fn redact_redis_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
@@ -1199,8 +1200,41 @@ mod tests {
         dir: PathBuf,
     }
 
+    struct RedisEnvGuard {
+        username: Option<String>,
+        password: Option<String>,
+    }
+
+    impl RedisEnvGuard {
+        fn clear_auth() -> Self {
+            let guard = Self {
+                username: env::var("MC_REDIS_USERNAME").ok(),
+                password: env::var("MC_REDIS_PASSWORD").ok(),
+            };
+            env::remove_var("MC_REDIS_USERNAME");
+            env::remove_var("MC_REDIS_PASSWORD");
+            guard
+        }
+    }
+
+    impl Drop for RedisEnvGuard {
+        fn drop(&mut self) {
+            if let Some(username) = &self.username {
+                env::set_var("MC_REDIS_USERNAME", username);
+            } else {
+                env::remove_var("MC_REDIS_USERNAME");
+            }
+            if let Some(password) = &self.password {
+                env::set_var("MC_REDIS_PASSWORD", password);
+            } else {
+                env::remove_var("MC_REDIS_PASSWORD");
+            }
+        }
+    }
+
     impl RedisTestServer {
         fn start() -> Option<Self> {
+            let _env_guard = RedisEnvGuard::clear_auth();
             if Command::new("redis-server")
                 .arg("--version")
                 .stdout(Stdio::null())
