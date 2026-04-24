@@ -1,11 +1,12 @@
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
 use crate::redis_backend::{ClientLeaseLiveness, RedisMetadataCleanupReport};
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
-use etcd_client::{Client, Compare, CompareOp, DeleteOptions, GetOptions, Txn, TxnOp};
+use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
@@ -2154,7 +2155,18 @@ impl MetadataBackend for EtcdMetadataBackend {
                 if let Some(object) = next_object.clone() {
                     frontier_objects.push(object);
                 }
-                let frontier_entries = self.frontier_entries_from_objects(&scope.tenant, &frontier_objects);
+                let frontier_entries =
+                    self.frontier_entries_from_objects(&scope.tenant, &frontier_objects);
+                let next_frontier_keys = frontier_entries
+                    .iter()
+                    .map(|(frontier_key, _)| frontier_key.clone())
+                    .collect::<BTreeSet<_>>();
+                let stale_frontier_keys = frontier_response
+                    .kvs()
+                    .iter()
+                    .filter_map(|kv| String::from_utf8(kv.key().to_vec()).ok())
+                    .filter(|frontier_key| !next_frontier_keys.contains(frontier_key))
+                    .collect::<Vec<_>>();
 
                 let quota_payload = serde_json::to_string(&quota).map_err(json_error)?;
                 let reservation_payload =
@@ -2183,7 +2195,6 @@ impl MetadataBackend for EtcdMetadataBackend {
                 let mut ops = vec![
                     TxnOp::put(quota_key.clone(), quota_payload, None),
                     TxnOp::put(reservation_key.clone(), reservation_payload, None),
-                    TxnOp::delete(frontier_prefix.clone(), Some(DeleteOptions::new().with_prefix())),
                 ];
                 match next_object.as_ref() {
                     Some(object) => ops.push(TxnOp::put(
@@ -2192,6 +2203,9 @@ impl MetadataBackend for EtcdMetadataBackend {
                         None,
                     )),
                     None => ops.push(TxnOp::delete(object_key.clone(), None)),
+                }
+                for frontier_key in stale_frontier_keys {
+                    ops.push(TxnOp::delete(frontier_key, None));
                 }
                 for (frontier_key, object_key) in frontier_entries {
                     ops.push(TxnOp::put(frontier_key, object_key, None));
