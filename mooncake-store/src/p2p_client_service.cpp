@@ -526,55 +526,14 @@ std::string P2PClientService::GetHealthStatus() const {
 tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
                                                     std::vector<Slice>& slices,
                                                     const WriteConfig& config) {
-    ErrorCode result = ErrorCode::OK;
-    ScopedVLogTimer timer(1, "P2PClientService::Put");
-    timer.LogRequest("key=", key, "slice_count=", slices.size());
-
-    Stopwatch stopwatch;
-    if (metrics_) {
-        metrics_->local_put_requests.inc();
+    std::vector<std::vector<Slice>> batched_slices{std::move(slices)};
+    auto result = BatchPut({key}, batched_slices, config);
+    if (result.empty()) {
+        LOG(ERROR) << "BatchPut returned empty result for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
-    auto guard = AcquireInflightGuard();
-    const auto* route_config = std::get_if<WriteRouteRequestConfig>(&config);
-    if (!guard.is_valid()) {
-        LOG(ERROR) << "client is shutting down";
-        result = ErrorCode::SHUTTING_DOWN;
-    } else if (!route_config) {
-        LOG(ERROR) << "P2PClientService currently only supports "
-                      "WriteRouteRequestConfig";
-        result = ErrorCode::INVALID_PARAMS;
-    } else {
-        auto task_handle_ptr = CreatePutHandle(key, slices, *route_config);
-        if (!task_handle_ptr) {
-            LOG(ERROR) << "Failed to create put handle for key: " << key
-                       << ", error: " << task_handle_ptr.error();
-            result = task_handle_ptr.error();
-        } else if (!task_handle_ptr.value()) {
-            LOG(ERROR) << "put task handle is null for key: " << key;
-            result = ErrorCode::INTERNAL_ERROR;
-        } else {
-            auto wait_result = task_handle_ptr.value()->Wait();
-            if (!wait_result) {
-                LOG(ERROR) << "Failed to put key: " << key
-                           << ", error: " << wait_result.error();
-                result = wait_result.error();
-            }
-        }
-    }
-
-    if (metrics_) {
-        metrics_->local_put_latency.observe(stopwatch.elapsed_us());
-        if (result == ErrorCode::OK) {
-            metrics_->local_put_bytes.inc(
-                ClientService::CalculateSliceSize(slices));
-        } else {
-            metrics_->local_put_failures.inc();
-        }
-    }
-    timer.LogResponse("error_code=", result);
-    return result == ErrorCode::OK ? tl::expected<void, ErrorCode>{}
-                                   : tl::unexpected(result);
+    slices = std::move(batched_slices[0]);  // restore original slices
+    return result[0];
 }
 
 std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
@@ -625,7 +584,10 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         if (failure_count > 0) {
             metrics_->local_put_failures.inc(failure_count);
         }
-        metrics_->local_put_latency.observe(stopwatch.elapsed_us());
+        const auto elapsed = stopwatch.elapsed_us();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            metrics_->local_put_latency.observe(elapsed);
+        }
     }
 
     timer.LogResponse("success=", success_count,
@@ -1019,7 +981,10 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
         if (failure_count > 0) {
             metrics_->local_get_failures.inc(failure_count);
         }
-        metrics_->local_get_latency.observe(stopwatch.elapsed_us());
+        const auto elapsed = stopwatch.elapsed_us();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            metrics_->local_get_latency.observe(elapsed);
+        }
     }
 
     timer.LogResponse("success=", success_count,
