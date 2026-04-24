@@ -218,6 +218,45 @@ Semantics:
 - `reset_counters()` zeros call counts but preserves injection state;
   `reset_all()` clears everything back to default.
 
+## Route Migration Coverage
+
+Route-migration verification is split across three layers so that runtime,
+control-plane, and operator regressions are caught at the narrowest possible
+scope first.
+
+### Unit and in-process integration
+
+- `crates/mooncake-store-client/src/client/tests/route_migration_tests.rs`
+  covers explicit `copy` / `move` route transitions, CAS conflict handling,
+  worker-failure recovery, and the main control-plane request / reply contracts.
+- `crates/mooncake-store-client/src/control_plane/tests.rs`
+  covers migration RPC validation and client-side decoding failures.
+- `crates/mooncake-store-py/src/admin/*.rs`
+  keeps admin HTTP / queue / CLI behaviour under in-process tests.
+
+### Scripted E2E
+
+Use [scripts/e2e/run-route-migration-e2e.sh](../scripts/e2e/run-route-migration-e2e.sh)
+when the host already has a usable `cargo`, Python, Redis, and upstream build
+environment.
+
+Supported scenarios:
+
+- `move`
+- `copy`
+- `copy-multi`
+
+Important knobs:
+
+- `MC_STORE_RS_ROUTE_MIGRATION_SUBMITTER=http|cli`
+- `MC_STORE_RS_ROUTE_MIGRATION_SEQUENCE=copy-then-move|move-then-copy`
+- `MC_STORE_RS_ROUTE_MIGRATION_REPEAT=<n>`
+- `MC_STORE_RS_ROUTE_MIGRATION_KILL_EXECUTOR_AT=dispatching|running`
+
+This script is the canonical black-box entry point for route-migration E2E in
+this repository. It validates the full operator path: admin server, executor
+selection, control-plane RPC, route publication, and post-migration readback.
+
 ### Dual-node fault-injection topology
 
 Transport faults only affect the remote path (`open_segment` + `submit`).
