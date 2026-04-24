@@ -62,20 +62,6 @@ enum Command {
     },
 }
 
-#[derive(ClapArgs, Clone, Debug)]
-struct ServerArgs {
-    #[arg(long, default_value = "127.0.0.1:0")]
-    bind_addr: String,
-    #[arg(long, default_value_t = 5_000)]
-    cleanup_interval_ms: u64,
-    #[arg(long, default_value_t = 128)]
-    cleanup_batch_size: usize,
-    #[arg(long, default_value_t = 0)]
-    quota_reconcile_interval_ms: u64,
-    #[arg(long = "quota-reconcile-tenant")]
-    quota_reconcile_tenants: Vec<String>,
-}
-
 #[derive(Subcommand, Debug)]
 enum PolicyCommand {
     Get {
@@ -325,91 +311,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             run_quota_command(&service, &args, command)
         }
     }
-}
-
-fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<dyn Error>> {
-    let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
-    let maintenance_shutdown = Arc::new(AtomicBool::new(false));
-    let quota_thread =
-        spawn_quota_reconcile_worker(service.clone(), server_args, maintenance_shutdown.clone());
-    let mut server = AdminHttpServerHandle::start(&server_args.bind_addr, service)?;
-    info!(address = %server.address(), "admin http server listening");
-
-    let (shutdown_tx, shutdown_rx) = mpsc::channel();
-    ctrlc::set_handler(move || {
-        let _ = shutdown_tx.send(());
-    })?;
-    let _ = shutdown_rx.recv();
-
-    maintenance_shutdown.store(true, Ordering::Relaxed);
-    server.shutdown()?;
-    if let Some(thread) = quota_thread {
-        thread
-            .join()
-            .map_err(|_| std::io::Error::other("admin quota reconcile worker panicked"))?;
-    }
-    Ok(())
-}
-
-fn spawn_quota_reconcile_worker(
-    service: AdminService,
-    server_args: &ServerArgs,
-    shutdown: Arc<AtomicBool>,
-) -> Option<JoinHandle<()>> {
-    if server_args.quota_reconcile_interval_ms == 0 {
-        info!("admin tenant quota reconcile disabled");
-        return None;
-    }
-    if server_args.quota_reconcile_tenants.is_empty() {
-        info!("admin tenant quota reconcile disabled because no tenants were configured");
-        return None;
-    }
-    let interval = Duration::from_millis(server_args.quota_reconcile_interval_ms);
-    let tenants = server_args.quota_reconcile_tenants.clone();
-    Some(
-        thread::Builder::new()
-            .name("mooncake-store-admin-quota-reconcile".to_string())
-            .spawn(move || run_quota_reconcile_loop(service, interval, tenants, shutdown))
-            .expect("admin quota reconcile worker thread should spawn"),
-    )
-}
-
-fn run_quota_reconcile_loop(
-    service: AdminService,
-    interval: Duration,
-    tenants: Vec<String>,
-    shutdown: Arc<AtomicBool>,
-) {
-    info!(
-        interval_ms = interval.as_millis() as u64,
-        tenants = %tenants.join(","),
-        "admin tenant quota reconcile worker started"
-    );
-    while !shutdown.load(Ordering::Relaxed) {
-        for tenant in &tenants {
-            match service.reconcile_tenant_quota_reservations(tenant, None, None, false) {
-                Ok(report) => {
-                    if report.inspected > 0
-                        && (report.finalized > 0 || report.aborted > 0 || report.skipped > 0)
-                    {
-                        info!(
-                            tenant,
-                            inspected = report.inspected,
-                            finalized = report.finalized,
-                            aborted = report.aborted,
-                            skipped = report.skipped,
-                            "admin tenant quota reconcile batch finished"
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(tenant, error = %error, "admin tenant quota reconcile batch failed");
-                }
-            }
-        }
-        thread::sleep(interval);
-    }
-    info!("admin tenant quota reconcile worker stopped");
 }
 
 fn run_migrate_command(args: &Args, command: &MigrateCommand) -> Result<(), Box<dyn Error>> {
