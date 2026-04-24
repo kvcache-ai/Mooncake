@@ -43,10 +43,13 @@ impl StoreClient {
         if refresh_tenants.is_empty() {
             return Ok(resolved);
         }
+        let scopes = refresh_tenants
+            .iter()
+            .map(|tenant| TenantPolicyScope::new(tenant.as_str(), None::<String>, None::<String>))
+            .collect::<Vec<_>>();
+        let policies = self.metadata.get_tenant_policies(&scopes)?;
         let mut cache = self.live_client_cache.lock();
-        for tenant in refresh_tenants {
-            let scope = TenantPolicyScope::new(tenant.as_str(), None::<String>, None::<String>);
-            let policy = self.metadata.get_tenant_policy(&scope)?;
+        for (tenant, policy) in refresh_tenants.into_iter().zip(policies.into_iter()) {
             let version = policy.as_ref().map(|policy| policy.version);
             let quota = policy.and_then(|policy| policy.spec.quota);
             cache.store_tenant_quota_policy(tenant.clone(), version, quota.clone(), now);

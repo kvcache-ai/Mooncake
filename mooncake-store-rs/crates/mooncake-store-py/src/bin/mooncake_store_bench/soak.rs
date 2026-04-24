@@ -114,7 +114,7 @@ pub fn run_soak(
             }
         }
 
-        if iteration % HEARTBEAT_EVERY == 0 {
+        if iteration.is_multiple_of(HEARTBEAT_EVERY) {
             let expires_at = now_ms().saturating_add(LEASE_MS);
             let _ = cluster.writers[0].runtime.client.heartbeat(expires_at);
             let _ = cluster.readers[0].runtime.client.heartbeat(expires_at);
