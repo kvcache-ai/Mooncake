@@ -83,15 +83,6 @@ impl NoHotPathMetadataBackend {
             deny_segment_list: false,
         }
     }
-
-    fn with_metadata_lists_blocked(inner: Arc<InMemoryMetadataBackend>) -> Self {
-        Self {
-            inner,
-            deny_tenant_policy_list: false,
-            deny_live_client_list: true,
-            deny_segment_list: true,
-        }
-    }
 }
 
 impl HotPathBlockedMetadataBackend {
@@ -8497,9 +8488,7 @@ fn builder_allows_takeover_of_unreachable_duplicate_runtime() {
 
 #[test]
 fn builder_auto_allocates_higher_epoch_when_newer_runtime_is_reachable() {
-    let metadata = Arc::new(NoHotPathMetadataBackend::with_metadata_lists_blocked(
-        Arc::new(InMemoryMetadataBackend::new()),
-    ));
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
     let newer = StoreClientBuilder::new(metadata.clone(), "epoch-fence")
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7105")
@@ -8519,9 +8508,7 @@ fn builder_auto_allocates_higher_epoch_when_newer_runtime_is_reachable() {
 
 #[test]
 fn builder_rejects_live_segment_name_reuse_across_runtimes() {
-    let metadata = Arc::new(NoHotPathMetadataBackend::with_metadata_lists_blocked(
-        Arc::new(InMemoryMetadataBackend::new()),
-    ));
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
     let _owner = StoreClientBuilder::new(metadata.clone(), "segment-owner-a")
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7107")
@@ -8555,7 +8542,7 @@ fn builder_ignores_stale_segment_owner_index_without_live_lease() {
         .update_client_state(owner.runtime_id(), ClientLifecycleState::Draining)
         .expect("owner should be marked non-active");
 
-    let metadata = Arc::new(NoHotPathMetadataBackend::with_metadata_lists_blocked(inner));
+    let metadata = inner;
     let _replacement = StoreClientBuilder::new(metadata, "replacement-owner")
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7111")
