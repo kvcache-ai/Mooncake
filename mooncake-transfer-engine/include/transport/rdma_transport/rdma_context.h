@@ -107,9 +107,14 @@ class RdmaContext {
     // load while evictions/deletions continue). See issue #1845.
     void reclaimEndpoints();
 
-    // Raw accessor for the endpoint cache. Null before construct() runs.
-    // Used by integration tests that need to observe waiting_list_ directly.
-    EndpointStore *endpointStore() const { return endpoint_store_.get(); }
+    // Number of endpoints awaiting reclaim. For tests and operator
+    // observability.
+    size_t waitingListSize() const;
+
+    // Test-only: push a pre-constructed endpoint into the store's
+    // waiting_list_ so the reclaim path can be exercised without standing up
+    // a real RDMA QP.
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep);
 
     int disconnectAllEndpoints();
 

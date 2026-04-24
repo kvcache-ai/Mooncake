@@ -101,22 +101,16 @@ TEST(EndpointStoreIntegration, MonitorWorkerTickDrainsWaitingList) {
                                 /*max_endpoints=*/4);
     ASSERT_EQ(rc, 0) << "RdmaContext::construct failed on device " << device;
 
-    auto *raw_store = context->endpointStore();
-    ASSERT_NE(raw_store, nullptr);
-    auto *sieve = dynamic_cast<SIEVEEndpointStore *>(raw_store);
-    ASSERT_NE(sieve, nullptr) << "default endpoint store should be SIEVE; "
-                                 "integration test assumes it";
-
-    sieve->testOnlyInsertWaiting(makeQuiescentEndpoint(*context));
-    sieve->testOnlyInsertWaiting(makeQuiescentEndpoint(*context));
-    sieve->testOnlyInsertWaiting(makeQuiescentEndpoint(*context));
-    ASSERT_EQ(sieve->waitingListSize(), 3u);
+    context->testOnlyInsertWaiting(makeQuiescentEndpoint(*context));
+    context->testOnlyInsertWaiting(makeQuiescentEndpoint(*context));
+    context->testOnlyInsertWaiting(makeQuiescentEndpoint(*context));
+    ASSERT_EQ(context->waitingListSize(), 3u);
 
     // monitorWorker's reclaim tick fires every ~1 s. Give it enough margin
     // for scheduling jitter but keep the test fast.
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
-    EXPECT_EQ(sieve->waitingListSize(), 0u)
+    EXPECT_EQ(context->waitingListSize(), 0u)
         << "monitorWorker must call reclaimEndpoints within ~1 s. If this "
            "fails, either the periodic tick in worker_pool.cpp was removed or "
            "reclaim is failing on quiescent entries.";

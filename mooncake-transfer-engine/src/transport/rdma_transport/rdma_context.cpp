@@ -367,6 +367,14 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
 
 void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
 
+size_t RdmaContext::waitingListSize() const {
+    return endpoint_store_->waitingListSize();
+}
+
+void RdmaContext::testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) {
+    endpoint_store_->testOnlyInsertWaiting(std::move(ep));
+}
+
 size_t RdmaContext::getTotalQPNumber() const {
     return endpoint_store_->getTotalQPNumber();
 }

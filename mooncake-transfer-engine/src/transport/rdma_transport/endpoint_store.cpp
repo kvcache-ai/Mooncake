@@ -127,6 +127,13 @@ size_t FIFOEndpointStore::getTotalQPNumber() {
     return total_qps;
 }
 
+void FIFOEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(ep);
+    waiting_list_len_++;
+}
+
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
     const std::string &peer_nic_path) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
