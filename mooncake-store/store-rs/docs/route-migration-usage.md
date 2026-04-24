@@ -1,102 +1,168 @@
-# Route Migration 使用手册
+# Route Migration Guide
 
-最后更新：2026-04-23
+Last updated: 2026-04-23
 
-本文只说明 `route migration` 这个特性的使用方式：它能做什么、需要哪些前置条件、如何启动服务、如何通过 HTTP 或 CLI 提交任务，以及如何查询任务结果。
+This guide is for operators and control-plane callers that need to submit
+explicit key-level route migration tasks in `mooncake-pro`.
 
-## 1. 能力概览
+## 1. Capability Summary
 
-当前显式 route migration 提供两类任务：
+The current implementation exposes two explicit route-migration task types.
 
 - `copy`
-  - 显式指定 `source_segment`
-  - 显式指定一个或多个 `target_segment`
-  - 成功后保留 source replica，并把目标 replica 加入 authoritative route
+  - requires an explicit `source_segment`
+  - accepts one or more explicit `target_segments`
+  - keeps the source replica and appends the target replica set to the
+    authoritative route
 - `move`
-  - 显式指定 `source_segment`
-  - 当前只支持一个 `target_segment`
-  - 成功后 authoritative route 去掉 source replica，只保留目标 replica
+  - requires an explicit `source_segment`
+  - currently accepts exactly one `target_segment`
+  - removes the source replica from the authoritative route after the target
+    replica is committed
 
-当前约束：
+Shared constraints:
 
-- 迁移粒度是 `tenant/domain/object_set/key`
-- durable truth 是 object route，不是 admin task record
-- admin task queue 只存在于 `mooncake-store-admin-server` 进程内存里
-- `copy` 支持多目标，当前采用 `all-or-nothing`
-- `task_executor` 必须显式指定
+- the migration granularity is `tenant/domain/object_set/key`
+- the durable truth remains the object route, not the admin task record
+- the admin task queue exists only in the memory of `mooncake-store-admin server`
+- multi-target `copy` currently uses all-or-nothing semantics
+- `task_executor` must be explicitly selected
 
-## 2. 前置条件
+## 2. Operator Surfaces
 
-使用 route migration 前，需要准备：
+The current product surface exposes two operator entry points:
 
-- 一个可用的 metadata backend
-- 至少一个 source store runtime 和一个 target store runtime
-- 一个常驻的 `mooncake-store-admin-server`
-- 一个能访问 admin server 的调用方：HTTP client 或 `mooncake-store-admin --admin-url ...`
+1. admin HTTP API
+2. `mooncake-store-admin --admin-url ...` CLI
 
-运行时要求：
+There is currently no dedicated Python route-migration API.
 
-- source segment 必须存在于当前 authoritative route 中
-- `move` 当前必须且只能有一个 target segment
-- `copy` 至少需要一个 target segment
-- `task_executor` 必须对应一个当前可用的 runtime stable id
+### 2.1 HTTP API
 
-## 3. 对外接口
-
-### 3.1 HTTP API
-
-由常驻的 `mooncake-store-admin-server` 暴露：
+The long-lived `mooncake-store-admin server` exposes:
 
 - `POST /v1/route-migrations/copy`
 - `POST /v1/route-migrations/move`
 - `GET /v1/route-migrations`
 - `GET /v1/route-migrations/<task_id>`
 
-语义：
+Implementation entry points:
 
-- `POST /copy` 提交 `copy` 任务
-- `POST /move` 提交 `move` 任务
-- `GET list` 查询当前 admin 进程内存里的任务列表
-- `GET <task_id>` 查询单个任务状态
+- [http.rs](../crates/mooncake-store-py/src/admin/http.rs)
+- [service.rs](../crates/mooncake-store-py/src/admin/service.rs)
 
-### 3.2 CLI
+### 2.2 CLI
 
-`mooncake-store-admin` 是 admin HTTP 的 operator client，本身不持有任务队列。
+`mooncake-store-admin` is an operator client for the admin HTTP surface. It does
+not own a private task queue.
 
-当前支持：
+Current commands:
 
 - `mooncake-store-admin ... migrate copy`
 - `mooncake-store-admin ... migrate move`
 - `mooncake-store-admin ... migrate task list`
 - `mooncake-store-admin ... migrate task get`
 
-关键约束：
+Implementation entry point:
 
-- `migrate` 命令必须显式传 `--admin-url`
-- CLI 不会自起一个私有 in-process task queue
-- route migration 是异步任务，不是同步 CLI 子过程
-- submit body 只接受文档列出的字段；未知字段会返回 `400`
+- [mooncake-store-admin.rs](../crates/mooncake-store-py/src/bin/mooncake-store-admin.rs)
 
-## 4. 启动 admin server
+Key constraints:
 
-示例：
+- `migrate` commands must pass `--admin-url`
+- the CLI does not start an in-process task queue
+- route migration is asynchronous; it is not a synchronous CLI subcommand
+- submit request bodies accept only the documented fields; legacy `mode` or
+  other unknown fields return `400`
+
+## 3. Execution Flow and Responsibility Boundaries
+
+The current end-to-end flow is:
+
+1. the caller submits a task through admin HTTP or through
+   `mooncake-store-admin --admin-url ...`
+2. `mooncake-store-admin server` stores the task in an in-memory queue
+3. admin resolves the live lease for the selected `task_executor`
+4. admin submits `SubmitMigrationTask` through control-plane RPC to the chosen
+   executor runtime
+5. the executor runtime receives the task in `LocalMigrationAdapter`
+6. the executor runtime reuses `execute_explicit_route_migration(...)`
+7. the executor writes the target replica set and CAS-publishes the new route
+8. admin polls `GetMigrationExecutionStatus`; if executor status is lost, admin
+   falls back to authoritative route visibility
+
+Key implementation locations:
+
+- admin scheduling and retry:
+  - [service.rs](../crates/mooncake-store-py/src/admin/service.rs)
+- control-plane migration service:
+  - [control_plane/mod.rs](../crates/mooncake-store-client/src/control_plane/mod.rs)
+  - [server.rs](../crates/mooncake-store-client/src/control_plane/server.rs)
+  - [client.rs](../crates/mooncake-store-client/src/control_plane/client.rs)
+- executor-side worker:
+  - [state_adapters.rs](../crates/mooncake-store-client/src/client/state_adapters.rs)
+- migration execution kernel:
+  - [runtime_io.rs](../crates/mooncake-store-client/src/client/runtime_io.rs)
+
+## 4. What `task_executor` Means
+
+`task_executor` is not a temporary thread and it is not the admin process.
+
+It means:
+
+- which stable runtime is responsible for executing the migration task
+
+Current executor-side implementation:
+
+- each runtime can host a long-lived `LocalMigrationAdapter`
+- the adapter owns a long-lived worker thread
+- each task is queued to that worker instead of spawning a one-off execution
+  thread
+
+The current model is therefore “select a runtime and let its background worker
+execute the task”, not “one task equals one thread”.
+
+## 5. Recommended Usage
+
+### 5.1 Operator or Script Usage
+
+Prefer the CLI for manual operations or lightweight scripts:
 
 ```bash
-cargo run -p mooncake-store-py --bin mooncake-store-admin-server -- \
+mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
-  --keyspace mc/store-rs/demo \
-  --bind-addr 127.0.0.1:18080
+  --admin-url http://127.0.0.1:18080 \
+  migrate copy \
+  --authority source-store \
+  --tenant tenant-a \
+  --domain domain-a \
+  --object-set set-a \
+  --key object-a \
+  --source-segment source-segment \
+  --target-segment target-segment-a \
+  --target-segment target-segment-b \
+  --task-executor executor-store \
+  --max-retries 5
 ```
 
-说明：
+Query tasks:
 
-- route migration task queue 只存在于 `mooncake-store-admin-server` 进程内存中
-- admin server 重启后，未完成任务不会恢复
-- authoritative durable state 仍然是 object route
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  --admin-url http://127.0.0.1:18080 \
+  migrate task list
 
-## 5. 提交任务
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  --admin-url http://127.0.0.1:18080 \
+  migrate task get \
+  --task-id route-migration-1
+```
 
-### 5.1 HTTP `copy`
+### 5.2 Programmatic Controller Usage
+
+Prefer direct admin HTTP calls from an operator/controller:
 
 ```bash
 curl -X POST http://127.0.0.1:18080/v1/route-migrations/copy \
@@ -114,118 +180,59 @@ curl -X POST http://127.0.0.1:18080/v1/route-migrations/copy \
   }'
 ```
 
-### 5.2 HTTP `move`
-
-```bash
-curl -X POST http://127.0.0.1:18080/v1/route-migrations/move \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "authority": "source-store",
-    "tenant": "tenant-a",
-    "domain": "domain-a",
-    "object_set": "set-a",
-    "key": "object-a",
-    "source_segment": "source-segment",
-    "target_segments": ["target-a"],
-    "task_executor": "executor-store",
-    "max_retries": 5
-  }'
-```
-
-### 5.3 CLI `copy`
-
-```bash
-mooncake-store-admin \
-  --metadata-url redis://127.0.0.1:6380/0 \
-  --admin-url http://127.0.0.1:18080 \
-  migrate copy \
-  --authority source-store \
-  --tenant tenant-a \
-  --domain domain-a \
-  --object-set set-a \
-  --key object-a \
-  --source-segment source-segment \
-  --target-segment target-a \
-  --target-segment target-b \
-  --task-executor executor-store \
-  --max-retries 5
-```
-
-### 5.4 CLI `move`
-
-```bash
-mooncake-store-admin \
-  --metadata-url redis://127.0.0.1:6380/0 \
-  --admin-url http://127.0.0.1:18080 \
-  migrate move \
-  --authority source-store \
-  --tenant tenant-a \
-  --domain domain-a \
-  --object-set set-a \
-  --key object-a \
-  --source-segment source-segment \
-  --target-segment target-a \
-  --task-executor executor-store \
-  --max-retries 5
-```
-
-## 6. 查询任务
-
-HTTP：
+Query tasks:
 
 ```bash
 curl http://127.0.0.1:18080/v1/route-migrations
 curl http://127.0.0.1:18080/v1/route-migrations/<task_id>
 ```
 
-CLI：
+## 6. Request Fields
 
-```bash
-mooncake-store-admin \
-  --metadata-url redis://127.0.0.1:6380/0 \
-  --admin-url http://127.0.0.1:18080 \
-  migrate task list
-
-mooncake-store-admin \
-  --metadata-url redis://127.0.0.1:6380/0 \
-  --admin-url http://127.0.0.1:18080 \
-  migrate task get \
-  --task-id route-migration-1
-```
-
-## 7. 请求字段说明
-
-任务提交请求包含这些字段：
+The current request surface uses these key fields:
 
 - `authority`
   - route authority stable id
 - `tenant`
-  - 必填
+  - required
 - `domain`
-  - 可选，默认 domain
+  - optional, defaults to the default domain
 - `object_set`
-  - 可选，默认 object_set
+  - optional, defaults to the default object set
 - `key`
-  - 逻辑对象 key
+  - logical object key
 - `source_segment`
-  - source replica 所在 segment
+  - segment that currently hosts the source replica
 - `target_segments`
-  - target segment 列表
+  - explicit target segment list
 - `task_executor`
-  - 执行任务的 runtime stable id
+  - stable id of the runtime that executes the task
 - `max_retries`
-  - admin 侧最大重试次数，默认 `5`
+  - admin-side retry budget override; default is `5`
 
-约束：
+Constraints:
 
-- `copy` 至少需要一个 target
-- `move` 当前必须且只能有一个 target
-- `task_executor` 不能为空
-- 提交请求不再接受 `mode` 字段；`copy` / `move` 语义由 path 决定
+- `copy` requires at least one target
+- `move` currently requires exactly one target
+- `task_executor` must not be empty
+- the admin queue is not persisted; queued tasks are lost if the admin server
+  restarts
 
-## 8. 状态与重试语义
+## 7. Failure and Retry Semantics
 
-当前 task state：
+Retry is owned by the admin server, not by the CLI.
+
+Current semantics:
+
+- while admin is alive, it automatically retries executor loss and transient RPC
+  failures
+- the default retry budget is `5`
+- if executor status is lost but the authoritative route already shows the task
+  is complete, admin marks the task as `succeeded`
+- if the admin process restarts, the in-memory queue is lost; the durable truth
+  remains the route
+
+Task states currently exposed to callers:
 
 - `pending`
 - `dispatching`
@@ -235,23 +242,23 @@ mooncake-store-admin \
 - `failed`
 - `cancelled`
 
-当前 retry 语义：
+## 8. Scope Boundaries
 
-- admin 活着时，会对 executor 丢失或瞬时 RPC 失败做自动重试
-- 默认重试预算 `5`
-- 如果 executor 状态丢失，但 authoritative route 已显示任务完成，admin 会直接把任务标记为 `succeeded`
-- 如果 admin 重启，内存队列丢失；durable truth 仍然是 route
+What this feature is:
 
-## 9. 使用建议
+- an explicit operator/control-plane migration surface
+- a task-based way to pre-place or rebalance selected keys
+- a route-authoritative migration mechanism
 
-建议的调用方式：
+What this feature is not:
 
-- 运维脚本或人工操作：优先使用 `mooncake-store-admin --admin-url ...`
-- 程序化控制器：优先直接调 admin HTTP
-- 将 route migration 视为独立的 operator / control-plane 能力，不要把它混到正常数据面读写调用里
+- not a full-segment migration API
+- not a durable scheduler that survives admin restart
+- not a replacement for the normal `put/get/remove` data plane
 
-## 10. 相关文档
+## 9. Related Docs
 
-- [features.md](./features.md)
-- [python.md](./python.md)
-- [configuration.md](./configuration.md)
+- [Python Guide](./python.md)
+- [Features](./features.md)
+- [Configuration Reference](./configuration.md)
+- [Architecture](./architecture.md)
