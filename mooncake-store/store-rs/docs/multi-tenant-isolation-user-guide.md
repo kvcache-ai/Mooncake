@@ -27,6 +27,8 @@ Current scope model:
 - tenant + domain
 - tenant + domain + object_set
 
+Object identity is deterministic across that scope model: the default namespace keeps the legacy route key shape `tenant::logical_key`, while non-default `domain` / `object_set` scopes use a full-scope route key so the same tenant can store the same logical key in different scopes without collision.
+
 In Phase 1 strict quota rollout, mutable quota state is still tenant-root metadata. Nested selectors remain useful for object-accounting lookups and for future policy expansion.
 
 ## Recommended Control-Plane Model
@@ -100,6 +102,8 @@ mooncake-store-admin \
   policy get \
   --tenant tenant-a
 ```
+
+`policy list --tenant <tenant>` pushes the tenant filter into metadata backends, so Redis and etcd only read the tenant-root policy plus that tenant's nested policy subtree instead of listing every tenant policy and filtering in process.
 
 Use `--keyspace <prefix>` when the deployment keeps multiple environments or tenants in separate metadata namespaces.
 
@@ -252,6 +256,7 @@ Interpretation notes:
 
 - `quota state` and `quota reservations` reflect authoritative metadata state, not best-effort local counters
 - `quota object` is the fastest way to inspect one logical object's committed accounting record
+- when inspecting non-default `domain` / `object_set` scopes, admin uses the same deterministic full-scope object key as request serving; it does not probe legacy keys as a fallback
 - in the current strict-quota rollout, quota state and reservations collapse to the tenant-root scope
 
 ## 4. Run explicit repair when needed

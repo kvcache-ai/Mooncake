@@ -104,7 +104,9 @@ The core design in this document is now substantially implemented:
 
 - unified tenant policy is stored in metadata
 - `mooncake-store-admin` is the preferred tenant policy entrypoint
+- `policy list --tenant <tenant>` is pushed down to metadata backends instead of scanning every tenant policy in process
 - Store-RS runtime consumes and enforces tenant-scoped routing/quota/fairness/shaping/placement defaults
+- non-default object scopes use deterministic full-scope route keys, while the default namespace keeps the legacy `tenant::logical_key` route key
 
 The remaining follow-up work is compatibility cleanup: legacy runtime-local builder / Python / CLI / env knobs are still accepted as compatibility fallbacks, but should no longer be presented as the preferred policy authoring surface.
 
@@ -258,14 +260,15 @@ This matches the existing namespace identity model and avoids inventing a second
 
 ### Storage backend abstraction
 
-Add new trait methods under metadata, for example:
+Implemented metadata trait methods include:
 
 - `get_tenant_policy(scope)`
-- `list_tenant_policies(prefix_scope)`
-- `upsert_tenant_policy(policy, expected_version)`
+- `get_tenant_policies(scopes)` for exact batched policy reads
+- `list_tenant_policies(tenant)` for optional tenant-filtered admin listing
+- `put_tenant_policy(policy, expected_version)`
 - `delete_tenant_policy(scope, expected_version)`
 
-The exact trait names can vary, but the important point is that this is a **metadata concern**, not a control-plane hot-path concern.
+Tenant-filtered listing is a backend concern: Redis and etcd narrow the read to the tenant-root policy and that tenant's nested subtree instead of scanning all tenant policies and filtering in the admin process.
 
 ---
 
@@ -452,7 +455,7 @@ Most specific wins:
 3. tenant
 4. runtime default
 
-This preserves backward compatibility and keeps config layering intuitive.
+This preserves backward compatibility and keeps config layering intuitive. Object route identity follows the same namespace boundary: default-scope routes keep the legacy `tenant::logical_key` key, while non-default scopes include tenant, domain, object_set, and logical_key in the deterministic route key.
 
 ---
 
