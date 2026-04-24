@@ -652,6 +652,49 @@ impl EmbeddedWrhRouteDirectory {
         }
     }
 
+    fn query_authorities_with_merge<Q, L>(
+        &self,
+        observer: &ClientLease,
+        suspect_context: &'static str,
+        mut query: Q,
+        mut log_error: L,
+    ) -> Result<Vec<ObjectRoute>>
+    where
+        Q: FnMut(&ClientLease) -> Result<Vec<ObjectRoute>>,
+        L: FnMut(&ClientLease, &StoreError),
+    {
+        let mut routes = BTreeMap::<String, ObjectRoute>::new();
+        let mut attempted = 0usize;
+        let mut successful_queries = 0usize;
+        let mut last_error = None;
+        for authority in self.authority_candidates(observer)? {
+            attempted = attempted.saturating_add(1);
+            match query(&authority) {
+                Ok(found) => {
+                    successful_queries = successful_queries.saturating_add(1);
+                    for route in found {
+                        Self::merge_route_listing(
+                            &mut routes,
+                            route,
+                            &authority.runtime.to_string(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.maybe_mark_authority_suspect(&authority, &error, suspect_context);
+                    log_error(&authority, &error);
+                    last_error = Some(error);
+                }
+            }
+        }
+        if successful_queries == 0 && attempted > 0 {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+        Ok(routes.into_values().collect())
+    }
+
     fn merge_route_listing(
         routes: &mut BTreeMap<String, ObjectRoute>,
         candidate: ObjectRoute,
@@ -1157,45 +1200,19 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
         owner: &ClientRuntimeId,
     ) -> Result<Vec<ObjectRoute>> {
-        let mut routes = BTreeMap::<String, ObjectRoute>::new();
-        let mut attempted = 0usize;
-        let mut successful_queries = 0usize;
-        let mut last_error = None;
-        for authority in self.authority_candidates(observer)? {
-            attempted = attempted.saturating_add(1);
-            match self.list_routes_by_replica_owner_from_authority(&authority, owner) {
-                Ok(found) => {
-                    successful_queries = successful_queries.saturating_add(1);
-                    for route in found {
-                        Self::merge_route_listing(
-                            &mut routes,
-                            route,
-                            &authority.runtime.to_string(),
-                        );
-                    }
-                }
-                Err(error) => {
-                    self.maybe_mark_authority_suspect(
-                        &authority,
-                        &error,
-                        "route_list_by_replica_owner_failed",
-                    );
-                    warn!(
-                        authority = %authority.runtime,
-                        owner = %owner,
-                        error = %error,
-                        "route-owner listing failed on authority"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-        if successful_queries == 0 && attempted > 0 {
-            if let Some(error) = last_error {
-                return Err(error);
-            }
-        }
-        Ok(routes.into_values().collect())
+        self.query_authorities_with_merge(
+            observer,
+            "route_list_by_replica_owner_failed",
+            |authority| self.list_routes_by_replica_owner_from_authority(authority, owner),
+            |authority, error| {
+                warn!(
+                    authority = %authority.runtime,
+                    owner = %owner,
+                    error = %error,
+                    "route-owner listing failed on authority"
+                );
+            },
+        )
     }
 
     fn list_routes_in_scope(
@@ -1203,47 +1220,21 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
         scope: &NamespaceScope,
     ) -> Result<Vec<ObjectRoute>> {
-        let mut routes = BTreeMap::<String, ObjectRoute>::new();
-        let mut attempted = 0usize;
-        let mut successful_queries = 0usize;
-        let mut last_error = None;
-        for authority in self.authority_candidates(observer)? {
-            attempted = attempted.saturating_add(1);
-            match self.list_routes_in_scope_from_authority(&authority, scope) {
-                Ok(found) => {
-                    successful_queries = successful_queries.saturating_add(1);
-                    for route in found {
-                        Self::merge_route_listing(
-                            &mut routes,
-                            route,
-                            &authority.runtime.to_string(),
-                        );
-                    }
-                }
-                Err(error) => {
-                    self.maybe_mark_authority_suspect(
-                        &authority,
-                        &error,
-                        "route_list_in_scope_failed",
-                    );
-                    warn!(
-                        authority = %authority.runtime,
-                        tenant = %scope.tenant,
-                        domain = %scope.domain,
-                        object_set = %scope.object_set,
-                        error = %error,
-                        "route scope listing failed on authority"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-        if successful_queries == 0 && attempted > 0 {
-            if let Some(error) = last_error {
-                return Err(error);
-            }
-        }
-        Ok(routes.into_values().collect())
+        self.query_authorities_with_merge(
+            observer,
+            "route_list_in_scope_failed",
+            |authority| self.list_routes_in_scope_from_authority(authority, scope),
+            |authority, error| {
+                warn!(
+                    authority = %authority.runtime,
+                    tenant = %scope.tenant,
+                    domain = %scope.domain,
+                    object_set = %scope.object_set,
+                    error = %error,
+                    "route scope listing failed on authority"
+                );
+            },
+        )
     }
 
     fn list_reuse_candidates(
@@ -1251,48 +1242,22 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
         reuse: &ReuseIdentity,
     ) -> Result<Vec<ObjectRoute>> {
-        let mut routes = BTreeMap::<String, ObjectRoute>::new();
-        let mut attempted = 0usize;
-        let mut successful_queries = 0usize;
-        let mut last_error = None;
-        for authority in self.authority_candidates(observer)? {
-            attempted = attempted.saturating_add(1);
-            match self.list_reuse_candidates_from_authority(&authority, reuse) {
-                Ok(found) => {
-                    successful_queries = successful_queries.saturating_add(1);
-                    for route in found {
-                        Self::merge_route_listing(
-                            &mut routes,
-                            route,
-                            &authority.runtime.to_string(),
-                        );
-                    }
-                }
-                Err(error) => {
-                    self.maybe_mark_authority_suspect(
-                        &authority,
-                        &error,
-                        "route_list_reuse_candidates_failed",
-                    );
-                    warn!(
-                        authority = %authority.runtime,
-                        tenant = %reuse.tenant,
-                        domain = %reuse.domain,
-                        sharing_scope = %reuse.sharing_scope,
-                        canonical_key = %reuse.canonical_key,
-                        error = %error,
-                        "route reuse listing failed on authority"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-        if successful_queries == 0 && attempted > 0 {
-            if let Some(error) = last_error {
-                return Err(error);
-            }
-        }
-        Ok(routes.into_values().collect())
+        self.query_authorities_with_merge(
+            observer,
+            "route_list_reuse_candidates_failed",
+            |authority| self.list_reuse_candidates_from_authority(authority, reuse),
+            |authority, error| {
+                warn!(
+                    authority = %authority.runtime,
+                    tenant = %reuse.tenant,
+                    domain = %reuse.domain,
+                    sharing_scope = %reuse.sharing_scope,
+                    canonical_key = %reuse.canonical_key,
+                    error = %error,
+                    "route reuse listing failed on authority"
+                );
+            },
+        )
     }
 }
 
