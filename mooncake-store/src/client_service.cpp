@@ -57,9 +57,7 @@ ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
       metrics_port_(metrics_port),
       enable_metrics_http_(enable_metrics_http) {
     LOG(INFO) << "client_id=" << client_id_;
-    // Note: metrics_ initialization and metrics HTTP server start are now
-    // handled by subclasses to avoid calling pure virtual function in
-    // constructor
+    metrics_port_ = StartMetricsHttpServer(enable_metrics_http_, metrics_port_);
 }
 
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
@@ -621,13 +619,6 @@ uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
     // Check if metrics HTTP is disabled
     if (!enable_metrics_http) {
         LOG(INFO) << "Client metrics HTTP server disabled";
-        return 0;
-    }
-
-    // Check if metrics are enabled
-    ClientMetric* metrics = GetMetrics();
-    if (!metrics) {
-        LOG(INFO) << "Client metrics disabled, skipping HTTP server start";
         return 0;
     }
 

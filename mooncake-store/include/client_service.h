@@ -463,15 +463,6 @@ class ClientService {
                                     uint16_t metrics_port);
 
     /**
-     * @brief Starts the metrics HTTP server using stored configuration.
-     * Convenience method for subclasses to call after metrics_ is initialized.
-     */
-    void StartMetricsHttpServer() {
-        metrics_port_ =
-            StartMetricsHttpServer(enable_metrics_http_, metrics_port_);
-    }
-
-    /**
      * @brief Stops the metrics HTTP server.
      */
     void StopMetricsHttpServer();

@@ -28,10 +28,7 @@ P2PClientService::P2PClientService(
                     enable_metrics_http, labels),
       metrics_(P2PClientMetric::Create(labels)),
       master_client_(client_id_,
-                     metrics_ ? &metrics_->master_client_metric : nullptr) {
-    // Start metrics HTTP server after metrics_ is initialized
-    StartMetricsHttpServer();
-}
+                     metrics_ ? &metrics_->master_client_metric : nullptr) {}
 
 void P2PClientService::Stop() {
     if (!MarkShuttingDown()) {

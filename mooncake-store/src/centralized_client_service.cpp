@@ -28,10 +28,7 @@ CentralizedClientService::CentralizedClientService(
       metrics_(ClientMetric::Create(labels)),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
-      write_thread_pool_(2) {
-    // Start metrics HTTP server after metrics_ is initialized
-    StartMetricsHttpServer();
-}
+      write_thread_pool_(2) {}
 
 CentralizedClientService::~CentralizedClientService() {
     Stop();
