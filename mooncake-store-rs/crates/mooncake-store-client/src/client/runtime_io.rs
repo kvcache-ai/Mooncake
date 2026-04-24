@@ -784,6 +784,7 @@ impl StoreClient {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn explicit_migration_policy(plan: &ExplicitMigrationPlan) -> Result<ReplicationPolicy> {
         if plan.target_segments.is_empty() {
             return Err(StoreError::InvalidState(
