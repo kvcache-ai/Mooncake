@@ -185,7 +185,7 @@ class ConnectionContext {
                std::to_string(rank);
     }
     static std::string getExtensionStateStoreKey(int backendIndex, int rank) {
-        return "extension_sa" + std::to_string(backendIndex) + "_" +
+        return "extension_state_" + std::to_string(backendIndex) + "_" +
                std::to_string(rank);
     }
 

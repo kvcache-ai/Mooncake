@@ -821,9 +821,7 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
     }
 
     // Step 2 -- Stale packet: the slot carries data from a previous epoch
-    // (before a Reset).  Clear it so the fresh invitation can land safely,
-    // but DO NOT advance the consume cursor -- the peer will re-send the
-    // same sequence after the Reset.
+    // (before a Reset).  Clear it so the fresh invitation can land safely.
     const uint32_t current_gen =
         peer_generation_[op_ctx.peer_rank_].load(std::memory_order_acquire);
     if (slot_gen != current_gen) {
@@ -1181,10 +1179,7 @@ bool P2PProxy::pollRecvCompletionSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
         peer_generation_[op_ctx.peer_rank_].load(std::memory_order_acquire);
 
     // Step 2 -- Stale packet: data from a previous epoch (before Reset).
-    // Clear the slot so the fresh completion can land safely.  Do NOT pop
-    // the task, do NOT free the chunk, and do NOT advance
-    // completion_consume_seq_ -- the current task is still waiting for valid
-    // completion.
+    // Clear the slot so the fresh completion can land safely.
     if (slot_gen != current_gen) {
         LOG(WARNING) << "[P2PProxy][Recv] pollRecvCompletionSlot peer="
                      << op_ctx.peer_rank_

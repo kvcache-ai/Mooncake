@@ -20,7 +20,7 @@
 
 namespace mooncake {
 
-// Memory layout of one P2PProxy instance (chunk_size=8MiB, num_chunks=32):
+// Memory layout of one P2PProxy (shown for chunk_size=8MiB, num_chunks=32):
 //
 //   +---------------------------------------------------------+
 //   |  SendPool  (32 x 8 MiB = 256 MiB)                       |
@@ -69,7 +69,7 @@ namespace mooncake {
 //     to the receiver's CompletionLane to acknowledge the transfer.
 //
 // Memory model:
-//   - SendPool / RecvPool are fixed-size chunk pools (8 MiB x 32).
+//   - SendPool / RecvPool are fixed-size chunk pools.
 //   - Control lanes are ring buffers.
 //
 // Per-chunk state machines:
@@ -393,7 +393,7 @@ class P2PProxy {
 
     // Active send operation state.  Tasks are created in order and advance
     // through the sender state machine (kCopyIn -> kWriteRemote -> kCompletion
-    // -> kFinished).  A task is erased only after reaching kFinished.
+    // -> kFinished).
     struct SendOpContext {
         SendOpContext() = default;
         SendOpContext(SendOp&& op_in);
@@ -438,8 +438,7 @@ class P2PProxy {
 
     // Active receive operation state.  Tasks are created in order and
     // advance through the receiver state machine (kAdvertise ->
-    // kWaitCompletion -> kCopyOut -> kFinished).  A task is erased after
-    // reaching kFinished.
+    // kWaitCompletion -> kCopyOut -> kFinished).
     struct RecvOpContext {
         RecvOpContext() = default;
         RecvOpContext(RecvOp&& op_in);
