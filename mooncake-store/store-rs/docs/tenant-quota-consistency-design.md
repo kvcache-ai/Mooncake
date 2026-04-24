@@ -827,6 +827,29 @@ Every reservation/finalize/abort should log:
 - gate behind an opt-in runtime/config flag if needed during bring-up
 - add crash/retry tests
 
+### Current single-object runtime behavior
+
+For positive-delta writes, the current single-object path adds a bounded
+tenant-local recovery step on top of metadata-authoritative
+reserve/finalize/abort semantics:
+
+- quota policy resolves from `LogicalObjectId.scope.tenant`, not only from
+  the writer's default tenant
+- when reservation returns `tenant quota bytes exceeded` or
+  `tenant quota objects exceeded`, runtime may evict one older object from
+  the same tenant and retry
+- recovery is bounded by `MAX_TENANT_LOCAL_EVICTION_ATTEMPTS`
+- victim selection stays tenant-local: skip the object being written,
+  consider only `RouteState::Active`, and order candidates by older version
+  first and then larger committed length
+- if no same-tenant victim can free enough room, the original quota conflict
+  is returned unchanged
+- cross-tenant data is never evicted to satisfy another tenant's write
+
+This keeps strict quota semantics intact: metadata reservation/finalize is
+still authoritative, and self-eviction only frees capacity inside the same
+tenant before the next retry.
+
 ## Phase 3: batch strict quota path
 
 - implement deterministic multi-object reservation flow

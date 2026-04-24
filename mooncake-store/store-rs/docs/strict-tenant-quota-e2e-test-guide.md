@@ -185,7 +185,7 @@ Expected operator interpretation:
 
 If QA needs deeper inspection, they can also confirm the repository already has supporting lower-level tests for strict quota semantics in:
 
-- `crates/mooncake-store-client/src/client/tests.rs`
+- `crates/mooncake-store-client/src/client/tests/mod.rs`
 
 Examples include coverage for:
 
@@ -196,6 +196,22 @@ Examples include coverage for:
 - tenant-local quota eviction observability via `mooncake_store_tenant_local_eviction_total`
 - successful eviction-triggered writes remaining readable while tenant usage stays within quota
 - cross-tenant isolation during tenant-local quota recovery
+
+Focused commands for the tenant-local recovery path:
+
+```bash
+cargo test -p mooncake-store-client \
+  namespace_quota_evicts_within_same_tenant_before_rejecting \
+  -- --nocapture
+
+cargo test -p mooncake-store-client \
+  tenant_local_quota_eviction_does_not_touch_other_tenants \
+  -- --nocapture
+```
+
+If you run the commands inside a container, enter the actual repository root
+first before invoking Cargo; running from the container's default
+`/workspace` directory can target the wrong tree.
 
 Those tests are complementary. The e2e described here is the process-level proof that the Redis-backed runtime path exercises the new logic in a real harness.
 
