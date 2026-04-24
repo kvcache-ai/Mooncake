@@ -9,12 +9,11 @@
 const static std::string GPU_PREFIX = "maca:";
 
 #define CUdevice MCdevice
-#define CUdeviceptr MCdeviceptr
+#define CUdeviceptr mcDeviceptr_t
 #define CUmemorytype MCmemorytype
 #define CUresult mcError_t
 #define cuDeviceGet mcDeviceGet
 #define cuDeviceGetAttribute mcDeviceGetAttribute
-#define cuGetErrorString mcGetErrorString
 #define cuMemAddressFree mcMemAddressFree
 #define cuMemAddressReserve mcMemAddressReserve
 #define cuMemCreate mcMemCreate
@@ -33,6 +32,21 @@ const static std::string GPU_PREFIX = "maca:";
 #define CUDA_SUCCESS mcSuccess
 #define CUDA_ERROR_NOT_PERMITTED mcErrorNotPermitted
 #define CUDA_ERROR_NOT_SUPPORTED mcErrorNotSupported
+
+#define CU_MEMORYTYPE_HOST mcMemoryTypeHost
+#define CU_MEMORYTYPE_DEVICE mcMemoryTypeDevice
+#define CU_POINTER_ATTRIBUTE_MEMORY_TYPE mcPointerAttributeMemoryType
+#define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR mcPointerAttributeRangeStartAddr
+#define CU_POINTER_ATTRIBUTE_RANGE_SIZE mcPointerAttributeRangeSize
+#define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD mcMemHandleTypePosixFileDescriptor
+#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED mcDeviceAttributeHandleTypePosixFileDescriptorSupported
+
+static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
+    if (err_str) {
+        *err_str = mcGetErrorString(error);
+    }
+    return CUDA_SUCCESS;
+}
 
 #define cudaDeviceCanAccessPeer mcDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess mcDeviceEnablePeerAccess

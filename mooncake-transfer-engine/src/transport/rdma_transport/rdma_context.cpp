@@ -225,7 +225,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-#if defined(USE_MLU) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
+#if defined(USE_MLU) || defined(USE_MACA) || \
+    (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
     // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
@@ -239,31 +240,44 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
+        CUdeviceptr allocBase;
+        result = cuPointerGetAttribute(
+            &allocBase, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            const char *errStr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to call cuPointerGetAttribute range start for "
+                       << (uintptr_t)addr << " cuda error=" << errStr;
+            return ERR_CONTEXT;
+        }
+
         size_t allocSize;
         result = cuPointerGetAttribute(
             &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
-            LOG(ERROR) << "Failed to call cuPointerGetAttribute for "
+            LOG(ERROR) << "Failed to call cuPointerGetAttribute range size for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
             return ERR_CONTEXT;
         }
 
         int dmabuf_fd;
         result = cuMemGetHandleForAddressRange(
-            &dmabuf_fd, (CUdeviceptr)addr, allocSize,
+            &dmabuf_fd, allocBase, allocSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
-                       << " cuda error=" << errStr;
+                       << " base=" << (uintptr_t)allocBase
+                       << " size=" << allocSize << " cuda error=" << errStr;
             return ERR_CONTEXT;
         }
         mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
-                                      (uintptr_t)addr, dmabuf_fd, access);
+        mrMeta.mr = ibv_reg_dmabuf_mr(
+            pd_, (uintptr_t)addr - (uintptr_t)allocBase, length,
+            (uintptr_t)addr, dmabuf_fd, access);
     }
 #else
     mrMeta.addr = addr;
@@ -591,7 +605,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             return ERR_CONTEXT;
         }
 
-#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+#if defined(USE_MACA) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
         // Verify dmabuf support which is required if not using nvidia-peermem.
         // Assume device index matches.
         CUdevice cuDevice;
