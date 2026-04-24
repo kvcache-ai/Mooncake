@@ -2146,6 +2146,9 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
 auto MasterService::ReportSsdCapacity(const UUID& client_id,
                                       int64_t ssd_total_capacity_bytes)
     -> tl::expected<void, ErrorCode> {
+    if (ssd_total_capacity_bytes < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     ScopedLocalDiskSegmentAccess local_disk_segment_access =
         segment_manager_.getLocalDiskSegmentAccess();
