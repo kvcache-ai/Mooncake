@@ -179,22 +179,6 @@ End-to-end flows that compose ≥2 real components without mocks.
   registered-buffer `batch_get_into` must issue remote reads directly into
   the destination buffers instead of staging through scratch.
 
-## Route Migration Layered E2E
-
-Route migration is validated in stacked layers so each PR can carry its own
-executable acceptance check.
-
-### Runtime / control-plane layer
-
-Use
-[scripts/tests/route-migration/test-route-migration-runtime-e2e.sh](../scripts/tests/route-migration/test-route-migration-runtime-e2e.sh)
-for the runtime PR layer.
-
-It validates:
-
-- control-plane submit -> executor worker -> explicit move completion
-- worker panic recovery without involving the admin queue
-
 ## Test Infrastructure: `mooncake-store-test-utils`
 
 A `dev-dependencies`-only crate providing the shared primitives that let

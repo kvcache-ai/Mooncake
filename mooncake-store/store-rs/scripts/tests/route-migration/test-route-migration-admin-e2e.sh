@@ -29,6 +29,11 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 mc_scripts_require_command cargo
+mc_scripts_require_command python3
+
+UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
+mc_scripts_setup_upstream_runtime_env "${REPO_ROOT}" python "${UPSTREAM_BUILD_DIR}"
+export PYTHONDONTWRITEBYTECODE=1
 
 cd "${REPO_ROOT}"
 
