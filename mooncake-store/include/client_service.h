@@ -388,6 +388,9 @@ class Client {
         bool enable_offloading,
         std::unordered_map<std::string, int64_t>& offloading_objects);
 
+    tl::expected<void, ErrorCode> ReportSsdCapacity(
+        int64_t ssd_total_capacity_bytes);
+
     /**
      * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
