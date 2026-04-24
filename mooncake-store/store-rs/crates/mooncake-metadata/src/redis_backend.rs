@@ -2131,6 +2131,8 @@ impl MetadataBackend for RedisMetadataBackend {
             ));
             let mut keys = vec![root_key.clone()];
             keys.extend(scan_keys(&mut connection, &format!("{}/*", root_key))?);
+            keys.sort();
+            keys.dedup();
             keys
         } else {
             let prefix = self.keyspace.tenant_policy_prefix(None);
