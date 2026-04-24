@@ -370,19 +370,22 @@ class P2PProxy {
    public:
     friend class P2PDeviceWorker;
 
+    enum class OpStatus : uint8_t { kPending = 0, kSuccess = 1, kFailed = 2 };
+
     struct Options {
         bool is_cpu = false;
         int rank = 0;
         int size = 0;
         int cuda_device_index = -1;
         std::string location;
+        std::chrono::milliseconds transfer_timeout_ms{30000};
     };
 
     struct SendOp {
         at::Tensor tensor_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
-        std::shared_ptr<std::atomic<bool>> completed_;
+        std::shared_ptr<std::atomic<OpStatus>> status_;
     };
 
     struct RecvOp {
@@ -390,7 +393,7 @@ class P2PProxy {
         at::Tensor original_tensor_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
-        std::shared_ptr<std::atomic<bool>> completed_;
+        std::shared_ptr<std::atomic<OpStatus>> status_;
     };
 
     P2PProxy(TransferEngine* engine, const Options& options);
@@ -408,15 +411,6 @@ class P2PProxy {
     void enqueueRecv(RecvOp op);
 
     void resetPeerState(int peer_rank);
-
-    // Generation for fault recovery.  All control slots carry this
-    // value so that stale messages from before a Reset can be detected.
-    uint32_t getGeneration() const {
-        return global_generation_.load(std::memory_order_acquire);
-    }
-    void setGeneration(uint32_t generation) {
-        global_generation_.store(generation, std::memory_order_release);
-    }
 
     /**
      * @brief Waits for all active P2P send and receive tasks to complete.
@@ -438,6 +432,16 @@ class P2PProxy {
      */
     void abandonResources();
 
+    // Generation for fault recovery.  All control slots carry this
+    // value so that stale messages from before a Reset can be detected.
+    uint32_t getGeneration(int peer_rank) const {
+        return peer_generation_[peer_rank].load(std::memory_order_acquire);
+    }
+    void setGeneration(int peer_rank, uint32_t generation) {
+        peer_generation_[peer_rank].store(generation,
+                                          std::memory_order_release);
+    }
+
    private:
     // Sender-side per-chunk state machine.
     enum class SendTaskState {
@@ -447,6 +451,7 @@ class P2PProxy {
         kWriteRemote,  // Write from SendPool -> remote RecvPool.
         kCompletion,   // Writing CompletionSlot back to the receiver.
         kFinished,     // CompletionSlot write done, staging buffer freed.
+        kFailed,       // Transport error or timeout; staging buffer freed.
     };
 
     // Receiver-side per-chunk state machine.
@@ -455,6 +460,7 @@ class P2PProxy {
         kWaitCompletion,  // Waiting for sender's CompletionSlot.
         kCopyOut,         // GPU: cudaMemcpyAsync RecvPool -> tensor in flight.
         kFinished,        // Copy-out done, chunk returned to pool.
+        kFailed,          // Transport error or timeout; chunk returned to pool.
     };
 
     struct SendOpContext;
@@ -480,6 +486,7 @@ class P2PProxy {
         std::optional<BatchID>
             completion_batch_id_;  // CompletionSlot write batch id.
         cudaEvent_t copy_ready_event_ = nullptr;  // Signals Copy-In done (GPU).
+        std::chrono::steady_clock::time_point last_update_time_;
     };
 
     // Active send operation state.  Tasks are created in order and advance
@@ -489,16 +496,19 @@ class P2PProxy {
         SendOpContext() = default;
         SendOpContext(SendOp&& op_in);
 
+        std::deque<SendTransferTask> tasks_;
+        std::shared_ptr<std::atomic<OpStatus>> status_;
+
         at::Tensor tensor_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
-        std::shared_ptr<std::atomic<bool>> completed_;
         uint64_t total_bytes_ = 0;
         // Number of bytes already pulled from the user tensor into SendPool
         // staging buffers.  When bytes_staged_ == total_bytes_ every chunk
         // has at least entered the Copy-In stage.
         uint64_t bytes_staged_ = 0;
-        std::deque<SendTransferTask> tasks_;
+
+        std::chrono::steady_clock::time_point last_update_time_;
     };
 
     // One chunk of a RecvOp.  The receiver allocates a RecvPool chunk,
@@ -521,6 +531,7 @@ class P2PProxy {
             publish_batch_id_;  // PublishSlot RDMA Write batch id.
         cudaEvent_t copy_ready_event_ =
             nullptr;  // Signals Copy-Out done (GPU).
+        std::chrono::steady_clock::time_point last_update_time_;
     };
 
     // Active receive operation state.  Tasks are created in order and
@@ -531,17 +542,18 @@ class P2PProxy {
         RecvOpContext() = default;
         RecvOpContext(RecvOp&& op_in);
 
+        std::deque<RecvTransferTask> tasks_;
+        std::shared_ptr<std::atomic<OpStatus>> status_;
+
         at::Tensor tensor_;
         at::Tensor original_tensor_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
-        std::shared_ptr<std::atomic<bool>> completed_;
         uint64_t total_bytes_ = 0;
         // Number of bytes for which a RecvPool chunk has been reserved and a
         // PublishSlot has been sent to the peer.  When bytes_advertised_ ==
         // total_bytes_ the entire tensor has been offered to the sender.
         uint64_t bytes_advertised_ = 0;
-        std::deque<RecvTransferTask> tasks_;
     };
 
     // Per-peer sender state.  The sender consumes PublishSlots that the
@@ -596,6 +608,8 @@ class P2PProxy {
     bool isSendOpCompleted(const SendOpContext& op_ctx) const;
     void performSendReset(int peer_rank);
 
+    void reportBrokenPeer(int peer_rank);
+
     // Control lane addressing.
     //
     // Each rank owns one contiguous Publish region and one Completion region.
@@ -615,6 +629,12 @@ class P2PProxy {
                                            uint32_t sequence) const;
     CompletionSlot* getLocalCompletionStagingBuf(int peer_rank,
                                                  uint32_t sequence) const;
+
+    template <typename T>
+    bool isTimeout(const T& obj) const {
+        return std::chrono::steady_clock::now() - obj.last_update_time_ >
+               transfer_timeout_ms_;
+    }
 
    private:
     struct P2PResources {
@@ -636,6 +656,7 @@ class P2PProxy {
     int size_ = 0;
     int cuda_device_index_ = -1;
     std::string location_;
+    std::chrono::milliseconds transfer_timeout_ms_{5000};  // 5s
     P2PResources resources_;
     bool resource_abandoned_{false};
 
@@ -654,10 +675,10 @@ class P2PProxy {
     std::atomic<int> active_send_tasks_{0};
     std::atomic<int> active_recv_tasks_{0};
 
-    // Global generation for fault recovery.  Incremented once on every Reset
-    // (atomically in resetPeerState) so that all worker threads see the new
-    // epoch immediately and no stale interleaving can occur.
-    std::atomic<uint32_t> global_generation_{1};
+    // Per-peer generation for fault recovery.  Incremented in resetPeerState
+    // and performSend/RecvReset so that stale messages from a previous epoch
+    // can be detected on a per-peer basis.
+    std::array<std::atomic<uint32_t>, kMaxNumRanks> peer_generation_;
 
     std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_;
     std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_;
