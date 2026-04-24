@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -693,7 +693,14 @@ where
     }
     request.push_str("\r\n");
 
-    let mut stream = TcpStream::connect((host.as_str(), port))?;
+    let socket_addr = (host.as_str(), port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or("admin_url did not resolve to a socket address")?;
+    let timeout = Duration::from_secs(30);
+    let mut stream = TcpStream::connect_timeout(&socket_addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     stream.write_all(request.as_bytes())?;
     if !body.is_empty() {
         stream.write_all(&body)?;
@@ -703,7 +710,8 @@ where
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     let (status_line, response_body) = split_http_response(&response)?;
-    if status_line.contains(" 200 ") {
+    let status_code = parse_http_status_code(status_line)?;
+    if (200..300).contains(&status_code) {
         return Ok(serde_json::from_str(response_body)?);
     }
 
@@ -711,6 +719,14 @@ where
         .map(|error| error.error)
         .unwrap_or_else(|_| response_body.trim().to_string());
     Err(format!("admin http request failed: {status_line}: {message}").into())
+}
+
+fn parse_http_status_code(status_line: &str) -> Result<u16, Box<dyn Error>> {
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or("admin http response has invalid status line")?;
+    Ok(code.parse::<u16>()?)
 }
 
 fn split_http_response(response: &str) -> Result<(&str, &str), Box<dyn Error>> {

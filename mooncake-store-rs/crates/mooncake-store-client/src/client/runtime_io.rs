@@ -10,6 +10,22 @@ struct PutObjectCurrentOptions<'a> {
 }
 
 impl StoreClient {
+    fn best_effort_release_reserved_allocations(
+        &self,
+        targets: &[ReplicaWriteTarget],
+        reservations: &[mooncake_store_core::SegmentReservation],
+        reason: &str,
+    ) {
+        if let Err(error) = self.release_reserved_allocations(targets, reservations) {
+            warn!(
+                runtime = %self.lease.runtime,
+                error = %error,
+                reason,
+                "failed to release reserved allocations"
+            );
+        }
+    }
+
     fn expect_exactly_one_control_plane_result<T>(
         items: Vec<T>,
         operation: &str,
@@ -413,7 +429,11 @@ impl StoreClient {
             let offsets = match write_result {
                 Ok(offsets) => offsets,
                 Err(error) => {
-                    let _ = self.release_reserved_allocations(&targets, &reservations);
+                    self.best_effort_release_reserved_allocations(
+                        &targets,
+                        &reservations,
+                        "put_stage_write_failed",
+                    );
                     let _ = self.abort_tenant_quota_reservation(
                         quota_reservation.as_ref(),
                         "replica_write_failed",
@@ -489,7 +509,11 @@ impl StoreClient {
             cas_tracker.finish(&cas_result, 0);
             let cas = cas_result?;
             if !cas.applied {
-                let _ = self.release_reserved_allocations(&targets, &reservations);
+                self.best_effort_release_reserved_allocations(
+                    &targets,
+                    &reservations,
+                    "put_stage_route_cas_conflict",
+                );
                 let _ = self.abort_tenant_quota_reservation(
                     quota_reservation.as_ref(),
                     "route_compare_and_swap_conflict",
@@ -870,7 +894,11 @@ impl StoreClient {
             match self.write_reserved_replicas(&targets, &reservations, &payload, None) {
             Ok(offsets) => offsets,
             Err(error) => {
-                let _ = self.release_reserved_allocations(&targets, &reservations);
+                self.best_effort_release_reserved_allocations(
+                    &targets,
+                    &reservations,
+                    "explicit_migration_write_failed",
+                );
                 self.note_remote_write_failure(&targets, &error, "explicit_migration_write_failed");
                 return Err(error);
             }
@@ -918,12 +946,20 @@ impl StoreClient {
         ) {
             Ok(cas) => cas,
             Err(error) => {
-                let _ = self.release_reserved_allocations(&targets, &reservations);
+                self.best_effort_release_reserved_allocations(
+                    &targets,
+                    &reservations,
+                    "explicit_migration_route_cas_error",
+                );
                 return Err(error);
             }
         };
         if !cas.applied {
-            let _ = self.release_reserved_allocations(&targets, &reservations);
+            self.best_effort_release_reserved_allocations(
+                &targets,
+                &reservations,
+                "explicit_migration_route_race",
+            );
             return Err(StoreError::Conflict(format!(
                 "explicit migration lost route race for tenant={} key={}",
                 object_id.scope.tenant, object_id.logical_key
@@ -972,7 +1008,11 @@ impl StoreClient {
                 ))
             })?;
             if self.runtime_is_suspect(&preferred.owner) {
-                let _ = self.release_reserved_allocations(&targets, &reservations);
+                self.best_effort_release_reserved_allocations(
+                    &targets,
+                    &reservations,
+                    "explicit_migration_target_runtime_suspect",
+                );
                 return Err(StoreError::Transport(format!(
                     "explicit migration target segment {} belongs to suspect runtime {}",
                     requested_segment.0, preferred.owner
@@ -987,13 +1027,21 @@ impl StoreClient {
             ) {
                 Ok(result) => result,
                 Err(error) => {
-                    let _ = self.release_reserved_allocations(&targets, &reservations);
+                    self.best_effort_release_reserved_allocations(
+                        &targets,
+                        &reservations,
+                        "explicit_migration_target_reserve_failed",
+                    );
                     return Err(error);
                 }
             };
             if target.storage_runtime != preferred.owner || target.segment_name != preferred.segment_name
             {
-                let _ = self.release_reserved_allocations(&targets, &reservations);
+                self.best_effort_release_reserved_allocations(
+                    &targets,
+                    &reservations,
+                    "explicit_migration_target_reserve_mismatch",
+                );
                 return Err(StoreError::Conflict(format!(
                     "explicit migration reserved target {} on {} instead of requested {} on {}",
                     target.segment_name.0,

@@ -314,7 +314,9 @@ message SubmitMigrationTaskRequest {
   string task_executor = 8;
   // Admin-owned retry budget. P1 executor implementations do not retry a submitted execution.
   uint64 max_retries = 9;
+  // Optional domain scope. Empty means the default domain.
   string domain = 10;
+  // Optional object-set scope. Empty means the default object set.
   string object_set = 11;
 }
 

@@ -1135,6 +1135,8 @@ fn control_plane_migration_entrypoints_reject_invalid_requests() {
                 namespace: "ns-a".to_string(),
                 authority: "authority".to_string(),
                 tenant: "tenant-a".to_string(),
+                domain: String::new(),
+                object_set: String::new(),
                 key: "alpha".to_string(),
                 mode: 999,
                 source_segment: "segment-a".to_string(),
