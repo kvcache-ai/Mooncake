@@ -7,9 +7,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <mutex>
-#include <glog/logging.h>
 
 namespace mooncake {
 
@@ -43,9 +41,13 @@ class MmapArena {
      * Initialize arena with a large mmap'd pool
      * @param pool_size Total size to pre-allocate (aligned to huge pages)
      * @param alignment Allocation alignment (default 64 bytes)
+     * @param allow_regular_page_fallback When true, the arena may retry the
+     *        initial pool mmap on regular pages after a hugepage failure.
+     *        Callers that need strict hugepage semantics should pass false.
      * @return true on success
      */
-    bool initialize(size_t pool_size, size_t alignment = kMinAlignment);
+    bool initialize(size_t pool_size, size_t alignment = kMinAlignment,
+                    bool allow_regular_page_fallback = true);
 
     /**
      * Allocate memory from arena

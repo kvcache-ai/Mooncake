@@ -7,11 +7,29 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 
 #include "utils.h"
 
 namespace mooncake {
+
+namespace {
+
+bool HostHasReservedHugepages() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    size_t value = 0;
+    std::string unit;
+    while (meminfo >> key >> value >> unit) {
+        if (key == "HugePages_Total:") {
+            return value > 0;
+        }
+    }
+    return false;
+}
+
+}  // namespace
 
 class MmapArenaFallbackTest : public ::testing::Test {
    protected:
@@ -57,6 +75,27 @@ TEST_F(MmapArenaFallbackTest, ArenaInitFailureIsStickyForProcessLifetime) {
     EXPECT_EQ(second_logs.find("ARENA INITIALIZATION FAILED"),
               std::string::npos);
     EXPECT_EQ(second_logs.find("ARENA ALLOCATOR ENABLED"), std::string::npos);
+}
+
+TEST_F(MmapArenaFallbackTest,
+       ExplicitHugepageRequestDoesNotSilentlyFallbackToRegularPages) {
+    if (HostHasReservedHugepages()) {
+        GTEST_SKIP() << "Host has reserved hugepages; this strict-fallback "
+                        "test only proves itself on hugepage-free hosts";
+    }
+
+    unsetenv("MC_DISABLE_MMAP_ARENA");
+    setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
+    setenv("MC_MMAP_ARENA_POOL_SIZE", "2mb", 1);
+
+    FLAGS_minloglevel = google::INFO;
+    testing::internal::CaptureStderr();
+    void* ptr = allocate_buffer_mmap_memory(64 * 1024, 64);
+    const std::string logs = testing::internal::GetCapturedStderr();
+
+    EXPECT_EQ(ptr, nullptr) << logs;
+    EXPECT_EQ(logs.find("retrying without huge pages"), std::string::npos)
+        << logs;
 }
 
 TEST_F(MmapArenaFallbackTest, HonorsPageAlignment) {

@@ -2,7 +2,9 @@
 // Simple arena allocator implementation
 
 #include "mmap_arena.h"
+#include "utils.h"
 #include <sys/mman.h>
+#include <glog/logging.h>
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
@@ -49,7 +51,8 @@ MmapArena::~MmapArena() {
     }
 }
 
-bool MmapArena::initialize(size_t pool_size, size_t alignment) {
+bool MmapArena::initialize(size_t pool_size, size_t alignment,
+                           bool allow_regular_page_fallback) {
     // Mutex serializes concurrent initialize() calls so that exactly one
     // thread performs the mmap and publishes the pool.  This avoids the
     // metadata-overwrite race that existed with the old CAS approach
@@ -74,9 +77,8 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
     const size_t actual_alignment = std::max(alignment, kMinAlignment);
 
     // Align pool size to 2MB for huge pages with overflow protection
-    constexpr size_t kHugePageSize = 2 * 1024 * 1024;
     size_t aligned_pool_size;
-    if (!safe_align_up(pool_size, kHugePageSize, &aligned_pool_size)) {
+    if (!safe_align_up(pool_size, SZ_2MB, &aligned_pool_size)) {
         LOG(ERROR) << "Arena pool size overflow: requested=" << pool_size;
         return false;
     }
@@ -96,11 +98,23 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
         mmap(nullptr, aligned_pool_size, PROT_READ | PROT_WRITE, flags, -1, 0);
 
     if (pool_base == MAP_FAILED) {
+        const int mmap_errno = errno;
+        if (!allow_regular_page_fallback) {
+            LOG(ERROR) << "Arena hugepage mmap failed for pool_size="
+                       << aligned_pool_size << " bytes"
+                       << ", errno=" << mmap_errno << " ("
+                       << strerror(mmap_errno)
+                       << "); regular-page fallback disabled because "
+                          "MC_STORE_USE_HUGEPAGE explicitly requested "
+                          "hugepages";
+            return false;
+        }
+
         // Retry without huge pages
         flags &= ~MAP_HUGETLB;
         LOG(WARNING) << "Arena hugepage mmap failed for pool_size="
                      << aligned_pool_size << " bytes"
-                     << ", errno=" << errno << " (" << strerror(errno)
+                     << ", errno=" << mmap_errno << " (" << strerror(mmap_errno)
                      << "); retrying without huge pages";
         pool_base = mmap(nullptr, aligned_pool_size, PROT_READ | PROT_WRITE,
                          flags, -1, 0);
@@ -136,8 +150,7 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
     pool_size_.store(aligned_pool_size, std::memory_order_relaxed);
     pool_base_.store(pool_base, std::memory_order_release);
 
-    LOG(INFO) << "Arena initialized: "
-              << (aligned_pool_size / (1024.0 * 1024.0 * 1024.0))
+    LOG(INFO) << "Arena initialized: " << (aligned_pool_size / BYTES_PER_GIB)
               << " GiB, alignment=" << actual_alignment << " bytes";
 
     return true;

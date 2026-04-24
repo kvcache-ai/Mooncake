@@ -285,6 +285,7 @@ std::vector<std::string> splitString(const std::string& str,
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
+constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
 /**
  * @brief Allocates memory for the `BufferAllocator` class.
@@ -315,9 +316,6 @@ inline size_t align_up(size_t size, size_t alignment) {
     if (use_hp_env == nullptr) {
         return 0;
     }
-
-    constexpr size_t SZ_2MB = 2 * 1024 * 1024;
-    constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 
     size_t size = SZ_2MB;  // Default to 2MB
 

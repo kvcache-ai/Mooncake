@@ -153,6 +153,14 @@ static void initializeGlobalArena() {
     }
 
     g_mmap_arena = std::make_unique<MmapArena>();
+    // Keep arena init consistent with the direct-mmap path:
+    //   MC_STORE_USE_HUGEPAGE=1  -> strict: hard fail if hugepage mmap fails
+    //   unset                    -> permissive: try hugepages, retry on
+    //                               regular pages if HugeTLB is unavailable
+    // This preserves both pre-existing contracts and avoids surprising
+    // operators with a silent hugepage downgrade.
+    const bool hugepages_explicitly_requested =
+        get_hugepage_size_from_env() > 0;
 
     // Allow env var override since gflags cannot be set from Python (pybind11).
     // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB",
@@ -171,17 +179,23 @@ static void initializeGlobalArena() {
         }
     }
 
-    bool success = g_mmap_arena->initialize(arena_pool_size);
+    bool success =
+        g_mmap_arena->initialize(arena_pool_size, MmapArena::kMinAlignment,
+                                 !hugepages_explicitly_requested);
 
     if (success) {
         auto stats = g_mmap_arena->getStats();
         LOG(INFO) << "=== ARENA ALLOCATOR ENABLED ===";
-        LOG(INFO) << "Arena pool size: "
-                  << (stats.pool_size / (1024.0 * 1024.0 * 1024.0)) << " GiB";
+        LOG(INFO) << "Arena pool size: " << (stats.pool_size / BYTES_PER_GIB)
+                  << " GiB";
         LOG(INFO) << "Using lock-free atomic bump allocation";
     } else {
         LOG(ERROR) << "=== ARENA INITIALIZATION FAILED ===";
         LOG(ERROR) << "Falling back to traditional mmap()";
+        if (hugepages_explicitly_requested) {
+            LOG(ERROR) << "MC_STORE_USE_HUGEPAGE is set, so the fallback path "
+                          "will also require hugepages";
+        }
         LOG(ERROR) << "Arena initialization is only attempted once per "
                       "process; restart after fixing the environment if you "
                       "want to retry arena bring-up";
