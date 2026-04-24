@@ -87,6 +87,27 @@ It contains the public builder, the request API, the allocator logic, the route 
 | Observability | `src/observability.rs` | tracing, metrics registry, HTTP export |
 | Transport helpers | `src/transport.rs` | transfer submission and completion helpers |
 
+#### Explicit route migration runtime
+
+The explicit route-migration runtime is implemented in the same
+`mooncake-store-client` crate and is split across three pieces:
+
+- `src/client/runtime_io.rs`
+  - source-replica selection
+  - explicit `copy` / `move` route-delta construction
+  - payload copy, CAS route publish, and best-effort reclaim
+- `src/client/state_adapters.rs`
+  - executor-side task adapter
+  - background worker that turns a control-plane request into one runtime
+    migration execution
+- `src/control_plane/*`
+  - `SubmitMigrationTask` and `GetMigrationExecutionStatus`
+  - migration request validation and client/server wiring
+
+This runtime layer is intentionally lower-level than the admin queue and HTTP
+operator surface. It is the executor-side kernel that later stacked PRs build
+on top of.
+
 ## Transport Layer
 
 ### `mooncake-transport-sys`
