@@ -744,36 +744,20 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
 fn validate_submit_migration_task_request(
     request: &pb::SubmitMigrationTaskRequest,
 ) -> mooncake_store_core::Result<()> {
-    if request.namespace.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane submit_migration_task request is missing namespace".to_string(),
-        ));
-    }
-    if request.authority.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane submit_migration_task request is missing authority".to_string(),
-        ));
-    }
-    if request.tenant.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane submit_migration_task request is missing tenant".to_string(),
-        ));
-    }
-    if request.key.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane submit_migration_task request is missing key".to_string(),
-        ));
-    }
-    if request.source_segment.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane submit_migration_task request is missing source_segment".to_string(),
-        ));
-    }
-    if request.task_executor.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane submit_migration_task request is missing task_executor".to_string(),
-        ));
-    }
+    require_non_empty_control_field("submit_migration_task", "namespace", &request.namespace)?;
+    require_non_empty_control_field("submit_migration_task", "authority", &request.authority)?;
+    require_non_empty_control_field("submit_migration_task", "tenant", &request.tenant)?;
+    require_non_empty_control_field("submit_migration_task", "key", &request.key)?;
+    require_non_empty_control_field(
+        "submit_migration_task",
+        "source_segment",
+        &request.source_segment,
+    )?;
+    require_non_empty_control_field(
+        "submit_migration_task",
+        "task_executor",
+        &request.task_executor,
+    )?;
     match pb::MigrationMode::try_from(request.mode) {
         Ok(pb::MigrationMode::Copy) => {
             if request.target_segments.is_empty() {
@@ -809,21 +793,33 @@ fn validate_submit_migration_task_request(
 fn validate_get_migration_execution_status_request(
     request: &pb::GetMigrationExecutionStatusRequest,
 ) -> mooncake_store_core::Result<()> {
-    if request.namespace.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane get_migration_execution_status request is missing namespace".to_string(),
-        ));
-    }
-    if request.authority.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane get_migration_execution_status request is missing authority".to_string(),
-        ));
-    }
-    if request.execution_id.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            "control plane get_migration_execution_status request is missing execution_id"
-                .to_string(),
-        ));
+    require_non_empty_control_field(
+        "get_migration_execution_status",
+        "namespace",
+        &request.namespace,
+    )?;
+    require_non_empty_control_field(
+        "get_migration_execution_status",
+        "authority",
+        &request.authority,
+    )?;
+    require_non_empty_control_field(
+        "get_migration_execution_status",
+        "execution_id",
+        &request.execution_id,
+    )?;
+    Ok(())
+}
+
+fn require_non_empty_control_field(
+    operation: &str,
+    field: &str,
+    value: &str,
+) -> mooncake_store_core::Result<()> {
+    if value.trim().is_empty() {
+        return Err(StoreError::InvalidState(format!(
+            "control plane {operation} request is missing {field}",
+        )));
     }
     Ok(())
 }
