@@ -104,7 +104,7 @@ Environment:
   MC_STORE_RS_ROUTE_MIGRATION_CLIENT_BIN
                                    Optional explicit client binary path.
   MC_STORE_RS_ROUTE_MIGRATION_ADMIN_BIN
-                                   Optional explicit admin server binary path.
+                                   Optional explicit admin binary path.
   MC_STORE_RS_ROUTE_MIGRATION_ADMIN_CLI_BIN
                                    Optional explicit admin CLI binary path.
   MOONCAKE_UPSTREAM_DIR            Mooncake upstream checkout override
@@ -223,78 +223,30 @@ raise SystemExit(f"admin health check failed for {base_url}: {last_error!r}")
 PY
 }
 
-have_command() {
-  command -v "$1" >/dev/null 2>&1
+setup_runtime_loader_env() {
+  local build_dir=$1
+
+  export MOONCAKE_UPSTREAM_BUILD_DIR="${build_dir}"
+  if [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/third_party/Mooncake" ]]; then
+    export MOONCAKE_UPSTREAM_DIR="${REPO_ROOT}/third_party/Mooncake"
+  fi
+
+  mc_scripts_prepend_env_path \
+    LD_LIBRARY_PATH \
+    "${build_dir}/mooncake-transfer-engine/src" \
+    "${build_dir}/mooncake-transfer-engine/tent/src"
+  mc_scripts_prepend_env_path PYTHONPATH "${REPO_ROOT}/python"
 }
 
-wait_for_docker_redis() {
-  local container_name=$1
-  local timeout_seconds=${2:-20}
-  python3 - "${container_name}" "${timeout_seconds}" <<'PY'
-import subprocess
-import sys
-import time
+prepend_transport_shim_loader_env() {
+  local profile_dir=$1
+  local shim_dir
 
-container_name = sys.argv[1]
-timeout_seconds = float(sys.argv[2])
-deadline = time.time() + timeout_seconds
-last_error = None
-
-while time.time() < deadline:
-    try:
-        completed = subprocess.run(
-            ["docker", "exec", container_name, "redis-cli", "ping"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-        )
-        if completed.stdout.strip() == "PONG":
-            raise SystemExit(0)
-    except Exception as error:
-        last_error = error
-        time.sleep(0.2)
-
-raise SystemExit(f"docker redis did not become ready: {last_error!r}")
-PY
-}
-
-start_local_or_docker_redis_if_needed() {
-  local redis_port=$1
-  local started_var=${2:-}
-  local container_var=${3:-}
-  local container_name=${4:-}
-  local started=0
-  local container_started=
-
-  if have_command redis-cli && redis-cli -p "${redis_port}" ping >/dev/null 2>&1; then
-    started=0
-  elif have_command redis-cli && have_command redis-server; then
-    mc_scripts_start_local_redis_if_needed "${redis_port}" started
-  else
-    mc_scripts_require_command docker "docker redis fallback"
-    docker rm -f "${container_name}" >/dev/null 2>&1 || true
-    docker run -d --rm \
-      --name "${container_name}" \
-      -p "${redis_port}:6379" \
-      --entrypoint redis-server \
-      "${MC_STORE_RS_ROUTE_MIGRATION_REDIS_IMAGE:-mooncake-store-nightly-builder:20260421}" \
-      --port 6379 \
-      --bind 0.0.0.0 \
-      --save '' \
-      --appendonly no \
-      >/dev/null
-    wait_for_docker_redis "${container_name}" 20
-    started=1
-    container_started="${container_name}"
-  fi
-
-  if [[ -n "${started_var}" ]]; then
-    printf -v "${started_var}" '%s' "${started}"
-  fi
-  if [[ -n "${container_var}" ]]; then
-    printf -v "${container_var}" '%s' "${container_started}"
-  fi
+  for shim_dir in "${profile_dir}"/build/mooncake-transport-sys-*/out; do
+    if [[ -d "${shim_dir}" ]]; then
+      mc_scripts_prepend_env_path LD_LIBRARY_PATH "${shim_dir}"
+    fi
+  done
 }
 
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-$(allocate_port)}"
@@ -318,7 +270,7 @@ EXECUTOR_SEGMENT="route-migration-executor-segment-${EXECUTOR_STABLE_ID}"
 PAYLOAD="route-migration-payload-${SOURCE_STABLE_ID}"
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
 ADMIN_URL="http://127.0.0.1:${ADMIN_PORT}"
-TMP_BASE="${TMPDIR:-/nvme/tmp}"
+TMP_BASE="${TMPDIR:-/tmp}"
 mkdir -p "${TMP_BASE}"
 TMP_DIR="$(mktemp -d "${TMP_BASE}/mc-route-migration-e2e.XXXXXX")"
 SOURCE_LOG="${TMP_DIR}/source-client.log"
@@ -332,8 +284,6 @@ TARGET_PID=0
 EXTRA_TARGET_PID=0
 EXECUTOR_PID=0
 REDIS_STARTED=0
-REDIS_CONTAINER_NAME="mc-route-migration-e2e-redis-${SOURCE_STABLE_ID}"
-REDIS_CONTAINER_STARTED=
 
 cleanup() {
   local status=$?
@@ -354,9 +304,6 @@ cleanup() {
   if [[ "${REDIS_STARTED}" == "1" ]]; then
     redis-cli -p "${REDIS_PORT}" shutdown nosave >/dev/null 2>&1 || true
   fi
-  if [[ -n "${REDIS_CONTAINER_STARTED}" ]]; then
-    docker rm -f "${REDIS_CONTAINER_STARTED}" >/dev/null 2>&1 || true
-  fi
 
   if [[ "${status}" != "0" && "${MC_STORE_RS_KEEP_TEMP:-0}" == "1" ]]; then
     echo "preserving temp dir: ${TMP_DIR}" >&2
@@ -370,9 +317,9 @@ trap cleanup EXIT
 
 mc_scripts_require_command cargo
 mc_scripts_require_command python3
+mc_scripts_require_command redis-cli
+mc_scripts_require_command redis-server
 
-UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
-mc_scripts_setup_upstream_runtime_env "${REPO_ROOT}" python "${UPSTREAM_BUILD_DIR}"
 export PYTHONDONTWRITEBYTECODE=1
 export MC_STORE_RS_REDIS_URL="${REDIS_URL}"
 export MC_STORE_RS_REDIS_PORT="${REDIS_PORT}"
@@ -387,11 +334,7 @@ if [[ -n "${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR:-}" ]]; then
   ADMIN_CLI_BIN_OVERRIDE=${ADMIN_CLI_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-admin}
 fi
 
-start_local_or_docker_redis_if_needed \
-  "${REDIS_PORT}" \
-  REDIS_STARTED \
-  REDIS_CONTAINER_STARTED \
-  "${REDIS_CONTAINER_NAME}"
+mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
@@ -399,13 +342,20 @@ if [[ -n "${CLIENT_BIN_OVERRIDE}" || -n "${ADMIN_BIN_OVERRIDE}" ]]; then
   echo "==> reusing prebuilt standalone binaries"
 else
   echo "==> building standalone mooncake-store-client/admin binaries"
+  if [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/third_party/Mooncake" ]]; then
+    export MOONCAKE_UPSTREAM_DIR="${REPO_ROOT}/third_party/Mooncake"
+  fi
   cargo build -p mooncake-store-py
 fi
+
+UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
+setup_runtime_loader_env "${UPSTREAM_BUILD_DIR}"
 
 TARGET_DIR="${CARGO_TARGET_DIR}"
 BIN="${CLIENT_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-client}"
 ADMIN_BIN="${ADMIN_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-admin}"
 ADMIN_CLI_BIN="${ADMIN_CLI_BIN_OVERRIDE:-${ADMIN_BIN}}"
+BIN_DIR="$(dirname "${BIN}")"
 
 if [[ ! -x "${BIN}" ]]; then
   echo "expected client binary was not produced at ${BIN}" >&2
@@ -419,6 +369,8 @@ if [[ "${SUBMITTER}" == "cli" && ! -x "${ADMIN_CLI_BIN}" ]]; then
   echo "expected admin CLI binary was not produced at ${ADMIN_CLI_BIN}" >&2
   exit 1
 fi
+
+prepend_transport_shim_loader_env "${BIN_DIR}"
 
 CLIENT_BASE_ARGS=(
   --local-hostname 127.0.0.1
