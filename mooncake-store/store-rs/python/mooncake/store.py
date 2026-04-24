@@ -352,13 +352,19 @@ class MooncakeDistributedStore:
         keyspace: str | None = None,
         worker_scope: str | None = None,
     ):
+        kwargs = _apply_dummy_setup_env_defaults(
+            {
+                "keyspace": keyspace,
+                "worker_scope": worker_scope,
+            }
+        )
         return self._invoke(
             "setup_dummy",
             mem_pool_size,
             local_buffer_size,
             server_address,
-            keyspace=keyspace,
-            worker_scope=worker_scope,
+            keyspace=kwargs.get("keyspace"),
+            worker_scope=kwargs.get("worker_scope"),
         )
 
     def close(self) -> None:
@@ -854,6 +860,8 @@ _SETUP_ENV_DEFAULTS = {
     "route_control": ("MC_STORE_RS_ROUTE_CONTROL", _coerce_optional_str),
 }
 
+_DUMMY_SETUP_ENV_DEFAULT_KEYS = ("keyspace",)
+
 
 def _apply_setup_env_defaults(config: Mapping[str, object]) -> dict:
     merged = dict(config)
@@ -873,6 +881,19 @@ def _apply_setup_env_defaults(config: Mapping[str, object]) -> dict:
         labels = _labels_from_env()
         if labels:
             merged["labels"] = labels
+    return merged
+
+
+def _apply_dummy_setup_env_defaults(config: Mapping[str, object]) -> dict:
+    merged = dict(config)
+    for key in _DUMMY_SETUP_ENV_DEFAULT_KEYS:
+        if _has_value(merged.get(key)):
+            continue
+        env_name, coerce = _SETUP_ENV_DEFAULTS[key]
+        env_value = os.environ.get(env_name)
+        if not _has_value(env_value):
+            continue
+        merged[key] = coerce(env_value)
     return merged
 
 
