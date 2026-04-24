@@ -581,6 +581,7 @@ jobs:
       run: |
         cd mooncake-store/rust
         export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
+        cargo test --lib
         MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
         MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
           cargo test --examples --tests --no-run
