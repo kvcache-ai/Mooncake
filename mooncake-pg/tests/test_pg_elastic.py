@@ -27,6 +27,8 @@ def _extension_worker(
     initial_world_size = ctx.world_size - 1
     extension_rank = ctx.world_size - 1
 
+    join_ranks = [extension_rank]
+
     if ctx.proc_rank < initial_world_size:
         # Original ranks
         device = ctx.init_group(world_size=initial_world_size)
@@ -42,9 +44,17 @@ def _extension_worker(
             extend_event.set()
         pg.extend_group_size_to(backend, ctx.world_size)
 
-        # Wait for extension rank to complete init before collective
-        if not init_done_event.wait(timeout=30.0):
-            raise TimeoutError("timed out waiting for extension init")
+        # Two-phase extension protocol:
+        #   1) joiner publishes metadata + establishes transport readiness
+        #   2) healthy ranks recover/activate it via recover_ranks()
+        # Note: get_peer_state() is collective among *healthy ranks*.
+        wait_until(
+            lambda: all(pg.get_peer_state(backend, join_ranks)),
+            timeout_s=30.0,
+            poll_interval_s=0.05,
+            description=f"rank {ctx.proc_rank} waiting for joiner ready",
+        )
+        pg.recover_ranks(backend, join_ranks)
 
         # Final collective
         final_tensor = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -63,10 +73,22 @@ def _extension_worker(
         device = ctx.init_group(
             rank=extension_rank,
             world_size=ctx.world_size,
+            is_extension=True,
         )
 
-        # Signal init complete before collective
-        init_done_event.set()
+        backend = ctx.get_backend()
+
+        # In extension mode, joiner starts in local-only collectives.
+        local_tensor = torch.tensor([extension_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(local_tensor, op=dist.ReduceOp.SUM)
+        if int(local_tensor.cpu().item()) != extension_rank + 1:
+            raise AssertionError(
+                f"extension rank expected local-only sum {extension_rank + 1}, got {int(local_tensor.cpu().item())}"
+            )
+
+        # join_group publishes metadata and then blocks until recover_ranks()
+        # publishes the extension state.
+        pg.join_group(backend)
 
         # Final collective
         final_tensor = torch.tensor([extension_rank + 1], dtype=torch.int32, device=device)

@@ -27,6 +27,7 @@ def _elastic_worker(rank, num_processes, signals):
     """Worker for testing elastic world size extension."""
     _set_device(rank)
     assert num_processes % 2 == 0
+    join_ranks = list(range(num_processes // 2, num_processes))
     if rank < num_processes // 2:
         # Ensure correct operation before extension
         world_size = num_processes // 2
@@ -48,6 +49,13 @@ def _elastic_worker(rank, num_processes, signals):
         # This allows overlapping other operations between the group expansion
         # and the first communication call.
         pg.extend_group_size_to(backend, num_processes)
+
+        # Two-phase scale-up: poll joiner readiness, then explicitly recover/activate.
+        while True:
+            if all(pg.get_peer_state(backend, join_ranks)):
+                break
+            time.sleep(0.05)
+        pg.recover_ranks(backend, join_ranks)
     else:
         while "extend" not in signals:
             time.sleep(1)
@@ -55,7 +63,21 @@ def _elastic_worker(rank, num_processes, signals):
             backend=TEST_BACKEND,
             rank=rank,
             world_size=num_processes,
+            pg_options=pg.MooncakeBackendOptions(
+                torch.ones((num_processes,), dtype=torch.int32, device=TEST_DEVICE),
+                True,
+            ),
         )
+
+        backend = dist.group.WORLD._get_backend(TEST_DEVICE)
+
+        # Extension backends start in local-only collectives.
+        local_tensor = torch.tensor([rank + 1], dtype=torch.int32, device=TEST_DEVICE)
+        dist.all_reduce(local_tensor, op=dist.ReduceOp.SUM)
+        assert local_tensor.item() == rank + 1
+
+        # Publish metadata and block until recovered state is published.
+        pg.join_group(backend)
 
     # Ensure correct operation after extension
     tensor = torch.tensor([rank + 1], dtype=torch.int32, device=TEST_DEVICE)

@@ -952,12 +952,18 @@ void MooncakeBackend::extendGroupSizeTo(int newSize) {
     // Initialize new rank's metadata
     for (int i = oldSize; i < newSize; ++i) {
         local2global_rank_map_[i] = i;
-        meta_->activeRanks[i] = true;
+        // IMPORTANT: Newly-extended ranks must start as inactive.
+        // They will only participate in collectives after healthy ranks
+        // explicitly activate them via recoverRanks(). This enables a
+        // two-phase scale-up protocol (extend capacity -> poll readiness
+        // -> recover/activate) and avoids collectives including ranks that
+        // haven't joined yet.
+        meta_->activeRanks[i] = false;
     }
 
     auto& tensor = meta_->activeRanksTensor;
     tensor.resize_({newSize});
-    tensor.slice(0, oldSize, newSize).fill_(1);
+    tensor.slice(0, oldSize, newSize).fill_(0);
 
     connection_ctx_->extendGroupSizeTo(newSize);
     // After extendGroupSizeTo, we don't `waitUntilNewRanksConnected` here
