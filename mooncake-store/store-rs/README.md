@@ -441,7 +441,9 @@ Correctness smoke check:
 ```bash
 mooncake-store-bench \
   --metadata-url redis://127.0.0.1:6380/0 \
-  verify
+  verify \
+  --write-interface batch-put-from \
+  --read-interface batch-get-into
 ```
 
 Scratch-only remote-store benchmark:
@@ -455,6 +457,30 @@ mooncake-store-bench \
   --duration 30
 ```
 
+The default measured interfaces are `batch_put_from` and `batch_get_into`. Override them
+from the CLI or env when needed:
+
+```bash
+MC_BENCH_WRITE_INTERFACE=put \
+MC_BENCH_READ_INTERFACE=get \
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  bench \
+  --mode mixed \
+  --write-interface put \
+  --read-interface get
+```
+
+Or use one combined env:
+
+```bash
+MC_BENCH_INTERFACES=put,get \
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  bench \
+  --mode mixed
+```
+
 Longer soak run:
 
 ```bash
@@ -462,6 +488,8 @@ mooncake-store-bench \
   --metadata-url redis://127.0.0.1:6380/0 \
   soak \
   --duration 3600 \
+  --write-interface batch-put-from \
+  --read-interface batch-get-into \
   --fault redis-jitter:5:50 \
   --verify-reads
 ```
@@ -469,6 +497,8 @@ mooncake-store-bench \
 Important runtime behavior:
 
 - `MC_BENCH_STORAGE_BYTES=0` by default, so the bench expects separate active `storage=true` daemons in the same metadata keyspace
+- `MC_BENCH_INTERFACES=<write>,<read>` can set both interface env defaults together
+- `MC_BENCH_WRITE_INTERFACE=batch-put-from` and `MC_BENCH_READ_INTERFACE=batch-get-into` by default
 - when `--keyspace` is omitted in scratch-only mode, bench joins `mc/store-rs/v1`
 - when `--storage-bytes > 0` and `--keyspace` is omitted, bench generates an isolated `mc/store-rs/bench/<unique>` keyspace
 - bench tracing goes to `stderr` by default, honors `--trace-filter` / `MC_STORE_RS_TRACE_FILTER` / `RUST_LOG`, and falls back to `info`

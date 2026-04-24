@@ -172,8 +172,8 @@ Purpose:
 
 The bench binary provides three subcommands:
 
-- `bench` — concurrent put/get/mixed throughput and latency measurement with p50/p90/p99/p999 percentiles, configurable concurrency, batch size, and duration
-- `verify` — sequential correctness checks including round-trip, batch put/get, get_into, is_exist, overwrite correctness, delete/reclaim, and tenant isolation
+- `bench` — concurrent single-key or batch read/write throughput and latency measurement with p50/p90/p99/p999 percentiles, configurable mode, interfaces, concurrency, batch size, and duration
+- `verify` — sequential correctness checks including configurable single-key or batch read/write paths, `get_into`, `is_exist`, overwrite correctness, delete/reclaim, and tenant isolation
 - `soak` — long-duration stability test with per-operation fault injection (Redis jitter, metadata drop, transport delay, transport error) and optional read verification
 
 See `docs/bench.md` for full usage and design.

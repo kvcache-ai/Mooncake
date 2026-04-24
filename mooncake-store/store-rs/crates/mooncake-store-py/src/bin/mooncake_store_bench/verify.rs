@@ -1,9 +1,23 @@
-use mooncake_store_client::{MooncakeCompatibilityFacade, PutRequest, StoreClient};
+use mooncake_store_client::{
+    GetRequest, MooncakeCompatibilityFacade, ObjectRef, PutFromRequest, PutRequest, StoreClient,
+};
 use tracing::{error, info, warn};
 
-use crate::cli::{GlobalArgs, VerifyArgs};
+use crate::cli::{GlobalArgs, ReadInterface, VerifyArgs, WriteInterface};
 use crate::datagen::{ensure_payload, make_key, make_seed, payload};
 use crate::setup::BenchCluster;
+
+struct VerifyPut<'a> {
+    tenant: &'a str,
+    key: &'a str,
+    value: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
+struct VerifyGet<'a> {
+    tenant: &'a str,
+    key: &'a str,
+}
 
 struct CheckResult {
     passed: bool,
@@ -25,6 +39,166 @@ where
     }
 }
 
+fn verify_write_width(interface: WriteInterface, batch_size: usize) -> usize {
+    match interface {
+        WriteInterface::Put => 1,
+        WriteInterface::BatchPut | WriteInterface::BatchPutFrom => batch_size,
+    }
+}
+
+fn verify_read_width(interface: ReadInterface, batch_size: usize) -> usize {
+    match interface {
+        ReadInterface::Get => 1,
+        ReadInterface::BatchGet | ReadInterface::BatchGetInto => batch_size,
+    }
+}
+
+fn with_registered_buffer<T, F>(client: &StoreClient, size: usize, f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut [u8]) -> Result<T, String>,
+{
+    let mut storage = vec![0u8; size];
+    client
+        .register_buffer(storage.as_mut_ptr().cast(), storage.len())
+        .map_err(|error| error.to_string())?;
+    let result = f(storage.as_mut_slice());
+    if let Err(error) = client.unregister_buffer(storage.as_mut_ptr().cast(), storage.len()) {
+        warn!("verify unregister_buffer failed during cleanup: {error}");
+    }
+    result
+}
+
+fn execute_verify_write(
+    writer: &StoreClient,
+    interface: WriteInterface,
+    requests: &[VerifyPut<'_>],
+) -> Result<(), String> {
+    match interface {
+        WriteInterface::Put => {
+            for request in requests {
+                writer
+                    .put_in_tenant(request.tenant, request.key, request.value)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        WriteInterface::BatchPut => {
+            let puts = requests
+                .iter()
+                .map(|request| PutRequest::new(request.key, request.value).tenant(request.tenant))
+                .collect::<Vec<_>>();
+            writer.batch_put(&puts).map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        WriteInterface::BatchPutFrom => {
+            let total_bytes = requests.iter().map(|request| request.value.len()).sum();
+            with_registered_buffer(writer, total_bytes, |storage| {
+                let mut offset = 0usize;
+                let puts = requests
+                    .iter()
+                    .map(|request| {
+                        let start = offset;
+                        let end = start + request.value.len();
+                        storage[start..end].copy_from_slice(request.value);
+                        offset = end;
+                        PutFromRequest::new(
+                            request.key,
+                            unsafe { storage.as_ptr().add(start).cast() },
+                            request.value.len(),
+                        )
+                        .tenant(request.tenant)
+                    })
+                    .collect::<Vec<_>>();
+                writer
+                    .batch_put_from(&puts)
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+        }
+    }
+}
+
+fn execute_verify_read(
+    reader: &StoreClient,
+    interface: ReadInterface,
+    value_size: usize,
+    requests: &[VerifyGet<'_>],
+) -> Result<Vec<Vec<u8>>, String> {
+    match interface {
+        ReadInterface::Get => requests
+            .iter()
+            .map(|request| {
+                reader
+                    .get_in_tenant(request.tenant, request.key)
+                    .map_err(|error| error.to_string())
+            })
+            .collect(),
+        ReadInterface::BatchGet => {
+            let objects = requests
+                .iter()
+                .map(|request| ObjectRef::new(request.key).tenant(request.tenant))
+                .collect::<Vec<_>>();
+            reader
+                .batch_get(&objects)
+                .map_err(|error| error.to_string())
+        }
+        ReadInterface::BatchGetInto => {
+            let mut buffers = requests
+                .iter()
+                .map(|_| vec![0u8; value_size])
+                .collect::<Vec<_>>();
+            let mut gets = requests
+                .iter()
+                .zip(buffers.iter_mut())
+                .map(|(request, buffer)| {
+                    GetRequest::new(request.key, buffer.as_mut_slice()).tenant(request.tenant)
+                })
+                .collect::<Vec<_>>();
+            let sizes = reader
+                .batch_get_into(&mut gets)
+                .map_err(|error| error.to_string())?;
+            for (request, (buffer, size)) in requests.iter().zip(buffers.iter_mut().zip(sizes)) {
+                if size != value_size {
+                    return Err(format!(
+                        "batch_get_into returned {size} bytes for key {}, expected {value_size}",
+                        request.key
+                    ));
+                }
+                buffer.truncate(size);
+            }
+            Ok(buffers)
+        }
+    }
+}
+
+fn write_verify_all(
+    writer: &StoreClient,
+    interface: WriteInterface,
+    batch_size: usize,
+    requests: &[VerifyPut<'_>],
+) -> Result<(), String> {
+    let width = verify_write_width(interface, batch_size);
+    for chunk in requests.chunks(width) {
+        execute_verify_write(writer, interface, chunk)?;
+    }
+    Ok(())
+}
+
+fn read_verify_all(
+    reader: &StoreClient,
+    interface: ReadInterface,
+    batch_size: usize,
+    value_size: usize,
+    requests: &[VerifyGet<'_>],
+) -> Result<Vec<Vec<u8>>, String> {
+    let width = verify_read_width(interface, batch_size);
+    let mut values = Vec::with_capacity(requests.len());
+    for chunk in requests.chunks(width) {
+        values.extend(execute_verify_read(reader, interface, value_size, chunk)?);
+    }
+    Ok(values)
+}
+
 pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut cluster = BenchCluster::new(&global, 1, 1)?;
 
@@ -38,6 +212,8 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
     let batch_size = args.batch_size;
     let tenant = global.tenant.clone();
     let seed = global.seed;
+    let write_interface = args.write_interface;
+    let read_interface = args.read_interface;
 
     let mut results = Vec::new();
 
@@ -45,12 +221,34 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
     {
         let writer = unsafe { &*(writer_addr as *const StoreClient) };
         let reader = unsafe { &*(reader_addr as *const StoreClient) };
+        let tenant = tenant.clone();
         results.push(run_check("single-round-trip", move || {
             let key = make_key("verify-single", 0, 0);
             let s = make_seed(seed, &key, 0);
             let value = payload(&s, value_size);
-            writer.put(&key, &value).map_err(|e| e.to_string())?;
-            let got = reader.get(&key).map_err(|e| e.to_string())?;
+            write_verify_all(
+                writer,
+                write_interface,
+                batch_size,
+                &[VerifyPut {
+                    tenant: &tenant,
+                    key: &key,
+                    value: &value,
+                }],
+            )?;
+            let got = read_verify_all(
+                reader,
+                read_interface,
+                batch_size,
+                value_size,
+                &[VerifyGet {
+                    tenant: &tenant,
+                    key: &key,
+                }],
+            )?
+            .into_iter()
+            .next()
+            .expect("single read should return one value");
             ensure_payload("single-round-trip", &value, &got)
         }));
     }
@@ -59,11 +257,21 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
     {
         let writer = unsafe { &*(writer_addr as *const StoreClient) };
         let reader = unsafe { &*(reader_addr as *const StoreClient) };
+        let tenant = tenant.clone();
         results.push(run_check("get-into-buffer", move || {
             let key = make_key("verify-get-into", 0, 0);
             let s = make_seed(seed, &key, 0);
             let value = payload(&s, value_size);
-            writer.put(&key, &value).map_err(|e| e.to_string())?;
+            write_verify_all(
+                writer,
+                write_interface,
+                batch_size,
+                &[VerifyPut {
+                    tenant: &tenant,
+                    key: &key,
+                    value: &value,
+                }],
+            )?;
             let mut buf = vec![0u8; value_size];
             let size = reader.get_into(&key, &mut buf).map_err(|e| e.to_string())?;
             if size != value_size {
@@ -88,15 +296,27 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
                 .iter()
                 .map(|k| payload(&make_seed(seed, k, 0), value_size))
                 .collect();
-            let puts: Vec<PutRequest<'_>> = keys
+            let puts: Vec<VerifyPut<'_>> = keys
                 .iter()
                 .zip(values.iter())
-                .map(|(k, v)| PutRequest::new(k, v).tenant(&tenant))
+                .map(|(k, v)| VerifyPut {
+                    tenant: &tenant,
+                    key: k,
+                    value: v,
+                })
                 .collect();
-            writer.batch_put(&puts).map_err(|e| e.to_string())?;
-            for (key, expected) in keys.iter().zip(values.iter()) {
-                let got = reader.get(key).map_err(|e| e.to_string())?;
-                ensure_payload("batch-get", expected, &got)?;
+            let gets: Vec<VerifyGet<'_>> = keys
+                .iter()
+                .map(|key| VerifyGet {
+                    tenant: &tenant,
+                    key,
+                })
+                .collect();
+            write_verify_all(writer, write_interface, batch_size, &puts)?;
+            let got_values =
+                read_verify_all(reader, read_interface, batch_size, value_size, &gets)?;
+            for (expected, got) in values.iter().zip(got_values.iter()) {
+                ensure_payload("batch-get", expected, got)?;
             }
             Ok(())
         }));
@@ -106,11 +326,21 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
     {
         let writer = unsafe { &*(writer_addr as *const StoreClient) };
         let reader = unsafe { &*(reader_addr as *const StoreClient) };
+        let tenant = tenant.clone();
         results.push(run_check("is-exist", move || {
             let key = make_key("verify-exist", 0, 0);
             let s = make_seed(seed, &key, 0);
             let value = payload(&s, value_size);
-            writer.put(&key, &value).map_err(|e| e.to_string())?;
+            write_verify_all(
+                writer,
+                write_interface,
+                batch_size,
+                &[VerifyPut {
+                    tenant: &tenant,
+                    key: &key,
+                    value: &value,
+                }],
+            )?;
             let exists = reader.is_exist(&key).map_err(|e| e.to_string())?;
             if !exists {
                 return Err(format!("is_exist returned false for key {key} after put"));
@@ -133,20 +363,31 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
             .collect();
         // Write phase
         let write_ok = run_check("multi-key-write", || {
-            for (key, value) in &pairs {
-                let req = PutRequest::new(key, value).tenant(&tenant);
-                writer.batch_put(&[req]).map_err(|e| e.to_string())?;
-            }
-            Ok(())
+            let writes = pairs
+                .iter()
+                .map(|(key, value)| VerifyPut {
+                    tenant: &tenant,
+                    key,
+                    value,
+                })
+                .collect::<Vec<_>>();
+            write_verify_all(writer, write_interface, batch_size, &writes)
         });
+        let reads = pairs
+            .iter()
+            .map(|(key, _)| VerifyGet {
+                tenant: &tenant,
+                key,
+            })
+            .collect::<Vec<_>>();
+        let expected_values = pairs.iter().map(|(_, value)| value).collect::<Vec<_>>();
         results.push(write_ok);
-        // Heartbeat between phases
         cluster.heartbeat_all().ok();
-        // Read phase
         results.push(run_check("multi-key-read", move || {
-            for (key, expected) in &pairs {
-                let got = reader.get(key).map_err(|e| e.to_string())?;
-                ensure_payload("multi-key", expected, &got)?;
+            let got_values =
+                read_verify_all(reader, read_interface, batch_size, value_size, &reads)?;
+            for (expected, got) in expected_values.iter().zip(got_values.iter()) {
+                ensure_payload("multi-key", expected, got)?;
             }
             Ok(())
         }));
@@ -163,11 +404,31 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
             for gen in 0..64usize {
                 let s = make_seed(seed, &key, gen as u64);
                 let value = payload(&s, value_size);
-                let req = PutRequest::new(&key, &value).tenant(&tenant);
-                writer.batch_put(&[req]).map_err(|e| e.to_string())?;
+                write_verify_all(
+                    writer,
+                    write_interface,
+                    batch_size,
+                    &[VerifyPut {
+                        tenant: &tenant,
+                        key: &key,
+                        value: &value,
+                    }],
+                )?;
                 last_value = value;
             }
-            let got = reader.get(&key).map_err(|e| e.to_string())?;
+            let got = read_verify_all(
+                reader,
+                read_interface,
+                batch_size,
+                value_size,
+                &[VerifyGet {
+                    tenant: &tenant,
+                    key: &key,
+                }],
+            )?
+            .into_iter()
+            .next()
+            .expect("overwrite read should return one value");
             ensure_payload("overwrite", &last_value, &got)
         }));
     }
@@ -181,16 +442,44 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
             let key = make_key("verify-delete", 0, 0);
             let s = make_seed(seed, &key, 0);
             let value = payload(&s, value_size);
-            let req = PutRequest::new(&key, &value).tenant(&tenant);
-            writer.batch_put(&[req]).map_err(|e| e.to_string())?;
+            write_verify_all(
+                writer,
+                write_interface,
+                batch_size,
+                &[VerifyPut {
+                    tenant: &tenant,
+                    key: &key,
+                    value: &value,
+                }],
+            )?;
             writer.remove(&key, false).map_err(|e| e.to_string())?;
             let exists = reader.is_exist(&key).map_err(|e| e.to_string())?;
             if exists {
                 return Err(format!("is_exist returned true for key {key} after remove"));
             }
-            let req2 = PutRequest::new(&key, &value).tenant(&tenant);
-            writer.batch_put(&[req2]).map_err(|e| e.to_string())?;
-            let got = reader.get(&key).map_err(|e| e.to_string())?;
+            write_verify_all(
+                writer,
+                write_interface,
+                batch_size,
+                &[VerifyPut {
+                    tenant: &tenant,
+                    key: &key,
+                    value: &value,
+                }],
+            )?;
+            let got = read_verify_all(
+                reader,
+                read_interface,
+                batch_size,
+                value_size,
+                &[VerifyGet {
+                    tenant: &tenant,
+                    key: &key,
+                }],
+            )?
+            .into_iter()
+            .next()
+            .expect("delete-reclaim read should return one value");
             ensure_payload("delete-reclaim-re-put", &value, &got)
         }));
     }
@@ -206,20 +495,34 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
             let tenant_b = format!("{tenant}-b");
             let value_a = payload("tenant-a-data", value_size);
             let value_b = payload("tenant-b-data", value_size);
-            writer
-                .batch_put(&[PutRequest::new(key, &value_a).tenant(&tenant_a)])
-                .map_err(|e| e.to_string())?;
-            writer
-                .batch_put(&[PutRequest::new(key, &value_b).tenant(&tenant_b)])
-                .map_err(|e| e.to_string())?;
-            let got_a = reader
-                .get_in_tenant(&tenant_a, key)
-                .map_err(|e| e.to_string())?;
-            let got_b = reader
-                .get_in_tenant(&tenant_b, key)
-                .map_err(|e| e.to_string())?;
-            ensure_payload("tenant-a", &value_a, &got_a)?;
-            ensure_payload("tenant-b", &value_b, &got_b)?;
+            let writes = [
+                VerifyPut {
+                    tenant: &tenant_a,
+                    key,
+                    value: &value_a,
+                },
+                VerifyPut {
+                    tenant: &tenant_b,
+                    key,
+                    value: &value_b,
+                },
+            ];
+            write_verify_all(writer, write_interface, batch_size, &writes)?;
+            let reads = [
+                VerifyGet {
+                    tenant: &tenant_a,
+                    key,
+                },
+                VerifyGet {
+                    tenant: &tenant_b,
+                    key,
+                },
+            ];
+            let got = read_verify_all(reader, read_interface, batch_size, value_size, &reads)?;
+            let got_a = &got[0];
+            let got_b = &got[1];
+            ensure_payload("tenant-a", &value_a, got_a)?;
+            ensure_payload("tenant-b", &value_b, got_b)?;
             if got_a == got_b {
                 return Err("tenant isolation failed: both tenants returned same data".to_string());
             }
@@ -241,5 +544,27 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
         Err(format!("{failed} verification check(s) failed").into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::{ReadInterface, WriteInterface};
+
+    #[test]
+    fn verify_single_item_interfaces_ignore_batch_size() {
+        assert_eq!(super::verify_write_width(WriteInterface::Put, 8), 1);
+        assert_eq!(super::verify_read_width(ReadInterface::Get, 8), 1);
+    }
+
+    #[test]
+    fn verify_batch_interfaces_use_batch_size() {
+        assert_eq!(super::verify_write_width(WriteInterface::BatchPut, 8), 8);
+        assert_eq!(super::verify_read_width(ReadInterface::BatchGet, 8), 8);
+        assert_eq!(
+            super::verify_write_width(WriteInterface::BatchPutFrom, 8),
+            8
+        );
+        assert_eq!(super::verify_read_width(ReadInterface::BatchGetInto, 8), 8);
     }
 }

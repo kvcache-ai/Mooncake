@@ -305,9 +305,11 @@ Quick start:
 
 ```bash
 # Correctness check
+# Defaults use batch_put + batch_get; override interfaces when needed.
 mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 verify
 
-# 30-second mixed put/get benchmark, 8 concurrent workers
+# 30-second mixed benchmark, 8 concurrent workers
+# Defaults measure batch_put + batch_get; override interfaces when needed.
 # Start storage=true daemons first, and pass the same --keyspace they use
 # when you are not using the default `mc/store-rs/v1` namespace.
 mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 bench \
