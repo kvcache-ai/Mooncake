@@ -16,8 +16,10 @@ namespace mooncake {
 
 namespace {
 
-constexpr size_t kP2PPoolBytes =
-    static_cast<size_t>(kP2PPoolNumChunks) * kP2PChunkSize;
+size_t getEnv_size_t(const char* name, size_t default_val) {
+    const char* val = std::getenv(name);
+    return val ? std::strtoull(val, nullptr, 10) : default_val;
+}
 
 void setCudaDeviceIfNeeded(bool is_cpu, int cuda_device_index,
                            const char* context) {
@@ -32,6 +34,129 @@ void setCudaDeviceIfNeeded(bool is_cpu, int cuda_device_index,
 }
 
 }  // namespace
+
+void P2PChunkPool::init(void* base_addr, size_t chunk_size,
+                        uint32_t num_chunks) {
+    base_addr_ = base_addr;
+    chunk_size_ = chunk_size;
+    free_stack_.clear();
+    free_stack_.reserve(num_chunks);
+    for (uint32_t idx = 0; idx < num_chunks; ++idx) {
+        free_stack_.push_back(static_cast<uint8_t*>(base_addr_) +
+                              (num_chunks - 1 - idx) * chunk_size_);
+    }
+}
+
+void* P2PChunkPool::acquire() {
+    if (free_stack_.empty()) {
+        return nullptr;
+    }
+    void* ptr = free_stack_.back();
+    free_stack_.pop_back();
+    return ptr;
+}
+
+void P2PChunkPool::release(void* ptr) { free_stack_.push_back(ptr); }
+
+// Consumer-side reliable read.
+//
+// 1. Load header_token with acquire semantics.
+// 2. If it is kInvalidControlToken the slot is empty -> fail.
+// 3. Optimistically copy the payload (these plain loads may be torn).
+// 4. Issue an acquire fence so the payload reads cannot be reordered past
+//    the footer load that follows.
+// 5. Load footer_token.
+// 6. Accept the payload only when header == footer.
+bool PublishSlot::tryLoad(uint64_t& out_recv_addr, uint32_t& out_chunk_len,
+                          uint32_t& out_generation,
+                          uint32_t& out_sequence) const {
+    uint64_t h = std::atomic_ref(header_token).load(std::memory_order_acquire);
+    if (h == kInvalidControlToken) return false;
+
+    // Optimistic payload copy – may be torn if the NIC is still writing.
+    uint64_t addr = recv_addr;
+    uint32_t len = chunk_len;
+
+    // Avoid moving payload reads below the footer check.
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    uint64_t f = std::atomic_ref(footer_token).load(std::memory_order_relaxed);
+
+    if (h == f) {
+        out_recv_addr = addr;
+        out_chunk_len = len;
+        out_generation = static_cast<uint32_t>(h >> 32);
+        out_sequence = static_cast<uint32_t>(h);
+        return true;
+    }
+    // Torn write – caller retries next poll.
+    return false;
+}
+
+// Producer-side reliable publish.
+//
+// On the local CPU the store order matters:
+//   payload -> footer (relaxed) -> header (release).
+// The release store to header_token guarantees that every prior store is
+// visible to any consumer that sees the new header value.
+void PublishSlot::publish(uint32_t gen, uint32_t seq, uint64_t addr,
+                          uint32_t len) {
+    uint64_t new_token = makeControlToken(gen, seq);
+
+    recv_addr = addr;
+    chunk_len = len;
+
+    // Write footer first so it is never ahead of the header.
+    std::atomic_ref(footer_token).store(new_token, std::memory_order_relaxed);
+    // Release the header last
+    std::atomic_ref(header_token).store(new_token, std::memory_order_release);
+}
+
+void PublishSlot::reset() {
+    recv_addr = 0;
+    chunk_len = 0;
+    uint64_t inv = kInvalidControlToken;
+    std::atomic_ref(footer_token).store(inv, std::memory_order_relaxed);
+    std::atomic_ref(header_token).store(inv, std::memory_order_release);
+}
+
+// See PublishSlot::tryLoad() for the detailed description.
+bool CompletionSlot::tryLoad(uint32_t& out_chunk_len, uint32_t& out_generation,
+                             uint32_t& out_sequence) const {
+    uint64_t h = std::atomic_ref(header_token).load(std::memory_order_acquire);
+    if (h == kInvalidControlToken) return false;
+
+    uint32_t len = chunk_len;
+
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    uint64_t f = std::atomic_ref(footer_token).load(std::memory_order_relaxed);
+
+    if (h == f) {
+        out_chunk_len = len;
+        out_generation = static_cast<uint32_t>(h >> 32);
+        out_sequence = static_cast<uint32_t>(h);
+        return true;
+    }
+    return false;
+}
+
+// See PublishSlot::publish() for the detailed description.
+void CompletionSlot::publish(uint32_t gen, uint32_t seq, uint32_t len) {
+    uint64_t new_token = makeControlToken(gen, seq);
+
+    chunk_len = len;
+
+    std::atomic_ref(footer_token).store(new_token, std::memory_order_relaxed);
+    std::atomic_ref(header_token).store(new_token, std::memory_order_release);
+}
+
+void CompletionSlot::reset() {
+    chunk_len = 0;
+    uint64_t inv = kInvalidControlToken;
+    std::atomic_ref(footer_token).store(inv, std::memory_order_relaxed);
+    std::atomic_ref(header_token).store(inv, std::memory_order_release);
+}
 
 P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
     : engine_(engine),
@@ -66,6 +191,11 @@ void P2PProxy::bindMeta(const std::shared_ptr<TransferGroupMeta>& meta) {
     meta_ = meta;
 }
 
+void P2PProxy::extendGroupSizeTo(int new_size) {
+    TORCH_CHECK(new_size >= size_, "extendGroupSizeTo: new_size < size_");
+    size_ = new_size;
+}
+
 // Allocate fixed-size SendPool, RecvPool and control regions.
 void P2PProxy::allocateResources() {
     TORCH_CHECK(engine_, "P2PProxy engine is null.");
@@ -80,46 +210,51 @@ void P2PProxy::allocateResources() {
     TORCH_CHECK(static_cast<size_t>(size_) <= kMaxNumRanks,
                 "P2PProxy group size exceeds kMaxNumRanks: ", size_);
 
+    // Parse pool configuration from environment.
+    pool_bytes_ = getEnv_size_t("MOONCAKE_P2P_POOL_SIZE", kDefaultPoolSize);
+    chunk_size_ = getEnv_size_t("MOONCAKE_P2P_CHUNK_SIZE", kDefaultChunkSize);
+    TORCH_CHECK(
+        pool_bytes_ % chunk_size_ == 0,
+        "Invalid pool size and chunk size (pool_bytes_ % chunk_size_ != 0)");
+    num_chunks_ = pool_bytes_ / chunk_size_;
+
     if (is_cpu_) {
-        resources_.send_pool_base_ = std::malloc(kP2PPoolBytes);
+        resources_.send_pool_base_ = std::malloc(pool_bytes_);
         TORCH_CHECK(resources_.send_pool_base_ != nullptr,
                     "Failed to allocate CPU P2P send pool");
         int rc = engine_->registerLocalMemory(resources_.send_pool_base_,
-                                              kP2PPoolBytes, location_);
+                                              pool_bytes_, location_);
         TORCH_CHECK(rc == 0, "Failed to register CPU P2P send pool");
 
-        resources_.recv_pool_base_ = std::malloc(kP2PPoolBytes);
+        resources_.recv_pool_base_ = std::malloc(pool_bytes_);
         TORCH_CHECK(resources_.recv_pool_base_ != nullptr,
                     "Failed to allocate CPU P2P recv pool");
         rc = engine_->registerLocalMemory(resources_.recv_pool_base_,
-                                          kP2PPoolBytes, location_);
+                                          pool_bytes_, location_);
         TORCH_CHECK(rc == 0, "Failed to register CPU P2P recv pool");
     } else {
         setCudaDeviceIfNeeded(
             is_cpu_, cuda_device_index_,
             "P2PProxy AllocateResources cudaSetDevice failed");
-        cudaError_t err =
-            cudaMalloc(&resources_.send_pool_base_, kP2PPoolBytes);
+        cudaError_t err = cudaMalloc(&resources_.send_pool_base_, pool_bytes_);
         TORCH_CHECK(
             err == cudaSuccess,
             "Failed to allocate CUDA P2P send pool: ", cudaGetErrorString(err));
         int rc = engine_->registerLocalMemory(resources_.send_pool_base_,
-                                              kP2PPoolBytes, location_);
+                                              pool_bytes_, location_);
         TORCH_CHECK(rc == 0, "Failed to register CUDA P2P send pool");
 
-        err = cudaMalloc(&resources_.recv_pool_base_, kP2PPoolBytes);
+        err = cudaMalloc(&resources_.recv_pool_base_, pool_bytes_);
         TORCH_CHECK(
             err == cudaSuccess,
             "Failed to allocate CUDA P2P recv pool: ", cudaGetErrorString(err));
         rc = engine_->registerLocalMemory(resources_.recv_pool_base_,
-                                          kP2PPoolBytes, location_);
+                                          pool_bytes_, location_);
         TORCH_CHECK(rc == 0, "Failed to register CUDA P2P recv pool");
     }
 
-    send_pool_.init(resources_.send_pool_base_, kP2PChunkSize,
-                    kP2PPoolNumChunks);
-    recv_pool_.init(resources_.recv_pool_base_, kP2PChunkSize,
-                    kP2PPoolNumChunks);
+    send_pool_.init(resources_.send_pool_base_, chunk_size_, num_chunks_);
+    recv_pool_.init(resources_.recv_pool_base_, chunk_size_, num_chunks_);
 
     const size_t ctrl_slots =
         kMaxNumRanks * static_cast<size_t>(kP2PControlRingSize);
@@ -542,7 +677,7 @@ bool P2PProxy::tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane) {
     }
 
     const uint32_t chunk_len = static_cast<uint32_t>(std::min<uint64_t>(
-        kP2PChunkSize, op_ctx.total_bytes_ - op_ctx.bytes_advertised_));
+        chunk_size_, op_ctx.total_bytes_ - op_ctx.bytes_advertised_));
     const uint64_t seq = lane.publish_issue_seq_;
     const uint64_t remote_publish_offset =
         getRemotePublishSlot(op_ctx.peer_rank_, seq);
@@ -712,7 +847,7 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
 
     const uint32_t expected_chunk_len =
         static_cast<uint32_t>(std::min<uint64_t>(
-            kP2PChunkSize, op_ctx.total_bytes_ - op_ctx.bytes_staged_));
+            chunk_size_, op_ctx.total_bytes_ - op_ctx.bytes_staged_));
     TORCH_CHECK(chunk_len <= expected_chunk_len,
                 "P2P send got invalid chunk_len in publish slot.");
 

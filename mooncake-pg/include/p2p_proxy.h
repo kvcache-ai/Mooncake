@@ -20,7 +20,7 @@
 
 namespace mooncake {
 
-// Memory layout of one P2PProxy instance:
+// Memory layout of one P2PProxy instance (chunk_size=8MiB, num_chunks=32):
 //
 //   +---------------------------------------------------------+
 //   |  SendPool  (32 x 8 MiB = 256 MiB)                       |
@@ -77,9 +77,9 @@ namespace mooncake {
 //   Receiver: Advertise -> Poll Completion -> Copy-Out -> Free Chunk
 //
 // Concurrency rules:
-//   - All pool allocations are non-blocking (TryAlloc). If a pool is exhausted
-//     the step function returns false immediately and retries on the next
-//     polling iteration. This prevents deadlocks.
+//   - All pool allocations are non-blocking. If a pool is exhausted the step
+//     function returns false immediately and retries on the next polling
+//     iteration. This prevents deadlocks.
 //   - SendPool and RecvPool are strictly separated so that a deadlock where
 //     "all chunks are reserved for receiving and none are left for sending"
 //     can never happen.
@@ -161,9 +161,10 @@ namespace mooncake {
 //   +-----------------------+
 //
 // ---------------------------------------------------------------------------
-inline constexpr size_t kP2PChunkSize = 8u * 1024 * 1024;  // 8 MB
-inline constexpr uint32_t kP2PPoolNumChunks = 32;
 inline constexpr uint32_t kP2PControlRingSize = 64;
+// default config: pool_size=128M, chunk_size=16M, num_chunks=8
+inline constexpr uint64_t kDefaultPoolSize = 128u * 1024 * 1024;  // 128 M
+inline constexpr uint64_t kDefaultChunkSize = 16u * 1024 * 1024;  // 16 M
 
 // Single-word atomic publication token.
 // Combines generation and sequence to avoid torn reads.
@@ -204,69 +205,17 @@ struct alignas(64) PublishSlot {
     uint64_t footer_token = kInvalidControlToken;
 
    public:
-    // Consumer-side reliable read.
-    //
-    // 1. Load header_token with acquire semantics.
-    // 2. If it is kInvalidControlToken the slot is empty -> fail.
-    // 3. Optimistically copy the payload (these plain loads may be torn).
-    // 4. Issue an acquire fence so the payload reads cannot be reordered past
-    //    the footer load that follows.
-    // 5. Load footer_token.
-    // 6. Accept the payload only when header == footer.
+    // Consumer-side reliable read.  Returns true when a consistent slot is
+    // observed (header == footer != kInvalidControlToken).
     bool tryLoad(uint64_t& out_recv_addr, uint32_t& out_chunk_len,
-                 uint32_t& out_generation, uint32_t& out_sequence) const {
-        uint64_t h =
-            std::atomic_ref(header_token).load(std::memory_order_acquire);
-        if (h == kInvalidControlToken) return false;
+                 uint32_t& out_generation, uint32_t& out_sequence) const;
 
-        // Optimistic payload copy – may be torn if the NIC is still writing.
-        uint64_t addr = recv_addr;
-        uint32_t len = chunk_len;
+    // Producer-side reliable publish.  Writes payload and footer first,
+    // then releases header so consumers see a consistent slot.
+    void publish(uint32_t gen, uint32_t seq, uint64_t addr, uint32_t len);
 
-        // Avoid moving payload reads below the footer check.
-        std::atomic_thread_fence(std::memory_order_acquire);
-
-        uint64_t f =
-            std::atomic_ref(footer_token).load(std::memory_order_relaxed);
-
-        if (h == f) {
-            out_recv_addr = addr;
-            out_chunk_len = len;
-            out_generation = static_cast<uint32_t>(h >> 32);
-            out_sequence = static_cast<uint32_t>(h);
-            return true;
-        }
-        // Torn write – caller retries next poll.
-        return false;
-    }
-
-    // Producer-side reliable publish.
-    //
-    // On the local CPU the store order matters:
-    //   payload -> footer (relaxed) -> header (release).
-    // The release store to header_token guarantees that every prior store is
-    // visible to any consumer that sees the new header value.
-    void publish(uint32_t gen, uint32_t seq, uint64_t addr, uint32_t len) {
-        uint64_t new_token = makeControlToken(gen, seq);
-
-        recv_addr = addr;
-        chunk_len = len;
-
-        // Write footer first so it is never ahead of the header.
-        std::atomic_ref(footer_token)
-            .store(new_token, std::memory_order_relaxed);
-        // Release the header last
-        std::atomic_ref(header_token)
-            .store(new_token, std::memory_order_release);
-    }
-
-    void reset() {
-        recv_addr = 0;
-        chunk_len = 0;
-        uint64_t inv = kInvalidControlToken;
-        std::atomic_ref(footer_token).store(inv, std::memory_order_relaxed);
-        std::atomic_ref(header_token).store(inv, std::memory_order_release);
-    }
+    // Reset both tokens to kInvalidControlToken.
+    void reset();
 };
 
 // CompletionSlot Layout:
@@ -283,84 +232,36 @@ struct alignas(64) CompletionSlot {
     uint64_t footer_token = kInvalidControlToken;
 
    public:
-    // See PublishSlot::tryLoad() for the detailed description.
+    // See PublishSlot::tryLoad().
     bool tryLoad(uint32_t& out_chunk_len, uint32_t& out_generation,
-                 uint32_t& out_sequence) const {
-        uint64_t h =
-            std::atomic_ref(header_token).load(std::memory_order_acquire);
-        if (h == kInvalidControlToken) return false;
+                 uint32_t& out_sequence) const;
 
-        uint32_t len = chunk_len;
+    // See PublishSlot::publish().
+    void publish(uint32_t gen, uint32_t seq, uint32_t len);
 
-        std::atomic_thread_fence(std::memory_order_acquire);
-
-        uint64_t f =
-            std::atomic_ref(footer_token).load(std::memory_order_relaxed);
-
-        if (h == f) {
-            out_chunk_len = len;
-            out_generation = static_cast<uint32_t>(h >> 32);
-            out_sequence = static_cast<uint32_t>(h);
-            return true;
-        }
-        return false;
-    }
-
-    // See PublishSlot::publish() for the detailed description.
-    void publish(uint32_t gen, uint32_t seq, uint32_t len) {
-        uint64_t new_token = makeControlToken(gen, seq);
-
-        chunk_len = len;
-
-        std::atomic_ref(footer_token)
-            .store(new_token, std::memory_order_relaxed);
-        std::atomic_ref(header_token)
-            .store(new_token, std::memory_order_release);
-    }
-
-    void reset() {
-        chunk_len = 0;
-        uint64_t inv = kInvalidControlToken;
-        std::atomic_ref(footer_token).store(inv, std::memory_order_relaxed);
-        std::atomic_ref(header_token).store(inv, std::memory_order_release);
-    }
+    // Reset both tokens to kInvalidControlToken.
+    void reset();
 };
 
+// P2PChunkPool
+// No lock needed because it is only accessed by one worker thread.
 class P2PChunkPool {
    public:
     P2PChunkPool() = default;
 
-    void init(void* base_addr, size_t chunk_size, uint32_t num_chunks) {
-        base_addr_ = base_addr;
-        chunk_size_ = chunk_size;
-        free_stack_.clear();
-        free_stack_.reserve(num_chunks);
-        for (uint32_t idx = 0; idx < num_chunks; ++idx) {
-            free_stack_.push_back(static_cast<uint8_t*>(base_addr_) +
-                                  (num_chunks - 1 - idx) * chunk_size_);
-        }
-    }
+    // Initialize pool with given base address, chunk size and number of chunks.
+    void init(void* base_addr, size_t chunk_size, uint32_t num_chunks);
 
-    void* acquire() {
-        std::lock_guard<std::mutex> l(lock_);
-        if (free_stack_.empty()) {
-            return nullptr;
-        }
-        void* ptr = free_stack_.back();
-        free_stack_.pop_back();
-        return ptr;
-    }
+    // Acquire a free chunk. Returns nullptr if the pool is exhausted.
+    void* acquire();
 
-    void release(void* ptr) {
-        std::lock_guard<std::mutex> l(lock_);
-        free_stack_.push_back(ptr);
-    }
+    // Release a chunk back to the pool.
+    void release(void* ptr);
 
    private:
     void* base_addr_ = nullptr;
     size_t chunk_size_ = 0;
     std::vector<void*> free_stack_;
-    std::mutex lock_;
 };
 
 class P2PDeviceWorker;
@@ -406,6 +307,7 @@ class P2PProxy {
         return resources_.completion_region_;
     }
     void bindMeta(const std::shared_ptr<TransferGroupMeta>& meta);
+    void extendGroupSizeTo(int new_size);
 
     void enqueueSend(SendOp op);
     void enqueueRecv(RecvOp op);
@@ -659,6 +561,10 @@ class P2PProxy {
     std::chrono::milliseconds transfer_timeout_ms_{5000};  // 5s
     P2PResources resources_;
     bool resource_abandoned_{false};
+
+    size_t chunk_size_ = 0;
+    uint32_t num_chunks_ = 0;
+    size_t pool_bytes_ = 0;
 
     P2PChunkPool send_pool_;
     P2PChunkPool recv_pool_;

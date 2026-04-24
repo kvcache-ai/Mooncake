@@ -1043,6 +1043,7 @@ void MooncakeBackend::extendGroupSizeTo(int newSize) {
     tensor.slice(0, oldSize, newSize).fill_(1);
 
     connection_ctx_->extendGroupSizeTo(newSize);
+    p2p_proxy_->extendGroupSizeTo(newSize);
     // After extendGroupSizeTo, we don't `waitUntilNewRanksConnected` here
     // but do it in the first task. This enables client code to overlap
     // execution between `extendGroupSizeTo` and the first communication call.
