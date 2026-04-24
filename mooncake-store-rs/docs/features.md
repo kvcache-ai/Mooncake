@@ -107,8 +107,8 @@ For simpler bring-up or debugging, the runtime can store and resolve routes dire
 
 The current implementation also exposes admin-driven explicit route migration tasks for key-level `copy` and `move`.
 
-See [Route Migration 使用手册](./route-migration-usage.md) for
-operator-facing usage, request examples, and task semantics.
+See [Route Migration Guide](./route-migration-usage.md) for the current
+operator workflow, task semantics, and request examples.
 
 What it provides:
 
@@ -125,7 +125,7 @@ What it provides:
 Design boundary:
 
 - the admin queue is runtime memory only and does not recover across admin restart
-- the CLI is only an HTTP client for this queue; `migrate ...` commands must talk to a long-lived `mooncake-store-admin-server`
+- the CLI is only an HTTP client for this queue; `migrate ...` commands must talk to a long-lived `mooncake-store-admin server`
 - the authoritative durable state remains the object route, not the admin task record
 - retry is for executor loss or transient RPC failure, not for preserving a persistent migration backlog
 

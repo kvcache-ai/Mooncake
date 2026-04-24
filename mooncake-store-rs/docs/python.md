@@ -265,42 +265,6 @@ Port reminder:
 - cross-host real-mode deployments should set both a reachable `local_hostname` and a fixed `transport_rpc_port`
 - `local_hostname` may also be passed as `host:port`; the compatibility layer will split the port into `transport_rpc_port`
 
-## Run Route-Migration E2E
-
-Use the local route-migration e2e helper to validate end-to-end `query_route` /
-`get` correctness for explicit `move`, single-target `copy`, or multi-target
-`copy`.
-
-Examples:
-
-```bash
-./scripts/e2e/run-route-migration-e2e.sh
-./scripts/e2e/run-route-migration-e2e.sh move
-./scripts/e2e/run-route-migration-e2e.sh copy
-./scripts/e2e/run-route-migration-e2e.sh copy-multi
-```
-
-The script:
-
-- starts a local Redis metadata backend when needed
-- launches two or three standalone `mooncake-store-client` storage nodes
-- launches `mooncake-store-admin-server`
-- writes a seed key into the source segment
-- submits the task either through admin HTTP directly or through
-  `mooncake-store-admin --admin-url ...`
-- polls task status through the same operator surface
-- verifies final `query_route` shape and payload readability
-
-Important knobs:
-
-- `MC_STORE_RS_ROUTE_MIGRATION_MODE=move|copy|copy-multi`
-- `MC_STORE_RS_ROUTE_MIGRATION_SUBMITTER=http|cli`
-- `MC_STORE_RS_ROUTE_MIGRATION_LEASE_TTL_MS`
-- `MC_STORE_RS_ROUTE_MIGRATION_STORAGE_BYTES`
-- `MC_STORE_RS_ROUTE_MIGRATION_SCRATCH_BYTES`
-- `MC_STORE_RS_ROUTE_MIGRATION_REQUEST_TIMEOUT_MS`
-- `MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR`
-
 Heartbeat behavior:
 
 - timeout knobs now come from one shared helper across the standalone client, Python compatibility runtime, and dummy client
@@ -327,9 +291,9 @@ mooncake-store-admin \
 
 ## Admin HTTP Migration Tasks
 
-`mooncake-store-admin-server` now exposes an in-memory route-migration task queue over HTTP.
+`mooncake-store-admin server` exposes an in-memory route-migration task queue over HTTP.
 
-For operator-facing task submission and query examples, see
+For the operator workflow, task semantics, and request examples, see
 [Route Migration 使用手册](./route-migration-usage.md).
 
 The packaged `mooncake-store-admin` binary acts as an operator client for that
