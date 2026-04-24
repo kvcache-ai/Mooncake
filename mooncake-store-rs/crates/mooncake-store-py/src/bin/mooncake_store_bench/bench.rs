@@ -4,11 +4,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mooncake_store_client::{
-    MooncakeCompatibilityFacade, PutRequest, ReplicationPolicy, StoreClient,
+    GetRequest, MooncakeCompatibilityFacade, ObjectRef, PutFromRequest, PutRequest,
+    ReplicationPolicy, StoreClient,
 };
+use mooncake_store_core::{Result as StoreResult, StoreError};
 use tracing::{debug, info, warn};
 
-use crate::cli::{BenchArgs, BenchMode, GlobalArgs};
+use crate::cli::{BenchArgs, BenchMode, GlobalArgs, ReadInterface, WriteInterface};
 use crate::datagen::{make_key, make_seed, payload};
 use crate::latency::LatencyRecorder;
 use crate::reporter::BenchReport;
@@ -18,10 +20,31 @@ const HEARTBEAT_EVERY: usize = 64;
 const PREFILL_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const PREFILL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+fn is_heartbeat_tick(iteration: usize) -> bool {
+    iteration.checked_rem(HEARTBEAT_EVERY) == Some(0)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WorkerKeyShard {
     start: usize,
     count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct OperationTarget<'a> {
+    worker_id: usize,
+    shard: WorkerKeyShard,
+    key_offset: usize,
+    width: usize,
+    tenant: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct WriteOperation<'a> {
+    target: OperationTarget<'a>,
+    global_seed: u64,
+    iteration: u64,
+    value_size: usize,
 }
 
 fn worker_key_shard(worker_id: usize, concurrency: usize, key_space_size: usize) -> WorkerKeyShard {
@@ -39,6 +62,212 @@ fn worker_key_index(shard: WorkerKeyShard, offset: usize) -> usize {
 
 fn request_replication_policy(replica_count: usize) -> Option<ReplicationPolicy> {
     (replica_count > 1).then(|| ReplicationPolicy::default().replica_count(replica_count))
+}
+
+fn operation_keys(target: OperationTarget<'_>) -> Vec<String> {
+    (0..target.width.max(1))
+        .map(|offset| {
+            make_key(
+                "bench",
+                target.worker_id,
+                worker_key_index(target.shard, target.key_offset + offset),
+            )
+        })
+        .collect()
+}
+
+fn operation_objects<'a>(keys: &'a [String], tenant: &'a str) -> Vec<ObjectRef<'a>> {
+    keys.iter()
+        .map(|key| ObjectRef::new(key).tenant(tenant))
+        .collect()
+}
+
+fn write_operation_width(interface: WriteInterface, batch_size: usize) -> usize {
+    match interface {
+        WriteInterface::Put => 1,
+        WriteInterface::BatchPut | WriteInterface::BatchPutFrom => batch_size,
+    }
+}
+
+fn read_operation_width(interface: ReadInterface, batch_size: usize) -> usize {
+    match interface {
+        ReadInterface::Get => 1,
+        ReadInterface::BatchGet | ReadInterface::BatchGetInto => batch_size,
+    }
+}
+
+struct RegisteredWriteBuffers<'a> {
+    client: &'a StoreClient,
+    storage: Vec<u8>,
+    slot_size: usize,
+}
+
+impl<'a> RegisteredWriteBuffers<'a> {
+    fn new(
+        client: &'a StoreClient,
+        slots: usize,
+        slot_size: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let total_bytes = slots.saturating_mul(slot_size);
+        let mut storage = vec![0u8; total_bytes];
+        client.register_buffer(storage.as_mut_ptr().cast(), storage.len())?;
+        Ok(Self {
+            client,
+            storage,
+            slot_size,
+        })
+    }
+
+    fn fill_slot(&mut self, slot: usize, value: &[u8]) {
+        let start = slot * self.slot_size;
+        let end = start + self.slot_size;
+        self.storage[start..end].copy_from_slice(value);
+    }
+
+    fn request<'b>(
+        &'b self,
+        slot: usize,
+        key: &'b str,
+        tenant: &'b str,
+        policy: Option<&ReplicationPolicy>,
+    ) -> PutFromRequest<'b> {
+        let start = slot * self.slot_size;
+        let request = PutFromRequest::new(
+            key,
+            unsafe { self.storage.as_ptr().add(start).cast() },
+            self.slot_size,
+        )
+        .tenant(tenant);
+        if let Some(policy) = policy {
+            request.replication(policy.clone())
+        } else {
+            request
+        }
+    }
+}
+
+impl Drop for RegisteredWriteBuffers<'_> {
+    fn drop(&mut self) {
+        if self.storage.is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .client
+            .unregister_buffer(self.storage.as_mut_ptr().cast(), self.storage.len())
+        {
+            warn!("bench unregister_buffer failed during cleanup: {error}");
+        }
+    }
+}
+
+struct ReadBuffers {
+    slots: Vec<Vec<u8>>,
+}
+
+impl ReadBuffers {
+    fn new(slots: usize, slot_size: usize) -> Self {
+        Self {
+            slots: (0..slots).map(|_| vec![0u8; slot_size]).collect(),
+        }
+    }
+
+    fn requests<'a>(&'a mut self, keys: &'a [String], tenant: &'a str) -> Vec<GetRequest<'a>> {
+        keys.iter()
+            .zip(self.slots.iter_mut())
+            .map(|(key, buffer)| GetRequest::new(key, buffer.as_mut_slice()).tenant(tenant))
+            .collect()
+    }
+}
+
+fn execute_write(
+    writer: &StoreClient,
+    interface: WriteInterface,
+    operation: WriteOperation<'_>,
+    policy: Option<&ReplicationPolicy>,
+    batch_put_from_buffers: Option<&mut RegisteredWriteBuffers<'_>>,
+) -> StoreResult<u64> {
+    let keys = operation_keys(operation.target);
+    match interface {
+        WriteInterface::Put => {
+            let key = &keys[0];
+            let value = payload(
+                &make_seed(operation.global_seed, key, operation.iteration),
+                operation.value_size,
+            );
+            if let Some(policy) = policy {
+                writer.put_in_tenant_with_policy(operation.target.tenant, key, &value, policy)?;
+            } else {
+                writer.put_in_tenant(operation.target.tenant, key, &value)?;
+            }
+            Ok(value.len() as u64)
+        }
+        WriteInterface::BatchPut => {
+            let values: Vec<Vec<u8>> = keys
+                .iter()
+                .map(|key| {
+                    payload(
+                        &make_seed(operation.global_seed, key, operation.iteration),
+                        operation.value_size,
+                    )
+                })
+                .collect();
+            let requests: Vec<PutRequest<'_>> = keys
+                .iter()
+                .zip(values.iter())
+                .map(|(key, value)| put_request(key, value, operation.target.tenant, policy))
+                .collect();
+            writer.batch_put(&requests)?;
+            Ok(values.iter().map(|value| value.len() as u64).sum())
+        }
+        WriteInterface::BatchPutFrom => {
+            let Some(buffers) = batch_put_from_buffers else {
+                return Err(StoreError::InvalidState(
+                    "batch_put_from buffers are not initialized".to_string(),
+                ));
+            };
+            for (slot, key) in keys.iter().enumerate() {
+                let value = payload(
+                    &make_seed(operation.global_seed, key, operation.iteration),
+                    operation.value_size,
+                );
+                buffers.fill_slot(slot, &value);
+            }
+            let requests = keys
+                .iter()
+                .enumerate()
+                .map(|(slot, key)| buffers.request(slot, key, operation.target.tenant, policy))
+                .collect::<Vec<_>>();
+            writer.batch_put_from(&requests)?;
+            Ok((requests.len() * operation.value_size) as u64)
+        }
+    }
+}
+
+fn execute_read(
+    reader: &StoreClient,
+    interface: ReadInterface,
+    target: OperationTarget<'_>,
+    batch_get_into_buffers: Option<&mut ReadBuffers>,
+) -> StoreResult<u64> {
+    let keys = operation_keys(target);
+    match interface {
+        ReadInterface::Get => reader
+            .get_in_tenant(target.tenant, &keys[0])
+            .map(|value| value.len() as u64),
+        ReadInterface::BatchGet => reader
+            .batch_get(&operation_objects(&keys, target.tenant))
+            .map(|values| values.iter().map(|value| value.len() as u64).sum()),
+        ReadInterface::BatchGetInto => {
+            let Some(buffers) = batch_get_into_buffers else {
+                return Err(StoreError::InvalidState(
+                    "batch_get_into buffers are not initialized".to_string(),
+                ));
+            };
+            let mut requests = buffers.requests(&keys, target.tenant);
+            let sizes = reader.batch_get_into(&mut requests)?;
+            Ok(sizes.iter().map(|size| *size as u64).sum())
+        }
+    }
 }
 
 fn put_request<'a>(
@@ -107,7 +336,9 @@ pub fn run_bench(
     let tenant = global.tenant.clone();
     let warmup = args.warmup;
     let replica_count = global.replica_count;
-    let mode = args.mode.clone();
+    let mode = args.mode;
+    let write_interface = args.write_interface;
+    let read_interface = args.read_interface;
     let report_interval = Duration::from_secs(args.report_interval);
 
     let counters = Arc::new(LiveCounters::new());
@@ -184,7 +415,7 @@ pub fn run_bench(
         for worker_id in 0..concurrency {
             let writer_ptr = writer_ptrs[worker_id];
             let reader_ptr = reader_ptrs[worker_id];
-            let mode = mode.clone();
+            let worker_mode = mode;
             let tenant = tenant.clone();
             let stop = Arc::clone(&workers_stop);
             let ctrs = Arc::clone(&counters);
@@ -201,25 +432,51 @@ pub fn run_bench(
 
                 let shard = worker_key_shard(worker_id, concurrency, key_space_size);
                 let replication_policy = request_replication_policy(replica_count);
+                let mut batch_put_from_buffers =
+                    matches!(write_interface, WriteInterface::BatchPutFrom).then(|| {
+                        RegisteredWriteBuffers::new(writer, batch_size.max(1), value_size)
+                    });
+                let mut batch_get_into_buffers =
+                    matches!(read_interface, ReadInterface::BatchGetInto)
+                        .then(|| ReadBuffers::new(batch_size.max(1), value_size));
+                let batch_put_from_buffers = match batch_put_from_buffers.take() {
+                    Some(Ok(buffers)) => Some(buffers),
+                    Some(Err(error)) => return Err(error.to_string()),
+                    None => None,
+                };
+                let mut batch_put_from_buffers = batch_put_from_buffers;
 
                 // Pre-populate keys for get-only or mixed modes
-                if matches!(mode, BenchMode::Get | BenchMode::Mixed) {
+                if matches!(worker_mode, BenchMode::Get | BenchMode::Mixed) {
                     for ki in 0..shard.count {
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
-                        let key = make_key("bench", worker_id, worker_key_index(shard, ki));
-                        let s = make_seed(global_seed, &key, 0);
-                        let value = payload(&s, value_size);
                         let retry_started = Instant::now();
                         let mut attempts = 0usize;
                         loop {
                             attempts += 1;
-                            let request =
-                                put_request(&key, &value, &tenant, replication_policy.as_ref());
-                            match writer.batch_put(&[request]) {
-                                Ok(_) => break,
-                                Err(error) => {
+                            let key = make_key("bench", worker_id, worker_key_index(shard, ki));
+                            match execute_write(
+                                writer,
+                                write_interface,
+                                WriteOperation {
+                                    target: OperationTarget {
+                                        worker_id,
+                                        shard,
+                                        key_offset: ki,
+                                        width: 1,
+                                        tenant: &tenant,
+                                },
+                                global_seed,
+                                iteration: 0,
+                                value_size,
+                            },
+                            replication_policy.as_ref(),
+                            batch_put_from_buffers.as_mut(),
+                        ) {
+                            Ok(_) => break,
+                            Err(error) => {
                                     let message = error.to_string();
                                     if !is_retryable_prefill_error(&message)
                                         || retry_started.elapsed() >= PREFILL_RETRY_TIMEOUT
@@ -246,11 +503,24 @@ pub fn run_bench(
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let key = make_key("bench-warm", worker_id, wi % shard.count);
-                    let s = make_seed(global_seed, &key, 0);
-                    let value = payload(&s, value_size);
-                    let req = put_request(&key, &value, &tenant, replication_policy.as_ref());
-                    let _ = writer.batch_put(&[req]);
+                    let _ = execute_write(
+                        writer,
+                        write_interface,
+                        WriteOperation {
+                            target: OperationTarget {
+                                worker_id,
+                                shard,
+                                key_offset: wi,
+                                width: write_operation_width(write_interface, batch_size),
+                                tenant: &tenant,
+                            },
+                            global_seed,
+                            iteration: 0,
+                            value_size,
+                        },
+                        replication_policy.as_ref(),
+                        batch_put_from_buffers.as_mut(),
+                    );
                 }
 
                 put_rec.reset_start();
@@ -271,19 +541,27 @@ pub fn run_bench(
                     }
 
                     let key_offset = iter % shard.count;
-                    let is_read = match mode {
+                    let is_read = match worker_mode {
                         BenchMode::Put => false,
                         BenchMode::Get => true,
                         BenchMode::Mixed => (iter % 100) < read_ratio as usize,
                     };
 
                     if is_read {
-                        let key =
-                            make_key("bench", worker_id, worker_key_index(shard, key_offset));
                         let t0 = Instant::now();
-                        match reader.get(&key) {
-                            Ok(v) => {
-                                let len = v.len() as u64;
+                        match execute_read(
+                            reader,
+                            read_interface,
+                            OperationTarget {
+                                worker_id,
+                                shard,
+                                key_offset,
+                                width: read_operation_width(read_interface, batch_size),
+                                tenant: &tenant,
+                            },
+                            batch_get_into_buffers.as_mut(),
+                        ) {
+                            Ok(len) => {
                                 get_rec.record(t0.elapsed(), len);
                                 ctrs.get_ops.fetch_add(1, Ordering::Relaxed);
                                 ctrs.get_bytes.fetch_add(len, Ordering::Relaxed);
@@ -297,34 +575,29 @@ pub fn run_bench(
                             }
                         }
                     } else {
-                        // Build batch of keys+values (all in scope for the duration of batch_put)
-                        let keys: Vec<String> = (0..batch_size)
-                            .map(|bi| {
-                                make_key(
-                                    "bench",
-                                    worker_id,
-                                    worker_key_index(shard, key_offset + bi),
-                                )
-                            })
-                            .collect();
-                        let values: Vec<Vec<u8>> = keys
-                            .iter()
-                            .map(|k| payload(&make_seed(global_seed, k, iter as u64), value_size))
-                            .collect();
-                        let puts: Vec<PutRequest<'_>> = keys
-                            .iter()
-                            .zip(values.iter())
-                            .map(|(k, v)| {
-                                put_request(k, v, &tenant, replication_policy.as_ref())
-                            })
-                            .collect();
                         let t0 = Instant::now();
-                        let batch_bytes = (batch_size * value_size) as u64;
-                        match writer.batch_put(&puts) {
-                            Ok(_) => {
-                                put_rec.record(t0.elapsed(), batch_bytes);
+                        match execute_write(
+                            writer,
+                            write_interface,
+                            WriteOperation {
+                                target: OperationTarget {
+                                    worker_id,
+                                    shard,
+                                    key_offset,
+                                    width: write_operation_width(write_interface, batch_size),
+                                    tenant: &tenant,
+                                },
+                                global_seed,
+                                iteration: iter as u64,
+                                value_size,
+                            },
+                            replication_policy.as_ref(),
+                            batch_put_from_buffers.as_mut(),
+                        ) {
+                            Ok(written_bytes) => {
+                                put_rec.record(t0.elapsed(), written_bytes);
                                 ctrs.put_ops.fetch_add(1, Ordering::Relaxed);
-                                ctrs.put_bytes.fetch_add(batch_bytes, Ordering::Relaxed);
+                                ctrs.put_bytes.fetch_add(written_bytes, Ordering::Relaxed);
                             }
                             Err(e) => {
                                 put_rec.record_error();
@@ -337,7 +610,7 @@ pub fn run_bench(
                     }
 
                     iter += 1;
-                    if worker_heartbeats_enabled && iter % HEARTBEAT_EVERY == 0 {
+                    if worker_heartbeats_enabled && is_heartbeat_tick(iter) {
                         let expires_at = now_ms().saturating_add(LEASE_MS);
                         let writer_mut = unsafe { &mut *(writer_ptr as *mut StoreClient) };
                         let _ = writer_mut.heartbeat(expires_at);
@@ -375,6 +648,8 @@ pub fn run_bench(
 
     let mut report = BenchReport {
         mode: format!("{mode:?}").to_lowercase(),
+        write_label: write_interface.as_label().to_string(),
+        read_label: read_interface.as_label().to_string(),
         elapsed,
         concurrency,
         value_size,
@@ -429,6 +704,14 @@ mod tests {
     }
 
     #[test]
+    fn batch_interfaces_use_batch_width() {
+        assert_eq!(write_operation_width(WriteInterface::BatchPut, 8), 8);
+        assert_eq!(write_operation_width(WriteInterface::BatchPutFrom, 8), 8);
+        assert_eq!(read_operation_width(ReadInterface::BatchGet, 8), 8);
+        assert_eq!(read_operation_width(ReadInterface::BatchGetInto, 8), 8);
+    }
+
+    #[test]
     fn prefill_retries_transport_readiness_errors_only() {
         assert!(is_retryable_prefill_error(
             "transport error: tent_get_segment_info failed with rc=-1"
@@ -439,5 +722,12 @@ mod tests {
         assert!(!is_retryable_prefill_error(
             "invalid state: no placement candidates available"
         ));
+    }
+
+    #[test]
+    fn heartbeat_tick_uses_stable_multiple_check() {
+        assert!(is_heartbeat_tick(0));
+        assert!(is_heartbeat_tick(64));
+        assert!(!is_heartbeat_tick(65));
     }
 }

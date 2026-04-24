@@ -28,7 +28,14 @@ static BENCH_TRACING_STATE: OnceLock<()> = OnceLock::new();
 const TRACE_FILE_ENV: &str = "MC_BENCH_TRACE_FILE";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let cli = Cli::parse();
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    let combined_interfaces = std::env::var(cli::COMBINED_INTERFACE_ENV).ok();
+    let mut cli = Cli::parse_from(raw_args.clone());
+    cli::apply_combined_interface_env_from_raw_args(
+        &raw_args,
+        &mut cli,
+        combined_interfaces.as_deref(),
+    )?;
 
     init_bench_tracing(normalize_trace_filter(cli.global.trace_filter.as_deref()))?;
 

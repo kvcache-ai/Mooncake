@@ -28,6 +28,8 @@ fn format_throughput(mib_s: f64) -> String {
 
 pub struct BenchReport {
     pub mode: String,
+    pub write_label: String,
+    pub read_label: String,
     pub elapsed: Duration,
     pub concurrency: usize,
     pub value_size: usize,
@@ -49,8 +51,10 @@ impl BenchReport {
         let mut lines = Vec::new();
         lines.push("=== Benchmark Results ===".to_string());
         lines.push(format!(
-            "Mode: {} | Duration: {:.2}s | Workers: {} | Value size: {} B | Batch size: {}",
+            "Mode: {} | Write: {} | Read: {} | Duration: {:.2}s | Workers: {} | Value size: {} B | Batch size: {}",
             self.mode,
+            self.write_label,
+            self.read_label,
             self.elapsed.as_secs_f64(),
             self.concurrency,
             self.value_size,
@@ -62,13 +66,16 @@ impl BenchReport {
         let has_get = self.get_stats.is_some();
 
         if has_put && has_get {
-            lines.push(format!("  {:<16} {:<16} {:<16}", "Metric", "PUT", "GET"));
+            lines.push(format!(
+                "  {:<16} {:<16} {:<16}",
+                "Metric", self.write_label, self.read_label
+            ));
             lines.push(format!("  {:<16} {:<16} {:<16}", "------", "---", "---"));
         } else if has_put {
-            lines.push(format!("  {:<16} {:<16}", "Metric", "PUT"));
+            lines.push(format!("  {:<16} {:<16}", "Metric", self.write_label));
             lines.push(format!("  {:<16} {:<16}", "------", "---"));
         } else if has_get {
-            lines.push(format!("  {:<16} {:<16}", "Metric", "GET"));
+            lines.push(format!("  {:<16} {:<16}", "Metric", self.read_label));
             lines.push(format!("  {:<16} {:<16}", "------", "---"));
         }
 
@@ -157,6 +164,14 @@ impl BenchReport {
         let mut obj = serde_json::Map::new();
         obj.insert("mode".into(), serde_json::Value::String(self.mode.clone()));
         obj.insert(
+            "write_interface".into(),
+            serde_json::Value::String(self.write_label.clone()),
+        );
+        obj.insert(
+            "read_interface".into(),
+            serde_json::Value::String(self.read_label.clone()),
+        );
+        obj.insert(
             "elapsed_s".into(),
             serde_json::Value::Number(
                 serde_json::Number::from_f64(self.elapsed.as_secs_f64()).unwrap(),
@@ -167,10 +182,10 @@ impl BenchReport {
         obj.insert("batch_size".into(), serde_json::json!(self.batch_size));
 
         if let Some(ref mut stats) = self.put_stats {
-            obj.insert("put".into(), stats_to_json(stats));
+            obj.insert(self.write_label.clone(), stats_to_json(stats));
         }
         if let Some(ref mut stats) = self.get_stats {
-            obj.insert("get".into(), stats_to_json(stats));
+            obj.insert(self.read_label.clone(), stats_to_json(stats));
         }
 
         info!(
@@ -182,10 +197,10 @@ impl BenchReport {
     fn print_csv(&mut self) {
         info!("operation,metric,value");
         if let Some(ref mut stats) = self.put_stats {
-            print_csv_rows("put", stats);
+            print_csv_rows(&self.write_label, stats);
         }
         if let Some(ref mut stats) = self.get_stats {
-            print_csv_rows("get", stats);
+            print_csv_rows(&self.read_label, stats);
         }
     }
 }
@@ -225,13 +240,15 @@ fn print_csv_rows(op: &str, stats: &mut LatencyRecorder) {
 
 pub fn print_progress_detailed(
     elapsed_secs: u64,
+    write_label: &str,
+    read_label: &str,
     put_stats: &mut Option<LatencyRecorder>,
     get_stats: &mut Option<LatencyRecorder>,
 ) {
     let mut parts = Vec::new();
     if let Some(ref mut s) = put_stats {
         parts.push(format!(
-            "put: {:.0} qps p50={} p99={}",
+            "{write_label}: {:.0} qps p50={} p99={}",
             s.qps(),
             format_duration(s.percentile(50.0)),
             format_duration(s.percentile(99.0)),
@@ -239,7 +256,7 @@ pub fn print_progress_detailed(
     }
     if let Some(ref mut s) = get_stats {
         parts.push(format!(
-            "get: {:.0} qps p50={} p99={}",
+            "{read_label}: {:.0} qps p50={} p99={}",
             s.qps(),
             format_duration(s.percentile(50.0)),
             format_duration(s.percentile(99.0)),

@@ -3,6 +3,7 @@ use std::error::Error;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const DEFAULT_STORAGE_BYTES: usize = 0;
+pub const COMBINED_INTERFACE_ENV: &str = "MC_BENCH_INTERFACES";
 
 #[derive(Parser)]
 #[command(name = "mooncake-store-bench")]
@@ -77,6 +78,10 @@ pub enum Command {
 pub struct BenchArgs {
     #[arg(long, value_enum, default_value_t = BenchMode::Mixed, env = "MC_BENCH_MODE")]
     pub mode: BenchMode,
+    #[arg(long, value_enum, default_value_t = WriteInterface::BatchPutFrom, env = "MC_BENCH_WRITE_INTERFACE")]
+    pub write_interface: WriteInterface,
+    #[arg(long, value_enum, default_value_t = ReadInterface::BatchGetInto, env = "MC_BENCH_READ_INTERFACE")]
+    pub read_interface: ReadInterface,
     #[arg(long, default_value_t = 4, env = "MC_BENCH_CONCURRENCY")]
     pub concurrency: usize,
     #[arg(long, default_value_t = 4096, env = "MC_BENCH_VALUE_SIZE")]
@@ -103,11 +108,55 @@ pub struct BenchArgs {
     pub output_format: OutputFormat,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BenchMode {
     Put,
     Get,
     Mixed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum WriteInterface {
+    Put,
+    #[value(alias = "batch_put")]
+    BatchPut,
+    #[value(alias = "batch_put_from")]
+    BatchPutFrom,
+}
+
+impl WriteInterface {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::BatchPut => "batch_put",
+            Self::BatchPutFrom => "batch_put_from",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ReadInterface {
+    Get,
+    #[value(alias = "batch_get")]
+    BatchGet,
+    #[value(alias = "batch_get_into")]
+    BatchGetInto,
+}
+
+impl ReadInterface {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::BatchGet => "batch_get",
+            Self::BatchGetInto => "batch_get_into",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceSelection {
+    pub write: WriteInterface,
+    pub read: ReadInterface,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -119,6 +168,10 @@ pub enum OutputFormat {
 
 #[derive(Args)]
 pub struct VerifyArgs {
+    #[arg(long, value_enum, default_value_t = WriteInterface::BatchPutFrom, env = "MC_BENCH_WRITE_INTERFACE")]
+    pub write_interface: WriteInterface,
+    #[arg(long, value_enum, default_value_t = ReadInterface::BatchGetInto, env = "MC_BENCH_READ_INTERFACE")]
+    pub read_interface: ReadInterface,
     #[arg(long, default_value_t = 4096, env = "MC_BENCH_VALUE_SIZE")]
     pub value_size: usize,
     #[arg(long, default_value_t = 256, env = "MC_BENCH_KEY_COUNT")]
@@ -139,6 +192,10 @@ pub struct SoakArgs {
     pub duration: u64,
     #[arg(long, default_value_t = 2, env = "MC_BENCH_CONCURRENCY")]
     pub concurrency: usize,
+    #[arg(long, value_enum, default_value_t = WriteInterface::BatchPutFrom, env = "MC_BENCH_WRITE_INTERFACE")]
+    pub write_interface: WriteInterface,
+    #[arg(long, value_enum, default_value_t = ReadInterface::BatchGetInto, env = "MC_BENCH_READ_INTERFACE")]
+    pub read_interface: ReadInterface,
     #[arg(long, default_value_t = 4096, env = "MC_BENCH_VALUE_SIZE")]
     pub value_size: usize,
     #[arg(long, default_value_t = 8, env = "MC_BENCH_BATCH_SIZE")]
@@ -245,9 +302,190 @@ pub fn validate_soak_args(args: &SoakArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn parse_write_interface(value: &str) -> Result<WriteInterface, String> {
+    WriteInterface::from_str(value.trim(), true).map_err(|_| {
+        format!("invalid write interface '{value}': expected put, batch-put, or batch-put-from")
+    })
+}
+
+fn parse_read_interface(value: &str) -> Result<ReadInterface, String> {
+    ReadInterface::from_str(value.trim(), true).map_err(|_| {
+        format!("invalid read interface '{value}': expected get, batch-get, or batch-get-into")
+    })
+}
+
+pub fn parse_combined_interface_env(value: &str) -> Result<InterfaceSelection, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("combined interface env must not be empty".to_string());
+    }
+
+    let parts = if trimmed.contains(',') {
+        trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+    } else {
+        trimmed
+            .split(':')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+    };
+
+    if parts.iter().any(|part| part.contains('=')) {
+        let mut write = None;
+        let mut read = None;
+        for part in &parts {
+            let Some((key, interface)) = part.split_once('=') else {
+                return Err(
+                    "combined interface env named format must use write=<...>,read=<...>"
+                        .to_string(),
+                );
+            };
+            match key.trim() {
+                "write" => write = Some(parse_write_interface(interface)?),
+                "read" => read = Some(parse_read_interface(interface)?),
+                other => {
+                    return Err(format!(
+                        "unknown combined interface env key '{other}': expected write or read"
+                    ));
+                }
+            }
+        }
+        return Ok(InterfaceSelection {
+            write: write.ok_or_else(|| {
+                "combined interface env named format requires a write=<...> entry".to_string()
+            })?,
+            read: read.ok_or_else(|| {
+                "combined interface env named format requires a read=<...> entry".to_string()
+            })?,
+        });
+    }
+
+    if parts.len() != 2 {
+        return Err(
+            "combined interface env must be '<write>,<read>', '<write>:<read>', or 'write=<...>,read=<...>'"
+                .to_string(),
+        );
+    }
+
+    Ok(InterfaceSelection {
+        write: parse_write_interface(parts[0])?,
+        read: parse_read_interface(parts[1])?,
+    })
+}
+
+fn has_explicit_cli_flag(raw_args: &[std::ffi::OsString], flag: &str) -> bool {
+    let prefix = format!("{flag}=");
+    raw_args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == flag || arg.starts_with(&prefix)
+    })
+}
+
+pub fn apply_combined_interface_env_from_raw_args(
+    raw_args: &[std::ffi::OsString],
+    cli: &mut Cli,
+    combined_env: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(combined_env) = combined_env
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let selection = parse_combined_interface_env(combined_env).map_err(std::io::Error::other)?;
+    let write_explicit = has_explicit_cli_flag(raw_args, "--write-interface");
+    let read_explicit = has_explicit_cli_flag(raw_args, "--read-interface");
+
+    match &mut cli.command {
+        Command::Bench(args) => {
+            if !write_explicit {
+                args.write_interface = selection.write;
+            }
+            if !read_explicit {
+                args.read_interface = selection.read;
+            }
+        }
+        Command::Soak(args) => {
+            if !write_explicit {
+                args.write_interface = selection.write;
+            }
+            if !read_explicit {
+                args.read_interface = selection.read;
+            }
+        }
+        Command::Verify(args) => {
+            if !write_explicit {
+                args.write_interface = selection.write;
+            }
+            if !read_explicit {
+                args.read_interface = selection.read;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
+
+    use clap::CommandFactory;
+
     use super::*;
+
+    #[test]
+    fn bench_cli_exposes_interface_selection_defaults() {
+        let mut command = Cli::command();
+        let bench = command
+            .find_subcommand_mut("bench")
+            .expect("bench subcommand should exist");
+
+        let write = bench
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("write-interface"))
+            .expect("bench should expose --write-interface");
+        assert_eq!(
+            write.get_env(),
+            Some(OsStr::new("MC_BENCH_WRITE_INTERFACE"))
+        );
+        assert_eq!(write.get_default_values(), [OsStr::new("batch-put-from")]);
+
+        let read = bench
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("read-interface"))
+            .expect("bench should expose --read-interface");
+        assert_eq!(read.get_env(), Some(OsStr::new("MC_BENCH_READ_INTERFACE")));
+        assert_eq!(read.get_default_values(), [OsStr::new("batch-get-into")]);
+    }
+
+    #[test]
+    fn parse_bench_supports_explicit_interface_selection() {
+        let parsed = Cli::try_parse_from([
+            "mooncake-store-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "bench",
+            "--write-interface",
+            "batch-put-from",
+            "--read-interface",
+            "batch-get-into",
+        ]);
+
+        assert!(parsed.is_ok(), "bench should accept explicit interfaces");
+        let cli = parsed.expect("cli should parse explicit interface selection");
+        if let Command::Bench(args) = cli.command {
+            assert_eq!(args.write_interface, WriteInterface::BatchPutFrom);
+            assert_eq!(args.read_interface, ReadInterface::BatchGetInto);
+        } else {
+            panic!("expected bench command");
+        }
+    }
 
     #[test]
     fn parse_bench_defaults() {
@@ -266,6 +504,8 @@ mod tests {
         assert!(matches!(cli.command, Command::Bench(_)));
         if let Command::Bench(args) = cli.command {
             assert!(matches!(args.mode, BenchMode::Mixed));
+            assert_eq!(args.write_interface, WriteInterface::BatchPutFrom);
+            assert_eq!(args.read_interface, ReadInterface::BatchGetInto);
             assert_eq!(args.concurrency, 4);
             assert_eq!(args.value_size, 4096);
         }
@@ -324,8 +564,55 @@ mod tests {
             "64",
         ]);
         if let Command::Verify(args) = cli.command {
+            assert_eq!(args.write_interface, WriteInterface::BatchPutFrom);
+            assert_eq!(args.read_interface, ReadInterface::BatchGetInto);
             assert!(args.verify_overwrite);
             assert_eq!(args.key_count, 64);
+        } else {
+            panic!("expected verify command");
+        }
+    }
+
+    #[test]
+    fn verify_cli_exposes_interface_selection_defaults() {
+        let mut command = Cli::command();
+        let verify = command
+            .find_subcommand_mut("verify")
+            .expect("verify subcommand should exist");
+
+        let write = verify
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("write-interface"))
+            .expect("verify should expose --write-interface");
+        assert_eq!(
+            write.get_env(),
+            Some(OsStr::new("MC_BENCH_WRITE_INTERFACE"))
+        );
+        assert_eq!(write.get_default_values(), [OsStr::new("batch-put-from")]);
+
+        let read = verify
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("read-interface"))
+            .expect("verify should expose --read-interface");
+        assert_eq!(read.get_env(), Some(OsStr::new("MC_BENCH_READ_INTERFACE")));
+        assert_eq!(read.get_default_values(), [OsStr::new("batch-get-into")]);
+    }
+
+    #[test]
+    fn parse_verify_supports_explicit_interface_selection() {
+        let cli = Cli::parse_from([
+            "mooncake-store-bench",
+            "--metadata-url",
+            "redis://localhost/0",
+            "verify",
+            "--write-interface",
+            "put",
+            "--read-interface",
+            "get",
+        ]);
+        if let Command::Verify(args) = cli.command {
+            assert_eq!(args.write_interface, WriteInterface::Put);
+            assert_eq!(args.read_interface, ReadInterface::Get);
         } else {
             panic!("expected verify command");
         }
@@ -345,6 +632,8 @@ mod tests {
         ]);
         if let Command::Soak(args) = cli.command {
             assert_eq!(args.fault.len(), 2);
+            assert_eq!(args.write_interface, WriteInterface::BatchPutFrom);
+            assert_eq!(args.read_interface, ReadInterface::BatchGetInto);
             assert!(matches!(
                 args.fault[0],
                 FaultSpec::RedisJitter {
@@ -362,6 +651,52 @@ mod tests {
     }
 
     #[test]
+    fn soak_cli_exposes_interface_selection_defaults() {
+        let mut command = Cli::command();
+        let soak = command
+            .find_subcommand_mut("soak")
+            .expect("soak subcommand should exist");
+
+        let write = soak
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("write-interface"))
+            .expect("soak should expose --write-interface");
+        assert_eq!(
+            write.get_env(),
+            Some(OsStr::new("MC_BENCH_WRITE_INTERFACE"))
+        );
+        assert_eq!(write.get_default_values(), [OsStr::new("batch-put-from")]);
+
+        let read = soak
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("read-interface"))
+            .expect("soak should expose --read-interface");
+        assert_eq!(read.get_env(), Some(OsStr::new("MC_BENCH_READ_INTERFACE")));
+        assert_eq!(read.get_default_values(), [OsStr::new("batch-get-into")]);
+    }
+
+    #[test]
+    fn parse_soak_supports_explicit_interface_selection() {
+        let cli = Cli::parse_from([
+            "mooncake-store-bench",
+            "--metadata-url",
+            "redis://localhost/0",
+            "soak",
+            "--write-interface",
+            "put",
+            "--read-interface",
+            "get",
+        ]);
+
+        if let Command::Soak(args) = cli.command {
+            assert_eq!(args.write_interface, WriteInterface::Put);
+            assert_eq!(args.read_interface, ReadInterface::Get);
+        } else {
+            panic!("expected soak command");
+        }
+    }
+
+    #[test]
     fn parse_fault_spec_errors() {
         assert!(parse_fault_spec("unknown:1:2").is_err());
         assert!(parse_fault_spec("redis-jitter:1").is_err());
@@ -369,9 +704,110 @@ mod tests {
     }
 
     #[test]
+    fn parse_combined_interface_env_supports_positional_format() {
+        let selection = parse_combined_interface_env("batch-put-from,batch-get-into")
+            .expect("positional format should parse");
+        assert_eq!(selection.write, WriteInterface::BatchPutFrom);
+        assert_eq!(selection.read, ReadInterface::BatchGetInto);
+    }
+
+    #[test]
+    fn parse_combined_interface_env_supports_existing_aliases() {
+        let selection = parse_combined_interface_env("put,batch-get")
+            .expect("legacy positional format should parse");
+        assert_eq!(selection.write, WriteInterface::Put);
+        assert_eq!(selection.read, ReadInterface::BatchGet);
+    }
+
+    #[test]
+    fn parse_combined_interface_env_supports_named_format() {
+        let selection = parse_combined_interface_env("write=batch_put,read=get")
+            .expect("named format should parse");
+        assert_eq!(selection.write, WriteInterface::BatchPut);
+        assert_eq!(selection.read, ReadInterface::Get);
+    }
+
+    #[test]
+    fn parse_combined_interface_env_rejects_incomplete_values() {
+        assert!(parse_combined_interface_env("write=put").is_err());
+        assert!(parse_combined_interface_env("put").is_err());
+    }
+
+    #[test]
+    fn combined_interface_env_overrides_defaults_for_bench() {
+        let raw_args = vec![
+            OsString::from("mooncake-store-bench"),
+            OsString::from("--metadata-url"),
+            OsString::from("redis://127.0.0.1:6379/0"),
+            OsString::from("bench"),
+        ];
+        let mut cli = Cli::parse_from(raw_args.clone());
+
+        apply_combined_interface_env_from_raw_args(&raw_args, &mut cli, Some("put,get"))
+            .expect("combined env should apply");
+
+        if let Command::Bench(args) = cli.command {
+            assert_eq!(args.write_interface, WriteInterface::Put);
+            assert_eq!(args.read_interface, ReadInterface::Get);
+        } else {
+            panic!("expected bench command");
+        }
+    }
+
+    #[test]
+    fn combined_interface_env_respects_explicit_cli_overrides() {
+        let raw_args = vec![
+            OsString::from("mooncake-store-bench"),
+            OsString::from("--metadata-url"),
+            OsString::from("redis://127.0.0.1:6379/0"),
+            OsString::from("soak"),
+            OsString::from("--write-interface"),
+            OsString::from("put"),
+        ];
+        let mut cli = Cli::parse_from(raw_args.clone());
+
+        apply_combined_interface_env_from_raw_args(
+            &raw_args,
+            &mut cli,
+            Some("batch-put-from,batch-get-into"),
+        )
+        .expect("combined env should apply");
+
+        if let Command::Soak(args) = cli.command {
+            assert_eq!(args.write_interface, WriteInterface::Put);
+            assert_eq!(args.read_interface, ReadInterface::BatchGetInto);
+        } else {
+            panic!("expected soak command");
+        }
+    }
+
+    #[test]
+    fn combined_interface_env_overrides_defaults_for_verify() {
+        let raw_args = vec![
+            OsString::from("mooncake-store-bench"),
+            OsString::from("--metadata-url"),
+            OsString::from("redis://127.0.0.1:6379/0"),
+            OsString::from("verify"),
+        ];
+        let mut cli = Cli::parse_from(raw_args.clone());
+
+        apply_combined_interface_env_from_raw_args(&raw_args, &mut cli, Some("write=put,read=get"))
+            .expect("combined env should apply to verify");
+
+        if let Command::Verify(args) = cli.command {
+            assert_eq!(args.write_interface, WriteInterface::Put);
+            assert_eq!(args.read_interface, ReadInterface::Get);
+        } else {
+            panic!("expected verify command");
+        }
+    }
+
+    #[test]
     fn validate_bench_zero_concurrency() {
         let args = BenchArgs {
             mode: BenchMode::Put,
+            write_interface: WriteInterface::BatchPutFrom,
+            read_interface: ReadInterface::BatchGetInto,
             concurrency: 0,
             value_size: 4096,
             batch_size: 8,
