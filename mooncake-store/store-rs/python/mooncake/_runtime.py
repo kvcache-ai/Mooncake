@@ -45,39 +45,29 @@ def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]
     env_candidates: list[pathlib.Path] = []
     upstream_build = os.environ.get("MOONCAKE_UPSTREAM_BUILD_DIR")
     if upstream_build:
-        env_candidates.extend(
-            [
-                pathlib.Path(upstream_build) / "mooncake-asio",
-                pathlib.Path(upstream_build) / "mooncake-transfer-engine" / "src",
-                pathlib.Path(upstream_build)
-                / "mooncake-transfer-engine"
-                / "tent"
-                / "src",
-            ]
-        )
+        build_root = pathlib.Path(upstream_build).expanduser()
+        if build_root.exists():
+            env_candidates.extend(
+                [
+                    build_root / "mooncake-asio",
+                    build_root / "mooncake-transfer-engine" / "src",
+                    build_root / "mooncake-transfer-engine" / "tent" / "src",
+                ]
+            )
     upstream_root = os.environ.get("MOONCAKE_UPSTREAM_DIR")
     if upstream_root:
-        env_candidates.extend(
-            [
-                pathlib.Path(upstream_root) / "build-wheel-compat" / "mooncake-asio",
-                pathlib.Path(upstream_root)
-                / "build-wheel-compat"
-                / "mooncake-transfer-engine"
-                / "src",
-                pathlib.Path(upstream_root)
-                / "build-wheel-compat"
-                / "mooncake-transfer-engine"
-                / "tent"
-                / "src",
-                pathlib.Path(upstream_root) / "build-rust" / "mooncake-asio",
-                pathlib.Path(upstream_root) / "build-rust" / "mooncake-transfer-engine" / "src",
-                pathlib.Path(upstream_root)
-                / "build-rust"
-                / "mooncake-transfer-engine"
-                / "tent"
-                / "src",
-            ]
-        )
+        root_path = pathlib.Path(upstream_root).expanduser()
+        if root_path.exists():
+            env_candidates.extend(
+                [
+                    root_path / "build-wheel-compat" / "mooncake-asio",
+                    root_path / "build-wheel-compat" / "mooncake-transfer-engine" / "src",
+                    root_path / "build-wheel-compat" / "mooncake-transfer-engine" / "tent" / "src",
+                    root_path / "build-rust" / "mooncake-asio",
+                    root_path / "build-rust" / "mooncake-transfer-engine" / "src",
+                    root_path / "build-rust" / "mooncake-transfer-engine" / "tent" / "src",
+                ]
+            )
     candidates = env_candidates + [
         root,
         root / "lib",
