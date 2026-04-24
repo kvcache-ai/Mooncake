@@ -254,6 +254,28 @@ try:
 finally:
     clear_setup_env()
 
+try:
+    clear_setup_env()
+    os.environ["MC_STORE_RS_KEYSPACE"] = "dummy/env-keyspace"
+    store.setup_dummy(64 * 1024 * 1024, 16 * 1024 * 1024, "127.0.0.1:16590")
+    name, args, kwargs = store._worker.calls.pop()
+    assert name == "setup_dummy"
+    assert kwargs["keyspace"] == "dummy/env-keyspace"
+    assert kwargs["worker_scope"] is None
+
+    store.setup_dummy(
+        64 * 1024 * 1024,
+        16 * 1024 * 1024,
+        "127.0.0.1:16590",
+        keyspace="dummy/explicit",
+        worker_scope="dummy-scope",
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert kwargs["keyspace"] == "dummy/explicit"
+    assert kwargs["worker_scope"] == "dummy-scope"
+finally:
+    clear_setup_env()
+
 os.environ["MC_STORE_RS_METRICS_ADDR"] = "127.0.0.1:19090"
 try:
     store.setup(

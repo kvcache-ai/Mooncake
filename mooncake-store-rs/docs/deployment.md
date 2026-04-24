@@ -223,8 +223,9 @@ Important inputs:
 - `--auto-download-model` or `MC_STORE_RS_SGLANG_AUTO_DOWNLOAD_MODEL=1` opts into Hugging Face download when no local model path is provided
 - `--model-id` or `MC_STORE_RS_SGLANG_MODEL_ID` selects the download target; the default is `Qwen/Qwen3-0.6B`
 - `--model-cache` or `MC_STORE_RS_SGLANG_MODEL_CACHE` selects the Hugging Face cache directory for optional downloads
-- `MC_STORE_RS_SGLANG_SERVER_A_GPU` and `MC_STORE_RS_SGLANG_SERVER_B_GPU` control `--base-gpu-id`
-- `MC_STORE_RS_SGLANG_MEM_FRACTION_STATIC` controls the SGLang `--mem-fraction-static` used by this true e2e path; the default is `0.15`
+- `MC_STORE_RS_SGLANG_SERVER_A_GPU` and `MC_STORE_RS_SGLANG_SERVER_B_GPU` control `--base-gpu-id`; when server B is unset, the runner now picks a different GPU automatically when `nvidia-smi` reports more than one visible device
+- `MC_STORE_RS_SGLANG_MEM_FRACTION_STATIC` controls the SGLang `--mem-fraction-static` used by this true e2e path; the default is `0.25`
+- `MC_STORE_RS_SGLANG_HICACHE_SIZE_GB` controls the SGLang `--hicache-size` used by this true e2e path; the default is `20` so the host-side HiCache stays larger than the device-side pool on the current dual-A10 validation host
 - `SGLANG_HICACHE_MOONCAKE_REUSE_TE` defaults to `0` for this validation path
 - logs are written to `target/sglang-true-e2e-*.log`
 
@@ -321,7 +322,7 @@ python -m sglang.launch_server \
 
 - real mode uses `setup(...)` and does not use `client_server_address`
 - dummy mode uses `setup_dummy(...)` and only needs `client_server_address`
-- when `keyspace` is absent, `mooncake-store-client --client-server-address` uses the default dummy worker scope `worker-1`, matching the first omitted-scope Python/SGLang dummy client
+- dummy mode also consumes `MC_STORE_RS_KEYSPACE` as a Python wrapper fallback when `setup_dummy(...)` does not pass `keyspace`, which is how the true SGLang e2e aligns the dummy side-channel namespace with the routed gateway
 - the current `run-sglang-true-e2e.sh` workflow validates the dummy/gateway topology
 
 The runner intentionally does not scan local model caches. A missing model path is a configuration error unless auto-download is explicitly enabled.
