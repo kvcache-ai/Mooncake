@@ -799,7 +799,8 @@ int put_direct_parallelism_shard(const std::string &key,
                                  const ReplicateConfig &config) {
     auto tp_axis_index = find_tp_axis_index(parallelism.axes);
     if (tp_axis_index.has_value() && parallelism.axes.size() > 1) {
-        return put_requested_parallelism_shard(key, tensor, parallelism, config);
+        return put_requested_parallelism_shard(key, tensor, parallelism,
+                                               config);
     }
     auto info =
         build_direct_parallelism_shard_info(tensor, parallelism.axes, key);
@@ -1127,8 +1128,9 @@ int upsert_tensor_parallelism_tp_impl(
 }
 
 int upsert_requested_parallelism_shard(const std::string &key,
-    pybind11::object tensor, const TensorParallelismSpec &parallelism,
-    const ReplicateConfig &config) {
+                                       pybind11::object tensor,
+                                       const TensorParallelismSpec &parallelism,
+                                       const ReplicateConfig &config) {
     std::string shard_key = get_parallelism_key_name(key, parallelism);
     auto shard_info = build_requested_parallelism_shard_info(
         tensor, parallelism, shard_key, "upsert_tensor_with_parallelism");
@@ -1221,9 +1223,9 @@ int execute_upsert_tensor_with_parallelism_route(
                const ReplicateConfig &write_config, int rank, int size,
                int split_dim, const std::vector<ParallelAxisSpec> &axes) {
             if (axes.size() == 1) {
-                return upsert_tensor_parallelism_tp_impl(write_key, write_tensor,
-                                                         write_config, rank,
-                                                         size, split_dim, axes);
+                return upsert_tensor_parallelism_tp_impl(
+                    write_key, write_tensor, write_config, rank, size,
+                    split_dim, axes);
             }
             return upsert_requested_parallelism_shard(
                 write_key, write_tensor, TensorParallelismSpec{axes},

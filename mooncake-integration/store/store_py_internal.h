@@ -407,8 +407,9 @@ std::optional<ParallelismShardTensorInfo> build_direct_parallelism_shard_info(
     if (infer_global_shape) {
         global_shape[split_dim] *= tp_axis.size;
     }
-    if (!validate_uniform_shard_request(global_shape, split_dim, tp_axis.size,
-                                        "build_direct_parallelism_shard_info")) {
+    if (!validate_uniform_shard_request(
+            global_shape, split_dim, tp_axis.size,
+            "build_direct_parallelism_shard_info")) {
         return std::nullopt;
     }
 
@@ -421,21 +422,25 @@ std::optional<ParallelismShardTensorInfo> build_direct_parallelism_shard_info(
     shard_info.info = extract_tensor_info(
         py::reinterpret_borrow<py::object>(shard_tensor), key_name);
     auto metadata = build_shard_metadata_from_parallelism(
-        shard_tensor, shard_tensor, dtype_enum, axes, shard_info.info.tensor_size);
+        shard_tensor, shard_tensor, dtype_enum, axes,
+        shard_info.info.tensor_size);
     if (!metadata.has_value()) {
         return std::nullopt;
     }
     shard_info.info.metadata = *metadata;
-    shard_info.info.metadata.layout.global_shape = MakeTensorShape(global_shape);
+    shard_info.info.metadata.layout.global_shape =
+        MakeTensorShape(global_shape);
     if (!shard_info.info.valid()) {
         return std::nullopt;
     }
     shard_info.manifest = build_parallelism_manifest_from_shape(
-        global_shape, static_cast<int32_t>(dtype_enum), split_dim, tp_axis.size);
+        global_shape, static_cast<int32_t>(dtype_enum), split_dim,
+        tp_axis.size);
     return shard_info;
 }
 
-std::optional<ParallelismShardTensorInfo> build_requested_parallelism_shard_info(
+std::optional<ParallelismShardTensorInfo>
+build_requested_parallelism_shard_info(
     const py::handle &tensor, const TensorParallelismSpec &parallelism,
     const std::string &key_name, const std::string &error_context) {
     auto tp_axis_index = find_tp_axis_index(parallelism.axes);
@@ -450,8 +455,8 @@ std::optional<ParallelismShardTensorInfo> build_requested_parallelism_shard_info
 
     const int split_dim = tp_axis.split_dim.value();
     auto global_shape = tensor_shape_to_vector(tensor);
-    if (!validate_uniform_shard_request(global_shape, split_dim, tp_axis.size,
-                                        error_context)) {
+    if (!validate_uniform_shard_request(global_shape, split_dim,
+                                        tp_axis.size, error_context)) {
         return std::nullopt;
     }
 
@@ -479,7 +484,8 @@ std::optional<ParallelismShardTensorInfo> build_requested_parallelism_shard_info
         return std::nullopt;
     }
     shard_info.manifest = build_parallelism_manifest_from_shape(
-        global_shape, static_cast<int32_t>(dtype_enum), split_dim, tp_axis.size);
+        global_shape, static_cast<int32_t>(dtype_enum), split_dim,
+        tp_axis.size);
     return shard_info;
 }
 

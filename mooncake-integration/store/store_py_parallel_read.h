@@ -87,7 +87,8 @@ std::optional<size_t> extract_reconstruction_element_size(
             }
             continue;
         }
-        if (source.metadata.data_bytes % static_cast<size_t>(shard_numel) != 0) {
+        if (source.metadata.data_bytes % static_cast<size_t>(shard_numel) !=
+            0) {
             LOG(ERROR) << context << ": invalid shard tensor byte size";
             return std::nullopt;
         }
@@ -97,8 +98,9 @@ std::optional<size_t> extract_reconstruction_element_size(
 }
 
 std::optional<std::pair<int64_t, int64_t>> get_source_shard_range(
-    const ReconstructedShardSource &source, const std::vector<int64_t> &global_shape,
-    int split_dim, const std::string &context) {
+    const ReconstructedShardSource &source,
+    const std::vector<int64_t> &global_shape, int split_dim,
+    const std::string &context) {
     const auto local_shape =
         TensorShapeToVector(source.metadata.metadata.layout.local_shape,
                             source.metadata.metadata.header.ndim);
@@ -126,12 +128,14 @@ std::optional<std::pair<int64_t, int64_t>> get_source_shard_range(
         return std::nullopt;
     }
     if (tp_axis->split_dim != split_dim || tp_axis->shard_count <= 0 ||
-        tp_axis->shard_rank < 0 || tp_axis->shard_rank >= tp_axis->shard_count) {
+        tp_axis->shard_rank < 0 ||
+        tp_axis->shard_rank >= tp_axis->shard_count) {
         LOG(ERROR) << context << ": invalid TP shard metadata for key "
                    << source.read_key;
         return std::nullopt;
     }
-    if (!is_uniform_shardable_dim(global_shape[split_dim], tp_axis->shard_count)) {
+    if (!is_uniform_shardable_dim(global_shape[split_dim],
+                                  tp_axis->shard_count)) {
         LOG(ERROR) << context << ": only uniform sharding is supported";
         return std::nullopt;
     }
@@ -179,8 +183,9 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
 
     size_t target_tensor_numel = 1;
     for (size_t dim = 0; dim < global_shape.size(); ++dim) {
-        const int64_t dim_extent =
-            static_cast<int>(dim) == split_dim ? target_extent : global_shape[dim];
+        const int64_t dim_extent = static_cast<int>(dim) == split_dim
+                                       ? target_extent
+                                       : global_shape[dim];
         target_tensor_numel *= static_cast<size_t>(dim_extent);
     }
     const size_t target_tensor_bytes = target_tensor_numel * *element_size;
@@ -219,8 +224,8 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
         }
         const auto [source_start, source_extent] = *source_range;
         const int64_t overlap_start = std::max(source_start, target_start);
-        const int64_t overlap_end =
-            std::min(source_start + source_extent, target_start + target_extent);
+        const int64_t overlap_end = std::min(source_start + source_extent,
+                                             target_start + target_extent);
         if (overlap_end <= overlap_start) {
             continue;
         }
@@ -230,19 +235,21 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
         const size_t row_bytes = static_cast<size_t>(overlap_extent) *
                                  static_cast<size_t>(elements_after) *
                                  *element_size;
-        for (int64_t idx = dst_inner_offset; idx < dst_inner_offset + overlap_extent;
-             ++idx) {
+        for (int64_t idx = dst_inner_offset;
+             idx < dst_inner_offset + overlap_extent; ++idx) {
             covered[static_cast<size_t>(idx)] = true;
         }
 
         for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
             const size_t dst_offset =
                 region->offset + sizeof(TensorMetadata) +
-                static_cast<size_t>(slice_idx * target_extent + dst_inner_offset) *
+                static_cast<size_t>(slice_idx * target_extent +
+                                    dst_inner_offset) *
                     static_cast<size_t>(elements_after) * *element_size;
             const size_t src_offset =
                 source.metadata.data_offset +
-                static_cast<size_t>(slice_idx * source_extent + src_inner_offset) *
+                static_cast<size_t>(slice_idx * source_extent +
+                                    src_inner_offset) *
                     static_cast<size_t>(elements_after) * *element_size;
             plan.fragments.push_back(TensorIntoFragment{
                 .read_key = source.read_key,
@@ -255,8 +262,9 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
 
     for (bool is_covered : covered) {
         if (!is_covered) {
-            LOG(ERROR) << context
-                       << ": shard extents do not cover reconstructed dimension";
+            LOG(ERROR)
+                << context
+                << ": shard extents do not cover reconstructed dimension";
             return std::nullopt;
         }
     }
@@ -640,7 +648,8 @@ load_parallelism_manifest_reconstruction(
     std::shared_ptr<BufferHandle> manifest_handle;
     {
         py::gil_scoped_release release_gil;
-        manifest_handle = store_->get_buffer(get_parallelism_manifest_key_name(key));
+        manifest_handle =
+            store_->get_buffer(get_parallelism_manifest_key_name(key));
     }
     auto parsed_manifest = parse_writer_shard_manifest(manifest_handle.get());
     if (!parsed_manifest.has_value()) {
@@ -660,7 +669,8 @@ load_parallelism_manifest_reconstruction(
         LOG(ERROR) << context << ": split_dim mismatch";
         return std::nullopt;
     }
-    if (!is_uniform_shardable_dim(global_shape[split_dim], request_tp_axis->size) ||
+    if (!is_uniform_shardable_dim(global_shape[split_dim],
+                                  request_tp_axis->size) ||
         !is_uniform_shardable_dim(global_shape[split_dim], shard_count)) {
         LOG(ERROR) << context << ": only uniform sharding is supported";
         return std::nullopt;
@@ -685,15 +695,18 @@ load_parallelism_manifest_reconstruction(
         auto shard_parallelism = *canonical_parallelism;
         shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
         shard_parallelism.axes[*tp_axis_index].size = shard_count;
-        const std::string shard_key = get_parallelism_key_name(key, shard_parallelism);
+        const std::string shard_key =
+            get_parallelism_key_name(key, shard_parallelism);
         auto metadata = get_tensor_metadata(shard_key);
         if (!metadata.has_value()) {
-            LOG(ERROR) << context << ": no shard matched stored layout for TP rank "
+            LOG(ERROR) << context
+                       << ": no shard matched stored layout for TP rank "
                        << shard_rank;
             return std::nullopt;
         }
-        auto stored_parallelism = resolve_tp_compatible_parallelism_from_metadata(
-            shard_parallelism, metadata->metadata, context);
+        auto stored_parallelism =
+            resolve_tp_compatible_parallelism_from_metadata(
+                shard_parallelism, metadata->metadata, context);
         if (!stored_parallelism.has_value() ||
             !parallelism_specs_equal_by_kind(
                 shard_parallelism, *stored_parallelism,
@@ -739,15 +752,18 @@ load_parallelism_full_reconstruction_sources(
 
     FullTensorReconstructionSources reconstruction;
     if (uses_legacy_tp_storage_key(*canonical_parallelism)) {
-        const std::string first_key = resolve_tp_read_key(key, 0, request_tp_axis->size);
+        const std::string first_key =
+            resolve_tp_read_key(key, 0, request_tp_axis->size);
         auto first_metadata = get_tensor_metadata(first_key);
         if (!first_metadata.has_value()) {
-            LOG(ERROR) << context << ": no shard matched requested layout for TP rank 0";
+            LOG(ERROR) << context
+                       << ": no shard matched requested layout for TP rank 0";
             return std::nullopt;
         }
         const LayoutAxis *stored_tp_axis =
             find_layout_axis(first_metadata->metadata, LayoutAxisKind::TP);
-        if (!is_shard_tensor_metadata(first_metadata->metadata) || !stored_tp_axis) {
+        if (!is_shard_tensor_metadata(first_metadata->metadata) ||
+            !stored_tp_axis) {
             LOG(ERROR) << context << ": missing TP axis metadata";
             return std::nullopt;
         }
@@ -784,8 +800,8 @@ load_parallelism_full_reconstruction_sources(
             }
             const LayoutAxis *source_tp_axis =
                 find_layout_axis(metadata->metadata, LayoutAxisKind::TP);
-            if (!is_shard_tensor_metadata(metadata->metadata) || !source_tp_axis ||
-                source_tp_axis->shard_rank != shard_rank ||
+            if (!is_shard_tensor_metadata(metadata->metadata) ||
+                !source_tp_axis || source_tp_axis->shard_rank != shard_rank ||
                 source_tp_axis->shard_count != stored_tp_axis->shard_count ||
                 source_tp_axis->split_dim != reconstruction.split_dim) {
                 LOG(ERROR) << context
@@ -898,8 +914,8 @@ std::optional<TensorIntoPlan> build_parallelism_shard_tensor_into_plan(
     }
     return build_reconstructed_tensor_into_plan_from_sources(
         buffer_ptr, size, reconstruction->sources, reconstruction->global_shape,
-        reconstruction->split_dim, *target_metadata, target_start, target_extent,
-        context, reconstruction->allow_empty_fragments);
+        reconstruction->split_dim, *target_metadata, target_start,
+        target_extent, context, reconstruction->allow_empty_fragments);
 }
 
 pybind11::object get_tensor_with_parallelism_shard_full_materialized(
@@ -1166,8 +1182,9 @@ pybind11::object get_tensor_with_parallelism(
             return buffer_to_tensor(resolved->buffer_handle.get(), nullptr, 0);
         }
         if (find_axis_spec_by_kind(*parallelism, LayoutAxisKind::TP)) {
-            auto reconstructed = get_tensor_with_parallelism_shard_full_materialized(
-                key, *parallelism, "get_tensor_with_parallelism");
+            auto reconstructed =
+                get_tensor_with_parallelism_shard_full_materialized(
+                    key, *parallelism, "get_tensor_with_parallelism");
             if (!reconstructed.is_none()) {
                 return reconstructed;
             }
