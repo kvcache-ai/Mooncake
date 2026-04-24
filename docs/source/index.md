@@ -66,12 +66,15 @@ This repository also hosts its technical report and the open-sourced traces.
 getting_started/build
 getting_started/quick-start
 getting_started/supported-protocols
+getting_started/rust-bindings
 getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
+getting_started/examples/rl-training-integration
+getting_started/examples/mooncake-pg-usage
 :::
 
 % Making the most out of Mooncake
@@ -110,10 +113,12 @@ python-api-reference/ep-backend
 design/architecture
 design/mooncake-store
 design/p2p-store
+design/mooncake-pg
 design/transfer-engine/index
 design/tent/overview
 design/tent/tebench
 design/hicache-design
+design/conductor/indexer-api-design
 :::
 
 % Q&A for Mooncake
@@ -133,6 +138,9 @@ troubleshooting/troubleshooting
 :maxdepth: 2
 
 deployment/mooncake-store-deployment-guide
+deployment/ha-hot-standby
+deployment/monitoring
+deployment/multi-tier-storage
 :::
 
 % Community

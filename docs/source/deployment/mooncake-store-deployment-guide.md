@@ -153,6 +153,126 @@ This sets the log level for yalantinglibs (including coro_rpc and coro_http) to 
 
 Available log levels: trace, debug, info, warn (or warning), error, and critical.
 
+## S3 Snapshot Backend
+
+When `--snapshot_backend_type=s3` is set, Mooncake Master stores snapshots in an S3-compatible object store.
+
+### Required Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `AWS_ACCESS_KEY_ID` | S3 access key (or IAM role credential) |
+| `AWS_SECRET_ACCESS_KEY` | S3 secret key |
+| `AWS_DEFAULT_REGION` | AWS region (e.g., `us-east-1`) |
+| `MOONCAKE_SNAPSHOT_S3_BUCKET` | Target S3 bucket name |
+| `MOONCAKE_SNAPSHOT_S3_PREFIX` | (Optional) Key prefix inside the bucket |
+
+For IAM role-based authentication (recommended in production), omit `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` — the SDK will use the instance profile automatically.
+
+### Bucket Naming Conventions
+
+- Create a dedicated bucket for Mooncake snapshots (e.g., `my-org-mooncake-snapshots`).
+- Enable versioning on the bucket for additional safety.
+- Set a lifecycle rule to expire old snapshot objects beyond the `--snapshot_retention_count` limit.
+
+> **Warning:** The S3 bucket is a managed directory. Do not store other data under the same key prefix as Mooncake snapshots — old snapshots are deleted automatically during cleanup.
+
+### Example Startup Command (S3 backend)
+
+```bash
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+export AWS_DEFAULT_REGION=us-east-1
+export MOONCAKE_SNAPSHOT_S3_BUCKET=my-org-mooncake-snapshots
+export MOONCAKE_SNAPSHOT_S3_PREFIX=prod-cluster/
+
+mooncake_master \
+    --rpc_port=50051 \
+    --enable_snapshot=true \
+    --snapshot_backend_type=s3 \
+    --snapshot_interval_seconds=300 \
+    --snapshot_retention_count=3 \
+    --enable_snapshot_restore=true
+```
+
+### Restore Procedure
+
+On master restart with `--enable_snapshot_restore=true`, the master:
+1. Lists snapshots in the configured S3 bucket/prefix.
+2. Downloads the latest snapshot.
+3. Applies the snapshot to restore in-memory metadata.
+4. Resumes serving client RPCs.
+
+If `--snapshot_backup_dir` is also set, the downloaded snapshot is additionally saved locally as a fallback.
+
+---
+
+## Redis HA Backend
+
+Mooncake Store HA mode can use **Redis** instead of etcd for distributed leader election and cluster coordination.
+
+### Build Requirement
+
+Redis HA support must be enabled at compile time:
+
+```bash
+cmake .. \
+    -DSTORE_USE_REDIS=ON \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo
+make -j$(nproc)
+```
+
+This adds the `STORE_USE_REDIS` compile definition and links `hiredis`.
+
+### Connection Configuration
+
+| Environment Variable | Description |
+|----------------------|-------------|
+| `MC_REDIS_PASSWORD` | Redis AUTH password (omit if no auth is configured) |
+| `MC_REDIS_DB_INDEX` | Redis database index (default: `0`) |
+
+The Redis server URL is passed via `--etcd_endpoints` using the `redis://` scheme:
+
+```bash
+mooncake_master \
+    --rpc_port=50051 \
+    --enable_ha=true \
+    --etcd_endpoints="redis://10.0.0.10:6379" \
+    --cluster_id=prod-cluster \
+    --client_ttl=15
+```
+
+For a Redis Cluster or Sentinel setup:
+
+```bash
+# Redis Cluster (semicolon-separated nodes)
+--etcd_endpoints="redis://10.0.0.10:6379;redis://10.0.0.11:6379;redis://10.0.0.12:6379"
+```
+
+### Key Hash-Tag Conventions
+
+Mooncake uses Redis hash tags to ensure that all keys for a given cluster land on the same Redis cluster slot. The tag is derived from `--cluster_id` and sanitised via `SanitizeHashTagComponent()` (which strips characters that are illegal inside `{}`). For example:
+
+- `--cluster_id=prod-cluster` → Redis keys use `{prod-cluster}` as the hash tag.
+- All leader election keys, oplog entries, and session heartbeats share this tag.
+
+Do not use the same Redis instance / keyspace for other applications without ensuring their keys use different hash tags.
+
+### ConnectRedis() Helper
+
+The internal `ha::backends::redis::ConnectRedis()` helper reads `MC_REDIS_PASSWORD` and `MC_REDIS_DB_INDEX` from the environment automatically. No additional code changes are needed; configure these variables before starting the master.
+
+### Redis vs etcd
+
+| Feature | Redis | etcd |
+|---------|-------|------|
+| Build flag | `STORE_USE_REDIS=ON` | `STORE_USE_ETCD=ON` |
+| URL scheme | `redis://` | `etcd://` or bare `host:port` |
+| Cluster support | Redis Cluster / Sentinel | etcd cluster |
+| Recommended for | Environments already running Redis | New deployments |
+
+---
+
 ## Quick Tips
 
 - Scale `--rpc_thread_num` with available CPU cores and workload.
@@ -167,4 +287,7 @@ Available log levels: trace, debug, info, warn (or warning), error, and critical
 :maxdepth: 1
 
 ssd-offload
+ha-hot-standby
+monitoring
+multi-tier-storage
 :::
