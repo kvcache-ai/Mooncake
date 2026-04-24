@@ -559,10 +559,13 @@ def put_tensor_with_parallelism(
     tensor,
     parallelism: mooncake.store.TensorParallelism | None = None,
     config: ReplicateConfig | None = None,
+    writer_partition = None,
 ) -> int
 ```
 
 Use `parallelism=None` to store a full tensor object. Provide `TensorParallelism` to store a shard-scoped object.
+
+`writer_partition` is an optional write-side shorthand for full-tensor inputs that should be stored as one shard. It describes the writer's `(rank, size, split_dim)` and is mutually exclusive with `parallelism`; do not provide both in one call.
 
 For TP-containing multi-axis layouts, the caller may pass the full source tensor; Mooncake derives and persists the uniform shard selected by the requested TP rank/layout. That applies to layouts such as `dp_tp`, `pp_tp`, and `ep_tp`.
 
@@ -653,8 +656,11 @@ def upsert_tensor_with_parallelism(
     tensor,
     parallelism: mooncake.store.TensorParallelism | None = None,
     config: ReplicateConfig | None = None,
+    writer_partition = None,
 ) -> int
 ```
+
+The write semantics match `put_tensor_with_parallelism()`, including full-tensor input for TP-containing layouts and the mutually exclusive `writer_partition` shorthand.
 
 ### batch_upsert_tensor_with_parallelism()
 
@@ -2217,7 +2223,7 @@ def get_tensor_with_tp_into(self, key: str, buffer_ptr: int, size: int, tp_rank:
 Get a batch of PyTorch tensor shards from the store for a given Tensor Parallel rank, directly into the pre-allocated buffer.
 
 ```python
-def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> List[torch.Tensor]
+def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1) -> List[torch.Tensor]
 ```
 
 **Parameters:**

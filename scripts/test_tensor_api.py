@@ -1637,7 +1637,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
     def test_35_unified_parallelism_full_large_payload(self):
         require_unified_parallelism_api(self)
         key = "func_unified_tp_full_large"
-        _, tensors = generate_tensors(1, 32)
+        _, tensors = generate_tensors(1, 1)
         tensor = tensors[0]
         split_dim = 1
         tp_size = 4

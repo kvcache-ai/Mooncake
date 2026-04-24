@@ -178,11 +178,12 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
     }
 
     int ndim = metadata.header.ndim;
-    if (ndim < 0 || ndim > 4) {
+    if (ndim < 0 || ndim > static_cast<int>(kMaxTensorDims)) {
         if (take_ownership) {
             delete[] exported_data;
         }
-        LOG(ERROR) << "Invalid tensor metadata: ndim=" << ndim;
+        LOG(ERROR) << "Invalid tensor metadata: ndim=" << ndim
+                   << ", max supported=" << kMaxTensorDims;
         return pybind11::none();
     }
 
@@ -1966,7 +1967,9 @@ PYBIND11_MODULE(store, m) {
             "  buffer_ptr: The buffer pointer pre-allocated for tensor.\n"
             "  size: The size of buffer.\n"
             "  tp_rank: The current tensor parallel rank (default 0).\n"
-            "  tp_size: The total tensor parallel size (default 1).")
+            "  tp_size: The total tensor parallel size (default 1).\n"
+            "  split_dim: The tensor dimension used for TP sharding "
+            "(default 0).")
         .def(
             "batch_get_tensor_with_tp_into",
             &MooncakeStorePyWrapper::batch_get_tensor_with_tp_into,
