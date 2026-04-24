@@ -15,9 +15,8 @@ use mooncake_store_core::{
     MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result,
     RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState,
     RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
-    TenantObjectAccounting, TenantObjectAccountingState, TenantPlacementPolicy,
-    TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
-    TenantQuotaReservationRequest,
+    TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
 };
 use mooncake_transport::{
     Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,

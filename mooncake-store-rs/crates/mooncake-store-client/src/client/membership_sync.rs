@@ -185,16 +185,13 @@ pub(crate) fn refresh_due_tenant_quota_policy_cache(
     if tenants.is_empty() {
         return Ok(());
     }
-    let scopes = tenants
-        .iter()
-        .map(|tenant| TenantPolicyScope::new(tenant.as_str(), None::<String>, None::<String>))
-        .collect::<Vec<_>>();
-    let tracker = OperationTracker::new("tenant_policy_cache_refresh");
-    let result = metadata.get_tenant_policies(&scopes);
-    tracker.finish(&result, 0);
-    let policies = result?;
     let mut cache = live_client_cache.lock();
-    for (tenant, policy) in tenants.into_iter().zip(policies.into_iter()) {
+    for tenant in tenants {
+        let scope = TenantPolicyScope::new(tenant.as_str(), None::<String>, None::<String>);
+        let tracker = OperationTracker::new("tenant_policy_cache_refresh");
+        let result = metadata.get_tenant_policy(&scope);
+        tracker.finish(&result, 0);
+        let policy = result?;
         let version = policy.as_ref().map(|policy| policy.version);
         let quota = policy.and_then(|policy| policy.spec.quota);
         cache.store_tenant_quota_policy(tenant, version, quota, now);
