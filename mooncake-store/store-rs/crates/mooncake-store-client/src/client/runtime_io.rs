@@ -70,13 +70,10 @@ impl StoreClient {
         {
             return Ok(Some(quota));
         }
-        if object_id.scope.tenant == self.default_tenant() {
-            return Ok(self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
-                max_bytes: quota.max_bytes,
-                max_objects: quota.max_objects,
-            }));
-        }
-        Ok(None)
+        Ok(self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
+            max_bytes: quota.max_bytes,
+            max_objects: quota.max_objects,
+        }))
     }
 
     fn tenant_quota_scope(&self, object_id: &LogicalObjectId) -> TenantPolicyScope {
