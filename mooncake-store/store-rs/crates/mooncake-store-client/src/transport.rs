@@ -575,8 +575,15 @@ pub struct ClassicTeTransport {
 
 impl ClassicTeTransport {
     fn new(config: ClassicEngineConfig, segment_name: &str) -> Result<Self> {
+        let local_server_name = classic_te_local_server_name(&config, segment_name);
+        let engine = ClassicTransferEngine::new(&config, &local_server_name)?;
+        let published_segment_name = if config.uses_p2p_handshake_metadata() {
+            engine.rpc_server_address_text()?
+        } else {
+            segment_name.to_string()
+        };
         Ok(Self {
-            engine: RwLock::new(ClassicTransferEngine::new(&config, segment_name)?),
+            engine: RwLock::new(engine),
             max_registration_bytes: matches!(
                 config.transport_protocol(),
                 mooncake_transport::ClassicTransportProtocol::Rdma
@@ -584,7 +591,7 @@ impl ClassicTeTransport {
             .then(ClassicTransferEngine::rdma_max_registration_size)
             .flatten(),
             config,
-            segment_name: segment_name.to_string(),
+            segment_name: published_segment_name,
             allocations: Mutex::new(BTreeMap::new()),
         })
     }
@@ -680,6 +687,24 @@ impl ClassicTeTransport {
         let previous = std::mem::replace(&mut *engine, replacement);
         drop(previous);
         engine.republish_local_metadata()
+    }
+}
+
+fn classic_te_local_server_name(config: &ClassicEngineConfig, segment_name: &str) -> String {
+    if !config.uses_p2p_handshake_metadata() {
+        return segment_name.to_string();
+    }
+    match config.rpc_port_value() {
+        Some(port) => format_host_port(config.rpc_bind_host(), port),
+        None => config.rpc_bind_host().to_string(),
+    }
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -1943,16 +1968,16 @@ mod tests {
 
     use mooncake_store_core::{ClientLease, Result, StoreError};
     use mooncake_transport::{
-        Opcode, SegmentInfo, TransferBatchHints, TransferPacingMode, TransferProgress,
-        TransferRequest, TransferStatus,
+        ClassicEngineConfig, Opcode, SegmentInfo, TransferBatchHints, TransferPacingMode,
+        TransferProgress, TransferRequest, TransferStatus,
     };
     use parking_lot::Mutex;
 
     use super::{
-        classic_buffer_location, parse_rpc_server_address, registration_chunks, system_page_size,
-        wait_for_batch_completion, wait_for_batch_completion_detailed, BatchWaitFailureKind,
-        ClassicAllocationOwner, ClassicAllocationRecord, HttpStoreTransport,
-        HttpTransportServerHandle, StoreTransport,
+        classic_buffer_location, classic_te_local_server_name, format_host_port,
+        parse_rpc_server_address, registration_chunks, system_page_size, wait_for_batch_completion,
+        wait_for_batch_completion_detailed, BatchWaitFailureKind, ClassicAllocationOwner,
+        ClassicAllocationRecord, HttpStoreTransport, HttpTransportServerHandle, StoreTransport,
     };
 
     struct ScriptedTransport {
@@ -2297,6 +2322,31 @@ mod tests {
         assert_eq!(classic_buffer_location(&allocations, 0x1080, 0x80), "cpu:1");
         assert_eq!(classic_buffer_location(&allocations, 0x1080, 0x81), "*");
         assert_eq!(classic_buffer_location(&allocations, 0x2000, 0x10), "*");
+    }
+
+    #[test]
+    fn classic_te_p2p_uses_bind_endpoint_as_local_server_name() {
+        let config = ClassicEngineConfig::new("P2PHANDSHAKE", "127.0.0.1").rpc_port(17111);
+        assert_eq!(
+            classic_te_local_server_name(&config, "logical-segment"),
+            "127.0.0.1:17111"
+        );
+
+        let redis_config =
+            ClassicEngineConfig::new("redis://127.0.0.1:6379", "127.0.0.1").rpc_port(17111);
+        assert_eq!(
+            classic_te_local_server_name(&redis_config, "logical-segment"),
+            "logical-segment"
+        );
+    }
+
+    #[test]
+    fn format_host_port_wraps_ipv6_literals() {
+        assert_eq!(
+            format_host_port("2001:db8::1", 17111),
+            "[2001:db8::1]:17111"
+        );
+        assert_eq!(format_host_port("127.0.0.1", 17111), "127.0.0.1:17111");
     }
 
     #[derive(Clone)]

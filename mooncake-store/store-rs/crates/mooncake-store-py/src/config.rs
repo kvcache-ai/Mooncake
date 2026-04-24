@@ -11,6 +11,7 @@ use mooncake_transport::{ClassicEngineConfig, ClassicTransportProtocol, TentEngi
 use url::Url;
 
 pub const DEFAULT_COMPAT_LEASE_TTL_MS: u64 = 30_000;
+const P2P_HANDSHAKE_METADATA: &str = "P2PHANDSHAKE";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -218,12 +219,13 @@ impl CompatSetupArgs {
         let stable_id = stable_id.unwrap_or_else(|| format!("py-store-{}", now_ms()));
         let transport_backend = resolve_transport_backend(transport_backend.as_deref())?;
         let timeouts = timeouts.unwrap_or_else(CompatTimeoutConfig::from_env);
-        let (metadata, transport_redis_url) =
-            build_metadata_backend(&metadata_url, transport_metadata_url, keyspace)?;
+        let metadata = build_store_metadata_backend(&metadata_url, keyspace)?;
+        let transport_metadata_uri =
+            resolve_transport_metadata_uri(&metadata_url, transport_metadata_url)?;
         let transport_config = build_transport_config(
             transport_backend,
             &local_hostname,
-            &transport_redis_url,
+            &transport_metadata_uri,
             &protocol,
             transport_rpc_port,
             timeouts,
@@ -305,22 +307,27 @@ fn resolve_transport_backend(explicit: Option<&str>) -> Result<TransportBackend>
 fn build_transport_config(
     backend: TransportBackend,
     local_hostname: &str,
-    transport_redis_url: &str,
+    transport_metadata_uri: &str,
     protocol: &str,
     transport_rpc_port: Option<u16>,
     timeouts: CompatTimeoutConfig,
 ) -> Result<CompatTransportConfig> {
     match backend {
+        TransportBackend::Tent if is_p2p_handshake_metadata(transport_metadata_uri) => {
+            Err(StoreError::Unsupported(
+                "P2PHANDSHAKE transport metadata is supported only with classic_te".to_string(),
+            ))
+        }
         TransportBackend::Tent => Ok(CompatTransportConfig::Tent(build_tent_config(
             local_hostname,
-            transport_redis_url,
+            transport_metadata_uri,
             protocol,
             transport_rpc_port,
             timeouts,
         )?)),
         TransportBackend::ClassicTe => Ok(CompatTransportConfig::ClassicTe(build_classic_config(
             local_hostname,
-            transport_redis_url,
+            transport_metadata_uri,
             protocol,
             transport_rpc_port,
             timeouts,
@@ -334,16 +341,14 @@ fn build_transport_config(
     }
 }
 
-pub fn build_metadata_backend(
+pub fn build_store_metadata_backend(
     metadata_url: &str,
-    transport_metadata_url: Option<String>,
     keyspace: MetadataKeyspace,
-) -> Result<(Arc<dyn MetadataBackend>, String)> {
+) -> Result<Arc<dyn MetadataBackend>> {
     if metadata_url.starts_with("redis://") {
-        let backend = Arc::new(RedisMetadataBackend::new(
+        return Ok(Arc::new(RedisMetadataBackend::new(
             RedisMetadataConfig::new(metadata_url.to_string()).keyspace(keyspace),
-        )?);
-        return Ok((backend, metadata_url.to_string()));
+        )?));
     }
 
     if let Some(rest) = metadata_url.strip_prefix("etcd://") {
@@ -357,18 +362,9 @@ pub fn build_metadata_backend(
                 "etcd metadata url must contain at least one endpoint".to_string(),
             ));
         }
-        let backend = Arc::new(EtcdMetadataBackend::from_config(
+        return Ok(Arc::new(EtcdMetadataBackend::from_config(
             EtcdMetadataConfig::new(endpoints).keyspace(keyspace),
-        )?);
-        let transport_redis_url = transport_metadata_url
-            .or_else(|| std::env::var("MC_STORE_RS_TENT_REDIS_URL").ok())
-            .unwrap_or_else(|| "redis://127.0.0.1:6380/0".to_string());
-        if !transport_redis_url.starts_with("redis://") {
-            return Err(StoreError::Metadata(
-                "transport metadata url must be redis:// when store metadata uses etcd".to_string(),
-            ));
-        }
-        return Ok((backend, transport_redis_url));
+        )?));
     }
 
     if metadata_url.starts_with("http://") || metadata_url.starts_with("https://") {
@@ -383,16 +379,80 @@ pub fn build_metadata_backend(
     )))
 }
 
+fn resolve_transport_metadata_uri(
+    metadata_url: &str,
+    transport_metadata_url: Option<String>,
+) -> Result<String> {
+    if metadata_url.starts_with("redis://") {
+        let transport_metadata_uri =
+            normalize_transport_metadata_uri(transport_metadata_url, metadata_url.to_string());
+        validate_transport_metadata_uri(&transport_metadata_uri)?;
+        return Ok(transport_metadata_uri);
+    }
+
+    if metadata_url.starts_with("etcd://") {
+        let transport_metadata_uri = normalize_transport_metadata_uri(
+            transport_metadata_url.or_else(|| std::env::var("MC_STORE_RS_TENT_REDIS_URL").ok()),
+            "redis://127.0.0.1:6380/0".to_string(),
+        );
+        validate_transport_metadata_uri(&transport_metadata_uri)?;
+        return Ok(transport_metadata_uri);
+    }
+
+    if metadata_url.starts_with("http://") || metadata_url.starts_with("https://") {
+        return Err(StoreError::Unsupported(
+            "http metadata endpoints are not supported in store-rs; use redis:// or etcd://"
+                .to_string(),
+        ));
+    }
+
+    Err(StoreError::Metadata(format!(
+        "unsupported metadata url scheme: {metadata_url}"
+    )))
+}
+
+fn normalize_transport_metadata_uri(explicit: Option<String>, fallback: String) -> String {
+    explicit
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if is_p2p_handshake_metadata(&value) {
+                P2P_HANDSHAKE_METADATA.to_string()
+            } else {
+                value
+            }
+        })
+        .unwrap_or(fallback)
+}
+
+fn validate_transport_metadata_uri(value: &str) -> Result<()> {
+    if is_redis_metadata_uri(value) || is_p2p_handshake_metadata(value) {
+        return Ok(());
+    }
+
+    Err(StoreError::Metadata(
+        "transport metadata url must be redis:// or P2PHANDSHAKE".to_string(),
+    ))
+}
+
+fn is_p2p_handshake_metadata(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(P2P_HANDSHAKE_METADATA)
+}
+
+fn is_redis_metadata_uri(value: &str) -> bool {
+    value.starts_with("redis://")
+}
+
 fn build_tent_config(
     local_hostname: &str,
-    transport_redis_url: &str,
+    transport_metadata_uri: &str,
     protocol: &str,
     transport_rpc_port: Option<u16>,
     timeouts: CompatTimeoutConfig,
 ) -> Result<TentEngineConfig> {
     let (local_hostname, transport_rpc_port) =
         normalize_transport_listen_endpoint(local_hostname, transport_rpc_port)?;
-    let redis = Url::parse(transport_redis_url)
+    let redis = Url::parse(transport_metadata_uri)
         .map_err(|error| StoreError::Metadata(format!("invalid redis url: {error}")))?;
     let host = redis
         .host_str()
@@ -403,7 +463,7 @@ fn build_tent_config(
         .and_then(|mut segments| segments.next())
         .filter(|segment| !segment.is_empty())
         .unwrap_or("0");
-    let auth = resolve_redis_auth(transport_redis_url)?;
+    let auth = resolve_redis_auth(transport_metadata_uri)?;
 
     let (tcp_enable, rdma_enable) = match protocol.to_ascii_lowercase().as_str() {
         "tcp" | "" => ("true", "false"),
@@ -446,14 +506,34 @@ fn build_tent_config(
 
 fn build_classic_config(
     local_hostname: &str,
-    transport_redis_url: &str,
+    transport_metadata_uri: &str,
     protocol: &str,
     transport_rpc_port: Option<u16>,
     timeouts: CompatTimeoutConfig,
 ) -> Result<ClassicEngineConfig> {
     let (rpc_bind_host, rpc_port) =
         normalize_transport_listen_endpoint(local_hostname, transport_rpc_port)?;
-    let redis = Url::parse(transport_redis_url)
+    let protocol = match protocol.to_ascii_lowercase().as_str() {
+        "tcp" | "" | "auto" => ClassicTransportProtocol::Tcp,
+        "rdma" => ClassicTransportProtocol::Rdma,
+        other => {
+            return Err(StoreError::Unsupported(format!(
+                "unsupported transport protocol: {other}"
+            )))
+        }
+    };
+
+    if is_p2p_handshake_metadata(transport_metadata_uri) {
+        let mut config = ClassicEngineConfig::new(P2P_HANDSHAKE_METADATA, rpc_bind_host)
+            .protocol(protocol)
+            .slice_timeout(timeouts.transfer_stall_timeout);
+        if let Some(rpc_port) = rpc_port {
+            config = config.rpc_port(rpc_port);
+        }
+        return Ok(config);
+    }
+
+    let redis = Url::parse(transport_metadata_uri)
         .map_err(|error| StoreError::Metadata(format!("invalid redis url: {error}")))?;
     let host = redis
         .host_str()
@@ -464,16 +544,7 @@ fn build_classic_config(
         .and_then(|mut segments| segments.next())
         .filter(|segment| !segment.is_empty())
         .unwrap_or("0");
-    let auth = resolve_redis_auth(transport_redis_url)?;
-    let protocol = match protocol.to_ascii_lowercase().as_str() {
-        "tcp" | "" | "auto" => ClassicTransportProtocol::Tcp,
-        "rdma" => ClassicTransportProtocol::Rdma,
-        other => {
-            return Err(StoreError::Unsupported(format!(
-                "unsupported transport protocol: {other}"
-            )))
-        }
-    };
+    let auth = resolve_redis_auth(transport_metadata_uri)?;
     let metadata_uri = format!("redis://{}:{port}", format_redis_host(host));
     let mut config = ClassicEngineConfig::new(metadata_uri, rpc_bind_host)
         .protocol(protocol)
@@ -646,6 +717,79 @@ mod tests {
     }
 
     #[test]
+    fn resolve_transport_metadata_uri_honors_explicit_value_for_redis_store() {
+        let transport_metadata_uri = resolve_transport_metadata_uri(
+            "redis://127.0.0.1:6379/0",
+            Some("P2PHANDSHAKE".to_string()),
+        )
+        .expect("transport metadata uri should resolve");
+        assert_eq!(transport_metadata_uri, P2P_HANDSHAKE_METADATA);
+    }
+
+    #[test]
+    fn resolve_transport_metadata_uri_rejects_non_redis_explicit_value_for_redis_store() {
+        let error = match resolve_transport_metadata_uri(
+            "redis://127.0.0.1:6379/0",
+            Some("http://bad-transport".to_string()),
+        ) {
+            Ok(_) => panic!("transport metadata requires redis or p2p metadata"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Metadata(_)));
+    }
+
+    #[test]
+    fn build_classic_config_accepts_p2p_handshake_metadata() {
+        let config = build_classic_config(
+            "node-a:17112",
+            "p2phandshake",
+            "tcp",
+            None,
+            sample_timeouts(),
+        )
+        .expect("classic config should accept p2p handshake metadata");
+        assert_eq!(config.metadata_uri(), P2P_HANDSHAKE_METADATA);
+        assert_eq!(config.rpc_bind_host(), "node-a");
+        assert_eq!(config.rpc_port_value(), Some(17112));
+        assert_eq!(config.transport_protocol(), ClassicTransportProtocol::Tcp);
+        assert_eq!(config.redis_username_value(), None);
+        assert_eq!(config.redis_password_value(), None);
+        assert_eq!(config.redis_db_index_value(), None);
+    }
+
+    #[test]
+    fn compat_setup_rejects_p2p_handshake_metadata_for_tent() {
+        let result = CompatSetupArgs {
+            local_hostname: "node-a:17112".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: Some("P2PHANDSHAKE".to_string()),
+            global_segment_size: 4096,
+            local_buffer_size: 1024,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            transport_rpc_port: None,
+            transport_backend: Some("tent".to_string()),
+            stable_id: Some("tent-p2p".to_string()),
+            tenant: "tenant-a".to_string(),
+            labels: BTreeMap::new(),
+            routed_writes: false,
+            replica_count: 1,
+            route_topk: 2,
+            keyspace: None,
+            expires_at_ms: Some(10_000),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+            timeouts: None,
+        }
+        .build();
+        let error = match result {
+            Ok(_) => panic!("tent backend should reject P2PHANDSHAKE transport metadata"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Unsupported(_)));
+    }
+
+    #[test]
     fn resolve_transport_backend_prefers_explicit_value() {
         let _guard = env_test_lock().lock();
         std::env::set_var("MC_STORE_RS_TRANSPORT_BACKEND", "tent");
@@ -698,10 +842,9 @@ mod tests {
     }
 
     #[test]
-    fn build_metadata_backend_rejects_http_metadata() {
-        let result = build_metadata_backend(
+    fn build_store_metadata_backend_rejects_http_metadata() {
+        let result = build_store_metadata_backend(
             "http://127.0.0.1:8080/metadata",
-            None,
             MetadataKeyspace::default(),
         );
         let error = match result {
@@ -990,22 +1133,21 @@ mod tests {
     }
 
     #[test]
-    fn build_metadata_backend_validates_etcd_transport_url() {
-        let error = match build_metadata_backend(
+    fn resolve_transport_metadata_uri_validates_etcd_transport_url() {
+        let error = match resolve_transport_metadata_uri(
             "etcd://127.0.0.1:2379",
             Some("http://bad-transport".to_string()),
-            MetadataKeyspace::default(),
         ) {
-            Ok(_) => panic!("etcd metadata requires redis transport metadata"),
+            Ok(_) => panic!("etcd metadata requires redis or p2p transport metadata"),
             Err(error) => error,
         };
         assert!(matches!(error, StoreError::Metadata(_)));
     }
 
     #[test]
-    fn build_metadata_backend_rejects_unknown_scheme() {
+    fn build_store_metadata_backend_rejects_unknown_scheme() {
         let error =
-            match build_metadata_backend("file:///tmp/metadata", None, MetadataKeyspace::default())
+            match build_store_metadata_backend("file:///tmp/metadata", MetadataKeyspace::default())
             {
                 Ok(_) => panic!("unknown metadata scheme should fail"),
                 Err(error) => error,

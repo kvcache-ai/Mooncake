@@ -270,7 +270,7 @@ These are compatibility bridges because current upstream SGLang does not forward
 - `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
 - `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
-- `MC_STORE_RS_TRANSPORT_METADATA_URL`, `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
+- `MC_STORE_RS_TRANSPORT_METADATA_URL` (`redis://...` by default, or `P2PHANDSHAKE` with `classic_te`), `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
 - `MC_STORE_RS_TRACE_FILE=/path/to/real-client.log` to append real-client Rust logs to a dedicated file instead of the SGLang process stream
@@ -631,7 +631,7 @@ Runtime selection:
 - `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
 - `MC_STORE_RS_GID_INDEX=<n>` when `classic_te` over RDMA must pick a non-default RoCE GID index; Store-RS forwards it to upstream `MC_GID_INDEX`
 
-When store metadata uses etcd in the Python compatibility layer, transport metadata still requires Redis through `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL`.
+When store metadata uses etcd in the Python compatibility layer, TENT transport metadata still requires Redis through `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL`. With `classic_te`, `transport_metadata_url=P2PHANDSHAKE` keeps Store-RS metadata on `metadata_url` and lets the transfer engine use peer handshake metadata.
 
 Port roles stay the same across backends:
 

@@ -300,8 +300,8 @@ Notes:
 
 - HTTP metadata endpoints are not supported
 - Redis store metadata accepts URL-embedded credentials or `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD`
-- when store metadata uses etcd, transport metadata still needs Redis
-- set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint
+- when store metadata uses etcd, TENT transport metadata still needs Redis; classic_te can use P2PHANDSHAKE
+- set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for the TENT Redis endpoint, or set `transport_metadata_url=P2PHANDSHAKE` with `classic_te`
 
 ### Redis authentication
 
@@ -350,7 +350,7 @@ Important Python-only compatibility knobs:
 | `replica_count` | default replica count when routed writes are enabled |
 | `route_topk` | WRH route-authority fanout; must match the policy already stored in the metadata keyspace |
 | `transport_backend` | choose `tent` or `classic_te` for the real transport runtime |
-| `transport_metadata_url` | Redis endpoint for transport metadata when store metadata uses etcd |
+| `transport_metadata_url` | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
 | `transport_rpc_port` | fixed real data-plane TCP port for real-mode peers |
 | `use_hugepage` | enable hugepage-backed local store memory |
 | `hugepage_size` | hugepage size for local store memory; accepts `2MB` or `1GB` |
@@ -470,7 +470,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_REPLICA_COUNT` | Python wrapper setup fallback | default routed-writer replica count |
 | `MC_STORE_RS_ROUTE_TOPK` | Python wrapper setup fallback | WRH route-authority fanout; must be `>= 2` |
 | `MC_STORE_RS_ROUTE_CONTROL` | Python wrapper setup fallback | route control mode, usually `embedded_wrh` |
-| `MC_STORE_RS_TRANSPORT_METADATA_URL` | Python wrapper setup fallback | transport Redis URL when store metadata uses etcd |
+| `MC_STORE_RS_TRANSPORT_METADATA_URL` | Python wrapper setup fallback | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
 | `MC_STORE_RS_GID_INDEX` | compatibility layer, standalone client, Python wrapper, and bench | `classic_te` RDMA GID index override; forwarded to upstream `MC_GID_INDEX` |
 | `MC_STORE_RS_TRANSPORT_RPC_PORT` | Python wrapper setup fallback | fixed real data-plane transport port |
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |
