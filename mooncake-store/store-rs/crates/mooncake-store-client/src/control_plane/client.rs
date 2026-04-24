@@ -524,9 +524,13 @@ impl ControlPlaneClient {
         let tracker = OperationTracker::new("control_migration_status");
         let result = self
             .get_migration_execution_status_detail(lease, request)
-            .map(|reply| {
-                pb::MigrationExecutionState::try_from(reply.state)
-                    .unwrap_or(pb::MigrationExecutionState::Unspecified)
+            .and_then(|reply| {
+                pb::MigrationExecutionState::try_from(reply.state).map_err(|_| {
+                    StoreError::Transport(format!(
+                        "control plane get_migration_execution_status reply has invalid state: {}",
+                        reply.state
+                    ))
+                })
             });
         tracker.finish(&result, 0);
         result
@@ -539,6 +543,7 @@ impl ControlPlaneClient {
         authority: &ClientStableId,
         key: &ObjectKey,
     ) -> Result<Option<ObjectRoute>> {
+        // batch_get_routes 保证返回结果顺序与输入 keys 顺序一致。
         let mut replies =
             self.batch_get_routes(lease, namespace, authority, std::slice::from_ref(key))?;
         replies.pop().ok_or_else(|| {

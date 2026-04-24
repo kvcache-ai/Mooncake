@@ -477,15 +477,19 @@ impl LocalMigrationExecutionContext {
         &self,
         request: &pb::SubmitMigrationTaskRequest,
     ) -> Result<(LogicalObjectId, ExplicitMigrationPlan)> {
-        let mode = match pb::MigrationMode::try_from(request.mode)
-            .unwrap_or(pb::MigrationMode::Unspecified)
-        {
-            pb::MigrationMode::Copy => ExplicitMigrationMode::Copy,
-            pb::MigrationMode::Move => ExplicitMigrationMode::Move,
-            pb::MigrationMode::Unspecified => {
+        let mode = match pb::MigrationMode::try_from(request.mode) {
+            Ok(pb::MigrationMode::Copy) => ExplicitMigrationMode::Copy,
+            Ok(pb::MigrationMode::Move) => ExplicitMigrationMode::Move,
+            Ok(pb::MigrationMode::Unspecified) => {
                 return Err(StoreError::InvalidState(
                     "migration task is missing mode".to_string(),
                 ));
+            }
+            Err(_) => {
+                return Err(StoreError::InvalidState(format!(
+                    "migration task has invalid mode value {}",
+                    request.mode
+                )));
             }
         };
         let object_id = LogicalObjectId::new(

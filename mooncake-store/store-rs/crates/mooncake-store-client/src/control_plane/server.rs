@@ -774,8 +774,8 @@ fn validate_submit_migration_task_request(
             "control plane submit_migration_task request is missing task_executor".to_string(),
         ));
     }
-    match pb::MigrationMode::try_from(request.mode).unwrap_or(pb::MigrationMode::Unspecified) {
-        pb::MigrationMode::Copy => {
+    match pb::MigrationMode::try_from(request.mode) {
+        Ok(pb::MigrationMode::Copy) => {
             if request.target_segments.is_empty() {
                 return Err(StoreError::InvalidState(
                     "control plane submit_migration_task request is missing target_segments"
@@ -783,7 +783,7 @@ fn validate_submit_migration_task_request(
                 ));
             }
         }
-        pb::MigrationMode::Move => {
+        Ok(pb::MigrationMode::Move) => {
             if request.target_segments.len() != 1 {
                 return Err(StoreError::InvalidState(
                     "control plane submit_migration_task move requests require exactly one target_segment"
@@ -791,10 +791,16 @@ fn validate_submit_migration_task_request(
                 ));
             }
         }
-        pb::MigrationMode::Unspecified => {
+        Ok(pb::MigrationMode::Unspecified) => {
             return Err(StoreError::InvalidState(
                 "control plane submit_migration_task request is missing mode".to_string(),
             ));
+        }
+        Err(_) => {
+            return Err(StoreError::InvalidState(format!(
+                "control plane submit_migration_task request has invalid mode value {}",
+                request.mode
+            )));
         }
     }
     Ok(())

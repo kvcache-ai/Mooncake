@@ -627,6 +627,236 @@ impl Drop for DelayedUnaryHandle {
     }
 }
 
+struct InvalidMigrationStatusService {
+    inner: GrpcControlPlaneService,
+    invalid_state: i32,
+}
+
+#[tonic::async_trait]
+impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationStatusService {
+    type ControlStreamStream = ReceiverStream<std::result::Result<pb::ControlStreamReply, Status>>;
+
+    async fn get_route(
+        &self,
+        request: Request<pb::GetRouteRequest>,
+    ) -> std::result::Result<Response<pb::GetRouteReply>, Status> {
+        self.inner.get_route(request).await
+    }
+
+    async fn batch_get_routes(
+        &self,
+        request: Request<pb::BatchGetRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchGetRoutesReply>, Status> {
+        self.inner.batch_get_routes(request).await
+    }
+
+    async fn compare_and_swap_route(
+        &self,
+        request: Request<pb::CompareAndSwapRouteRequest>,
+    ) -> std::result::Result<Response<pb::CompareAndSwapRouteReply>, Status> {
+        self.inner.compare_and_swap_route(request).await
+    }
+
+    async fn list_routes_by_replica_owner(
+        &self,
+        request: Request<pb::ListRoutesByReplicaOwnerRequest>,
+    ) -> std::result::Result<Response<pb::ListRoutesByReplicaOwnerReply>, Status> {
+        self.inner.list_routes_by_replica_owner(request).await
+    }
+
+    async fn batch_compare_and_swap_routes(
+        &self,
+        request: Request<pb::BatchCompareAndSwapRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchCompareAndSwapRoutesReply>, Status> {
+        self.inner.batch_compare_and_swap_routes(request).await
+    }
+
+    async fn replace_route(
+        &self,
+        request: Request<pb::ReplaceRouteRequest>,
+    ) -> std::result::Result<Response<pb::ReplaceRouteReply>, Status> {
+        self.inner.replace_route(request).await
+    }
+
+    async fn batch_replace_routes(
+        &self,
+        request: Request<pb::BatchReplaceRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchReplaceRoutesReply>, Status> {
+        self.inner.batch_replace_routes(request).await
+    }
+
+    async fn reserve_any(
+        &self,
+        request: Request<pb::ReserveAnyRequest>,
+    ) -> std::result::Result<Response<pb::ReserveAnyReply>, Status> {
+        self.inner.reserve_any(request).await
+    }
+
+    async fn batch_reserve_any(
+        &self,
+        request: Request<pb::BatchReserveAnyRequest>,
+    ) -> std::result::Result<Response<pb::BatchReserveAnyReply>, Status> {
+        self.inner.batch_reserve_any(request).await
+    }
+
+    async fn reserve_specific(
+        &self,
+        request: Request<pb::ReserveSpecificRequest>,
+    ) -> std::result::Result<Response<pb::ReserveSpecificReply>, Status> {
+        self.inner.reserve_specific(request).await
+    }
+
+    async fn batch_reserve_specific(
+        &self,
+        request: Request<pb::BatchReserveSpecificRequest>,
+    ) -> std::result::Result<Response<pb::BatchReserveSpecificReply>, Status> {
+        self.inner.batch_reserve_specific(request).await
+    }
+
+    async fn release(
+        &self,
+        request: Request<pb::ReleaseRequest>,
+    ) -> std::result::Result<Response<pb::ReleaseReply>, Status> {
+        self.inner.release(request).await
+    }
+
+    async fn batch_release(
+        &self,
+        request: Request<pb::BatchReleaseRequest>,
+    ) -> std::result::Result<Response<pb::BatchReleaseReply>, Status> {
+        self.inner.batch_release(request).await
+    }
+
+    async fn batch_report_route_hits(
+        &self,
+        request: Request<pb::BatchReportRouteHitsRequest>,
+    ) -> std::result::Result<Response<pb::BatchReportRouteHitsReply>, Status> {
+        self.inner.batch_report_route_hits(request).await
+    }
+
+    async fn batch_track_replica_routes(
+        &self,
+        request: Request<pb::BatchTrackReplicaRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchTrackReplicaRoutesReply>, Status> {
+        self.inner.batch_track_replica_routes(request).await
+    }
+
+    async fn submit_migration_task(
+        &self,
+        request: Request<pb::SubmitMigrationTaskRequest>,
+    ) -> std::result::Result<Response<pb::SubmitMigrationTaskReply>, Status> {
+        self.inner.submit_migration_task(request).await
+    }
+
+    async fn get_migration_execution_status(
+        &self,
+        request: Request<pb::GetMigrationExecutionStatusRequest>,
+    ) -> std::result::Result<Response<pb::GetMigrationExecutionStatusReply>, Status> {
+        let execution_id = request.into_inner().execution_id;
+        Ok(Response::new(pb::GetMigrationExecutionStatusReply {
+            execution_id,
+            state: self.invalid_state,
+            attempts: 1,
+            last_error: String::new(),
+            error: None,
+        }))
+    }
+
+    async fn control_stream(
+        &self,
+        _request: Request<tonic::Streaming<pb::ControlStreamRequest>>,
+    ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
+        Err(Status::unavailable("stream disabled"))
+    }
+}
+
+struct InvalidMigrationStatusHandle {
+    address: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl InvalidMigrationStatusHandle {
+    fn spawn(
+        authority: Arc<dyn AuthorityService>,
+        allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
+        invalid_state: i32,
+    ) -> mooncake_store_core::Result<Self> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
+            StoreError::Transport(format!("invalid status bind failed: {error}"))
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            StoreError::Transport(format!("invalid status listener setup failed: {error}"))
+        })?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| {
+                StoreError::Transport(format!("invalid status local addr failed: {error}"))
+            })?
+            .to_string();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let thread = thread::Builder::new()
+            .name(format!("invalid-status-{address}"))
+            .spawn(move || {
+                let runtime = RuntimeBuilder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime should start");
+                let service = InvalidMigrationStatusService {
+                    inner: GrpcControlPlaneService::new(authority, allocator, eviction),
+                    invalid_state,
+                };
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("listener conversion should succeed");
+                    Server::builder()
+                        .tcp_nodelay(true)
+                        .add_service(
+                            pb::control_plane_service_server::ControlPlaneServiceServer::new(
+                                service,
+                            ),
+                        )
+                        .serve_with_incoming_shutdown(
+                            TcpListenerStream::new(listener),
+                            async move {
+                                let _ = shutdown_rx.await;
+                            },
+                        )
+                        .await
+                        .expect("invalid status server should run");
+                });
+            })
+            .map_err(|error| {
+                StoreError::Transport(format!("invalid status spawn failed: {error}"))
+            })?;
+        Ok(Self {
+            address,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for InvalidMigrationStatusHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
     let _guard = crate::observability::test_process_lock().lock();
     let previous = std::env::var(key).ok();
@@ -896,6 +1126,24 @@ fn control_plane_migration_entrypoints_reject_invalid_requests() {
         .expect_err("move migration with multiple targets should be rejected");
     assert!(matches!(submit_error, StoreError::InvalidState(_)));
 
+    let invalid_mode_error = client
+        .submit_migration_task(
+            &lease,
+            pb::SubmitMigrationTaskRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                tenant: "tenant-a".to_string(),
+                key: "alpha".to_string(),
+                mode: 999,
+                source_segment: "segment-a".to_string(),
+                target_segments: vec!["segment-b".to_string()],
+                task_executor: "executor-a".to_string(),
+                max_retries: 3,
+            },
+        )
+        .expect_err("invalid migration mode should be rejected");
+    assert!(matches!(invalid_mode_error, StoreError::InvalidState(_)));
+
     let status_error = client
         .get_migration_execution_status(
             &lease,
@@ -905,8 +1153,41 @@ fn control_plane_migration_entrypoints_reject_invalid_requests() {
                 execution_id: String::new(),
             },
         )
-        .expect_err("status lookup without execution_id should be rejected");
+        .expect_err("status lookup with empty execution_id should be rejected");
     assert!(matches!(status_error, StoreError::InvalidState(_)));
+
+    drop(client);
+    handle.shutdown();
+}
+
+#[test]
+fn control_plane_migration_status_rejects_invalid_reply_state() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("alpha", 1, &owner));
+
+    let mut handle = InvalidMigrationStatusHandle::spawn(authority, allocator, eviction, 999)
+        .expect("invalid-status control plane server should start");
+    let lease = sample_lease(handle.address());
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+
+    let error = client
+        .get_migration_execution_status(
+            &lease,
+            pb::GetMigrationExecutionStatusRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                execution_id: "migration-1".to_string(),
+            },
+        )
+        .expect_err("invalid migration execution state should be rejected");
+    assert!(matches!(error, StoreError::Transport(_)));
+    assert!(
+        error.to_string().contains("invalid state"),
+        "unexpected error: {error}"
+    );
 
     drop(client);
     handle.shutdown();
