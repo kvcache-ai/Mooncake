@@ -386,6 +386,16 @@ struct LocalMigrationExecutionContext {
     executions: Arc<Mutex<BTreeMap<String, MigrationExecutionRecord>>>,
 }
 
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "migration worker panicked".to_string(),
+        },
+    }
+}
+
 impl LocalMigrationExecutionContext {
     fn update_execution(
         &self,
@@ -545,13 +555,40 @@ impl LocalMigrationAdapter {
         let (task_sender, task_receiver) = std::sync::mpsc::channel::<MigrationWorkItem>();
         let worker_context = context.clone();
         let worker_name = format!("store-migration-{}", context.executor_stable_id.0);
-        let _ = std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name(worker_name)
             .spawn(move || {
                 while let Ok(work_item) = task_receiver.recv() {
-                    worker_context.execute_task(work_item.execution_id, work_item.request);
+                    worker_context.update_execution(
+                        &work_item.execution_id,
+                        pb::MigrationExecutionState::Dispatching,
+                        1,
+                        String::new(),
+                    );
+                    let execution_id = work_item.execution_id.clone();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker_context.execute_task(work_item.execution_id, work_item.request);
+                    }));
+                    if let Err(payload) = result {
+                        worker_context.update_execution(
+                            &execution_id,
+                            pb::MigrationExecutionState::Failed,
+                            1,
+                            format!(
+                                "migration execution panicked: {}",
+                                panic_payload_message(payload)
+                            ),
+                        );
+                    }
                 }
-            });
+            })
+        {
+            warn!(
+                executor = %context.executor_stable_id,
+                error = %error,
+                "failed to spawn local migration worker"
+            );
+        }
 
         Self {
             executor_stable_id: context.executor_stable_id,
@@ -576,12 +613,12 @@ impl MigrationService for LocalMigrationAdapter {
         self.executions.lock().insert(
             execution_id.clone(),
             MigrationExecutionRecord {
-                state: pb::MigrationExecutionState::Dispatching,
+                state: pb::MigrationExecutionState::Pending,
                 attempts: 0,
                 last_error: String::new(),
             },
         );
-        self.task_sender
+        let send_result = self.task_sender
             .send(MigrationWorkItem {
                 execution_id: execution_id.clone(),
                 request: request.clone(),
@@ -590,7 +627,18 @@ impl MigrationService for LocalMigrationAdapter {
                 StoreError::Transport(
                     "migration task executor worker is not accepting new tasks".to_string(),
                 )
-            })?;
+            });
+        if let Err(error) = send_result {
+            self.executions.lock().insert(
+                execution_id.clone(),
+                MigrationExecutionRecord {
+                    state: pb::MigrationExecutionState::Failed,
+                    attempts: 0,
+                    last_error: error.to_string(),
+                },
+            );
+            return Err(error);
+        }
         Ok(execution_id)
     }
 
