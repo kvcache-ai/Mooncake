@@ -354,18 +354,144 @@ TEST_F(ClientMetricsTest, P2PClientMetricWithLabelsTest) {
     std::map<std::string, std::string> labels = {
         {"instance_id", "test-instance"}, {"deployment_mode", "p2p"}};
 
-    P2PClientMetric metrics(labels);
-    metrics.local_put_requests.inc();
-    metrics.local_get_requests.inc();
+    auto metrics = P2PClientMetric::Create(labels);
+    ASSERT_NE(metrics, nullptr);
+    metrics->local_put_requests.inc();
+    metrics->local_get_requests.inc();
 
     std::string serialized;
-    metrics.serialize(serialized);
+    metrics->serialize(serialized);
 
     // Verify labels are present in output
     EXPECT_TRUE(serialized.find("instance_id=\"test-instance\"") !=
                 std::string::npos);
     EXPECT_TRUE(serialized.find("deployment_mode=\"p2p\"") !=
                 std::string::npos);
+}
+
+// Test P2PClientMetric inheritance from ClientMetric
+TEST_F(ClientMetricsTest, P2PClientMetricInheritanceTest) {
+    auto p2p_metrics = P2PClientMetric::Create({});
+    ASSERT_NE(p2p_metrics, nullptr);
+
+    // Add data to both base class metrics and P2P-specific metrics
+    p2p_metrics->transfer_metric.total_read_bytes.inc(1024 * 1024);  // 1 MB
+    p2p_metrics->transfer_metric.total_write_bytes.inc(2 * 1024 *
+                                                       1024);  // 2 MB
+    p2p_metrics->local_get_requests.inc(100);
+    p2p_metrics->local_put_requests.inc(50);
+
+    // Test serialize includes both base and P2P metrics
+    std::string serialized;
+    p2p_metrics->serialize(serialized);
+    EXPECT_TRUE(serialized.find("mooncake_transfer_read_bytes") !=
+                std::string::npos);  // Base class metric
+    EXPECT_TRUE(serialized.find("mooncake_transfer_write_bytes") !=
+                std::string::npos);  // Base class metric
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total") !=
+                std::string::npos);  // P2P-specific metric
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_requests_total") !=
+                std::string::npos);  // P2P-specific metric
+
+    // Test summary_metrics includes both base and P2P metrics
+    std::string summary = p2p_metrics->summary_metrics();
+    EXPECT_TRUE(summary.find("Transfer Metrics Summary") !=
+                std::string::npos);  // Base class summary
+    EXPECT_TRUE(summary.find("RPC Metrics Summary") !=
+                std::string::npos);  // Base class summary
+    EXPECT_TRUE(summary.find("P2P Local Storage Metrics") !=
+                std::string::npos);  // P2P-specific summary
+    EXPECT_TRUE(summary.find("Local Get: 100 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Local Put: 50 requests") != std::string::npos);
+}
+
+// Test ClientMetric::Create returns nullptr when disabled
+TEST_F(ClientMetricsTest, ClientMetricCreateDisabledTest) {
+    // Save current env and set to disable
+    const char* original = std::getenv("MC_STORE_CLIENT_METRIC");
+
+    // Set to disable
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+    auto metrics_disabled = ClientMetric::Create({});
+    EXPECT_EQ(metrics_disabled, nullptr);
+
+    // Set to enable
+    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
+    auto metrics_enabled = ClientMetric::Create({});
+    EXPECT_NE(metrics_enabled, nullptr);
+
+    // Restore original value
+    if (original) {
+        setenv("MC_STORE_CLIENT_METRIC", original, 1);
+    } else {
+        unsetenv("MC_STORE_CLIENT_METRIC");
+    }
+}
+
+// Test P2PClientMetric::Create returns nullptr when disabled
+TEST_F(ClientMetricsTest, P2PClientMetricCreateDisabledTest) {
+    // Save current env and set to disable
+    const char* original = std::getenv("MC_STORE_CLIENT_METRIC");
+
+    // Set to disable
+    setenv("MC_STORE_CLIENT_METRIC", "false", 1);
+    auto p2p_disabled = P2PClientMetric::Create({});
+    EXPECT_EQ(p2p_disabled, nullptr);
+
+    // Set to enable
+    setenv("MC_STORE_CLIENT_METRIC", "true", 1);
+    auto p2p_enabled = P2PClientMetric::Create({});
+    EXPECT_NE(p2p_enabled, nullptr);
+
+    // Restore original value
+    if (original) {
+        setenv("MC_STORE_CLIENT_METRIC", original, 1);
+    } else {
+        unsetenv("MC_STORE_CLIENT_METRIC");
+    }
+}
+
+// Test IsEnabled and GetDefaultInterval
+TEST_F(ClientMetricsTest, MetricEnvironmentVariablesTest) {
+    const char* original_metric = std::getenv("MC_STORE_CLIENT_METRIC");
+    const char* original_interval =
+        std::getenv("MC_STORE_CLIENT_METRIC_INTERVAL");
+
+    // Test IsEnabled with various values
+    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
+    EXPECT_TRUE(ClientMetric::IsEnabled());
+
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+    EXPECT_FALSE(ClientMetric::IsEnabled());
+
+    setenv("MC_STORE_CLIENT_METRIC", "true", 1);
+    EXPECT_TRUE(ClientMetric::IsEnabled());
+
+    setenv("MC_STORE_CLIENT_METRIC", "false", 1);
+    EXPECT_FALSE(ClientMetric::IsEnabled());
+
+    // Test GetDefaultInterval
+    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "10", 1);
+    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 10);
+
+    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "0", 1);
+    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 0);
+
+    // Test with invalid value
+    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "invalid", 1);
+    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 0);
+
+    // Restore original values
+    if (original_metric) {
+        setenv("MC_STORE_CLIENT_METRIC", original_metric, 1);
+    } else {
+        unsetenv("MC_STORE_CLIENT_METRIC");
+    }
+    if (original_interval) {
+        setenv("MC_STORE_CLIENT_METRIC_INTERVAL", original_interval, 1);
+    } else {
+        unsetenv("MC_STORE_CLIENT_METRIC_INTERVAL");
+    }
 }
 
 }  // namespace mooncake::test

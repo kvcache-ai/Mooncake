@@ -279,11 +279,12 @@ class ClientService {
         const std::vector<std::string>& keys) = 0;
 
     // For human-readable metrics
-    virtual tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
-        if (metrics_ == nullptr) {
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
+        ClientMetric* metrics = GetMetrics();
+        if (metrics == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        return metrics_->summary_metrics();
+        return metrics->summary_metrics();
     }
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
@@ -297,12 +298,13 @@ class ClientService {
     }
 
     // For Prometheus-style metrics
-    virtual tl::expected<std::string, ErrorCode> SerializeMetrics() {
-        if (metrics_ == nullptr) {
+    tl::expected<std::string, ErrorCode> SerializeMetrics() {
+        ClientMetric* metrics = GetMetrics();
+        if (metrics == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         std::string str;
-        metrics_->serialize(str);
+        metrics->serialize(str);
         return str;
     }
 
@@ -375,6 +377,12 @@ class ClientService {
      * @return Reference to MasterClient
      */
     virtual MasterClient& GetMasterClient() = 0;
+
+    /**
+     * @brief Get the metrics object for this client.
+     * @return Pointer to ClientMetric, or nullptr if metrics are disabled.
+     */
+    virtual ClientMetric* GetMetrics() = 0;
 
     /**
      * @brief Connects to the master server.
@@ -525,9 +533,6 @@ class ClientService {
    protected:
     // Client identification
     const UUID client_id_;
-
-    // Client-side metrics
-    std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;

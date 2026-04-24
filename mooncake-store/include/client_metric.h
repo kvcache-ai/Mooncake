@@ -4,6 +4,7 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+#include <glog/logging.h>
 #include <ylt/metric/counter.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
@@ -303,6 +304,15 @@ struct ClientMetric {
     static bool IsEnabled();
 
     /**
+     * @brief Get the default reporting interval from environment variable
+     * @return Reporting interval in seconds (default: 0)
+     *
+     * Environment variable:
+     * - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds
+     */
+    static uint64_t GetDefaultInterval();
+
+    /**
      * @brief Creates a ClientMetric instance based on environment variables
      * @return std::unique_ptr<ClientMetric> containing the instance if enabled,
      *         nullptr if disabled
@@ -314,16 +324,42 @@ struct ClientMetric {
      *   (default: 0, 0 = collect but don't report)
      */
     static std::unique_ptr<ClientMetric> Create(
-        std::map<std::string, std::string> labels = {});
+        std::map<std::string, std::string> labels = {}) {
+        return CreatePtr<ClientMetric>(labels);
+    }
 
-    void serialize(std::string& str);
-    std::string summary_metrics();
+    virtual void serialize(std::string& str);
+    virtual std::string summary_metrics();
 
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
 
     explicit ClientMetric(uint64_t interval_seconds = 0,
                           std::map<std::string, std::string> labels = {});
-    ~ClientMetric();
+    virtual ~ClientMetric();
+
+   protected:
+    /**
+     * @brief Template helper for creating metric instances.
+     * Used by Create() in base and derived classes.
+     */
+    template <typename T>
+    static std::unique_ptr<T> CreatePtr(
+        std::map<std::string, std::string> labels) {
+        if (!IsEnabled()) {
+            LOG(INFO) << "Client metrics disabled (set "
+                         "MC_STORE_CLIENT_METRIC=1 to enable)";
+            return nullptr;
+        }
+        uint64_t interval = GetDefaultInterval();
+        if (interval > 0) {
+            LOG(INFO) << "Client metrics enabled with reporting interval: "
+                      << interval << "s";
+        } else {
+            LOG(INFO)
+                << "Client metrics enabled but reporting disabled (interval=0)";
+        }
+        return std::make_unique<T>(interval, merge_labels(labels));
+    }
 
    private:
     // Metrics reporting thread management

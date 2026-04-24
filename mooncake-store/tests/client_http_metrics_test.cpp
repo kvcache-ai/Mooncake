@@ -214,8 +214,7 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     const uint16_t test_port = 19004;
 
     // Create P2PClientMetric instance
-    auto p2p_metrics = std::make_unique<P2PClientMetric>(
-        std::map<std::string, std::string>{{"p2p_label", "p2p_value"}});
+    auto p2p_metrics = P2PClientMetric::Create({{"p2p_label", "p2p_value"}});
     ASSERT_NE(p2p_metrics, nullptr);
 
     // Add test data to P2P metrics
@@ -370,8 +369,7 @@ TEST_F(ClientHttpMetricsTest, CombinedMetricsHttpEndpointsTest) {
     auto metrics = ClientMetric::Create({{"instance", "combined_test"}});
     ASSERT_NE(metrics, nullptr);
 
-    auto p2p_metrics = std::make_unique<P2PClientMetric>(
-        std::map<std::string, std::string>{{"instance", "combined_test"}});
+    auto p2p_metrics = P2PClientMetric::Create({{"instance", "combined_test"}});
     ASSERT_NE(p2p_metrics, nullptr);
 
     // Add test data to both metrics

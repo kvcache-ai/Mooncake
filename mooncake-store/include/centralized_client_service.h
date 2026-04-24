@@ -139,6 +139,8 @@ class CentralizedClientService
 
     MasterClient& GetMasterClient() override { return master_client_; }
 
+    ClientMetric* GetMetrics() override { return metrics_.get(); }
+
    private:
     void InitTransferSubmitter();
 
@@ -196,6 +198,9 @@ class CentralizedClientService
         Replica::Descriptor& replica);
 
    private:
+    // Client-side metrics (must be initialized before master_client_)
+    std::unique_ptr<ClientMetric> metrics_;
+
     CentralizedMasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
