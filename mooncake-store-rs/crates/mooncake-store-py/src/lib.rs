@@ -48,6 +48,8 @@ fn finalize_real_dispatcher_setup(
     Ok(())
 }
 
+pub const DEFAULT_COMPAT_WORKER_SCOPE: &str = "worker-1";
+
 fn resolve_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
     if let Some(scope) = worker_scope
         .map(str::trim)
@@ -63,6 +65,9 @@ fn resolve_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> S
     }
     static NEXT_WORKER_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_WORKER_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 1 {
+        return DEFAULT_COMPAT_WORKER_SCOPE.to_string();
+    }
     format!("worker-{id}")
 }
 
@@ -1589,7 +1594,7 @@ fn parse_initial_state_arg(value: &str) -> PyResult<ClientLifecycleState> {
 
 #[cfg(test)]
 mod tests {
-    use crate::finalize_real_dispatcher_setup;
+    use crate::{finalize_real_dispatcher_setup, DEFAULT_COMPAT_WORKER_SCOPE};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::net::TcpListener;
@@ -2710,6 +2715,37 @@ mod tests {
             sleep(Duration::from_millis(25));
         }
         (store, server)
+    }
+
+    #[test]
+    fn setup_dummy_without_worker_scope_connects_to_default_scope_server() {
+        let _guard = env_test_lock().lock();
+        prepare_freethreaded_python();
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client("dummy-default-worker-scope"),
+                "dummy-default-worker-scope",
+            )
+            .expect("dummy dispatcher should spawn"),
+        );
+        dispatcher
+            .register_local_memory()
+            .expect("dummy local memory should register");
+        let server =
+            start_dummy_store_server(dispatcher, &bind_addr(), DEFAULT_COMPAT_WORKER_SCOPE)
+                .expect("dummy server should start");
+        let mut store = PyMooncakeDistributedStore::new();
+        store
+            .setup_dummy(0, 0, server.address(), None, None)
+            .expect("dummy store should connect without explicit worker scope");
+        for _ in 0..40 {
+            if store.health_check().expect("health check should succeed") == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(25));
+        }
+        store.close();
+        server.shutdown().expect("dummy server should stop");
     }
 
     struct EnvVarGuard {
