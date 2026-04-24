@@ -189,7 +189,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     }
 
     // 8. Start P2P client RPC service
-    client_rpc_service_.emplace(*data_manager_);
+    client_rpc_service_.emplace(*data_manager_, metrics_.get());
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         config.rpc_thread_num, client_rpc_port_);
     RegisterClientRpcService(*client_rpc_server_, *client_rpc_service_);

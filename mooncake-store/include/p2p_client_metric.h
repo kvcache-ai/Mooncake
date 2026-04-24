@@ -32,6 +32,8 @@ struct RequestMetric {
 struct P2PClientMetric : public ClientMetric {
     // Local request metrics (Get/Put)
     RequestMetric local_request;
+    // Peer request metrics (requests from other clients)
+    RequestMetric peer_request;
 
     /**
      * @brief Creates a P2PClientMetric instance based on environment variables

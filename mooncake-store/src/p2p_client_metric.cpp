@@ -53,7 +53,8 @@ std::string RequestMetric::summary_metrics() {
 P2PClientMetric::P2PClientMetric(
     uint64_t interval_seconds, const std::map<std::string, std::string>& labels)
     : ClientMetric(interval_seconds, labels),
-      local_request("mooncake_p2p_local", labels) {}
+      local_request("mooncake_p2p_local", labels),
+      peer_request("mooncake_p2p_peer", labels) {}
 
 void P2PClientMetric::serialize(std::string& str) {
     // Call base class serialize first
@@ -61,6 +62,7 @@ void P2PClientMetric::serialize(std::string& str) {
 
     // Then serialize P2P-specific metrics
     local_request.serialize(str);
+    peer_request.serialize(str);
 }
 
 std::string P2PClientMetric::summary_metrics() {
@@ -71,6 +73,9 @@ std::string P2PClientMetric::summary_metrics() {
     // Then add P2P-specific metrics
     ss << "=== P2P Local Request Metrics ===\n";
     ss << local_request.summary_metrics();
+
+    ss << "=== P2P Peer Request Metrics ===\n";
+    ss << peer_request.summary_metrics();
 
     return ss.str();
 }

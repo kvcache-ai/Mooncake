@@ -5,8 +5,19 @@
 
 namespace mooncake {
 
-ClientRpcService::ClientRpcService(DataManager& data_manager)
-    : data_manager_(data_manager) {}
+namespace {
+
+size_t CalculateBufferSize(const std::vector<RemoteBufferDesc>& buffers) {
+    size_t total = 0;
+    for (const auto& buf : buffers) total += buf.size;
+    return total;
+}
+
+}  // namespace
+
+ClientRpcService::ClientRpcService(DataManager& data_manager,
+                                   P2PClientMetric* metrics)
+    : data_manager_(data_manager), metrics_(metrics) {}
 
 tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     const RemoteReadRequest& request) {
@@ -14,24 +25,37 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     timer.LogRequest("key=", request.key,
                      "buffer_count=", request.dest_buffers.size());
 
+    if (metrics_) {
+        metrics_->peer_request.get_requests.inc();
+    }
+    Stopwatch sw;
+
     if (request.key.empty()) {
         LOG(ERROR) << "ReadRemoteData: empty key";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request.get_failures.inc();
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     if (request.dest_buffers.empty()) {
         LOG(ERROR) << "ReadRemoteData: empty destination buffers";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request.get_failures.inc();
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate buffers (segment name validation is done in DataManager)
     for (const auto& buffer_desc : request.dest_buffers) {
         if (buffer_desc.size == 0 || buffer_desc.addr == 0) {
             LOG(ERROR)
                 << "ReadRemoteData: invalid buffer (zero size or null address)";
             timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+            if (metrics_) {
+                metrics_->peer_request.get_failures.inc();
+            }
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
@@ -44,12 +68,25 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         LOG(ERROR) << "ReadRemoteData failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
-
-        // Rectify stale route when key not found
         if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
             data_manager_.RectifyReadRoute(request.key);
+            if (metrics_) {
+                metrics_->peer_request.get_misses.inc();
+            }
+        } else {
+            if (metrics_) {
+                metrics_->peer_request.get_failures.inc();
+            }
         }
         return result;
+    }
+
+    // Record successful get: hits + bytes + latency
+    if (metrics_) {
+        metrics_->peer_request.get_hits.inc();
+        metrics_->peer_request.get_bytes.inc(
+            CalculateBufferSize(request.dest_buffers));
+        metrics_->peer_request.get_latency.observe(sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
@@ -62,24 +99,37 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
     timer.LogRequest("key=", request.key,
                      "buffer_count=", request.src_buffers.size());
 
+    if (metrics_) {
+        metrics_->peer_request.put_requests.inc();
+    }
+    Stopwatch sw;
+
     if (request.key.empty()) {
         LOG(ERROR) << "WriteRemoteData: empty key";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request.put_failures.inc();
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     if (request.src_buffers.empty()) {
         LOG(ERROR) << "WriteRemoteData: empty source buffers";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        if (metrics_) {
+            metrics_->peer_request.put_failures.inc();
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate buffers (segment name validation is done in DataManager)
     for (const auto& buffer_desc : request.src_buffers) {
         if (buffer_desc.size == 0 || buffer_desc.addr == 0) {
             LOG(ERROR) << "WriteRemoteData: invalid buffer (zero size or null "
                           "address)";
             timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+            if (metrics_) {
+                metrics_->peer_request.put_failures.inc();
+            }
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
@@ -92,7 +142,17 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
         LOG(ERROR) << "WriteRemoteData failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
+        if (metrics_) {
+            metrics_->peer_request.put_failures.inc();
+        }
         return result;
+    }
+
+    // Record successful put: bytes + latency
+    if (metrics_) {
+        metrics_->peer_request.put_bytes.inc(
+            CalculateBufferSize(request.src_buffers));
+        metrics_->peer_request.put_latency.observe(sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
