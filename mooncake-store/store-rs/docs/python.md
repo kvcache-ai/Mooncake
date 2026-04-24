@@ -920,6 +920,7 @@ python -m sglang.launch_server \
 ```
 
   Use this when SGLang should behave like the upstream dummy client. The standalone `mooncake-store-client` process owns the real runtime and exposes a dummy-compatible gRPC endpoint through `client_server_address`.
+  Because upstream SGLang still does not forward `worker_scope`, the standalone `mooncake-store-client --client-server-address` path now defaults its dummy side-channel scope to `worker-1` when `keyspace` is absent. That matches the first omitted-scope `setup_dummy(...)` client in the serving process, so the default SGLang gateway topology can register shared-memory buffers without requiring a patched SGLang fork.
 
 Port role summary:
 

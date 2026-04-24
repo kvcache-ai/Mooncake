@@ -15,6 +15,7 @@ use _store_rs::dummy_service::start_dummy_store_server;
 use _store_rs::runtime::{
     CompatRuntimeArgs, CompatSetupArgs, CompatTimeoutCliOverrides, CompatTimeoutConfig,
 };
+use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_store_client::{
     init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
@@ -24,11 +25,11 @@ use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
 };
 
-fn dummy_worker_scope(keyspace: Option<&str>, stable_id: &str) -> String {
+fn dummy_worker_scope(keyspace: Option<&str>) -> String {
     keyspace
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(stable_id)
+        .unwrap_or(DEFAULT_COMPAT_WORKER_SCOPE)
         .to_string()
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -235,7 +236,7 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     client.register_local_memory()?;
     let dummy_server = match args.client_server_address.as_deref() {
         Some(address) => {
-            let worker_scope = dummy_worker_scope(args.keyspace.as_deref(), &stable_id);
+            let worker_scope = dummy_worker_scope(args.keyspace.as_deref());
             Some(start_dummy_store_server(
                 client.clone(),
                 address,
@@ -782,12 +783,13 @@ mod tests {
 
     use super::{
         build_runtime_args, compat_warnings, drained_message, effective_heartbeat_interval,
-        emit_compat_warnings, fetch_stats_body, heartbeat_retry_delay_ms,
+        dummy_worker_scope, emit_compat_warnings, fetch_stats_body, heartbeat_retry_delay_ms,
         initial_heartbeat_delay_ms, now_ms, parse_cli_from, parse_hugepage_size_arg, parse_label,
         requested_initial_state, resolve_timeout_config, should_activate_after_ready,
         start_metrics_if_needed, started_message, startup_initial_state, stopped_message,
         validate_args, Command, HeartbeatLoopState, InitialStateArg, RouteControlArg, RunArgs,
     };
+    use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
 
     fn sample_timeouts() -> CompatTimeoutConfig {
         CompatTimeoutConfig {
@@ -1294,6 +1296,16 @@ mod tests {
             startup_initial_state(ClientLifecycleState::Draining),
             ClientLifecycleState::Draining
         );
+    }
+
+    #[test]
+    fn dummy_worker_scope_matches_python_dummy_default_without_keyspace() {
+        assert_eq!(dummy_worker_scope(None), DEFAULT_COMPAT_WORKER_SCOPE);
+        assert_eq!(
+            dummy_worker_scope(Some("tenant/keyspace")),
+            "tenant/keyspace"
+        );
+        assert_eq!(dummy_worker_scope(Some("   ")), DEFAULT_COMPAT_WORKER_SCOPE);
     }
 
     #[test]
