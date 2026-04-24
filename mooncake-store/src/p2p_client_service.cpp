@@ -651,27 +651,23 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
     }
     for (size_t i = 0; i < handles.size(); ++i) {
         if (!handles[i]) {
-            LOG(ERROR) << "Failed to create put handle for key: " << keys[i]
-                       << ", error: " << handles[i].error();
-            results[i] = tl::unexpected(handles[i].error());
-        } else if (!handles[i].value()) {
             if (!IsAlreadyExistsError(handles[i].error())) {
-                LOG(ERROR) << "put task handle is null for key: " << keys[i];
+                LOG(ERROR) << "Failed to create put handle for key: " << keys[i]
+                           << ", error: " << handles[i].error();
                 results[i] = tl::unexpected(handles[i].error());
             } else {
                 results[i] = {};
             }
+        } else if (!handles[i].value()) {
+            LOG(ERROR) << "put task handle is null for key: " << keys[i];
+            results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
         } else {
             auto wait_result = handles[i].value()->Wait();
-            if (wait_result || !IsAlreadyExistsError(wait_result.error())) {
-                if (!wait_result) {
-                    LOG(ERROR) << "Failed to put key: " << keys[i]
-                               << ", error: " << wait_result.error();
-                }
-                results[i] = wait_result;
-            } else {
-                results[i] = {};
+            if (!wait_result) {
+                LOG(ERROR) << "Failed to put key: " << keys[i]
+                           << ", error: " << wait_result.error();
             }
+            results[i] = wait_result;
         }
     }
     return results;
@@ -680,6 +676,10 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
 P2PClientService::CreatePutHandleFromLocal(const std::string& key,
                                            std::vector<Slice>& slices) {
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "Data manager not initialized";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     auto local_handle = data_manager_->Put(key, slices);
 
     if (local_handle) {
@@ -750,12 +750,14 @@ P2PClientService::CreatePutHandleViaRoute(
                 LOG(ERROR) << "Data manager not initialized";
                 continue;
             }
-            write_ops.push_back(MakeLocalWriteOp(key, &slices));
+            write_ops.push_back(LocalWriteOp{
+                data_manager_ ? &*data_manager_ : nullptr, key, &slices});
         } else {
             std::string endpoint =
                 proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
-            write_ops.push_back(MakeRemoteWriteOp(
-                GetOrCreatePeerClient(endpoint), write_req, proxy));
+            write_ops.push_back(RemoteWriteOp{
+                &GetOrCreatePeerClient(endpoint), write_req, std::move(proxy),
+                route_cache_ ? &*route_cache_ : nullptr, endpoint});
         }
     }
 
@@ -768,69 +770,73 @@ P2PClientService::CreatePutHandleViaRoute(
         std::make_shared<std::promise<tl::expected<void, ErrorCode>>>();
     auto future = promise->get_future();
 
-    RunWriteRetry(std::move(write_ops), promise).start([](auto&&) {});
+    RunWriteRetry(std::move(write_ops), key, promise).start([](auto&&) {});
 
     return FutureHandle<void>::Create(std::move(write_req), std::move(future));
 }
 
-P2PClientService::WriteOp P2PClientService::MakeLocalWriteOp(
-    const std::string& key, std::vector<Slice>* slices) {
-    return WriteOp(
-        [this, key,
-         slices]() -> async_simple::coro::Lazy<tl::expected<void, ErrorCode>> {
-            auto handle = data_manager_->Put(key, *slices);
-            if (!handle) {
-                if (!IsAlreadyExistsError(handle.error())) {
-                    LOG(ERROR) << "Local write failed, key: " << key
-                               << ", error: " << handle.error();
-                }
-                co_return tl::unexpected(handle.error());
-            }
-            co_return handle.value()->Wait();
-        });
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+P2PClientService::LocalWriteOp::operator()() {
+    if (!data_manager) {
+        LOG(ERROR) << "Data manager not initialized";
+        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto handle = data_manager->Put(key, *slices);
+    if (!handle) {
+        if (!IsAlreadyExistsError(handle.error())) {
+            LOG(ERROR) << "Local write failed, key: " << key
+                       << ", error: " << handle.error();
+        }
+        co_return tl::unexpected(handle.error());
+    }
+    co_return handle.value()->Wait();
 }
 
-P2PClientService::WriteOp P2PClientService::MakeRemoteWriteOp(
-    PeerClient& peer, std::shared_ptr<RemoteWriteRequest> write_req,
-    P2PProxyDescriptor proxy) {
-    RouteCache* route_cache = route_cache_ ? &(*route_cache_) : nullptr;
-    return WriteOp(
-        [peer_ptr = &peer, write_req = std::move(write_req), proxy,
-         route_cache]()
-            -> async_simple::coro::Lazy<tl::expected<void, ErrorCode>> {
-            auto result = co_await peer_ptr->AsyncWriteRemoteData(*write_req);
-            if (result.has_value()) {
-                if (route_cache) {
-                    P2PProxyDescriptor np = proxy;
-                    np.segment_id = result.value();
-                    route_cache->Upsert(write_req->key, {np});
-                }
-                co_return tl::expected<void, ErrorCode>{};
-            }
-            if (!IsAlreadyExistsError(result.error())) {
-                LOG(ERROR) << "Failed to write to remote, key: "
-                           << write_req->key << ", error: " << result.error();
-            }
-            co_return tl::unexpected(result.error());
-        });
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+P2PClientService::RemoteWriteOp::operator()() {
+    auto result = co_await peer_ptr->AsyncWriteRemoteData(*write_req);
+    if (result.has_value()) {
+        if (route_cache) {
+            P2PProxyDescriptor np = proxy;
+            np.segment_id = result.value();
+            route_cache->Upsert(write_req->key, {np});
+        }
+        co_return tl::expected<void, ErrorCode>{};
+    }
+    if (!IsAlreadyExistsError(result.error())) {
+        LOG(ERROR) << "Failed to write to remote, key: " << write_req->key
+                   << ", error: " << result.error();
+    }
+    co_return tl::unexpected(result.error());
 }
 
 async_simple::coro::Lazy<void> P2PClientService::RunWriteRetry(
-    std::vector<WriteOp> write_ops,
+    std::vector<WriteOp> write_ops, const std::string& key,
     std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise) {
+    auto get_route = [](const WriteOp& op) {
+        return std::visit([](const auto& o) { return o.route(); }, op);
+    };
     try {
         for (auto& op : write_ops) {
             try {
-                auto result = co_await op();
+                auto result =
+                    co_await std::visit([](auto& o) { return o(); }, op);
                 if (result.has_value() ||
                     IsAlreadyExistsError(result.error())) {
                     promise->set_value({});
                     co_return;
                 }
+                LOG(ERROR) << "Write candidate failed, key: " << key
+                           << ", route: " << get_route(op)
+                           << ", error: " << result.error();
             } catch (const std::exception& e) {
-                LOG(ERROR) << "Write candidate failed, exception: " << e.what();
+                LOG(ERROR) << "Write candidate failed, key: " << key
+                           << ", route: " << get_route(op)
+                           << ", exception: " << e.what();
             } catch (...) {
-                LOG(ERROR) << "Write candidate failed, unknown exception";
+                LOG(ERROR) << "Write candidate failed, key: " << key
+                           << ", route: " << get_route(op)
+                           << ", unknown exception";
             }
         }
         promise->set_value(tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));

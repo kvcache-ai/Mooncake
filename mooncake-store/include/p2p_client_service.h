@@ -259,26 +259,30 @@ class P2PClientService final : public ClientService {
                             const WriteRouteRequestConfig& config,
                             std::vector<WriteCandidate> candidates);
 
-    class WriteOp {
-       public:
-        template <typename F>
-        explicit WriteOp(F&& f) : fn_(std::forward<F>(f)) {}
-        async_simple::coro::Lazy<tl::expected<void, ErrorCode>> operator()() {
-            return fn_();
-        }
+    struct LocalWriteOp {
+        DataManager* data_manager;
+        std::string key;
+        std::vector<Slice>* slices;
 
-       private:
-        std::function<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>()>
-            fn_;
+        std::string_view route() const { return "local"; }
+        async_simple::coro::Lazy<tl::expected<void, ErrorCode>> operator()();
     };
 
-    WriteOp MakeLocalWriteOp(const std::string& key,
-                             std::vector<Slice>* slices);
-    WriteOp MakeRemoteWriteOp(PeerClient& peer,
-                              std::shared_ptr<RemoteWriteRequest> write_req,
-                              P2PProxyDescriptor proxy);
+    struct RemoteWriteOp {
+        PeerClient* peer_ptr;
+        std::shared_ptr<RemoteWriteRequest> write_req;
+        P2PProxyDescriptor proxy;
+        RouteCache* route_cache;
+        std::string endpoint;
+
+        std::string_view route() const { return endpoint; }
+        async_simple::coro::Lazy<tl::expected<void, ErrorCode>> operator()();
+    };
+
+    using WriteOp = std::variant<LocalWriteOp, RemoteWriteOp>;
+
     async_simple::coro::Lazy<void> RunWriteRetry(
-        std::vector<WriteOp> write_ops,
+        std::vector<WriteOp> write_ops, const std::string& key,
         std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise);
 
    private:
