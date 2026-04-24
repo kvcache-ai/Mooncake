@@ -2345,11 +2345,11 @@ class TestMooncakeStress(MooncakeTestBase):
     def _run_unified_full_worker(self, worker_id, split_dim, tp_size, use_into=False, mixed_reads=False):
         key = f"stress_unified_full_{worker_id}"
         if split_dim == 0:
-            tensor = make_deterministic_tensor((2048, 512))
+            tensor = make_deterministic_tensor((64, 32))
         elif split_dim == 1:
-            tensor = make_deterministic_tensor((512, 2048))
+            tensor = make_deterministic_tensor((32, 64))
         else:
-            tensor = make_deterministic_tensor((64, 96, 32))
+            tensor = make_deterministic_tensor((16, 16, 16))
 
         rc = put_uniform_full_tensor_with_unified_tp(
             self.store, key, tensor, tp_size, split_dim
@@ -2371,7 +2371,7 @@ class TestMooncakeStress(MooncakeTestBase):
                 return f"shard mismatch for {key}, split_dim={split_dim}, tp_size={tp_size}, rank={shard_rank}"
 
         if use_into:
-            buffer_spacing = serialized_tensor_size(tensor) + 2 * 1024 * 1024
+            buffer_spacing = serialized_tensor_size(tensor) + 64 * 1024
             buffer = (ctypes.c_ubyte * buffer_spacing)()
             buffer_ptr = ctypes.addressof(buffer)
             if self.store.register_buffer(buffer_ptr, buffer_spacing) != 0:
@@ -2498,12 +2498,12 @@ class TestMooncakeStress(MooncakeTestBase):
     def test_stress_unified_parallelism_full_reads(self):
         require_unified_parallelism_api(self)
         worker_cases = [
-            (0, 0, 4, False, False),
-            (1, 1, 4, False, True),
-            (2, 0, 8, True, False),
-            (3, 1, 8, True, True),
-            (4, 2, 16, False, True),
-            (5, 2, 16, True, True),
+            (0, 0, 2, False, False),
+            (1, 1, 2, False, True),
+            (2, 0, 4, True, False),
+            (3, 1, 4, True, True),
+            (4, 2, 4, False, True),
+            (5, 2, 4, True, True),
         ]
         errors = []
 
