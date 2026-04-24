@@ -560,6 +560,11 @@ mooncake-store-admin \
 
 mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
+  policy list \
+  --tenant tenant-a
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
   policy set \
   --tenant tenant-a \
   --route-topk 3 \
@@ -586,6 +591,7 @@ mooncake-store-admin \
 Useful options:
 
 - `--keyspace <prefix>` to target a non-default metadata namespace for either policy management or stale cleanup
+- `policy list --tenant <tenant>` narrows Redis / etcd metadata reads to that tenant's root policy and nested policy subtree
 - `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` for Redis ACL authentication
 - terminal tenant-quota reservations (`Finalized` / `Aborted`) expire automatically after `24h` by default; if a deployment needs a different retention window, configure `RedisMetadataConfig::tenant_quota_terminal_ttl(...)`
 - `server --cleanup-interval-ms 0` to run the admin HTTP surface without the maintenance worker
