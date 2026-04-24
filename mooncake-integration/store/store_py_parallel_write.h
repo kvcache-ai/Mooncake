@@ -776,9 +776,9 @@ int put_tensor_parallelism_tp_impl(const std::string &key,
 }
 
 int put_requested_parallelism_shard(const std::string &key,
-                                   pybind11::object tensor,
-                                   const TensorParallelismSpec &parallelism,
-                                   const ReplicateConfig &config) {
+                                    pybind11::object tensor,
+                                    const TensorParallelismSpec &parallelism,
+                                    const ReplicateConfig &config) {
     std::string shard_key = get_parallelism_key_name(key, parallelism);
     auto shard_info = build_requested_parallelism_shard_info(
         tensor, parallelism, shard_key, "put_tensor_with_parallelism");
@@ -864,8 +864,7 @@ int execute_put_tensor_with_parallelism_route(
                const ReplicateConfig &write_config, int rank, int size,
                int split_dim) {
             return put_tensor_with_tp_impl(write_key, write_tensor,
-                                           write_config, rank, size,
-                                           split_dim);
+                                           write_config, rank, size, split_dim);
         },
         [this](const std::string &write_key, pybind11::object write_tensor,
                const ReplicateConfig &write_config, int rank, int size,
@@ -875,9 +874,9 @@ int execute_put_tensor_with_parallelism_route(
                                                       write_config, rank, size,
                                                       split_dim, axes);
             }
-            return put_requested_parallelism_shard(
-                write_key, write_tensor, TensorParallelismSpec{axes},
-                write_config);
+            return put_requested_parallelism_shard(write_key, write_tensor,
+                                                   TensorParallelismSpec{axes},
+                                                   write_config);
         },
         [this](const std::string &write_key, pybind11::object write_tensor,
                const TensorParallelismSpec &parallelism_spec,

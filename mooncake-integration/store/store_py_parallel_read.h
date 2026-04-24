@@ -773,9 +773,9 @@ load_parallelism_full_reconstruction_sources(
             LOG(ERROR) << context << ": split_dim mismatch";
             return std::nullopt;
         }
-        reconstruction.global_shape = TensorShapeToVector(
-            first_metadata->metadata.layout.global_shape,
-            first_metadata->metadata.header.ndim);
+        reconstruction.global_shape =
+            TensorShapeToVector(first_metadata->metadata.layout.global_shape,
+                                first_metadata->metadata.header.ndim);
         if (!is_uniform_shardable_dim(
                 reconstruction.global_shape[reconstruction.split_dim],
                 request_tp_axis->size) ||

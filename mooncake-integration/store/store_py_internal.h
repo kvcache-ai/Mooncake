@@ -440,9 +440,10 @@ std::optional<ParallelismShardTensorInfo> build_direct_parallelism_shard_info(
 }
 
 std::optional<ParallelismShardTensorInfo>
-build_requested_parallelism_shard_info(
-    const py::handle &tensor, const TensorParallelismSpec &parallelism,
-    const std::string &key_name, const std::string &error_context) {
+build_requested_parallelism_shard_info(const py::handle &tensor,
+                                       const TensorParallelismSpec &parallelism,
+                                       const std::string &key_name,
+                                       const std::string &error_context) {
     auto tp_axis_index = find_tp_axis_index(parallelism.axes);
     if (!tp_axis_index.has_value()) {
         return std::nullopt;
@@ -455,8 +456,8 @@ build_requested_parallelism_shard_info(
 
     const int split_dim = tp_axis.split_dim.value();
     auto global_shape = tensor_shape_to_vector(tensor);
-    if (!validate_uniform_shard_request(global_shape, split_dim,
-                                        tp_axis.size, error_context)) {
+    if (!validate_uniform_shard_request(global_shape, split_dim, tp_axis.size,
+                                        error_context)) {
         return std::nullopt;
     }
 
