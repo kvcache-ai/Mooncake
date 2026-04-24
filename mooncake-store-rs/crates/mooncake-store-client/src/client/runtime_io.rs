@@ -805,7 +805,14 @@ impl StoreClient {
             fallback_replicas: VecDeque::new(),
         };
         let deadline = self.request_deadline_for_transfer(source.length, 1);
-        self.execute_selected_replica_direct(transport, &resolved, &mut payload, deadline)?;
+        let mut checked_runtimes = BTreeSet::new();
+        self.execute_selected_replica_direct(
+            transport,
+            &resolved,
+            &mut payload,
+            &mut checked_runtimes,
+            deadline,
+        )?;
         Ok(payload)
     }
 
@@ -859,7 +866,8 @@ impl StoreClient {
             Self::explicit_migration_object_ref(object_id, current.qos_tier.as_deref());
         let (targets, reservations) =
             self.reserve_explicit_migration_targets(&object_ref, payload.len(), plan)?;
-        let offsets = match self.write_reserved_replicas(&targets, &reservations, &payload) {
+        let offsets =
+            match self.write_reserved_replicas(&targets, &reservations, &payload, None) {
             Ok(offsets) => offsets,
             Err(error) => {
                 let _ = self.release_reserved_allocations(&targets, &reservations);
