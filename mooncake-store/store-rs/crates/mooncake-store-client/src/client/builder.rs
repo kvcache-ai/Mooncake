@@ -336,6 +336,8 @@ impl StoreClientBuilder {
         let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
         let effective_tenant_policy =
             resolve_effective_tenant_policy(self.metadata.as_ref(), &default_scope)?;
+        let effective_namespace_quota =
+            resolved_namespace_quota(&effective_tenant_policy).or(self.namespace_quota.clone());
         let effective_route_policy = route_policy_from_tenant_spec(&effective_tenant_policy);
         let effective_route_control = effective_route_policy
             .as_ref()
@@ -441,6 +443,25 @@ impl StoreClientBuilder {
         if !prewarm_delay.is_zero() {
             std::thread::sleep(prewarm_delay);
         }
+        refresh_live_client_cache(
+            self.metadata.as_ref(),
+            &live_client_cache,
+            "live_client_snapshot_prewarm",
+        )?;
+        live_client_cache.lock().store_tenant_quota_policy(
+            self.default_tenant.clone(),
+            None,
+            effective_namespace_quota
+                .as_ref()
+                .map(|quota| TenantQuotaPolicy {
+                    max_bytes: quota.max_bytes,
+                    max_objects: quota.max_objects,
+                }),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        );
         let membership_sync = MembershipSyncHandle::spawn(
             &runtime,
             self.metadata.clone(),
@@ -480,8 +501,7 @@ impl StoreClientBuilder {
             tenant_quota_reservation_counter: AtomicU64::new(1),
             route_control: effective_route_control,
             route_topk: effective_route_topk,
-            namespace_quota: resolved_namespace_quota(&effective_tenant_policy)
-                .or(self.namespace_quota),
+            namespace_quota: effective_namespace_quota,
             execution_fairness: resolved_execution_fairness(&effective_tenant_policy)
                 .or(self.execution_fairness),
             bandwidth_shaping: resolved_bandwidth_shaping(&effective_tenant_policy)
