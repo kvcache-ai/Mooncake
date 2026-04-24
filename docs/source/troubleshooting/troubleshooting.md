@@ -123,6 +123,34 @@ Note: In most cases, the errors output, except for the first occurrence, are `wo
 
 In addition, if the error `Failed to get description of XXX` is displayed, it indicates that the Segment name input by the user when calling the `openSegment` interface cannot be found in the etcd database. For memory read/write scenarios, the Segment name needs to strictly match the `local_hostname` field filled in by the other node during initialization.
 
+## TCP Transport
+### Recommended Troubleshooting Directions
+
+1. If sustained, high-concurrency TCP traffic (for example, PD-disaggregated KV transfers over the TCP transport) fails with `connect: Cannot assign requested address`, the initiator side has exhausted its ephemeral port range. Each transfer opens a fresh short-lived socket, and ports held in `TIME_WAIT` accumulate faster than the kernel can reclaim them.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Confirm large numbers of TIME_WAIT sockets to the peer
+   ss -tan state time-wait | wc -l
+
+   # Check the local ephemeral port range
+   sysctl net.ipv4.ip_local_port_range
+   ```
+
+   **Solutions:**
+   - Enable the TCP connection pool so that long-lived sockets are reused across transfers instead of being opened per transfer:
+     ```bash
+     export MC_TCP_ENABLE_CONNECTION_POOL=1
+     ```
+   - Widen the ephemeral port range if the workload genuinely needs many distinct connections:
+     ```bash
+     sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+     ```
+   - As a last resort, enable `TIME_WAIT` reuse on the initiator. `tcp_tw_reuse` only affects outbound connections and requires TCP timestamps to be enabled on both sides:
+     ```bash
+     sysctl -w net.ipv4.tcp_tw_reuse=1
+     ```
+
 ## SGLang Common Questions
 
 ### Do I need RDMA to run SGLang and Mooncake?
