@@ -337,7 +337,7 @@ pub fn run_bench(
                     }
 
                     iter += 1;
-                    if worker_heartbeats_enabled && iter.is_multiple_of(HEARTBEAT_EVERY) {
+                    if worker_heartbeats_enabled && iter % HEARTBEAT_EVERY == 0 {
                         let expires_at = now_ms().saturating_add(LEASE_MS);
                         let writer_mut = unsafe { &mut *(writer_ptr as *mut StoreClient) };
                         let _ = writer_mut.heartbeat(expires_at);
