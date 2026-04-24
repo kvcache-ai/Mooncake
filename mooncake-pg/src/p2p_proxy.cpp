@@ -62,7 +62,7 @@ void P2PChunkPool::release(void* ptr) { free_stack_.push_back(ptr); }
 //
 // 1. Load header_token with acquire semantics.
 // 2. If it is kInvalidControlToken the slot is empty -> fail.
-// 3. Optimistically copy the payload (these plain loads may be torn).
+// 3. Optimistically copy the payload.
 // 4. Issue an acquire fence so the payload reads cannot be reordered past
 //    the footer load that follows.
 // 5. Load footer_token.
@@ -74,8 +74,8 @@ bool PublishSlot::tryLoad(uint64_t& out_recv_addr, uint32_t& out_chunk_len,
     if (h == kInvalidControlToken) return false;
 
     // Optimistic payload copy – may be torn if the NIC is still writing.
-    uint64_t addr = recv_addr;
-    uint32_t len = chunk_len;
+    uint64_t addr = std::atomic_ref(recv_addr).load(std::memory_order_relaxed);
+    uint32_t len = std::atomic_ref(chunk_len).load(std::memory_order_relaxed);
 
     // Avoid moving payload reads below the footer check.
     std::atomic_thread_fence(std::memory_order_acquire);
@@ -126,7 +126,7 @@ bool CompletionSlot::tryLoad(uint32_t& out_chunk_len, uint32_t& out_generation,
     uint64_t h = std::atomic_ref(header_token).load(std::memory_order_acquire);
     if (h == kInvalidControlToken) return false;
 
-    uint32_t len = chunk_len;
+    uint32_t len = std::atomic_ref(chunk_len).load(std::memory_order_relaxed);
 
     std::atomic_thread_fence(std::memory_order_acquire);
 
@@ -213,10 +213,19 @@ void P2PProxy::allocateResources() {
     // Parse pool configuration from environment.
     pool_bytes_ = getEnv_size_t("MOONCAKE_P2P_POOL_SIZE", kDefaultPoolSize);
     chunk_size_ = getEnv_size_t("MOONCAKE_P2P_CHUNK_SIZE", kDefaultChunkSize);
+
+    // chunk_len is uint32_t fields in control slots
     TORCH_CHECK(
-        pool_bytes_ % chunk_size_ == 0,
-        "Invalid pool size and chunk size (pool_bytes_ % chunk_size_ != 0)");
-    num_chunks_ = pool_bytes_ / chunk_size_;
+        chunk_size_ > 0 && chunk_size_ <= std::numeric_limits<uint32_t>::max(),
+        "Invalid MOONCAKE_P2P_CHUNK_SIZE: must be > 0 and <= 4GB");
+
+    TORCH_CHECK(
+        pool_bytes_ > 0 && pool_bytes_ % chunk_size_ == 0,
+        "Invalid pool size and chunk size (must hold 'pool_bytes_ > 0 && "
+        "pool_bytes_ % chunk_size_ == 0')");
+
+    num_chunks_ = static_cast<uint32_t>(pool_bytes_ / chunk_size_);
+    TORCH_CHECK(num_chunks_ > 0, "P2PProxy: num_chunks_ must be > 0");
 
     if (is_cpu_) {
         resources_.send_pool_base_ = std::malloc(pool_bytes_);

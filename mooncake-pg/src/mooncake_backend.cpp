@@ -84,9 +84,15 @@ ExtensionState deserialize(const std::vector<uint8_t>& buffer) {
     std::memcpy(&rankCount, ptr, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
 
+    // Calculate expected total size and verify buffer is sufficient before
+    // proceeding with further reads.
+    size_t bitmapSize = (rankCount + 7) / 8;
+    size_t expectedSize = sizeof(uint32_t) + bitmapSize +
+                          sizeof(uint32_t) * rankCount + sizeof(int);
+    if (buffer.size() < expectedSize) return state;
+
     // 2. Read the bitmap and reconstruct the activeRanks vector
     state.activeRanks.resize(rankCount);
-    size_t bitmapSize = (rankCount + 7) / 8;
     for (size_t i = 0; i < rankCount; ++i) {
         // Check if the i-th bit is set
         bool isActive = ptr[i / 8] & (1 << (i % 8));
@@ -97,16 +103,12 @@ ExtensionState deserialize(const std::vector<uint8_t>& buffer) {
     // 3. Read per-peer p2pGenerations
     state.p2pGenerations.resize(rankCount);
     for (size_t i = 0; i < rankCount; ++i) {
-        if (ptr + sizeof(uint32_t) <= buffer.data() + buffer.size()) {
-            std::memcpy(&state.p2pGenerations[i], ptr, sizeof(uint32_t));
-            ptr += sizeof(uint32_t);
-        }
+        std::memcpy(&state.p2pGenerations[i], ptr, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
     }
 
     // 4. Read taskCount
-    if (ptr + sizeof(int) <= buffer.data() + buffer.size()) {
-        std::memcpy(&state.taskCount, ptr, sizeof(int));
-    }
+    std::memcpy(&state.taskCount, ptr, sizeof(int));
 
     return state;
 }
