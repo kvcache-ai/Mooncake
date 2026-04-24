@@ -1755,8 +1755,8 @@ pub fn redact_redis_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
     use std::collections::VecDeque;
+    use std::env;
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
