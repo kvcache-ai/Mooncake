@@ -240,6 +240,9 @@ Task states currently exposed to callers:
 - `retry_wait`
 - `succeeded`
 - `failed`
+
+Reserved but not currently exposed in P1:
+
 - `cancelled`
 
 ## 8. Scope Boundaries
