@@ -219,19 +219,19 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
 
     // Add test data to P2P metrics
     // Local Put metrics
-    p2p_metrics->local_put_requests.inc(10);
-    p2p_metrics->local_put_bytes.inc(5 * 1024 * 1024);  // 5 MB
-    p2p_metrics->local_put_latency.observe(200);
-    p2p_metrics->local_put_latency.observe(300);
+    p2p_metrics->local_request.put_requests.inc(10);
+    p2p_metrics->local_request.put_bytes.inc(5 * 1024 * 1024);  // 5 MB
+    p2p_metrics->local_request.put_latency.observe(200);
+    p2p_metrics->local_request.put_latency.observe(300);
 
     // Local Get metrics
-    p2p_metrics->local_get_requests.inc(100);
-    p2p_metrics->local_get_hits.inc(80);
-    p2p_metrics->local_get_misses.inc(15);
-    p2p_metrics->local_get_failures.inc(5);
-    p2p_metrics->local_get_bytes.inc(20 * 1024 * 1024);  // 20 MB
-    p2p_metrics->local_get_latency.observe(100);
-    p2p_metrics->local_get_latency.observe(150);
+    p2p_metrics->local_request.get_requests.inc(100);
+    p2p_metrics->local_request.get_hits.inc(80);
+    p2p_metrics->local_request.get_misses.inc(15);
+    p2p_metrics->local_request.get_failures.inc(5);
+    p2p_metrics->local_request.get_bytes.inc(20 * 1024 * 1024);  // 20 MB
+    p2p_metrics->local_request.get_latency.observe(100);
+    p2p_metrics->local_request.get_latency.observe(150);
 
     // Create and start HTTP server
     coro_http::coro_http_server server(1, test_port);
@@ -337,13 +337,13 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
             << "P2P metrics summary endpoint returned wrong status";
 
         // Check summary contains expected P2P metrics
-        EXPECT_TRUE(resp.resp_body.find("P2P Local Storage Metrics") !=
+        EXPECT_TRUE(resp.resp_body.find("P2P Local Request Metrics") !=
                     std::string::npos)
             << "Summary should contain P2P metrics header";
-        EXPECT_TRUE(resp.resp_body.find("Local Put:") != std::string::npos)
-            << "Summary should contain local put section";
-        EXPECT_TRUE(resp.resp_body.find("Local Get:") != std::string::npos)
-            << "Summary should contain local get section";
+        EXPECT_TRUE(resp.resp_body.find("Put:") != std::string::npos)
+            << "Summary should contain put section";
+        EXPECT_TRUE(resp.resp_body.find("Get:") != std::string::npos)
+            << "Summary should contain get section";
         EXPECT_TRUE(resp.resp_body.find("10 requests") != std::string::npos)
             << "Summary should show 10 put requests";
         EXPECT_TRUE(resp.resp_body.find("100 requests") != std::string::npos)
@@ -376,11 +376,11 @@ TEST_F(ClientHttpMetricsTest, CombinedMetricsHttpEndpointsTest) {
     metrics->transfer_metric.total_read_bytes.inc(1024 * 1024);
     metrics->transfer_metric.total_write_bytes.inc(2 * 1024 * 1024);
 
-    p2p_metrics->local_get_requests.inc(50);
-    p2p_metrics->local_get_hits.inc(40);
-    p2p_metrics->local_get_bytes.inc(10 * 1024 * 1024);
-    p2p_metrics->local_put_requests.inc(20);
-    p2p_metrics->local_put_bytes.inc(5 * 1024 * 1024);
+    p2p_metrics->local_request.get_requests.inc(50);
+    p2p_metrics->local_request.get_hits.inc(40);
+    p2p_metrics->local_request.get_bytes.inc(10 * 1024 * 1024);
+    p2p_metrics->local_request.put_requests.inc(20);
+    p2p_metrics->local_request.put_bytes.inc(5 * 1024 * 1024);
 
     // Create and start HTTP server
     coro_http::coro_http_server server(1, test_port);
@@ -446,15 +446,15 @@ TEST_F(ClientHttpMetricsTest, CombinedMetricsHttpEndpointsTest) {
         EXPECT_TRUE(resp.resp_body.find("Transfer Metrics Summary") !=
                     std::string::npos)
             << "Should contain transfer metrics summary";
-        EXPECT_TRUE(resp.resp_body.find("P2P Local Storage Metrics") !=
+        EXPECT_TRUE(resp.resp_body.find("P2P Local Request Metrics") !=
                     std::string::npos)
             << "Should contain P2P metrics summary";
         EXPECT_TRUE(resp.resp_body.find("Total Read") != std::string::npos)
             << "Should contain transfer total read";
-        EXPECT_TRUE(resp.resp_body.find("Local Get:") != std::string::npos)
-            << "Should contain local get section";
-        EXPECT_TRUE(resp.resp_body.find("Local Put:") != std::string::npos)
-            << "Should contain local put section";
+        EXPECT_TRUE(resp.resp_body.find("Get:") != std::string::npos)
+            << "Should contain get section";
+        EXPECT_TRUE(resp.resp_body.find("Put:") != std::string::npos)
+            << "Should contain put section";
     }
 
     server.stop();
