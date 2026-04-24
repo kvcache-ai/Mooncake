@@ -59,10 +59,18 @@ struct ParsedWriterShardManifest {
     std::vector<int64_t> global_shape;
 };
 
+using ParallelismManifest = WriterShardManifest;
+using ParsedParallelismManifest = ParsedWriterShardManifest;
+
 struct WriterShardTensorInfo {
     PyTensorInfo info;
     std::string shard_key;
     WriterShardManifest manifest;
+};
+
+struct ParallelismShardTensorInfo {
+    PyTensorInfo info;
+    ParallelismManifest manifest;
 };
 
 struct RawTensorShardWritePlan {
@@ -83,6 +91,7 @@ struct TensorIntoPlan {
     size_t registered_buffer_size{0};
     size_t total_length{0};
     std::vector<TensorIntoFragment> fragments;
+    std::optional<TensorMetadata> materialized_metadata;
 };
 
 struct ResolvedTensorRead {
@@ -118,6 +127,14 @@ std::optional<TensorMetadata> build_shard_metadata_from_parallelism(
     const py::handle &full_tensor, const py::handle &shard_tensor,
     TensorDtype dtype_enum, const std::vector<ParallelAxisSpec> &axes,
     size_t tensor_size);
+std::optional<size_t> find_tp_axis_index(
+    const std::vector<ParallelAxisSpec> &axes);
+bool validate_uniform_shard_request(const std::vector<int64_t> &shape,
+                                    int split_dim, int shard_count,
+                                    const std::string &error_context);
+std::optional<py::object> materialize_shard_tensor(const py::handle &tensor,
+                                                   int split_dim, int rank,
+                                                   int shard_count);
 std::string get_parallelism_key_name(const std::string &base_key,
                                      const TensorParallelismSpec &parallelism);
 bool parallelism_matches_metadata(const TensorParallelismSpec &parallelism,
@@ -139,6 +156,10 @@ constexpr uint16_t kWriterShardManifestVersion = 1;
 
 std::string get_writer_manifest_key_name(const std::string &base_key) {
     return base_key + "__writer_manifest";
+}
+
+std::string get_parallelism_manifest_key_name(const std::string &base_key) {
+    return base_key + "__parallelism_manifest";
 }
 
 std::string get_writer_shard_key_name(const std::string &base_key,
@@ -189,6 +210,22 @@ WriterShardManifest build_writer_shard_manifest_from_shape(
     manifest.header.ndim = static_cast<int32_t>(shape.size());
     manifest.header.split_dim = writer.split_dim;
     manifest.header.shard_count = writer.size;
+    manifest.header.reserved0 = 0;
+    manifest.global_shape = MakeTensorShape(shape);
+    return manifest;
+}
+
+ParallelismManifest build_parallelism_manifest_from_shape(
+    const std::vector<int64_t> &shape, int32_t dtype, int split_dim,
+    int shard_count) {
+    ParallelismManifest manifest{};
+    manifest.header.magic = kWriterShardManifestMagic;
+    manifest.header.version = kWriterShardManifestVersion;
+    manifest.header.header_size = sizeof(ParallelismManifest);
+    manifest.header.dtype = dtype;
+    manifest.header.ndim = static_cast<int32_t>(shape.size());
+    manifest.header.split_dim = split_dim;
+    manifest.header.shard_count = shard_count;
     manifest.header.reserved0 = 0;
     manifest.global_shape = MakeTensorShape(shape);
     return manifest;
@@ -298,6 +335,10 @@ std::optional<TensorMetadata> build_shard_metadata_from_parallelism(
         tensor_shape_to_vector(shard_tensor), axes, tensor_size);
 }
 
+bool validate_uniform_shard_request(const std::vector<int64_t> &shape,
+                                    int split_dim, int shard_count,
+                                    const std::string &error_context);
+
 TensorMetadata build_tp_shard_metadata(const py::handle &full_tensor,
                                        const py::handle &shard_tensor,
                                        TensorDtype dtype_enum, int tp_rank,
@@ -341,6 +382,105 @@ std::optional<PyTensorInfo> build_direct_parallelism_shard_info(
         return std::nullopt;
     }
     return info;
+}
+
+std::optional<ParallelismShardTensorInfo> build_direct_parallelism_shard_info(
+    const py::handle &shard_tensor, const std::vector<ParallelAxisSpec> &axes,
+    const std::string &key_name, bool infer_global_shape) {
+    auto tp_axis_index = find_tp_axis_index(axes);
+    if (!tp_axis_index.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto &tp_axis = axes[*tp_axis_index];
+    if (!tp_axis.split_dim.has_value()) {
+        return std::nullopt;
+    }
+
+    auto local_shape = tensor_shape_to_vector(shard_tensor);
+    int split_dim = tp_axis.split_dim.value();
+    if (split_dim < 0 || split_dim >= static_cast<int>(local_shape.size())) {
+        return std::nullopt;
+    }
+
+    auto global_shape = local_shape;
+    if (infer_global_shape) {
+        global_shape[split_dim] *= tp_axis.size;
+    }
+    if (!validate_uniform_shard_request(global_shape, split_dim, tp_axis.size,
+                                        "build_direct_parallelism_shard_info")) {
+        return std::nullopt;
+    }
+
+    TensorDtype dtype_enum = get_tensor_dtype(shard_tensor.attr("dtype"));
+    if (dtype_enum == TensorDtype::UNKNOWN) {
+        return std::nullopt;
+    }
+
+    ParallelismShardTensorInfo shard_info;
+    shard_info.info = extract_tensor_info(
+        py::reinterpret_borrow<py::object>(shard_tensor), key_name);
+    auto metadata = build_shard_metadata_from_parallelism(
+        shard_tensor, shard_tensor, dtype_enum, axes, shard_info.info.tensor_size);
+    if (!metadata.has_value()) {
+        return std::nullopt;
+    }
+    shard_info.info.metadata = *metadata;
+    shard_info.info.metadata.layout.global_shape = MakeTensorShape(global_shape);
+    if (!shard_info.info.valid()) {
+        return std::nullopt;
+    }
+    shard_info.manifest = build_parallelism_manifest_from_shape(
+        global_shape, static_cast<int32_t>(dtype_enum), split_dim, tp_axis.size);
+    return shard_info;
+}
+
+std::optional<ParallelismShardTensorInfo> build_requested_parallelism_shard_info(
+    const py::handle &tensor, const TensorParallelismSpec &parallelism,
+    const std::string &key_name, const std::string &error_context) {
+    auto tp_axis_index = find_tp_axis_index(parallelism.axes);
+    if (!tp_axis_index.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto &tp_axis = parallelism.axes[*tp_axis_index];
+    if (!tp_axis.split_dim.has_value()) {
+        return std::nullopt;
+    }
+
+    const int split_dim = tp_axis.split_dim.value();
+    auto global_shape = tensor_shape_to_vector(tensor);
+    if (!validate_uniform_shard_request(global_shape, split_dim, tp_axis.size,
+                                        error_context)) {
+        return std::nullopt;
+    }
+
+    TensorDtype dtype_enum = get_tensor_dtype(tensor.attr("dtype"));
+    if (dtype_enum == TensorDtype::UNKNOWN) {
+        return std::nullopt;
+    }
+
+    auto shard_tensor =
+        materialize_shard_tensor(tensor, split_dim, tp_axis.rank, tp_axis.size);
+    if (!shard_tensor.has_value()) {
+        return std::nullopt;
+    }
+
+    ParallelismShardTensorInfo shard_info;
+    shard_info.info = extract_tensor_info(*shard_tensor, key_name);
+    auto metadata = build_shard_metadata_from_parallelism(
+        tensor, *shard_tensor, dtype_enum, parallelism.axes,
+        shard_info.info.tensor_size);
+    if (!metadata.has_value()) {
+        return std::nullopt;
+    }
+    shard_info.info.metadata = *metadata;
+    if (!shard_info.info.valid()) {
+        return std::nullopt;
+    }
+    shard_info.manifest = build_parallelism_manifest_from_shape(
+        global_shape, static_cast<int32_t>(dtype_enum), split_dim, tp_axis.size);
+    return shard_info;
 }
 
 bool is_uniform_shardable_dim(int64_t dim_size, int shard_count) {
@@ -468,6 +608,11 @@ bool uses_legacy_tp_storage_key(const TensorParallelismSpec &parallelism) {
     return is_single_axis_parallelism_kind(parallelism, LayoutAxisKind::TP);
 }
 
+bool should_use_legacy_single_tp_write_route(
+    const TensorParallelismSpec &parallelism) {
+    return false;
+}
+
 bool can_read_single_tp_request_from_writer_partition_storage(
     const TensorParallelismSpec &parallelism) {
     return uses_legacy_tp_storage_key(parallelism);
@@ -548,7 +693,7 @@ resolve_parallelism_write_request(const py::object &parallelism_obj,
     if (!parallelism.has_value()) {
         return std::nullopt;
     }
-    if (uses_legacy_tp_storage_key(*parallelism)) {
+    if (should_use_legacy_single_tp_write_route(*parallelism)) {
         return ResolvedParallelismWriteRequest{
             ParallelismWriteStorageRoute::LEGACY_SINGLE_TP,
             *parallelism,
@@ -791,6 +936,10 @@ bool is_valid_writer_partition(const WriterPartitionSpec &writer,
     if (writer.split_dim < 0 ||
         writer.split_dim >= static_cast<int>(shape.size())) {
         LOG(ERROR) << error_context << ": split_dim out of range";
+        return false;
+    }
+    if (!validate_uniform_shard_request(shape, writer.split_dim, writer.size,
+                                        error_context)) {
         return false;
     }
     return true;

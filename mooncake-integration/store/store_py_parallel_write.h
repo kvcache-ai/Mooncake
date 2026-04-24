@@ -758,19 +758,49 @@ int put_tensor_parallelism_tp_impl(const std::string &key,
                                    const ReplicateConfig &config, int tp_rank,
                                    int tp_size, int split_dim,
                                    const std::vector<ParallelAxisSpec> &axes) {
-    return execute_tp_tensor_write_impl(
-        key, tensor, config, tp_size, split_dim, axes,
-        "Failed to put tensor with tp",
-        [this](const std::string &shard_key, const PyTensorInfo &info,
-               const ReplicateConfig &write_config) {
-            return put_tensor_info_impl(shard_key, info, write_config);
-        });
+    std::string shard_key = get_tp_write_shard_key(key, tp_rank, axes);
+    if (shard_key.empty()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    auto shard_info = build_direct_parallelism_shard_info(
+        tensor, axes, shard_key, true /* infer_global_shape */);
+    if (!shard_info.has_value()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    int ret = put_tensor_info_impl(shard_key, shard_info->info, config);
+    if (ret != 0) {
+        return ret;
+    }
+    return put_manifest_impl(get_parallelism_manifest_key_name(key),
+                             shard_info->manifest, config);
+}
+
+int put_requested_parallelism_shard(const std::string &key,
+                                   pybind11::object tensor,
+                                   const TensorParallelismSpec &parallelism,
+                                   const ReplicateConfig &config) {
+    std::string shard_key = get_parallelism_key_name(key, parallelism);
+    auto shard_info = build_requested_parallelism_shard_info(
+        tensor, parallelism, shard_key, "put_tensor_with_parallelism");
+    if (!shard_info.has_value()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    int ret = put_tensor_info_impl(shard_key, shard_info->info, config);
+    if (ret != 0) {
+        return ret;
+    }
+    return put_manifest_impl(get_parallelism_manifest_key_name(key),
+                             shard_info->manifest, config);
 }
 
 int put_direct_parallelism_shard(const std::string &key,
                                  pybind11::object tensor,
                                  const TensorParallelismSpec &parallelism,
                                  const ReplicateConfig &config) {
+    auto tp_axis_index = find_tp_axis_index(parallelism.axes);
+    if (tp_axis_index.has_value() && parallelism.axes.size() > 1) {
+        return put_requested_parallelism_shard(key, tensor, parallelism, config);
+    }
     auto info =
         build_direct_parallelism_shard_info(tensor, parallelism.axes, key);
     if (!info.has_value()) {
@@ -833,14 +863,20 @@ int execute_put_tensor_with_parallelism_route(
                const ReplicateConfig &write_config, int rank, int size,
                int split_dim) {
             return put_tensor_with_tp_impl(write_key, write_tensor,
-                                           write_config, size, split_dim);
+                                           write_config, rank, size,
+                                           split_dim);
         },
         [this](const std::string &write_key, pybind11::object write_tensor,
                const ReplicateConfig &write_config, int rank, int size,
                int split_dim, const std::vector<ParallelAxisSpec> &axes) {
-            return put_tensor_parallelism_tp_impl(write_key, write_tensor,
-                                                  write_config, rank, size,
-                                                  split_dim, axes);
+            if (axes.size() == 1) {
+                return put_tensor_parallelism_tp_impl(write_key, write_tensor,
+                                                      write_config, rank, size,
+                                                      split_dim, axes);
+            }
+            return put_requested_parallelism_shard(
+                write_key, write_tensor, TensorParallelismSpec{axes},
+                write_config);
         },
         [this](const std::string &write_key, pybind11::object write_tensor,
                const TensorParallelismSpec &parallelism_spec,
@@ -1071,21 +1107,51 @@ int upsert_tensor_with_writer_shards(
 
 int upsert_tensor_parallelism_tp_impl(
     const std::string &key, pybind11::object tensor,
-    const ReplicateConfig &config, int tp_size, int split_dim,
+    const ReplicateConfig &config, int tp_rank, int tp_size, int split_dim,
     const std::vector<ParallelAxisSpec> &axes) {
-    return execute_tp_tensor_write_impl(
-        key, tensor, config, tp_size, split_dim, axes,
-        "Failed to upsert tensor with tp",
-        [this](const std::string &shard_key, const PyTensorInfo &info,
-               const ReplicateConfig &write_config) {
-            return upsert_tensor_info_impl(shard_key, info, write_config);
-        });
+    std::string shard_key = get_tp_write_shard_key(key, tp_rank, axes);
+    if (shard_key.empty()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    auto shard_info = build_direct_parallelism_shard_info(
+        tensor, axes, shard_key, true /* infer_global_shape */);
+    if (!shard_info.has_value()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    int ret = upsert_tensor_info_impl(shard_key, shard_info->info, config);
+    if (ret != 0) {
+        return ret;
+    }
+    return upsert_manifest_impl(get_parallelism_manifest_key_name(key),
+                                shard_info->manifest, config);
+}
+
+int upsert_requested_parallelism_shard(const std::string &key,
+    pybind11::object tensor, const TensorParallelismSpec &parallelism,
+    const ReplicateConfig &config) {
+    std::string shard_key = get_parallelism_key_name(key, parallelism);
+    auto shard_info = build_requested_parallelism_shard_info(
+        tensor, parallelism, shard_key, "upsert_tensor_with_parallelism");
+    if (!shard_info.has_value()) {
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    int ret = upsert_tensor_info_impl(shard_key, shard_info->info, config);
+    if (ret != 0) {
+        return ret;
+    }
+    return upsert_manifest_impl(get_parallelism_manifest_key_name(key),
+                                shard_info->manifest, config);
 }
 
 int upsert_direct_parallelism_shard(const std::string &key,
                                     pybind11::object tensor,
                                     const TensorParallelismSpec &parallelism,
                                     const ReplicateConfig &config) {
+    auto tp_axis_index = find_tp_axis_index(parallelism.axes);
+    if (tp_axis_index.has_value() && parallelism.axes.size() > 1) {
+        return upsert_requested_parallelism_shard(key, tensor, parallelism,
+                                                  config);
+    }
     auto info =
         build_direct_parallelism_shard_info(tensor, parallelism.axes, key);
     if (!info.has_value()) {
@@ -1154,8 +1220,14 @@ int execute_upsert_tensor_with_parallelism_route(
         [this](const std::string &write_key, pybind11::object write_tensor,
                const ReplicateConfig &write_config, int rank, int size,
                int split_dim, const std::vector<ParallelAxisSpec> &axes) {
-            return upsert_tensor_parallelism_tp_impl(
-                write_key, write_tensor, write_config, size, split_dim, axes);
+            if (axes.size() == 1) {
+                return upsert_tensor_parallelism_tp_impl(write_key, write_tensor,
+                                                         write_config, rank,
+                                                         size, split_dim, axes);
+            }
+            return upsert_requested_parallelism_shard(
+                write_key, write_tensor, TensorParallelismSpec{axes},
+                write_config);
         },
         [this](const std::string &write_key, pybind11::object write_tensor,
                const TensorParallelismSpec &parallelism_spec,

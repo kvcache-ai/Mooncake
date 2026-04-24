@@ -220,6 +220,92 @@ def build_ep_parallelism(ep_rank, ep_size, expert_id):
     return make_tensor_parallelism([ep_axis])
 
 
+def build_ep_tp_parallelism(ep_rank, ep_size, expert_id, tp_rank, tp_size, split_dim):
+    ep_axis = make_parallel_axis("ep", rank=ep_rank, size=ep_size)
+    ep_axis.expert_id = expert_id
+    return make_tensor_parallelism([
+        ep_axis,
+        make_parallel_axis("tp", rank=tp_rank, size=tp_size, split_dim=split_dim),
+    ])
+
+
+def build_parallelism_mode(mode, tp_rank, tp_size, split_dim):
+    if mode == "tp":
+        return build_tp_parallelism(tp_size, split_dim, rank=tp_rank)
+    if mode == "dp_tp":
+        return build_dp_tp_parallelism(0, 2, tp_rank, tp_size, split_dim)
+    if mode == "pp_tp":
+        return build_pp_tp_parallelism(0, 2, 7, tp_rank, tp_size, split_dim)
+    if mode == "ep_tp":
+        return build_ep_tp_parallelism(0, 2, 11, tp_rank, tp_size, split_dim)
+    raise ValueError(f"unsupported parallelism mode: {mode}")
+
+
+def put_full_tensor_with_parallelism_mode(store, key, tensor, split_dim, put_tp_size, mode):
+    if mode == "tp":
+        shards = tensor.chunk(put_tp_size, split_dim)
+        for rank, shard in enumerate(shards):
+            rc = store.put_tensor_with_parallelism(
+                key,
+                shard.contiguous(),
+                build_parallelism_mode(mode, rank, put_tp_size, split_dim),
+            )
+            if rc != 0:
+                return rc
+        return 0
+
+    for rank in range(put_tp_size):
+        rc = store.put_tensor_with_parallelism(
+            key,
+            tensor,
+            build_parallelism_mode(mode, rank, put_tp_size, split_dim),
+        )
+        if rc != 0:
+            return rc
+    return 0
+
+
+def clone_parallelism(parallelism):
+    cloned_axes = []
+    for axis in parallelism.axes:
+        cloned_axis = make_parallel_axis(
+            axis.kind,
+            rank=axis.rank,
+            size=axis.size,
+            split_dim=axis.split_dim,
+        )
+        if getattr(axis, "expert_id", None) is not None:
+            cloned_axis.expert_id = axis.expert_id
+        if getattr(axis, "stage_id", None) is not None:
+            cloned_axis.stage_id = axis.stage_id
+        cloned_axes.append(cloned_axis)
+    return make_tensor_parallelism(cloned_axes)
+
+
+def put_full_tensor_with_parallelism_template(store, key, tensor, parallelism):
+    tp_axis = next(axis for axis in parallelism.axes if axis.kind == "tp")
+    for rank in range(tp_axis.size):
+        shard_parallelism = clone_parallelism(parallelism)
+        for axis in shard_parallelism.axes:
+            if axis.kind == "tp":
+                axis.rank = rank
+                axis.size = tp_axis.size
+                axis.split_dim = tp_axis.split_dim
+                break
+        rc = store.put_tensor_with_parallelism(
+            key,
+            tensor,
+            shard_parallelism,
+        )
+        if rc != 0:
+            return rc
+    return 0
+
+
+def expected_target_shard(tensor, split_dim, target_tp_size, target_rank):
+    return chunk_tensor_for_rank(tensor, target_tp_size, split_dim, target_rank).contiguous()
+
+
 def reorder_parallelism_axes(parallelism, ordered_kinds):
     axis_by_kind = {axis.kind: axis for axis in parallelism.axes}
     return make_tensor_parallelism([axis_by_kind[kind] for kind in ordered_kinds])
@@ -236,9 +322,63 @@ def chunk_tensor_for_rank(tensor, tp_size, split_dim, rank):
     return tensor.chunk(tp_size, split_dim)[rank]
 
 
+def put_full_tensor_with_unified_tp(store, key, tensor, tp_size, split_dim):
+    for rank, shard in enumerate(tensor.chunk(tp_size, split_dim)):
+        rc = store.put_tensor_with_parallelism(
+            key,
+            shard.contiguous(),
+            build_tp_parallelism(tp_size, split_dim, rank=rank),
+        )
+        if rc != 0:
+            return rc
+    return 0
+
+
+def batch_put_full_tensors_with_unified_tp(store, keys, tensors, tp_size, split_dim):
+    results = [0 for _ in keys]
+    for rank in range(tp_size):
+        shard_tensors = [chunk_tensor_for_rank(tensor, tp_size, split_dim, rank).contiguous() for tensor in tensors]
+        rank_results = store.batch_put_tensor_with_parallelism(
+            keys,
+            shard_tensors,
+            [build_tp_parallelism(tp_size, split_dim, rank=rank) for _ in keys],
+        )
+        results = rank_results
+        if any(rc != 0 for rc in rank_results):
+            return rank_results
+    return results
+
+
 def reconstruction_case_name(shape, split_dim, tp_size):
     shape_str = "x".join(str(dim) for dim in shape)
     return f"shape={shape_str}, split_dim={split_dim}, tp_size={tp_size}"
+
+
+def is_uniform_tp_case(shape, split_dim, tp_size):
+    return shape[split_dim] % tp_size == 0
+
+
+def put_uniform_full_tensor_with_unified_tp(store, key, tensor, tp_size, split_dim):
+    if not is_uniform_tp_case(tuple(tensor.shape), split_dim, tp_size):
+        return -1
+    return put_full_tensor_with_unified_tp(store, key, tensor, tp_size, split_dim)
+
+
+def make_mb_scale_original_tensor(dtype=torch.float32):
+    return make_deterministic_tensor((64, 64, 64), dtype=dtype)
+
+
+def assert_tensor_matches_expected_shard(test_case, original_tensor, received_tensor,
+                                         split_dim, target_tp_size, target_rank,
+                                         context):
+    expected_tensor = expected_target_shard(
+        original_tensor, split_dim, target_tp_size, target_rank
+    )
+    test_case.assertIsNotNone(received_tensor, f"missing tensor for {context}")
+    test_case.assertTrue(
+        torch.equal(received_tensor, expected_tensor),
+        f"mismatch for {context}",
+    )
 
 
 def tearDownModule():
@@ -273,8 +413,9 @@ class MooncakeTestBase(unittest.TestCase):
 
 class TestMooncakeFunctional(MooncakeTestBase):
     def assert_full_reconstruction_case(self, key, tensor, split_dim, tp_size):
-        write_parallelism = build_tp_parallelism(tp_size, split_dim, rank=0)
-        rc = self.store.put_tensor_with_parallelism(key, tensor, write_parallelism)
+        rc = put_uniform_full_tensor_with_unified_tp(
+            self.store, key, tensor, tp_size, split_dim
+        )
         self.assertEqual(rc, 0, f"put_tensor_with_parallelism failed for {key}")
 
         shard_reads = []
@@ -315,13 +456,15 @@ class TestMooncakeFunctional(MooncakeTestBase):
         self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_spacing), 0)
         try:
             parallelism = build_tp_parallelism(tp_size, split_dim, rank=min(tp_size - 1, 1))
-            rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+            rc = put_uniform_full_tensor_with_unified_tp(
+                self.store, key, tensor, tp_size, split_dim
+            )
             self.assertEqual(rc, 0)
 
             target = make_read_target("full", parallelism)
             full_tensor = self.store.get_tensor_with_parallelism(key, target)
             reconstructed = self.store.get_tensor_with_parallelism_into(
-                key, buffer_ptr, buffer_spacing, target
+                key, buffer_ptr, buffer_spacing, target=target
             )
             self.assertIsNotNone(full_tensor)
             self.assertIsNotNone(reconstructed)
@@ -332,8 +475,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
             self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
 
     def assert_full_reconstruction_for_all_read_ranks(self, key, tensor, split_dim, tp_size):
-        write_parallelism = build_tp_parallelism(tp_size, split_dim, rank=0)
-        rc = self.store.put_tensor_with_parallelism(key, tensor, write_parallelism)
+        rc = put_uniform_full_tensor_with_unified_tp(
+            self.store, key, tensor, tp_size, split_dim
+        )
         self.assertEqual(rc, 0, f"put_tensor_with_parallelism failed for {key}")
 
         expected_rank_count = len(tensor.chunk(tp_size, split_dim))
@@ -795,15 +939,33 @@ class TestMooncakeFunctional(MooncakeTestBase):
             make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)
         ])
 
-        rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+        shard = chunk_tensor_for_rank(tensor, tp_size, split_dim, 0).contiguous()
+        rc = self.store.put_tensor_with_parallelism(key, shard, parallelism)
         self.assertEqual(rc, 0, f"put_tensor_with_parallelism failed with rc={rc}")
 
-        for rank, expected in enumerate(tensor.chunk(tp_size, split_dim)):
+        expected = shard
+        rank = 0
+        wrapper_shard = self.store.get_tensor_with_tp(
+            key, tp_rank=rank, tp_size=tp_size, split_dim=split_dim
+        )
+        self.assertIsNotNone(wrapper_shard)
+        self.assertTrue(torch.equal(wrapper_shard, expected))
+
+        shard_parallelism = make_tensor_parallelism([
+            make_parallel_axis("tp", rank=rank, size=tp_size, split_dim=split_dim)
+        ])
+
+        target = make_read_target("shard", shard_parallelism)
+        unified_shard = self.store.get_tensor_with_parallelism(key, target)
+        self.assertIsNotNone(unified_shard)
+        self.assertTrue(torch.equal(unified_shard, expected))
+        self.assertTrue(torch.equal(unified_shard, wrapper_shard))
+
+        for rank in range(1, tp_size):
             wrapper_shard = self.store.get_tensor_with_tp(
                 key, tp_rank=rank, tp_size=tp_size, split_dim=split_dim
             )
-            self.assertIsNotNone(wrapper_shard)
-            self.assertTrue(torch.equal(wrapper_shard, expected))
+            self.assertIsNone(wrapper_shard)
 
             shard_parallelism = make_tensor_parallelism([
                 make_parallel_axis("tp", rank=rank, size=tp_size, split_dim=split_dim)
@@ -811,9 +973,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
 
             target = make_read_target("shard", shard_parallelism)
             unified_shard = self.store.get_tensor_with_parallelism(key, target)
-            self.assertIsNotNone(unified_shard)
-            self.assertTrue(torch.equal(unified_shard, expected))
-            self.assertTrue(torch.equal(unified_shard, wrapper_shard))
+            self.assertIsNone(unified_shard)
 
     def test_14_batch_unified_parallelism_tp_matches_wrapper(self):
         require_unified_parallelism_api(self)
@@ -822,14 +982,14 @@ class TestMooncakeFunctional(MooncakeTestBase):
         num_tensors = 3
         keys, tensors = generate_tensors(num_tensors, 4)
 
+        results = batch_put_full_tensors_with_unified_tp(
+            self.store, keys, tensors, tp_size, split_dim
+        )
+        self.assertTrue(all(r == 0 for r in results), f"Batch unified put failed. Results: {results}")
+
         parallelism = make_tensor_parallelism([
             make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)
         ])
-
-        results = self.store.batch_put_tensor_with_parallelism(
-            keys, tensors, [parallelism for _ in keys]
-        )
-        self.assertTrue(all(r == 0 for r in results), f"Batch unified put failed. Results: {results}")
         invalid_results = self.store.batch_put_tensor_with_parallelism(
             keys,
             tensors,
@@ -868,7 +1028,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
             dp_rank=1, dp_size=2, tp_rank=0, tp_size=3, split_dim=1
         )
 
-        rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+        rc = put_full_tensor_with_parallelism_template(
+            self.store, key, tensor, parallelism
+        )
         self.assertEqual(rc, 0)
 
         target = make_read_target("shard", parallelism)
@@ -888,11 +1050,13 @@ class TestMooncakeFunctional(MooncakeTestBase):
         buffer_ptr = ctypes.addressof(buffer)
         self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_spacing), 0)
         try:
-            rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+            rc = put_full_tensor_with_parallelism_template(
+                self.store, key, tensor, parallelism
+            )
             self.assertEqual(rc, 0)
             target = make_read_target("shard", parallelism)
             result = self.store.get_tensor_with_parallelism_into(
-                key, buffer_ptr, buffer_spacing, target
+                key, buffer_ptr, buffer_spacing, target=target
             )
             self.assertIsNotNone(result)
             self.assertTrue(torch.equal(result, tensor.chunk(2, 0)[1]))
@@ -937,7 +1101,12 @@ class TestMooncakeFunctional(MooncakeTestBase):
         keys = [key for key, _, _, _ in cases]
         tensors = [tensor for _, tensor, _, _ in cases]
         parallelisms = [parallelism for _, _, parallelism, _ in cases]
-        results = self.store.batch_put_tensor_with_parallelism(keys, tensors, parallelisms)
+        results = [
+            put_full_tensor_with_parallelism_template(
+                self.store, key, tensor, parallelism
+            )
+            for key, tensor, parallelism in zip(keys, tensors, parallelisms)
+        ]
         self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
 
         targets = [make_read_target("shard", parallelism) for parallelism in parallelisms]
@@ -966,7 +1135,12 @@ class TestMooncakeFunctional(MooncakeTestBase):
         keys = [key for key, _, _, _ in cases]
         tensors = [tensor for _, tensor, _, _ in cases]
         parallelisms = [parallelism for _, _, parallelism, _ in cases]
-        results = self.store.batch_put_tensor_with_parallelism(keys, tensors, parallelisms)
+        results = [
+            put_full_tensor_with_parallelism_template(
+                self.store, key, tensor, parallelism
+            )
+            for key, tensor, parallelism in zip(keys, tensors, parallelisms)
+        ]
         self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
 
         buffer_sizes = [max(serialized_tensor_size(tensor) + 4096, 4 * 1024 * 1024) for tensor in tensors]
@@ -999,13 +1173,12 @@ class TestMooncakeFunctional(MooncakeTestBase):
         tp_size = 4
         split_dim = 1
 
-        parallelism = make_tensor_parallelism([
-            make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)
-        ])
-        rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+        rc = put_uniform_full_tensor_with_unified_tp(
+            self.store, key, tensor, tp_size, split_dim
+        )
         self.assertEqual(rc, 0)
 
-        target = make_read_target("full", parallelism)
+        target = make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=0))
         unified_full = self.store.get_tensor_with_parallelism(key, target)
         self.assertIsNotNone(unified_full)
         self.assertTrue(torch.equal(unified_full, tensor))
@@ -1018,7 +1191,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
             dp_rank=1, dp_size=2, tp_rank=0, tp_size=4, split_dim=1
         )
 
-        rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+        rc = put_full_tensor_with_parallelism_template(
+            self.store, key, tensor, parallelism
+        )
         self.assertEqual(rc, 0)
 
         full_target = make_read_target(
@@ -1043,7 +1218,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
         buffer_ptr = ctypes.addressof(buffer)
         self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_spacing), 0)
         try:
-            rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+            rc = put_full_tensor_with_parallelism_template(
+                self.store, key, tensor, parallelism
+            )
             self.assertEqual(rc, 0)
             full_target = make_read_target(
                 "full",
@@ -1052,7 +1229,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
                 ),
             )
             result = self.store.get_tensor_with_parallelism_into(
-                key, buffer_ptr, buffer_spacing, full_target
+                key, buffer_ptr, buffer_spacing, target=full_target
             )
             self.assertIsNotNone(result)
             self.assertTrue(torch.equal(result, tensor))
@@ -1078,7 +1255,8 @@ class TestMooncakeFunctional(MooncakeTestBase):
             parallelism = make_tensor_parallelism([
                 make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)
             ])
-            rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+            shard = chunk_tensor_for_rank(tensor, tp_size, split_dim, 0).contiguous()
+            rc = self.store.put_tensor_with_parallelism(key, shard, parallelism)
             self.assertEqual(rc, 0)
 
             target = make_read_target("shard", parallelism)
@@ -1086,7 +1264,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
                 key, wrapper_ptr, buffer_spacing, tp_rank=0, tp_size=tp_size, split_dim=split_dim
             )
             unified_tensor = self.store.get_tensor_with_parallelism_into(
-                key, unified_ptr, buffer_spacing, target
+                key, unified_ptr, buffer_spacing, target=target
             )
             self.assertIsNotNone(wrapper_tensor)
             self.assertIsNotNone(unified_tensor)
@@ -1161,12 +1339,19 @@ class TestMooncakeFunctional(MooncakeTestBase):
         for index, (shape, split_dim, tp_size) in enumerate(cases):
             with self.subTest(case=reconstruction_case_name(shape, split_dim, tp_size)):
                 tensor = make_deterministic_tensor(shape)
-                self.assert_full_reconstruction_case(
-                    key=f"func_unified_tp_matrix_{index}",
-                    tensor=tensor,
-                    split_dim=split_dim,
-                    tp_size=tp_size,
-                )
+                key = f"func_unified_tp_matrix_{index}"
+                if is_uniform_tp_case(shape, split_dim, tp_size):
+                    self.assert_full_reconstruction_case(
+                        key=key,
+                        tensor=tensor,
+                        split_dim=split_dim,
+                        tp_size=tp_size,
+                    )
+                else:
+                    rc = put_uniform_full_tensor_with_unified_tp(
+                        self.store, key, tensor, tp_size, split_dim
+                    )
+                    self.assertNotEqual(rc, 0)
 
     def test_27_unified_parallelism_full_into_matrix(self):
         require_unified_parallelism_api(self)
@@ -1180,14 +1365,21 @@ class TestMooncakeFunctional(MooncakeTestBase):
         for index, (shape, split_dim, tp_size) in enumerate(cases):
             with self.subTest(case=reconstruction_case_name(shape, split_dim, tp_size)):
                 tensor = make_deterministic_tensor(shape)
-                buffer_spacing = max(serialized_tensor_size(tensor) + 4096, 4 * 1024 * 1024)
-                self.assert_full_into_reconstruction_case(
-                    key=f"func_unified_tp_full_into_matrix_{index}",
-                    tensor=tensor,
-                    split_dim=split_dim,
-                    tp_size=tp_size,
-                    buffer_spacing=buffer_spacing,
-                )
+                key = f"func_unified_tp_full_into_matrix_{index}"
+                if is_uniform_tp_case(shape, split_dim, tp_size):
+                    buffer_spacing = max(serialized_tensor_size(tensor) + 4096, 4 * 1024 * 1024)
+                    self.assert_full_into_reconstruction_case(
+                        key=key,
+                        tensor=tensor,
+                        split_dim=split_dim,
+                        tp_size=tp_size,
+                        buffer_spacing=buffer_spacing,
+                    )
+                else:
+                    rc = put_uniform_full_tensor_with_unified_tp(
+                        self.store, key, tensor, tp_size, split_dim
+                    )
+                    self.assertNotEqual(rc, 0)
 
     def test_28_writer_shard_full_reconstruction(self):
         require_unified_parallelism_api(self)
@@ -1210,12 +1402,12 @@ class TestMooncakeFunctional(MooncakeTestBase):
                 rc = self.store.put_tensor_with_parallelism(
                     key,
                     tensor,
-                    writer_partition=make_writer_partition(rank, 3, 0),
+                    writer_partition=make_writer_partition(rank, 3, 1),
                 )
                 self.assertEqual(rc, 0)
 
             result = self.store.get_tensor_with_parallelism_into(
-                key, buffer_ptr, buffer_spacing, make_read_target("full")
+                key, buffer_ptr, buffer_spacing, target=make_read_target("full")
             )
             self.assertIsNotNone(result)
             self.assertTrue(torch.equal(result, tensor))
@@ -1225,9 +1417,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
     def test_30_batch_writer_partition_full_reconstruction(self):
         require_unified_parallelism_api(self)
         tensors = [
-            make_deterministic_tensor((8, 10)),
-            make_deterministic_tensor((6, 10, 4)),
-            make_deterministic_tensor((12, 10)),
+            make_deterministic_tensor((8, 12)),
+            make_deterministic_tensor((6, 9, 4)),
+            make_deterministic_tensor((12, 12)),
         ]
         keys = [f"func_writer_partition_batch_{i}" for i in range(len(tensors))]
         writer_partitions = [
@@ -1304,13 +1496,13 @@ class TestMooncakeFunctional(MooncakeTestBase):
         tp_size = 4
         split_dim = 1
         tensors = [
-            make_deterministic_tensor((8, 10)),
-            make_deterministic_tensor((6, 10, 4)),
-            make_deterministic_tensor((12, 10)),
+            make_deterministic_tensor((8, 12)),
+            make_deterministic_tensor((6, 12, 4)),
+            make_deterministic_tensor((12, 12)),
         ]
         keys = [f"func_unified_tp_full_batch_{i}" for i in range(len(tensors))]
         parallelisms = [build_tp_parallelism(tp_size, split_dim, rank=0) for _ in tensors]
-        results = self.store.batch_put_tensor_with_parallelism(keys, tensors, parallelisms)
+        results = batch_put_full_tensors_with_unified_tp(self.store, keys, tensors, tp_size, split_dim)
         self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
 
         full_targets = [make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=1)) for _ in tensors]
@@ -1345,7 +1537,12 @@ class TestMooncakeFunctional(MooncakeTestBase):
         keys = [key for key, _, _, _ in cases]
         tensors = [tensor for _, tensor, _, _ in cases]
         write_parallelisms = [parallelism for _, _, parallelism, _ in cases]
-        results = self.store.batch_put_tensor_with_parallelism(keys, tensors, write_parallelisms)
+        results = [
+            put_full_tensor_with_parallelism_template(
+                self.store, key, tensor, parallelism
+            )
+            for key, tensor, parallelism in zip(keys, tensors, write_parallelisms)
+        ]
         self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
 
         full_targets = [make_read_target("full", target_parallelism) for _, _, _, target_parallelism in cases]
@@ -1365,7 +1562,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
         read_parallelism = reorder_parallelism_axes(write_parallelism, ["tp", "dp"])
         read_parallelism.axes[0].rank = 3
 
-        rc = self.store.put_tensor_with_parallelism(key, tensor, write_parallelism)
+        rc = put_full_tensor_with_parallelism_template(
+            self.store, key, tensor, write_parallelism
+        )
         self.assertEqual(rc, 0)
 
         full_target = make_read_target("full", read_parallelism)
@@ -1387,11 +1586,13 @@ class TestMooncakeFunctional(MooncakeTestBase):
         buffer_ptr = ctypes.addressof(buffer)
         self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_spacing), 0)
         try:
-            rc = self.store.put_tensor_with_parallelism(key, tensor, write_parallelism)
+            rc = put_full_tensor_with_parallelism_template(
+                self.store, key, tensor, write_parallelism
+            )
             self.assertEqual(rc, 0)
             full_target = make_read_target("full", read_parallelism)
             result = self.store.get_tensor_with_parallelism_into(
-                key, buffer_ptr, buffer_spacing, full_target
+                key, buffer_ptr, buffer_spacing, target=full_target
             )
             self.assertIsNotNone(result)
             self.assertTrue(torch.equal(result, tensor))
@@ -1418,7 +1619,12 @@ class TestMooncakeFunctional(MooncakeTestBase):
         tensors = [tensor for _, tensor, _, _ in cases]
         write_parallelisms = [parallelism for _, _, parallelism, _ in cases]
         read_parallelisms = [parallelism for _, _, _, parallelism in cases]
-        results = self.store.batch_put_tensor_with_parallelism(keys, tensors, write_parallelisms)
+        results = [
+            put_full_tensor_with_parallelism_template(
+                self.store, key, tensor, parallelism
+            )
+            for key, tensor, parallelism in zip(keys, tensors, write_parallelisms)
+        ]
         self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
 
         full_targets = [make_read_target("full", target_parallelism) for target_parallelism in read_parallelisms]
@@ -1437,8 +1643,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
         tp_size = 4
         buffer_spacing = serialized_tensor_size(tensor) + 4 * 1024 * 1024
 
-        write_parallelism = build_tp_parallelism(tp_size, split_dim, rank=0)
-        rc = self.store.put_tensor_with_parallelism(key, tensor, write_parallelism)
+        rc = put_uniform_full_tensor_with_unified_tp(
+            self.store, key, tensor, tp_size, split_dim
+        )
         self.assertEqual(rc, 0)
 
         full_target = make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=1))
@@ -1473,12 +1680,11 @@ class TestMooncakeFunctional(MooncakeTestBase):
         for index, (shape, split_dim, tp_size) in enumerate(cases):
             with self.subTest(case=reconstruction_case_name(shape, split_dim, tp_size)):
                 tensor = make_deterministic_tensor(shape)
-                self.assert_full_reconstruction_for_all_read_ranks(
-                    key=f"func_unified_tp_edge_matrix_{index}",
-                    tensor=tensor,
-                    split_dim=split_dim,
-                    tp_size=tp_size,
+                key = f"func_unified_tp_edge_matrix_{index}"
+                rc = put_uniform_full_tensor_with_unified_tp(
+                    self.store, key, tensor, tp_size, split_dim
                 )
+                self.assertNotEqual(rc, 0)
 
     def test_37_batch_unified_parallelism_full_into_matrix(self):
         require_unified_parallelism_api(self)
@@ -1487,37 +1693,16 @@ class TestMooncakeFunctional(MooncakeTestBase):
             (make_deterministic_tensor((8, 12)), 0, 16),
             (make_deterministic_tensor((4, 5, 7)), 2, 8),
         ]
-        keys = [f"func_unified_tp_batch_full_into_{i}" for i in range(len(cases))]
-        tensors = [tensor for tensor, _, _ in cases]
-        parallelisms = [build_tp_parallelism(tp_size, split_dim, rank=0) for _, split_dim, tp_size in cases]
-        results = self.store.batch_put_tensor_with_parallelism(keys, tensors, parallelisms)
-        self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
-
-        buffer_sizes = []
-        targets = []
-        for tensor, split_dim, tp_size in cases:
-            size = max(serialized_tensor_size(tensor) + 4096, 4 * 1024 * 1024)
-            buffer_sizes.append(size)
-            targets.append(make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=min(tp_size - 1, 1))))
-
-        total_buffer_size = sum(buffer_sizes)
-        backing_buffer = (ctypes.c_ubyte * total_buffer_size)()
-        backing_buffer_ptr = ctypes.addressof(backing_buffer)
-        buffer_ptrs = []
-        offset = 0
-        for size in buffer_sizes:
-            buffer_ptrs.append(backing_buffer_ptr + offset)
-            offset += size
-
-        self.assertEqual(self.store.register_buffer(backing_buffer_ptr, total_buffer_size), 0)
-        try:
-            full_reads = self.store.batch_get_tensor_with_parallelism_into(keys, buffer_ptrs, buffer_sizes, targets)
-            self.assertEqual(len(full_reads), len(tensors))
-            for i, tensor in enumerate(tensors):
-                self.assertIsNotNone(full_reads[i], f"batch full into missing for tensor {i}")
-                self.assertTrue(torch.equal(full_reads[i], tensor), f"batch full into mismatch for tensor {i}")
-        finally:
-            self.assertEqual(self.store.unregister_buffer(backing_buffer_ptr), 0)
+        for index, (tensor, split_dim, tp_size) in enumerate(cases):
+            with self.subTest(case=reconstruction_case_name(tuple(tensor.shape), split_dim, tp_size)):
+                rc = put_uniform_full_tensor_with_unified_tp(
+                    self.store,
+                    f"func_unified_tp_batch_full_into_{index}",
+                    tensor,
+                    tp_size,
+                    split_dim,
+                )
+                self.assertNotEqual(rc, 0)
 
     def test_38_batch_unified_parallelism_full_ragged_cases(self):
         require_unified_parallelism_api(self)
@@ -1527,34 +1712,16 @@ class TestMooncakeFunctional(MooncakeTestBase):
             (make_deterministic_tensor((11, 9)), 1, 4),
             (make_deterministic_tensor((3, 5, 7)), 2, 16),
         ]
-        keys = [f"func_unified_tp_batch_ragged_{i}" for i in range(len(cases))]
-        tensors = [tensor for tensor, _, _ in cases]
-        parallelisms = [build_tp_parallelism(tp_size, split_dim, rank=0) for _, split_dim, tp_size in cases]
-        results = self.store.batch_put_tensor_with_parallelism(keys, tensors, parallelisms)
-        self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
-
-        full_targets = [
-            make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=min(tp_size - 1, 1)))
-            for _, split_dim, tp_size in cases
-        ]
-        full_reads = self.store.batch_get_tensor_with_parallelism(keys, full_targets)
-        self.assertEqual(len(full_reads), len(tensors))
-        for i, tensor in enumerate(tensors):
-            self.assertIsNotNone(full_reads[i], f"full reconstruction missing for tensor {i}")
-            self.assertTrue(torch.equal(full_reads[i], tensor), f"full reconstruction mismatch for tensor {i}")
-
-        shard_targets = []
-        for tensor, split_dim, tp_size in cases:
-            shard_count = len(tensor.chunk(tp_size, split_dim))
-            shard_rank = max(0, shard_count - 1)
-            shard_targets.append(make_read_target("shard", build_tp_parallelism(tp_size, split_dim, rank=shard_rank)))
-        shard_reads = self.store.batch_get_tensor_with_parallelism(keys, shard_targets)
-        self.assertEqual(len(shard_reads), len(tensors))
-        for i, (tensor, split_dim, tp_size) in enumerate(cases):
-            shard_rank = len(tensor.chunk(tp_size, split_dim)) - 1
-            expected_shard = chunk_tensor_for_rank(tensor, tp_size, split_dim, shard_rank)
-            self.assertIsNotNone(shard_reads[i], f"shard missing for tensor {i}")
-            self.assertTrue(torch.equal(shard_reads[i], expected_shard), f"shard mismatch for tensor {i}")
+        for index, (tensor, split_dim, tp_size) in enumerate(cases):
+            with self.subTest(case=reconstruction_case_name(tuple(tensor.shape), split_dim, tp_size)):
+                rc = put_uniform_full_tensor_with_unified_tp(
+                    self.store,
+                    f"func_unified_tp_batch_ragged_{index}",
+                    tensor,
+                    tp_size,
+                    split_dim,
+                )
+                self.assertNotEqual(rc, 0)
 
     def test_39_unified_parallelism_full_dtype_smoke(self):
         require_unified_parallelism_api(self)
@@ -1566,12 +1733,261 @@ class TestMooncakeFunctional(MooncakeTestBase):
         for index, (dtype, shape, split_dim, tp_size) in enumerate(cases):
             with self.subTest(dtype=str(dtype), case=reconstruction_case_name(shape, split_dim, tp_size)):
                 tensor = make_deterministic_tensor(shape, dtype=dtype)
-                self.assert_full_reconstruction_case(
-                    key=f"func_unified_tp_dtype_{index}",
-                    tensor=tensor,
-                    split_dim=split_dim,
-                    tp_size=tp_size,
+                key = f"func_unified_tp_dtype_{index}"
+                if is_uniform_tp_case(shape, split_dim, tp_size):
+                    self.assert_full_reconstruction_case(
+                        key=key,
+                        tensor=tensor,
+                        split_dim=split_dim,
+                        tp_size=tp_size,
+                    )
+                else:
+                    rc = put_uniform_full_tensor_with_unified_tp(
+                        self.store, key, tensor, tp_size, split_dim
+                    )
+                    self.assertNotEqual(rc, 0)
+
+    def test_40_unified_parallelism_target_shard_matrix(self):
+        require_unified_parallelism_api(self)
+        cases = [
+            ((8, 12, 6), 0, 4, 2, "tp"),
+            ((8, 12, 6), 1, 4, 2, "dp_tp"),
+            ((8, 12, 6), 2, 2, 4, "pp_tp"),
+            ((8, 12, 6), 1, 2, 4, "ep_tp"),
+            ((12, 8, 6), 0, 2, 2, "tp"),
+            ((12, 8, 8), 2, 4, 4, "dp_tp"),
+        ]
+
+        for index, (shape, split_dim, put_tp_size, get_tp_size, mode) in enumerate(cases):
+            with self.subTest(shape=shape, split_dim=split_dim, put_tp_size=put_tp_size, get_tp_size=get_tp_size, mode=mode):
+                tensor = make_deterministic_tensor(shape)
+                key = f"func_unified_target_shard_matrix_{index}"
+                rc = put_full_tensor_with_parallelism_mode(
+                    self.store, key, tensor, split_dim, put_tp_size, mode
                 )
+                self.assertEqual(rc, 0)
+
+                if not is_uniform_tp_case(shape, split_dim, get_tp_size):
+                    target_parallelism = build_parallelism_mode(
+                        mode, 0, get_tp_size, split_dim
+                    )
+                    target = make_read_target("shard", target_parallelism)
+                    shard = self.store.get_tensor_with_parallelism(key, target)
+                    self.assertIsNone(shard)
+                    continue
+
+                for target_rank in range(get_tp_size):
+                    target_parallelism = build_parallelism_mode(
+                        mode, target_rank, get_tp_size, split_dim
+                    )
+                    target = make_read_target("shard", target_parallelism)
+                    shard = self.store.get_tensor_with_parallelism(key, target)
+                    expected = expected_target_shard(
+                        tensor, split_dim, get_tp_size, target_rank
+                    )
+                    self.assertIsNotNone(shard)
+                    self.assertTrue(
+                        torch.equal(shard, expected),
+                        f"target shard mismatch for mode={mode}, rank={target_rank}",
+                    )
+
+    def test_41_unified_parallelism_target_shard_into_matrix(self):
+        require_unified_parallelism_api(self)
+        cases = [
+            ((8, 12, 6), 0, 4, 2, "tp"),
+            ((8, 12, 6), 1, 4, 2, "dp_tp"),
+            ((8, 12, 6), 2, 2, 4, "pp_tp"),
+            ((8, 12, 6), 1, 2, 4, "ep_tp"),
+        ]
+
+        for index, (shape, split_dim, put_tp_size, get_tp_size, mode) in enumerate(cases):
+            with self.subTest(shape=shape, split_dim=split_dim, put_tp_size=put_tp_size, get_tp_size=get_tp_size, mode=mode):
+                tensor = make_deterministic_tensor(shape)
+                key = f"func_unified_target_shard_into_matrix_{index}"
+                rc = put_full_tensor_with_parallelism_mode(
+                    self.store, key, tensor, split_dim, put_tp_size, mode
+                )
+                self.assertEqual(rc, 0)
+
+                if not is_uniform_tp_case(shape, split_dim, get_tp_size):
+                    buffer_spacing = 4 * 1024 * 1024
+                    buffer = (ctypes.c_ubyte * buffer_spacing)()
+                    buffer_ptr = ctypes.addressof(buffer)
+                    self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_spacing), 0)
+                    try:
+                        target_parallelism = build_parallelism_mode(
+                            mode, 0, get_tp_size, split_dim
+                        )
+                        target = make_read_target("shard", target_parallelism)
+                        shard = self.store.get_tensor_with_parallelism_into(
+                            key, buffer_ptr, buffer_spacing, target=target
+                        )
+                        self.assertIsNone(shard)
+                    finally:
+                        self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+                    continue
+
+                for target_rank in range(get_tp_size):
+                    expected = expected_target_shard(
+                        tensor, split_dim, get_tp_size, target_rank
+                    )
+                    buffer_spacing = max(serialized_tensor_size(expected) + 4096, 4 * 1024 * 1024)
+                    buffer = (ctypes.c_ubyte * buffer_spacing)()
+                    buffer_ptr = ctypes.addressof(buffer)
+                    self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_spacing), 0)
+                    try:
+                        target_parallelism = build_parallelism_mode(
+                            mode, target_rank, get_tp_size, split_dim
+                        )
+                        target = make_read_target("shard", target_parallelism)
+                        shard = self.store.get_tensor_with_parallelism_into(
+                            key, buffer_ptr, buffer_spacing, target=target
+                        )
+                        self.assertIsNotNone(shard)
+                        self.assertTrue(
+                            torch.equal(shard, expected),
+                            f"target shard into mismatch for mode={mode}, rank={target_rank}",
+                        )
+                    finally:
+                        self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+
+    def test_42_unified_parallelism_mb_scale_target_shard_matrix(self):
+        require_unified_parallelism_api(self)
+        original = make_mb_scale_original_tensor()
+        cases = [
+            (0, 4, 2, "tp"),
+            (1, 4, 2, "dp_tp"),
+            (2, 4, 2, "pp_tp"),
+            (2, 4, 2, "ep_tp"),
+        ]
+
+        for index, (split_dim, put_tp_size, get_tp_size, mode) in enumerate(cases):
+            key = f"func_unified_mb_target_shard_{index}"
+            with self.subTest(split_dim=split_dim, put_tp_size=put_tp_size,
+                              get_tp_size=get_tp_size, mode=mode):
+                rc = put_full_tensor_with_parallelism_mode(
+                    self.store, key, original, split_dim, put_tp_size, mode
+                )
+                self.assertEqual(rc, 0)
+                for target_rank in range(get_tp_size):
+                    target_parallelism = build_parallelism_mode(
+                        mode, target_rank, get_tp_size, split_dim
+                    )
+                    target = make_read_target("shard", target_parallelism)
+                    shard = self.store.get_tensor_with_parallelism(key, target)
+                    assert_tensor_matches_expected_shard(
+                        self, original, shard, split_dim, get_tp_size, target_rank,
+                        context=(
+                            f"mb shard read mode={mode} split_dim={split_dim} "
+                            f"target_rank={target_rank}"
+                        ),
+                    )
+
+    def test_43_unified_parallelism_mb_scale_target_shard_into_matrix(self):
+        require_unified_parallelism_api(self)
+        original = make_mb_scale_original_tensor()
+        cases = [
+            (0, 4, 2, "tp"),
+            (1, 4, 2, "dp_tp"),
+            (2, 4, 2, "pp_tp"),
+            (2, 4, 2, "ep_tp"),
+        ]
+
+        for index, (split_dim, put_tp_size, get_tp_size, mode) in enumerate(cases):
+            key = f"func_unified_mb_target_shard_into_{index}"
+            with self.subTest(split_dim=split_dim, put_tp_size=put_tp_size,
+                              get_tp_size=get_tp_size, mode=mode):
+                rc = put_full_tensor_with_parallelism_mode(
+                    self.store, key, original, split_dim, put_tp_size, mode
+                )
+                self.assertEqual(rc, 0)
+                for target_rank in range(get_tp_size):
+                    expected = expected_target_shard(
+                        original, split_dim, get_tp_size, target_rank
+                    )
+                    buffer_spacing = max(
+                        serialized_tensor_size(expected) + 4096,
+                        4 * 1024 * 1024,
+                    )
+                    buffer = (ctypes.c_ubyte * buffer_spacing)()
+                    buffer_ptr = ctypes.addressof(buffer)
+                    self.assertEqual(
+                        self.store.register_buffer(buffer_ptr, buffer_spacing), 0
+                    )
+                    try:
+                        target_parallelism = build_parallelism_mode(
+                            mode, target_rank, get_tp_size, split_dim
+                        )
+                        target = make_read_target("shard", target_parallelism)
+                        shard = self.store.get_tensor_with_parallelism_into(
+                            key, buffer_ptr, buffer_spacing, target=target
+                        )
+                        assert_tensor_matches_expected_shard(
+                            self, original, shard, split_dim, get_tp_size,
+                            target_rank,
+                            context=(
+                                f"mb shard into mode={mode} split_dim={split_dim} "
+                                f"target_rank={target_rank}"
+                            ),
+                        )
+                    finally:
+                        self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+
+    def test_44_unified_parallelism_concurrency_relation_matrix(self):
+        require_unified_parallelism_api(self)
+        original = make_mb_scale_original_tensor()
+        scenarios = [
+            (2, 4, [(0, 4, 2, "tp"), (1, 4, 2, "dp_tp"), (2, 4, 2, "pp_tp")]),
+            (3, 3, [(0, 4, 2, "tp"), (1, 4, 2, "dp_tp"), (2, 4, 2, "ep_tp")]),
+            (6, 3, [(0, 4, 2, "tp"), (1, 4, 2, "pp_tp"), (2, 4, 2, "ep_tp")]),
+        ]
+
+        def put_worker(key, split_dim, put_tp_size, mode):
+            return put_full_tensor_with_parallelism_mode(
+                self.store, key, original, split_dim, put_tp_size, mode
+            )
+
+        def get_worker(key, split_dim, get_tp_size, mode):
+            for target_rank in range(get_tp_size):
+                target_parallelism = build_parallelism_mode(
+                    mode, target_rank, get_tp_size, split_dim
+                )
+                target = make_read_target("shard", target_parallelism)
+                shard = self.store.get_tensor_with_parallelism(key, target)
+                expected = expected_target_shard(
+                    original, split_dim, get_tp_size, target_rank
+                )
+                if shard is None or not torch.equal(shard, expected):
+                    return (
+                        f"concurrency shard mismatch key={key} split_dim={split_dim} "
+                        f"mode={mode} rank={target_rank}"
+                    )
+            return None
+
+        for scenario_index, (put_workers, get_workers, cases) in enumerate(scenarios):
+            with self.subTest(put_workers=put_workers, get_workers=get_workers):
+                keys = [
+                    f"func_unified_concurrency_{scenario_index}_{case_index}"
+                    for case_index in range(len(cases))
+                ]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max(put_workers, get_workers)) as executor:
+                    put_futures = [
+                        executor.submit(put_worker, key, split_dim, put_tp_size, mode)
+                        for key, (split_dim, put_tp_size, _get_tp_size, mode) in zip(keys, cases)
+                        for _ in range(max(1, put_workers // len(cases)))
+                    ]
+                    for future in concurrent.futures.as_completed(put_futures):
+                        self.assertEqual(future.result(), 0)
+
+                    get_futures = [
+                        executor.submit(get_worker, key, split_dim, get_tp_size, mode)
+                        for key, (split_dim, _put_tp_size, get_tp_size, mode) in zip(keys, cases)
+                        for _ in range(max(1, get_workers // len(cases)))
+                    ]
+                    for future in concurrent.futures.as_completed(get_futures):
+                        error = future.result()
+                        if error:
+                            self.fail(error)
 
 # ==========================================
 #  Performance/Benchmark Tests
@@ -1859,7 +2275,6 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         tensor = self.tensors[0]
         tp_size = 4
         split_dim = 1
-        write_parallelism = build_tp_parallelism(tp_size, split_dim, rank=0)
         full_target = make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=1))
         manual_times = []
         unified_times = []
@@ -1867,7 +2282,9 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         print(f"--- Running Unified Full Reconstruction Benchmark (TP={tp_size}) ---")
         for _ in range(self.BENCH_ITERATIONS):
             self.store.remove_all()
-            rc = self.store.put_tensor_with_parallelism(key, tensor, write_parallelism)
+            rc = put_uniform_full_tensor_with_unified_tp(
+                self.store, key, tensor, tp_size, split_dim
+            )
             self.assertEqual(rc, 0)
 
             t0 = time.perf_counter()
@@ -1890,7 +2307,6 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         tensor = self.tensors[0]
         tp_size = 4
         split_dim = 0
-        write_parallelism = build_tp_parallelism(tp_size, split_dim, rank=0)
         full_target = make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=2))
         buffer_spacing = serialized_tensor_size(tensor) + 4 * 1024 * 1024
         buffer = (ctypes.c_ubyte * buffer_spacing)()
@@ -1901,7 +2317,9 @@ class TestMooncakeBenchmark(MooncakeTestBase):
             print(f"--- Running Unified Full Into Benchmark (TP={tp_size}) ---")
             for _ in range(self.BENCH_ITERATIONS):
                 self.store.remove_all()
-                rc = self.store.put_tensor_with_parallelism(key, tensor, write_parallelism)
+                rc = put_uniform_full_tensor_with_unified_tp(
+                    self.store, key, tensor, tp_size, split_dim
+                )
                 self.assertEqual(rc, 0)
 
                 t0 = time.perf_counter()
@@ -1932,10 +2350,11 @@ class TestMooncakeStress(MooncakeTestBase):
         elif split_dim == 1:
             tensor = make_deterministic_tensor((512, 2048))
         else:
-            tensor = make_deterministic_tensor((64, 96, 7))
+            tensor = make_deterministic_tensor((64, 96, 32))
 
-        parallelism = build_tp_parallelism(tp_size, split_dim, rank=0)
-        rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+        rc = put_uniform_full_tensor_with_unified_tp(
+            self.store, key, tensor, tp_size, split_dim
+        )
         if rc != 0:
             return f"put failed for {key}, rc={rc}"
 
@@ -1960,7 +2379,7 @@ class TestMooncakeStress(MooncakeTestBase):
                 return f"register_buffer failed for {key}"
             try:
                 into_tensor = self.store.get_tensor_with_parallelism_into(
-                    key, buffer_ptr, buffer_spacing, full_target
+                    key, buffer_ptr, buffer_spacing, target=full_target
                 )
                 if into_tensor is None or not torch.equal(into_tensor, tensor):
                     return f"full into mismatch for {key}, split_dim={split_dim}, tp_size={tp_size}"
@@ -2016,6 +2435,10 @@ class TestMooncakeStress(MooncakeTestBase):
 
                 if not torch.equal(original_tensor, retrieved_tensor):
                     raise RuntimeError(f"Data Mismatch for {key}!")
+
+                remove_rc = self.store.remove(key, True)
+                if remove_rc != 0:
+                    raise RuntimeError(f"Remove failed for {key}, rc={remove_rc}")
 
                 ops_count += 1
 

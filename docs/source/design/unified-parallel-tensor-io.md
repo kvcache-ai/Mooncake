@@ -245,6 +245,12 @@ The unified write family should be driven by the identity of the object being wr
 | full tensor | combined shard | `put_tensor_with_parallelism(...)` | explicit axis list such as `[PP(...), TP(...)]` |
 | shard tensor | shard object | `put_tensor_with_parallelism(...)` | explicit axis list describing that shard identity |
 
+For TP-containing **multi-axis** layouts, the write semantic is now: the caller may pass the **full source tensor**, and the provided TP rank/layout tells Mooncake which uniform shard to materialize and persist. Callers no longer need to pre-split the tensor themselves for `dp_tp` / `pp_tp` / `ep_tp` style writes.
+
+Single-axis TP compatibility wrappers and the preserved plain-TP `with_parallelism` behavior still accept shard input rather than auto-materializing from a full tensor.
+
+Pure DP still does not invent a split axis on its own. If the stored object is actually sharded, the request must still include the layout axis that defines the shard shape.
+
 The same matrix applies to `upsert_tensor_with_parallelism(...)`.
 
 ## Read-side matrix
@@ -361,6 +367,8 @@ This is intentionally narrower than the full `TensorParallelism` model:
 - it is a write-side convenience, not a replacement for `TensorParallelism`
 - it is primarily for batch full-tensor writes where the caller already knows rank / size / split_dim per item
 - it should not change the unified read-side abstraction
+
+`writer_partitions` remains a separate explicit route. The newer TP-containing `parallelism` write semantic now overlaps with it for the common case of “full tensor in, store one requested shard”, but `writer_partitions` is still useful when the caller wants a lighter write-side request shape without constructing `TensorParallelism` objects.
 
 ### Implemented read-side behavior
 

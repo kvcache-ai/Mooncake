@@ -564,6 +564,12 @@ def put_tensor_with_parallelism(
 
 Use `parallelism=None` to store a full tensor object. Provide `TensorParallelism` to store a shard-scoped object.
 
+For TP-containing multi-axis layouts, the caller may pass the full source tensor; Mooncake derives and persists the uniform shard selected by the requested TP rank/layout. That applies to layouts such as `dp_tp`, `pp_tp`, and `ep_tp`.
+
+Plain single-axis TP remains shard-input for compatibility.
+
+Pure DP still does not imply a split axis by itself.
+
 ### batch_put_tensor_with_parallelism()
 
 Batch version of unified tensor writes.
@@ -581,7 +587,7 @@ def batch_put_tensor_with_parallelism(
 
 `writer_partitions` is an optional write-side convenience input for batch full-tensor writes that should be partitioned into stored shards. Each entry describes the target shard write as `(rank, size, split_dim)`.
 
-Use `writer_partitions` when the caller has full tensors and wants Mooncake to derive the stored shard objects from writer-side partition info instead of constructing full `TensorParallelism` objects per element.
+Use `writer_partitions` when the caller has full tensors and wants Mooncake to derive the stored shard objects from writer-side partition info instead of constructing full `TensorParallelism` objects per element. TP-containing `parallelisms` can now express the same full-tensor-input behavior too; `writer_partitions` remains the lighter explicit write-side shorthand.
 
 ### get_tensor_with_parallelism()
 
@@ -664,6 +670,8 @@ def batch_upsert_tensor_with_parallelism(
     writer_partitions = None,
 ) -> list[int]
 ```
+
+The write semantics match `put_tensor_with_parallelism()`, including full-tensor input for TP-containing layouts.
 
 ### *_from zero-copy write variants
 
