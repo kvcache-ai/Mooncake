@@ -439,36 +439,22 @@ class P2PProxy {
     void abandonResources();
 
    private:
-    // Per-chunk state machine.  The lifecycle depends on which side owns
-    // the task (Sender task inside SendOpContext, Receiver task inside
-    // RecvOpContext).
-    //
-    // SENDER side lifecycle (SendTransferTask):
-    //   kDataCopy  -- Copy user tensor data into the SendPool staging buffer.
-    //                 On CPU this is synchronous; on GPU we record a
-    //                 cudaEvent on the op's stream and poll it.
-    //   kTransfer  -- Staging buffer is ready.  An RDMA Write to the remote
-    //                 RecvPool has been submitted and we are polling it.
-    //   kDone      -- RDMA Write finished.  We now write a CompletionSlot
-    //                 back to the receiver.  When that control write finishes
-    //                 the task is erased and the staging chunk is freed.
-    //
-    // RECEIVER side lifecycle (RecvTransferTask):
-    //   kTransfer  -- The PublishSlot RDMA Write is in flight.  We poll the
-    //                 local batch status until it completes.
-    //   kDataCopy  -- PublishSlot has reached the sender.  We now poll our
-    //                 local CompletionLane for the sender's ack.  Once the
-    //                 ack arrives we initiate cudaMemcpyAsync (or memcpy on
-    //                 CPU) from RecvPool to the user tensor and record an
-    //                 event (GPU) or finish immediately (CPU).
-    //   kDone      -- (CPU path only) memcpy is finished and the RecvPool
-    //                 chunk has been returned to the pool.  On GPU the
-    //                 transition to kDone happens inside StepRecvDataCopy
-    //                 when the recorded cudaEvent signals completion.
-    enum class TransferState {
-        kDataCopy,
-        kTransfer,
-        kDone,
+    // Sender-side per-chunk state machine.
+    enum class SendTaskState {
+        kCopyIn,  // Copying tensor slice into local SendPool staging buffer.
+                  // On CPU this is synchronous; on GPU we record a
+                  // cudaEvent on the op's stream and poll it.
+        kWriteRemote,  // Write from SendPool -> remote RecvPool.
+        kCompletion,   // Writing CompletionSlot back to the receiver.
+        kFinished,     // CompletionSlot write done, staging buffer freed.
+    };
+
+    // Receiver-side per-chunk state machine.
+    enum class RecvTaskState {
+        kAdvertise,       // PublishSlot Write is in flight.
+        kWaitCompletion,  // Waiting for sender's CompletionSlot.
+        kCopyOut,         // GPU: cudaMemcpyAsync RecvPool -> tensor in flight.
+        kFinished,        // Copy-out done, chunk returned to pool.
     };
 
     struct SendOpContext;
@@ -483,7 +469,7 @@ class P2PProxy {
                          void* staging_addr_in, uint64_t remote_addr_in,
                          uint32_t sequence_in, uint32_t generation_in);
 
-        TransferState state_ = TransferState::kDataCopy;
+        SendTaskState state_ = SendTaskState::kCopyIn;
         uint64_t tensor_offset_ = 0;  // Offset inside the user tensor.
         uint32_t chunk_len_ = 0;      // Bytes in this chunk (<= kP2PChunkSize).
         void* staging_addr_ = nullptr;  // Address inside SendPool.
@@ -497,9 +483,8 @@ class P2PProxy {
     };
 
     // Active send operation state.  Tasks are created in order and advance
-    // through the sender state machine (kDataCopy -> kTransfer -> kDone).
-    // A task is erased only after the CompletionSlot write has finished and
-    // the staging chunk has been returned to SendPool.
+    // through the sender state machine (kCopyIn -> kWriteRemote -> kCompletion
+    // -> kFinished).  A task is erased only after reaching kFinished.
     struct SendOpContext {
         SendOpContext() = default;
         SendOpContext(SendOp&& op_in);
@@ -526,7 +511,7 @@ class P2PProxy {
                          void* local_addr_in, uint32_t sequence_in,
                          uint32_t generation_in);
 
-        TransferState state_ = TransferState::kTransfer;
+        RecvTaskState state_ = RecvTaskState::kAdvertise;
         uint64_t tensor_offset_ = 0;  // Offset inside the user tensor.
         uint32_t chunk_len_ = 0;      // Bytes in this chunk.
         void* local_addr_ = nullptr;  // Address inside local RecvPool.
@@ -539,9 +524,9 @@ class P2PProxy {
     };
 
     // Active receive operation state.  Tasks are created in order and
-    // advance through the receiver state machine (kTransfer -> kDataCopy).
-    // A task is erased after the data has been copied into the user tensor
-    // and the RecvPool chunk has been returned.
+    // advance through the receiver state machine (kAdvertise ->
+    // kWaitCompletion -> kCopyOut -> kFinished).  A task is erased after
+    // reaching kFinished.
     struct RecvOpContext {
         RecvOpContext() = default;
         RecvOpContext(RecvOp&& op_in);
@@ -595,18 +580,19 @@ class P2PProxy {
     bool hasActiveRecvWork() const;
 
     bool tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane);
-    bool stepRecvTransferTask(RecvTransferTask& task);
-    bool stepRecvDataCopy(RecvTransferTask& task);
-    bool stepRecvTransfer(RecvTransferTask& task);
-    bool isRecvDataPathCompleted(const RecvOpContext& op_ctx) const;
+    bool stepRecvTask(RecvTransferTask& task);
+    bool stepRecvCopyOut(RecvTransferTask& task);
+    bool stepRecvAdvertise(RecvTransferTask& task);
+    bool pollRecvCompletionSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
+                                RecvTransferTask& head_task);
+    bool isRecvOpCompleted(const RecvOpContext& op_ctx) const;
     void performRecvReset(int peer_rank);
 
     bool tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane);
-    bool stepSendTransferTask(SendOpContext& op_ctx, SendTransferTask& task);
-    bool stepSendDataCopy(SendTransferTask& task);
-    bool stepSendTransfer(SendOpContext& op_ctx, SendTransferTask& task);
+    bool stepSendTask(SendOpContext& op_ctx, SendTransferTask& task);
+    bool stepSendCopyIn(SendTransferTask& task);
+    bool stepSendWriteRemote(SendOpContext& op_ctx, SendTransferTask& task);
     bool stepSendCompletion(SendOpContext& op_ctx, SendTransferTask& task);
-    bool isSendDataPathCompleted(const SendOpContext& op_ctx) const;
     bool isSendOpCompleted(const SendOpContext& op_ctx) const;
     void performSendReset(int peer_rank);
 

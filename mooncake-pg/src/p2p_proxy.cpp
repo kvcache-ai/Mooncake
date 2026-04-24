@@ -476,7 +476,7 @@ CompletionSlot* P2PProxy::getLocalCompletionStagingBuf(
 // Receiver advertise.
 //
 // Grab a free chunk from RecvPool and invite the sender to write into it.
-// We RDMA-write a PublishSlot into the sender's PublishLane so the sender
+// We (RDMA) write a PublishSlot into the sender's PublishLane so the sender
 // knows:
 //   (a) which sequence this is,
 //   (b) the RecvPool offset to write to,
@@ -530,29 +530,30 @@ bool P2PProxy::tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane) {
     return true;
 }
 
-// Poll the PublishSlot RDMA Write batch.
+// Drive a single receiver chunk through its state machine.
 //
-// Before we can consider a chunk "advertised" we must know that the
-// PublishSlot write has reached the sender.  Once the batch completes we
-// clear the batch id and transition to kDataCopy, where we wait for the
-// sender's CompletionSlot.
-bool P2PProxy::stepRecvTransferTask(RecvTransferTask& task) {
+// kAdvertise -> kWaitCompletion -> kCopyOut -> kFinished -> erase.
+bool P2PProxy::stepRecvTask(RecvTransferTask& task) {
     switch (task.state_) {
-        case TransferState::kTransfer:
-            return stepRecvTransfer(task);
-        case TransferState::kDataCopy:
-            return stepRecvDataCopy(task);
-        default:
+        case RecvTaskState::kAdvertise:
+            return stepRecvAdvertise(task);
+
+        case RecvTaskState::kWaitCompletion:
+            // kWaitCompletion is polled in stepRecv
+            return false;
+
+        case RecvTaskState::kCopyOut:
+            return stepRecvCopyOut(task);
+
+        case RecvTaskState::kFinished:
             return false;
     }
     return false;
 }
 
-bool P2PProxy::stepRecvTransfer(RecvTransferTask& task) {
-    if (!task.publish_batch_id_.has_value()) {
-        task.state_ = TransferState::kDataCopy;
-        return true;
-    }
+bool P2PProxy::stepRecvAdvertise(RecvTransferTask& task) {
+    TORCH_CHECK(task.publish_batch_id_.has_value(),
+                "Expected a publish_batch_id in tryIssueRecvTask");
 
     TransferStatus publish_status;
     engine_->getTransferStatus(task.publish_batch_id_.value(), 0,
@@ -561,7 +562,7 @@ bool P2PProxy::stepRecvTransfer(RecvTransferTask& task) {
     if (publish_status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(task.publish_batch_id_.value());
         task.publish_batch_id_.reset();
-        task.state_ = TransferState::kDataCopy;
+        task.state_ = RecvTaskState::kWaitCompletion;
         return true;
     }
 
@@ -578,32 +579,25 @@ bool P2PProxy::stepRecvTransfer(RecvTransferTask& task) {
 // After the CompletionSlot arrives we initiate cudaMemcpyAsync from the
 // RecvPool chunk to the user tensor and record an event.  This function
 // waits for that event and returns the chunk to RecvPool.
-bool P2PProxy::stepRecvDataCopy(RecvTransferTask& task) {
-    if (task.copy_ready_event_ != nullptr) {
-        cudaError_t query_error = cudaEventQuery(task.copy_ready_event_);
-        if (query_error == cudaSuccess) {
-            task.copy_ready_event_ = nullptr;
-            recv_pool_.release(task.local_addr_);
-            task.local_addr_ = nullptr;
-            task.state_ = TransferState::kDone;
-            return true;
-        }
-        if (query_error == cudaErrorNotReady) {
-            return false;
-        }
-
+bool P2PProxy::stepRecvCopyOut(RecvTransferTask& task) {
+    TORCH_CHECK(task.copy_ready_event_ != nullptr,
+                "Expected a copy_ready_event");
+    cudaError_t query_error = cudaEventQuery(task.copy_ready_event_);
+    if (query_error == cudaSuccess) {
         task.copy_ready_event_ = nullptr;
-        TORCH_CHECK(false, "P2P recv cudaEventQuery failed: ",
-                    cudaGetErrorString(query_error));
+        recv_pool_.release(task.local_addr_);
+        task.local_addr_ = nullptr;
+        task.state_ = RecvTaskState::kFinished;
+        return true;
+    }
+    if (query_error == cudaErrorNotReady) {
         return false;
     }
 
+    task.copy_ready_event_ = nullptr;
+    TORCH_CHECK(false, "P2P recv cudaEventQuery failed: ",
+                cudaGetErrorString(query_error));
     return false;
-}
-
-bool P2PProxy::isRecvDataPathCompleted(const RecvOpContext& op_ctx) const {
-    return op_ctx.bytes_advertised_ == op_ctx.total_bytes_ &&
-           op_ctx.tasks_.empty();
 }
 
 // Sender fetch invitation
@@ -678,7 +672,7 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
     if (is_cpu_) {
         std::memcpy(staging_addr, tensor_ptr + task.tensor_offset_,
                     task.chunk_len_);
-        task.state_ = TransferState::kTransfer;
+        task.state_ = SendTaskState::kWriteRemote;
     } else {
         cudaError_t copy_error = cudaMemcpyAsync(
             staging_addr, tensor_ptr + task.tensor_offset_, task.chunk_len_,
@@ -708,29 +702,32 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
 
 // Drive a single sender chunk through its state machine.
 //
-// DataCopy -> Transfer -> Done -> Completion write -> erase.
-bool P2PProxy::stepSendTransferTask(SendOpContext& op_ctx,
-                                    SendTransferTask& task) {
+// kCopyIn -> kWriteRemote -> kCompletion -> kFinished -> erase.
+bool P2PProxy::stepSendTask(SendOpContext& op_ctx, SendTransferTask& task) {
     switch (task.state_) {
-        case TransferState::kDataCopy:
-            return stepSendDataCopy(task);
+        case SendTaskState::kCopyIn:
+            return stepSendCopyIn(task);
 
-        case TransferState::kTransfer:
-            return stepSendTransfer(op_ctx, task);
+        case SendTaskState::kWriteRemote:
+            return stepSendWriteRemote(op_ctx, task);
 
-        case TransferState::kDone:
+        case SendTaskState::kCompletion:
             return stepSendCompletion(op_ctx, task);
+
+        case SendTaskState::kFinished:
+            return false;
     }
     return false;
 }
 
 // Poll the GPU Copy-In event (or skip on CPU).
 //
-// When the event signals we transition from kDataCopy to kTransfer so the
-// RDMA Write can be submitted.
-bool P2PProxy::stepSendDataCopy(SendTransferTask& task) {
+// When the event signals we transition from kCopyIn to kWriteRemote so the
+// (RDMA) Write can be submitted.
+bool P2PProxy::stepSendCopyIn(SendTransferTask& task) {
     if (task.copy_ready_event_ == nullptr) {
-        task.state_ = TransferState::kTransfer;
+        // CPU case
+        task.state_ = SendTaskState::kWriteRemote;
         return true;
     }
 
@@ -742,7 +739,7 @@ bool P2PProxy::stepSendDataCopy(SendTransferTask& task) {
     task.copy_ready_event_ = nullptr;
 
     if (query_error == cudaSuccess) {
-        task.state_ = TransferState::kTransfer;
+        task.state_ = SendTaskState::kWriteRemote;
         return true;
     }
 
@@ -751,9 +748,10 @@ bool P2PProxy::stepSendDataCopy(SendTransferTask& task) {
     return false;
 }
 
-// Submit the RDMA Write from SendPool staging to remote RecvPool, then
+// Submit the Write from SendPool staging to remote RecvPool, then
 // poll for its completion.
-bool P2PProxy::stepSendTransfer(SendOpContext& op_ctx, SendTransferTask& task) {
+bool P2PProxy::stepSendWriteRemote(SendOpContext& op_ctx,
+                                   SendTransferTask& task) {
     bool did_work = false;
     if (!task.transfer_batch_id_.has_value()) {
         const BatchID batch_id = engine_->allocateBatchID(1);
@@ -775,7 +773,7 @@ bool P2PProxy::stepSendTransfer(SendOpContext& op_ctx, SendTransferTask& task) {
     if (transfer_status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(task.transfer_batch_id_.value());
         task.transfer_batch_id_.reset();
-        task.state_ = TransferState::kDone;
+        task.state_ = SendTaskState::kCompletion;
         did_work = true;
     } else if (transfer_status.s == TransferStatusEnum::FAILED) {
         engine_->freeBatchID(task.transfer_batch_id_.value());
@@ -791,7 +789,7 @@ bool P2PProxy::stepSendTransfer(SendOpContext& op_ctx, SendTransferTask& task) {
 //
 // This tells the receiver that the data is present in its RecvPool and it
 // may begin the Copy-Out.  When the CompletionSlot write finishes we free
-// the staging chunk.
+// the staging chunk and transition to kFinished.
 bool P2PProxy::stepSendCompletion(SendOpContext& op_ctx,
                                   SendTransferTask& task) {
     bool did_work = false;
@@ -823,6 +821,7 @@ bool P2PProxy::stepSendCompletion(SendOpContext& op_ctx,
         task.completion_batch_id_.reset();
         send_pool_.release(task.staging_addr_);
         task.staging_addr_ = nullptr;
+        task.state_ = SendTaskState::kFinished;
         return true;
     }
     if (completion_status.s == TransferStatusEnum::FAILED) {
@@ -835,12 +834,13 @@ bool P2PProxy::stepSendCompletion(SendOpContext& op_ctx,
     return did_work;
 }
 
-bool P2PProxy::isSendDataPathCompleted(const SendOpContext& op_ctx) const {
+bool P2PProxy::isSendOpCompleted(const SendOpContext& op_ctx) const {
     return op_ctx.bytes_staged_ == op_ctx.total_bytes_ && op_ctx.tasks_.empty();
 }
 
-bool P2PProxy::isSendOpCompleted(const SendOpContext& op_ctx) const {
-    return isSendDataPathCompleted(op_ctx);
+bool P2PProxy::isRecvOpCompleted(const RecvOpContext& op_ctx) const {
+    return op_ctx.bytes_advertised_ == op_ctx.total_bytes_ &&
+           op_ctx.tasks_.empty();
 }
 
 // Sender state machine
@@ -851,12 +851,13 @@ bool P2PProxy::isSendOpCompleted(const SendOpContext& op_ctx) const {
 //   3. While we have invitations (PublishSlots) and staging buffers,
 //      pull more tensor slices into SendPool (TryIssueSendTask).
 //   4. Advance every active chunk through its state machine
-//      (Copy-In -> RDMA Write -> Completion write).
+//      (Copy-In -> Write Remote -> Completion write).
 //   5. Erase fully-acknowledged chunks.  When the op is empty and all
 //      bytes have been staged, mark it complete.
 bool P2PProxy::stepSend() {
     bool did_work = false;
 
+    // Handle reset first
     for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
         if (reset_send_req_[peer_rank].exchange(false,
                                                 std::memory_order_acquire)) {
@@ -865,6 +866,7 @@ bool P2PProxy::stepSend() {
         }
     }
 
+    // Drain send_queue_
     {
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
         while (!send_queue_.empty()) {
@@ -876,6 +878,7 @@ bool P2PProxy::stepSend() {
         }
     }
 
+    // Promote active op
     for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
         auto& lane = send_peer_lanes_[peer_rank];
         if (lane.active_send_op_.has_value() ||
@@ -894,12 +897,14 @@ bool P2PProxy::stepSend() {
         did_work = true;
     }
 
+    // Advance state machine
     for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
         auto& lane = send_peer_lanes_[peer_rank];
         if (!lane.active_send_op_.has_value()) {
             continue;
         }
         auto& op_ctx = lane.active_send_op_.value();
+
         // Pull as many invitations as we have free chunks
         while (tryIssueSendTask(op_ctx, lane)) {
             did_work = true;
@@ -907,15 +912,10 @@ bool P2PProxy::stepSend() {
 
         // Advance every chunk through the sender state machine.
         for (auto it = op_ctx.tasks_.begin(); it != op_ctx.tasks_.end();) {
-            if (stepSendTransferTask(op_ctx, *it)) {
+            if (stepSendTask(op_ctx, *it)) {
                 did_work = true;
             }
-
-            // A task is fully retired only after the CompletionSlot write
-            // has finished and the staging buffer has been freed.
-            if (it->state_ == TransferState::kDone &&
-                !it->completion_batch_id_.has_value() &&
-                it->staging_addr_ == nullptr) {
+            if (it->state_ == SendTaskState::kFinished) {
                 it = op_ctx.tasks_.erase(it);
                 did_work = true;
             } else {
@@ -934,6 +934,82 @@ bool P2PProxy::stepSend() {
     return did_work;
 }
 
+// Poll the local CompletionLane for the head task and initiate Copy-Out.
+//
+// Returns true if a completion was processed (including stale-slot clearing).
+bool P2PProxy::pollRecvCompletionSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
+                                      RecvTransferTask& head_task) {
+    auto* completion_lane = getLocalCompletionLane(op_ctx.peer_rank_);
+    auto& slot = completion_lane[head_task.sequence_ % kP2PControlRingSize];
+
+    // Step 1 -- Try load the slot
+    uint32_t completed_len = 0;
+    uint32_t slot_gen = 0;
+    uint32_t slot_seq = 0;
+    if (!slot.tryLoad(completed_len, slot_gen, slot_seq)) {
+        // Slot is either empty or torn. Retry next poll.
+        return false;
+    }
+
+    const uint32_t current_gen =
+        global_generation_.load(std::memory_order_acquire);
+
+    // Step 2 -- Stale packet: data from a previous epoch (before Reset).
+    // Clear the slot so the fresh completion can land safely.  Do NOT pop
+    // the task, do NOT free the chunk, and do NOT advance
+    // completion_consume_seq_ -- the current task is still waiting.
+    if (slot_gen != current_gen) {
+        LOG(WARNING) << "[P2PProxy][Recv] pollRecvCompletionSlot peer="
+                     << op_ctx.peer_rank_
+                     << " front-seq=" << head_task.sequence_
+                     << " GEN_MISMATCH slot.gen=" << slot_gen
+                     << " current_gen=" << current_gen;
+        slot.reset();
+        return true;
+    }
+
+    // Step 3 -- Sequence check: make sure this is the exact completion
+    // we are waiting for.
+    if (slot_seq != head_task.sequence_) {
+        return false;
+    }
+
+    void* src_ptr = head_task.local_addr_;
+    auto* tensor_ptr = static_cast<uint8_t*>(op_ctx.tensor_.data_ptr());
+    void* dst_ptr = tensor_ptr + head_task.tensor_offset_;
+
+    if (is_cpu_) {
+        std::memcpy(dst_ptr, src_ptr, head_task.chunk_len_);
+        recv_pool_.release(head_task.local_addr_);
+        head_task.local_addr_ = nullptr;
+        head_task.state_ = RecvTaskState::kFinished;
+    } else {
+        cudaError_t copy_error =
+            cudaMemcpyAsync(dst_ptr, src_ptr, head_task.chunk_len_,
+                            cudaMemcpyDeviceToDevice, op_ctx.cuda_stream_);
+        TORCH_CHECK(!copy_error, "P2P recv cudaMemcpyAsync failed: ",
+                    cudaGetErrorString(copy_error));
+        const cudaEvent_t pooled_copy_ready_event =
+            lane.copy_ready_events_[static_cast<size_t>(head_task.sequence_ %
+                                                        kP2PControlRingSize)];
+        TORCH_CHECK(pooled_copy_ready_event != nullptr,
+                    "P2P recv pooled copy-ready event is not initialized.");
+        head_task.copy_ready_event_ = pooled_copy_ready_event;
+        copy_error =
+            cudaEventRecord(head_task.copy_ready_event_, op_ctx.cuda_stream_);
+        if (copy_error != cudaSuccess) {
+            head_task.copy_ready_event_ = nullptr;
+            TORCH_CHECK(false, "P2P recv cudaEventRecord failed: ",
+                        cudaGetErrorString(copy_error));
+        }
+        head_task.state_ = RecvTaskState::kCopyOut;
+    }
+
+    slot.reset();
+    ++lane.completion_consume_seq_;
+    return true;
+}
+
 // Receiver state machine
 //
 // Pipeline per peer:
@@ -944,11 +1020,12 @@ bool P2PProxy::stepSend() {
 //   4. Poll the local CompletionLane in order.  When a CompletionSlot
 //      arrives, initiate Copy-Out from RecvPool to the user tensor.
 //   5. Advance every active chunk through its state machine
-//      (Publish done -> Copy-Out done -> erase).
+//      (Advertise -> Copy-Out -> erase).
 //   6. When all chunks are copied out, mark the op complete.
 bool P2PProxy::stepRecv() {
     bool did_work = false;
 
+    // Handle reset first
     for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
         if (reset_recv_req_[peer_rank].exchange(false,
                                                 std::memory_order_acquire)) {
@@ -957,6 +1034,7 @@ bool P2PProxy::stepRecv() {
         }
     }
 
+    // Drain recv_queue_
     {
         std::lock_guard<std::mutex> lock(recv_queue_mutex_);
         while (!recv_queue_.empty()) {
@@ -968,6 +1046,7 @@ bool P2PProxy::stepRecv() {
         }
     }
 
+    // Promote active op
     for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
         auto& lane = recv_peer_lanes_[peer_rank];
         if (lane.active_recv_op_.has_value() ||
@@ -981,6 +1060,7 @@ bool P2PProxy::stepRecv() {
         did_work = true;
     }
 
+    // Advance state machine
     for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
         auto& lane = recv_peer_lanes_[peer_rank];
         if (!lane.active_recv_op_.has_value()) {
@@ -998,93 +1078,27 @@ bool P2PProxy::stepRecv() {
         // In-order completion polling: we only look at the head of the queue
         // because the sender acknowledges chunks in the same order it
         // consumes invitations.
-        auto* completion_lane = getLocalCompletionLane(peer_rank);
-        while (!op_ctx.tasks_.empty()) {
-            auto& task = op_ctx.tasks_.front();
-            auto& slot = completion_lane[task.sequence_ % kP2PControlRingSize];
-
-            // Step 1 -- Try load the slot
-            uint32_t completed_len = 0;
-            uint32_t slot_gen = 0;
-            uint32_t slot_seq = 0;
-            if (!slot.tryLoad(completed_len, slot_gen, slot_seq)) {
-                // Slot is either empty or torn. Retry next poll.
-                break;
-            }
-
-            const uint32_t current_gen =
-                global_generation_.load(std::memory_order_acquire);
-
-            // Step 2 -- Stale packet: data from a previous epoch (before
-            // Reset). Clear the slot so the fresh completion can land safely.
-            // Do NOT pop the task, do NOT free the chunk, and do NOT advance
-            // completion_consume_seq_ -- the current task is still waiting.
-            if (slot_gen != current_gen) {
-                LOG(WARNING) << "[P2PProxy][Recv] stepRecv peer=" << peer_rank
-                             << " front-seq=" << task.sequence_
-                             << " GEN_MISMATCH slot.gen=" << slot_gen
-                             << " current_gen=" << current_gen;
-                slot.reset();
-                did_work = true;
-                break;
-            }
-
-            // Step 3 -- Sequence check: make sure this is the exact completion
-            // we are waiting for.
-            if (slot_seq != task.sequence_) {
-                break;
-            }
-
-            void* src_ptr = task.local_addr_;
-            auto* tensor_ptr = static_cast<uint8_t*>(op_ctx.tensor_.data_ptr());
-            void* dst_ptr = tensor_ptr + task.tensor_offset_;
-
-            if (is_cpu_) {
-                std::memcpy(dst_ptr, src_ptr, task.chunk_len_);
-                recv_pool_.release(task.local_addr_);
-                task.local_addr_ = nullptr;
-                task.state_ = TransferState::kDone;
-            } else {
-                cudaError_t copy_error = cudaMemcpyAsync(
-                    dst_ptr, src_ptr, task.chunk_len_, cudaMemcpyDeviceToDevice,
-                    op_ctx.cuda_stream_);
-                TORCH_CHECK(!copy_error, "P2P recv cudaMemcpyAsync failed: ",
-                            cudaGetErrorString(copy_error));
-                const cudaEvent_t pooled_copy_ready_event =
-                    lane.copy_ready_events_[static_cast<size_t>(
-                        task.sequence_ % kP2PControlRingSize)];
-                TORCH_CHECK(
-                    pooled_copy_ready_event != nullptr,
-                    "P2P recv pooled copy-ready event is not initialized.");
-                task.copy_ready_event_ = pooled_copy_ready_event;
-                copy_error = cudaEventRecord(task.copy_ready_event_,
-                                             op_ctx.cuda_stream_);
-                if (copy_error != cudaSuccess) {
-                    task.copy_ready_event_ = nullptr;
-                    TORCH_CHECK(false, "P2P recv cudaEventRecord failed: ",
-                                cudaGetErrorString(copy_error));
+        if (!op_ctx.tasks_.empty()) {
+            auto& head = op_ctx.tasks_.front();
+            if (head.state_ == RecvTaskState::kWaitCompletion) {
+                if (pollRecvCompletionSlot(op_ctx, lane, head)) {
+                    did_work = true;
                 }
             }
-
-            slot.reset();
-            ++lane.completion_consume_seq_;
-            did_work = true;
-            break;
         }
 
+        // Advance every chunk through the receiver state machine.
         for (auto it = op_ctx.tasks_.begin(); it != op_ctx.tasks_.end();) {
-            if (it->state_ == TransferState::kDone) {
+            did_work |= stepRecvTask(*it);
+            if (it->state_ == RecvTaskState::kFinished) {
                 it = op_ctx.tasks_.erase(it);
                 did_work = true;
-                continue;
+            } else {
+                ++it;
             }
-            if (stepRecvTransferTask(*it)) {
-                did_work = true;
-            }
-            ++it;
         }
 
-        if (isRecvDataPathCompleted(op_ctx)) {
+        if (isRecvOpCompleted(op_ctx)) {
             if (!op_ctx.original_tensor_.is_contiguous()) {
                 (void)op_ctx.original_tensor_.copy_(op_ctx.tensor_);
                 if (!is_cpu_) {
