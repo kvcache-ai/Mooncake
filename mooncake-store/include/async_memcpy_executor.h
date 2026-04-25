@@ -4,7 +4,6 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -13,6 +12,8 @@
 #include <type_traits>
 #include <vector>
 
+#include <async_simple/Future.h>
+#include <async_simple/Promise.h>
 #include <glog/logging.h>
 
 #include "tiered_cache/tiered_backend.h"
@@ -78,7 +79,7 @@ class AsyncMemcpyExecutor {
                                              ErrorFn&& on_error);
 
     template <typename ResultType, typename Fn>
-    std::future<ResultType> SubmitSingleTask(Fn&& fn);
+    async_simple::Future<ResultType> SubmitSingleTask(Fn&& fn);
 
     void Shutdown();
 
@@ -182,9 +183,10 @@ AsyncMemcpyExecutor::SubmitBatchTasks(const std::vector<size_t>& indices,
 }
 
 template <typename ResultType, typename Fn>
-std::future<ResultType> AsyncMemcpyExecutor::SubmitSingleTask(Fn&& fn) {
-    auto promise = std::make_shared<std::promise<ResultType>>();
-    auto future = promise->get_future();
+async_simple::Future<ResultType> AsyncMemcpyExecutor::SubmitSingleTask(
+    Fn&& fn) {
+    auto promise = std::make_shared<async_simple::Promise<ResultType>>();
+    auto future = promise->getFuture();
 
     using FnType = typename std::decay<Fn>::type;
     auto fn_ptr = std::make_shared<FnType>(std::forward<Fn>(fn));
@@ -192,14 +194,14 @@ std::future<ResultType> AsyncMemcpyExecutor::SubmitSingleTask(Fn&& fn) {
     QueueTask task;
     task.run = [promise, fn_ptr]() {
         try {
-            promise->set_value((*fn_ptr)());
+            promise->setValue((*fn_ptr)());
         } catch (...) {
-            promise->set_exception(std::current_exception());
+            promise->setException(std::current_exception());
         }
     };
     task.cancel = [promise]() {
         try {
-            promise->set_exception(
+            promise->setException(
                 std::make_exception_ptr(std::runtime_error("task cancelled")));
         } catch (...) {
         }

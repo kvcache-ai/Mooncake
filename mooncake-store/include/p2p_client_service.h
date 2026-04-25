@@ -8,6 +8,8 @@
 #include <thread>
 #include <utility>
 #include <coroutine>
+#include <async_simple/Future.h>
+#include <async_simple/Promise.h>
 #include <async_simple/Try.h>
 #include <async_simple/coro/Lazy.h>
 
@@ -240,6 +242,91 @@ class P2PClientService final : public ClientService {
     HeartbeatRequest build_heartbeat_request() override;
 
    private:
+    std::vector<tl::expected<void, ErrorCode>> InnerBatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const WriteRouteRequestConfig& route_config);
+
+    std::vector<tl::expected<void, ErrorCode>> InnerBatchPutDegraded(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices);
+
+    std::vector<tl::expected<void, ErrorCode>> InnerBatchPutNormal(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const WriteRouteRequestConfig& route_config);
+
+    std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
+    CreatePutHandlesFromRoute(const std::vector<ObjectKey>& keys,
+                              std::vector<std::vector<Slice>>& batched_slices,
+                              const WriteRouteRequestConfig& route_config,
+                              BatchGetWriteRouteResponse& batch_resp);
+
+    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
+    CreatePutHandleFromLocal(const std::string& key,
+                             std::vector<Slice>& slices);
+
+    std::vector<tl::expected<void, ErrorCode>> CollectResults(
+        std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>&
+            handles,
+        const std::vector<ObjectKey>& keys);
+
+    tl::expected<BatchGetWriteRouteResponse, ErrorCode> BatchFetchWriteRoutes(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const WriteRouteRequestConfig& config);
+
+    struct WriteOp {
+        virtual ~WriteOp() = default;
+        virtual std::string_view route() const = 0;
+        // starts an async write task, then generate a wait task handle
+        virtual std::unique_ptr<TaskHandle<void>> Dispatch() = 0;
+    };
+
+    struct LocalWriteOp : WriteOp {
+        DataManager* data_manager;
+        std::string key;
+        std::vector<Slice>* slices;
+
+        LocalWriteOp(DataManager* dm, std::string k, std::vector<Slice>* s)
+            : data_manager(dm), key(std::move(k)), slices(s) {}
+
+        std::string_view route() const override { return "local"; }
+        std::unique_ptr<TaskHandle<void>> Dispatch() override;
+    };
+
+    struct RemoteWriteOp : WriteOp {
+        PeerClient* peer_ptr;
+        std::shared_ptr<RemoteWriteRequest> write_req;
+        P2PProxyDescriptor proxy;
+        RouteCache* route_cache;
+        std::string endpoint;
+
+        RemoteWriteOp(PeerClient* p, std::shared_ptr<RemoteWriteRequest> wr,
+                      P2PProxyDescriptor px, RouteCache* rc, std::string ep)
+            : peer_ptr(p),
+              write_req(std::move(wr)),
+              proxy(std::move(px)),
+              route_cache(rc),
+              endpoint(std::move(ep)) {}
+
+        std::string_view route() const override { return endpoint; }
+        std::unique_ptr<TaskHandle<void>> Dispatch() override;
+    };
+
+    tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode>
+    BuildWriteOps(const std::string& key, std::vector<Slice>& slices,
+                  const WriteRouteRequestConfig& config,
+                  std::vector<WriteCandidate> candidates);
+
+    async_simple::coro::Lazy<void> RunWriteWithRetry(
+        std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+            promise,
+        std::unique_ptr<TaskHandle<void>> current_task,
+        std::string current_route,
+        std::vector<std::unique_ptr<WriteOp>> retry_op_list, std::string key);
+
+   private:
     struct ResolvedRoute {
         PeerClient* peer = nullptr;
         uint64_t object_size = 0;
@@ -289,46 +376,7 @@ class P2PClientService final : public ClientService {
         const std::string& key, const ReadRouteConfig& config,
         std::vector<ResolvedRoute> pre_fetched);
 
-    std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>>
-    BatchFetchReadRoutes(const std::vector<std::string_view>& keys,
-                         const ReadRouteConfig& config);
-
-    async_simple::coro::Lazy<std::vector<ResolvedRoute>>
-    AsyncResolveRoutesFromMaster(const std::string& key,
-                                 const ReadRouteConfig& config);
-
-    async_simple::coro::Lazy<void> RunReadRetry(
-        RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
-        std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise);
-
    private:
-    std::vector<tl::expected<void, ErrorCode>> InnerBatchPut(
-        const std::vector<ObjectKey>& keys,
-        std::vector<std::vector<Slice>>& batched_slices,
-        const WriteRouteRequestConfig& route_config);
-
-    tl::expected<BatchGetWriteRouteResponse, ErrorCode> BatchFetchWriteRoutes(
-        const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices,
-        const WriteRouteRequestConfig& config);
-
-    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> CreatePutHandle(
-        const std::string& key, std::vector<Slice>& slices,
-        const WriteRouteRequestConfig& config);
-
-    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-    CreateLocalPutHandle(const std::string& key, std::vector<Slice>& slices);
-
-    tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-    InnerCreatePutHandle(const std::string& key, std::vector<Slice>& slices,
-                         const WriteRouteRequestConfig& config,
-                         std::vector<WriteCandidate> candidates);
-    async_simple::coro::Lazy<void> RunWriteRetry(
-        std::vector<std::pair<PeerClient*, P2PProxyDescriptor>> peers,
-        std::shared_ptr<RemoteWriteRequest> write_req,
-        std::shared_ptr<std::promise<tl::expected<void, ErrorCode>>> promise,
-        RouteCache* route_cache, std::string key);
-
     template <typename ResultT, typename CreateHandlesFn, typename ExtractFn>
     std::vector<tl::expected<ResultT, ErrorCode>> BatchGetImpl(
         const std::vector<std::string>& keys, CreateHandlesFn&& create_handles,
@@ -350,6 +398,10 @@ class P2PClientService final : public ClientService {
                               const ReadRouteConfig& config,
                               LocalGetFn&& local_get, RemoteGetFn&& remote_get);
 
+    std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>>
+    BatchFetchReadRoutes(const std::vector<std::string_view>& keys,
+                         const ReadRouteConfig& config);
+
     tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> allocator,
@@ -367,6 +419,15 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
         const std::string& key, std::vector<Slice>& slices, RouteIterator iter);
+
+    async_simple::coro::Lazy<void> RunReadWithRetry(
+        RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
+        std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+            promise);
+
+    async_simple::coro::Lazy<std::vector<ResolvedRoute>>
+    AsyncResolveRoutesFromMaster(const std::string& key,
+                                 const ReadRouteConfig& config);
 
     /**
      * @brief Get or create a PeerClient for the given endpoint.

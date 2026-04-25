@@ -77,6 +77,16 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManager::Put(
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 }
 
+// TODO: The returned CallableTaskHandle's WaitAsync() falls back to a
+// synchronous Wait() on the coroutine's current thread, because the
+// WaitAllTransferBatches() is a loop with no async completion notification.
+// Possible optimizations:
+//   (1) run a polling coroutine on yalantinglibs coro_io's io_context (via
+//       co_await coro_io::sleep_for(100us) + getTransferStatus), no new thread;
+//   (2) introduce a lightweight timer service to bridge cv-poll to
+//       async_simple::Promise;
+//   (3) introduce a completion callback from transfer_engine itself.
+// Once any of these lands, switch the return type to FutureHandle.
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
 DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
     // using Te, treat local memory as remote memory
@@ -85,7 +95,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
     auto src_buffers = SlicesToRemoteBufferDescs(slices);
     auto validate_result = ValidateRemoteBuffers(src_buffers);
     if (!validate_result) {
-        LOG(ERROR) << "PutViaTe: Buffer validation failed"
+        LOG(ERROR) << "Buffer validation failed"
                    << ", error: " << toString(validate_result.error());
         return tl::unexpected(validate_result.error());
     }
@@ -95,7 +105,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
         std::unique_lock<std::shared_mutex> lock(GetKeyLock(key));
 
         if (tiered_backend_->Exist(key)) {
-            LOG(WARNING) << "PutViaTe: key already exists: " << key;
+            LOG(WARNING) << "key already exists: " << key;
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
 
@@ -105,9 +115,8 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
             if (err == ErrorCode::REPLICA_NUM_EXCEEDED ||
                 err == ErrorCode::OBJECT_ALREADY_EXISTS ||
                 err == ErrorCode::REPLICA_ALREADY_EXISTS) {
-                LOG(WARNING)
-                    << "PutViaTe: object already exists for key: " << key
-                    << ", error code: " << err;
+                LOG(WARNING) << "object already exists for key: " << key
+                             << ", error code: " << err;
             }
             return tl::unexpected(err);
         }
@@ -117,7 +126,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
     auto submit_result = SubmitTeTransferInternal(
         alloc_handle, src_buffers, Transport::TransferRequest::READ);
     if (!submit_result) {
-        LOG(ERROR) << "PutViaTe: SubmitTeTransferInternal failed"
+        LOG(ERROR) << "SubmitTeTransferInternal failed"
                    << ", key=" << key
                    << ", error_code=" << toString(submit_result.error());
         return tl::unexpected(submit_result.error());
@@ -131,7 +140,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
 
             auto wait_result = WaitAllTransferBatches(ctx.transfer_batches);
             if (!wait_result) {
-                LOG(ERROR) << "PutViaTe: WaitAllTransferBatches failed"
+                LOG(ERROR) << "WaitAllTransferBatches failed"
                            << ", key=" << key
                            << ", error_code=" << toString(wait_result.error());
                 return tl::unexpected(wait_result.error());
@@ -147,7 +156,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
                     ctx.handle->backend);
                 if (!copy_result) {
                     LOG(ERROR)
-                        << "PutViaTe: CopyFromDRAMBuffer failed"
+                        << "CopyFromDRAMBuffer failed"
                         << ", key=" << key
                         << ", error_code=" << toString(copy_result.error());
                     return tl::unexpected(copy_result.error());
@@ -157,7 +166,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
             std::unique_lock<std::shared_mutex> lock(GetKeyLock(key));
             auto commit_result = tiered_backend_->Commit(key, alloc_handle);
             if (!commit_result) {
-                LOG(WARNING) << "PutViaTe: commit race for key: " << key;
+                LOG(WARNING) << "commit race for key: " << key;
             }
             timer.LogResponse("error_code=", ErrorCode::OK);
             return {};
@@ -222,54 +231,36 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
         return {};
     };
 
+    auto write_and_commit = [write_fn = std::move(write_fn),
+                             commit_fn = std::move(commit_fn),
+                             key]() mutable -> tl::expected<void, ErrorCode> {
+        ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
+        timer.LogRequest("key=", key);
+        auto write_result = write_fn();
+        if (!write_result) {
+            LOG(ERROR) << "Failed to write data, error: "
+                       << write_result.error();
+            return tl::make_unexpected(write_result.error());
+        }
+        auto commit_result = commit_fn();
+        if (!commit_result) {
+            LOG(ERROR) << "Failed to commit data, error: "
+                       << commit_result.error();
+            return tl::make_unexpected(commit_result.error());
+        }
+        timer.LogResponse("error_code=", ErrorCode::OK);
+        return {};
+    };
+
     if (async_memcpy_executor_) {
-        // async write + sync commit
         auto future = async_memcpy_executor_
                           ->SubmitSingleTask<tl::expected<void, ErrorCode>>(
-                              std::move(write_fn));
-        return CallableTaskHandle<void>::Create(
-            [f = std::move(future), commit_fn = std::move(commit_fn),
-             key]() mutable -> tl::expected<void, ErrorCode> {
-                ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
-                timer.LogRequest("key=", key);
-                auto write_result = f.get();
-                if (!write_result) {
-                    LOG(ERROR) << "Failed to write data, error: "
-                               << write_result.error();
-                    return tl::make_unexpected(write_result.error());
-                }
-                auto commit_result = commit_fn();
-                if (!commit_result) {
-                    LOG(ERROR) << "Failed to commit data, error: "
-                               << commit_result.error();
-                    return tl::make_unexpected(commit_result.error());
-                }
-                timer.LogResponse("error_code=", ErrorCode::OK);
-                return {};
-            });
-    } else {
-        // sync write + sync commit
-        return CallableTaskHandle<void>::Create(
-            [write_fn = std::move(write_fn), commit_fn = std::move(commit_fn),
-             key]() mutable -> tl::expected<void, ErrorCode> {
-                ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
-                timer.LogRequest("key=", key);
-                auto write_result = write_fn();
-                if (!write_result) {
-                    LOG(ERROR) << "Failed to write data, error: "
-                               << write_result.error();
-                    return tl::make_unexpected(write_result.error());
-                }
-                auto commit_result = commit_fn();
-                if (!commit_result) {
-                    LOG(ERROR) << "Failed to commit data, error: "
-                               << commit_result.error();
-                    return tl::make_unexpected(commit_result.error());
-                }
-                timer.LogResponse("error_code=", ErrorCode::OK);
-                return {};
-            });
+                              std::move(write_and_commit));
+        return FutureHandle<void>::Create(std::shared_ptr<void>{},
+                                          std::move(future));
     }
+    // No async executor: run synchronously when Wait() is called.
+    return CallableTaskHandle<void>::Create(std::move(write_and_commit));
 }
 
 // ================================================================
@@ -396,25 +387,26 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
     res.data_size = static_cast<int64_t>(plan_result.value().source_size);
 
     if (async_memcpy_executor_) {
-        auto future = async_memcpy_executor_->SubmitSingleTask<ErrorCode>(
-            [plan = plan_result.value()]() {
-                return ExecuteLocalCopyPlan(plan);
-            });
-        res.task_handle = CallableTaskHandle<void>::Create(
-            [f = std::move(future),
-             key]() mutable -> tl::expected<void, ErrorCode> {
-                ScopedVLogTimer timer(1,
-                                      "DataManager::BuildDataCopierViaMemcpy");
-                timer.LogRequest("key=", key);
-                ErrorCode ec = f.get();
-                if (ec != ErrorCode::OK) {
-                    LOG(ERROR) << "Failed to execute local copy plan"
-                               << ", key=" << key << ", error_code=" << ec;
-                    return tl::unexpected(ec);
-                }
-                timer.LogResponse("error_code=", ErrorCode::OK);
-                return {};
-            });
+        auto future =
+            async_memcpy_executor_
+                ->SubmitSingleTask<tl::expected<void, ErrorCode>>(
+                    [plan = plan_result.value(),
+                     key]() -> tl::expected<void, ErrorCode> {
+                        ScopedVLogTimer timer(
+                            1, "DataManager::BuildDataCopierViaMemcpy");
+                        timer.LogRequest("key=", key);
+                        ErrorCode ec = ExecuteLocalCopyPlan(plan);
+                        if (ec != ErrorCode::OK) {
+                            LOG(ERROR)
+                                << "Failed to execute local copy plan"
+                                << ", key=" << key << ", error_code=" << ec;
+                            return tl::unexpected(ec);
+                        }
+                        timer.LogResponse("error_code=", ErrorCode::OK);
+                        return {};
+                    });
+        res.task_handle = FutureHandle<void>::Create(std::shared_ptr<void>{},
+                                                     std::move(future));
     } else {
         res.task_handle = CallableTaskHandle<void>::Create(
             [plan = std::move(plan_result.value()),
