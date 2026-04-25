@@ -382,6 +382,183 @@ mod state_store_tests {
         let error = StoreError::Allocator("allocator failure".to_string());
         assert!(!remote_segment_cache_refreshable(&error));
     }
+    fn test_runtime() -> ClientRuntimeId {
+        ClientRuntimeId::new("test-owner", ClientEpoch(1))
+    }
+
+    fn test_route(key: &str, runtime: &ClientRuntimeId) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey(key.to_string()),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: runtime.clone(),
+                segment_name: SegmentName("seg-0".to_string()),
+                offset: 0,
+                segment_offset: 0,
+                length: 1024,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn pending_hot_keys_accumulates_without_bound() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+
+        for round in 0..100 {
+            let key = format!("object-{round}");
+            let route = test_route(&key, &runtime);
+            clock.track_route(&route, &runtime);
+            clock.mark_hot_keys(&[ObjectKey(key)]);
+        }
+
+        assert_eq!(
+            clock.pending_hot_keys.len(),
+            100,
+            "pending_hot_keys grows with every unique key accessed"
+        );
+    }
+
+    #[test]
+    fn rebuild_without_clear_degrades_clock_to_all_hot() {
+        let runtime = test_runtime();
+
+        let mut clock = StorageClockState::default();
+        let mut routes = Vec::new();
+        for index in 0..8 {
+            let route = test_route(&format!("k-{index}"), &runtime);
+            clock.track_route(&route, &runtime);
+            routes.push(route);
+        }
+        for index in 0..8 {
+            clock.mark_hot_keys(&[ObjectKey(format!("k-{index}"))]);
+        }
+        assert_eq!(clock.pending_hot_keys.len(), 8);
+
+        // Simulate rebuild WITHOUT clearing pending_hot_keys (old behavior).
+        let mut rebuilt = StorageClockState {
+            pending_hot_keys: clock.pending_hot_keys.clone(),
+            ..StorageClockState::default()
+        };
+        for route in &routes {
+            rebuilt.track_route(route, &runtime);
+        }
+
+        let cold_before_rotation = rebuilt
+            .entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|entry| !entry.hot)
+            .count();
+        assert_eq!(
+            cold_before_rotation, 0,
+            "without clear, every rebuilt entry starts hot — clock loses temporal discrimination"
+        );
+    }
+
+    #[test]
+    fn rebuild_with_fresh_clock_restores_cold_entries() {
+        let runtime = test_runtime();
+
+        let mut clock = StorageClockState::default();
+        let mut routes = Vec::new();
+        for index in 0..8 {
+            let route = test_route(&format!("k-{index}"), &runtime);
+            clock.track_route(&route, &runtime);
+            routes.push(route);
+        }
+        for index in 0..8 {
+            clock.mark_hot_keys(&[ObjectKey(format!("k-{index}"))]);
+        }
+
+        // Simulate rebuild WITHOUT inheriting pending_hot_keys (fixed behavior).
+        let mut rebuilt = StorageClockState::default();
+        for route in &routes {
+            rebuilt.track_route(route, &runtime);
+        }
+
+        let cold_count = rebuilt
+            .entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|entry| !entry.hot)
+            .count();
+        assert_eq!(
+            cold_count, 8,
+            "fresh rebuild starts all entries cold — no stale hotness inherited"
+        );
+
+        // After rebuild, mark_hot_keys only protects genuinely active keys.
+        rebuilt.mark_hot_keys(&[ObjectKey("k-0".to_string())]);
+
+        let hot_count = rebuilt
+            .entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.hot)
+            .count();
+        assert_eq!(
+            hot_count, 1,
+            "only k-0 is hot — clock distinguishes one genuinely active key"
+        );
+
+        // pick_victim should return a cold entry, never the hot k-0.
+        let victim = rebuilt.pick_victim(None).expect("should find a cold victim");
+        assert_ne!(
+            victim.route_key,
+            ObjectKey("k-0".to_string()),
+            "genuinely hot key k-0 must survive eviction"
+        );
+    }
+
+    #[test]
+    fn sync_route_after_fresh_rebuild_does_not_resurrect_stale_hotness() {
+        let runtime = test_runtime();
+
+        let mut clock = StorageClockState::default();
+        let mut routes = Vec::new();
+        for index in 0..4 {
+            let route = test_route(&format!("k-{index}"), &runtime);
+            clock.track_route(&route, &runtime);
+            routes.push(route);
+        }
+        clock.mark_hot_keys(&[
+            ObjectKey("k-0".to_string()),
+            ObjectKey("k-1".to_string()),
+            ObjectKey("k-2".to_string()),
+            ObjectKey("k-3".to_string()),
+        ]);
+
+        // Rebuild with fresh clock (no inherited pending_hot_keys).
+        let mut rebuilt = StorageClockState::default();
+        for route in &routes {
+            rebuilt.track_route(route, &runtime);
+        }
+
+        // Simulate CAS failure: sync_route re-inserts k-2.
+        rebuilt.sync_route(&routes[2], &runtime);
+
+        let k2_entry = rebuilt
+            .entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .find(|entry| entry.id.route_key == ObjectKey("k-2".to_string()))
+            .expect("k-2 should be tracked after sync_route");
+        assert!(
+            !k2_entry.hot,
+            "sync_route must not resurrect stale hotness for k-2 after fresh rebuild"
+        );
+    }
 }
 
 impl StorageOwnerState {
@@ -614,11 +791,7 @@ impl StorageOwnerState {
         let tracker = OperationTracker::new("storage_owner_rebuild_clock");
         let result = (|| {
             let routes = self.collect_routes_by_replica_owner(&self.runtime)?;
-            let pending_hot_keys = self.clock.lock().pending_hot_keys.clone();
-            let mut clock = StorageClockState {
-                pending_hot_keys,
-                ..StorageClockState::default()
-            };
+            let mut clock = StorageClockState::default();
             for route in &routes {
                 clock.track_route(route, &self.runtime);
             }
