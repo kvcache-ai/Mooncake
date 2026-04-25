@@ -352,6 +352,10 @@ impl BlockingCasMetadataBackend {
     fn arm_blocked_cas(&self) {
         let (lock, _) = &*self.gate;
         let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
+        assert!(
+            !(state.entered && !state.released),
+            "cannot arm blocked CAS while a previous CAS is still blocked"
+        );
         state.armed = true;
         state.entered = false;
         state.released = false;
@@ -11716,6 +11720,22 @@ fn routed_put_skips_draining_storage_and_authority() {
 }
 
 #[test]
+#[should_panic(expected = "cannot arm blocked CAS while a previous CAS is still blocked")]
+fn blocking_cas_gate_rejects_rearm_while_previous_wait_is_active() {
+    let blocking = BlockingCasMetadataBackend::new(
+        Arc::new(InMemoryMetadataBackend::new()),
+        "default::blocked-cas-rearm-key",
+    );
+    let (lock, _) = &*blocking.gate;
+    let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
+    state.entered = true;
+    state.released = false;
+    drop(state);
+
+    blocking.arm_blocked_cas();
+}
+
+#[test]
 fn true_client_shrink_waits_for_inflight_route_publish() {
     let inner = Arc::new(InMemoryMetadataBackend::new());
     let blocking = Arc::new(BlockingCasMetadataBackend::new(
@@ -11797,6 +11817,7 @@ fn true_client_shrink_waits_for_inflight_route_publish() {
     let key = "shrink-inflight-key";
     let value = b"shrink-inflight-value".to_vec();
     let writer_value = value.clone();
+    blocking.arm_blocked_cas();
     let writer = std::thread::spawn(move || router.put_with_policy(key, &writer_value, &policy));
 
     assert!(
