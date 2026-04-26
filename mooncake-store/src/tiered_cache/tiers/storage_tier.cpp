@@ -250,9 +250,8 @@ tl::expected<void, ErrorCode> StorageTier::Commit(std::string_view key,
         std::unique_lock<std::mutex> lock(batch_mutex_);
 
         // Add to pending batch
-        std::string key_str(key);
-        staging->SetKey(key_str);
-        pending_batch_.emplace(std::move(key_str), staging);
+        staging->SetKey(key);
+        pending_batch_.emplace(key, staging);
         pending_batch_size_.fetch_add(staging->size());
 
         // Check thresholds for async flush trigger
