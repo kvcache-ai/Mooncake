@@ -1,4 +1,4 @@
-name: Release CUDA 13
+name: Release CUDA 12
 
 on:
   push:
@@ -17,7 +17,7 @@ jobs:
         python-version: ['3.10', '3.11', '3.12', '3.13']
     env:
       BUILD_WITH_EP: "1"
-      CU13_BUILD: "1"
+      CU12_BUILD: "1"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
     steps:
       - name: Checkout source
@@ -36,10 +36,10 @@ jobs:
           sudo rm -rf /usr/local/lib/android
           df -h
 
-      - name: Install CUDA Toolkit 13
-        uses: Jimver/cuda-toolkit@v0.2.29
+      - name: Install CUDA Toolkit 12
+        uses: Jimver/cuda-toolkit@v0.2.24
         with:
-          cuda: '13.0.2'
+          cuda: '12.8.1'
           linux-local-args: '["--toolkit"]'
           method: 'network'
           sub-packages: '["nvcc", "nvrtc-dev"]'
@@ -103,7 +103,7 @@ jobs:
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mooncake-wheel-cuda13-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          name: mooncake-wheel-cuda12-py${{ steps.generate_tag_release.outputs.python_version_tag }}
           path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
@@ -120,7 +120,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: mooncake-wheel/dist-all
-          pattern: mooncake-wheel-cuda13-py*
+          pattern: mooncake-wheel-cuda12-py*
 
       - name: Prepare wheels for release
         run: |
@@ -142,4 +142,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist-release/
-          password: ${{ secrets.PYPI_CU13_API_TOKEN }}
+          password: ${{ secrets.PYPI_CU12_API_TOKEN }}
