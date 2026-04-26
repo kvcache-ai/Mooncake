@@ -417,7 +417,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 if (!peerState.countedInGroup &&
                     pollingRank < groupSize_.load(std::memory_order_acquire)) {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
-                    totalConnectedPeers_.fetch_add(1, std::memory_order_release);
+                    totalConnectedPeers_.fetch_add(1,
+                                                   std::memory_order_release);
                     peerState.countedInGroup = true;
                     backend_wakeup_cv_.notify_all();
                 }
