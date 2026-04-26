@@ -31,7 +31,10 @@ def _extension_worker(
 
     if ctx.proc_rank < initial_world_size:
         # Original ranks
-        device = ctx.init_group(world_size=initial_world_size)
+        device = ctx.init_group(
+            world_size=initial_world_size,
+            max_world_size=ctx.world_size,
+        )
         backend = ctx.get_backend()
 
         # First collective
@@ -42,7 +45,6 @@ def _extension_worker(
         # Signal ready and extend
         if ctx.proc_rank == 0:
             extend_event.set()
-        pg.extend_group_size_to(backend, ctx.world_size)
 
         # Two-phase extension protocol:
         #   1) joiner publishes metadata + establishes transport readiness
@@ -74,6 +76,7 @@ def _extension_worker(
             rank=extension_rank,
             world_size=ctx.world_size,
             is_extension=True,
+            max_world_size=ctx.world_size,
         )
 
         backend = ctx.get_backend()

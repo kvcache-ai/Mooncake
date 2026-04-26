@@ -101,6 +101,14 @@ MooncakeBackend::MooncakeBackend(
     auto store = std::move(distBackendOpts.store);
     const int rank = distBackendOpts.group_rank;
     const int size = distBackendOpts.group_size;
+    const int max_size =
+        (options_ && options_->maxWorldSize_ > 0) ? options_->maxWorldSize_
+                                                  : size;
+
+    TORCH_CHECK(max_size >= 0 && static_cast<size_t>(max_size) < kMaxNumRanks,
+                "max_world_size out of range");
+    TORCH_CHECK(max_size >= size,
+                "max_world_size must be >= process group size");
     const auto& globalRanks = distBackendOpts.global_ranks_in_group;
 
     // Memory location for device specific buffers
@@ -132,6 +140,11 @@ MooncakeBackend::MooncakeBackend(
         for (int i = 0; i < size; ++i) {
             local2global_rank_map_[i] = i;
         }
+    }
+
+    // Fill the remaining slots for polling / future joiners.
+    for (int i = size; i < max_size; ++i) {
+        local2global_rank_map_[i] = i;
     }
 
     // Register buffers
@@ -228,6 +241,10 @@ MooncakeBackend::MooncakeBackend(
         backendIndex_, rank, size, options_ && options_->isExtension_,
         local2global_rank_map_, store, meta_, p2p_proxy_, engine_);
 
+    if (max_size != size) {
+        connection_ctx_->setPollingLimitTo(max_size);
+    }
+
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
     rank_info.recv_buffer[0] = (uint64_t)recv_buffer_[0];
@@ -249,7 +266,7 @@ MooncakeBackend::MooncakeBackend(
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
     memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
     meta_->rank = rank;
-    meta_->size = size;
+    meta_->size = max_size;
     meta_->taskCount = 0;
     if (isCpu) {
         meta_->activeRanks = new bool[kMaxNumRanks];
@@ -262,6 +279,11 @@ MooncakeBackend::MooncakeBackend(
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         meta_->activeRanks[i] = true;
     }
+
+    // Reserve extra slots as inactive so collectives won't wait on them.
+    for (int i = size; i < max_size; ++i) {
+        meta_->activeRanks[i] = false;
+    }
     if (options_ && options_->activeRanks_.defined()) {
         TORCH_CHECK(options_->activeRanks_.dtype() == at::kInt,
                     "activeRanks must be int.");
@@ -272,11 +294,20 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(options_->activeRanks_.device().is_cuda(),
                         "activeRanks must be on CUDA.");
         }
+        if (max_size != size) {
+            TORCH_CHECK(options_->activeRanks_.numel() == max_size,
+                        "activeRanks must be sized to max_world_size when "
+                        "max_world_size is set");
+        }
         meta_->activeRanksTensor = options_->activeRanks_;
     } else {
         meta_->activeRanksTensor =
-            at::ones({size}, torch::dtype(torch::kInt32)
-                                 .device(isCpu ? torch::kCPU : torch::kCUDA));
+            at::ones({max_size}, torch::dtype(torch::kInt32)
+                                     .device(isCpu ? torch::kCPU
+                                                   : torch::kCUDA));
+        if (max_size != size) {
+            meta_->activeRanksTensor.slice(0, size, max_size).fill_(0);
+        }
     }
     meta_->engine = engine_;
     meta_->store = store;

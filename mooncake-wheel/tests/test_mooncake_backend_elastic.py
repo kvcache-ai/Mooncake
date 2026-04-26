@@ -35,6 +35,20 @@ def _elastic_worker(rank, num_processes, signals):
             backend=TEST_BACKEND,
             rank=rank,
             world_size=world_size,
+            pg_options=pg.MooncakeBackendOptions(
+                torch.cat(
+                    [
+                        torch.ones((world_size,), dtype=torch.int32, device=TEST_DEVICE),
+                        torch.zeros(
+                            (num_processes - world_size,),
+                            dtype=torch.int32,
+                            device=TEST_DEVICE,
+                        ),
+                    ]
+                ),
+                False,
+                num_processes,
+            ),
         )
         tensor = torch.tensor([rank + 1], dtype=torch.int32, device=TEST_DEVICE)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
@@ -43,12 +57,6 @@ def _elastic_worker(rank, num_processes, signals):
             signals["extend"] = 1
 
         backend = dist.group.WORLD._get_backend(TEST_DEVICE)
-        # Extend world
-        # Note: `extend_group_size_to` is non-blocking. Blocking will only
-        # occur at the first communication if some peers have not yet connected.
-        # This allows overlapping other operations between the group expansion
-        # and the first communication call.
-        pg.extend_group_size_to(backend, num_processes)
 
         # Two-phase scale-up: poll joiner readiness, then explicitly recover/activate.
         while True:
@@ -66,6 +74,7 @@ def _elastic_worker(rank, num_processes, signals):
             pg_options=pg.MooncakeBackendOptions(
                 torch.ones((num_processes,), dtype=torch.int32, device=TEST_DEVICE),
                 True,
+                num_processes,
             ),
         )
 

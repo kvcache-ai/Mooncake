@@ -24,11 +24,21 @@ class MooncakeBackend final : public ::c10d::Backend {
             : Options{"mooncake"},
               activeRanks_{activeRanks},
               isExtension_{isExtension} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+                               int maxWorldSize)
+            : Options{"mooncake"},
+              activeRanks_{activeRanks},
+              isExtension_{isExtension},
+              maxWorldSize_{maxWorldSize} {}
 
         ~MooncakeBackendOptions() override = default;
 
         at::Tensor activeRanks_;
         bool isExtension_ = false;
+        // Optional upper bound for connection polling / reserved rank slots.
+        // When > 0, the backend may pre-size internal rank metadata to this
+        // value (while PyTorch's group_size() remains unchanged).
+        int maxWorldSize_ = -1;
     };
 
     /**

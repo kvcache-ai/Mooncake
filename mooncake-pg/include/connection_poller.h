@@ -56,6 +56,11 @@ class ConnectionContext {
 
     std::atomic<int> groupSize_;
 
+    // Upper bound of peer polling range.
+    // This can be larger than groupSize_ so that existing ranks can observe
+    // joiners without calling extendGroupSizeTo().
+    std::atomic<int> pollingLimit_;
+
     bool isDummy_;
 
     // A mark tracking the group size for which all ranks
@@ -119,6 +124,9 @@ class ConnectionContext {
      * @param newGroupSize The target size for the extended group.
      */
     void extendGroupSizeTo(int newGroupSize);
+
+    // Allow polling ranks beyond groupSize_ without changing groupSize_.
+    void setPollingLimitTo(int pollingLimit);
 
     /**
      * @brief Checks whether all peers within the group have
