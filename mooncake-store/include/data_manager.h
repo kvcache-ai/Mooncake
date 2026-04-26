@@ -250,9 +250,6 @@ class DataManager {
         const AllocationHandle& handle, const std::string& key,
         const std::vector<Slice>& slices);
 
-    tl::expected<LocalCopyPlan, ErrorCode> BuildLocalCopyPlan(
-        const std::string& key, const AllocationHandle& handle,
-        const std::vector<Slice>& slices) const;
     // --- Put dispatch by transfer mode ---
 
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> PutViaTe(

@@ -1,5 +1,7 @@
 #include "data_manager.h"
 
+#include <algorithm>
+#include <cstring>
 #include <glog/logging.h>
 #include <thread>
 #include <chrono>
@@ -17,6 +19,101 @@
 #include "utils.h"
 
 namespace mooncake {
+
+namespace {
+
+struct LocalCopyPlan {
+    AllocationHandle source_handle;
+    const char* source_ptr = nullptr;
+    size_t source_size = 0;
+    bool use_single_dest = false;
+    void* single_dest_ptr = nullptr;
+    size_t single_dest_size = 0;
+    std::vector<Slice> dest_slices;
+};
+
+tl::expected<LocalCopyPlan, ErrorCode> BuildLocalCopyPlan(
+    const std::string& key, const AllocationHandle& handle,
+    const std::vector<Slice>& slices) {
+    if (!handle) {
+        LOG(ERROR) << "Invalid local allocation handle for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const auto& loc = handle->loc;
+    if (!loc.data.buffer) {
+        LOG(ERROR) << "Allocation handle has null buffer for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const char* src = reinterpret_cast<const char*>(loc.data.buffer->data());
+    const size_t src_size = loc.data.buffer->size();
+    size_t provided_size = 0;
+    for (const auto& s : slices) provided_size += s.size;
+    if (provided_size < src_size) {
+        LOG(ERROR) << "Buffer too small for local key '" << key
+                   << "': required=" << src_size
+                   << ", provided=" << provided_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    LocalCopyPlan plan;
+    plan.source_handle = handle;
+    plan.source_ptr = src;
+    plan.source_size = src_size;
+    if (slices.size() == 1) {
+        plan.use_single_dest = true;
+        plan.single_dest_ptr = slices[0].ptr;
+        plan.single_dest_size = slices[0].size;
+    } else {
+        plan.dest_slices = slices;
+    }
+    return plan;
+}
+
+ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
+    if (plan.use_single_dest) {
+        if (!plan.single_dest_ptr) {
+            LOG(ERROR) << "Local copy destination buffer is null";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        if (plan.single_dest_size < plan.source_size) {
+            LOG(ERROR) << "Local copy destination is too small, required="
+                       << plan.source_size
+                       << ", provided=" << plan.single_dest_size;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        if (plan.source_size > 0) {
+            std::memcpy(plan.single_dest_ptr, plan.source_ptr,
+                        plan.source_size);
+        }
+        return ErrorCode::OK;
+    }
+
+    size_t offset = 0;
+    for (const auto& slice : plan.dest_slices) {
+        if (offset >= plan.source_size) break;
+        const size_t copy_size =
+            std::min(slice.size, plan.source_size - offset);
+        if (copy_size == 0) continue;
+        if (!slice.ptr) {
+            LOG(ERROR) << "Local copy destination buffer is null";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        std::memcpy(slice.ptr, plan.source_ptr + offset, copy_size);
+        offset += copy_size;
+    }
+
+    if (offset != plan.source_size) {
+        LOG(ERROR) << "Local copy did not complete, copied=" << offset
+                   << ", source_size=" << plan.source_size;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+}  // namespace
+
 // ================================================================
 // Constructor
 // ================================================================
@@ -386,85 +483,31 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
     ReadTaskHandle res;
     res.data_size = static_cast<int64_t>(plan_result.value().source_size);
 
+    auto read_fn = [plan = std::move(plan_result.value()),
+                    key]() mutable -> tl::expected<void, ErrorCode> {
+        ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaMemcpy");
+        timer.LogRequest("key=", key);
+        ErrorCode ec = ExecuteLocalCopyPlan(plan);
+        if (ec != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to execute local copy plan"
+                       << ", key=" << key << ", error_code=" << ec;
+            return tl::unexpected(ec);
+        }
+        timer.LogResponse("error_code=", ErrorCode::OK);
+        return {};
+    };
+
     if (async_memcpy_executor_) {
-        auto future =
-            async_memcpy_executor_
-                ->SubmitSingleTask<tl::expected<void, ErrorCode>>(
-                    [plan = plan_result.value(),
-                     key]() -> tl::expected<void, ErrorCode> {
-                        ScopedVLogTimer timer(
-                            1, "DataManager::BuildDataCopierViaMemcpy");
-                        timer.LogRequest("key=", key);
-                        ErrorCode ec = ExecuteLocalCopyPlan(plan);
-                        if (ec != ErrorCode::OK) {
-                            LOG(ERROR)
-                                << "Failed to execute local copy plan"
-                                << ", key=" << key << ", error_code=" << ec;
-                            return tl::unexpected(ec);
-                        }
-                        timer.LogResponse("error_code=", ErrorCode::OK);
-                        return {};
-                    });
+        auto future = async_memcpy_executor_
+                          ->SubmitSingleTask<tl::expected<void, ErrorCode>>(
+                              std::move(read_fn));
         res.task_handle = FutureHandle<void>::Create(std::shared_ptr<void>{},
                                                      std::move(future));
     } else {
-        res.task_handle = CallableTaskHandle<void>::Create(
-            [plan = std::move(plan_result.value()),
-             key]() mutable -> tl::expected<void, ErrorCode> {
-                ScopedVLogTimer timer(1,
-                                      "DataManager::BuildDataCopierViaMemcpy");
-                timer.LogRequest("key=", key);
-                ErrorCode ec = ExecuteLocalCopyPlan(plan);
-                if (ec != ErrorCode::OK) {
-                    LOG(ERROR) << "Failed to execute local copy plan"
-                               << ", key=" << key << ", error_code=" << ec;
-                    return tl::unexpected(ec);
-                }
-                timer.LogResponse("error_code=", ErrorCode::OK);
-                return {};
-            });
+        res.task_handle = CallableTaskHandle<void>::Create(std::move(read_fn));
     }
 
     return res;
-}
-
-tl::expected<LocalCopyPlan, ErrorCode> DataManager::BuildLocalCopyPlan(
-    const std::string& key, const AllocationHandle& handle,
-    const std::vector<Slice>& slices) const {
-    if (!handle) {
-        LOG(ERROR) << "Invalid local allocation handle for key: " << key;
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    const auto& loc = handle->loc;
-    if (!loc.data.buffer) {
-        LOG(ERROR) << "Allocation handle has null buffer for key: " << key;
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    const char* src = reinterpret_cast<const char*>(loc.data.buffer->data());
-    const size_t src_size = loc.data.buffer->size();
-    size_t provided_size = 0;
-    for (const auto& s : slices) provided_size += s.size;
-    if (provided_size < src_size) {
-        LOG(ERROR) << "Buffer too small for local key '" << key
-                   << "': required=" << src_size
-                   << ", provided=" << provided_size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    LocalCopyPlan plan;
-    plan.source_handle = handle;
-    plan.source_ptr = src;
-    plan.source_size = src_size;
-    if (slices.size() == 1) {
-        plan.use_single_dest = true;
-        plan.single_dest_ptr = slices[0].ptr;
-        plan.single_dest_size = slices[0].size;
-    } else {
-        plan.dest_slices = slices;
-    }
-    return plan;
 }
 
 // ================================================================
