@@ -3,6 +3,7 @@
 #include <shared_mutex>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <memory>
 #include <optional>
 #include <ylt/util/tl/expected.hpp>
@@ -102,7 +103,7 @@ class DataManager {
     // returned TaskHandle may capture raw pointers from the slices for
     // asynchronous transfer.
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> Put(
-        const std::string& key, std::vector<Slice>& slices);
+        std::string_view key, std::vector<Slice>& slices);
 
     // Attention!!!
     // Get() method run without key lock.
@@ -117,21 +118,20 @@ class DataManager {
     // returned TaskHandle may capture raw pointers from the slices for
     // asynchronous data copy.
     tl::expected<ReadTaskHandle, ErrorCode> Get(
-        const std::string& key, const std::vector<Slice>& slices);
+        std::string_view key, const std::vector<Slice>& slices);
 
     tl::expected<ReadTaskHandle, ErrorCode> Get(
-        const std::string& key,
-        std::shared_ptr<ClientBufferAllocator> allocator);
+        std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator);
 
     /**
      * @brief Query the size of an object.
      * @param key Object key
      * @return Object size in bytes, or ErrorCode on failure
      */
-    tl::expected<size_t, ErrorCode> QueryObjectSize(const std::string& key);
+    tl::expected<size_t, ErrorCode> QueryObjectSize(std::string_view key);
 
     tl::expected<void, ErrorCode> Delete(
-        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
+        std::string_view key, std::optional<UUID> tier_id = std::nullopt);
 
     /**
      * @brief Get tier views from underlying tiered storage
@@ -158,7 +158,7 @@ class DataManager {
     /**
      * @brief Get all tier IDs where a key has replicas.
      */
-    std::vector<UUID> GetReplicaTierIds(const std::string& key) const;
+    std::vector<UUID> GetReplicaTierIds(std::string_view key) const;
 
     /**
      * @brief Read data and transfer to remote destination buffers
@@ -172,7 +172,7 @@ class DataManager {
      * @return ErrorCode indicating success or failure
      */
     tl::expected<void, ErrorCode> ReadRemoteData(
-        const std::string& key,
+        std::string_view key,
         const std::vector<RemoteBufferDesc>& dest_buffers);
 
     /**
@@ -183,8 +183,7 @@ class DataManager {
      * @return UUID of the tier (segment) where data was written, or ErrorCode
      */
     tl::expected<UUID, ErrorCode> WriteRemoteData(
-        const std::string& key,
-        const std::vector<RemoteBufferDesc>& src_buffers,
+        std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
 
     // ================================================================
@@ -199,7 +198,7 @@ class DataManager {
      * @param tier_id Optional tier ID. If specified, only checks the given
      *        tier; if nullopt, checks all tiers.
      */
-    void RectifyReadRoute(const std::string& key,
+    void RectifyReadRoute(std::string_view key,
                           std::optional<UUID> tier_id = std::nullopt);
 
     /**
@@ -207,14 +206,14 @@ class DataManager {
      * @param fn Callback invoked when key not found locally.
      */
     void SetRectifyCallback(
-        std::function<void(const std::string&, std::optional<UUID>)> fn);
+        std::function<void(std::string_view, std::optional<UUID>)> fn);
 
-    bool Exist(const std::string& key,
+    bool Exist(std::string_view key,
                std::optional<UUID> tier_id = std::nullopt) const;
 
    private:
-    std::shared_mutex& GetKeyLock(const std::string& key) {
-        size_t hash = std::hash<std::string>{}(key);
+    std::shared_mutex& GetKeyLock(std::string_view key) {
+        size_t hash = std::hash<std::string_view>{}(key);
         return lock_shards_[hash % lock_shard_count_];
     }
 
@@ -240,23 +239,22 @@ class DataManager {
         const std::vector<RemoteBufferDesc>& src_buffers);
 
     tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopier(
-        const AllocationHandle& handle, const std::string& key,
+        const AllocationHandle& handle, std::string_view key,
         const std::vector<Slice>& slices);
 
     tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopierViaTe(
         const AllocationHandle& handle, const std::vector<Slice>& slices);
 
     tl::expected<ReadTaskHandle, ErrorCode> BuildDataCopierViaMemcpy(
-        const AllocationHandle& handle, const std::string& key,
+        const AllocationHandle& handle, std::string_view key,
         const std::vector<Slice>& slices);
 
     // --- Put dispatch by transfer mode ---
-
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> PutViaTe(
-        const std::string& key, std::vector<Slice>& slices);
+        std::string_view key, std::vector<Slice>& slices);
 
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> PutViaMemcpy(
-        const std::string& key, std::vector<Slice>& slices);
+        std::string_view key, std::vector<Slice>& slices);
 
     // --- Conversion helpers ---
 
@@ -373,7 +371,7 @@ class DataManager {
     std::vector<std::shared_mutex> lock_shards_;
 
     // Callback for rectifying stale read routes
-    std::function<void(const std::string&, std::optional<UUID>)>
+    std::function<void(std::string_view, std::optional<UUID>)>
         rectify_wrong_route_fn_;
 
     LocalTransferConfig local_transfer_config_;

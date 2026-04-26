@@ -144,7 +144,7 @@ class StorageTier : public CacheTier {
 
     tl::expected<void, ErrorCode> Free(DataSource data) override;
 
-    tl::expected<void, ErrorCode> Commit(const std::string& key,
+    tl::expected<void, ErrorCode> Commit(std::string_view key,
                                          const DataSource& data) override;
 
     tl::expected<void, ErrorCode> Flush() override;

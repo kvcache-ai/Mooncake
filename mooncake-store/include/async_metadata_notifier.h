@@ -21,7 +21,7 @@ namespace mooncake {
 // Called when an async ADD fails with a non-transient error.
 // Caller should delete the local replica.
 using SyncFailureCallback = std::function<void(
-    const std::string& key, const UUID& segment_id, ErrorCode error)>;
+    std::string_view key, const UUID& segment_id, ErrorCode error)>;
 
 class AsyncMetadataNotifier {
    public:
@@ -42,15 +42,15 @@ class AsyncMetadataNotifier {
     void Stop(bool drop_pending = false);
 
     // --- Normal priority ---
-    tl::expected<void, ErrorCode> EnqueueAdd(const std::string& key,
+    tl::expected<void, ErrorCode> EnqueueAdd(std::string_view key,
                                              const UUID& segment_id,
                                              size_t size);
 
-    tl::expected<void, ErrorCode> EnqueueRemove(const std::string& key,
+    tl::expected<void, ErrorCode> EnqueueRemove(std::string_view key,
                                                 const UUID& segment_id);
 
     // --- Recovery priority (lower send priority) ---
-    tl::expected<void, ErrorCode> EnqueueRecoveryAdd(const std::string& key,
+    tl::expected<void, ErrorCode> EnqueueRecoveryAdd(std::string_view key,
                                                      const UUID& segment_id,
                                                      size_t size);
 

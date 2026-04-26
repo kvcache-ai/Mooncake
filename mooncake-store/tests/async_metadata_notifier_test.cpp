@@ -238,7 +238,7 @@ TEST_F(AsyncMetadataNotifierTest, FailureCallbackInvoked) {
     ASSERT_EQ(ec, ErrorCode::OK);
 
     std::atomic<int> failure_count{0};
-    SyncFailureCallback cb = [&](const std::string& key, const UUID& seg_id,
+    SyncFailureCallback cb = [&](std::string_view key, const UUID& seg_id,
                                  ErrorCode err) {
         failure_count.fetch_add(1, std::memory_order_relaxed);
     };

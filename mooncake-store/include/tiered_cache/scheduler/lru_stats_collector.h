@@ -5,10 +5,12 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "tiered_cache/scheduler/stats_collector.h"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -27,12 +29,17 @@ class LRUStatsCollector : public StatsCollector {
           max_snapshot_keys_(
               detail::NormalizeSnapshotLimit(max_snapshot_keys)) {}
 
-    void RecordAccess(const std::string& key) override {
+    void RecordAccess(std::string_view key) override {
         const uint64_t sequence =
             next_sequence_.fetch_add(1, std::memory_order_relaxed);
         auto& shard = GetShard(key);
         std::lock_guard<std::mutex> lock(shard.mutex);
-        shard.pending_updates[key] = sequence;
+        auto it = shard.pending_updates.find(key);
+        if (it != shard.pending_updates.end()) {
+            it->second = sequence;
+        } else {
+            shard.pending_updates.emplace(std::string(key), sequence);
+        }
     }
 
     AccessStats GetSnapshot() override {
@@ -41,11 +48,14 @@ class LRUStatsCollector : public StatsCollector {
         return BuildSnapshot();
     }
 
-    void RemoveKey(const std::string& key) override {
+    void RemoveKey(std::string_view key) override {
         auto& shard = GetShard(key);
         std::lock_guard<std::mutex> lock(shard.mutex);
-        shard.pending_updates.erase(key);
-        shard.pending_deletes.push_back(key);
+        auto it = shard.pending_updates.find(key);
+        if (it != shard.pending_updates.end()) {
+            shard.pending_updates.erase(it);
+        }
+        shard.pending_deletes.emplace_back(key);
     }
 
    private:
@@ -65,18 +75,21 @@ class LRUStatsCollector : public StatsCollector {
 
     struct alignas(64) Shard {
         std::mutex mutex;
-        std::unordered_map<std::string, uint64_t> pending_updates;
+        std::unordered_map<std::string, uint64_t, StringHash, std::equal_to<>>
+            pending_updates;
         std::vector<std::string> pending_deletes;
     };
 
-    Shard& GetShard(const std::string& key) {
-        const auto shard_index = std::hash<std::string>{}(key)&shard_mask_;
+    Shard& GetShard(std::string_view key) {
+        const auto shard_index = std::hash<std::string_view>{}(key)&shard_mask_;
         return shards_[shard_index];
     }
 
     void ApplyPendingChanges() {
         for (auto& shard : shards_) {
-            std::unordered_map<std::string, uint64_t> pending_updates;
+            std::unordered_map<std::string, uint64_t, StringHash,
+                               std::equal_to<>>
+                pending_updates;
             std::vector<std::string> pending_deletes;
 
             {

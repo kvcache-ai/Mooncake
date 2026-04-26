@@ -117,29 +117,29 @@ void AsyncMetadataNotifier::ResetShard(SenderShard& shard) {
 // ============================================================================
 
 tl::expected<void, ErrorCode> AsyncMetadataNotifier::EnqueueAdd(
-    const std::string& key, const UUID& segment_id, size_t size) {
+    std::string_view key, const UUID& segment_id, size_t size) {
     PendingOp op;
     op.type = PendingOp::ADD;
-    op.key = key;
+    op.key = key;  // copy string
     op.segment_id = segment_id;
     op.size = size;
     return DoEnqueue(std::move(op), /*is_recovery=*/false);
 }
 
 tl::expected<void, ErrorCode> AsyncMetadataNotifier::EnqueueRemove(
-    const std::string& key, const UUID& segment_id) {
+    std::string_view key, const UUID& segment_id) {
     PendingOp op;
     op.type = PendingOp::REMOVE;
-    op.key = key;
+    op.key = key;  // copy string
     op.segment_id = segment_id;
     return DoEnqueue(std::move(op), /*is_recovery=*/false);
 }
 
 tl::expected<void, ErrorCode> AsyncMetadataNotifier::EnqueueRecoveryAdd(
-    const std::string& key, const UUID& segment_id, size_t size) {
+    std::string_view key, const UUID& segment_id, size_t size) {
     PendingOp op;
     op.type = PendingOp::ADD;
-    op.key = key;
+    op.key = key;  // copy string
     op.segment_id = segment_id;
     op.size = size;
     return DoEnqueue(std::move(op), /*is_recovery=*/true);
@@ -356,11 +356,11 @@ void AsyncMetadataNotifier::SendBatch(std::vector<PendingOp>& batch,
     for (size_t i = 0; i < count; ++i) {
         auto& op = batch[i];
         if (op.type == PendingOp::ADD) {
-            req.add_keys.push_back(std::move(op.key));
+            req.add_keys.push_back(std::string_view(op.key));
             req.add_sizes.push_back(op.size);
             req.add_segment_ids.push_back(op.segment_id);
         } else {
-            req.remove_keys.push_back(std::move(op.key));
+            req.remove_keys.push_back(std::string_view(op.key));
             req.remove_segment_ids.push_back(op.segment_id);
         }
     }

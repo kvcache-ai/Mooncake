@@ -447,7 +447,7 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Commit(
-    const std::string& key, AllocationHandle handle,
+    std::string_view key, AllocationHandle handle,
     std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
@@ -479,7 +479,7 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
             entry = it->second;
         } else {
             entry = std::make_shared<MetadataEntry>();
-            shard.index[key] = entry;
+            shard.index.emplace(std::string(key), entry);
         }
     }
 
@@ -565,7 +565,7 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
-    const std::string& key, std::optional<UUID> tier_id, bool record_access,
+    std::string_view key, std::optional<UUID> tier_id, bool record_access,
     uint64_t* out_version) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
@@ -616,7 +616,7 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     return entry->replicas.begin()->second;
 }
 
-bool TieredBackend::Exist(const std::string& key,
+bool TieredBackend::Exist(std::string_view key,
                           std::optional<UUID> tier_id) const {
     auto& shard = GetMetadataShard(key);
     std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
@@ -639,7 +639,7 @@ bool TieredBackend::Exist(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Delete(
-    const std::string& key, std::optional<UUID> tier_id) {
+    std::string_view key, std::optional<UUID> tier_id) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -774,7 +774,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
 }
 
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
-    const std::string& key, const DataSource& source, UUID dest_tier_id,
+    std::string_view key, const DataSource& source, UUID dest_tier_id,
     std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
@@ -798,8 +798,6 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
         return tl::make_unexpected(write_result.error());
     }
 
-    // Commit (Add Replica)
-    // Takes ownership of dest_handle into the map
     auto commit_result =
         Commit(key, dest_handle.value(), expected_version, record_access);
     if (!commit_result.has_value()) {
@@ -814,7 +812,7 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
     return tl::expected<void, ErrorCode>{};
 }
 
-tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
+tl::expected<void, ErrorCode> TieredBackend::Transfer(std::string_view key,
                                                       UUID source_tier_id,
                                                       UUID dest_tier_id,
                                                       bool record_access) {
@@ -865,8 +863,7 @@ std::vector<TierView> TieredBackend::GetTierViews() const {
     return views;
 }
 
-std::vector<UUID> TieredBackend::GetReplicaTierIds(
-    const std::string& key) const {
+std::vector<UUID> TieredBackend::GetReplicaTierIds(std::string_view key) const {
     auto& shard = GetMetadataShard(key);
     std::shared_lock map_lock(shard.mutex);
     auto it = shard.index.find(key);

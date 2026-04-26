@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "replica.h"
@@ -46,7 +47,8 @@ inline std::ostream& operator<<(std::ostream& os,
  * @brief Request structure for getting write route.
  */
 struct WriteRouteRequest {
-    std::string key;  // used for pre-filter with limitation of replica number
+    // used for pre-filter with limitation of replica number
+    std::string_view key;
     UUID client_id;
     size_t size = 0;
     WriteRouteRequestConfig config;
@@ -76,7 +78,7 @@ YLT_REFL(WriteRouteResponse, candidates);
  */
 struct BatchGetWriteRouteRequest {
     UUID client_id;
-    std::vector<std::string> keys;
+    std::vector<std::string_view> keys;
     std::vector<size_t> sizes;
     WriteRouteRequestConfig config;  // shared config for all keys
 };
@@ -97,7 +99,7 @@ YLT_REFL(BatchGetWriteRouteResponse, responses, error_codes);
  *        Master resolves ip_address/rpc_port from registered client info.
  */
 struct AddReplicaRequest {
-    std::string key;
+    std::string_view key;
     size_t size;
     UUID client_id;
     UUID segment_id;
@@ -108,7 +110,7 @@ YLT_REFL(AddReplicaRequest, key, size, client_id, segment_id);
  * @brief Request to remove a replica
  */
 struct RemoveReplicaRequest {
-    std::string key;
+    std::string_view key;
     UUID client_id;
     UUID segment_id;
 };
@@ -118,7 +120,7 @@ YLT_REFL(RemoveReplicaRequest, key, client_id, segment_id);
  * @brief Request to remove replicas from multiple segments in one call
  */
 struct BatchRemoveReplicaRequest {
-    std::string key;
+    std::string_view key;
     UUID client_id;
     std::vector<UUID> segment_ids;
 };
@@ -131,11 +133,11 @@ YLT_REFL(BatchRemoveReplicaRequest, key, client_id, segment_ids);
 struct BatchSyncReplicaRequest {
     UUID client_id;
     // ADD operations
-    std::vector<std::string> add_keys;
+    std::vector<std::string_view> add_keys;
     std::vector<size_t> add_sizes;
     std::vector<UUID> add_segment_ids;
     // REMOVE operations
-    std::vector<std::string> remove_keys;
+    std::vector<std::string_view> remove_keys;
     std::vector<UUID> remove_segment_ids;
 };
 YLT_REFL(BatchSyncReplicaRequest, client_id, add_keys, add_sizes,

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <string_view>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -276,7 +277,9 @@ CentralizedClientService::BatchQuery(
     }
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto response = master_client_.BatchGetReplicaList(object_keys, config);
+    std::vector<std::string_view> key_views(object_keys.begin(),
+                                            object_keys.end());
+    auto response = master_client_.BatchGetReplicaList(key_views, config);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -338,7 +341,8 @@ CentralizedClientService::BatchIsExist(const std::vector<std::string>& keys) {
         return std::vector<tl::expected<bool, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::SHUTTING_DOWN));
     }
-    auto results = master_client_.BatchExistKey(keys);
+    std::vector<std::string_view> key_views(keys.begin(), keys.end());
+    auto results = master_client_.BatchExistKey(key_views);
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
             LOG(ERROR) << "Failed to query key"

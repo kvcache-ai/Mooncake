@@ -6,7 +6,7 @@
 namespace mooncake {
 
 size_t P2PRouteData::Serialize(
-    void* dest, const std::string& key,
+    void* dest, std::string_view key,
     const std::vector<P2PProxyDescriptor>& replicas) {
     size_t record_size = P2PRouteData::CalculateSize(replicas.size());
     char* base_ptr = reinterpret_cast<char*>(dest);
@@ -128,11 +128,10 @@ uint64_t RouteCache::ComputeSafeEpoch() const {
 // 2. [Return Handle]: After Get() returns, the Caller is protected by
 //    the shared_ptr within P2PRouteHandle. Even if the Node is recycled, the
 //    underlying P2PRouteData memory remains valid and unchanged.
-P2PRouteHandle RouteCache::Get(const std::string& key)
-    NO_THREAD_SAFETY_ANALYSIS {
+P2PRouteHandle RouteCache::Get(std::string_view key) NO_THREAD_SAFETY_ANALYSIS {
     EpochGuard guard(this);
 
-    size_t hash_val = std::hash<std::string>{}(key);
+    size_t hash_val = std::hash<std::string_view>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
     size_t bucket_idx = hash_val % buckets_per_shard_;
 
@@ -185,10 +184,10 @@ P2PRouteHandle RouteCache::Get(const std::string& key)
     return P2PRouteHandle();
 }
 
-void RouteCache::Replace(const std::string& key,
+void RouteCache::Replace(std::string_view key,
                          const std::vector<P2PProxyDescriptor>& replicas)
     NO_THREAD_SAFETY_ANALYSIS {
-    size_t hash_val = std::hash<std::string>{}(key);
+    size_t hash_val = std::hash<std::string_view>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
     size_t bucket_idx = hash_val % buckets_per_shard_;
 
@@ -204,10 +203,10 @@ void RouteCache::Replace(const std::string& key,
     InnerPut(shard, bucket_idx, hash_val, key, replicas, false);
 }
 
-void RouteCache::Upsert(const std::string& key,
+void RouteCache::Upsert(std::string_view key,
                         const std::vector<P2PProxyDescriptor>& replicas)
     NO_THREAD_SAFETY_ANALYSIS {
-    size_t hash_val = std::hash<std::string>{}(key);
+    size_t hash_val = std::hash<std::string_view>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
     size_t bucket_idx = hash_val % buckets_per_shard_;
 
@@ -224,7 +223,7 @@ void RouteCache::Upsert(const std::string& key,
 }
 
 void RouteCache::InnerPut(Shard& shard, size_t bucket_idx, size_t hash_val,
-                          const std::string& key,
+                          std::string_view key,
                           const std::vector<P2PProxyDescriptor>& replicas,
                           bool merge) REQUIRES(shard.mtx_) {
     // 1. Identify target node
@@ -282,10 +281,10 @@ void RouteCache::InnerPut(Shard& shard, size_t bucket_idx, size_t hash_val,
     shard.buckets_[bucket_idx].store(new_node, std::memory_order_release);
 }
 
-void RouteCache::RemoveReplica(const std::string& key,
+void RouteCache::RemoveReplica(std::string_view key,
                                const std::vector<P2PProxyDescriptor>&
                                    remove_replicas) NO_THREAD_SAFETY_ANALYSIS {
-    size_t hash_val = std::hash<std::string>{}(key);
+    size_t hash_val = std::hash<std::string_view>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
     size_t bucket_idx = hash_val % buckets_per_shard_;
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();

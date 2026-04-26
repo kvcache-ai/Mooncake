@@ -33,7 +33,7 @@ struct LocalCopyPlan {
 };
 
 tl::expected<LocalCopyPlan, ErrorCode> BuildLocalCopyPlan(
-    const std::string& key, const AllocationHandle& handle,
+    std::string_view key, const AllocationHandle& handle,
     const std::vector<Slice>& slices) {
     if (!handle) {
         LOG(ERROR) << "Invalid local allocation handle for key: " << key;
@@ -164,7 +164,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
 // In future, we will add a pre-occupation mechanism in the Allocation stage
 // to optimize this issue.
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManager::Put(
-    const std::string& key, std::vector<Slice>& slices) {
+    std::string_view key, std::vector<Slice>& slices) {
     switch (local_transfer_config_.mode) {
         case LocalTransferMode::TE:
             return PutViaTe(key, slices);
@@ -185,7 +185,7 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManager::Put(
 //   (3) introduce a completion callback from transfer_engine itself.
 // Once any of these lands, switch the return type to FutureHandle.
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
+DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
     // using Te, treat local memory as remote memory
     size_t total_size = 0;
     for (const auto& s : slices) total_size += s.size;
@@ -271,7 +271,7 @@ DataManager::PutViaTe(const std::string& key, std::vector<Slice>& slices) {
 }
 
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
+DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
     if (slices.size() != 1) {
         LOG(ERROR) << "PutLocal in memcpy mode only supports a single slice";
         return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
@@ -365,7 +365,7 @@ DataManager::PutViaMemcpy(const std::string& key, std::vector<Slice>& slices) {
 // ================================================================
 
 tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
-    const std::string& key, std::shared_ptr<ClientBufferAllocator> allocator) {
+    std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator) {
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
         if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -398,7 +398,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
 }
 
 tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
-    const std::string& key, const std::vector<Slice>& slices) {
+    std::string_view key, const std::vector<Slice>& slices) {
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
         if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -416,7 +416,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
 }
 
 tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopier(
-    const AllocationHandle& handle, const std::string& key,
+    const AllocationHandle& handle, std::string_view key,
     const std::vector<Slice>& slices) {
     if (!handle || !handle->loc.data.buffer) {
         LOG(ERROR) << "Failed to get data for key: " << key;
@@ -471,7 +471,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaTe(
 }
 
 tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
-    const AllocationHandle& handle, const std::string& key,
+    const AllocationHandle& handle, std::string_view key,
     const std::vector<Slice>& slices) {
     auto plan_result = BuildLocalCopyPlan(key, handle, slices);
     if (!plan_result) {
@@ -517,7 +517,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
 // Attention!!!
 // This method runs without key lock.
 tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
-    const std::string& key, const std::vector<RemoteBufferDesc>& dest_buffers) {
+    std::string_view key, const std::vector<RemoteBufferDesc>& dest_buffers) {
     ScopedVLogTimer timer(1, "DataManager::ReadRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", dest_buffers.size());
 
@@ -557,7 +557,7 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 }
 
 tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
-    const std::string& key, const std::vector<RemoteBufferDesc>& src_buffers,
+    std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
     std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::WriteRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", src_buffers.size());
@@ -1119,7 +1119,7 @@ std::vector<RemoteBufferDesc> DataManager::SlicesToRemoteBufferDescs(
 // ================================================================
 
 tl::expected<size_t, ErrorCode> DataManager::QueryObjectSize(
-    const std::string& key) {
+    std::string_view key) {
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
         return tl::unexpected(handle.error());
@@ -1129,7 +1129,7 @@ tl::expected<size_t, ErrorCode> DataManager::QueryObjectSize(
     return size;
 }
 
-tl::expected<void, ErrorCode> DataManager::Delete(const std::string& key,
+tl::expected<void, ErrorCode> DataManager::Delete(std::string_view key,
                                                   std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Delete");
     timer.LogRequest("key=", key);
@@ -1147,7 +1147,7 @@ tl::expected<void, ErrorCode> DataManager::Delete(const std::string& key,
     return {};
 }
 
-bool DataManager::Exist(const std::string& key,
+bool DataManager::Exist(std::string_view key,
                         std::optional<UUID> tier_id) const {
     return tiered_backend_->Exist(key, tier_id);
 }
@@ -1164,7 +1164,7 @@ AccessStats DataManager::GetHotKeyStats() const {
     return tiered_backend_->GetHotKeyStats();
 }
 
-std::vector<UUID> DataManager::GetReplicaTierIds(const std::string& key) const {
+std::vector<UUID> DataManager::GetReplicaTierIds(std::string_view key) const {
     if (!tiered_backend_) return {};
     return tiered_backend_->GetReplicaTierIds(key);
 }
@@ -1175,7 +1175,7 @@ std::vector<UUID> DataManager::GetReplicaTierIds(const std::string& key) const {
 
 // If a client attempts to access data via a read route and the data is not
 // found locally, it calls this function to rectify the stale route in master.
-void DataManager::RectifyReadRoute(const std::string& key,
+void DataManager::RectifyReadRoute(std::string_view key,
                                    std::optional<UUID> tier_id) {
     if (!rectify_wrong_route_fn_) return;
 
@@ -1189,12 +1189,13 @@ void DataManager::RectifyReadRoute(const std::string& key,
                                    std::to_string(tier_id.value().second)
                              : "")
                      << ", removing replica from master for key: " << key;
+        // Callback signature pins const std::string&; copy at the boundary.
         rectify_wrong_route_fn_(key, tier_id);
     }
 }
 
 void DataManager::SetRectifyCallback(
-    std::function<void(const std::string&, std::optional<UUID>)> fn) {
+    std::function<void(std::string_view, std::optional<UUID>)> fn) {
     rectify_wrong_route_fn_ = std::move(fn);
 }
 
