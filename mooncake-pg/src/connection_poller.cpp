@@ -131,9 +131,9 @@ void ConnectionContext::setPollingLimitTo(int pollingLimit) {
     const int groupSize = groupSize_.load(std::memory_order_acquire);
     TORCH_CHECK(pollingLimit >= groupSize,
                 "pollingLimit must be >= current groupSize");
-    TORCH_CHECK(pollingLimit >= 0 &&
-                    static_cast<size_t>(pollingLimit) < kMaxNumRanks,
-                "Size out of range");
+    TORCH_CHECK(
+        pollingLimit >= 0 && static_cast<size_t>(pollingLimit) < kMaxNumRanks,
+        "Size out of range");
     pollingLimit_.store(pollingLimit, std::memory_order_release);
 }
 
@@ -196,6 +196,7 @@ void ConnectionContext::bootstrapLocalPeer(const std::string& localServerName,
     ConnectionPoller::GetInstance()
         .global_peerConnected_[local2global_rank_map_[rank_]] = true;
     peerState.state = PeerConnectionState::CONNECTED;
+    peerState.countedInGroup = true;
 
     {
         std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
@@ -297,6 +298,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                         groupSize_.load(std::memory_order_acquire)) {
                         totalConnectedPeers_.fetch_add(
                             1, std::memory_order_release);
+                        peerState.countedInGroup = true;
                         backend_wakeup_cv_.notify_all();
                     }
                 }
@@ -343,6 +345,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                         groupSize_.load(std::memory_order_acquire)) {
                         totalConnectedPeers_.fetch_add(
                             1, std::memory_order_release);
+                        peerState.countedInGroup = true;
                         backend_wakeup_cv_.notify_all();
                     }
                 }
@@ -373,6 +376,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                         groupSize_.load(std::memory_order_acquire)) {
                         totalConnectedPeers_.fetch_add(
                             1, std::memory_order_release);
+                        peerState.countedInGroup = true;
                         backend_wakeup_cv_.notify_all();
                     }
                 }
@@ -382,6 +386,11 @@ bool ConnectionContext::pollPeer(int pollingRank) {
         }
 
         case PeerConnectionState::CONNECTED: {
+            // A peer may be warmed up (CONNECTED) while still outside of the
+            // current groupSize_. When it later enters the group, we need to
+            // update totalConnectedPeers_ lazily here; otherwise
+            // waitUntilAllConnected()/isAllPeerConnected() may hang.
+
             // ATTENTION: Ensure consistency of local (meta_->peerConnected)
             //            and global (global_peerConnected_).
             //
@@ -405,6 +414,14 @@ bool ConnectionContext::pollPeer(int pollingRank) {
 
             if (meta_->peerConnected[pollingRank] &&
                 global_peerConnected_[globalPollingRank]) {
+                if (!peerState.countedInGroup &&
+                    pollingRank < groupSize_.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
+                    totalConnectedPeers_.fetch_add(
+                        1, std::memory_order_release);
+                    peerState.countedInGroup = true;
+                    backend_wakeup_cv_.notify_all();
+                }
                 // happy path: both are connected.
                 break;
             }
@@ -443,8 +460,9 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             peerState.state = PeerConnectionState::WAITING_STORE;
             engine_->closeSegment(peerState.segmentId.value());
             peerState.segmentId = std::nullopt;
-            if (pollingRank < groupSize_.load(std::memory_order_acquire)) {
-                totalConnectedPeers_.fetch_sub(1);
+            if (peerState.countedInGroup) {
+                totalConnectedPeers_.fetch_sub(1, std::memory_order_release);
+                peerState.countedInGroup = false;
             }
             state_changed = true;
             break;

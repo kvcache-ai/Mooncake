@@ -101,9 +101,9 @@ MooncakeBackend::MooncakeBackend(
     auto store = std::move(distBackendOpts.store);
     const int rank = distBackendOpts.group_rank;
     const int size = distBackendOpts.group_size;
-    const int max_size =
-        (options_ && options_->maxWorldSize_ > 0) ? options_->maxWorldSize_
-                                                  : size;
+    const int max_size = (options_ && options_->maxWorldSize_ > 0)
+                             ? options_->maxWorldSize_
+                             : size;
 
     TORCH_CHECK(max_size >= 0 && static_cast<size_t>(max_size) < kMaxNumRanks,
                 "max_world_size out of range");
@@ -266,6 +266,10 @@ MooncakeBackend::MooncakeBackend(
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
     memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
     meta_->rank = rank;
+    // NOTE: meta_->size is intentionally initialized to max_world_size (when
+    // provided) so that healthy ranks can activate joiners via recoverRanks()
+    // without calling extendGroupSizeTo(). Inactive slots are masked by
+    // meta_->activeRanks / meta_->activeRanksTensor.
     meta_->size = max_size;
     meta_->taskCount = 0;
     if (isCpu) {
@@ -302,9 +306,9 @@ MooncakeBackend::MooncakeBackend(
         meta_->activeRanksTensor = options_->activeRanks_;
     } else {
         meta_->activeRanksTensor =
-            at::ones({max_size}, torch::dtype(torch::kInt32)
-                                     .device(isCpu ? torch::kCPU
-                                                   : torch::kCUDA));
+            at::ones({max_size},
+                     torch::dtype(torch::kInt32).device(isCpu ? torch::kCPU
+                                                            : torch::kCUDA));
         if (max_size != size) {
             meta_->activeRanksTensor.slice(0, size, max_size).fill_(0);
         }
@@ -993,7 +997,9 @@ void MooncakeBackend::extendGroupSizeTo(int newSize) {
     }
 
     auto& tensor = meta_->activeRanksTensor;
-    tensor.resize_({newSize});
+    if (newSize > tensor.numel()) {
+        tensor.resize_({newSize});
+    }
     tensor.slice(0, oldSize, newSize).fill_(0);
 
     connection_ctx_->extendGroupSizeTo(newSize);

@@ -32,6 +32,12 @@ struct PeerConnection {
     std::optional<BatchID> warmupBatchId{std::nullopt};
     std::optional<TransferMetadata::SegmentID> segmentId{std::nullopt};
 
+    // Whether this peer has been counted in `totalConnectedPeers_`.
+    // Note that ConnectionPoller may establish connections for ranks beyond
+    // the current groupSize_ (when pollingLimit_ > groupSize_). In that case we
+    // delay counting until the rank officially enters the group.
+    bool countedInGroup{false};
+
     // Back off to avoid frequently checking store.
     std::chrono::steady_clock::time_point last_check_store;
     size_t check_store_backoff_ms{kCheckStoreInitialBackoffMs};
