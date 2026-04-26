@@ -361,6 +361,16 @@ void Workers::asyncPollCq() {
                 }
             } else {
                 num_slices += ep->acknowledge(slice, COMPLETED);
+                // A successful transfer proves this rail is healthy; clear
+                // any accumulated error count so a previously-cooled-down
+                // rail can be used again without waiting for the full
+                // cooldown to expire. Use find() to avoid default-
+                // constructing a RailMonitor on the completion hot path
+                // when the machine_id was not yet loaded.
+                auto it = worker.rails.find(slice->target_machine_id);
+                if (it != worker.rails.end() && it->second.ready())
+                    it->second.markRecovered(slice->source_dev_id,
+                                             slice->target_dev_id);
                 worker.perf.inflight_lat.add(inflight_lat);
                 worker.perf.enqueue_lat.add(enqueue_lat);
             }
@@ -534,7 +544,8 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     auto& rail = worker.rails[target.segment->machine_id];
     if (!rail.ready() || target.topo != rail.remote())
-        rail.load(source.topo, target.topo);
+        rail.load(source.topo, target.topo, /*rail_topo_json=*/"",
+                  transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
@@ -663,6 +674,9 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
         CHECK_STATUS(selectFallbackDevice(source, target, slice));
     slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
     slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    // Cache machine_id so asyncPollCq can call markRecovered without a
+    // segment lookup on the hot success path.
+    slice->target_machine_id = target.segment->machine_id;
     return Status::OK();
 }
 }  // namespace tent

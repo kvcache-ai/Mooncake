@@ -71,6 +71,9 @@ struct RdmaSlice {
     bool failed = false;
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
+    // Cached target machine_id, set in generatePostPath so that
+    // asyncPollCq can call markRecovered on success without a segment lookup.
+    std::string target_machine_id;
 };
 
 using RdmaSliceStorage = Slab<RdmaSlice>;
