@@ -275,9 +275,10 @@ MooncakeBackend::MooncakeBackend(
     int cuda_device_index = isCpu_ ? -1 : at::cuda::current_device();
 
     if (isCpu_)
-        p2p_device_worker_ = dev_worker_mgr.getCPUWorker();
+        p2p_device_worker_ = dev_worker_mgr.getCPUWorker(engine_);
     else
-        p2p_device_worker_ = dev_worker_mgr.getCUDAWorker(cuda_device_index);
+        p2p_device_worker_ =
+            dev_worker_mgr.getCUDAWorker(cuda_device_index, engine_);
 
     auto& worker_mgr = MooncakeWorkerManager::GetInstance();
     if (isCpu_)
@@ -295,7 +296,6 @@ MooncakeBackend::MooncakeBackend(
                      .rank = rank_,
                      .size = size_,
                      .cuda_device_index = cuda_device_index,
-                     .location = location,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 

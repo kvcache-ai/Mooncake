@@ -162,9 +162,12 @@ namespace mooncake {
 //
 // ---------------------------------------------------------------------------
 inline constexpr uint32_t kP2PControlRingSize = 64;
-// default config: pool_size=128M, chunk_size=16M, num_chunks=8
-inline constexpr uint64_t kDefaultPoolSize = 128u * 1024 * 1024;  // 128 M
-inline constexpr uint64_t kDefaultChunkSize = 16u * 1024 * 1024;  // 16 M
+// Pool size and chunk size can be overridden via environment variables:
+//   MOONCAKE_P2P_POOL_SIZE  -- total bytes per direction (default 128 MiB)
+//   MOONCAKE_P2P_CHUNK_SIZE -- granularity of each chunk (default 16 MiB)
+// The chunk count is pool_size / chunk_size (default 8).
+inline constexpr uint64_t kDefaultPoolSize = 128u * 1024 * 1024;  // 128 MiB
+inline constexpr uint64_t kDefaultChunkSize = 16u * 1024 * 1024;  // 16 MiB
 
 // Single-word atomic publication token.
 // Combines generation and sequence to avoid torn reads.
@@ -278,7 +281,6 @@ class P2PProxy {
         int rank = 0;
         int size = 0;
         int cuda_device_index = -1;
-        std::string location;
         std::chrono::milliseconds transfer_timeout_ms{30000};
     };
 
@@ -300,8 +302,6 @@ class P2PProxy {
     P2PProxy(TransferEngine* engine, const Options& options);
     ~P2PProxy();
 
-    void* send_pool_base() const { return resources_.send_pool_base_; }
-    void* recv_pool_base() const { return resources_.recv_pool_base_; }
     PublishSlot* publish_region() const { return resources_.publish_region_; }
     CompletionSlot* completion_region() const {
         return resources_.completion_region_;
@@ -488,7 +488,8 @@ class P2PProxy {
     // For P2PDeviceWorker
     bool stepSend();
     bool stepRecv();
-    void setDeviceWorker(P2PDeviceWorker*);
+    void attachToWorker(P2PDeviceWorker* worker, P2PChunkPool* send,
+                        P2PChunkPool* recv, size_t chunk_size);
     bool hasActiveSendWork() const;
     bool hasActiveRecvWork() const;
 
@@ -510,6 +511,15 @@ class P2PProxy {
     void performSendReset(int peer_rank);
 
     void reportBrokenPeer(int peer_rank);
+
+    // These helpers are used only during reset or shutdown.
+    // In the normal execution path, task and lane resources are released
+    // incrementally as work progresses.
+    void releaseSendTaskResources(SendTransferTask& task) const;
+    void releaseRecvTaskResources(RecvTransferTask& task) const;
+    void resetSendLane(SendPeerLane& lane);
+    void resetRecvLane(RecvPeerLane& lane);
+    void resetPeerControlLanes(int peer_rank);
 
     // Control lane addressing.
     //
@@ -539,8 +549,6 @@ class P2PProxy {
 
    private:
     struct P2PResources {
-        void* send_pool_base_ = nullptr;
-        void* recv_pool_base_ = nullptr;
         PublishSlot* publish_region_ = nullptr;
         CompletionSlot* completion_region_ = nullptr;
         // Serve as RDMA write source address
@@ -556,17 +564,14 @@ class P2PProxy {
     int rank_ = 0;
     int size_ = 0;
     int cuda_device_index_ = -1;
-    std::string location_;
     std::chrono::milliseconds transfer_timeout_ms_{5000};  // 5s
     P2PResources resources_;
     bool resource_abandoned_{false};
 
     size_t chunk_size_ = 0;
-    uint32_t num_chunks_ = 0;
-    size_t pool_bytes_ = 0;
 
-    P2PChunkPool send_pool_;
-    P2PChunkPool recv_pool_;
+    P2PChunkPool* send_pool_ = nullptr;
+    P2PChunkPool* recv_pool_ = nullptr;
 
     std::queue<SendOpContext> send_queue_;
     std::mutex send_queue_mutex_;
@@ -598,13 +603,10 @@ class P2PDeviceWorker {
     void registerProxy(const std::shared_ptr<P2PProxy>&);
     void removeProxy(const std::shared_ptr<P2PProxy>&);
 
-    P2PDeviceWorker(bool is_cpu, int cuda_device_index)
-        : is_cpu_(is_cpu), cuda_device_index_(cuda_device_index) {
-        start();
-    }
+    P2PDeviceWorker(TransferEngine* engine, const std::string& location,
+                    bool is_cpu, int cuda_device_index);
 
-    ~P2PDeviceWorker() { stop(); }
-
+    ~P2PDeviceWorker();
     void wakeUpSend();
     void wakeUpRecv();
 
@@ -633,6 +635,23 @@ class P2PDeviceWorker {
 
     bool is_cpu_;
     int cuda_device_index_;
+
+    // Per-device shared chunk pools
+    //
+    // Memory footprint (with default env values):
+    //   - One direction (send or recv)    : 128 MiB
+    //   - Total per device (send + recv)  : 256 MiB
+    // This stays constant no matter how many backends or peer ranks are active.
+    TransferEngine* engine_ = nullptr;
+    P2PChunkPool send_pool_;
+    P2PChunkPool recv_pool_;
+    void* send_pool_base_ = nullptr;
+    void* recv_pool_base_ = nullptr;
+    size_t pool_bytes_ = 0;
+    size_t chunk_size_ = 0;
+    uint32_t num_chunks_ = 0;
+    void initPools(TransferEngine* engine, const std::string& location);
+    void releasePools();
 };
 
 class P2PDeviceWorkerManager {
@@ -643,8 +662,9 @@ class P2PDeviceWorkerManager {
         return *manager;
     }
 
-    std::shared_ptr<P2PDeviceWorker> getCPUWorker();
-    std::shared_ptr<P2PDeviceWorker> getCUDAWorker(int cuda_device_index);
+    std::shared_ptr<P2PDeviceWorker> getCPUWorker(TransferEngine* engine);
+    std::shared_ptr<P2PDeviceWorker> getCUDAWorker(int cuda_device_index,
+                                                   TransferEngine* engine);
 
    private:
     static constexpr int CPUWorkerID = -1;

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <thread>
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "pg_utils.h"
 
@@ -164,7 +165,6 @@ P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
       rank_(options.rank),
       size_(options.size),
       cuda_device_index_(options.cuda_device_index),
-      location_(options.location),
       transfer_timeout_ms_(options.transfer_timeout_ms) {
     if (!is_cpu_ && cuda_device_index_ < 0) {
         int current_device = -1;
@@ -196,12 +196,12 @@ void P2PProxy::extendGroupSizeTo(int new_size) {
     size_ = new_size;
 }
 
-// Allocate fixed-size SendPool, RecvPool and control regions.
+// Allocate control regions only.
+// Send/Recv chunk pools are owned by P2PDeviceWorker and shared across
+// multiple P2PProxy instances on the same device.
 void P2PProxy::allocateResources() {
     TORCH_CHECK(engine_, "P2PProxy engine is null.");
-    if (resources_.send_pool_base_ != nullptr ||
-        resources_.recv_pool_base_ != nullptr ||
-        resources_.publish_region_ != nullptr ||
+    if (resources_.publish_region_ != nullptr ||
         resources_.completion_region_ != nullptr) {
         return;
     }
@@ -209,61 +209,6 @@ void P2PProxy::allocateResources() {
     TORCH_CHECK(size_ > 0, "P2PProxy invalid group size: ", size_);
     TORCH_CHECK(static_cast<size_t>(size_) <= kMaxNumRanks,
                 "P2PProxy group size exceeds kMaxNumRanks: ", size_);
-
-    // Parse pool configuration from environment.
-    pool_bytes_ = getEnv_size_t("MOONCAKE_P2P_POOL_SIZE", kDefaultPoolSize);
-    chunk_size_ = getEnv_size_t("MOONCAKE_P2P_CHUNK_SIZE", kDefaultChunkSize);
-
-    // chunk_len is uint32_t fields in control slots
-    TORCH_CHECK(
-        chunk_size_ > 0 && chunk_size_ <= std::numeric_limits<uint32_t>::max(),
-        "Invalid MOONCAKE_P2P_CHUNK_SIZE: must be > 0 and <= 4GB");
-
-    TORCH_CHECK(
-        pool_bytes_ > 0 && pool_bytes_ % chunk_size_ == 0,
-        "Invalid pool size and chunk size (must hold 'pool_bytes_ > 0 && "
-        "pool_bytes_ % chunk_size_ == 0')");
-
-    num_chunks_ = static_cast<uint32_t>(pool_bytes_ / chunk_size_);
-    TORCH_CHECK(num_chunks_ > 0, "P2PProxy: num_chunks_ must be > 0");
-
-    if (is_cpu_) {
-        resources_.send_pool_base_ = std::malloc(pool_bytes_);
-        TORCH_CHECK(resources_.send_pool_base_ != nullptr,
-                    "Failed to allocate CPU P2P send pool");
-        int rc = engine_->registerLocalMemory(resources_.send_pool_base_,
-                                              pool_bytes_, location_);
-        TORCH_CHECK(rc == 0, "Failed to register CPU P2P send pool");
-
-        resources_.recv_pool_base_ = std::malloc(pool_bytes_);
-        TORCH_CHECK(resources_.recv_pool_base_ != nullptr,
-                    "Failed to allocate CPU P2P recv pool");
-        rc = engine_->registerLocalMemory(resources_.recv_pool_base_,
-                                          pool_bytes_, location_);
-        TORCH_CHECK(rc == 0, "Failed to register CPU P2P recv pool");
-    } else {
-        setCudaDeviceIfNeeded(
-            is_cpu_, cuda_device_index_,
-            "P2PProxy AllocateResources cudaSetDevice failed");
-        cudaError_t err = cudaMalloc(&resources_.send_pool_base_, pool_bytes_);
-        TORCH_CHECK(
-            err == cudaSuccess,
-            "Failed to allocate CUDA P2P send pool: ", cudaGetErrorString(err));
-        int rc = engine_->registerLocalMemory(resources_.send_pool_base_,
-                                              pool_bytes_, location_);
-        TORCH_CHECK(rc == 0, "Failed to register CUDA P2P send pool");
-
-        err = cudaMalloc(&resources_.recv_pool_base_, pool_bytes_);
-        TORCH_CHECK(
-            err == cudaSuccess,
-            "Failed to allocate CUDA P2P recv pool: ", cudaGetErrorString(err));
-        rc = engine_->registerLocalMemory(resources_.recv_pool_base_,
-                                          pool_bytes_, location_);
-        TORCH_CHECK(rc == 0, "Failed to register CUDA P2P recv pool");
-    }
-
-    send_pool_.init(resources_.send_pool_base_, chunk_size_, num_chunks_);
-    recv_pool_.init(resources_.recv_pool_base_, chunk_size_, num_chunks_);
 
     const size_t ctrl_slots =
         kMaxNumRanks * static_cast<size_t>(kP2PControlRingSize);
@@ -363,83 +308,14 @@ void P2PProxy::resetPeerState(int peer_rank) {
 
 // Reset sender state for peer_rank.
 void P2PProxy::performSendReset(int peer_rank) {
-    auto& lane = send_peer_lanes_[peer_rank];
-
-    // Mark all pending ops as failed and clear them.
-    for (auto& pending : lane.pending_send_ops_) {
-        pending.status_->store(OpStatus::kFailed, std::memory_order_release);
-        active_send_tasks_.fetch_sub(1, std::memory_order_release);
-    }
-    lane.pending_send_ops_.clear();
-
-    if (lane.active_send_op_.has_value()) {
-        auto& op_ctx = lane.active_send_op_.value();
-        // Free all remaining batch IDs and staging buffers.
-        for (auto& task : op_ctx.tasks_) {
-            if (task.staging_addr_ != nullptr) {
-                send_pool_.release(task.staging_addr_);
-                task.staging_addr_ = nullptr;
-            }
-            if (task.transfer_batch_id_.has_value()) {
-                engine_->freeBatchID(task.transfer_batch_id_.value());
-            }
-            if (task.completion_batch_id_.has_value()) {
-                engine_->freeBatchID(task.completion_batch_id_.value());
-            }
-        }
-        op_ctx.tasks_.clear();
-        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
-        active_send_tasks_.fetch_sub(1, std::memory_order_release);
-    }
-
-    lane.active_send_op_.reset();
-    lane.publish_consume_seq_ = 0;
-
-    auto* publish_lane = getLocalPublishLane(peer_rank);
-    auto* completion_lane = getLocalCompletionLane(peer_rank);
-    for (uint32_t i = 0; i < kP2PControlRingSize; ++i) {
-        publish_lane[i].reset();
-        completion_lane[i].reset();
-    }
+    resetSendLane(send_peer_lanes_[peer_rank]);
+    resetPeerControlLanes(peer_rank);
 }
 
 // Reset receiver state for peer_rank.
 void P2PProxy::performRecvReset(int peer_rank) {
-    auto& lane = recv_peer_lanes_[peer_rank];
-
-    // Mark all pending ops as failed and clear them.
-    for (auto& pending : lane.pending_recv_ops_) {
-        pending.status_->store(OpStatus::kFailed, std::memory_order_release);
-        active_recv_tasks_.fetch_sub(1, std::memory_order_release);
-    }
-    lane.pending_recv_ops_.clear();
-
-    if (lane.active_recv_op_.has_value()) {
-        auto& op_ctx = lane.active_recv_op_.value();
-        // Free all remaining batch IDs and recv pool chunks.
-        for (auto& task : op_ctx.tasks_) {
-            if (task.local_addr_ != nullptr) {
-                recv_pool_.release(task.local_addr_);
-            }
-            if (task.publish_batch_id_.has_value()) {
-                engine_->freeBatchID(task.publish_batch_id_.value());
-            }
-        }
-        op_ctx.tasks_.clear();
-        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
-        active_recv_tasks_.fetch_sub(1, std::memory_order_release);
-    }
-
-    lane.active_recv_op_.reset();
-    lane.publish_issue_seq_ = 0;
-    lane.completion_consume_seq_ = 0;
-
-    auto* publish_lane = getLocalPublishLane(peer_rank);
-    auto* completion_lane = getLocalCompletionLane(peer_rank);
-    for (uint32_t i = 0; i < kP2PControlRingSize; ++i) {
-        publish_lane[i].reset();
-        completion_lane[i].reset();
-    }
+    resetRecvLane(recv_peer_lanes_[peer_rank]);
+    resetPeerControlLanes(peer_rank);
 }
 
 void P2PProxy::reportBrokenPeer(int peer_rank) {
@@ -452,6 +328,82 @@ void P2PProxy::reportBrokenPeer(int peer_rank) {
                << " as broken during P2P transfer.";
 }
 
+void P2PProxy::releaseSendTaskResources(SendTransferTask& task) const {
+    if (task.staging_addr_ != nullptr) {
+        if (send_pool_) send_pool_->release(task.staging_addr_);
+        task.staging_addr_ = nullptr;
+    }
+    if (task.transfer_batch_id_.has_value()) {
+        if (engine_) engine_->freeBatchID(task.transfer_batch_id_.value());
+        task.transfer_batch_id_.reset();
+    }
+    if (task.completion_batch_id_.has_value()) {
+        if (engine_) engine_->freeBatchID(task.completion_batch_id_.value());
+        task.completion_batch_id_.reset();
+    }
+}
+
+void P2PProxy::releaseRecvTaskResources(RecvTransferTask& task) const {
+    if (task.local_addr_ != nullptr) {
+        if (recv_pool_) recv_pool_->release(task.local_addr_);
+        task.local_addr_ = nullptr;
+    }
+    if (task.publish_batch_id_.has_value()) {
+        if (engine_) engine_->freeBatchID(task.publish_batch_id_.value());
+        task.publish_batch_id_.reset();
+    }
+}
+
+void P2PProxy::resetSendLane(SendPeerLane& lane) {
+    for (auto& pending : lane.pending_send_ops_) {
+        pending.status_->store(OpStatus::kFailed, std::memory_order_release);
+        active_send_tasks_.fetch_sub(1, std::memory_order_release);
+    }
+    lane.pending_send_ops_.clear();
+
+    if (lane.active_send_op_.has_value()) {
+        auto& op_ctx = lane.active_send_op_.value();
+        for (auto& task : op_ctx.tasks_) {
+            releaseSendTaskResources(task);
+        }
+        op_ctx.tasks_.clear();
+        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
+        active_send_tasks_.fetch_sub(1, std::memory_order_release);
+        lane.active_send_op_.reset();
+    }
+    lane.publish_consume_seq_ = 0;
+}
+
+void P2PProxy::resetRecvLane(RecvPeerLane& lane) {
+    for (auto& pending : lane.pending_recv_ops_) {
+        pending.status_->store(OpStatus::kFailed, std::memory_order_release);
+        active_recv_tasks_.fetch_sub(1, std::memory_order_release);
+    }
+    lane.pending_recv_ops_.clear();
+
+    if (lane.active_recv_op_.has_value()) {
+        auto& op_ctx = lane.active_recv_op_.value();
+        for (auto& task : op_ctx.tasks_) {
+            releaseRecvTaskResources(task);
+        }
+        op_ctx.tasks_.clear();
+        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
+        active_recv_tasks_.fetch_sub(1, std::memory_order_release);
+        lane.active_recv_op_.reset();
+    }
+    lane.publish_issue_seq_ = 0;
+    lane.completion_consume_seq_ = 0;
+}
+
+void P2PProxy::resetPeerControlLanes(int peer_rank) {
+    auto* publish_lane = getLocalPublishLane(peer_rank);
+    auto* completion_lane = getLocalCompletionLane(peer_rank);
+    for (uint32_t i = 0; i < kP2PControlRingSize; ++i) {
+        publish_lane[i].reset();
+        completion_lane[i].reset();
+    }
+}
+
 void P2PProxy::releaseResources() {
     TORCH_CHECK(!resource_abandoned_,
                 "Should not release abandoned resources.");
@@ -460,93 +412,52 @@ void P2PProxy::releaseResources() {
                           "P2PProxy ReleaseResources cudaSetDevice failed");
 
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
+        // Reset lane
         auto& send_lane = send_peer_lanes_[i];
-        for (auto& copy_ready_event : send_lane.copy_ready_events_) {
-            if (copy_ready_event == nullptr) {
-                continue;
-            }
-            const cudaError_t destroy_error =
-                cudaEventDestroy(copy_ready_event);
-            TORCH_CHECK(destroy_error == cudaSuccess,
-                        "Failed to destroy pooled send copy-ready event: ",
-                        cudaGetErrorString(destroy_error));
-            copy_ready_event = nullptr;
-        }
-        send_lane.pending_send_ops_.clear();
-
-        if (send_lane.active_send_op_.has_value()) {
-            auto& op_ctx = send_lane.active_send_op_.value();
-            for (auto& task : op_ctx.tasks_) {
-                if (task.staging_addr_ != nullptr) {
-                    send_pool_.release(task.staging_addr_);
-                    task.staging_addr_ = nullptr;
-                }
-            }
-        }
-        send_lane.active_send_op_.reset();
-
         auto& recv_lane = recv_peer_lanes_[i];
-        for (auto& copy_ready_event : recv_lane.copy_ready_events_) {
-            if (copy_ready_event == nullptr) {
-                continue;
-            }
-            const cudaError_t destroy_error =
-                cudaEventDestroy(copy_ready_event);
-            TORCH_CHECK(destroy_error == cudaSuccess,
-                        "Failed to destroy pooled recv copy-ready event: ",
-                        cudaGetErrorString(destroy_error));
-            copy_ready_event = nullptr;
-        }
-        recv_lane.pending_recv_ops_.clear();
-        recv_lane.active_recv_op_.reset();
-    }
+        resetSendLane(send_lane);
+        resetRecvLane(recv_lane);
 
-    if (!engine_) {
-        return;
+        // Destroy cuda events
+        auto destroyEvents = [](auto& events) {
+            for (auto& ev : events) {
+                if (ev == nullptr) continue;
+                const cudaError_t err = cudaEventDestroy(ev);
+                TORCH_CHECK(err == cudaSuccess,
+                            "Failed to destroy pooled copy-ready event: ",
+                            cudaGetErrorString(err));
+                ev = nullptr;
+            }
+        };
+        destroyEvents(send_lane.copy_ready_events_);
+        destroyEvents(recv_lane.copy_ready_events_);
     }
 
     if (resources_.publish_staging_buf_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.publish_staging_buf_);
+        if (engine_)
+            engine_->unregisterLocalMemory(resources_.publish_staging_buf_);
         delete[] resources_.publish_staging_buf_;
         resources_.publish_staging_buf_ = nullptr;
     }
 
     if (resources_.completion_staging_buf_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.completion_staging_buf_);
+        if (engine_)
+            engine_->unregisterLocalMemory(resources_.completion_staging_buf_);
         delete[] resources_.completion_staging_buf_;
         resources_.completion_staging_buf_ = nullptr;
     }
 
     if (resources_.publish_region_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.publish_region_);
+        if (engine_) engine_->unregisterLocalMemory(resources_.publish_region_);
         delete[] resources_.publish_region_;
         resources_.publish_region_ = nullptr;
     }
 
     if (resources_.completion_region_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.completion_region_);
+        if (engine_)
+            engine_->unregisterLocalMemory(resources_.completion_region_);
         delete[] resources_.completion_region_;
         resources_.completion_region_ = nullptr;
-    }
-
-    if (resources_.send_pool_base_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.send_pool_base_);
-        if (is_cpu_) {
-            std::free(resources_.send_pool_base_);
-        } else {
-            cudaFree(resources_.send_pool_base_);
-        }
-        resources_.send_pool_base_ = nullptr;
-    }
-
-    if (resources_.recv_pool_base_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.recv_pool_base_);
-        if (is_cpu_) {
-            std::free(resources_.recv_pool_base_);
-        } else {
-            cudaFree(resources_.recv_pool_base_);
-        }
-        resources_.recv_pool_base_ = nullptr;
     }
 }
 
@@ -679,7 +590,7 @@ bool P2PProxy::tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane) {
         return false;
     }
 
-    void* local_addr = recv_pool_.acquire();
+    void* local_addr = recv_pool_->acquire();
     if (local_addr == nullptr) {
         // No free recv chunk, retry on the next iteration
         return false;
@@ -777,7 +688,7 @@ bool P2PProxy::stepRecvCopyOut(RecvTransferTask& task) {
     cudaError_t query_error = cudaEventQuery(task.copy_ready_event_);
     if (query_error == cudaSuccess) {
         task.copy_ready_event_ = nullptr;
-        recv_pool_.release(task.local_addr_);
+        recv_pool_->release(task.local_addr_);
         task.local_addr_ = nullptr;
         task.state_ = RecvTaskState::kFinished;
         return true;
@@ -847,7 +758,7 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
         return false;
     }
 
-    void* staging_addr = send_pool_.acquire();
+    void* staging_addr = send_pool_->acquire();
     if (staging_addr == nullptr) {
         return false;
     }
@@ -1026,7 +937,7 @@ bool P2PProxy::stepSendCompletion(SendOpContext& op_ctx,
     if (completion_status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(task.completion_batch_id_.value());
         task.completion_batch_id_.reset();
-        send_pool_.release(task.staging_addr_);
+        send_pool_->release(task.staging_addr_);
         task.staging_addr_ = nullptr;
         task.state_ = SendTaskState::kFinished;
         did_work = true;
@@ -1211,7 +1122,7 @@ bool P2PProxy::pollRecvCompletionSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
 
     if (is_cpu_) {
         std::memcpy(dst_ptr, src_ptr, head_task.chunk_len_);
-        recv_pool_.release(head_task.local_addr_);
+        recv_pool_->release(head_task.local_addr_);
         head_task.local_addr_ = nullptr;
         head_task.state_ = RecvTaskState::kFinished;
     } else {
@@ -1362,8 +1273,12 @@ bool P2PProxy::stepRecv() {
     return did_work;
 }
 
-void P2PProxy::setDeviceWorker(P2PDeviceWorker* worker) {
+void P2PProxy::attachToWorker(P2PDeviceWorker* worker, P2PChunkPool* send,
+                              P2PChunkPool* recv, size_t chunk_size) {
     device_worker_ = worker;
+    send_pool_ = send;
+    recv_pool_ = recv;
+    chunk_size_ = chunk_size;
 }
 
 bool P2PProxy::hasActiveSendWork() const {
@@ -1423,8 +1338,21 @@ void P2PDeviceWorker::stop() {
     }
 }
 
+P2PDeviceWorker::P2PDeviceWorker(TransferEngine* engine,
+                                 const std::string& location, bool is_cpu,
+                                 int cuda_device_index)
+    : is_cpu_(is_cpu), cuda_device_index_(cuda_device_index) {
+    initPools(engine, location);
+    start();
+}
+
+P2PDeviceWorker::~P2PDeviceWorker() {
+    stop();
+    releasePools();
+}
+
 void P2PDeviceWorker::registerProxy(const std::shared_ptr<P2PProxy>& proxy) {
-    proxy->setDeviceWorker(this);
+    proxy->attachToWorker(this, &send_pool_, &recv_pool_, chunk_size_);
     {
         std::lock_guard<std::mutex> lock(proxies_mutex_);
         proxies_.emplace_back(proxy);
@@ -1448,9 +1376,92 @@ void P2PDeviceWorker::removeProxy(const std::shared_ptr<P2PProxy>& proxy) {
         std::lock_guard<std::mutex> r_lock(recv_wakeup_mutex_);
         proxies_version_.fetch_add(1, std::memory_order_release);
     }
-    proxy->setDeviceWorker(nullptr);
     send_wakeup_cv_.notify_one();
     recv_wakeup_cv_.notify_one();
+}
+
+void P2PDeviceWorker::initPools(TransferEngine* engine,
+                                const std::string& location) {
+    engine_ = engine;
+
+    // Parse from environment variables
+    pool_bytes_ = getEnv_size_t("MOONCAKE_P2P_POOL_SIZE", kDefaultPoolSize);
+    chunk_size_ = getEnv_size_t("MOONCAKE_P2P_CHUNK_SIZE", kDefaultChunkSize);
+
+    // chunk_len is uint32_t fields in control slots
+    TORCH_CHECK(
+        chunk_size_ > 0 && chunk_size_ <= std::numeric_limits<uint32_t>::max(),
+        "Invalid MOONCAKE_P2P_CHUNK_SIZE: must be > 0 and <= 4GB");
+
+    TORCH_CHECK(
+        pool_bytes_ > 0 && pool_bytes_ % chunk_size_ == 0,
+        "Invalid pool size and chunk size (must hold 'pool_bytes_ > 0 && "
+        "pool_bytes_ % chunk_size_ == 0')");
+
+    num_chunks_ = static_cast<uint32_t>(pool_bytes_ / chunk_size_);
+    TORCH_CHECK(num_chunks_ > 0, "P2PDeviceWorker: num_chunks_ must be > 0");
+
+    if (is_cpu_) {
+        send_pool_base_ = std::malloc(pool_bytes_);
+        TORCH_CHECK(send_pool_base_ != nullptr,
+                    "Failed to allocate CPU P2P send pool");
+        int rc =
+            engine->registerLocalMemory(send_pool_base_, pool_bytes_, location);
+        TORCH_CHECK(rc == 0, "Failed to register CPU P2P send pool");
+
+        recv_pool_base_ = std::malloc(pool_bytes_);
+        TORCH_CHECK(recv_pool_base_ != nullptr,
+                    "Failed to allocate CPU P2P recv pool");
+        rc =
+            engine->registerLocalMemory(recv_pool_base_, pool_bytes_, location);
+        TORCH_CHECK(rc == 0, "Failed to register CPU P2P recv pool");
+    } else {
+        setCudaDeviceIfNeeded(is_cpu_, cuda_device_index_,
+                              "P2PDeviceWorker initPools cudaSetDevice failed");
+        cudaError_t err = cudaMalloc(&send_pool_base_, pool_bytes_);
+        TORCH_CHECK(
+            err == cudaSuccess,
+            "Failed to allocate CUDA P2P send pool: ", cudaGetErrorString(err));
+        int rc =
+            engine->registerLocalMemory(send_pool_base_, pool_bytes_, location);
+        TORCH_CHECK(rc == 0, "Failed to register CUDA P2P send pool");
+
+        err = cudaMalloc(&recv_pool_base_, pool_bytes_);
+        TORCH_CHECK(
+            err == cudaSuccess,
+            "Failed to allocate CUDA P2P recv pool: ", cudaGetErrorString(err));
+        rc =
+            engine->registerLocalMemory(recv_pool_base_, pool_bytes_, location);
+        TORCH_CHECK(rc == 0, "Failed to register CUDA P2P recv pool");
+    }
+
+    send_pool_.init(send_pool_base_, chunk_size_, num_chunks_);
+    recv_pool_.init(recv_pool_base_, chunk_size_, num_chunks_);
+}
+
+void P2PDeviceWorker::releasePools() {
+    setCudaDeviceIfNeeded(is_cpu_, cuda_device_index_,
+                          "P2PDeviceWorker releasePools cudaSetDevice failed");
+
+    if (send_pool_base_ != nullptr) {
+        if (engine_) engine_->unregisterLocalMemory(send_pool_base_);
+        if (is_cpu_) {
+            std::free(send_pool_base_);
+        } else {
+            cudaFree(send_pool_base_);
+        }
+        send_pool_base_ = nullptr;
+    }
+
+    if (recv_pool_base_ != nullptr) {
+        if (engine_) engine_->unregisterLocalMemory(recv_pool_base_);
+        if (is_cpu_) {
+            std::free(recv_pool_base_);
+        } else {
+            cudaFree(recv_pool_base_);
+        }
+        recv_pool_base_ = nullptr;
+    }
 }
 
 template <typename HasWorkFn, typename StepWorkFn>
@@ -1590,7 +1601,8 @@ void P2PDeviceWorker::wakeUpRecv() {
     recv_wakeup_cv_.notify_one();
 }
 
-std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::getCPUWorker() {
+std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::getCPUWorker(
+    TransferEngine* engine) {
     std::lock_guard<std::mutex> lock(manager_mutex_);
 
     auto it = workers_.find(CPUWorkerID);
@@ -1598,14 +1610,14 @@ std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::getCPUWorker() {
         if (auto ptr = it->second.lock()) return ptr;
     }
 
-    auto worker =
-        std::make_shared<P2PDeviceWorker>(/* is_cpu */ true, CPUWorkerID);
+    auto worker = std::make_shared<P2PDeviceWorker>(
+        engine, kWildcardLocation, /* is_cpu */ true, CPUWorkerID);
     workers_[CPUWorkerID] = worker;
     return worker;
 }
 
 std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::getCUDAWorker(
-    int cuda_device_index) {
+    int cuda_device_index, TransferEngine* engine) {
     std::lock_guard<std::mutex> lock(manager_mutex_);
 
     auto it = workers_.find(cuda_device_index);
@@ -1613,8 +1625,9 @@ std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::getCUDAWorker(
         if (auto ptr = it->second.lock()) return ptr;
     }
 
-    auto worker = std::make_shared<P2PDeviceWorker>(/* is_cpu */ false,
-                                                    cuda_device_index);
+    auto worker = std::make_shared<P2PDeviceWorker>(
+        engine, GPU_PREFIX + std::to_string(cuda_device_index),
+        /* is_cpu */ false, cuda_device_index);
     workers_[cuda_device_index] = worker;
     return worker;
 }
