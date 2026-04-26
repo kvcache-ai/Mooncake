@@ -187,7 +187,7 @@ auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
 }
 
 tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
-    MetadataShard& shard, const std::string& key, const UUID& client_id,
+    MetadataShard& shard, std::string_view key, const UUID& client_id,
     const UUID& segment_id, size_t size,
     const std::shared_ptr<P2PClientMeta>& client) {
     auto segment_res = client->QuerySegment(segment_id);
@@ -231,7 +231,7 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
                 return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
             }
         }
-        AddReplicaToSegmentIndex(shard, key, new_replica);
+        AddReplicaToSegmentIndex(shard, it->first, new_replica);
         OnReplicaAdded(new_replica);
         metadata.replicas_.push_back(std::move(new_replica));
     } else {
@@ -240,7 +240,7 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
         auto new_meta =
             std::make_unique<ObjectMetadata>(size, std::move(replicas));
         auto emplace_it =
-            shard.metadata.emplace(key, std::move(new_meta)).first;
+            shard.metadata.emplace(std::string(key), std::move(new_meta)).first;
         AddReplicaToSegmentIndex(shard, emplace_it->first,
                                  emplace_it->second->replicas_[0]);
         OnReplicaAdded(emplace_it->second->replicas_[0]);
@@ -256,7 +256,7 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
 }
 
 tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
-    MetadataShard& shard, const std::string& key, const UUID& client_id,
+    MetadataShard& shard, std::string_view key, const UUID& client_id,
     const UUID& segment_id) {
     auto it = shard.metadata.find(key);
     if (it == shard.metadata.end()) {
@@ -279,7 +279,7 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
         auto seg_id = rit->get_segment_id();
         auto cli_id = rit->get_p2p_client_id();
         if (cli_id && seg_id && cli_id == client_id && *seg_id == segment_id) {
-            RemoveReplicaFromSegmentIndex(shard, key, *rit);
+            RemoveReplicaFromSegmentIndex(shard, it->first, *rit);
             OnReplicaRemoved(*rit);
             metadata.replicas_.erase(rit);
             if (metadata.replicas_.empty()) {

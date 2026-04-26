@@ -77,8 +77,8 @@ class P2PMasterService : public MasterService {
     }
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
     // Helper to get shard index from key
-    size_t GetShardIndex(const std::string& key) const override {
-        return std::hash<std::string>{}(key) % kNumShards;
+    size_t GetShardIndex(std::string_view key) const override {
+        return std::hash<std::string_view>{}(key) % kNumShards;
     }
     size_t GetShardCount() const override { return kNumShards; }
 
@@ -91,11 +91,11 @@ class P2PMasterService : public MasterService {
 
    private:
     tl::expected<void, ErrorCode> InnerAddReplica(
-        MetadataShard& shard, const std::string& key, const UUID& client_id,
+        MetadataShard& shard, std::string_view key, const UUID& client_id,
         const UUID& segment_id, size_t size,
         const std::shared_ptr<P2PClientMeta>& client) NO_THREAD_SAFETY_ANALYSIS;
     tl::expected<void, ErrorCode> InnerRemoveReplica(
-        MetadataShard& shard, const std::string& key, const UUID& client_id,
+        MetadataShard& shard, std::string_view key, const UUID& client_id,
         const UUID& segment_id) NO_THREAD_SAFETY_ANALYSIS;
 
     std::shared_ptr<P2PClientManager> client_manager_;

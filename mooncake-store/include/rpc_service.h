@@ -25,13 +25,13 @@ class WrappedMasterService {
 
     void init_http_server();
 
-    tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
+    tl::expected<bool, ErrorCode> ExistKey(std::string_view key);
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string_view>& keys);
 
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
@@ -44,17 +44,17 @@ class WrappedMasterService {
     GetReplicaListByRegex(const std::string& str);
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const GetReplicaListRequestConfig& config =
-                                    GetReplicaListRequestConfig());
+        std::string_view key, const GetReplicaListRequestConfig& config =
+                                  GetReplicaListRequestConfig());
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
+    BatchGetReplicaList(const std::vector<std::string_view>& keys,
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig());
 
-    tl::expected<void, ErrorCode> Remove(const std::string& key);
+    tl::expected<void, ErrorCode> Remove(std::string_view key);
 
-    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
+    tl::expected<long, ErrorCode> RemoveByRegex(std::string_view str);
 
     long RemoveAll();
 

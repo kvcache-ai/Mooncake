@@ -16,26 +16,7 @@
 #include <async_simple/Promise.h>
 #include <glog/logging.h>
 
-#include "tiered_cache/tiered_backend.h"
-#include "types.h"
-
 namespace mooncake {
-
-// ============================================================================
-// LocalCopyPlan — describes a local memcpy operation
-// ============================================================================
-
-struct LocalCopyPlan {
-    AllocationHandle source_handle;
-    const char* source_ptr = nullptr;
-    size_t source_size = 0;
-    bool use_single_dest = false;
-    void* single_dest_ptr = nullptr;
-    size_t single_dest_size = 0;
-    std::vector<Slice> dest_slices;
-};
-
-ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan);
 
 // ============================================================================
 // AsyncMemcpyExecutor

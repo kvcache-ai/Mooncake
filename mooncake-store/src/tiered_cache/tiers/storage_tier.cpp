@@ -238,7 +238,7 @@ tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageTier::Commit(const std::string& key,
+tl::expected<void, ErrorCode> StorageTier::Commit(std::string_view key,
                                                   const DataSource& data) {
     auto* staging = static_cast<StorageBuffer*>(data.buffer.get());
     if (!staging) {
@@ -251,7 +251,7 @@ tl::expected<void, ErrorCode> StorageTier::Commit(const std::string& key,
 
         // Add to pending batch
         staging->SetKey(key);
-        pending_batch_[key] = staging;
+        pending_batch_.emplace(key, staging);
         pending_batch_size_.fetch_add(staging->size());
 
         // Check thresholds for async flush trigger

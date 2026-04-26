@@ -1,54 +1,8 @@
 #include "async_memcpy_executor.h"
 
 #include <algorithm>
-#include <cstring>
 
 namespace mooncake {
-
-// ============================================================================
-// ExecuteLocalCopyPlan
-// ============================================================================
-
-ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
-    if (plan.use_single_dest) {
-        if (!plan.single_dest_ptr) {
-            LOG(ERROR) << "Local copy destination buffer is null";
-            return ErrorCode::INVALID_PARAMS;
-        }
-        if (plan.single_dest_size < plan.source_size) {
-            LOG(ERROR) << "Local copy destination is too small, required="
-                       << plan.source_size
-                       << ", provided=" << plan.single_dest_size;
-            return ErrorCode::INVALID_PARAMS;
-        }
-        if (plan.source_size > 0) {
-            std::memcpy(plan.single_dest_ptr, plan.source_ptr,
-                        plan.source_size);
-        }
-        return ErrorCode::OK;
-    }
-
-    size_t offset = 0;
-    for (const auto& slice : plan.dest_slices) {
-        if (offset >= plan.source_size) break;
-        const size_t copy_size =
-            std::min(slice.size, plan.source_size - offset);
-        if (copy_size == 0) continue;
-        if (!slice.ptr) {
-            LOG(ERROR) << "Local copy destination buffer is null";
-            return ErrorCode::INVALID_PARAMS;
-        }
-        std::memcpy(slice.ptr, plan.source_ptr + offset, copy_size);
-        offset += copy_size;
-    }
-
-    if (offset != plan.source_size) {
-        LOG(ERROR) << "Local copy did not complete, copied=" << offset
-                   << ", source_size=" << plan.source_size;
-        return ErrorCode::INTERNAL_ERROR;
-    }
-    return ErrorCode::OK;
-}
 
 // ============================================================================
 // AsyncMemcpyExecutor

@@ -17,6 +17,10 @@ class PeerClient {
     tl::expected<void, ErrorCode> Connect(const std::string& endpoint);
 
     // --- Async single-key interfaces ---
+    // LIFETIME: `request` of sync read and write must remain valid
+    // until the returned Lazy coroutine completes.
+    // Otherwise, the string_view of `request` might be UAF.
+
     async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AsyncReadRemoteData(
         const RemoteReadRequest& request);
 

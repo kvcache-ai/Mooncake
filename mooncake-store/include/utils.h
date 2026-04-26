@@ -2,8 +2,10 @@
 
 #include <cstddef>
 #include <cstdlib>
-#include <string>
+#include <functional>
 #include <limits>
+#include <string>
+#include <string_view>
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
@@ -244,6 +246,16 @@ std::vector<std::string> splitString(const std::string& str,
                                      char delimiter = ',',
                                      bool trim_spaces = true,
                                      bool keep_empty = false);
+
+/// @brief Transparent hasher enabling heterogeneous string_view lookup
+/// in unordered containers keyed by std::string.
+/// std::string implicitly converts to string_view, so one overload suffices.
+struct StringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+};
 
 // Network utility functions
 

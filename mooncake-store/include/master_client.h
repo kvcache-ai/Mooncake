@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cstdlib>
 #include <boost/functional/hash.hpp>
@@ -49,7 +50,7 @@ class MasterClient {
      * @return tl::expected<bool, ErrorCode> indicating exist or not
      */
     [[nodiscard]] tl::expected<bool, ErrorCode> ExistKey(
-        const std::string& object_key);
+        std::string_view object_key);
 
     /**
      * @brief Checks if multiple objects exist
@@ -57,7 +58,7 @@ class MasterClient {
      * @return Vector containing existence status for each key
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& object_keys);
+        const std::vector<std::string_view>& object_keys);
     /**
      * @brief Gets replica list for an object
      * @param object_key Key to query
@@ -65,13 +66,13 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
-    GetReplicaList(const std::string& key,
+    GetReplicaList(std::string_view key,
                    const GetReplicaListRequestConfig& config =
                        GetReplicaListRequestConfig());
 
     [[nodiscard]] async_simple::coro::Lazy<
         tl::expected<GetReplicaListResponse, ErrorCode>>
-    AsyncGetReplicaList(const std::string& key,
+    AsyncGetReplicaList(std::string_view key,
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig());
 
@@ -79,7 +80,7 @@ class MasterClient {
      * @brief Batch query read routes
      */
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
+    BatchGetReplicaList(const std::vector<std::string_view>& keys,
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig());
 
@@ -119,7 +120,7 @@ class MasterClient {
      * @param key Key to remove
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> Remove(std::string_view key);
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
@@ -128,7 +129,7 @@ class MasterClient {
      * success, or an ErrorCode on failure.
      */
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
-        const std::string& str);
+        std::string_view str);
 
     /**
      * @brief Removes all objects and all its replicas

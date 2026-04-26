@@ -122,7 +122,7 @@ void ClientScheduler::Stop() {
     }
 }
 
-void ClientScheduler::OnAccess(const std::string& key) {
+void ClientScheduler::OnAccess(std::string_view key) {
     if (stats_collector_) {
         stats_collector_->RecordAccess(key);
     }
@@ -135,14 +135,14 @@ AccessStats ClientScheduler::GetHotKeyStats() const {
     return {};
 }
 
-void ClientScheduler::OnCommit(const std::string& key, UUID tier_id,
+void ClientScheduler::OnCommit(std::string_view key, UUID tier_id,
                                size_t size_bytes) {
     auto& shard = GetKeyCacheShard(key);
     MutexLocker lock(&shard.mutex);
     TrackReplicaLocked(shard, key, tier_id, size_bytes);
 }
 
-void ClientScheduler::OnDelete(const std::string& key,
+void ClientScheduler::OnDelete(std::string_view key,
                                std::optional<UUID> tier_id) {
     bool remove_stats = false;
     {
@@ -358,9 +358,14 @@ size_t ClientScheduler::GetCachedKeySize(const std::string& key) const {
 }
 
 void ClientScheduler::TrackReplicaLocked(KeyCacheShard& shard,
-                                         const std::string& key, UUID tier_id,
+                                         std::string_view key, UUID tier_id,
                                          size_t size_bytes) {
-    auto& state = shard.key_cache[key];
+    auto cache_it = shard.key_cache.find(key);
+    if (cache_it == shard.key_cache.end()) {
+        cache_it =
+            shard.key_cache.emplace(std::string(key), CachedKeyState{}).first;
+    }
+    auto& state = cache_it->second;
     state.size_bytes = size_bytes;
 
     const auto existing_it = std::find(state.current_locations.begin(),
@@ -369,22 +374,32 @@ void ClientScheduler::TrackReplicaLocked(KeyCacheShard& shard,
         state.current_locations.push_back(tier_id);
     }
 
-    shard.tier_resident_keys[tier_id].insert(key);
+    auto& tier_set = shard.tier_resident_keys[tier_id];
+    if (tier_set.find(key) == tier_set.end()) {
+        tier_set.emplace(std::string(key));
+    }
 }
 
 bool ClientScheduler::RemoveReplicaLocked(KeyCacheShard& shard,
-                                          const std::string& key,
+                                          std::string_view key,
                                           std::optional<UUID> tier_id) {
     auto cache_it = shard.key_cache.find(key);
     if (cache_it == shard.key_cache.end()) {
         return true;
     }
 
+    auto erase_resident = [&](auto& resident_set) {
+        auto rit = resident_set.find(key);
+        if (rit != resident_set.end()) {
+            resident_set.erase(rit);
+        }
+    };
+
     if (!tier_id.has_value()) {
         for (const auto& resident_tier : cache_it->second.current_locations) {
             auto resident_it = shard.tier_resident_keys.find(resident_tier);
             if (resident_it != shard.tier_resident_keys.end()) {
-                resident_it->second.erase(key);
+                erase_resident(resident_it->second);
             }
         }
         shard.key_cache.erase(cache_it);
@@ -399,7 +414,7 @@ bool ClientScheduler::RemoveReplicaLocked(KeyCacheShard& shard,
 
     auto resident_it = shard.tier_resident_keys.find(tier_id.value());
     if (resident_it != shard.tier_resident_keys.end()) {
-        resident_it->second.erase(key);
+        erase_resident(resident_it->second);
     }
 
     if (current_locations.empty()) {

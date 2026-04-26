@@ -380,7 +380,7 @@ void CentralizedMasterService::OnReplicaAdded(const Replica& replica) {
 }
 
 auto CentralizedMasterService::GetReplicaList(
-    const std::string& key, const GetReplicaListRequestConfig& config)
+    std::string_view key, const GetReplicaListRequestConfig& config)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     auto res = MasterService::GetReplicaList(key, config);
     if (!res) {

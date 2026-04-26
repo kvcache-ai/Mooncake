@@ -889,7 +889,7 @@ TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
     // Re-init backend with a counting callback
     std::atomic<int> commit_count{0};
     AddReplicaCallback counting_cb =
-        [&commit_count](const std::string&, const UUID&,
+        [&commit_count](std::string_view, const UUID&,
                         size_t) -> tl::expected<void, ErrorCode> {
         commit_count.fetch_add(1);
         return {};
