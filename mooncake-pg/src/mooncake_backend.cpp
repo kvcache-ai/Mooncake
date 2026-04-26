@@ -307,8 +307,8 @@ MooncakeBackend::MooncakeBackend(
     } else {
         meta_->activeRanksTensor =
             at::ones({max_size},
-                     torch::dtype(torch::kInt32).device(isCpu ? torch::kCPU
-                                                            : torch::kCUDA));
+                     torch::dtype(torch::kInt32)
+                         .device(isCpu ? torch::kCPU : torch::kCUDA));
         if (max_size != size) {
             meta_->activeRanksTensor.slice(0, size, max_size).fill_(0);
         }
