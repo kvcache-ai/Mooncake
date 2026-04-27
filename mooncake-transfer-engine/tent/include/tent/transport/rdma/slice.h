@@ -33,6 +33,7 @@
 namespace mooncake {
 namespace tent {
 struct RdmaSlice;
+class RailMonitor;
 
 struct RdmaSliceList {
     RdmaSlice* first = nullptr;
@@ -71,9 +72,13 @@ struct RdmaSlice {
     bool failed = false;
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
-    // Cached target machine_id, set in generatePostPath so that
-    // asyncPollCq can call markRecovered on success without a segment lookup.
-    std::string target_machine_id;
+    // Non-owning pointer to the per-worker RailMonitor for this slice's
+    // target machine, resolved once in generatePostPath. Lets asyncPollCq
+    // and disableEndpoint call markRecovered / markFailed without a
+    // string-keyed map lookup on the RDMA hot path. Stable because
+    // WorkerContext::rails stores values via unique_ptr, so rehashes do
+    // not invalidate the pointee.
+    RailMonitor* rail_monitor = nullptr;
 };
 
 using RdmaSliceStorage = Slab<RdmaSlice>;
