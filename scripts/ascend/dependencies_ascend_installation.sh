@@ -35,11 +35,12 @@ git_with_github_mirror_fallback() {
 }
 
 clone_repo_if_not_exists() {
-    local repo_dir=$1
-    local repo_url=$2
+    local repo_dir="$1"
+    local repo_url="$2"
+    shift 2
 
     if [ ! -d "$repo_dir" ]; then
-        git_with_github_mirror_fallback "$repo_dir" "$repo_url"
+        git_with_github_mirror_fallback "$repo_dir" "$repo_url" "$@"
     else
         echo "Directory $repo_dir already exists, skipping clone."
     fi
@@ -117,7 +118,7 @@ elif command -v yum &> /dev/null; then
     cd ../..
 
     # Install msgpack-c
-    clone_repo_if_not_exists "msgpack" "https://github.com/msgpack/msgpack-c.git"
+    clone_repo_if_not_exists "msgpack-c" "https://github.com/msgpack/msgpack-c.git"
     cd msgpack-c || exit
     git checkout cpp-7.0.0
     rm -rf build
