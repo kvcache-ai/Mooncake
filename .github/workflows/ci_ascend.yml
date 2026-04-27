@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       checkout_ref:
-        description: 'Git ref to checkout (PR head SHA for pull_request_target)'
+        description: 'Git ref to checkout (PR head SHA)'
         required: false
         type: string
 

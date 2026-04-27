@@ -18,12 +18,27 @@
 
 #!/bin/bash
 
+# Try git clone with GitHub mirror fallback via https://ghfast.top/
+git_with_github_mirror_fallback() {
+    local repo_dir="$1"
+    local repo_url="$2"
+    shift 2
+
+    if git clone "$repo_url" "$@"; then
+        return 0
+    fi
+
+    echo "Direct clone failed, retrying with mirror https://ghfast.top/"
+    local mirror_url="https://ghfast.top/${repo_url}"
+    git clone "$mirror_url" "$@"
+}
+
 clone_repo_if_not_exists() {
     local repo_dir=$1
     local repo_url=$2
 
     if [ ! -d "$repo_dir" ]; then
-        git clone "$repo_url"
+        git_with_github_mirror_fallback "$repo_dir" "$repo_url"
     else
         echo "Directory $repo_dir already exists, skipping clone."
     fi
