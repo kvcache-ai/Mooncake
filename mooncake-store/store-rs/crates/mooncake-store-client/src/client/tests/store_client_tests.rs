@@ -231,6 +231,7 @@ fn batch_is_exist_reflects_put_and_remove() {
 struct RecordingRouteDirectory {
     single_calls: AtomicUsize,
     batch_calls: AtomicUsize,
+    bounded_batch_calls: AtomicUsize,
     last_batch_len: AtomicUsize,
 }
 
@@ -271,6 +272,16 @@ impl RouteDirectory for RecordingRouteDirectory {
         Ok(keys.iter().map(Self::route_for).collect())
     }
 
+    fn get_object_routes_bounded(
+        &self,
+        _observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.bounded_batch_calls.fetch_add(1, Ordering::Relaxed);
+        self.last_batch_len.store(keys.len(), Ordering::Relaxed);
+        Ok(keys.iter().map(Self::route_for).collect())
+    }
+
     fn compare_and_swap_object_route(
         &self,
         _observer: &ClientLease,
@@ -301,7 +312,8 @@ fn batch_is_exist_uses_batched_route_lookup() {
         .expect("batch_is_exist should succeed");
 
     assert_eq!(exists, vec![true, false, true]);
-    assert_eq!(directory.batch_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(directory.bounded_batch_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(directory.batch_calls.load(Ordering::Relaxed), 0);
     assert_eq!(directory.last_batch_len.load(Ordering::Relaxed), 3);
     assert_eq!(directory.single_calls.load(Ordering::Relaxed), 0);
 }

@@ -674,6 +674,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn publish_labeled_client(
         metadata: &InMemoryMetadataBackend,
         stable_id: &str,

@@ -787,8 +787,8 @@ mod tests {
                 operation["operation"]
                     == serde_json::Value::String("storage_owner_background_eviction".to_string())
                     && operation["status"] == serde_json::Value::String("ok".to_string())
-                    && operation["bytes_in_total"] == serde_json::Value::from(32_u64)
-                    && operation["bytes_out_total"] == serde_json::Value::from(64_u64)
+                    && operation["bytes_in_total"] == 32_u64
+                    && operation["bytes_out_total"] == 64_u64
             }),
             "stats json should include the recorded eviction operation"
         );
@@ -799,8 +799,8 @@ mod tests {
         assert!(
             runtimes.iter().any(|entry| {
                 entry["runtime"] == serde_json::Value::String(runtime.runtime.to_string())
-                    && entry["heartbeat_consecutive_failures"] == serde_json::Value::from(2_u64)
-                    && entry["heartbeat_last_success_ms"] == serde_json::Value::from(456_789_u64)
+                    && entry["heartbeat_consecutive_failures"] == 2_u64
+                    && entry["heartbeat_last_success_ms"] == 456_789_u64
             }),
             "stats json should include heartbeat health for the recorded runtime"
         );

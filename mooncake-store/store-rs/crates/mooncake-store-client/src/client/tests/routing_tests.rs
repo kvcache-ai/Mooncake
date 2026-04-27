@@ -35,7 +35,7 @@ fn build_local_writer(
     let t = Arc::new(transport.peer(&format!("{stable_id}-seg")));
     let client = StoreClientBuilder::new(meta.clone(), stable_id)
         .state(ClientLifecycleState::Active)
-        .segment_name(&format!("{stable_id}-seg"))
+        .segment_name(format!("{stable_id}-seg"))
         .transport(t)
         .live_client_sync_interval(fast_live_client_sync_interval())
         .local_memory(storage_config_with_bytes(storage_bytes))

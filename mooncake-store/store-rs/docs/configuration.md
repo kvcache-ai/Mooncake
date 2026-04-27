@@ -210,6 +210,8 @@ Reconnect behavior:
 
 Use `MetadataOnly` for bring-up and debugging. Use `EmbeddedWrh` for normal deployments.
 
+Embedded route authorities maintain in-memory indexes for scope and reuse-identity lookups. Hot-path existence and prefix-reuse queries resolve through exact route-authority reads instead of scanning the metadata backend or the full local route map. Batched existence checks stop at the mirrored `route_topk` authority set, so common misses do not fan out to every live authority.
+
 ### Route authority policy
 
 `route_topk` controls how many WRH-ranked route authorities each key uses.
