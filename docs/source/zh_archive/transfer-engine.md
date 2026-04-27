@@ -396,6 +396,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_IB_TC` 当使用`RDMA`通信协议时，在交换机和网卡默认配置不一致场景/需要流量规划场景下，可能需要修改 RDMA 网卡的 Traffic Class 配置，默认值 -1
 - `MC_IB_PCI_RELAXED_ORDERING` 将网络适配器的PCIe顺序设置为放宽有时会带来更好的性能。可设置 1 以启用RO功能，默认值 0
 - `MC_GID_INDEX` 每个设备实例使用的 GID 序号，默认值 3（或平台支持的最大值）
+- `MC_PKEY_INDEX` QP 转换到 INIT 状态时使用的 `pkey_index`（partition key 表索引）。有效范围：0 到 65535，默认值 0。当 fabric 所需的 partition key 不在 HCA pkey 表的 0 号位置时需要设置该值
 - `MC_MAX_CQE_PER_CTX` 每个设备实例中 CQ 缓冲区大小，默认值 4096
 - `MC_MAX_EP_PER_CTX` 每个设备实例中活跃 EndPoint 数量上限，默认值 65536。**注意：** 小于 0.3.7.post1 的版本，这里默认值是 256，但是无法手动设置为 65536，最大值支持 65535！请注意
 - `MC_NUM_QP_PER_EP` 每个 EndPoint 中 QP 数量，数量越多则细粒度 I/O 性能越好，默认值 2
