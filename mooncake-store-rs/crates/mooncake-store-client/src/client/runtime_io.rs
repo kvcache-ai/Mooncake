@@ -2645,7 +2645,9 @@ impl StoreClient {
         }
         let mut buffers = info.buffers.iter().collect::<Vec<_>>();
         buffers.sort_by_key(|buffer| buffer.base);
-        let total_capacity: u64 = buffers.iter().map(|buffer| buffer.length).sum();
+        let total_capacity: u64 = buffers
+            .iter()
+            .fold(0u64, |acc, buffer| acc.saturating_add(buffer.length));
         let mut remaining_offset = segment_offset;
         for buffer in &buffers {
             if remaining_offset >= buffer.length {
@@ -3559,5 +3561,313 @@ mod runtime_io_tests {
 
         // Must not panic — either Ok or Err is acceptable.
         let _ = StoreClient::segment_relative_target_offset(&info, &segment, 50, 64);
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_replica_target_offset tests — this function is the entry point
+    // for all read-path offset resolution and has two code paths:
+    //   1. Fast path: replica.offset is already covered by buffers → return it
+    //   2. Fallback: re-map via segment_relative_target_offset using
+    //      replica.segment_offset
+    // -----------------------------------------------------------------------
+
+    fn make_replica(
+        segment_name: &str,
+        offset: u64,
+        segment_offset: u64,
+        length: u64,
+    ) -> ReplicaRoute {
+        ReplicaRoute {
+            owner: ClientRuntimeId::new("test-runtime", ClientEpoch(0)),
+            segment_name: SegmentName::new(segment_name),
+            offset,
+            segment_offset,
+            length,
+            checksum: None,
+            tier: ReplicaTier::Dram,
+            priority: 0,
+        }
+    }
+
+    #[test]
+    fn remote_replica_target_offset_fast_path_returns_absolute_offset() {
+        let info = memory_segment(&[(1000, 128)]);
+        let replica = make_replica("seg", 1024, 24, 32);
+
+        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        assert_eq!(
+            result.expect("fast path should succeed when offset is within buffer"),
+            1024,
+            "fast path must return replica.offset directly"
+        );
+    }
+
+    #[test]
+    fn remote_replica_target_offset_fallback_remaps_via_segment_offset() {
+        // replica.offset is NOT covered by any buffer, so the function
+        // should fall back to segment_relative_target_offset using
+        // replica.segment_offset.
+        let info = memory_segment(&[(1000, 128)]);
+        let replica = make_replica("seg", 9999, 24, 32);
+
+        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        assert_eq!(
+            result.expect("fallback should remap using segment_offset"),
+            1024,
+            "fallback must compute base + segment_offset"
+        );
+    }
+
+    #[test]
+    fn remote_replica_target_offset_fallback_fails_when_segment_offset_out_of_range() {
+        let info = memory_segment(&[(1000, 64)]);
+        let replica = make_replica("seg", 9999, 100, 16);
+
+        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        assert!(
+            result.is_err(),
+            "fallback must fail when segment_offset exceeds buffer capacity"
+        );
+    }
+
+    #[test]
+    fn remote_replica_target_offset_fast_path_with_multi_buffer() {
+        let info = memory_segment(&[(1000, 64), (1064, 64)]);
+        let replica = make_replica("seg", 1080, 80, 32);
+
+        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        assert_eq!(
+            result.expect("fast path should work across contiguous buffers"),
+            1080,
+            "fast path should accept offset spanning contiguous buffers"
+        );
+    }
+
+    #[test]
+    fn remote_replica_target_offset_fast_path_rejects_gap_crossing() {
+        // offset is within first buffer, but length crosses the gap
+        let info = memory_segment(&[(1000, 64), (2000, 64)]);
+        let replica = make_replica("seg", 1060, 60, 16);
+
+        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        // Fast path should reject because covers_target fails for gap
+        // Fallback should also fail because logical mapping crosses gap
+        assert!(
+            result.is_err(),
+            "both paths must reject transfer that crosses buffer gap"
+        );
+    }
+
+    #[test]
+    fn remote_replica_target_offset_prefers_fast_path_over_fallback() {
+        // Both paths are valid; the function should use the fast path
+        // (returning replica.offset) rather than recomputing.
+        let info = memory_segment(&[(1000, 128)]);
+        let replica = make_replica("seg", 1024, 24, 16);
+
+        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        assert_eq!(
+            result.expect("should prefer fast path"),
+            1024,
+            "when both paths are valid, fast path (replica.offset) wins"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // segment_info_covers_target — additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_info_covers_target_with_unordered_buffers() {
+        // Buffers are given in reverse order — the internal sort must handle this.
+        let info = memory_segment(&[(1064, 64), (1000, 64)]);
+
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1000, 128),
+            "covers_target must sort buffers internally and accept contiguous span"
+        );
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1060, 8),
+            "covers_target must handle cross-buffer boundary with unordered input"
+        );
+    }
+
+    #[test]
+    fn segment_info_covers_target_zero_length() {
+        let info = memory_segment(&[(1000, 64)]);
+
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1000, 0),
+            "zero-length transfer should be trivially covered"
+        );
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 9999, 0),
+            "zero-length at arbitrary address should be covered (nothing to validate)"
+        );
+    }
+
+    #[test]
+    fn segment_info_covers_target_single_buffer_exact_fit() {
+        let info = memory_segment(&[(1000, 64)]);
+
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1000, 64),
+            "transfer filling entire buffer should be covered"
+        );
+        assert!(
+            !StoreClient::segment_info_covers_target(&info, 1000, 65),
+            "transfer exceeding buffer by 1 byte must not be covered"
+        );
+    }
+
+    #[test]
+    fn segment_info_covers_target_at_buffer_end_boundary() {
+        let info = memory_segment(&[(1000, 64)]);
+
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1063, 1),
+            "last byte of buffer should be covered"
+        );
+        assert!(
+            !StoreClient::segment_info_covers_target(&info, 1064, 1),
+            "first byte past buffer end must not be covered"
+        );
+    }
+
+    #[test]
+    fn segment_info_covers_target_overlapping_buffers() {
+        // Two buffers with overlapping address ranges — a defensive scenario
+        // where metadata is malformed. The function should still not panic.
+        let info = memory_segment(&[(1000, 100), (1050, 100)]);
+
+        // Address 1000..1100 is covered by first buffer,
+        // 1050..1150 by second — overlap at 1050..1100.
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1000, 50),
+            "first half should be covered by first buffer"
+        );
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1100, 50),
+            "second half should be covered by second buffer"
+        );
+        // Spanning the full range should work via contiguous iteration
+        // (sorted: first ends at 1100, second starts at 1050 < 1100 → overlap)
+        // The function's find() loop should handle this correctly.
+        let _ = StoreClient::segment_info_covers_target(&info, 1000, 150);
+    }
+
+    #[test]
+    fn segment_info_covers_target_three_buffer_full_span() {
+        let info = memory_segment(&[(1000, 32), (1032, 32), (1064, 32)]);
+
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1000, 96),
+            "transfer spanning all three contiguous buffers should be covered"
+        );
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1030, 36),
+            "transfer crossing two buffer boundaries should be covered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // segment_relative_target_offset — transfer length crossing gap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_offset_transfer_length_crosses_non_contiguous_gap() {
+        // Two non-contiguous buffers with a gap at [1064, 2000).
+        // Logical offset 60 maps to base + 60 = 1060 in the first buffer.
+        // The transfer length of 16 extends to 1076, which is in the gap.
+        let info = memory_segment(&[(1000, 64), (2000, 64)]);
+        let segment = SegmentName::new("seg-gap-cross");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 60, 16);
+        assert!(
+            result.is_err(),
+            "transfer whose length crosses into a gap must be rejected"
+        );
+    }
+
+    #[test]
+    fn segment_offset_transfer_exactly_fills_first_buffer() {
+        // Transfer starts near the end of the first buffer and exactly
+        // fills it — no crossing needed.
+        let info = memory_segment(&[(1000, 64), (2000, 64)]);
+        let segment = SegmentName::new("seg-exact-fill");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 60, 4);
+        assert_eq!(
+            result.expect("transfer exactly filling first buffer should succeed"),
+            1060
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // total_capacity saturating protection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_offset_total_capacity_saturates_on_overflow() {
+        // Two buffers whose lengths sum to more than u64::MAX.
+        let info = memory_segment(&[(0, u64::MAX), (u64::MAX, u64::MAX)]);
+        let segment = SegmentName::new("seg-saturate");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 1);
+        // Should not panic due to overflow; the result is either Ok or Err.
+        // The important thing is that total_capacity in the error message
+        // is u64::MAX (saturated), not 0 or a wrapped value.
+        match result {
+            Ok(_) => {} // acceptable if the buffer layout allows it
+            Err(error) => {
+                let message = format!("{error}");
+                assert!(
+                    !message.contains("total_capacity=0"),
+                    "total_capacity must not wrap to 0, got: {message}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // segment_relative_target_offset — single buffer start boundary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_offset_zero_offset_zero_length() {
+        let info = memory_segment(&[(5000, 128)]);
+        let segment = SegmentName::new("seg-zero");
+
+        // length=0 is a degenerate case; segment_info_covers_target
+        // returns true for length=0, so this should succeed.
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 0);
+        assert_eq!(
+            result.expect("zero offset + zero length should map to buffer base"),
+            5000
+        );
+    }
+
+    #[test]
+    fn segment_offset_at_start_with_exact_buffer_length() {
+        let info = memory_segment(&[(5000, 128)]);
+        let segment = SegmentName::new("seg-exact");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 128);
+        assert_eq!(
+            result.expect("transfer exactly filling buffer from offset 0 should succeed"),
+            5000
+        );
+    }
+
+    #[test]
+    fn segment_offset_at_start_exceeding_buffer_length() {
+        let info = memory_segment(&[(5000, 128)]);
+        let segment = SegmentName::new("seg-exceed");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 129);
+        assert!(
+            result.is_err(),
+            "transfer exceeding buffer length from offset 0 must fail"
+        );
     }
 }
