@@ -69,12 +69,20 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* pkey_index_env = std::getenv("MC_PKEY_INDEX");
     if (pkey_index_env) {
-        int val = atoi(pkey_index_env);
-        if (val >= 0 && val <= UINT16_MAX)
-            config.pkey_index = static_cast<uint16_t>(val);
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PKEY_INDEX";
+        try {
+            int val = std::stoi(pkey_index_env);
+            if (val >= 0 && val <= UINT16_MAX) {
+                config.pkey_index = static_cast<uint16_t>(val);
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_PKEY_INDEX, "
+                    << "value " << pkey_index_env
+                    << " out of range (should be 0-65535)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_PKEY_INDEX environment value: "
+                         << pkey_index_env << ". Error: " << e.what();
+        }
     }
 
     const char* max_cqe_per_ctx_env = std::getenv("MC_MAX_CQE_PER_CTX");

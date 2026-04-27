@@ -64,14 +64,19 @@ TEST_F(PkeyIndexEnvTest, NegativeIsIgnored) {
 }
 
 TEST_F(PkeyIndexEnvTest, NonNumericKeepsDefault) {
-    // atoi() parses "abc" as 0, which is in range — so the override
-    // succeeds and lands at 0. Pinning this behavior catches accidental
-    // changes to the parser.
     ASSERT_EQ(::setenv("MC_PKEY_INDEX", "abc", 1), 0);
     GlobalConfig config;
     config.pkey_index = 9;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.pkey_index, 0);
+    EXPECT_EQ(config.pkey_index, 9);
+}
+
+TEST_F(PkeyIndexEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_PKEY_INDEX", "", 1), 0);
+    GlobalConfig config;
+    config.pkey_index = 4;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.pkey_index, 4);
 }
 
 }  // namespace
