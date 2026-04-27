@@ -417,6 +417,7 @@ void dumpGlobalConfig() {
               << config.num_comp_channels_per_ctx;
     LOG(INFO) << "port = " << config.port;
     LOG(INFO) << "gid_index = " << config.gid_index;
+    LOG(INFO) << "pkey_index = " << config.pkey_index;
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
