@@ -29,7 +29,11 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     // Mem Storage Metrics
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
+    auto ratio = metrics.get_global_used_ratio();
+    ASSERT_EQ(ratio.size(), 3u);
+    ASSERT_DOUBLE_EQ(ratio[0], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[1], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[2], 0.0);
 
     // File Storage Metrics
     ASSERT_EQ(metrics.get_allocated_file_size(), 0);
@@ -142,11 +146,19 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
+    auto ratio = metrics.get_global_used_ratio();
+    ASSERT_EQ(ratio.size(), 3u);
+    ASSERT_DOUBLE_EQ(ratio[0], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[1], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[2], 0.0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
+    ratio = metrics.get_segment_used_ratio(segment.name);
+    ASSERT_EQ(ratio.size(), 3u);
+    ASSERT_DOUBLE_EQ(ratio[0], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[1], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[2], 0.0);
     ASSERT_EQ(metrics.get_mount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
@@ -238,14 +250,29 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
-    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+    ratio = metrics.get_global_used_ratio();
+    ASSERT_EQ(ratio.size(), 3u);
+    ASSERT_DOUBLE_EQ(ratio[0], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[1], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[2], 0.0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
+    ratio = metrics.get_segment_used_ratio(segment.name);
+    ASSERT_EQ(ratio.size(), 3u);
+    ASSERT_DOUBLE_EQ(ratio[0], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[1], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[2], 0.0);
 
     // check segment mem used ratio for non-existent segment
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(""), 0.0);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
+    ratio = metrics.get_segment_used_ratio("");
+    ASSERT_EQ(ratio.size(), 3u);
+    ASSERT_DOUBLE_EQ(ratio[0], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[1], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[2], 0.0);
+    ratio = metrics.get_segment_used_ratio("xxxxxx_segment");
+    ASSERT_EQ(ratio.size(), 3u);
+    ASSERT_DOUBLE_EQ(ratio[0], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[1], 0.0);
+    ASSERT_DOUBLE_EQ(ratio[2], 0.0);
 }
 
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {

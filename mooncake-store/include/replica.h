@@ -90,6 +90,7 @@ struct ReplicateConfig {
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
+    StorageLevel preferred_storage_level{StorageLevel::RAM};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -107,7 +108,9 @@ struct ReplicateConfig {
                << config.preferred_segment;
         }
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node << " }";
+           << config.prefer_alloc_in_same_node;
+        os << ", preferred_storage_level: "
+           << static_cast<int>(config.preferred_storage_level) << " }";
         return os;
     }
 };
@@ -153,6 +156,10 @@ class Replica {
     Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status)
         : id_(next_id_.fetch_add(1)),
           data_(MemoryReplicaData{std::move(buffer)}),
+          storage_level_(
+              std::get<MemoryReplicaData>(data_).buffer
+                  ? std::get<MemoryReplicaData>(data_).buffer->getStorageLevel()
+                  : StorageLevel::RAM),
           status_(status),
           refcnt_(0) {}
 
@@ -160,6 +167,7 @@ class Replica {
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
         : id_(next_id_.fetch_add(1)),
           data_(DiskReplicaData{std::move(file_path), object_size}),
+          storage_level_(StorageLevel::SSD),
           status_(status),
           refcnt_(0) {
         // Automatic update allocated_file_size via RAII
@@ -170,6 +178,7 @@ class Replica {
             std::string transport_endpoint, ReplicaStatus status)
         : data_(LocalDiskReplicaData{client_id, object_size,
                                      std::move(transport_endpoint)}),
+          storage_level_(StorageLevel::SSD),
           status_(status) {}
 
     ~Replica() {
@@ -188,6 +197,7 @@ class Replica {
     Replica(Replica&& src) noexcept
         : id_(src.id_),
           data_(std::move(src.data_)),
+          storage_level_(src.storage_level_),
           status_(src.status_),
           refcnt_(src.refcnt_.exchange(0)) {
         // Mark the source as moved-from so its destructor doesn't
@@ -210,6 +220,7 @@ class Replica {
 
         id_ = src.id_;
         data_ = std::move(src.data_);
+        storage_level_ = src.storage_level_;
         status_ = src.status_;
         refcnt_.store(src.refcnt_.exchange(0));
         // Mark src as moved-from.
@@ -323,10 +334,15 @@ class Replica {
         ReplicaID id;
         std::variant<MemoryDescriptor, DiskDescriptor, LocalDiskDescriptor>
             descriptor_variant;
+        StorageLevel storage_level;
         ReplicaStatus status;
-        YLT_REFL(Descriptor, id, descriptor_variant, status);
+        YLT_REFL(Descriptor, id, descriptor_variant, storage_level, status);
 
         // Helper functions
+        StorageLevel get_storage_level() const noexcept {
+            return storage_level;
+        }
+
         bool is_memory_replica() noexcept {
             return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
         }
@@ -406,6 +422,7 @@ class Replica {
     ReplicaID id_;
     std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
         data_;
+    StorageLevel storage_level_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
     friend class Serializer<Replica>;
@@ -417,6 +434,7 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
     desc.id = id_;
     desc.status = status_;
+    desc.storage_level = storage_level_;
 
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);

@@ -335,18 +335,22 @@ class WrappedMasterServiceConfig {
         }
 
         // Convert string allocation_strategy to AllocationStrategyType enum
+        // Note: CXL strategy is automatically selected when
+        // preferred_storage_level is CXL, so it's not configurable here. This
+        // config only controls RAM storage allocation strategy (RANDOM or
+        // FREE_RATIO_FIRST).
         if (config.allocation_strategy == "free_ratio_first") {
             allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
-        } else if (config.allocation_strategy == "cxl") {
-            allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
-                         << "Valid options are: random, free_ratio_first, cxl "
-                            "(case-sensitive)";
+                         << "Valid options are: random, free_ratio_first "
+                            "(case-sensitive). "
+                         << "Note: CXL strategy is automatically selected "
+                            "when preferred_storage_level is CXL.";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
@@ -757,8 +761,6 @@ class MasterServiceConfig {
 
     // From WrappedMasterServiceConfig
     MasterServiceConfig(const WrappedMasterServiceConfig& config) {
-        auto cxl_allocator_type = BufferAllocatorType::CACHELIB;
-
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
@@ -773,8 +775,7 @@ class MasterServiceConfig {
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
-        memory_allocator =
-            config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
+        memory_allocator = config.memory_allocator;
         allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;

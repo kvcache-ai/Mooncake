@@ -12,6 +12,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "master_metric_manager.h"
+#include "replica.h"
 #include "segment.h"
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
@@ -177,7 +178,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     if (enable_cxl_) {
-        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        // When CXL is enabled:
+        // - RAM storage uses RandomAllocationStrategy (original single-protocol
+        // strategy)
+        // - CXL storage uses CxlAllocationStrategy
+        cxl_allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
@@ -797,9 +802,19 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             preferred_segments = config.preferred_segments;
         }
 
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, slice_length, config.replica_num,
-            preferred_segments);
+        // Select allocation strategy based on preferred_storage_level
+        // - CXL storage level uses CxlAllocationStrategy when CXL is enabled
+        // - RAM storage level uses the configured
+        // allocation strategy (RANDOM or FREE_RATIO_FIRST)
+        std::shared_ptr<AllocationStrategy> strategy = allocation_strategy_;
+        if (enable_cxl_ &&
+            config.preferred_storage_level == StorageLevel::CXL) {
+            strategy = cxl_allocation_strategy_;
+        }
+
+        auto allocation_result =
+            strategy->Allocate(allocator_manager, slice_length,
+                               config.replica_num, preferred_segments);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate all replicas for key=" << key
@@ -1809,20 +1824,21 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
-        double used_ratio =
-            MasterMetricManager::instance().get_global_mem_used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
+        std::vector<double> used_ratios =
+            MasterMetricManager::instance().get_global_used_ratio();
+        if (used_ratios[0] > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
-            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
+            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratios[0]
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_eviction=" << need_eviction_
                       << " eviction_ratio=" << eviction_ratio_;
-            double evict_ratio_target = std::max(
-                eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
+            double evict_ratio_target =
+                std::max(eviction_ratio_, used_ratios[0] -
+                                              eviction_high_watermark_ratio_ +
+                                              eviction_ratio_);
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
-                         used_ratio - eviction_high_watermark_ratio_);
+                         used_ratios[0] - eviction_high_watermark_ratio_);
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;

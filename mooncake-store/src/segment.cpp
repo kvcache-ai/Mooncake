@@ -13,27 +13,23 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     // Check if cxl storage is enable
     if (segment_manager_->enable_cxl_ && segment.protocol == "cxl") {
         LOG(INFO) << "Start Mounting CXL Segment.";
-        if (segment_manager_->memory_allocator_ ==
-            BufferAllocatorType::CACHELIB) {
-            auto allocator = segment_manager_->cxl_global_allocator_;
-            if (segment_manager_->cxl_global_allocator_ == nullptr) {
-                LOG(ERROR) << "Cxl global allocator has not been initialized.";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-            segment_manager_->allocator_manager_.addAllocator(segment.name,
-                                                              allocator);
-            segment_manager_->client_segments_[client_id].push_back(segment.id);
-            segment_manager_->mounted_segments_[segment.id] = {
-                segment, SegmentStatus::OK, allocator};
-            segment_manager_->client_by_name_[segment.name] = client_id;
-
-            LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
-                      << segment.name
-                      << ", Mount size: " << (size / 1024 / 1024 / 1024)
-                      << " GB";
-            return ErrorCode::OK;
+        auto allocator = segment_manager_->cxl_global_allocator_;
+        if (segment_manager_->cxl_global_allocator_ == nullptr) {
+            LOG(ERROR) << "Cxl global allocator has not been initialized.";
+            return ErrorCode::INTERNAL_ERROR;
         }
-        return ErrorCode::INTERNAL_ERROR;
+        segment_manager_->allocator_manager_.addAllocator(segment.name,
+                                                          allocator);
+        segment_manager_->client_segments_[client_id].push_back(segment.id);
+        segment_manager_->mounted_segments_[segment.id] = {
+            segment, SegmentStatus::OK, allocator};
+        segment_manager_->client_by_name_[segment.name] = client_id;
+
+        LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
+                  << segment.name << ", Mount size: " << std::fixed
+                  << std::setprecision(2)
+                  << (static_cast<double>(size) / 1024 / 1024 / 1024) << " GB";
+        return ErrorCode::OK;
     }
     // Check if parameters are valid before allocating memory.
     if (buffer == 0 || size == 0) {
@@ -107,6 +103,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         segment, SegmentStatus::OK, std::move(allocator)};
     segment_manager_->client_by_name_[segment.name] = client_id;
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
+    MasterMetricManager::instance().inc_total_dram_capacity(segment.name, size);
 
     return ErrorCode::OK;
 }
@@ -231,6 +228,8 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     // Decrease the total capacity
     if (!is_cxl) {
         MasterMetricManager::instance().dec_total_mem_capacity(
+            segment_name, metrics_dec_capacity);
+        MasterMetricManager::instance().dec_total_dram_capacity(
             segment_name, metrics_dec_capacity);
     }
 
@@ -901,14 +900,30 @@ bool ScopedSegmentAccess::ExistsSegmentName(
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                             const size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";
-    LOG(INFO) << "[CXL] create allocator with "
-              << "path=" << cxl_path << " base=0x" << std::hex
-              << DEFAULT_CXL_BASE << std::dec << " size=" << cxl_size << " ("
-              << std::fixed << std::setprecision(2)
-              << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
+    LOG(INFO) << "[CXL] create allocator with " << "path=" << cxl_path
+              << " base=0x" << std::hex << DEFAULT_CXL_BASE << std::dec
+              << " size=" << cxl_size << " (" << std::fixed
+              << std::setprecision(2) << cxl_size / (1024.0 * 1024 * 1024)
+              << " GB)";
 
-    cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
-        cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    switch (memory_allocator_) {
+        case BufferAllocatorType::CACHELIB:
+            cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
+                cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path,
+                StorageLevel::CXL);
+            break;
+        case BufferAllocatorType::OFFSET:
+            cxl_global_allocator_ = std::make_shared<OffsetBufferAllocator>(
+                cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path,
+                StorageLevel::CXL);
+            break;
+        default:
+            LOG(ERROR) << "cxl_path=" << cxl_path
+                       << ", error=unknown_memory_allocator="
+                       << static_cast<int>(memory_allocator_);
+            return;
+    }
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
+    MasterMetricManager::instance().inc_total_cxl_capacity(cxl_path, cxl_size);
 }
 }  // namespace mooncake
