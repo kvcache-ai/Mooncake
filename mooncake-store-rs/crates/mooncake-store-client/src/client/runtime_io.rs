@@ -2645,8 +2645,9 @@ impl StoreClient {
         }
         let mut buffers = info.buffers.iter().collect::<Vec<_>>();
         buffers.sort_by_key(|buffer| buffer.base);
+        let total_capacity: u64 = buffers.iter().map(|buffer| buffer.length).sum();
         let mut remaining_offset = segment_offset;
-        for buffer in buffers {
+        for buffer in &buffers {
             if remaining_offset >= buffer.length {
                 remaining_offset -= buffer.length;
                 continue;
@@ -2659,9 +2660,20 @@ impl StoreClient {
             }
             break;
         }
+        warn!(
+            segment = %segment_name.0,
+            segment_offset,
+            length,
+            total_capacity,
+            num_buffers = buffers.len(),
+            buffers = ?buffers.iter().map(|b| (b.base, b.length)).collect::<Vec<_>>(),
+            "segment offset is outside segment — possible allocator/registration size mismatch \
+             or stale segment info cache after segment extension"
+        );
         Err(StoreError::Transport(format!(
-            "segment offset {} length {} is outside segment {}",
-            segment_offset, length, segment_name.0
+            "segment offset {} length {} is outside segment {} \
+             (total_capacity={}, num_buffers={})",
+            segment_offset, length, segment_name.0, total_capacity, buffers.len()
         )))
     }
 
@@ -3322,5 +3334,230 @@ mod runtime_io_tests {
         assert_eq!(requests[1].target_id, 7);
         assert_eq!(requests[1].target_offset, 964);
         assert_eq!(requests[1].length, 36);
+    }
+
+    // -----------------------------------------------------------------------
+    // Segment offset boundary tests — reproduce and characterise the
+    // "segment offset N length M is outside segment S" error observed in
+    // production when sglang's KV cache backup thread calls batch_put_from
+    // with a logical offset exceeding the segment's registered buffer size.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_offset_exactly_at_boundary_is_rejected() {
+        let four_gb: u64 = 4 * 1024 * 1024 * 1024;
+        let info = memory_segment(&[(0x1_0000_0000, four_gb)]);
+        let segment = SegmentName::new("seg-boundary");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, four_gb, 1);
+        assert!(
+            result.is_err(),
+            "offset equal to buffer length must be rejected"
+        );
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("is outside segment"),
+            "error should mention 'outside segment', got: {error_message}"
+        );
+    }
+
+    #[test]
+    fn segment_offset_exceeds_single_buffer_capacity() {
+        // Reproduces the production scenario: segment has ~32 GB buffer but
+        // the allocator handed out a ~50 GB offset (53686206464 bytes).
+        let buffer_size: u64 = 32 * 1024 * 1024 * 1024;
+        let info = memory_segment(&[(0x7f00_0000_0000, buffer_size)]);
+        let segment = SegmentName::new(
+            "sm-16--487fdbe0-1556-4ffb-a105-d6c5a7970cd5-segment-1777028012895-ext-1",
+        );
+
+        let overflowing_offset: u64 = 53_686_206_464; // ~50 GB
+        let request_length: u64 = 1_540_096; // ~1.5 MB
+
+        let result = StoreClient::segment_relative_target_offset(
+            &info,
+            &segment,
+            overflowing_offset,
+            request_length,
+        );
+        assert!(
+            result.is_err(),
+            "offset 50 GB into a 32 GB buffer must fail"
+        );
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("is outside segment"),
+            "error should contain 'outside segment', got: {error_message}"
+        );
+        assert!(
+            error_message.contains("total_capacity="),
+            "error should include total_capacity diagnostic, got: {error_message}"
+        );
+    }
+
+    #[test]
+    fn segment_offset_valid_within_large_buffer() {
+        let buffer_size: u64 = 64 * 1024 * 1024 * 1024;
+        let base: u64 = 0x7f00_0000_0000;
+        let info = memory_segment(&[(base, buffer_size)]);
+        let segment = SegmentName::new("seg-large");
+
+        let offset: u64 = 53_686_206_464; // ~50 GB — fits in 64 GB
+        let length: u64 = 1_540_096;
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, offset, length);
+        assert!(
+            result.is_ok(),
+            "50 GB offset into 64 GB buffer should succeed, got: {:?}",
+            result.unwrap_err()
+        );
+        assert_eq!(result.unwrap(), base + offset);
+    }
+
+    #[test]
+    fn segment_offset_spans_across_buffer_tail_is_rejected() {
+        let buffer_size: u64 = 1024 * 1024;
+        let base: u64 = 0x1000_0000;
+        let info = memory_segment(&[(base, buffer_size)]);
+        let segment = SegmentName::new("seg-tail-overflow");
+
+        let result = StoreClient::segment_relative_target_offset(
+            &info,
+            &segment,
+            buffer_size - 1,
+            2,
+        );
+        assert!(
+            result.is_err(),
+            "transfer crossing buffer tail must be rejected"
+        );
+    }
+
+    #[test]
+    fn segment_offset_multi_buffer_total_exceeded() {
+        let sixteen_gb: u64 = 16 * 1024 * 1024 * 1024;
+        let base1: u64 = 0x7f00_0000_0000;
+        let base2: u64 = base1 + sixteen_gb;
+        let info = memory_segment(&[(base1, sixteen_gb), (base2, sixteen_gb)]);
+        let segment = SegmentName::new("seg-multi-overflow");
+
+        let overflowing_offset: u64 = 53_686_206_464;
+        let result = StoreClient::segment_relative_target_offset(
+            &info,
+            &segment,
+            overflowing_offset,
+            1_540_096,
+        );
+        assert!(
+            result.is_err(),
+            "offset exceeding multi-buffer total capacity must fail"
+        );
+    }
+
+    #[test]
+    fn segment_offset_multi_buffer_spans_correctly() {
+        let thirty_two_gb: u64 = 32 * 1024 * 1024 * 1024;
+        let base1: u64 = 0x7f00_0000_0000;
+        let base2: u64 = base1 + thirty_two_gb;
+        let info = memory_segment(&[(base1, thirty_two_gb), (base2, thirty_two_gb)]);
+        let segment = SegmentName::new("seg-multi-valid");
+
+        let offset: u64 = 53_686_206_464;
+        let length: u64 = 1_540_096;
+
+        let result =
+            StoreClient::segment_relative_target_offset(&info, &segment, offset, length);
+        assert!(
+            result.is_ok(),
+            "50 GB offset into 64 GB (2x32 GB) should succeed, got: {:?}",
+            result.unwrap_err()
+        );
+        let expected_offset_in_second = offset - thirty_two_gb;
+        assert_eq!(result.unwrap(), base2 + expected_offset_in_second);
+    }
+
+    #[test]
+    fn segment_offset_empty_buffers_rejected() {
+        let info = memory_segment(&[]);
+        let segment = SegmentName::new("seg-empty");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 1);
+        assert!(result.is_err(), "empty buffer list must be rejected");
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("no buffers"),
+            "error should mention 'no buffers', got: {error_message}"
+        );
+    }
+
+    #[test]
+    fn segment_offset_error_includes_capacity_diagnostic() {
+        // Verify the improved error message includes total_capacity info.
+        let buffer_size: u64 = 8 * 1024 * 1024 * 1024;
+        let info = memory_segment(&[(0x1000, buffer_size)]);
+        let segment = SegmentName::new("seg-diag");
+
+        let result = StoreClient::segment_relative_target_offset(
+            &info,
+            &segment,
+            buffer_size + 100,
+            64,
+        );
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains(&format!("total_capacity={buffer_size}")),
+            "error should include total_capacity={buffer_size}, got: {error_message}"
+        );
+        assert!(
+            error_message.contains("num_buffers=1"),
+            "error should include num_buffers=1, got: {error_message}"
+        );
+    }
+
+    #[test]
+    fn segment_info_covers_target_rejects_gap_between_buffers() {
+        let info = memory_segment(&[(1000, 64), (2000, 64)]);
+
+        assert!(
+            !StoreClient::segment_info_covers_target(&info, 1060, 8),
+            "address in gap between buffers should not be covered"
+        );
+        assert!(
+            !StoreClient::segment_info_covers_target(&info, 1050, 20),
+            "transfer spanning buffer boundary into gap should not be covered"
+        );
+    }
+
+    #[test]
+    fn segment_info_covers_target_accepts_contiguous_span() {
+        let info = memory_segment(&[(1000, 64), (1064, 64)]);
+
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1000, 128),
+            "full span across contiguous buffers should be covered"
+        );
+        assert!(
+            StoreClient::segment_info_covers_target(&info, 1060, 8),
+            "transfer crossing contiguous buffer boundary should be covered"
+        );
+    }
+
+    #[test]
+    fn segment_offset_u64_max_does_not_panic() {
+        let info = memory_segment(&[(0, 1024)]);
+        let segment = SegmentName::new("seg-u64max");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, u64::MAX, 1);
+        assert!(result.is_err(), "u64::MAX offset must be rejected");
+    }
+
+    #[test]
+    fn segment_offset_addition_overflow_does_not_panic() {
+        let info = memory_segment(&[(u64::MAX - 100, 200)]);
+        let segment = SegmentName::new("seg-add-overflow");
+
+        // Must not panic — either Ok or Err is acceptable.
+        let _ = StoreClient::segment_relative_target_offset(&info, &segment, 50, 64);
     }
 }

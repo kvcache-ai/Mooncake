@@ -324,6 +324,64 @@ mod state_store_tests {
 
         assert_eq!(transport.counts(), (2, 0, 2));
     }
+
+    #[test]
+    fn cache_stale_detects_segment_handle_error() {
+        let error = StoreError::Transport("stale segment handle".to_string());
+        assert!(
+            remote_segment_cache_stale(&error),
+            "errors containing 'segment handle' should be detected as stale"
+        );
+    }
+
+    #[test]
+    fn cache_stale_detects_outside_segment_error() {
+        let error = StoreError::Transport(
+            "segment offset 53686206464 length 1540096 is outside segment \
+             sm-16--487fdbe0-ext-1 (total_capacity=34359738368, num_buffers=1)"
+                .to_string(),
+        );
+        assert!(
+            remote_segment_cache_stale(&error),
+            "'outside segment' errors should trigger cache refresh"
+        );
+    }
+
+    #[test]
+    fn cache_stale_rejects_unrelated_transport_error() {
+        let error = StoreError::Transport("connection refused".to_string());
+        assert!(
+            !remote_segment_cache_stale(&error),
+            "unrelated transport errors should not be treated as stale cache"
+        );
+    }
+
+    #[test]
+    fn cache_stale_rejects_allocator_error() {
+        let error = StoreError::Allocator("out of memory".to_string());
+        assert!(
+            !remote_segment_cache_stale(&error),
+            "allocator errors should not be treated as stale cache"
+        );
+    }
+
+    #[test]
+    fn cache_refreshable_accepts_transport_errors() {
+        let error = StoreError::Transport("any transport error".to_string());
+        assert!(remote_segment_cache_refreshable(&error));
+    }
+
+    #[test]
+    fn cache_refreshable_accepts_not_found_errors() {
+        let error = StoreError::NotFound("segment not found".to_string());
+        assert!(remote_segment_cache_refreshable(&error));
+    }
+
+    #[test]
+    fn cache_refreshable_rejects_allocator_errors() {
+        let error = StoreError::Allocator("allocator failure".to_string());
+        assert!(!remote_segment_cache_refreshable(&error));
+    }
 }
 
 impl StorageOwnerState {
@@ -721,7 +779,9 @@ fn remote_segment_cache_stale(error: &StoreError) -> bool {
     match error {
         StoreError::Transport(message)
         | StoreError::NotFound(message)
-        | StoreError::InvalidState(message) => message.contains("segment handle"),
+        | StoreError::InvalidState(message) => {
+            message.contains("segment handle") || message.contains("is outside segment")
+        }
         _ => false,
     }
 }
