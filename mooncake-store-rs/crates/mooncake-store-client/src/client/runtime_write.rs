@@ -75,7 +75,7 @@ impl StoreClient {
                     reservation.offset_bytes,
                     value.len() as u64,
                 )?;
-                remote_requests.push((handle, target_offset));
+                remote_requests.push((handle, target_offset, info));
                 absolute_offsets[index] = target_offset;
             }
 
@@ -99,13 +99,14 @@ impl StoreClient {
                 let result = (|| {
                     let requests = if let Some(source) = registered_source {
                         let mut requests = Vec::new();
-                        for (handle, target_offset) in &remote_requests {
-                            requests.extend(Self::direct_buffer_transfer_requests(
+                        for (handle, target_offset, info) in &remote_requests {
+                            requests.extend(Self::target_buffer_transfer_requests(
                                 Opcode::Write,
                                 *handle,
                                 *target_offset,
                                 source,
                                 value.len() as u64,
+                                info,
                                 transport.max_registration_bytes(),
                             )?);
                         }
@@ -116,16 +117,19 @@ impl StoreClient {
                             state.memory_ref()?.plan_scratch(&[value.len()])?
                         };
                         copy_into_region(scratch[0], value);
-                        remote_requests
-                            .iter()
-                            .map(|(handle, target_offset)| TransferRequest {
-                                opcode: Opcode::Write,
-                                source: scratch[0].addr,
-                                target_id: *handle,
-                                target_offset: *target_offset,
-                                length: value.len() as u64,
-                            })
-                            .collect::<Vec<_>>()
+                        let mut requests = Vec::new();
+                        for (handle, target_offset, info) in &remote_requests {
+                            requests.extend(Self::target_buffer_transfer_requests(
+                                Opcode::Write,
+                                *handle,
+                                *target_offset,
+                                scratch[0].addr,
+                                value.len() as u64,
+                                info,
+                                transport.max_registration_bytes(),
+                            )?);
+                        }
+                        requests
                     };
                     let chunk_size = self.remote_write_chunk_limit(value.len(), requests.len());
                     for chunk in requests.chunks(chunk_size) {
@@ -631,7 +635,14 @@ impl StoreClient {
                         tenant: &'a str,
                         value: &'a [u8],
                         registered_source: Option<*mut c_void>,
-                        requests: Vec<TransferRequest>,
+                        requests: Vec<RemoteBatchTarget>,
+                    }
+
+                    struct RemoteBatchTarget {
+                        segment: u64,
+                        offset: u64,
+                        length: u64,
+                        info: SegmentInfo,
                     }
 
                     let mut routes = Vec::with_capacity(prepared.len());
@@ -689,12 +700,11 @@ impl StoreClient {
                             reservation.offset_bytes,
                             entry.value.len() as u64,
                         )?;
-                        remote_requests.push(TransferRequest {
-                            opcode: Opcode::Write,
-                            source: ptr::null_mut(),
-                            target_id: handle,
-                            target_offset,
+                        remote_requests.push(RemoteBatchTarget {
+                            segment: handle,
+                            offset: target_offset,
                             length: entry.value.len() as u64,
+                            info,
                         });
                         target_offset
                     };
@@ -820,12 +830,13 @@ impl StoreClient {
                     let write = &remote_writes[*index];
                     if let Some(source) = write.registered_source {
                         for request in &write.requests {
-                            transfer_requests.extend(Self::direct_buffer_transfer_requests(
+                            transfer_requests.extend(Self::target_buffer_transfer_requests(
                                 Opcode::Write,
-                                request.target_id,
-                                request.target_offset,
+                                request.segment,
+                                request.offset,
                                 source,
                                 request.length,
+                                &request.info,
                                 transport.max_registration_bytes(),
                             )?);
                         }
@@ -835,11 +846,17 @@ impl StoreClient {
                             .expect("scratch reservation should exist for staged writes")
                             [scratch_position];
                         copy_into_region(allocation, write.value);
-                        transfer_requests.extend(write.requests.iter().map(|request| {
-                            let mut request = *request;
-                            request.source = allocation.addr;
-                            request
-                        }));
+                        for request in &write.requests {
+                            transfer_requests.extend(Self::target_buffer_transfer_requests(
+                                Opcode::Write,
+                                request.segment,
+                                request.offset,
+                                allocation.addr,
+                                request.length,
+                                &request.info,
+                                transport.max_registration_bytes(),
+                            )?);
+                        }
                         scratch_position += 1;
                     }
                 }

@@ -133,6 +133,11 @@ membership snapshot, and retries placement when the request is not pinned to a h
 segment. This keeps transient storage-owner transport failures from escaping into Python backup
 threads as fatal exceptions.
 
+Remote transfer planning splits each request at both local registration limits and remote segment
+buffer boundaries. The route still records one logical replica, but the transport only receives
+slices that fit inside one registered target buffer, matching classic RDMA transfer-engine
+requirements when a segment is backed by multiple contiguous registrations.
+
 ```mermaid
 sequenceDiagram
     participant App
