@@ -11,8 +11,7 @@ function(add_store_test name)
            ibverbs
            gtest
            gtest_main
-           pthread
-           zstd)
+           pthread)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
