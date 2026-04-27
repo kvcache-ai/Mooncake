@@ -63,7 +63,6 @@ class StorageBuffer : public BufferBase {
         return Slice{static_cast<char*>(staging_buffer_->data()), size_};
     }
 
-    void SetKey(const std::string& key) { key_ = key; }
     void SetKey(std::string_view key) { key_ = key; }
     const std::string& GetKey() const { return key_; }
 
