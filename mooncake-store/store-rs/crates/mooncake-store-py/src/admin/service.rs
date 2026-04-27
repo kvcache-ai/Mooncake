@@ -310,7 +310,6 @@ impl MigrationTaskManager {
             .tasks
             .lock()
             .values()
-            .cloned()
             .map(|record| record.to_response())
             .collect::<Vec<_>>();
         tasks.sort_by(|left, right| {
@@ -387,12 +386,14 @@ impl MigrationTaskManagerState {
         match result {
             Ok(execution_id) => self.update_task(
                 &record.task_id,
-                RouteMigrationTaskState::Dispatching,
-                attempted_dispatches,
-                0,
-                Some(execution_id),
-                None,
-                String::new(),
+                task_update(
+                    RouteMigrationTaskState::Dispatching,
+                    attempted_dispatches,
+                    0,
+                    Some(execution_id),
+                    None,
+                    String::new(),
+                ),
             ),
             Err(error) => {
                 self.handle_attempt_failure(record, attempted_dispatches, error.to_string())
@@ -425,31 +426,37 @@ impl MigrationTaskManagerState {
                 control_plane_pb::MigrationExecutionState::Pending
                 | control_plane_pb::MigrationExecutionState::Dispatching => self.update_task(
                     &record.task_id,
-                    RouteMigrationTaskState::Dispatching,
-                    record.attempts.max(status.attempts),
-                    0,
-                    Some(execution_id),
-                    None,
-                    status.last_error,
+                    task_update(
+                        RouteMigrationTaskState::Dispatching,
+                        record.attempts.max(status.attempts),
+                        0,
+                        Some(execution_id),
+                        None,
+                        status.last_error,
+                    ),
                 ),
                 control_plane_pb::MigrationExecutionState::Running
                 | control_plane_pb::MigrationExecutionState::RetryWait => self.update_task(
                     &record.task_id,
-                    RouteMigrationTaskState::Running,
-                    record.attempts.max(status.attempts),
-                    0,
-                    Some(execution_id),
-                    None,
-                    status.last_error,
+                    task_update(
+                        RouteMigrationTaskState::Running,
+                        record.attempts.max(status.attempts),
+                        0,
+                        Some(execution_id),
+                        None,
+                        status.last_error,
+                    ),
                 ),
                 control_plane_pb::MigrationExecutionState::Succeeded => self.update_task(
                     &record.task_id,
-                    RouteMigrationTaskState::Succeeded,
-                    record.attempts.max(status.attempts),
-                    0,
-                    Some(execution_id),
-                    None,
-                    status.last_error,
+                    task_update(
+                        RouteMigrationTaskState::Succeeded,
+                        record.attempts.max(status.attempts),
+                        0,
+                        Some(execution_id),
+                        None,
+                        status.last_error,
+                    ),
                 ),
                 control_plane_pb::MigrationExecutionState::Failed
                 | control_plane_pb::MigrationExecutionState::Cancelled
@@ -471,42 +478,50 @@ impl MigrationTaskManagerState {
         match self.check_route_completion(&record) {
             RouteCompletionCheck::Completed => self.update_task(
                 &record.task_id,
-                RouteMigrationTaskState::Succeeded,
-                record.attempts,
-                status_failures,
-                record.execution_id.clone(),
-                None,
-                String::new(),
+                task_update(
+                    RouteMigrationTaskState::Succeeded,
+                    record.attempts,
+                    status_failures,
+                    record.execution_id.clone(),
+                    None,
+                    String::new(),
+                ),
             ),
             RouteCompletionCheck::Conflict(message) => self.update_task(
                 &record.task_id,
-                RouteMigrationTaskState::Failed,
-                record.attempts,
-                status_failures,
-                record.execution_id.clone(),
-                None,
-                format!("{error}; {message}"),
+                task_update(
+                    RouteMigrationTaskState::Failed,
+                    record.attempts,
+                    status_failures,
+                    record.execution_id.clone(),
+                    None,
+                    format!("{error}; {message}"),
+                ),
             ),
             RouteCompletionCheck::Pending => {
                 if status_failures < record.max_retries {
                     self.update_task(
                         &record.task_id,
-                        RouteMigrationTaskState::RetryWait,
-                        record.attempts,
-                        status_failures,
-                        record.execution_id.clone(),
-                        Some(self.next_retry_at_ms(status_failures)),
-                        error.to_string(),
+                        task_update(
+                            RouteMigrationTaskState::RetryWait,
+                            record.attempts,
+                            status_failures,
+                            record.execution_id.clone(),
+                            Some(self.next_retry_at_ms(status_failures)),
+                            error.to_string(),
+                        ),
                     );
                 } else {
                     self.update_task(
                         &record.task_id,
-                        RouteMigrationTaskState::Failed,
-                        record.attempts,
-                        status_failures,
-                        record.execution_id.clone(),
-                        None,
-                        error.to_string(),
+                        task_update(
+                            RouteMigrationTaskState::Failed,
+                            record.attempts,
+                            status_failures,
+                            record.execution_id.clone(),
+                            None,
+                            error.to_string(),
+                        ),
                     );
                 }
             }
@@ -517,42 +532,50 @@ impl MigrationTaskManagerState {
         match self.check_route_completion(&record) {
             RouteCompletionCheck::Completed => self.update_task(
                 &record.task_id,
-                RouteMigrationTaskState::Succeeded,
-                record.attempts,
-                record.status_failures,
-                record.execution_id.clone(),
-                None,
-                String::new(),
+                task_update(
+                    RouteMigrationTaskState::Succeeded,
+                    record.attempts,
+                    record.status_failures,
+                    record.execution_id.clone(),
+                    None,
+                    String::new(),
+                ),
             ),
             RouteCompletionCheck::Conflict(message) => self.update_task(
                 &record.task_id,
-                RouteMigrationTaskState::Failed,
-                record.attempts,
-                record.status_failures,
-                record.execution_id.clone(),
-                None,
-                format!("{error}; {message}"),
+                task_update(
+                    RouteMigrationTaskState::Failed,
+                    record.attempts,
+                    record.status_failures,
+                    record.execution_id.clone(),
+                    None,
+                    format!("{error}; {message}"),
+                ),
             ),
             RouteCompletionCheck::Pending => {
                 if record.attempts < record.max_retries {
                     self.update_task(
                         &record.task_id,
-                        RouteMigrationTaskState::RetryWait,
-                        record.attempts,
-                        0,
-                        None,
-                        Some(self.next_retry_at_ms(record.attempts)),
-                        error.to_string(),
+                        task_update(
+                            RouteMigrationTaskState::RetryWait,
+                            record.attempts,
+                            0,
+                            None,
+                            Some(self.next_retry_at_ms(record.attempts)),
+                            error.to_string(),
+                        ),
                     );
                 } else {
                     self.update_task(
                         &record.task_id,
-                        RouteMigrationTaskState::Failed,
-                        record.attempts,
-                        0,
-                        record.execution_id.clone(),
-                        None,
-                        error.to_string(),
+                        task_update(
+                            RouteMigrationTaskState::Failed,
+                            record.attempts,
+                            0,
+                            record.execution_id.clone(),
+                            None,
+                            error.to_string(),
+                        ),
                     );
                 }
             }
@@ -568,42 +591,50 @@ impl MigrationTaskManagerState {
         match self.check_route_completion(&record) {
             RouteCompletionCheck::Completed => self.update_task(
                 &record.task_id,
-                RouteMigrationTaskState::Succeeded,
-                attempted_dispatches,
-                record.status_failures,
-                record.execution_id.clone(),
-                None,
-                String::new(),
+                task_update(
+                    RouteMigrationTaskState::Succeeded,
+                    attempted_dispatches,
+                    record.status_failures,
+                    record.execution_id.clone(),
+                    None,
+                    String::new(),
+                ),
             ),
             RouteCompletionCheck::Conflict(message) => self.update_task(
                 &record.task_id,
-                RouteMigrationTaskState::Failed,
-                attempted_dispatches,
-                record.status_failures,
-                record.execution_id.clone(),
-                None,
-                format!("{error}; {message}"),
+                task_update(
+                    RouteMigrationTaskState::Failed,
+                    attempted_dispatches,
+                    record.status_failures,
+                    record.execution_id.clone(),
+                    None,
+                    format!("{error}; {message}"),
+                ),
             ),
             RouteCompletionCheck::Pending => {
                 if attempted_dispatches < record.max_retries {
                     self.update_task(
                         &record.task_id,
-                        RouteMigrationTaskState::RetryWait,
-                        attempted_dispatches,
-                        0,
-                        None,
-                        Some(self.next_retry_at_ms(attempted_dispatches)),
-                        error,
+                        task_update(
+                            RouteMigrationTaskState::RetryWait,
+                            attempted_dispatches,
+                            0,
+                            None,
+                            Some(self.next_retry_at_ms(attempted_dispatches)),
+                            error,
+                        ),
                     );
                 } else {
                     self.update_task(
                         &record.task_id,
-                        RouteMigrationTaskState::Failed,
-                        attempted_dispatches,
-                        0,
-                        record.execution_id.clone(),
-                        None,
-                        error,
+                        task_update(
+                            RouteMigrationTaskState::Failed,
+                            attempted_dispatches,
+                            0,
+                            record.execution_id.clone(),
+                            None,
+                            error,
+                        ),
                     );
                 }
             }
@@ -708,25 +739,43 @@ impl MigrationTaskManagerState {
         now_ms().saturating_add(delay.as_millis() as u64)
     }
 
-    fn update_task(
-        &self,
-        task_id: &str,
-        state: RouteMigrationTaskState,
-        attempts: u32,
-        status_failures: u32,
-        execution_id: Option<String>,
-        next_retry_at_ms: Option<u64>,
-        last_error: String,
-    ) {
+    fn update_task(&self, task_id: &str, update: RouteMigrationTaskUpdate) {
         if let Some(record) = self.tasks.lock().get_mut(task_id) {
-            record.state = state;
-            record.attempts = attempts;
-            record.status_failures = status_failures;
-            record.execution_id = execution_id;
-            record.next_retry_at_ms = next_retry_at_ms;
-            record.last_error = last_error;
+            record.state = update.state;
+            record.attempts = update.attempts;
+            record.status_failures = update.status_failures;
+            record.execution_id = update.execution_id;
+            record.next_retry_at_ms = update.next_retry_at_ms;
+            record.last_error = update.last_error;
             record.updated_at_ms = now_ms();
         }
+    }
+}
+
+struct RouteMigrationTaskUpdate {
+    state: RouteMigrationTaskState,
+    attempts: u32,
+    status_failures: u32,
+    execution_id: Option<String>,
+    next_retry_at_ms: Option<u64>,
+    last_error: String,
+}
+
+fn task_update(
+    state: RouteMigrationTaskState,
+    attempts: u32,
+    status_failures: u32,
+    execution_id: Option<String>,
+    next_retry_at_ms: Option<u64>,
+    last_error: String,
+) -> RouteMigrationTaskUpdate {
+    RouteMigrationTaskUpdate {
+        state,
+        attempts,
+        status_failures,
+        execution_id,
+        next_retry_at_ms,
+        last_error,
     }
 }
 

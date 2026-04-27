@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::error::QuotaKind;
@@ -12,8 +12,11 @@ use mooncake_store_core::{
     TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
     TenantQuotaReservationRequest, TenantQuotaState,
 };
+use parking_lot::{Mutex, MutexGuard};
 use redis::cmd;
-use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
+use redis::{
+    Commands, ConnectionInfo, ConnectionLike, IntoConnectionInfo, RedisConnectionInfo, Script,
+};
 
 use crate::keyspace::{
     parse_route_policy_domain, parse_tenant_eviction_candidate_key, parse_tenant_policy_scope,
@@ -718,11 +721,14 @@ const REDIS_IO_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_IO_TIMEOUT_MS";
 const REDIS_AUTH_PROBE_TIMEOUT_ENV: &str = "MC_STORE_RS_REDIS_AUTH_PROBE_TIMEOUT_MS";
 const REDIS_RETRY_ATTEMPTS_ENV: &str = "MC_STORE_RS_REDIS_RETRY_ATTEMPTS";
 const REDIS_RETRY_DELAY_ENV: &str = "MC_STORE_RS_REDIS_RETRY_DELAY_MS";
+const REDIS_CONNECTION_POOL_SIZE_ENV: &str = "MC_STORE_RS_REDIS_CONNECTION_POOL_SIZE";
 const DEFAULT_REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_REDIS_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_REDIS_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REDIS_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_REDIS_RETRY_DELAY: Duration = Duration::from_millis(50);
+const DEFAULT_REDIS_CONNECTION_POOL_SIZE: usize = 16;
+const MAX_REDIS_CONNECTION_POOL_SIZE: usize = 256;
 const DEFAULT_TENANT_QUOTA_TERMINAL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
@@ -811,9 +817,97 @@ impl RedisMetadataConfig {
     }
 }
 
-pub struct RedisMetadataBackend {
+struct RedisConnectionPool {
     client: redis::Client,
-    legacy_auth_client: Option<redis::Client>,
+    slots: Vec<Mutex<Option<redis::Connection>>>,
+    next_slot: AtomicUsize,
+}
+
+struct RedisConnectionLease<'a> {
+    guard: MutexGuard<'a, Option<redis::Connection>>,
+    discard: bool,
+}
+
+impl RedisConnectionPool {
+    fn new(client: redis::Client) -> Self {
+        let slots = (0..redis_connection_pool_size())
+            .map(|_| Mutex::new(None))
+            .collect();
+        Self {
+            client,
+            slots,
+            next_slot: AtomicUsize::new(0),
+        }
+    }
+
+    fn checkout(&self) -> std::result::Result<RedisConnectionLease<'_>, redis::RedisError> {
+        let start = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        for offset in 0..self.slots.len() {
+            let index = (start + offset) % self.slots.len();
+            if let Some(guard) = self.slots[index].try_lock() {
+                return self.lease_from_guard(guard);
+            }
+        }
+        self.lease_from_guard(self.slots[start].lock())
+    }
+
+    fn lease_from_guard<'a>(
+        &'a self,
+        mut guard: MutexGuard<'a, Option<redis::Connection>>,
+    ) -> std::result::Result<RedisConnectionLease<'a>, redis::RedisError> {
+        let reconnect = guard
+            .as_ref()
+            .is_none_or(|connection| !connection.is_open());
+        if reconnect {
+            *guard = Some(open_redis_connection(&self.client)?);
+        }
+        Ok(RedisConnectionLease {
+            guard,
+            discard: false,
+        })
+    }
+}
+
+impl RedisConnectionLease<'_> {
+    fn discard(&mut self) {
+        self.discard = true;
+    }
+}
+
+impl std::ops::Deref for RedisConnectionLease<'_> {
+    type Target = redis::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("redis connection lease always holds a connection")
+    }
+}
+
+impl std::ops::DerefMut for RedisConnectionLease<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("redis connection lease always holds a connection")
+    }
+}
+
+impl Drop for RedisConnectionLease<'_> {
+    fn drop(&mut self) {
+        let should_discard = self.discard
+            || self
+                .guard
+                .as_ref()
+                .is_some_and(|connection| !connection.is_open());
+        if should_discard {
+            self.guard.take();
+        }
+    }
+}
+
+pub struct RedisMetadataBackend {
+    connection_pool: Box<RedisConnectionPool>,
+    legacy_auth_pool: Option<Box<RedisConnectionPool>>,
     prefer_legacy_auth: AtomicBool,
     connection_diagnostic_events: AtomicU64,
     keyspace: MetadataKeyspace,
@@ -858,13 +952,15 @@ impl RedisMetadataBackend {
         );
         let client = redis::Client::open(connection_info)
             .map_err(|error| metadata_error("redis client open", error))?;
-        let legacy_auth_client = legacy_auth_connection_info
+        let legacy_auth_pool = legacy_auth_connection_info
             .map(redis::Client::open)
             .transpose()
-            .map_err(|error| metadata_error("redis client open legacy auth", error))?;
+            .map_err(|error| metadata_error("redis client open legacy auth", error))?
+            .map(RedisConnectionPool::new)
+            .map(Box::new);
         Ok(Self {
-            client,
-            legacy_auth_client,
+            connection_pool: Box::new(RedisConnectionPool::new(client)),
+            legacy_auth_pool,
             prefer_legacy_auth: AtomicBool::new(false),
             connection_diagnostic_events: AtomicU64::new(0),
             keyspace: config.keyspace,
@@ -873,40 +969,30 @@ impl RedisMetadataBackend {
         })
     }
 
-    fn connection_with_client_raw(
-        &self,
-        client: &redis::Client,
-    ) -> std::result::Result<redis::Connection, redis::RedisError> {
-        let connection = client.get_connection_with_timeout(redis_connect_timeout())?;
-        connection.set_read_timeout(Some(redis_io_timeout()))?;
-        connection.set_write_timeout(Some(redis_io_timeout()))?;
-        Ok(connection)
-    }
-
-    fn connection_raw(&self) -> std::result::Result<redis::Connection, redis::RedisError> {
+    fn connection_raw(&self) -> std::result::Result<RedisConnectionLease<'_>, redis::RedisError> {
         if self.prefer_legacy_auth.load(Ordering::Relaxed) {
-            if let Some(client) = &self.legacy_auth_client {
-                return self.connection_with_client_raw(client);
+            if let Some(pool) = &self.legacy_auth_pool {
+                return pool.checkout();
             }
         }
 
-        match self.connection_with_client_raw(&self.client) {
+        match self.connection_pool.checkout() {
             Ok(connection) => Ok(connection),
             Err(error) => {
                 if !is_legacy_redis_auth_arity_error(&error.to_string()) {
                     return Err(error);
                 }
-                let Some(client) = &self.legacy_auth_client else {
+                let Some(pool) = &self.legacy_auth_pool else {
                     return Err(error);
                 };
-                let connection = self.connection_with_client_raw(client)?;
+                let connection = pool.checkout()?;
                 self.prefer_legacy_auth.store(true, Ordering::Relaxed);
                 Ok(connection)
             }
         }
     }
 
-    fn connection(&self, operation: &str) -> Result<redis::Connection> {
+    fn connection(&self, operation: &str) -> Result<RedisConnectionLease<'_>> {
         self.connection_raw().map_err(|error| {
             self.log_redis_diagnostic("connect", operation, &error, 1, 1);
             metadata_error(operation, error)
@@ -939,10 +1025,14 @@ impl RedisMetadataBackend {
                 Err(error)
                     if attempt + 1 < attempts && should_retry_transient_redis_error(&error) =>
                 {
+                    connection.discard();
                     self.log_redis_diagnostic("query", operation, &error, attempt + 1, attempts);
                     std::thread::sleep(delay);
                 }
                 Err(error) => {
+                    if should_retry_transient_redis_error(&error) {
+                        connection.discard();
+                    }
                     self.log_redis_diagnostic("query", operation, &error, attempt + 1, attempts);
                     return Err(metadata_error(operation, error));
                 }
@@ -978,6 +1068,7 @@ impl RedisMetadataBackend {
             connect_timeout_ms = redis_connect_timeout().as_millis() as u64,
             io_timeout_ms = redis_io_timeout().as_millis() as u64,
             retry_delay_ms = redis_retry_delay().as_millis() as u64,
+            connection_pool_size = redis_connection_pool_size(),
             prefer_legacy_auth = self.prefer_legacy_auth.load(Ordering::Relaxed),
             diagnostic_hint = hint.unwrap_or(""),
             error = %error,
@@ -1328,6 +1419,24 @@ fn redis_auth_probe_timeout() -> Duration {
         REDIS_AUTH_PROBE_TIMEOUT_ENV,
         DEFAULT_REDIS_AUTH_PROBE_TIMEOUT,
     )
+}
+
+fn redis_connection_pool_size() -> usize {
+    std::env::var(REDIS_CONNECTION_POOL_SIZE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|size| *size > 0)
+        .map(|size| size.min(MAX_REDIS_CONNECTION_POOL_SIZE))
+        .unwrap_or(DEFAULT_REDIS_CONNECTION_POOL_SIZE)
+}
+
+fn open_redis_connection(
+    client: &redis::Client,
+) -> std::result::Result<redis::Connection, redis::RedisError> {
+    let connection = client.get_connection_with_timeout(redis_connect_timeout())?;
+    connection.set_read_timeout(Some(redis_io_timeout()))?;
+    connection.set_write_timeout(Some(redis_io_timeout()))?;
+    Ok(connection)
 }
 
 fn duration_from_env_ms(name: &str, default: Duration) -> Duration {
@@ -2531,14 +2640,15 @@ impl MetadataBackend for RedisMetadataBackend {
         request: &TenantQuotaFinalizeRequest,
     ) -> Result<TenantQuotaFinalizeOutcome> {
         request.validate()?;
-        let mut connection = self.connection("redis finalize tenant quota")?;
         let reservation_key = self
             .keyspace
             .tenant_quota_reservation(&request.reservation_id);
-        let reservation_payload: Option<String> =
+        let reservation_payload: Option<String> = {
+            let mut connection = self.connection("redis finalize tenant quota")?;
             connection.get(&reservation_key).map_err(|error| {
                 metadata_error("redis get tenant quota reservation before finalize", error)
-            })?;
+            })?
+        };
         let reservation_payload = reservation_payload
             .ok_or_else(|| StoreError::NotFound(request.reservation_id.clone()))?;
         let reservation = parse_tenant_quota_reservation_payload(
@@ -2575,6 +2685,7 @@ impl MetadataBackend for RedisMetadataBackend {
         } else {
             "__none__".to_string()
         };
+        let mut connection = self.connection("redis finalize tenant quota")?;
         let result = Script::new(FINALIZE_TENANT_QUOTA_SCRIPT)
             .key(&quota_key)
             .key(&object_key)
@@ -2922,7 +3033,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
-    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
@@ -2940,13 +3051,16 @@ mod tests {
     use super::{
         is_legacy_redis_auth_arity_error, legacy_auth_connection_info, metadata_error,
         redacted_route_namespace_source, redis_auth_probe_timeout, redis_connect_timeout,
-        redis_connection_info, redis_error_diagnostic_hint, redis_io_timeout, redis_retry_attempts,
-        redis_retry_delay, resolve_redis_auth, should_log_redis_diagnostic_occurrence,
-        should_retry_readonly_redis_error, MetadataKeyspace, RedisMetadataBackend,
-        RedisMetadataConfig, DEFAULT_REDIS_AUTH_PROBE_TIMEOUT, DEFAULT_REDIS_CONNECT_TIMEOUT,
-        DEFAULT_REDIS_IO_TIMEOUT, DEFAULT_REDIS_RETRY_ATTEMPTS, DEFAULT_REDIS_RETRY_DELAY,
-        DEFAULT_TENANT_QUOTA_TERMINAL_TTL, REDIS_AUTH_PROBE_TIMEOUT_ENV, REDIS_CONNECT_TIMEOUT_ENV,
-        REDIS_IO_TIMEOUT_ENV, REDIS_RETRY_ATTEMPTS_ENV, REDIS_RETRY_DELAY_ENV,
+        redis_connection_info, redis_connection_pool_size, redis_error_diagnostic_hint,
+        redis_io_timeout, redis_retry_attempts, redis_retry_delay, resolve_redis_auth,
+        should_log_redis_diagnostic_occurrence, should_retry_readonly_redis_error,
+        MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig,
+        DEFAULT_REDIS_AUTH_PROBE_TIMEOUT, DEFAULT_REDIS_CONNECTION_POOL_SIZE,
+        DEFAULT_REDIS_CONNECT_TIMEOUT, DEFAULT_REDIS_IO_TIMEOUT, DEFAULT_REDIS_RETRY_ATTEMPTS,
+        DEFAULT_REDIS_RETRY_DELAY, DEFAULT_TENANT_QUOTA_TERMINAL_TTL,
+        MAX_REDIS_CONNECTION_POOL_SIZE, REDIS_AUTH_PROBE_TIMEOUT_ENV,
+        REDIS_CONNECTION_POOL_SIZE_ENV, REDIS_CONNECT_TIMEOUT_ENV, REDIS_IO_TIMEOUT_ENV,
+        REDIS_RETRY_ATTEMPTS_ENV, REDIS_RETRY_DELAY_ENV,
     };
 
     struct RedisTestServer {
@@ -3112,6 +3226,14 @@ mod tests {
         EnvLockGuard
     }
 
+    struct EnvVarGuard(&'static str);
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
     #[test]
     fn redis_backend_round_trips_full_metadata_surface() {
         let Some(server) = RedisTestServer::start() else {
@@ -3255,6 +3377,62 @@ mod tests {
                 .get_handoff(&handoff.stable_id)
                 .expect("handoff get should succeed"),
             Some(handoff)
+        );
+    }
+
+    #[test]
+    fn redis_backend_reuses_bounded_connections_under_concurrency() {
+        let _guard = env_lock();
+        std::env::set_var(REDIS_CONNECTION_POOL_SIZE_ENV, "2");
+        let _pool_env = EnvVarGuard(REDIS_CONNECTION_POOL_SIZE_ENV);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("port probe should bind");
+        let port = listener
+            .local_addr()
+            .expect("port probe should resolve")
+            .port();
+        drop(listener);
+        let Some(server) = RedisTestServer::start_on_port(port, None) else {
+            return;
+        };
+        let backend = Arc::new(
+            RedisMetadataBackend::new(
+                RedisMetadataConfig::new(server.url())
+                    .keyspace(MetadataKeyspace::new("test/redis-pool")),
+            )
+            .expect("redis backend should initialize"),
+        );
+
+        let workers = (0..16)
+            .map(|worker| {
+                let backend = Arc::clone(&backend);
+                std::thread::spawn(move || {
+                    for iter in 0..100 {
+                        let key = ObjectKey::new(format!("missing-{worker}-{iter}"));
+                        assert!(backend
+                            .get_object_route(&key)
+                            .expect("missing route lookup should succeed")
+                            .is_none());
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("worker should not panic");
+        }
+
+        let mut connection = redis::Client::open(server.url())
+            .expect("inspection client should open")
+            .get_connection()
+            .expect("inspection connection should open");
+        let clients: String = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query(&mut connection)
+            .expect("client list should succeed");
+        let client_count = clients.lines().count();
+        assert!(
+            client_count <= 3,
+            "pool size 2 plus inspection connection should cap Redis clients, got {client_count}: {clients}"
         );
     }
 
@@ -4797,23 +4975,30 @@ mod tests {
         std::env::set_var(REDIS_AUTH_PROBE_TIMEOUT_ENV, "900");
         std::env::set_var(REDIS_RETRY_ATTEMPTS_ENV, "9");
         std::env::set_var(REDIS_RETRY_DELAY_ENV, "80");
+        std::env::set_var(REDIS_CONNECTION_POOL_SIZE_ENV, "24");
 
         assert_eq!(redis_connect_timeout(), Duration::from_secs(7));
         assert_eq!(redis_io_timeout(), Duration::from_secs(11));
         assert_eq!(redis_auth_probe_timeout(), Duration::from_millis(900));
         assert_eq!(redis_retry_attempts(), 9);
         assert_eq!(redis_retry_delay(), Duration::from_millis(80));
+        assert_eq!(redis_connection_pool_size(), 24);
 
         std::env::remove_var(REDIS_CONNECT_TIMEOUT_ENV);
         std::env::remove_var(REDIS_IO_TIMEOUT_ENV);
         std::env::remove_var(REDIS_AUTH_PROBE_TIMEOUT_ENV);
         std::env::remove_var(REDIS_RETRY_ATTEMPTS_ENV);
         std::env::remove_var(REDIS_RETRY_DELAY_ENV);
+        std::env::remove_var(REDIS_CONNECTION_POOL_SIZE_ENV);
         assert_eq!(redis_connect_timeout(), DEFAULT_REDIS_CONNECT_TIMEOUT);
         assert_eq!(redis_io_timeout(), DEFAULT_REDIS_IO_TIMEOUT);
         assert_eq!(redis_auth_probe_timeout(), DEFAULT_REDIS_AUTH_PROBE_TIMEOUT);
         assert_eq!(redis_retry_attempts(), DEFAULT_REDIS_RETRY_ATTEMPTS);
         assert_eq!(redis_retry_delay(), DEFAULT_REDIS_RETRY_DELAY);
+        assert_eq!(
+            redis_connection_pool_size(),
+            DEFAULT_REDIS_CONNECTION_POOL_SIZE
+        );
     }
 
     #[test]
@@ -4955,6 +5140,31 @@ mod tests {
         );
         std::env::remove_var(REDIS_RETRY_ATTEMPTS_ENV);
         std::env::remove_var(REDIS_RETRY_DELAY_ENV);
+    }
+
+    #[test]
+    fn redis_connection_pool_size_rejects_zero_and_caps_large_values() {
+        let _guard = env_lock();
+
+        std::env::set_var(REDIS_CONNECTION_POOL_SIZE_ENV, "0");
+        assert_eq!(
+            redis_connection_pool_size(),
+            DEFAULT_REDIS_CONNECTION_POOL_SIZE
+        );
+
+        std::env::set_var(REDIS_CONNECTION_POOL_SIZE_ENV, "not-a-number");
+        assert_eq!(
+            redis_connection_pool_size(),
+            DEFAULT_REDIS_CONNECTION_POOL_SIZE
+        );
+
+        std::env::set_var(
+            REDIS_CONNECTION_POOL_SIZE_ENV,
+            (MAX_REDIS_CONNECTION_POOL_SIZE + 1).to_string(),
+        );
+        assert_eq!(redis_connection_pool_size(), MAX_REDIS_CONNECTION_POOL_SIZE);
+
+        std::env::remove_var(REDIS_CONNECTION_POOL_SIZE_ENV);
     }
 
     #[test]
