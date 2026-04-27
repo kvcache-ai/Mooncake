@@ -298,6 +298,18 @@ pub trait RouteDirectory: Send + Sync {
             .collect()
     }
 
+    /// Looks up routes without exhaustive fallback probing.
+    ///
+    /// Hot existence checks use this path because a miss is common and must not
+    /// fan out to every route authority in the cluster.
+    fn get_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Option<ObjectRoute>>> {
+        self.get_object_routes(observer, keys)
+    }
+
     fn compare_and_swap_object_route(
         &self,
         observer: &ClientLease,

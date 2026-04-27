@@ -353,7 +353,7 @@ impl BlockingCasMetadataBackend {
         let (lock, _) = &*self.gate;
         let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
         assert!(
-            !(state.entered && !state.released),
+            !state.entered || state.released,
             "cannot arm blocked CAS while a previous CAS is still blocked"
         );
         state.armed = true;
@@ -2241,6 +2241,7 @@ fn publish_storage_node_with_capacity(
     runtime
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_labeled_storage_node_with_capacity(
     metadata: &Arc<InMemoryMetadataBackend>,
     transport: &TestTransport,

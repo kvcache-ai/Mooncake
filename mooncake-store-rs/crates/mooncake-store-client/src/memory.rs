@@ -2273,7 +2273,7 @@ mod tests {
         assert_eq!(hugepage_map_flag(hugepage), libc::MAP_HUGE_2MB);
         assert_eq!(hugepage_map_flag(one_gb), libc::MAP_HUGE_1GB);
         assert!(matches!(
-            free_hugepage_region(1usize as *mut c_void, 4096),
+            free_hugepage_region(std::ptr::dangling_mut::<c_void>(), 4096),
             Err(StoreError::Allocator(_))
         ));
     }

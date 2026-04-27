@@ -5,7 +5,7 @@ use mooncake_store_core::{
     RouteState, RouteVersion, StoreError,
 };
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -1090,6 +1090,37 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         Ok(resolved)
     }
 
+    fn get_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Option<ObjectRoute>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = self.authority_candidates(observer)?;
+        let ranked_authorities = keys
+            .iter()
+            .map(|key| self.ranked_authorities_from_candidates(&candidates, key))
+            .collect::<Vec<_>>();
+        let mut resolved = vec![None; keys.len()];
+        for rank in 0..self.route_topk {
+            self.read_ranked_authorities(
+                keys,
+                &ranked_authorities,
+                rank,
+                &mut resolved,
+                None,
+                if rank == 0 {
+                    "authority bounded route batch read failed; trying mirrored authorities"
+                } else {
+                    "mirrored bounded route batch read failed; trying other authorities"
+                },
+            )?;
+        }
+        Ok(resolved)
+    }
+
     fn compare_and_swap_object_route(
         &self,
         observer: &ClientLease,
@@ -1358,13 +1389,14 @@ pub(crate) fn authority_list_routes_in_scope(
             authority
         )));
     }
+    let routes = guard.routes_by_authority.get(&authority.0);
     Ok(guard
-        .routes_by_authority
+        .scope_index
         .get(&authority.0)
+        .and_then(|index| index.get(scope))
         .into_iter()
-        .flat_map(|routes| routes.values())
-        .filter(|route| route.namespace.as_ref() == Some(scope))
-        .cloned()
+        .flat_map(|keys| keys.iter())
+        .filter_map(|key| routes.and_then(|routes| routes.get(key)).cloned())
         .collect())
 }
 
@@ -1381,17 +1413,14 @@ pub(crate) fn authority_list_reuse_candidates(
             authority
         )));
     }
+    let routes = guard.routes_by_authority.get(&authority.0);
     Ok(guard
-        .routes_by_authority
+        .reuse_index
         .get(&authority.0)
+        .and_then(|index| index.get(reuse))
         .into_iter()
-        .flat_map(|routes| routes.values())
-        .filter(|route| {
-            route_reuse_identity(route)
-                .map(|candidate| candidate == *reuse)
-                .unwrap_or(false)
-        })
-        .cloned()
+        .flat_map(|keys| keys.iter())
+        .filter_map(|key| routes.and_then(|routes| routes.get(key)).cloned())
         .collect())
 }
 
@@ -1527,17 +1556,30 @@ fn apply_route_update(
     key: &ObjectKey,
     next: Option<&ObjectRoute>,
 ) {
-    let routes = mesh
+    let old = mesh
         .routes_by_authority
-        .entry(authority.0.clone())
-        .or_default();
-    match next {
-        Some(route) => {
-            routes.insert(key.0.clone(), route.clone());
+        .get(&authority.0)
+        .and_then(|routes| routes.get(&key.0))
+        .cloned();
+    if let Some(route) = old.as_ref() {
+        mesh.remove_route_indexes(authority, key, route);
+    }
+    {
+        let routes = mesh
+            .routes_by_authority
+            .entry(authority.0.clone())
+            .or_default();
+        match next {
+            Some(route) => {
+                routes.insert(key.0.clone(), route.clone());
+            }
+            None => {
+                routes.remove(&key.0);
+            }
         }
-        None => {
-            routes.remove(&key.0);
-        }
+    }
+    if let Some(route) = next {
+        mesh.insert_route_indexes(authority, key, route);
     }
 }
 
@@ -1545,6 +1587,8 @@ fn apply_route_update(
 struct ClusterRouteMesh {
     attached_locals: BTreeMap<String, usize>,
     routes_by_authority: BTreeMap<String, BTreeMap<String, ObjectRoute>>,
+    scope_index: BTreeMap<String, BTreeMap<NamespaceScope, BTreeSet<String>>>,
+    reuse_index: BTreeMap<String, BTreeMap<ReuseIdentity, BTreeSet<String>>>,
     authority_services: BTreeMap<String, Arc<dyn AuthorityService>>,
 }
 
@@ -1554,6 +1598,8 @@ impl ClusterRouteMesh {
         self.routes_by_authority
             .entry(stable_id.0.clone())
             .or_default();
+        self.scope_index.entry(stable_id.0.clone()).or_default();
+        self.reuse_index.entry(stable_id.0.clone()).or_default();
     }
 
     fn bind_local_service(
@@ -1564,6 +1610,8 @@ impl ClusterRouteMesh {
         self.routes_by_authority
             .entry(stable_id.0.clone())
             .or_default();
+        self.scope_index.entry(stable_id.0.clone()).or_default();
+        self.reuse_index.entry(stable_id.0.clone()).or_default();
         self.authority_services.insert(stable_id.0.clone(), service);
     }
 
@@ -1574,6 +1622,8 @@ impl ClusterRouteMesh {
             Some(_) => {
                 self.attached_locals.remove(&key);
                 self.routes_by_authority.remove(&key);
+                self.scope_index.remove(&key);
+                self.reuse_index.remove(&key);
                 self.authority_services.remove(&key);
             }
             None => {}
@@ -1588,6 +1638,69 @@ impl ClusterRouteMesh {
 
     fn authority_service(&self, stable_id: &ClientStableId) -> Option<Arc<dyn AuthorityService>> {
         self.authority_services.get(&stable_id.0).cloned()
+    }
+
+    fn insert_route_indexes(
+        &mut self,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+        route: &ObjectRoute,
+    ) {
+        if let Some(scope) = route.namespace.clone() {
+            self.scope_index
+                .entry(authority.0.clone())
+                .or_default()
+                .entry(scope)
+                .or_default()
+                .insert(key.0.clone());
+        }
+        if let Ok(reuse) = route_reuse_identity(route) {
+            self.reuse_index
+                .entry(authority.0.clone())
+                .or_default()
+                .entry(reuse)
+                .or_default()
+                .insert(key.0.clone());
+        }
+    }
+
+    fn remove_route_indexes(
+        &mut self,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+        route: &ObjectRoute,
+    ) {
+        if let Some(scope) = route.namespace.as_ref() {
+            remove_index_key(
+                self.scope_index.get_mut(&authority.0),
+                scope,
+                key.0.as_str(),
+            );
+        }
+        if let Ok(reuse) = route_reuse_identity(route) {
+            remove_index_key(
+                self.reuse_index.get_mut(&authority.0),
+                &reuse,
+                key.0.as_str(),
+            );
+        }
+    }
+}
+
+fn remove_index_key<K: Ord>(
+    index: Option<&mut BTreeMap<K, BTreeSet<String>>>,
+    identity: &K,
+    key: &str,
+) {
+    let Some(index) = index else {
+        return;
+    };
+    let Some(keys) = index.get_mut(identity) else {
+        return;
+    };
+    keys.remove(key);
+    if keys.is_empty() {
+        index.remove(identity);
     }
 }
 
@@ -1757,15 +1870,17 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
-        CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState,
-        ClientRuntimeId, ClientStableId, CompatibilityDescriptor, MetadataBackend, ObjectKey,
+        apply_route_identity, route_reuse_identity, CasResult, ClientEndpointSet, ClientEpoch,
+        ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
+        CompatibilityDescriptor, LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey,
         ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteDirectory,
         RouteState, RouteVersion, SegmentName, StoreError,
     };
 
     use super::{
         authority_compare_and_swap, authority_compare_and_swap_many, authority_get,
-        authority_get_many, authority_list_routes_by_replica_owner, authority_replace,
+        authority_get_many, authority_list_reuse_candidates,
+        authority_list_routes_by_replica_owner, authority_list_routes_in_scope, authority_replace,
         authority_replace_many, bind_local_authority_service, build_route_directory,
         compatibility_matches, ranked_before, route_capable, route_mesh, route_tombstone,
         route_weight, stable_hash, weighted_rendezvous_score, ClusterRouteMesh, ControlPlaneClient,
@@ -2034,6 +2149,169 @@ mod tests {
         assert_eq!(found[0].key, route_a.key);
 
         route_mesh(namespace).lock().unregister_local(&authority);
+    }
+
+    #[test]
+    fn authority_mesh_keeps_scope_and_reuse_indexes_current() {
+        let namespace = "route-directory-indexes";
+        let authority = ClientStableId::new("authority-indexes");
+        let owner = ClientRuntimeId::new("owner-indexes", ClientEpoch(1));
+        let scope = NamespaceScope::new("tenant-a", "domain-a", "set-a");
+
+        route_mesh(namespace).lock().register_local(&authority);
+
+        let mut route_v1 = route_for("tenant-a::indexed", &owner);
+        apply_route_identity(
+            &mut route_v1,
+            &LogicalObjectId::new(scope.clone(), "indexed"),
+        );
+        route_v1.sharing_scope = Some("conversation-a".to_string());
+        route_v1.canonical_key = Some("tenant-a/domain-a/set-a/prefix-a".to_string());
+        let reuse_v1 = route_reuse_identity(&route_v1).expect("reuse v1 should build");
+        let key = route_v1.key.clone();
+
+        authority_replace(namespace, &authority, &key, Some(&route_v1))
+            .expect("indexed route should insert");
+        assert_eq!(
+            authority_list_routes_in_scope(namespace, &authority, &scope)
+                .expect("scope lookup should use index"),
+            vec![route_v1.clone()]
+        );
+        assert_eq!(
+            authority_list_reuse_candidates(namespace, &authority, &reuse_v1)
+                .expect("reuse lookup should use index"),
+            vec![route_v1.clone()]
+        );
+
+        let mut route_v2 = route_v1.clone();
+        route_v2.sharing_scope = Some("conversation-b".to_string());
+        route_v2.canonical_key = Some("tenant-a/domain-a/set-a/prefix-b".to_string());
+        route_v2.version = route_v2.version.next();
+        let reuse_v2 = route_reuse_identity(&route_v2).expect("reuse v2 should build");
+
+        authority_replace(namespace, &authority, &key, Some(&route_v2))
+            .expect("indexed route should update");
+        assert!(
+            authority_list_reuse_candidates(namespace, &authority, &reuse_v1)
+                .expect("old reuse lookup should use index")
+                .is_empty(),
+            "overwrite must remove the stale reuse identity"
+        );
+        assert_eq!(
+            authority_list_reuse_candidates(namespace, &authority, &reuse_v2)
+                .expect("new reuse lookup should use index"),
+            vec![route_v2.clone()]
+        );
+
+        authority_replace(namespace, &authority, &key, None).expect("indexed route should delete");
+        assert!(
+            authority_list_routes_in_scope(namespace, &authority, &scope)
+                .expect("scope lookup after delete should use index")
+                .is_empty()
+        );
+        assert!(
+            authority_list_reuse_candidates(namespace, &authority, &reuse_v2)
+                .expect("reuse lookup after delete should use index")
+                .is_empty()
+        );
+
+        let mesh = route_mesh(namespace);
+        let guard = mesh.lock();
+        assert!(guard
+            .scope_index
+            .get(&authority.0)
+            .is_none_or(|index| index.is_empty()));
+        assert!(guard
+            .reuse_index
+            .get(&authority.0)
+            .is_none_or(|index| index.is_empty()));
+    }
+
+    #[test]
+    fn bounded_route_lookup_does_not_probe_fallback_authorities() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-bounded-route", 1, false, Some("scope-a"));
+        let authorities = (0..4)
+            .map(|index| {
+                lease(
+                    &format!("authority-bounded-route-{index}"),
+                    10 + index,
+                    true,
+                    Some("scope-a"),
+                )
+            })
+            .collect::<Vec<_>>();
+        for lease in std::iter::once(observer.clone()).chain(authorities.iter().cloned()) {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_bounded_lookup_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &observer,
+            control,
+            live_client_cache,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::SuspectRuntimeCache::default(),
+            )),
+        );
+        let namespace = metadata.route_namespace();
+        for authority in &authorities {
+            route_mesh(&namespace)
+                .lock()
+                .register_local(&authority.runtime.stable_id);
+        }
+
+        let key = ObjectKey::new("tenant-a::bounded-miss");
+        let candidates = directory
+            .authority_candidates(&observer)
+            .expect("authority candidates should resolve");
+        let ranked = directory.ranked_authorities_from_candidates(&candidates, &key);
+        assert!(
+            ranked.len() > directory.route_topk,
+            "test needs a fallback authority outside route_topk"
+        );
+        let fallback_authority = ranked[directory.route_topk].clone();
+        let fallback_route = route_for(&key.0, &fallback_authority.runtime);
+        authority_replace(
+            &namespace,
+            &fallback_authority.runtime.stable_id,
+            &key,
+            Some(&fallback_route),
+        )
+        .expect("fallback route should seed");
+
+        assert_eq!(
+            directory
+                .get_object_routes_bounded(&observer, std::slice::from_ref(&key))
+                .expect("bounded route lookup should succeed"),
+            vec![None],
+            "hot existence lookup must stop at the mirrored top-k authorities"
+        );
+        assert_eq!(
+            directory
+                .get_object_routes(&observer, std::slice::from_ref(&key))
+                .expect("full route lookup should succeed"),
+            vec![Some(fallback_route)],
+            "full read lookup still keeps exhaustive fallback semantics"
+        );
+
+        for authority in &authorities {
+            route_mesh(&namespace)
+                .lock()
+                .unregister_local(&authority.runtime.stable_id);
+        }
     }
 
     #[test]

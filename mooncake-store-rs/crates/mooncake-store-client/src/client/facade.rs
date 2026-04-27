@@ -126,7 +126,7 @@ impl StoreClient {
         }
     }
 
-    fn query_routes_by_object_ids(
+    fn query_routes_by_object_ids_bounded(
         &self,
         object_ids: &[LogicalObjectId],
     ) -> Result<Vec<Option<ObjectRoute>>> {
@@ -136,7 +136,7 @@ impl StoreClient {
             .collect::<Vec<_>>();
         Ok(self
             .route_directory
-            .get_object_routes(&self.lease, &keys)?
+            .get_object_routes_bounded(&self.lease, &keys)?
             .into_iter()
             .map(|route| route.filter(|route| route.state == RouteState::Active))
             .collect())
@@ -639,7 +639,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             })
             .collect::<Vec<_>>();
         Ok(self
-            .query_routes_by_object_ids(&object_ids)?
+            .query_routes_by_object_ids_bounded(&object_ids)?
             .into_iter()
             .map(|route| route.is_some())
             .collect())
