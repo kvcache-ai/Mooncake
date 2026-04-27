@@ -532,7 +532,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .read()
             .tenant_policies
             .values()
-            .filter(|policy| tenant.map_or(true, |tenant| policy.scope.tenant == tenant))
+            .filter(|policy| tenant.is_none_or(|tenant| policy.scope.tenant == tenant))
             .cloned()
             .collect::<Vec<_>>();
         policies.sort_by(|left, right| left.scope.cmp(&right.scope));

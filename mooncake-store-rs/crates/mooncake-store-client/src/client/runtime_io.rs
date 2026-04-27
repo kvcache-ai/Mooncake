@@ -2643,8 +2643,10 @@ impl StoreClient {
                 segment_name.0
             )));
         }
+        let mut buffers = info.buffers.iter().collect::<Vec<_>>();
+        buffers.sort_by_key(|buffer| buffer.base);
         let mut remaining_offset = segment_offset;
-        for buffer in &info.buffers {
+        for buffer in buffers {
             if remaining_offset >= buffer.length {
                 remaining_offset -= buffer.length;
                 continue;
@@ -3261,6 +3263,30 @@ mod runtime_io_tests {
             StoreClient::segment_relative_target_offset(&info, &segment, 120, 24)
                 .expect("contiguous chunks should cover the transfer"),
             1120
+        );
+    }
+
+    #[test]
+    fn segment_relative_target_offset_orders_chunked_buffers() {
+        let info = memory_segment(&[(1064, 64), (1000, 64), (1128, 32)]);
+        let segment = SegmentName::new("seg");
+
+        assert_eq!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 80, 16)
+                .expect("logical offset should use buffer address order"),
+            1080
+        );
+    }
+
+    #[test]
+    fn segment_relative_target_offset_orders_tail_crossing_buffers() {
+        let info = memory_segment(&[(1128, 64), (1000, 64), (1064, 64)]);
+        let segment = SegmentName::new("seg");
+
+        assert_eq!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 60, 8)
+                .expect("logical range should cross into the next ordered buffer"),
+            1060
         );
     }
 
