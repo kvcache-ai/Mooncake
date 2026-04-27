@@ -31,10 +31,128 @@ fn unique_suffix() -> u64 {
     now_ms() ^ (std::process::id() as u64)
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum StorageSegmentNamingMode {
+    LogicalSegmentName,
+    RpcAddressSegmentName,
+}
+
+impl StorageSegmentNamingMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LogicalSegmentName => "metadata-backed logical segment names",
+            Self::RpcAddressSegmentName => "P2P-handshake rpc-address segment names",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StorageSegmentObservation {
+    runtime: String,
+    segment_name: String,
+    rpc_address: String,
+    mode: StorageSegmentNamingMode,
+}
+
+fn expected_storage_segment_naming_mode(transport_metadata_url: &str) -> StorageSegmentNamingMode {
+    if transport_metadata_url
+        .trim()
+        .eq_ignore_ascii_case("P2PHANDSHAKE")
+    {
+        StorageSegmentNamingMode::RpcAddressSegmentName
+    } else {
+        StorageSegmentNamingMode::LogicalSegmentName
+    }
+}
+
+fn observe_active_storage_segment_modes(
+    live_clients: &[ClientLease],
+) -> Vec<StorageSegmentObservation> {
+    live_clients
+        .iter()
+        .filter(|lease| lease.state == ClientLifecycleState::Active)
+        .filter(|lease| {
+            lease
+                .endpoints
+                .labels
+                .get("storage")
+                .is_some_and(|value| value == "true")
+        })
+        .filter_map(|lease| {
+            let segment_name = lease.endpoints.segment_name.as_ref()?.0.clone();
+            let rpc_address = lease.endpoints.rpc_address.trim().to_string();
+            if rpc_address.is_empty() {
+                return None;
+            }
+            let mode = if segment_name == rpc_address {
+                StorageSegmentNamingMode::RpcAddressSegmentName
+            } else {
+                StorageSegmentNamingMode::LogicalSegmentName
+            };
+            Some(StorageSegmentObservation {
+                runtime: lease.runtime.to_string(),
+                segment_name,
+                rpc_address,
+                mode,
+            })
+        })
+        .collect()
+}
+
+fn validate_storage_segment_naming_consistency(
+    live_clients: &[ClientLease],
+    keyspace_prefix: &str,
+    transport_metadata_url: &str,
+) -> Result<(), String> {
+    let observations = observe_active_storage_segment_modes(live_clients);
+    if observations.is_empty() {
+        return Ok(());
+    }
+
+    let mut distinct_modes = observations
+        .iter()
+        .map(|entry| entry.mode)
+        .collect::<Vec<_>>();
+    distinct_modes.sort();
+    distinct_modes.dedup();
+
+    let observed = observations
+        .iter()
+        .map(|entry| {
+            format!(
+                "runtime={} segment={} rpc={} mode={}",
+                entry.runtime,
+                entry.segment_name,
+                entry.rpc_address,
+                entry.mode.label()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if distinct_modes.len() > 1 {
+        return Err(format!(
+            "scratch-only bench refuses to start because active storage daemons in keyspace {keyspace_prefix} publish mixed segment naming modes under transport_metadata_url={transport_metadata_url}: {observed}. Restart every storage daemon and the bench with one transport metadata mode before benchmarking."
+        ));
+    }
+
+    let expected_mode = expected_storage_segment_naming_mode(transport_metadata_url);
+    let observed_mode = distinct_modes[0];
+    if observed_mode != expected_mode {
+        return Err(format!(
+            "scratch-only bench refuses to start because bench transport metadata expects {} in keyspace {keyspace_prefix}, but active storage daemons publish {} under transport_metadata_url={transport_metadata_url}: {observed}. Restart every storage daemon and the bench with one transport metadata mode before benchmarking.",
+            expected_mode.label(),
+            observed_mode.label(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn ensure_storage_candidates(
     metadata: &dyn MetadataBackend,
     keyspace_prefix: &str,
-    metadata_url: &str,
+    transport_metadata_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + STORAGE_CANDIDATE_WAIT;
     let mut logged_snapshot = false;
@@ -48,8 +166,15 @@ fn ensure_storage_candidates(
         if !logged_snapshot {
             log_live_client_snapshot(&live_clients, keyspace_prefix);
             log_segment_snapshot(metadata, &live_clients);
-            log_transfer_engine_metadata_snapshot(metadata_url, &live_clients);
+            log_transfer_engine_metadata_snapshot(transport_metadata_url, &live_clients);
             logged_snapshot = true;
+        }
+        if let Err(error) = validate_storage_segment_naming_consistency(
+            &live_clients,
+            keyspace_prefix,
+            transport_metadata_url,
+        ) {
+            return Err(error.into());
         }
         let storage_candidates = live_clients
             .iter()
@@ -82,9 +207,10 @@ fn log_bench_startup_context(
     reader_count: usize,
 ) {
     info!(
-        "[bench] startup keyspace={} metadata_url={} backend={:?} protocol={:?} local_hostname={} storage_bytes={} scratch_bytes={} replica_count={} route_control={:?} route_topk={} writers={} readers={}",
+        "[bench] startup keyspace={} metadata_url={} transport_metadata_url={} backend={:?} protocol={:?} local_hostname={} storage_bytes={} scratch_bytes={} replica_count={} route_control={:?} route_topk={} writers={} readers={}",
         keyspace_prefix,
         redact_url_for_log(&global.metadata_url),
+        redact_url_for_log(bench_transfer_metadata_debug_url(global)),
         global.transport_backend,
         global.protocol,
         global.local_hostname,
@@ -101,6 +227,7 @@ fn log_bench_startup_context(
 
 fn log_relevant_env() {
     const KEYS: &[&str] = &[
+        "MC_STORE_RS_METADATA_URL",
         "MC_STORE_RS_TRANSPORT_METADATA_URL",
         "MC_STORE_RS_TRACE_FILTER",
         "MC_STORE_RS_TRACE_FILE",
@@ -129,6 +256,13 @@ fn log_relevant_env() {
             Err(_) => debug!("[bench] env {key}=<unset>"),
         }
     }
+}
+
+fn bench_transfer_metadata_debug_url(global: &GlobalArgs) -> &str {
+    global
+        .transport_metadata_url
+        .as_deref()
+        .unwrap_or(&global.metadata_url)
 }
 
 fn redact_env_value(key: &str, value: &str) -> String {
@@ -225,11 +359,14 @@ struct RedisDebugTarget {
     password: Option<String>,
 }
 
-fn log_transfer_engine_metadata_snapshot(metadata_url: &str, live_clients: &[ClientLease]) {
-    let Ok(target) = parse_redis_debug_target(metadata_url) else {
+fn log_transfer_engine_metadata_snapshot(
+    transport_metadata_url: &str,
+    live_clients: &[ClientLease],
+) {
+    let Ok(target) = parse_redis_debug_target(transport_metadata_url) else {
         debug!(
-            "[bench] transfer metadata snapshot skipped: unsupported metadata url {}",
-            redact_url_for_log(metadata_url)
+            "[bench] transfer metadata snapshot skipped: unsupported transport metadata url {}",
+            redact_url_for_log(transport_metadata_url)
         );
         return;
     };
@@ -513,6 +650,12 @@ impl BenchCluster {
             RedisMetadataConfig::new(global.metadata_url.clone()).keyspace(keyspace),
         )?);
         log_bench_startup_context(global, &keyspace_prefix, writer_count, reader_count);
+        validate_storage_segment_naming_consistency(
+            &metadata.list_live_clients()?,
+            &keyspace_prefix,
+            bench_transfer_metadata_debug_url(global),
+        )
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
         let storage_label = if has_storage { "true" } else { "false" };
         let route_control = match global.route_control {
@@ -520,7 +663,11 @@ impl BenchCluster {
             RouteControl::MetadataOnly => RouteControlMode::MetadataOnly,
         };
         if !has_storage {
-            ensure_storage_candidates(metadata.as_ref(), &keyspace_prefix, &global.metadata_url)?;
+            ensure_storage_candidates(
+                metadata.as_ref(),
+                &keyspace_prefix,
+                bench_transfer_metadata_debug_url(global),
+            )?;
         }
 
         let mut writers = Vec::with_capacity(writer_count);
@@ -596,7 +743,7 @@ fn build_runtime(
     let setup = CompatSetupArgs {
         local_hostname: global.local_hostname.clone(),
         metadata_url: global.metadata_url.clone(),
-        transport_metadata_url: None,
+        transport_metadata_url: global.transport_metadata_url.clone(),
         global_segment_size: global.storage_bytes,
         local_buffer_size: global.scratch_bytes,
         protocol: protocol_name(&global.protocol).to_string(),
@@ -641,9 +788,34 @@ fn transport_backend_name(transport_backend: &TransportBackend) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
-        ClientEndpointSet, ClientEpoch, ClientRuntimeId, CompatibilityDescriptor,
+        ClientEndpointSet, ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, SegmentName,
     };
+
+    fn publish_storage_lease(
+        metadata: &InMemoryMetadataBackend,
+        stable_id: &str,
+        segment_name: &str,
+        rpc_address: &str,
+    ) {
+        let mut labels = BTreeMap::new();
+        labels.insert("storage".to_string(), "true".to_string());
+        let template = ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(0)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet {
+                rpc_address: rpc_address.to_string(),
+                segment_name: Some(SegmentName::new(segment_name)),
+                labels,
+            },
+            expires_at_ms: now_ms() + 60_000,
+        };
+        metadata
+            .allocate_client_lease(&template)
+            .expect("lease should publish");
+    }
 
     #[test]
     fn formats_live_client_snapshot() {
@@ -682,5 +854,110 @@ mod tests {
             redact_url_for_log("redis://redis.example:6379/0"),
             "redis://redis.example:6379/0"
         );
+    }
+
+    #[test]
+    fn transport_metadata_debug_url_prefers_explicit_transport_endpoint() {
+        let global = GlobalArgs {
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: Some("redis://127.0.0.1:6380/1".to_string()),
+            keyspace: String::new(),
+            protocol: Protocol::Tcp,
+            transport_backend: TransportBackend::ClassicTe,
+            local_hostname: "127.0.0.1".to_string(),
+            storage_bytes: 0,
+            scratch_bytes: 16 * 1024 * 1024,
+            tenant: "bench".to_string(),
+            trace_filter: None,
+            metrics_addr: None,
+            seed: 42,
+            route_control: RouteControl::EmbeddedWrh,
+            route_topk: 2,
+            replica_count: 1,
+        };
+
+        assert_eq!(
+            bench_transfer_metadata_debug_url(&global),
+            "redis://127.0.0.1:6380/1"
+        );
+    }
+
+    #[test]
+    fn transport_metadata_debug_url_falls_back_to_store_metadata_url() {
+        let global = GlobalArgs {
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: None,
+            keyspace: String::new(),
+            protocol: Protocol::Tcp,
+            transport_backend: TransportBackend::ClassicTe,
+            local_hostname: "127.0.0.1".to_string(),
+            storage_bytes: 0,
+            scratch_bytes: 16 * 1024 * 1024,
+            tenant: "bench".to_string(),
+            trace_filter: None,
+            metrics_addr: None,
+            seed: 42,
+            route_control: RouteControl::EmbeddedWrh,
+            route_topk: 2,
+            replica_count: 1,
+        };
+
+        assert_eq!(
+            bench_transfer_metadata_debug_url(&global),
+            "redis://127.0.0.1:6379/0"
+        );
+    }
+
+    #[test]
+    fn ensure_storage_candidates_rejects_mixed_segment_naming_modes() {
+        let metadata = InMemoryMetadataBackend::new();
+        publish_storage_lease(&metadata, "storage-a", "segment-a", "192.168.1.10:17001");
+        publish_storage_lease(
+            &metadata,
+            "storage-b",
+            "192.168.1.11:17002",
+            "192.168.1.11:17002",
+        );
+
+        let error = ensure_storage_candidates(&metadata, "mc/store-rs/test", "P2PHANDSHAKE")
+            .expect_err("mixed naming should hard-fail")
+            .to_string();
+
+        assert!(error.contains("mixed segment naming modes"));
+    }
+
+    #[test]
+    fn ensure_storage_candidates_rejects_cluster_mode_mismatch_for_p2p() {
+        let metadata = InMemoryMetadataBackend::new();
+        publish_storage_lease(&metadata, "storage-a", "segment-a", "192.168.1.10:17001");
+
+        let error = ensure_storage_candidates(&metadata, "mc/store-rs/test", "P2PHANDSHAKE")
+            .expect_err("named segments should not satisfy p2p bench startup")
+            .to_string();
+
+        assert!(error.contains("expects P2P-handshake rpc-address segment names"));
+    }
+
+    #[test]
+    fn ensure_storage_candidates_accepts_uniform_p2p_segment_naming() {
+        let metadata = InMemoryMetadataBackend::new();
+        publish_storage_lease(
+            &metadata,
+            "storage-a",
+            "192.168.1.10:17001",
+            "192.168.1.10:17001",
+        );
+
+        ensure_storage_candidates(&metadata, "mc/store-rs/test", "P2PHANDSHAKE")
+            .expect("uniform p2p naming should pass");
+    }
+
+    #[test]
+    fn ensure_storage_candidates_accepts_uniform_logical_segment_naming() {
+        let metadata = InMemoryMetadataBackend::new();
+        publish_storage_lease(&metadata, "storage-a", "segment-a", "192.168.1.10:17001");
+
+        ensure_storage_candidates(&metadata, "mc/store-rs/test", "redis://127.0.0.1:6379/0")
+            .expect("uniform logical naming should pass");
     }
 }
