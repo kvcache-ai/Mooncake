@@ -64,6 +64,7 @@ class StorageBuffer : public BufferBase {
     }
 
     void SetKey(const std::string& key) { key_ = key; }
+    void SetKey(std::string_view key) { key_ = key; }
     const std::string& GetKey() const { return key_; }
 
     // Transition from staging pool -> on disk.
