@@ -13,7 +13,45 @@ size_t CalculateBufferSize(const std::vector<RemoteBufferDesc>& buffers) {
     return total;
 }
 
-}  // namespace
+bool IsValidRequest(const RemoteReadRequest& request) {
+    if (request.key.empty()) {
+        LOG(ERROR) << "RemoteReadRequest: empty key";
+        return false;
+    }
+    if (request.dest_buffers.empty()) {
+        LOG(ERROR) << "RemoteReadRequest: empty buffers";
+        return false;
+    }
+    for (const auto& buf : request.dest_buffers) {
+        if (buf.size == 0 || buf.addr == 0) {
+            LOG(ERROR) << "RemoteReadRequest: invalid buffer (zero size or "
+                          "null address)";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsValidRequest(const RemoteWriteRequest& request) {
+    if (request.key.empty()) {
+        LOG(ERROR) << "RemoteWriteRequest: empty key";
+        return false;
+    }
+    if (request.src_buffers.empty()) {
+        LOG(ERROR) << "RemoteWriteRequest: empty buffers";
+        return false;
+    }
+    for (const auto& buf : request.src_buffers) {
+        if (buf.size == 0 || buf.addr == 0) {
+            LOG(ERROR) << "RemoteWriteRequest: invalid buffer (zero size or "
+                          "null address)";
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // anonymous namespace
 
 ClientRpcService::ClientRpcService(DataManager& data_manager,
                                    P2PClientMetric* metrics)
@@ -30,34 +68,12 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     }
     Stopwatch sw;
 
-    if (request.key.empty()) {
-        LOG(ERROR) << "ReadRemoteData: empty key";
+    if (!IsValidRequest(request)) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         if (metrics_) {
             metrics_->peer_request.get_failures.inc();
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    if (request.dest_buffers.empty()) {
-        LOG(ERROR) << "ReadRemoteData: empty destination buffers";
-        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
-        if (metrics_) {
-            metrics_->peer_request.get_failures.inc();
-        }
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    for (const auto& buffer_desc : request.dest_buffers) {
-        if (buffer_desc.size == 0 || buffer_desc.addr == 0) {
-            LOG(ERROR)
-                << "ReadRemoteData: invalid buffer (zero size or null address)";
-            timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
-            if (metrics_) {
-                metrics_->peer_request.get_failures.inc();
-            }
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
     }
 
     // Delegate to DataManager
@@ -104,34 +120,12 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
     }
     Stopwatch sw;
 
-    if (request.key.empty()) {
-        LOG(ERROR) << "WriteRemoteData: empty key";
+    if (!IsValidRequest(request)) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         if (metrics_) {
             metrics_->peer_request.put_failures.inc();
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    if (request.src_buffers.empty()) {
-        LOG(ERROR) << "WriteRemoteData: empty source buffers";
-        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
-        if (metrics_) {
-            metrics_->peer_request.put_failures.inc();
-        }
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    for (const auto& buffer_desc : request.src_buffers) {
-        if (buffer_desc.size == 0 || buffer_desc.addr == 0) {
-            LOG(ERROR) << "WriteRemoteData: invalid buffer (zero size or null "
-                          "address)";
-            timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
-            if (metrics_) {
-                metrics_->peer_request.put_failures.inc();
-            }
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
     }
 
     // Delegate to DataManager
