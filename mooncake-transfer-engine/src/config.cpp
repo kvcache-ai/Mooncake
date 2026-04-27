@@ -67,6 +67,16 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_GID_INDEX";
     }
 
+    const char* pkey_index_env = std::getenv("MC_PKEY_INDEX");
+    if (pkey_index_env) {
+        int val = atoi(pkey_index_env);
+        if (val >= 0 && val <= UINT16_MAX)
+            config.pkey_index = static_cast<uint16_t>(val);
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_PKEY_INDEX";
+    }
+
     const char* max_cqe_per_ctx_env = std::getenv("MC_MAX_CQE_PER_CTX");
     if (max_cqe_per_ctx_env) {
         size_t val = atoi(max_cqe_per_ctx_env);
