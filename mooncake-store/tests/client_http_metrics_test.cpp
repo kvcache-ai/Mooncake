@@ -460,4 +460,179 @@ TEST_F(ClientHttpMetricsTest, CombinedMetricsHttpEndpointsTest) {
     server.stop();
 }
 
+// Test P2P client peer_request metrics HTTP endpoints
+TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
+    const uint16_t test_port = 19006;
+
+    // Create P2PClientMetric instance
+    auto p2p_metrics = P2PClientMetric::Create({{"p2p_label", "peer_test"}});
+    ASSERT_NE(p2p_metrics, nullptr);
+
+    // Add test data to both local_request and peer_request
+    // Local Put metrics
+    p2p_metrics->local_request.put_requests.inc(10);
+    p2p_metrics->local_request.put_bytes.inc(5 * 1024 * 1024);  // 5 MB
+    p2p_metrics->local_request.put_latency.observe(200);
+
+    // Local Get metrics
+    p2p_metrics->local_request.get_requests.inc(100);
+    p2p_metrics->local_request.get_hits.inc(80);
+    p2p_metrics->local_request.get_misses.inc(15);
+    p2p_metrics->local_request.get_failures.inc(5);
+    p2p_metrics->local_request.get_bytes.inc(20 * 1024 * 1024);  // 20 MB
+    p2p_metrics->local_request.get_latency.observe(100);
+
+    // Peer Put metrics
+    p2p_metrics->peer_request.put_requests.inc(30);
+    p2p_metrics->peer_request.put_bytes.inc(15 * 1024 * 1024);  // 15 MB
+    p2p_metrics->peer_request.put_failures.inc(2);
+    p2p_metrics->peer_request.put_latency.observe(250);
+
+    // Peer Get metrics
+    p2p_metrics->peer_request.get_requests.inc(200);
+    p2p_metrics->peer_request.get_hits.inc(150);
+    p2p_metrics->peer_request.get_misses.inc(40);
+    p2p_metrics->peer_request.get_failures.inc(10);
+    p2p_metrics->peer_request.get_bytes.inc(40 * 1024 * 1024);  // 40 MB
+    p2p_metrics->peer_request.get_latency.observe(120);
+
+    // Create and start HTTP server
+    coro_http::coro_http_server server(1, test_port);
+
+    using namespace coro_http;
+
+    // Register handlers for P2P metrics
+    server.set_http_handler<GET>("/metrics", [&p2p_metrics](
+                                                 coro_http_request& req,
+                                                 coro_http_response& resp) {
+        std::string metrics_str;
+        p2p_metrics->serialize(metrics_str);
+        resp.add_header("Content-Type", "text/plain; version=0.0.4");
+        resp.set_status_and_content(status_type::ok, std::move(metrics_str));
+    });
+
+    server.set_http_handler<GET>(
+        "/metrics/summary",
+        [&p2p_metrics](coro_http_request& req, coro_http_response& resp) {
+            std::string summary = p2p_metrics->summary_metrics();
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, std::move(summary));
+        });
+
+    server.async_start();
+
+    // Wait for server to start
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Test /metrics endpoint for P2P peer metrics
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/metrics");
+        EXPECT_EQ(resp.status, 200)
+            << "P2P peer metrics endpoint returned wrong status";
+
+        // Check local metrics are present
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_get_requests_total") !=
+            std::string::npos)
+            << "Metrics should contain local get requests metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_put_requests_total") !=
+            std::string::npos)
+            << "Metrics should contain local put requests metric";
+
+        // Check peer metrics are present
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_get_requests_total") !=
+            std::string::npos)
+            << "Metrics should contain peer get requests metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_hits_total") !=
+                    std::string::npos)
+            << "Metrics should contain peer get hits metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_misses_total") !=
+                    std::string::npos)
+            << "Metrics should contain peer get misses metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_get_failures_total") !=
+            std::string::npos)
+            << "Metrics should contain peer get failures metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_bytes_total") !=
+                    std::string::npos)
+            << "Metrics should contain peer get bytes metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_latency_us") !=
+                    std::string::npos)
+            << "Metrics should contain peer get latency metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_put_requests_total") !=
+            std::string::npos)
+            << "Metrics should contain peer put requests metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_put_failures_total") !=
+            std::string::npos)
+            << "Metrics should contain peer put failures metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_put_bytes_total") !=
+                    std::string::npos)
+            << "Metrics should contain peer put bytes metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_put_latency_us") !=
+                    std::string::npos)
+            << "Metrics should contain peer put latency metric";
+
+        // Check actual values
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_get_requests_total") !=
+                std::string::npos &&
+            resp.resp_body.find("} 200\n") != std::string::npos)
+            << "Peer get requests should be 200";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_hits_total") !=
+                        std::string::npos &&
+                    resp.resp_body.find("} 150\n") != std::string::npos)
+            << "Peer get hits should be 150";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_put_requests_total") !=
+                std::string::npos &&
+            resp.resp_body.find("} 30\n") != std::string::npos)
+            << "Peer put requests should be 30";
+    }
+
+    // Test /metrics/summary endpoint for P2P peer metrics
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/metrics/summary");
+        EXPECT_EQ(resp.status, 200)
+            << "P2P peer metrics summary endpoint returned wrong status";
+
+        // Check summary contains both local and peer metrics
+        EXPECT_TRUE(resp.resp_body.find("P2P Local Request Metrics") !=
+                    std::string::npos)
+            << "Summary should contain local metrics header";
+        EXPECT_TRUE(resp.resp_body.find("P2P Peer Request Metrics") !=
+                    std::string::npos)
+            << "Summary should contain peer metrics header";
+
+        // Check local metrics in summary
+        EXPECT_TRUE(resp.resp_body.find("100 requests") != std::string::npos)
+            << "Summary should show 100 local get requests";
+        EXPECT_TRUE(resp.resp_body.find("80 hits") != std::string::npos)
+            << "Summary should show 80 local get hits";
+
+        // Check peer metrics in summary
+        EXPECT_TRUE(resp.resp_body.find("200 requests") != std::string::npos)
+            << "Summary should show 200 peer get requests";
+        EXPECT_TRUE(resp.resp_body.find("150 hits") != std::string::npos)
+            << "Summary should show 150 peer get hits";
+        EXPECT_TRUE(resp.resp_body.find("40 misses") != std::string::npos)
+            << "Summary should show 40 peer get misses";
+        EXPECT_TRUE(resp.resp_body.find("10 failures") != std::string::npos)
+            << "Summary should show 10 peer get failures";
+        EXPECT_TRUE(resp.resp_body.find("40.00 MB") != std::string::npos)
+            << "Summary should show 40.00 MB read for peer";
+        EXPECT_TRUE(resp.resp_body.find("15.00 MB") != std::string::npos)
+            << "Summary should show 15.00 MB written for peer";
+    }
+
+    server.stop();
+}
+
 }  // namespace mooncake::test
