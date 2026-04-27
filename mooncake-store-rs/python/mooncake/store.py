@@ -306,7 +306,8 @@ def metrics_server_address() -> str | None:
 
 class MooncakeDistributedStore:
     def __init__(self) -> None:
-        self._worker = _NativeStoreWorker()
+        self._native = _native.MooncakeDistributedStore()
+        self._worker = None
         self._lock = threading.RLock()
         self._registered_buffers: dict[int, int] = {}
         self._tracked_keys: set[tuple[str | None, str]] = set()
@@ -317,7 +318,9 @@ class MooncakeDistributedStore:
         return lambda *args, **kwargs: self._invoke(name, *args, **kwargs)
 
     def _invoke(self, name: str, *args, **kwargs):
-        return self._worker.call(name, *args, **kwargs)
+        if self._worker is not None:
+            return self._worker.call(name, *args, **kwargs)
+        return getattr(self._native, name)(*args, **kwargs)
 
     def setup(self, *args, **kwargs):
         if len(args) == 1 and isinstance(args[0], Mapping) and not kwargs:
@@ -380,7 +383,8 @@ class MooncakeDistributedStore:
         try:
             self._invoke("close")
         finally:
-            self._worker.close()
+            if self._worker is not None:
+                self._worker.close()
 
     def register_buffer(self, buffer_ptr: int, size: int):
         result = self._invoke("register_buffer", buffer_ptr, size)

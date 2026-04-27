@@ -66,6 +66,7 @@ Isolation knobs:
 This mode:
 
 - constructs a Rust `StoreClient`
+- dispatches compatibility calls directly into the native store object so concurrent Python threads are not serialized behind a single Python worker queue
 - registers local memory and participates in route / allocator control plane RPC
 - starts a background heartbeat loop after setup so long-lived Python runtimes keep their lease live and repair local metadata after Redis connectivity returns without requiring explicit `heartbeat()` calls
 - participates in the same hit-report and replica-route tracking RPC used by Rust clients
