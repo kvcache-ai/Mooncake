@@ -55,7 +55,7 @@ uint64_t parseMetricsInterval() {
 }  // anonymous namespace
 
 ClientMetric::ClientMetric(uint64_t interval_seconds,
-                           std::map<std::string, std::string> labels)
+                           const std::map<std::string, std::string>& labels)
     : transfer_metric(labels),
       master_client_metric(labels),
       should_stop_metrics_thread_(false),

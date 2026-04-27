@@ -273,32 +273,32 @@ TEST_F(ClientMetricsTest, P2PClientMetricBasicTest) {
 
     // Test empty metrics
     std::string summary = metrics.summary_metrics();
-    EXPECT_TRUE(summary.find("Local Get: 0 requests") != std::string::npos);
-    EXPECT_TRUE(summary.find("Local Put: 0 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Get: 0 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Put: 0 requests") != std::string::npos);
 
     // Add put data
-    metrics.local_put_requests.inc();
-    metrics.local_put_requests.inc();
-    metrics.local_put_failures.inc();
-    metrics.local_put_bytes.inc(1024 * 1024);  // 1 MB
-    metrics.local_put_latency.observe(200);
-    metrics.local_put_latency.observe(300);
+    metrics.local_request.put_requests.inc();
+    metrics.local_request.put_requests.inc();
+    metrics.local_request.put_failures.inc();
+    metrics.local_request.put_bytes.inc(1024 * 1024);  // 1 MB
+    metrics.local_request.put_latency.observe(200);
+    metrics.local_request.put_latency.observe(300);
 
     // Add get data
-    metrics.local_get_requests.inc();
-    metrics.local_get_requests.inc();
-    metrics.local_get_requests.inc();
-    metrics.local_get_failures.inc();
-    metrics.local_get_misses.inc();
-    metrics.local_get_hits.inc();
-    metrics.local_get_bytes.inc(2 * 1024 * 1024);  // 2 MB
-    metrics.local_get_latency.observe(100);
-    metrics.local_get_latency.observe(150);
+    metrics.local_request.get_requests.inc();
+    metrics.local_request.get_requests.inc();
+    metrics.local_request.get_requests.inc();
+    metrics.local_request.get_failures.inc();
+    metrics.local_request.get_misses.inc();
+    metrics.local_request.get_hits.inc();
+    metrics.local_request.get_bytes.inc(2 * 1024 * 1024);  // 2 MB
+    metrics.local_request.get_latency.observe(100);
+    metrics.local_request.get_latency.observe(150);
 
     summary = metrics.summary_metrics();
-    EXPECT_TRUE(summary.find("Local Put: 2 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Put: 2 requests") != std::string::npos);
     EXPECT_TRUE(summary.find("1.00 MB written") != std::string::npos);
-    EXPECT_TRUE(summary.find("Local Get: 3 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Get: 3 requests") != std::string::npos);
     EXPECT_TRUE(summary.find("2.00 MB read") != std::string::npos);
     EXPECT_TRUE(summary.find("1 misses") != std::string::npos);
     EXPECT_TRUE(summary.find("1 hits") != std::string::npos);
@@ -310,17 +310,17 @@ TEST_F(ClientMetricsTest, P2PClientMetricSerializeTest) {
     P2PClientMetric metrics;
 
     // Add some data
-    metrics.local_put_requests.inc(100);
-    metrics.local_put_bytes.inc(50 * 1024 * 1024);  // 50 MB
-    metrics.local_get_requests.inc(500);
-    metrics.local_get_misses.inc(20);
-    metrics.local_get_hits.inc(480);
-    metrics.local_get_bytes.inc(100 * 1024 * 1024);  // 100 MB
+    metrics.local_request.put_requests.inc(100);
+    metrics.local_request.put_bytes.inc(50 * 1024 * 1024);  // 50 MB
+    metrics.local_request.get_requests.inc(500);
+    metrics.local_request.get_misses.inc(20);
+    metrics.local_request.get_hits.inc(480);
+    metrics.local_request.get_bytes.inc(100 * 1024 * 1024);  // 100 MB
 
     // Add latency data to test histogram output
-    metrics.local_put_latency.observe(200);
-    metrics.local_put_latency.observe(300);
-    metrics.local_get_latency.observe(100);
+    metrics.local_request.put_latency.observe(200);
+    metrics.local_request.put_latency.observe(300);
+    metrics.local_request.get_latency.observe(100);
 
     std::string serialized;
     metrics.serialize(serialized);
@@ -356,8 +356,8 @@ TEST_F(ClientMetricsTest, P2PClientMetricWithLabelsTest) {
 
     auto metrics = P2PClientMetric::Create(labels);
     ASSERT_NE(metrics, nullptr);
-    metrics->local_put_requests.inc();
-    metrics->local_get_requests.inc();
+    metrics->local_request.put_requests.inc();
+    metrics->local_request.get_requests.inc();
 
     std::string serialized;
     metrics->serialize(serialized);
@@ -378,8 +378,8 @@ TEST_F(ClientMetricsTest, P2PClientMetricInheritanceTest) {
     p2p_metrics->transfer_metric.total_read_bytes.inc(1024 * 1024);  // 1 MB
     p2p_metrics->transfer_metric.total_write_bytes.inc(2 * 1024 *
                                                        1024);  // 2 MB
-    p2p_metrics->local_get_requests.inc(100);
-    p2p_metrics->local_put_requests.inc(50);
+    p2p_metrics->local_request.get_requests.inc(100);
+    p2p_metrics->local_request.put_requests.inc(50);
 
     // Test serialize includes both base and P2P metrics
     std::string serialized;
@@ -399,10 +399,10 @@ TEST_F(ClientMetricsTest, P2PClientMetricInheritanceTest) {
                 std::string::npos);  // Base class summary
     EXPECT_TRUE(summary.find("RPC Metrics Summary") !=
                 std::string::npos);  // Base class summary
-    EXPECT_TRUE(summary.find("P2P Local Storage Metrics") !=
+    EXPECT_TRUE(summary.find("P2P Local Request Metrics") !=
                 std::string::npos);  // P2P-specific summary
-    EXPECT_TRUE(summary.find("Local Get: 100 requests") != std::string::npos);
-    EXPECT_TRUE(summary.find("Local Put: 50 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Get: 100 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Put: 50 requests") != std::string::npos);
 }
 
 // Test ClientMetric::Create returns nullptr when disabled

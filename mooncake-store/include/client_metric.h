@@ -324,7 +324,7 @@ struct ClientMetric {
      *   (default: 0, 0 = collect but don't report)
      */
     static std::unique_ptr<ClientMetric> Create(
-        std::map<std::string, std::string> labels = {}) {
+        const std::map<std::string, std::string>& labels = {}) {
         return CreatePtr<ClientMetric>(labels);
     }
 
@@ -333,8 +333,9 @@ struct ClientMetric {
 
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
 
-    explicit ClientMetric(uint64_t interval_seconds = 0,
-                          std::map<std::string, std::string> labels = {});
+    explicit ClientMetric(
+        uint64_t interval_seconds = 0,
+        const std::map<std::string, std::string>& labels = {});
     virtual ~ClientMetric();
 
    protected:
@@ -344,7 +345,7 @@ struct ClientMetric {
      */
     template <typename T>
     static std::unique_ptr<T> CreatePtr(
-        std::map<std::string, std::string> labels) {
+        const std::map<std::string, std::string>& labels) {
         if (!IsEnabled()) {
             LOG(INFO) << "Client metrics disabled (set "
                          "MC_STORE_CLIENT_METRIC=1 to enable)";

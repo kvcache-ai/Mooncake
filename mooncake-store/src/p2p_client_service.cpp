@@ -554,7 +554,7 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
 
     Stopwatch stopwatch;
     if (metrics_) {
-        metrics_->local_put_requests.inc(keys.size());
+        metrics_->local_request.put_requests.inc(keys.size());
     }
 
     auto guard = AcquireInflightGuard();
@@ -581,7 +581,7 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         if (results[i].has_value()) {
             success_count++;
             if (metrics_) {
-                metrics_->local_put_bytes.inc(
+                metrics_->local_request.put_bytes.inc(
                     ClientService::CalculateSliceSize(batched_slices[i]));
             }
         }
@@ -589,11 +589,15 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     if (metrics_) {
         size_t failure_count = keys.size() - success_count;
         if (failure_count > 0) {
-            metrics_->local_put_failures.inc(failure_count);
+            metrics_->local_request.put_failures.inc(failure_count);
         }
         const auto elapsed = stopwatch.elapsed_us();
-        for (size_t i = 0; i < keys.size(); ++i) {
-            metrics_->local_put_latency.observe(elapsed);
+        if (!keys.empty()) {
+            const double avg_latency =
+                static_cast<double>(elapsed) / keys.size();
+            for (size_t i = 0; i < keys.size(); ++i) {
+                metrics_->local_request.put_latency.observe(avg_latency);
+            }
         }
     }
 
@@ -1055,7 +1059,7 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
     timer.LogRequest("batch_size=", keys.size());
 
     if (metrics_) {
-        metrics_->local_get_requests.inc(keys.size());
+        metrics_->local_request.get_requests.inc(keys.size());
     }
 
     std::vector<tl::expected<ResultT, ErrorCode>> results(
@@ -1102,18 +1106,22 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
         if (results[i].has_value()) {
             success_count++;
             if (metrics_) {
-                metrics_->local_get_bytes.inc(handles[i]->data_size);
+                metrics_->local_request.get_bytes.inc(handles[i]->data_size);
             }
         }
     }
     if (metrics_) {
         size_t failure_count = keys.size() - success_count;
         if (failure_count > 0) {
-            metrics_->local_get_failures.inc(failure_count);
+            metrics_->local_request.get_failures.inc(failure_count);
         }
         const auto elapsed = stopwatch.elapsed_us();
-        for (size_t i = 0; i < keys.size(); ++i) {
-            metrics_->local_get_latency.observe(elapsed);
+        if (!keys.empty()) {
+            const double avg_latency =
+                static_cast<double>(elapsed) / keys.size();
+            for (size_t i = 0; i < keys.size(); ++i) {
+                metrics_->local_request.get_latency.observe(avg_latency);
+            }
         }
     }
 
@@ -1182,7 +1190,7 @@ P2PClientService::BatchCreateGetHandlesImpl(
             handles[i] = std::move(local.value());
             // Count local cache hits
             if (metrics_) {
-                metrics_->local_get_hits.inc();
+                metrics_->local_request.get_hits.inc();
             }
         } else if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to get from local, key: " << keys[i]
@@ -1192,7 +1200,7 @@ P2PClientService::BatchCreateGetHandlesImpl(
             miss_indices.push_back(i);
             // Count local cache misses
             if (metrics_) {
-                metrics_->local_get_misses.inc();
+                metrics_->local_request.get_misses.inc();
             }
         }
     }
