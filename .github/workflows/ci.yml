@@ -525,7 +525,23 @@ jobs:
         df -h
       shell: bash
 
-    - name: Configure project with EP
+    - name: Configure project with unit tests and examples
+      run: |
+        cd build
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+      shell: bash
+      # TODO: lack WITH_RUST_EXAMPLE
+
+    - name: Build project with unit tests and examples
+      run: |
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+        cd build
+        cmake --build .
+        sudo cmake --install .
+      shell: bash
+
+    - name: Configure project
       run: |
         cd build
         rm -r */tests
