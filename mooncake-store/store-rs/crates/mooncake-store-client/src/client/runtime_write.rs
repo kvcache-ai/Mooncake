@@ -213,6 +213,12 @@ impl StoreClient {
             ));
         };
         let resolved_policy = self.resolve_replication_policy(policy)?;
+        let max_write_attempts = if resolved_policy.required_preferred_segments.is_empty() {
+            DEFAULT_PUT_WRITE_RETRY_LIMIT
+        } else {
+            1
+        };
+        let mut write_attempt = 0usize;
 
         let object_refs = requests
             .iter()
@@ -237,6 +243,22 @@ impl StoreClient {
         let rank_result = planner.rank_many(self, &object_refs);
         rank_tracker.finish(&rank_result, 0);
         let plans = rank_result?;
+        let abort_prepared_quota = |entries: &[PreparedObjectWrite<'_>], context: &str| {
+            for entry in entries {
+                let _ =
+                    self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
+            }
+        };
+        let release_prepared = |entries: &[PreparedObjectWrite<'_>], context: &str| {
+            for entry in entries {
+                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+                let _ =
+                    self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
+            }
+        };
+        let (routes, prepared) = loop {
+            write_attempt = write_attempt.saturating_add(1);
+            self.flush_due_reclaims()?;
 
         struct PendingBatchReservation<'a> {
             tenant: &'a str,
@@ -579,17 +601,6 @@ impl StoreClient {
         })();
         reserve_tracker.finish(&reserve_result, 0);
         let prepared = reserve_result?;
-        let abort_prepared_quota = |entries: &[PreparedObjectWrite<'_>], context: &str| {
-            for entry in entries {
-                let _ = self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
-            }
-        };
-        let release_prepared = |entries: &[PreparedObjectWrite<'_>], context: &str| {
-            for entry in entries {
-                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
-                let _ = self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
-            }
-        };
         let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
         let current_routes_result = self.route_directory.get_object_routes(
             &self.lease,
@@ -880,12 +891,41 @@ impl StoreClient {
             }
         };
         write_tracker.finish(&write_result, 0);
-        let routes = match write_result {
-            Ok(routes) => routes,
+        match write_result {
+            Ok(routes) => break (routes, prepared),
             Err(error) => {
                 release_prepared(&prepared, "batch_put_failed_before_publish");
+                let failed_targets = prepared
+                    .iter()
+                    .flat_map(|entry| entry.targets.iter().cloned())
+                    .collect::<Vec<_>>();
+                self.note_remote_write_failure(
+                    &failed_targets,
+                    &error,
+                    "remote_batch_write_failed",
+                );
+                if write_attempt < max_write_attempts
+                    && resolved_policy.required_preferred_segments.is_empty()
+                    && matches!(
+                        error,
+                        StoreError::Transport(_)
+                            | StoreError::NotFound(_)
+                            | StoreError::InvalidState(_)
+                    )
+                {
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        items = prepared.len(),
+                        attempt = write_attempt,
+                        max_write_attempts,
+                        error = %error,
+                        "retrying batch put after transient replica write failure"
+                    );
+                    continue;
+                }
                 return Err(error);
             }
+        };
         };
 
         let cas_requests = routes

@@ -127,6 +127,12 @@ For routed batch writes, remote replica transfers are coalesced by tenant and sc
 capacity before route publication. Large same-tenant batches therefore pay one transfer-completion
 wait per chunk instead of one wait per object.
 
+If a routed write fails during remote transfer before the object route is published, the client
+releases the prepared allocations, quarantines the failed remote storage runtime, refreshes its
+membership snapshot, and retries placement when the request is not pinned to a hard required
+segment. This keeps transient storage-owner transport failures from escaping into Python backup
+threads as fatal exceptions.
+
 ```mermaid
 sequenceDiagram
     participant App
