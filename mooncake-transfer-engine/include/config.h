@@ -34,7 +34,7 @@ struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
     uint8_t port = 1;
-    int gid_index = -1;  // -1 for auto-selection, >=0 for user-specified
+    int gid_index = -1;       // -1 for auto-selection, >=0 for user-specified
     uint16_t pkey_index = 0;  // QP attr.pkey_index; override via MC_PKEY_INDEX
     uint64_t max_mr_size = 0x10000000000;
     size_t max_cqe = 4096;
