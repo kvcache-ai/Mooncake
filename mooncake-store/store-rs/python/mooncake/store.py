@@ -43,7 +43,10 @@ def _load_native():
         seen: set[pathlib.Path] = set()
         for target_root in target_roots:
             for profile in ("debug", "release"):
-                for profile_dir in (target_root / profile, target_root / profile / "deps"):
+                for profile_dir in (
+                    target_root / profile,
+                    target_root / profile / "deps",
+                ):
                     for pattern in patterns:
                         for candidate in profile_dir.glob(pattern):
                             resolved = candidate.resolve()
@@ -77,6 +80,55 @@ def _load_native():
 
 
 _native = _load_native()
+
+_CACHE_STATUS = "status"
+_CACHE_STATUS_LIST = "status_list"
+_CACHE_BYTES = "bytes"
+_CACHE_BYTES_LIST = "bytes_list"
+_CACHE_BOOL = "bool"
+
+# Python compatibility policy: cache data-plane failures degrade to misses or
+# failed cache operations. Non-cache control-plane methods stay strict.
+_CACHE_COMPAT_POLICY = {
+    "register_buffer": _CACHE_STATUS,
+    "unregister_buffer": _CACHE_STATUS,
+    "put": _CACHE_STATUS,
+    "put_from": _CACHE_STATUS,
+    "batch_put": _CACHE_STATUS,
+    "batch_put_from": _CACHE_STATUS_LIST,
+    "batch_put_from_raw": _CACHE_STATUS_LIST,
+    "batch_put_from_multi_buffers": _CACHE_STATUS_LIST,
+    "batch_put_from_multi_buffers_raw": _CACHE_STATUS_LIST,
+    "batch_get": _CACHE_BYTES_LIST,
+    "batch_get_buffer": _CACHE_BYTES_LIST,
+    "batch_get_into": _CACHE_STATUS_LIST,
+    "batch_get_into_raw": _CACHE_STATUS_LIST,
+    "batch_get_into_multi_buffers": _CACHE_STATUS_LIST,
+    "get": _CACHE_BYTES,
+    "get_into": _CACHE_STATUS,
+    "is_exist": _CACHE_BOOL,
+    "batch_is_exist": _CACHE_STATUS_LIST,
+    "get_size": _CACHE_STATUS,
+    "remove": _CACHE_STATUS,
+    "batch_remove": _CACHE_STATUS_LIST,
+}
+
+
+def _cache_compat_fallback(name: str, count: int | None = None):
+    kind = _CACHE_COMPAT_POLICY[name]
+    if kind == _CACHE_STATUS:
+        return -1
+    if kind == _CACHE_BYTES:
+        return b""
+    if kind == _CACHE_BOOL:
+        return False
+    if count is None:
+        raise ValueError(f"{name} soft-fail fallback requires an item count")
+    if kind == _CACHE_STATUS_LIST:
+        return [-1] * count
+    if kind == _CACHE_BYTES_LIST:
+        return [b""] * count
+    raise AssertionError(f"unknown cache compatibility fallback {kind!r}")
 
 
 def _normalize_hugepage_size(value) -> int | None:
@@ -322,6 +374,18 @@ class MooncakeDistributedStore:
             return self._worker.call(name, *args, **kwargs)
         return getattr(self._native, name)(*args, **kwargs)
 
+    def _invoke_cache(
+        self,
+        name: str,
+        *args,
+        fallback_count: int | None = None,
+        **kwargs,
+    ):
+        try:
+            return self._invoke(name, *args, **kwargs)
+        except Exception:
+            return _cache_compat_fallback(name, fallback_count)
+
     def setup(self, *args, **kwargs):
         if len(args) == 1 and isinstance(args[0], Mapping) and not kwargs:
             return self._setup_from_config_dict(dict(args[0]))
@@ -387,7 +451,7 @@ class MooncakeDistributedStore:
                 self._worker.close()
 
     def register_buffer(self, buffer_ptr: int, size: int):
-        result = self._invoke("register_buffer", buffer_ptr, size)
+        result = self._invoke_cache("register_buffer", buffer_ptr, size)
         if result == 0:
             with self._lock:
                 self._registered_buffers[int(buffer_ptr)] = int(size)
@@ -395,14 +459,14 @@ class MooncakeDistributedStore:
 
     def unregister_buffer(self, buffer_ptr: int, size: int | None = None):
         resolved_size = self._resolve_registered_size(buffer_ptr, size)
-        result = self._invoke("unregister_buffer", buffer_ptr, resolved_size)
+        result = self._invoke_cache("unregister_buffer", buffer_ptr, resolved_size)
         if result == 0:
             with self._lock:
                 self._registered_buffers.pop(int(buffer_ptr), None)
         return result
 
     def put(self, key: str, value, *, tenant: str | None = None, config=None):
-        result = self._invoke(
+        result = self._invoke_cache(
             "put",
             key,
             value,
@@ -422,7 +486,7 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
         config=None,
     ):
-        result = self._invoke(
+        result = self._invoke_cache(
             "put_from",
             key,
             buffer_ptr,
@@ -444,7 +508,7 @@ class MooncakeDistributedStore:
         config=None,
     ):
         normalized = _normalize_key_value_items(items, keys, values)
-        result = self._invoke(
+        result = self._invoke_cache(
             "batch_put",
             normalized,
             tenant=tenant,
@@ -467,26 +531,32 @@ class MooncakeDistributedStore:
     def batch_put_from(self, *args, tenant: str | None = None, config=None):
         if len(args) == 1:
             items = _normalize_pointer_items(args[0])
-            result = self._invoke(
+            result = self._invoke_cache(
                 "batch_put_from",
                 items,
+                fallback_count=len(items),
                 tenant=tenant,
                 **_replication_kwargs(config),
             )
-            self._track_keys([key for key, _, _ in items], tenant=tenant)
-            return _coerce_batch_status_result(result, len(items))
+            statuses = _coerce_batch_status_result(result, len(items))
+            self._track_successful_keys(
+                [key for key, _, _ in items], statuses, tenant=tenant
+            )
+            return statuses
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
-            result = self._invoke(
+            result = self._invoke_cache(
                 "batch_put_from_raw",
                 keys,
                 buffer_ptrs,
                 sizes,
+                fallback_count=len(keys),
                 tenant=tenant,
                 **_replication_kwargs(config),
             )
-            self._track_keys(keys, tenant=tenant)
-            return _coerce_batch_status_result(result, len(keys))
+            statuses = _coerce_batch_status_result(result, len(keys))
+            self._track_successful_keys(keys, statuses, tenant=tenant)
+            return statuses
         raise TypeError(
             "batch_put_from expects either items or (keys, buffer_ptrs, sizes)"
         )
@@ -500,28 +570,31 @@ class MooncakeDistributedStore:
         if len(args) == 1:
             items = list(args[0])
             if _items_use_bytes_payloads(items):
-                return self._invoke(
+                return self._invoke_cache(
                     "batch_put_from_multi_buffers",
                     items,
+                    fallback_count=len(items),
                     tenant=tenant,
                     **_replication_kwargs(config),
                 )
             keys, all_buffer_ptrs, all_sizes = _normalize_descriptor_items(items)
-            return self._invoke(
+            return self._invoke_cache(
                 "batch_put_from_multi_buffers_raw",
                 keys,
                 all_buffer_ptrs,
                 all_sizes,
+                fallback_count=len(keys),
                 tenant=tenant,
                 **_replication_kwargs(config),
             )
         if len(args) == 3:
             keys, all_buffer_ptrs, all_sizes = _normalize_raw_multi_buffer_args(*args)
-            return self._invoke(
+            return self._invoke_cache(
                 "batch_put_from_multi_buffers_raw",
                 keys,
                 all_buffer_ptrs,
                 all_sizes,
+                fallback_count=len(keys),
                 tenant=tenant,
                 **_replication_kwargs(config),
             )
@@ -530,18 +603,35 @@ class MooncakeDistributedStore:
         )
 
     def batch_get(self, keys: Sequence[str], *, tenant: str | None = None):
-        return self._invoke("batch_get", list(keys), tenant=tenant)
+        key_list = list(keys)
+        return self._invoke_cache(
+            "batch_get", key_list, fallback_count=len(key_list), tenant=tenant
+        )
 
     def batch_get_buffer(self, keys: Sequence[str], *, tenant: str | None = None):
-        return self._invoke("batch_get_buffer", list(keys), tenant=tenant)
+        key_list = list(keys)
+        return self._invoke_cache(
+            "batch_get_buffer",
+            key_list,
+            fallback_count=len(key_list),
+            tenant=tenant,
+        )
 
     def batch_get_into(self, *args, tenant: str | None = None):
         if len(args) == 1:
-            return self._invoke("batch_get_into", args[0], tenant=tenant)
+            items = list(args[0])
+            return self._invoke_cache(
+                "batch_get_into", items, fallback_count=len(items), tenant=tenant
+            )
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
-            return self._invoke(
-                "batch_get_into_raw", keys, buffer_ptrs, sizes, tenant=tenant
+            return self._invoke_cache(
+                "batch_get_into_raw",
+                keys,
+                buffer_ptrs,
+                sizes,
+                fallback_count=len(keys),
+                tenant=tenant,
             )
         raise TypeError(
             "batch_get_into expects either items or (keys, buffer_ptrs, sizes)"
@@ -563,32 +653,49 @@ class MooncakeDistributedStore:
             raise TypeError(
                 "batch_get_into_multi_buffers expects items or (keys, all_buffer_ptrs, all_sizes)"
             )
-        return self._invoke(
+        return self._invoke_cache(
             "batch_get_into_multi_buffers",
             keys,
             all_buffer_ptrs,
             all_sizes,
+            fallback_count=len(keys),
             prefer_alloc_in_same_node=prefer_alloc_in_same_node,
             tenant=tenant,
         )
 
     def get(self, key: str, *, tenant: str | None = None):
-        return self._invoke("get", key, tenant=tenant)
+        return self._invoke_cache("get", key, tenant=tenant)
+
+    def get_into(
+        self,
+        key: str,
+        buffer_ptr: int,
+        size: int,
+        *,
+        tenant: str | None = None,
+    ):
+        return self._invoke_cache("get_into", key, buffer_ptr, size, tenant=tenant)
 
     def is_exist(self, key: str, *, tenant: str | None = None) -> bool:
-        return self._invoke("is_exist", key, tenant=tenant)
+        return bool(self._invoke_cache("is_exist", key, tenant=tenant))
 
     def batch_is_exist(self, keys: Sequence[str], *, tenant: str | None = None):
-        return self._invoke("batch_is_exist", list(keys), tenant=tenant)
+        key_list = list(keys)
+        return self._invoke_cache(
+            "batch_is_exist",
+            key_list,
+            fallback_count=len(key_list),
+            tenant=tenant,
+        )
 
     def get_hostname(self) -> str:
         return self._invoke("get_hostname")
 
     def get_size(self, key: str, *, tenant: str | None = None) -> int:
-        return self._invoke("get_size", key, tenant=tenant)
+        return self._invoke_cache("get_size", key, tenant=tenant)
 
     def remove(self, key: str, *, force: bool = False, tenant: str | None = None):
-        result = self._invoke("remove", key, force=force, tenant=tenant)
+        result = self._invoke_cache("remove", key, force=force, tenant=tenant)
         if result == 0:
             self._forget_keys([key], tenant=tenant)
         return result
@@ -601,7 +708,13 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
     ):
         key_list = list(keys)
-        result = self._invoke("batch_remove", key_list, force=force, tenant=tenant)
+        result = self._invoke_cache(
+            "batch_remove",
+            key_list,
+            fallback_count=len(key_list),
+            force=force,
+            tenant=tenant,
+        )
         for key, status in zip(key_list, result):
             if int(status) == 0:
                 self._forget_keys([key], tenant=tenant)
@@ -617,7 +730,13 @@ class MooncakeDistributedStore:
             pass
         removed = 0
         for tenant, keys in self._group_tracked_keys().items():
-            statuses = self._invoke("batch_remove", keys, force=force, tenant=tenant)
+            statuses = self._invoke_cache(
+                "batch_remove",
+                keys,
+                fallback_count=len(keys),
+                force=force,
+                tenant=tenant,
+            )
             for key, status in zip(keys, statuses):
                 if int(status) == 0:
                     self._forget_keys([key], tenant=tenant)
@@ -652,6 +771,18 @@ class MooncakeDistributedStore:
         with self._lock:
             for key in keys:
                 self._tracked_keys.discard((tenant, str(key)))
+
+    def _track_successful_keys(
+        self,
+        keys: Iterable[str],
+        statuses: Iterable[int],
+        *,
+        tenant: str | None = None,
+    ) -> None:
+        self._track_keys(
+            (key for key, status in zip(keys, statuses) if int(status) == 0),
+            tenant=tenant,
+        )
 
     def _group_tracked_keys(self) -> dict[str | None, list[str]]:
         grouped: dict[str | None, list[str]] = {}
@@ -786,9 +917,7 @@ def _normalize_pointer_items(items: Iterable[tuple]):
 
 def _coerce_batch_status_result(result, count: int) -> _BatchStatusResult:
     if isinstance(result, int):
-        if result != 0:
-            raise RuntimeError(f"batch put-from failed with status {result}")
-        return _BatchStatusResult([0] * count)
+        return _BatchStatusResult([int(result)] * count)
     return _BatchStatusResult([int(status) for status in result])
 
 

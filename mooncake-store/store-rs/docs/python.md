@@ -660,15 +660,15 @@ If hugepage mode is requested, the host kernel must already have compatible huge
 - `batch_get_into`
 - `batch_get_into_multi_buffers`
 
-## Batch Read Soft-Miss Semantics
+## Cache Soft-Fail Semantics
 
-The real backend keeps batch read behavior compatible with upstream Mooncake while avoiding Python-side crashes on transient backend failures.
+The Python compatibility API treats KV cache data-plane failures as best-effort misses or failed cache operations so optional HiCache traffic does not crash an inference process. Strict setup, configuration, metrics, lifecycle, and admin APIs still return normal exceptions.
 
-- `batch_get_into(...)` returns copied lengths and uses `-1` for soft misses
-- `batch_get_into_multi_buffers(...)` returns copied lengths and uses `-1` for soft misses
+- `get(...)` and `batch_get(...)` return empty byte payloads on soft failures
+- `get_into(...)`, `batch_get_into(...)`, and `batch_get_into_multi_buffers(...)` return copied lengths and use `-1` for soft misses
+- `put(...)`, `put_from(...)`, `batch_put_from(...)`, and related buffer write APIs return `-1` or per-item negative statuses on soft failures
 - `batch_is_exist(...)` returns `1` for hit, `0` for miss, and negative status codes for soft backend failures
-- soft-miss downgrade covers `NotFound`, `InvalidState`, metadata errors, and transport errors on the real backend
-- single-key `get(...)` and `get_into(...)` keep normal exception behavior
+- soft-fail downgrade covers transient native exceptions, including metadata and transport errors, at the Python compatibility boundary
 
 ### Lifecycle and Capacity
 
