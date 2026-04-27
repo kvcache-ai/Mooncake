@@ -480,6 +480,7 @@ The current repository uses these environment variables.
 | Variable | Used By | Meaning |
 |----------|---------|---------|
 | `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
+| `MC_STORE_RS_METADATA_URL` | bench | store metadata endpoint used by `mooncake-store-bench --metadata-url` |
 | `MC_STORE_RS_KEYSPACE` | Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace`; this also defines Python compatibility read/write visibility and local hot-cache partitioning |
 | `MC_STORE_RS_STABLE_ID` | Python wrapper setup fallback | stable client id used when SGLang cannot pass `stable_id` |
 | `MC_STORE_RS_INITIAL_STATE` | Python wrapper setup fallback | initial lifecycle state, for example `active`, `standby`, `draining`, or `offline` |
@@ -489,7 +490,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_REPLICA_COUNT` | Python wrapper setup fallback | default routed-writer replica count |
 | `MC_STORE_RS_ROUTE_TOPK` | Python wrapper setup fallback | WRH route-authority fanout; must be `>= 2` |
 | `MC_STORE_RS_ROUTE_CONTROL` | Python wrapper setup fallback | route control mode, usually `embedded_wrh` |
-| `MC_STORE_RS_TRANSPORT_METADATA_URL` | Python wrapper setup fallback | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
+| `MC_STORE_RS_TRANSPORT_METADATA_URL` | Python wrapper setup fallback, bench | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
 | `MC_STORE_RS_GID_INDEX` | compatibility layer, standalone client, Python wrapper, and bench | `classic_te` RDMA GID index override; forwarded to upstream `MC_GID_INDEX` |
 | `MC_STORE_RS_TRANSPORT_RPC_PORT` | Python wrapper setup fallback | fixed real data-plane transport port |
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |

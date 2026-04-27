@@ -12,7 +12,8 @@ mooncake-store-bench [global options] <COMMAND>
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metadata-url <URL>` | required | Redis URL used by the bench metadata backend; also read from `MC_STORE_RS_TRANSPORT_METADATA_URL` |
+| `--metadata-url <URL>` | required | Redis URL used by the bench metadata backend; also read from `MC_STORE_RS_METADATA_URL` |
+| `--transport-metadata-url <URL>` | unset | Optional transfer-engine metadata endpoint; also read from `MC_STORE_RS_TRANSPORT_METADATA_URL`. Use `P2PHANDSHAKE` with `classic_te` when the transport should use peer handshake metadata instead of Redis-backed transport metadata. |
 | `--keyspace <PREFIX>` | `mc/store-rs/v1` when `storage_bytes=0`; otherwise auto-generated | Metadata keyspace prefix |
 | `--transport-backend <classic-te\|tent>` | `classic-te` | Data-plane transport backend |
 | `--protocol <tcp\|rdma>` | `tcp` | Transport protocol |
@@ -36,6 +37,16 @@ scratch-only mode, bench joins the same default metadata namespace as
 `mooncake-store-client`: `mc/store-rs/v1`. When `--storage-bytes > 0` and
 `--keyspace` is omitted, bench generates an isolated
 `mc/store-rs/bench/<unique>` keyspace for that run.
+
+Startup safety gate for `classic_te` compatibility deployments:
+
+- bench refuses to start if active `storage=true` daemons in the same keyspace
+  mix metadata-backed logical segment names with `P2PHANDSHAKE` rpc-address
+  segment names
+- bench also refuses to start if its effective transport metadata mode disagrees
+  with the active storage daemons already visible in that keyspace
+- fix the cluster by restarting every participating storage daemon and bench
+  process with one transport metadata mode before benchmarking
 
 ### Tracing behavior
 

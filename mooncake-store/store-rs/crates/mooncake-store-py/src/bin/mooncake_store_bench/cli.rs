@@ -18,8 +18,10 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 pub struct GlobalArgs {
-    #[arg(long, env = "MC_STORE_RS_TRANSPORT_METADATA_URL")]
+    #[arg(long, env = "MC_STORE_RS_METADATA_URL")]
     pub metadata_url: String,
+    #[arg(long, env = "MC_STORE_RS_TRANSPORT_METADATA_URL")]
+    pub transport_metadata_url: Option<String>,
     #[arg(long, default_value = "", env = "MC_STORE_RS_KEYSPACE")]
     pub keyspace: String,
     #[arg(long, value_enum, default_value_t = Protocol::Tcp, env = "MOONCAKE_PROTOCOL")]
@@ -465,6 +467,34 @@ mod tests {
     }
 
     #[test]
+    fn global_cli_reads_metadata_url_from_mc_store_rs_metadata_url() {
+        let command = Cli::command();
+        let metadata = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("metadata-url"))
+            .expect("global args should expose --metadata-url");
+
+        assert_eq!(
+            metadata.get_env(),
+            Some(OsStr::new("MC_STORE_RS_METADATA_URL"))
+        );
+    }
+
+    #[test]
+    fn global_cli_reads_transport_metadata_url_from_mc_store_rs_transport_metadata_url() {
+        let command = Cli::command();
+        let transport_metadata = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("transport-metadata-url"))
+            .expect("global args should expose --transport-metadata-url");
+
+        assert_eq!(
+            transport_metadata.get_env(),
+            Some(OsStr::new("MC_STORE_RS_TRANSPORT_METADATA_URL"))
+        );
+    }
+
+    #[test]
     fn parse_bench_supports_explicit_interface_selection() {
         let parsed = Cli::try_parse_from([
             "mooncake-store-bench",
@@ -496,6 +526,7 @@ mod tests {
             "bench",
         ]);
         assert_eq!(cli.global.metadata_url, "redis://127.0.0.1:6379/0");
+        assert_eq!(cli.global.transport_metadata_url, None);
         assert_eq!(cli.global.trace_filter.as_deref(), None);
         assert!(matches!(
             cli.global.transport_backend,
@@ -521,6 +552,23 @@ mod tests {
         ]);
 
         assert_eq!(cli.global.storage_bytes, 0);
+    }
+
+    #[test]
+    fn parse_global_supports_explicit_transport_metadata_url() {
+        let cli = Cli::parse_from([
+            "mooncake-store-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "--transport-metadata-url",
+            "redis://127.0.0.1:6380/1",
+            "bench",
+        ]);
+
+        assert_eq!(
+            cli.global.transport_metadata_url.as_deref(),
+            Some("redis://127.0.0.1:6380/1")
+        );
     }
 
     #[test]
