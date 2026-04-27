@@ -24,13 +24,14 @@ git_with_github_mirror_fallback() {
     local repo_url="$2"
     shift 2
 
-    if git clone "$repo_url" "$@"; then
+    if git clone "$repo_url" "$repo_dir" "$@"; then
         return 0
     fi
 
     echo "Direct clone failed, retrying with mirror https://ghfast.top/"
+    rm -rf "$repo_dir"
     local mirror_url="https://ghfast.top/${repo_url}"
-    git clone "$mirror_url" "$@"
+    git clone "$mirror_url" "$repo_dir" "$@"
 }
 
 clone_repo_if_not_exists() {
