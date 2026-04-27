@@ -29,14 +29,59 @@ fn main() {
         .unwrap_or_else(|_| "../../build/mooncake-store/src".to_string());
 
     println!("cargo:rustc-link-search=native={lib_dir}");
+
+    // mooncake_store depends on libasio.so (shared) built in mooncake-common.
+    let lib_path = PathBuf::from(&lib_dir);
+    let build_dir = lib_path.ancestors().nth(2).map(PathBuf::from).unwrap_or_else(|| {
+        println!("cargo:warning=MOONCAKE_STORE_LIB_DIR='{lib_dir}' does not have enough parent directories; using current directory");
+        PathBuf::from(".")
+    });
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("mooncake-common").display()
+    );
+
+    // transfer_engine is built in a sibling directory.
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("mooncake-transfer-engine/src").display()
+    );
+
+    // common/base library (contains mooncake::Status etc.)
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("mooncake-transfer-engine/src/common/base").display()
+    );
+
+    // CUDA runtime libraries (needed by transfer_engine RDMA transport).
+    let cuda_home = env::var("CUDA_HOME")
+        .or_else(|_| env::var("CUDA_PATH"))
+        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    println!("cargo:rustc-link-search=native={}/targets/x86_64-linux/lib", cuda_home);
+
+    // cachelib_memory_allocator is a static library built alongside mooncake_store.
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("mooncake-store/src/cachelib_memory_allocator").display()
+    );
+
     println!("cargo:rustc-link-lib=mooncake_store");
 
     // Dependencies of mooncake_store that must be satisfied at link time.
     // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
     println!("cargo:rustc-link-lib=transfer_engine");
+    println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
+    println!("cargo:rustc-link-lib=asio"); // shared library built by mooncake-common
+    println!("cargo:rustc-link-lib=jsoncpp"); // transfer_engine dependency
+    println!("cargo:rustc-link-lib=cachelib_memory_allocator"); // static
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-link-lib=glog");
     println!("cargo:rustc-link-lib=gflags");
+    println!("cargo:rustc-link-lib=numa");   // NUMA binding
+    println!("cargo:rustc-link-lib=curl");    // HTTP metadata plugin
+    println!("cargo:rustc-link-lib=ibverbs"); // RDMA transport
+    println!("cargo:rustc-link-lib=cuda");
+    println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=xxhash");
 
