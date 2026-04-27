@@ -32,6 +32,22 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
+namespace {
+struct CudaStreamNVLinkRAII {
+    cudaStream_t stream_;
+    CudaStreamNVLinkRAII() : stream_(nullptr) {
+        auto err =
+            cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+        if (err != cudaSuccess) {
+            LOG(FATAL) << "Failed to create NVLink CUDA stream: "
+                       << err << " - " << cudaGetErrorString(err);
+        }
+    }
+    ~CudaStreamNVLinkRAII() { cudaStreamDestroy(stream_); }
+};
+static thread_local CudaStreamNVLinkRAII tl_nvlink_stream;
+}  // anonymous namespace
+
 static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
@@ -194,18 +210,24 @@ Status IntraNodeNvlinkTransport::submitTransfer(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
+        task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
+        cudaStream_t stream = tl_nvlink_stream.stream_;
         cudaError_t err;
         if (slice->opcode == TransferRequest::READ)
-            err = cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                             slice->length, cudaMemcpyDefault);
+            err = cudaMemcpyAsync(slice->source_addr,
+                                  (void *)slice->local.dest_addr,
+                                  slice->length, cudaMemcpyDefault, stream);
         else
-            err = cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                             slice->length, cudaMemcpyDefault);
-        if (err != cudaSuccess)
+            err = cudaMemcpyAsync((void *)slice->local.dest_addr,
+                                  slice->source_addr,
+                                  slice->length, cudaMemcpyDefault, stream);
+        if (err != cudaSuccess) {
             slice->markFailed();
-        else
-            slice->markSuccess();
+        } else {
+            slice->status = Slice::POSTED;
+            slice->local.cuda_stream = (void *)stream;
+        }
     }
 
     return Status::OK();
@@ -223,6 +245,19 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
+    // Poll POSTED slices for async completion via cudaStreamQuery
+    for (auto *slice : task.slice_list) {
+        if (slice && slice->status == Slice::POSTED) {
+            cudaStream_t stream = (cudaStream_t)slice->local.cuda_stream;
+            cudaError_t cuda_err = cudaStreamQuery(stream);
+            if (cuda_err == cudaSuccess) {
+                slice->markSuccess();
+            } else if (cuda_err != cudaErrorNotReady) {
+                slice->markFailed();
+            }
+            // cudaErrorNotReady means still in progress, keep POSTED
+        }
+    }
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -261,19 +296,22 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);
+        cudaStream_t stream = tl_nvlink_stream.stream_;
         cudaError_t err;
         if (slice->opcode == TransferRequest::READ)
-            err = cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                             slice->length, cudaMemcpyDefault);
+            err = cudaMemcpyAsync(slice->source_addr,
+                                  (void *)slice->local.dest_addr,
+                                  slice->length, cudaMemcpyDefault, stream);
         else
-            err = cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                             slice->length, cudaMemcpyDefault);
-        if (err != cudaSuccess)
+            err = cudaMemcpyAsync((void *)slice->local.dest_addr,
+                                  slice->source_addr,
+                                  slice->length, cudaMemcpyDefault, stream);
+        if (err != cudaSuccess) {
             slice->markFailed();
-        else
-            slice->markSuccess();
+        } else {
+            slice->status = Slice::POSTED;
+            slice->local.cuda_stream = (void *)stream;
+        }
     }
     return Status::OK();
 }

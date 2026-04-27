@@ -135,6 +135,7 @@ class Transport {
             } ub;
             struct {
                 void *dest_addr;
+                void *cuda_stream;
             } local;
             struct {
                 uint64_t dest_addr;
