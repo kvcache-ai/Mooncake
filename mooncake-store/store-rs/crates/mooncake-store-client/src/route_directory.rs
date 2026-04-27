@@ -310,6 +310,39 @@ impl EmbeddedWrhRouteDirectory {
         ranked.into_iter().map(|(_, lease)| lease).collect()
     }
 
+    fn ranked_top_authorities_from_candidates(
+        &self,
+        candidates: &[ClientLease],
+        key: &ObjectKey,
+        limit: usize,
+    ) -> Vec<ClientLease> {
+        let mut top = Vec::<(f64, ClientLease)>::with_capacity(limit.min(candidates.len()));
+        for lease in candidates {
+            let score = weighted_rendezvous_score(
+                &self.namespace,
+                &key.0,
+                &lease.runtime.stable_id.0,
+                route_weight(lease),
+            );
+            let insert_at = top.partition_point(|(current_score, current_lease)| {
+                current_score
+                    .total_cmp(&score)
+                    .then_with(|| {
+                        current_lease
+                            .runtime
+                            .stable_id
+                            .cmp(&lease.runtime.stable_id)
+                    })
+                    .is_lt()
+            });
+            if insert_at < limit {
+                top.insert(insert_at, (score, lease.clone()));
+                top.truncate(limit);
+            }
+        }
+        top.into_iter().map(|(_, lease)| lease).collect()
+    }
+
     fn local_authority_service(
         &self,
         authority: &ClientStableId,
@@ -1101,7 +1134,9 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         let candidates = self.authority_candidates(observer)?;
         let ranked_authorities = keys
             .iter()
-            .map(|key| self.ranked_authorities_from_candidates(&candidates, key))
+            .map(|key| {
+                self.ranked_top_authorities_from_candidates(&candidates, key, self.route_topk)
+            })
             .collect::<Vec<_>>();
         let mut resolved = vec![None; keys.len()];
         for rank in 0..self.route_topk {

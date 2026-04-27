@@ -126,17 +126,13 @@ impl StoreClient {
         }
     }
 
-    fn query_routes_by_object_ids_bounded(
+    fn query_routes_by_object_keys_bounded(
         &self,
-        object_ids: &[LogicalObjectId],
+        keys: &[ObjectKey],
     ) -> Result<Vec<Option<ObjectRoute>>> {
-        let keys = object_ids
-            .iter()
-            .map(ObjectKey::from_logical_id)
-            .collect::<Vec<_>>();
         Ok(self
             .route_directory
-            .get_object_routes_bounded(&self.lease, &keys)?
+            .get_object_routes_bounded(&self.lease, keys)?
             .into_iter()
             .map(|route| route.filter(|route| route.state == RouteState::Active))
             .collect())
@@ -628,18 +624,17 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
-        let object_ids = objects
+        let keys = objects
             .iter()
             .map(|object| {
                 let tenant = object.tenant.unwrap_or(self.default_tenant());
-                LogicalObjectId::new(
-                    NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
-                    object.key,
-                )
+                let scope =
+                    NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
+                ObjectKey::from_scope(&scope, object.key)
             })
             .collect::<Vec<_>>();
         Ok(self
-            .query_routes_by_object_ids_bounded(&object_ids)?
+            .query_routes_by_object_keys_bounded(&keys)?
             .into_iter()
             .map(|route| route.is_some())
             .collect())
