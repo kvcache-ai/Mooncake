@@ -47,7 +47,8 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
+        ;
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #else
@@ -167,6 +168,13 @@ int TEBenchRunner::freeBuffers() {
 TEBenchRunner::TEBenchRunner() {
     signal(SIGINT, signalHandlerV0);
     signal(SIGTERM, signalHandlerV0);
+
+    if (XferBenchConfig::xport_type == "tcp") {
+        setenv("MC_FORCE_TCP", "1", 1);
+        LOG(INFO) << "Force classic/TE benchmark to use TCP transport "
+                  << "because --xport_type=tcp";
+    }
+
     engine_ = std::make_unique<mooncake::TransferEngine>(true);
     auto conn_str = XferBenchConfig::metadata_type == "p2p"
                         ? "P2PHANDSHAKE"

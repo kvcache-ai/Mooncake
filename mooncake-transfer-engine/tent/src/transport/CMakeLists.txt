@@ -1,4 +1,5 @@
 add_subdirectory(tcp)
+add_subdirectory(tcp_hp)
 add_subdirectory(rdma)
 add_subdirectory(shm)
 add_subdirectory(nvlink)
@@ -17,6 +18,7 @@ foreach(tgt tent_xport_gds
             tent_xport_rdma
             tent_xport_shm
             tent_xport_tcp
+            tent_xport_tcp_hp
             tent_xport_ascend_direct)
     if (TARGET ${tgt})
         target_link_libraries(tent_transport_all INTERFACE ${tgt})

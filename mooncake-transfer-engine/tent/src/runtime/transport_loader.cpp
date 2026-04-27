@@ -15,6 +15,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/shm/shm_transport.h"
 #include "tent/transport/tcp/tcp_transport.h"
+#include "tent/transport/tcp_hp/tcp_hp_transport.h"
 
 #ifdef USE_RDMA
 #include "tent/transport/rdma/rdma_transport.h"
@@ -43,6 +44,9 @@ namespace tent {
 Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
+
+    if (conf_->get("transports/tcp_hp/enable", false))
+        transport_list_[TCP_HP] = std::make_shared<TcpHpTransport>();
 
     // TODO affect the end-to-end performance because it is not numa aware
     if (conf_->get("transports/shm/enable", false))

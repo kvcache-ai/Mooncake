@@ -101,7 +101,7 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
     std::unique_ptr<BenchRunner> runner;
-    if (XferBenchConfig::backend == "classic")
+    if (XferBenchConfig::useClassicBackend())
         runner = std::make_unique<TEBenchRunner>();
     else
         runner = std::make_unique<TENTBenchRunner>();
@@ -110,7 +110,11 @@ int main(int argc, char* argv[]) {
                   << "  ./tebench --target_seg_name="
                   << runner->getSegmentName()
                   << " --seg_type=" << XferBenchConfig::seg_type
-                  << " --backend=" << XferBenchConfig::backend << std::endl
+                  << " --backend=" << XferBenchConfig::backend;
+        if (!XferBenchConfig::xport_type.empty()) {
+            std::cout << " --xport_type=" << XferBenchConfig::xport_type;
+        }
+        std::cout << std::endl
                   << "Press Ctrl-C to terminate\033[0m" << std::endl;
         return runner->runTarget();
     }

@@ -47,6 +47,8 @@ namespace mooncake {
 namespace tent {
 struct XferBenchConfig {
     static void loadFromFlags();
+    static bool useClassicBackend();
+    static bool useTentBackend();
 
     static std::string seg_name;
     static std::string seg_type;
