@@ -158,8 +158,8 @@ TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
         TransferSubmitter::isSameProcessEndpoint("192.168.1.10:12345", ""));
 
     // Identical ip:port -> same process.
-    EXPECT_TRUE(TransferSubmitter::isSameProcessEndpoint(
-        "192.168.1.10:12345", "192.168.1.10:12345"));
+    EXPECT_TRUE(TransferSubmitter::isSameProcessEndpoint("192.168.1.10:12345",
+                                                         "192.168.1.10:12345"));
 
     // Same host, different port -> different process, NOT local.
     // This is the regression case fixed by this change.
