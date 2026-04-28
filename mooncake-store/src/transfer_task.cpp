@@ -426,6 +426,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      std::shared_ptr<StorageBackend>& backend,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
+      local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       transfer_metric_(transfer_metric) {
@@ -777,22 +778,23 @@ TransferStrategy TransferSubmitter::selectStrategy(
     return TransferStrategy::TRANSFER_ENGINE;
 }
 
-bool TransferSubmitter::isLocalTransfer(
-    const AllocatedBuffer::Descriptor& handle) const {
+bool TransferSubmitter::isSameProcessEndpoint(
+    const std::string& handle_endpoint, const std::string& local_endpoint) {
     // Local memcpy requires that handle.buffer_address_ is a virtual address
     // valid in THIS process. Same host is not enough — two processes on the
     // same host share an IP but have distinct virtual address spaces, so a
     // memcpy on a peer process's address would segfault. Require the full
     // transport endpoint to match, which uniquely identifies the owning
     // process.
-    if (handle.transport_endpoint_.empty()) {
+    if (handle_endpoint.empty() || local_endpoint.empty()) {
         return false;
     }
-    std::string local_ep = engine_.getLocalIpAndPort();
-    if (local_ep.empty()) {
-        return false;
-    }
-    return handle.transport_endpoint_ == local_ep;
+    return handle_endpoint == local_endpoint;
+}
+
+bool TransferSubmitter::isLocalTransfer(
+    const AllocatedBuffer::Descriptor& handle) const {
+    return isSameProcessEndpoint(handle.transport_endpoint_, local_endpoint_);
 }
 
 bool TransferSubmitter::validateTransferParams(
