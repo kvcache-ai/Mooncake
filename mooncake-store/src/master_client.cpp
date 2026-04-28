@@ -158,6 +158,11 @@ struct RpcNameTraits<&WrappedMasterService::UnmountSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GracefulUnmountSegment> {
+    static constexpr const char* value = "GracefulUnmountSegment";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::Ping> {
     static constexpr const char* value = "Ping";
 };
@@ -165,6 +170,11 @@ struct RpcNameTraits<&WrappedMasterService::Ping> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
     static constexpr const char* value = "GetFsdir";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::QuerySegmentStatus> {
+    static constexpr const char* value = "QuerySegmentStatus";
 };
 
 template <>
@@ -734,6 +744,19 @@ tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::GracefulUnmountSegment(
+    const UUID& segment_id, uint64_t grace_period_ms) {
+    ScopedVLogTimer timer(1, "MasterClient::GracefulUnmountSegment");
+    timer.LogRequest("segment_id=", segment_id, ", client_id=", client_id_,
+                     ", grace_period_ms=", grace_period_ms);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::GracefulUnmountSegment, void>(
+            segment_id, client_id_, grace_period_ms);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
     timer.LogRequest("client_id=", client_id_);
@@ -749,6 +772,18 @@ tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     timer.LogRequest("action=get_fsdir");
 
     auto result = invoke_rpc<&WrappedMasterService::GetFsdir, std::string>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<SegmentStatus, ErrorCode> MasterClient::QuerySegmentStatus(
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "MasterClient::QuerySegmentStatus");
+    timer.LogRequest("segment_name=", segment_name);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::QuerySegmentStatus, SegmentStatus>(
+            segment_name);
     timer.LogResponseExpected(result);
     return result;
 }

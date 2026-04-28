@@ -21,7 +21,8 @@ enum class SegmentStatus {
     OK,             // Segment is mounted and available for allocation
     DRAINING,       // Segment remains readable but accepts no new allocations
     DRAINED,        // Segment has been drained and awaits unmount
-    UNMOUNTING,     // Segment is under unmounting
+    GRACEFULLY_UNMOUNTING,  // Readable, no new allocations, timer running
+    UNMOUNTING,             // Segment is under unmounting
 };
 
 /**
@@ -30,11 +31,13 @@ enum class SegmentStatus {
 inline std::ostream& operator<<(std::ostream& os,
                                 const SegmentStatus& status) noexcept {
     static const std::unordered_map<SegmentStatus, std::string_view>
-        status_strings{{SegmentStatus::UNDEFINED, "UNDEFINED"},
-                       {SegmentStatus::OK, "OK"},
-                       {SegmentStatus::DRAINING, "DRAINING"},
-                       {SegmentStatus::DRAINED, "DRAINED"},
-                       {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
+        status_strings{
+            {SegmentStatus::UNDEFINED, "UNDEFINED"},
+            {SegmentStatus::OK, "OK"},
+            {SegmentStatus::DRAINING, "DRAINING"},
+            {SegmentStatus::DRAINED, "DRAINED"},
+            {SegmentStatus::GRACEFULLY_UNMOUNTING, "GRACEFULLY_UNMOUNTING"},
+            {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
 
     os << (status_strings.count(status) ? status_strings.at(status)
                                         : "UNKNOWN");
@@ -101,6 +104,12 @@ class ScopedSegmentAccess {
      */
     ErrorCode PrepareUnmountSegment(const UUID& segment_id,
                                     size_t& metrics_dec_capacity);
+
+    /**
+     * @brief Prepare a segment for graceful unmount: remove allocator but keep
+     *        segment metadata. Status becomes GRACEFULLY_UNMOUNTING.
+     */
+    ErrorCode PrepareGracefulUnmountSegment(const UUID& segment_id);
 
     /**
      * @brief Deleting the segment to complete the unmounting operation

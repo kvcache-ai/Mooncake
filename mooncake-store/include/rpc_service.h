@@ -124,6 +124,10 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
                                                  const UUID& client_id);
 
+    tl::expected<void, ErrorCode> GracefulUnmountSegment(
+        const UUID& segment_id, const UUID& client_id,
+        uint64_t grace_period_ms);
+
     tl::expected<std::string, ErrorCode> GetFsdir();
 
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
