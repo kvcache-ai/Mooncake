@@ -722,6 +722,8 @@ HTTP 元数据服务器可通过以下参数进行配置：
 - **MC_STORE_MEMCPY**: 控制是否启用本地 memcpy 优化, 1/true 启用, 0/false 禁用
 - **MC_STORE_CLIENT_METRIC**: 启用客户端指标上报, 默认启用；设为 0/false 禁用
 - **MC_STORE_CLIENT_METRIC_INTERVAL**: 指标上报间隔(秒), 默认 0(仅收集不上报)
+- **MC_STORE_CLIENT_MIN_PORT**: 客户端使用的最小端口号, 默认 12300
+- **MC_STORE_CLIENT_MAX_PORT**: 客户端使用的最大端口号, 默认 14300
 - **MC_STORE_USE_HUGEPAGE**: 启用 hugepage 优化, 默认禁用, 设置为 1/true 启用
 - **MC_STORE_HUGEPAGE_SIZE**: hugepage 页大小, 默认 2M
 
