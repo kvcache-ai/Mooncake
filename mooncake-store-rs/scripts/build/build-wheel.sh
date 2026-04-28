@@ -4,6 +4,18 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 
+# ── Timing helpers (only print when CI=true or TIMING=1) ──
+_WHEEL_TIMING=${TIMING:-${CI:-0}}
+_timer_start() { date +%s; }
+_timer_elapsed() {
+  local start=$1 label=$2
+  local elapsed=$(( $(date +%s) - start ))
+  if [[ "${_WHEEL_TIMING}" == "true" || "${_WHEEL_TIMING}" == "1" ]]; then
+    echo ">>> [TIMING] build-wheel: ${label}: ${elapsed}s"
+  fi
+}
+_WHEEL_GLOBAL_START=$(_timer_start)
+
 PYTHON_BIN=${PYTHON:-python3}
 VENV_DIR=${WHEEL_VENV:-"${REPO_ROOT}/.venv-wheel"}
 DIST_DIR=${DIST_DIR:-"${REPO_ROOT}/dist"}
@@ -285,7 +297,9 @@ fi
 ensure_pybind11
 ensure_yalantinglibs
 export CPATH="${YALANTINGLIBS_PREFIX}/include${CPATH:+:${CPATH}}"
+_timer_elapsed $_WHEEL_GLOBAL_START "setup (venv + deps + pybind11 + yalantinglibs)"
 
+_CMAKE_CONF_START=$(_timer_start)
 PATH="${VENV_BIN}:${PATH}" cmake \
   -S "${UPSTREAM_DIR}" \
   -B "${UPSTREAM_BUILD_DIR}" \
@@ -304,24 +318,32 @@ PATH="${VENV_BIN}:${PATH}" cmake \
   -DUSE_ETCD=OFF \
   -DBUILD_SHARED_LIBS=ON
 
+_timer_elapsed $_CMAKE_CONF_START "cmake configure"
+
+_CMAKE_BUILD_START=$(_timer_start)
 PATH="${VENV_BIN}:${PATH}" cmake --build "${UPSTREAM_BUILD_DIR}" \
   --target engine transfer_engine_bench tent_shared \
   -j"${BUILD_JOBS}"
+_timer_elapsed $_CMAKE_BUILD_START "cmake build (C++ libs)"
 
 export MOONCAKE_UPSTREAM_DIR="${UPSTREAM_DIR}"
 export MOONCAKE_UPSTREAM_BUILD_DIR="${UPSTREAM_BUILD_DIR}"
 
+_CARGO_BUILD_START=$(_timer_start)
 cargo build \
   --manifest-path "${REPO_ROOT}/crates/mooncake-store-py/Cargo.toml" \
   --bins \
   --release
+_timer_elapsed $_CARGO_BUILD_START "cargo build --release"
 
+_MATURIN_START=$(_timer_start)
 "${VENV_DIR}/bin/maturin" build \
   --release \
   --manifest-path "${REPO_ROOT}/crates/mooncake-store-py/Cargo.toml" \
   --interpreter "${VENV_PYTHON}" \
   --out "${WHEEL_DIR}" \
   "${MATURIN_ARGS[@]}"
+_timer_elapsed $_MATURIN_START "maturin build"
 
 install -m 0755 \
   "${REPO_ROOT}/target/release/mooncake-store-client" \
@@ -339,6 +361,7 @@ if [[ -z "${LATEST_WHEEL}" ]]; then
   exit 1
 fi
 
+_PY_POST_START=$(_timer_start)
 "${VENV_PYTHON}" - <<'PY' \
   "${LATEST_WHEEL}" \
   "${REPO_ROOT}" \
@@ -500,7 +523,11 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
             target_wheel.writestr(info, path.read_bytes())
 PY
 
+_timer_elapsed $_PY_POST_START "python wheel post-processing"
+
+_AUDITWHEEL_START=$(_timer_start)
 LATEST_WHEEL=$(repair_runtime_wheel "${LATEST_WHEEL}")
+_timer_elapsed $_AUDITWHEEL_START "auditwheel repair"
 
 readarray -t VERSION_INFO < <("${VENV_PYTHON}" - <<'PY' "${REPO_ROOT}/pyproject.toml"
 import pathlib
@@ -530,6 +557,8 @@ env \
   "${REPO_ROOT}/packages/mooncake-pro"
 
 LATEST_META_WHEEL=$(ls -1t "${WHEEL_DIR}"/mooncake-*.whl 2>/dev/null | head -n 1 || true)
+
+_timer_elapsed $_WHEEL_GLOBAL_START "TOTAL build-wheel.sh"
 
 cat <<EOF
 wheel:  ${LATEST_WHEEL}

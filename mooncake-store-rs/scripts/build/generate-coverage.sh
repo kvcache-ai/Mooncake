@@ -85,21 +85,39 @@ rm -rf "${HTML_DIR}"
 
 cd "${REPO_ROOT}"
 
-COMMON_ARGS=(
+# --exclude is only supported by test/nextest subcommands, not by `report`.
+# Split args: TEST_ARGS for the test run, REPORT_ARGS for report generation.
+TEST_ARGS=(
   --workspace
   --exclude mooncake-store-e2e
 )
 
+# Run tests once with --no-report to compile, execute tests, and collect
+# profraw data without generating any report.  Then use `cargo llvm-cov report`
+# (which reuses the existing profraw files) to emit all three formats.
+# This avoids recompiling and re-running tests three times.
+
+echo "==> running instrumented tests (compile + execute once)"
+cargo llvm-cov "${TEST_ARGS[@]}" --no-report --lib -- --test-threads=4
+
 echo "==> generating coverage summary"
-cargo llvm-cov "${COMMON_ARGS[@]}" --summary-only | tee "${SUMMARY_FILE}"
+cargo llvm-cov report --summary-only | tee "${SUMMARY_FILE}"
 
 echo "==> generating JSON report at ${JSON_FILE}"
-cargo llvm-cov "${COMMON_ARGS[@]}" --json --output-path "${JSON_FILE}"
+cargo llvm-cov report --json --output-path "${JSON_FILE}"
 
-echo "==> generating HTML report at ${HTML_DIR}"
-cargo llvm-cov "${COMMON_ARGS[@]}" --html --output-dir "${COVERAGE_DIR}"
+# HTML report generation is slow (~30-60s) and rarely viewed in CI.
+# Skip by default; set COVERAGE_HTML=1 to enable.
+if [[ "${COVERAGE_HTML:-0}" == "1" ]]; then
+  echo "==> generating HTML report at ${HTML_DIR}"
+  cargo llvm-cov report --html --output-dir "${COVERAGE_DIR}"
+else
+  echo "==> skipping HTML report (set COVERAGE_HTML=1 to enable)"
+fi
 
 echo
 echo "coverage summary: ${SUMMARY_FILE}"
 echo "coverage json:    ${JSON_FILE}"
-echo "coverage html:    ${HTML_DIR}/index.html"
+if [[ "${COVERAGE_HTML:-0}" == "1" ]]; then
+  echo "coverage html:    ${HTML_DIR}/index.html"
+fi

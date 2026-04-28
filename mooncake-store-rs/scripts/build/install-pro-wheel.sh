@@ -39,9 +39,26 @@ echo "links:  ${WHEEL_DIR}"
 
 PIP_INDEX=${PIP_INDEX_URL:-"https://mirrors.aliyun.com/pypi/simple/"}
 
+# Install in two steps to avoid --force-reinstall uninstalling and
+# re-downloading all transitive dependencies (aiohttp, requests, etc.):
+#
+# Step 1: Force-reinstall only the mooncake wheel itself (--no-deps),
+#         ensuring the latest CI-built wheel replaces any cached version
+#         with the same version number (e.g. 1.0.0+pro.1).
+#
+# Step 2: Install the wheel again without --force-reinstall to let pip
+#         resolve and install any missing dependencies.  Already-installed
+#         deps (matching version constraints) are skipped automatically.
 "${PYTHON_BIN}" -m pip install \
   --no-cache-dir \
   -i "${PIP_INDEX}" \
   --force-reinstall \
+  --no-deps \
+  --find-links "${WHEEL_DIR}" \
+  "${WHEEL_PATH}"
+
+"${PYTHON_BIN}" -m pip install \
+  --no-cache-dir \
+  -i "${PIP_INDEX}" \
   --find-links "${WHEEL_DIR}" \
   "${WHEEL_PATH}"

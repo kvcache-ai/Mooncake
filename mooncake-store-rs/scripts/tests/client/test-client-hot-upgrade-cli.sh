@@ -111,6 +111,9 @@ mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
+# This test uses inline Python (mooncake.store) which requires the native
+# _store_rs module built by `cargo build -p mooncake-store-py`.  We cannot
+# skip the build even when a prebuilt CLI binary is available.
 echo "==> building standalone mooncake-store-client binary"
 cargo build -p mooncake-store-py
 
