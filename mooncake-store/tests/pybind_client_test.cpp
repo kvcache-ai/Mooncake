@@ -6,6 +6,10 @@
 #include <string>
 #include <random>
 #include <barrier>
+#include <cstdio>
+#include <fcntl.h>
+#include <limits>
+#include <unistd.h>
 
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -63,7 +67,103 @@ class RealClientTest : public ::testing::Test {
     // In-proc master for tests
     mooncake::testing::InProcMaster master_;
     std::string master_address_;
+
+    void StartMasterAndSetupClient() {
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+            << "Failed to start in-proc master";
+        master_address_ = master_.master_address();
+
+        const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                             ? FLAGS_device_name
+                                             : std::string("");
+        ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                         16 * 1024 * 1024, 16 * 1024 * 1024,
+                                         FLAGS_protocol, rdma_devices,
+                                         master_address_),
+                  0);
+    }
+
+    std::string CreateTempSegmentFile(size_t size) {
+        std::string path = "/tmp/mooncake_real_client_segment_XXXXXX";
+        int fd = mkstemp(path.data());
+        EXPECT_GE(fd, 0) << "Failed to create temp segment file";
+        if (fd < 0) {
+            return "";
+        }
+        EXPECT_EQ(ftruncate(fd, size), 0)
+            << "Failed to resize temp segment file";
+        close(fd);
+        return path;
+    }
 };
+
+TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
+    StartMasterAndSetupClient();
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+
+    ASSERT_EQ(py_client_->allocateAndMountSegment(1, FLAGS_protocol, "",
+                                                  segment_ids, &allocated_size),
+              0);
+    EXPECT_EQ(allocated_size, slab_size);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+
+    segment_ids.clear();
+    allocated_size = 0;
+    ASSERT_EQ(
+        py_client_->allocateAndMountSegment(slab_size + 1, FLAGS_protocol, "",
+                                            segment_ids, &allocated_size),
+        0);
+    EXPECT_EQ(allocated_size, slab_size * 2);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
+    StartMasterAndSetupClient();
+
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+
+    EXPECT_NE(py_client_->allocateAndMountSegment(
+                  std::numeric_limits<size_t>::max(), FLAGS_protocol, "",
+                  segment_ids, &allocated_size),
+              0);
+    EXPECT_TRUE(segment_ids.empty());
+    EXPECT_EQ(allocated_size, 0);
+}
+
+TEST_F(RealClientTest, MountAndAllocateUnmountApisRejectForeignSegments) {
+    StartMasterAndSetupClient();
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    std::vector<std::string> allocated_segment_ids;
+    size_t allocated_size = 0;
+
+    ASSERT_EQ(
+        py_client_->allocateAndMountSegment(
+            1, FLAGS_protocol, "", allocated_segment_ids, &allocated_size),
+        0);
+    ASSERT_FALSE(allocated_segment_ids.empty());
+    EXPECT_NE(py_client_->unmountSegment(allocated_segment_ids), 0);
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_segment_ids), 0);
+
+    std::string path = CreateTempSegmentFile(slab_size);
+    ASSERT_FALSE(path.empty());
+
+    std::vector<std::string> mounted_segment_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, slab_size, FLAGS_protocol, "",
+                                       mounted_segment_ids),
+              0);
+    ASSERT_FALSE(mounted_segment_ids.empty());
+    EXPECT_NE(py_client_->unmountAndFreeSegment(mounted_segment_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_segment_ids), 0);
+
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
 
 // Test basic Put and Get operations
 TEST_F(RealClientTest, BasicPutGetOperations) {
