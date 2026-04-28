@@ -586,8 +586,8 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
             ptrs.emplace_back(src_ptr);
             dst_ptrs.emplace_back(dst_ptr);
             sizes.emplace_back(10 * uint32_size);
-            src_ptr += 10 * uint32_size;
-            dst_ptr += 10 * uint32_size;
+            src_ptr += 10;
+            dst_ptr += 10;
         }
         all_ptrs.emplace_back(ptrs);
         all_dst_ptrs.emplace_back(dst_ptrs);
@@ -604,7 +604,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
     std::vector<int> get_results = py_client_->batch_get_into_multi_buffers(
         keys, all_dst_ptrs, all_sizes, false);
     for (auto result : get_results) {
-        EXPECT_EQ(result, 10 * uint32_size) << "Get operation should succeed";
+        EXPECT_EQ(result, 100 * uint32_size) << "Get operation should succeed";
     }
 
     std::vector<uint32_t> src_host(size);
