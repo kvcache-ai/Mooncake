@@ -449,7 +449,7 @@ impl EmbeddedWrhRouteDirectory {
         };
         match result {
             Ok(results) => {
-                for (request, result) in requests.iter().zip(results.into_iter()) {
+                for (request, result) in requests.iter().zip(results) {
                     if let Err(error) = result {
                         self.maybe_mark_authority_suspect(
                             secondary,
@@ -585,11 +585,7 @@ impl EmbeddedWrhRouteDirectory {
                 .collect::<Vec<_>>();
             match self.read_authority_batch(&authority, &batch_keys) {
                 Ok(results) => {
-                    for ((index, key), result) in indices
-                        .into_iter()
-                        .zip(batch_keys.into_iter())
-                        .zip(results.into_iter())
-                    {
+                    for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
                         match result {
                             Ok(Some(route)) => {
                                 trace!(
@@ -849,7 +845,7 @@ impl EmbeddedWrhRouteDirectory {
         for (_, (authority, requests)) in backfills {
             match self.cas_authority_batch(&authority, &requests) {
                 Ok(results) => {
-                    for (request, result) in requests.iter().zip(results.into_iter()) {
+                    for (request, result) in requests.iter().zip(results) {
                         if let Err(error) = result {
                             self.maybe_mark_authority_suspect(
                                 &authority,
@@ -949,10 +945,8 @@ impl EmbeddedWrhRouteDirectory {
                             &authority.runtime.stable_id,
                             &batch_requests,
                         );
-                        for ((index, request), result) in indices
-                            .into_iter()
-                            .zip(batch_requests.into_iter())
-                            .zip(results.into_iter())
+                        for ((index, request), result) in
+                            indices.into_iter().zip(batch_requests).zip(results)
                         {
                             match result {
                                 Ok(result) => {
@@ -978,8 +972,7 @@ impl EmbeddedWrhRouteDirectory {
                     } else {
                         match self.cas_local_batch(&authority.runtime.stable_id, &batch_requests) {
                             Ok(results) => {
-                                for (index, result) in indices.into_iter().zip(results.into_iter())
-                                {
+                                for (index, result) in indices.into_iter().zip(results) {
                                     resolved[index] = Some(Ok(result));
                                     resolved_authorities[index] = Some(authority.clone());
                                 }
@@ -1012,10 +1005,8 @@ impl EmbeddedWrhRouteDirectory {
                     &batch_requests,
                 ) {
                     Ok(results) => {
-                        for ((index, request), result) in indices
-                            .into_iter()
-                            .zip(batch_requests.into_iter())
-                            .zip(results.into_iter())
+                        for ((index, request), result) in
+                            indices.into_iter().zip(batch_requests).zip(results)
                         {
                             match result {
                                 Ok(result) => {

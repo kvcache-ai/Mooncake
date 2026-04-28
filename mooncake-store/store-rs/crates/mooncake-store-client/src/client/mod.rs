@@ -56,8 +56,6 @@ const DEFAULT_REQUEST_TIMEOUT_CAP: Duration = Duration::from_secs(60);
 const DEFAULT_REQUEST_FAILOVER_SLACK: Duration = Duration::from_millis(250);
 const DEFAULT_REQUEST_THROUGHPUT_FLOOR_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 const DEFAULT_ROUTE_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
-const DEFAULT_BATCH_PUT_CONFLICT_RECHECK_ATTEMPTS: usize = 3;
-const DEFAULT_BATCH_PUT_CONFLICT_RECHECK_DELAY: Duration = Duration::from_millis(1);
 const DEFAULT_PUT_WRITE_RETRY_LIMIT: usize = 4;
 const DEFAULT_SEGMENT_PUBLISH_LEASE_TTL_MS: u64 = 30_000;
 const DEFAULT_TENANT_QUOTA_RESERVATION_TTL_MS: u64 = 60_000;
@@ -72,6 +70,12 @@ const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
 
 type SharedLifecycleState = Arc<AtomicU8>;
 type SharedRouteWriteGate = Arc<Mutex<()>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchPutRouteConflictPolicy {
+    Strict,
+    AcceptExistingActiveRoute,
+}
 
 #[derive(Clone, Debug)]
 struct TenantQuotaPolicyCacheEntry {

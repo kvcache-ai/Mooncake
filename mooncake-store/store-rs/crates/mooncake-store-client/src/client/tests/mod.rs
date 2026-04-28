@@ -6026,6 +6026,138 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
 }
 
 #[test]
+fn routed_batch_put_from_treats_route_conflicts_as_per_key_success() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let blocking = Arc::new(BlockingCasMetadataBackend::new(
+        inner,
+        "default::batch-put-from-conflict-key",
+    ));
+    let metadata: Arc<dyn MetadataBackend> = blocking.clone();
+    let store_transport = Arc::new(TestTransport::new("batch-put-conflict-store-segment"));
+    let writer_a_transport = Arc::new(store_transport.peer("batch-put-conflict-writer-a-segment"));
+    let writer_b_transport = Arc::new(store_transport.peer("batch-put-conflict-writer-b-segment"));
+    let reader_transport = Arc::new(store_transport.peer("batch-put-conflict-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let writer_a = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-writer-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_a_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner.clone(), 1)
+        .build(test_future_expiry_ms())
+        .expect("writer-a build should succeed");
+    let writer_b = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-writer-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_b_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer-b build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "batch-put-conflict-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    writer_a
+        .register_local_memory()
+        .expect("writer-a memory should register");
+    writer_b
+        .register_local_memory()
+        .expect("writer-b memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store, &writer_a, &writer_b, &reader]);
+
+    let mut source_a = b"batch-put-conflict-payload-a".to_vec();
+    let mut source_b = b"batch-put-conflict-payload-b".to_vec();
+    writer_a
+        .register_buffer(source_a.as_mut_ptr().cast(), source_a.len())
+        .expect("writer-a source buffer should register");
+    writer_b
+        .register_buffer(source_b.as_mut_ptr().cast(), source_b.len())
+        .expect("writer-b source buffer should register");
+    let policy = ReplicationPolicy::new()
+        .replica_count(1)
+        .prefer_local(false)
+        .preferred_storage_owner(store.runtime_id().storage_key());
+
+    blocking.arm_blocked_cas();
+    std::thread::scope(|scope| {
+        let writer_a_result = scope.spawn(|| {
+            writer_a.batch_put_from(&[PutFromRequest::new(
+                "batch-put-from-conflict-key",
+                source_a.as_ptr().cast(),
+                source_a.len(),
+            )
+            .replication(policy.clone())])
+        });
+        assert!(
+            blocking.wait_until_blocked(Duration::from_secs(1)),
+            "writer-a should reach the blocked route publish point"
+        );
+        let writer_b_result = scope.spawn(|| {
+            writer_b.batch_put_from(&[PutFromRequest::new(
+                "batch-put-from-conflict-key",
+                source_b.as_ptr().cast(),
+                source_b.len(),
+            )
+            .replication(policy.clone())])
+        });
+        sleep(Duration::from_millis(50));
+        blocking.release_blocked_cas();
+
+        let routes_a = writer_a_result
+            .join()
+            .expect("writer-a thread should join")
+            .expect("writer-a conflict loser should still succeed");
+        let routes_b = writer_b_result
+            .join()
+            .expect("writer-b thread should join")
+            .expect("writer-b conflict loser should still succeed");
+        assert_eq!(routes_a.len(), 1);
+        assert_eq!(routes_b.len(), 1);
+        assert_eq!(routes_a[0].key, routes_b[0].key);
+        assert_eq!(routes_a[0].version, routes_b[0].version);
+    });
+
+    let value = reader
+        .get("batch-put-from-conflict-key")
+        .expect("reader should fetch the published payload");
+    assert!(
+        value == source_a || value == source_b,
+        "the authoritative route should point at one completed writer"
+    );
+}
+
+#[test]
 fn routed_batch_put_from_works_when_metadata_hot_paths_are_disabled() {
     let metadata = Arc::new(NoHotPathMetadataBackend::new(Arc::new(
         InMemoryMetadataBackend::new(),

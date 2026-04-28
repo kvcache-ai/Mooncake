@@ -193,6 +193,7 @@ Behavior boundary:
 
 - `put_from` and `batch_put_from` send remote writes from the registered source buffer directly
 - `batch_get_into` reads remote payloads directly into registered destination buffers
+- routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races when an active route is already published, releases its own temporary reservation, and returns the published route for that key
 - unregistered `get_into` targets and `batch_put_from_multi_buffers` still fall back to the staged copy paths
 
 ## Hugepage-Backed Local Memory

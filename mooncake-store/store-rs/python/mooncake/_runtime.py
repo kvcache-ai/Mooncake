@@ -68,11 +68,22 @@ def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]
             env_candidates.extend(
                 [
                     root_path / "build-wheel-compat" / "mooncake-asio",
-                    root_path / "build-wheel-compat" / "mooncake-transfer-engine" / "src",
-                    root_path / "build-wheel-compat" / "mooncake-transfer-engine" / "tent" / "src",
+                    root_path
+                    / "build-wheel-compat"
+                    / "mooncake-transfer-engine"
+                    / "src",
+                    root_path
+                    / "build-wheel-compat"
+                    / "mooncake-transfer-engine"
+                    / "tent"
+                    / "src",
                     root_path / "build-rust" / "mooncake-asio",
                     root_path / "build-rust" / "mooncake-transfer-engine" / "src",
-                    root_path / "build-rust" / "mooncake-transfer-engine" / "tent" / "src",
+                    root_path
+                    / "build-rust"
+                    / "mooncake-transfer-engine"
+                    / "tent"
+                    / "src",
                 ]
             )
     candidates = env_candidates + [

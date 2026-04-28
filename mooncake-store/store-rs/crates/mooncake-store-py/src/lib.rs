@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use dispatcher::{CompatNamespaceScope, StoreDispatcher};
 use dummy_client::DummySession;
@@ -770,7 +769,7 @@ impl PyMooncakeDistributedStore {
                     .collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
                 let scope = dispatcher.object_scope(tenant);
-                run_without_gil(move || {
+                let statuses = run_without_gil(move || {
                     dispatcher.run(move |client| {
                         let requests = items
                             .iter()
@@ -793,12 +792,62 @@ impl PyMooncakeDistributedStore {
                                 request
                             })
                             .collect::<Vec<_>>();
-                        client.batch_put_from(&requests).map(|_| requests.len())
+                        match client.batch_put_from(&requests) {
+                            Ok(_) => Ok(vec![0; item_count]),
+                            Err(batch_error) => {
+                                tracing::debug!(
+                                    error = %batch_error,
+                                    "batch_put_from falling back to per-key best-effort status"
+                                );
+                                let statuses = items
+                                    .iter()
+                                    .map(|(key, buffer_ptr, size)| {
+                                        let mut request = PutFromRequest::new(
+                                            key,
+                                            (*buffer_ptr as *const c_void).cast(),
+                                            *size,
+                                        )
+                                        .tenant(scope.tenant.as_str());
+                                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                            request = request.domain(scope.domain.as_str());
+                                        }
+                                        if scope.object_set
+                                            != mooncake_store_core::DEFAULT_OBJECT_SET
+                                        {
+                                            request = request.object_set(scope.object_set.as_str());
+                                        }
+                                        if let Some(policy) = policy.clone() {
+                                            request = request.replication(policy);
+                                        }
+                                        let result = client.batch_put_from(&[request]);
+                                        match result {
+                                            Ok(_) | Err(StoreError::Conflict(_)) => 0,
+                                            Err(error) => {
+                                                tracing::debug!(
+                                                    key = %key,
+                                                    error = %error,
+                                                    "batch_put_from per-key write failed"
+                                                );
+                                                -1
+                                            }
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                Ok(statuses)
+                            }
+                        }
                     })
                 })
                 .map_err(store_error_to_py)?;
-                dispatcher.invalidate_keys(cache_keys, cache_tenant);
-                Ok(PyList::new(py, vec![0; item_count])?.into_any().unbind())
+                let successful_keys = cache_keys
+                    .into_iter()
+                    .zip(statuses.iter())
+                    .filter_map(|(key, status)| (*status == 0).then_some(key))
+                    .collect::<Vec<_>>();
+                if !successful_keys.is_empty() {
+                    dispatcher.invalidate_keys(successful_keys, cache_tenant);
+                }
+                Ok(PyList::new(py, statuses)?.into_any().unbind())
             }
         }
     }
@@ -1718,7 +1767,7 @@ mod tests {
     use std::ptr;
     use std::slice;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread::sleep;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -4147,6 +4196,114 @@ mod tests {
         put_thread
             .join()
             .expect("batch_put_from thread should complete cleanly");
+    }
+
+    #[test]
+    fn real_batch_put_from_treats_existing_cache_key_conflict_as_success() {
+        init_python();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(BlockingHealthMetadata::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            release.clone(),
+            entered_tx,
+        ));
+        let metadata: Arc<dyn MetadataBackend> = metadata;
+        let store_a = build_real_store_with_dispatcher_scope_and_metadata(
+            "py-cache-race-a",
+            "default",
+            metadata.clone(),
+        );
+        let store_b = build_real_store_with_dispatcher_scope_and_metadata(
+            "py-cache-race-b",
+            "default",
+            metadata,
+        );
+
+        let payload_a = b"shared-cache-page".to_vec();
+        let payload_b = b"shared-cache-page".to_vec();
+        store_a
+            .register_buffer(payload_a.as_ptr() as usize, payload_a.len())
+            .expect("store-a source buffer registration should succeed");
+        store_b
+            .register_buffer(payload_b.as_ptr() as usize, payload_b.len())
+            .expect("store-b source buffer registration should succeed");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let thread_a = {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Python::with_gil(|py| {
+                    store_a
+                        .batch_put_from(
+                            py,
+                            vec![(
+                                "shared-cache-key".to_string(),
+                                payload_a.as_ptr() as usize,
+                                payload_a.len(),
+                            )],
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            true,
+                            false,
+                            false,
+                        )
+                        .expect("store-a batch_put_from should succeed")
+                        .bind(py)
+                        .extract::<Vec<i32>>()
+                        .expect("store-a statuses should decode")
+                })
+            })
+        };
+        let thread_b = {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Python::with_gil(|py| {
+                    store_b
+                        .batch_put_from(
+                            py,
+                            vec![(
+                                "shared-cache-key".to_string(),
+                                payload_b.as_ptr() as usize,
+                                payload_b.len(),
+                            )],
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            true,
+                            false,
+                            false,
+                        )
+                        .expect("store-b batch_put_from should succeed")
+                        .bind(py)
+                        .extract::<Vec<i32>>()
+                        .expect("store-b statuses should decode")
+                })
+            })
+        };
+
+        barrier.wait();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("one writer should block in metadata CAS");
+        sleep(Duration::from_millis(100));
+        release.store(true, Ordering::SeqCst);
+
+        let statuses_a = thread_a.join().expect("store-a thread should join");
+        let statuses_b = thread_b.join().expect("store-b thread should join");
+        assert_eq!(statuses_a, vec![0]);
+        assert_eq!(statuses_b, vec![0]);
     }
 
     #[test]
