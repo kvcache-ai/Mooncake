@@ -116,7 +116,8 @@ inline bool IsHostPointer(const void* ptr) {
     aclrtPtrAttributes attr{};
     if (aclrtPointerGetAttributes(const_cast<void*>(ptr), &attr) !=
         ACL_SUCCESS) {
-        return false;  // cannot confirm host; conservative fallback
+        // Query failed: likely pageable host memory not tracked by the runtime.
+        return true;
     }
     return attr.location.type != ACL_MEM_LOCATION_TYPE_DEVICE;
 #else

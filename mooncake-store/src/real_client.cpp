@@ -4122,6 +4122,40 @@ RealClient::batch_get_into_multi_buffers_internal(
             temp_handles.emplace(key, std::move(handle));
         }
 
+        // Scatter temp CPU buffer -> user multi_buffers (GPU or host).
+        // Returns false and sets results[original_index] on error.
+        auto scatter_to_buffers = [&](const std::string &key, char *src,
+                                      const DiskKeyInfo &op) -> bool {
+            size_t offset = 0;
+            for (size_t j = 0; j < op.buffers.size(); ++j) {
+                if (offset >= op.total_size) break;
+                size_t sz = std::min(
+                    op.sizes[j], static_cast<size_t>(op.total_size - offset));
+                void *dst = op.buffers[j];
+                int device_id = -1;
+                if (gpu_staging::IsDevicePointer(dst, &device_id)) {
+                    gpu_staging::SetDevice(device_id);
+                    if (!gpu_staging::CopyHostToDevice(dst, src + offset, sz)) {
+                        LOG(ERROR) << "H2D copy failed during scatter"
+                                   << ", key: " << key;
+                        results[op.original_index] =
+                            tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+                        return false;
+                    }
+                } else if (gpu_staging::IsHostPointer(dst)) {
+                    memcpy(dst, src + offset, sz);
+                } else {
+                    LOG(ERROR) << "Unknown memory type for dst buffer"
+                               << ", key: " << key;
+                    results[op.original_index] =
+                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    return false;
+                }
+                offset += sz;
+            }
+            return true;
+        };
+
         for (auto &[endpoint, objects] : offload_objects) {
             if (objects.empty()) continue;
             auto read_result =
@@ -4137,39 +4171,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                         tl::make_unexpected(read_result.error());
                     continue;
                 }
-                // Scatter: temp contiguous buffer -> user's multi_buffers.
-                // Dual-check pointer type to avoid memcpy to GPU addresses.
-                char *src = static_cast<char *>(slice.ptr);
-                size_t offset = 0;
-                bool scatter_ok = true;
-                for (size_t j = 0; j < op.buffers.size() && scatter_ok; ++j) {
-                    if (offset >= op.total_size) break;
-                    size_t sz =
-                        std::min(op.sizes[j],
-                                 static_cast<size_t>(op.total_size - offset));
-                    void *dst = op.buffers[j];
-                    int device_id = -1;
-                    if (gpu_staging::IsDevicePointer(dst, &device_id)) {
-                        gpu_staging::SetDevice(device_id);
-                        if (!gpu_staging::CopyHostToDevice(dst, src + offset,
-                                                           sz)) {
-                            LOG(ERROR) << "H2D copy failed during scatter"
-                                       << ", key: " << key;
-                            results[op.original_index] =
-                                tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
-                            scatter_ok = false;
-                        }
-                    } else if (gpu_staging::IsHostPointer(dst)) {
-                        memcpy(dst, src + offset, sz);
-                    } else {
-                        LOG(ERROR) << "Unknown memory type for dst buffer"
-                                   << ", key: " << key;
-                        results[op.original_index] =
-                            tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                        scatter_ok = false;
-                    }
-                    offset += sz;
-                }
+                scatter_to_buffers(key, static_cast<char *>(slice.ptr), op);
             }
         }
         // DISK: one batched BatchGet into CPU temp buffers, then scatter.
@@ -4211,39 +4213,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                             tl::make_unexpected(disk_results[di].error());
                         continue;
                     }
-                    // Scatter from temp CPU buffer to user GPU/CPU
-                    // multi_buffers
-                    char *src = static_cast<char *>(handle_it->second->ptr());
-                    size_t offset = 0;
-                    for (size_t j = 0; j < op.buffers.size(); ++j) {
-                        if (offset >= op.total_size) break;
-                        size_t sz = std::min(
-                            op.sizes[j],
-                            static_cast<size_t>(op.total_size - offset));
-                        void *dst = op.buffers[j];
-                        int device_id = -1;
-                        if (gpu_staging::IsDevicePointer(dst, &device_id)) {
-                            gpu_staging::SetDevice(device_id);
-                            if (!gpu_staging::CopyHostToDevice(
-                                    dst, src + offset, sz)) {
-                                LOG(ERROR) << "H2D copy failed for DISK "
-                                           << "scatter, key: " << key;
-                                results[op.original_index] =
-                                    tl::make_unexpected(
-                                        ErrorCode::TRANSFER_FAIL);
-                                break;
-                            }
-                        } else if (gpu_staging::IsHostPointer(dst)) {
-                            memcpy(dst, src + offset, sz);
-                        } else {
-                            LOG(ERROR) << "Unknown memory type for dst buffer"
-                                       << ", key: " << key;
-                            results[op.original_index] =
-                                tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                            break;
-                        }
-                        offset += sz;
-                    }
+                    scatter_to_buffers(
+                        key, static_cast<char *>(handle_it->second->ptr()), op);
                 }
             }
         }
