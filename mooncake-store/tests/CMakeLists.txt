@@ -78,6 +78,7 @@ add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
+add_store_test(prefix_query_test prefix_query_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_subdirectory(e2e)
 

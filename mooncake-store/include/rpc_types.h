@@ -239,4 +239,50 @@ struct BatchGetOffloadObjectResponse {
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
 
+/**
+ * @brief Forge RL Design 01 — chained-prefix LPM lookup request.
+ *
+ * The router computes a per-block rolling hash chain (key_i = hash(key_{i-1},
+ * block_i)) and sends it to the master.  An empty chain is rejected with
+ * PREFIX_CHAIN_EMPTY; chains longer than kMaxPrefixChainLength are rejected
+ * with PREFIX_CHAIN_TOO_LONG.
+ */
+struct QueryPrefixMatchRequest {
+    std::vector<uint64_t> chain{};
+
+    QueryPrefixMatchRequest() = default;
+};
+YLT_REFL(QueryPrefixMatchRequest, chain);
+
+/**
+ * @brief A single segment that owns a replica of the deepest matched prefix
+ * key.  segment_id is left as {0,0} when only the segment_name is needed by
+ * the routing layer; this avoids holding segment_mutex_ during the read path.
+ */
+struct PrefixMatchCandidate {
+    UUID segment_id{0, 0};
+    std::string segment_name{};
+    int32_t replica_type{0};
+
+    PrefixMatchCandidate() = default;
+};
+YLT_REFL(PrefixMatchCandidate, segment_id, segment_name, replica_type);
+
+/**
+ * @brief Forge RL Design 01 — chained-prefix LPM lookup response.
+ *
+ * matched_blocks is the longest prefix length (in blocks) that was found in
+ * the master.  candidates is unranked; routing-aware ordering (by link
+ * class, inflight, etc.) is left to the caller.  query_lease_ms is an
+ * advisory TTL the caller may use to debounce repeated lookups.
+ */
+struct QueryPrefixMatchResponse {
+    uint32_t matched_blocks{0};
+    std::vector<PrefixMatchCandidate> candidates{};
+    uint64_t query_lease_ms{0};
+
+    QueryPrefixMatchResponse() = default;
+};
+YLT_REFL(QueryPrefixMatchResponse, matched_blocks, candidates, query_lease_ms);
+
 }  // namespace mooncake

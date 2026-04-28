@@ -295,6 +295,12 @@ enum class ErrorCode : int32_t {
     SERIALIZE_FAIL = -1501,         ///< Serialization failed.
     DESERIALIZE_FAIL = -1502,       ///< Deserialization failed.
     PERSISTENT_FAIL = -1503,        ///< Persistent failed.
+    // Forge RL Design 01 — chained-prefix LPM lookup (Range: -1600 to -1699)
+    PREFIX_QUERY_DISABLED =
+        -1600,  ///< QueryPrefixMatch RPC disabled by master config.
+    PREFIX_CHAIN_TOO_LONG =
+        -1601,  ///< Prefix chain exceeds kMaxPrefixChainLength.
+    PREFIX_CHAIN_EMPTY = -1602,  ///< Prefix chain is empty.
     // Task and job errors (Range: -1400 to -1499)
     TASK_NOT_FOUND = -1400,  ///< Task not found.
     TASK_PENDING_LIMIT_EXCEEDED =

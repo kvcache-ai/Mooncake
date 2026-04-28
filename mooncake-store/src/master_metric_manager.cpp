@@ -113,6 +113,13 @@ MasterMetricManager::MasterMetricManager()
                      "Total number of ping requests received"),
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
+      // Forge RL Design 01 — chained-prefix LPM lookup
+      query_prefix_match_requests_(
+          "master_query_prefix_match_requests_total",
+          "Total number of QueryPrefixMatch requests received"),
+      query_prefix_match_failures_(
+          "master_query_prefix_match_failures_total",
+          "Total number of failed QueryPrefixMatch requests"),
 
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
@@ -366,6 +373,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     remount_segment_failures_.inc(0);
     ping_requests_.inc(0);
     ping_failures_.inc(0);
+    query_prefix_match_requests_.inc(0);
+    query_prefix_match_failures_.inc(0);
     create_copy_task_requests_.inc(0);
     create_copy_task_failures_.inc(0);
     create_move_task_requests_.inc(0);
@@ -707,6 +716,12 @@ void MasterMetricManager::inc_ping_requests(int64_t val) {
 void MasterMetricManager::inc_ping_failures(int64_t val) {
     ping_failures_.inc(val);
 }
+void MasterMetricManager::inc_query_prefix_match_requests(int64_t val) {
+    query_prefix_match_requests_.inc(val);
+}
+void MasterMetricManager::inc_query_prefix_match_failures(int64_t val) {
+    query_prefix_match_failures_.inc(val);
+}
 
 // Batch Operation Statistics (Counters)
 void MasterMetricManager::inc_batch_exist_key_requests(int64_t items) {
@@ -926,6 +941,14 @@ int64_t MasterMetricManager::get_ping_requests() {
 
 int64_t MasterMetricManager::get_ping_failures() {
     return ping_failures_.value();
+}
+
+int64_t MasterMetricManager::get_query_prefix_match_requests() {
+    return query_prefix_match_requests_.value();
+}
+
+int64_t MasterMetricManager::get_query_prefix_match_failures() {
+    return query_prefix_match_failures_.value();
 }
 
 int64_t MasterMetricManager::get_batch_exist_key_requests() {
@@ -1316,6 +1339,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(remount_segment_failures_);
     serialize_metric(ping_requests_);
     serialize_metric(ping_failures_);
+    serialize_metric(query_prefix_match_requests_);
+    serialize_metric(query_prefix_match_failures_);
 
     // Serialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // Counters

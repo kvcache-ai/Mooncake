@@ -63,6 +63,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::QueryPrefixMatch> {
+    static constexpr const char* value = "QueryPrefixMatch";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -472,6 +477,17 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
                                    GetReplicaListResponse>(object_keys.size(),
                                                            object_keys);
     timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<QueryPrefixMatchResponse, ErrorCode>
+MasterClient::QueryPrefixMatch(const QueryPrefixMatchRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::QueryPrefixMatch");
+    timer.LogRequest("chain_len=", request.chain.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::QueryPrefixMatch,
+                             QueryPrefixMatchResponse>(request);
+    timer.LogResponseExpected(result);
     return result;
 }
 

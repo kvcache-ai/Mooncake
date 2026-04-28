@@ -43,6 +43,9 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Install and start etcd
       run: |
         wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
@@ -123,6 +126,33 @@ jobs:
         cd mooncake-transfer-engine/example/http-metadata-server-python
         pip install aiohttp
         python ./bootstrap_server.py &
+      shell: bash
+
+    - name: Run Mooncake Store Rust smoke test and benchmark
+      run: |
+        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
+          --eviction_high_watermark_ratio=0.95 \
+          --cluster_id=ci_rust_test_cluster \
+          --port 50051 &
+        MASTER_PID=$!
+        sleep 3
+        cd mooncake-store/rust
+        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:$LD_LIBRARY_PATH
+        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
+        export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
+        export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
+        export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
+        export MC_RUST_STORE_RUN_INTEGRATION=true
+        export MC_RUST_STORE_MASTER_ADDR=127.0.0.1:50051
+        export MC_RUST_STORE_LOCAL_HOSTNAME=127.0.0.1
+        export MC_RUST_STORE_PROTOCOL=tcp
+        export MC_RUST_STORE_DEVICE_NAME=
+        cargo test --test minimal_smoke -- --nocapture
+        MC_RUST_BENCH_ITERATIONS=4 \
+        MC_RUST_BENCH_VALUE_SIZE=4096 \
+        MC_RUST_BENCH_WARMUP=1 \
+          cargo run --release --example store_benchmark
+        kill $MASTER_PID 2>/dev/null || true
       shell: bash
 
     - name: Run Go store binding integration tests
@@ -557,12 +587,14 @@ jobs:
         sudo cmake --install .
       shell: bash
 
-    - name: Check Mooncake Store Rust bindings and example
+    - name: Check Mooncake Store Rust bindings, examples, and tests
       run: |
         cd mooncake-store/rust
+        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
+        cargo test --lib
         MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
         MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
-          cargo check --example basic_usage --tests
+          cargo test --examples --tests --no-run
       shell: bash
 
     - name: Configure project
@@ -696,7 +728,7 @@ jobs:
           echo "Error: code_format.sh not found or not executable"
           exit 1
         fi
-        
+
         # Determine base ref for comparison
         if [ "${{ github.event_name }}" == "pull_request" ]; then
           # For PRs: compare against the target branch

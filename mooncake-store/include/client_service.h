@@ -135,6 +135,17 @@ class Client {
     QueryByRegex(const std::string& str);
 
     /**
+     * @brief Forge RL Design 01 - chained-prefix LPM lookup.
+     *
+     * Forwards the per-block prefix-hash chain to the master and returns the
+     * unranked candidate replicas that hold the deepest matched prefix key.
+     * Returns ErrorCode::PREFIX_QUERY_DISABLED when the master has the
+     * feature flag turned off.
+     */
+    tl::expected<QueryPrefixMatchResponse, ErrorCode> QueryPrefixMatch(
+        const QueryPrefixMatchRequest& request);
+
+    /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
      * @return Vector of QueryResult objects containing replicas and lease
@@ -294,6 +305,20 @@ class Client {
      */
     tl::expected<void, ErrorCode> UnmountSegment(const void* buffer,
                                                  size_t size);
+
+    /**
+     * @brief Mounts a memory segment and returns its generated Segment UUID.
+     *        Logic is identical to MountSegment, but returns the segment id.
+     */
+    tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
+
+    /**
+     * @brief Unmounts a segment by its UUID.
+     *        Logic is identical to UnmountSegment, but looks up by id.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentById(const UUID& segment_id);
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -665,6 +690,13 @@ class Client {
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+
+    /**
+     * @brief Internal helper to unmount a segment by iterator.
+     *        Caller must hold mounted_segments_mutex_.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentImpl(
+        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
 
     // Configuration
     const std::string local_hostname_;

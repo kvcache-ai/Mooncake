@@ -848,6 +848,71 @@ To start the master service with the HTTP metadata server enabled:
 When enabled, the HTTP metadata server will start automatically and provide metadata services for the Mooncake Store cluster. This eliminates the need for an external etcd deployment, simplifying the setup process for development and testing environments.
 Note that the HTTP metadata server is designed for single-node deployments and does not provide the high availability features that etcd offers. For production environments requiring high availability, etcd is still the recommended choice.
 
+## Chained-Prefix Longest-Prefix-Match (LPM) Lookup
+
+For prefix-cache aware routing (e.g. an upstream router placing an LLM
+request on the node that already holds the longest matching KV cache),
+the master exposes a single RPC, `QueryPrefixMatch`, that performs a
+Longest-Prefix-Match lookup over a per-block rolling hash chain.
+
+### Chain encoding
+
+Callers compute a per-block rolling hash:
+
+```
+key_0 = hash(block_0)
+key_i = hash(key_{i-1}, block_i)
+```
+
+and submit the chain `[key_0, key_1, ..., key_{N-1}]`. Each entry is
+mapped to an `ObjectKey` via `MakePrefixHashKey()` (a fixed `"__pfx__"`
+prefix plus the 16-character hex of the uint64 hash — see
+`mooncake-store/include/prefix_key.h`), so prefix entries live in the
+same string-keyed metadata shards as ordinary objects without colliding
+with user keys. The encoding is shared verbatim by the master, the
+client SDK, the C++ tests, the bench, and the Python smoke test.
+
+### LPM walk
+
+The master walks the chain from the deepest entry backwards. Because
+the chain is built monotonically (`chain[i+1]` is only meaningful when
+`chain[i]` was indexed at some point), the first entry that has at
+least one COMPLETE replica is also the LPM. The walk holds only the
+per-shard metadata read lock; it deliberately does not acquire
+`segment_mutex_`, preserving the project-wide acquisition order
+`client_mutex_ → metadata_shards_[shard].mutex → segment_mutex_`.
+
+For the deepest matched key, the master emits one
+`PrefixMatchCandidate` per unique segment owning a COMPLETE replica
+(deduped by `segment_name`). The list is intentionally **unranked** —
+any ranking or routing policy is left to the caller, which has
+visibility into request-side context the master does not.
+
+### Configuration & error codes
+
+- `enable_prefix_query` (default `true`) — feature flag on the master.
+  When off, every `QueryPrefixMatch` returns
+  `PREFIX_QUERY_DISABLED` (`-1600`) with a single atomic load on the
+  fast path.
+- `kMaxPrefixChainLength = 1024` — chain longer than this is rejected
+  with `PREFIX_CHAIN_TOO_LONG` (`-1601`); empty chain is rejected with
+  `PREFIX_CHAIN_EMPTY` (`-1602`).
+
+### Observability
+
+Two Prometheus counters are exported:
+
+- `master_query_prefix_match_requests_total`
+- `master_query_prefix_match_failures_total`
+
+### Python binding
+
+`MooncakeDistributedStore.query_prefix_match(chain) -> (matched_blocks,
+[(segment_name, replica_type)], query_lease_ms, err_code)` — see
+`mooncake-store/include/master_client.h` and
+`mooncake-integration/store/store_py.cpp` for details.
+
+
 ## Mooncake Store Python API
 
 **Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html)
