@@ -246,6 +246,22 @@ impl MetadataKeyspace {
         }
     }
 
+    pub fn tenant_policy_index(&self, tenant: &str) -> String {
+        format!(
+            "{}/system/tenant-policy-index/by-tenant/{}",
+            self.slot_tag,
+            encode_key_component(tenant)
+        )
+    }
+
+    pub fn tenant_policy_index_ready(&self, tenant: &str) -> String {
+        format!(
+            "{}/system/tenant-policy-index-ready/by-tenant/{}",
+            self.slot_tag,
+            encode_key_component(tenant)
+        )
+    }
+
     pub fn tenant_quota_state(&self, scope: &TenantPolicyScope) -> String {
         format!(
             "{}/system/tenant-quota/tenants/{}",
