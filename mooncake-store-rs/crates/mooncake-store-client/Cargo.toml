@@ -28,6 +28,15 @@ tonic-build = "0.12"
 mooncake-metadata         = { path = "../mooncake-metadata" }
 mooncake-store-test-utils = { path = "../mooncake-store-test-utils" }
 proptest                  = "1"
+criterion                 = { version = "0.5", features = ["html_reports"] }
+
+# Multi-tenant isolation perf benches: compare client behaviour with the
+# multi-tenant feature stack disabled (single tenant, default scope, no admin
+# tenant policy installed) vs enabled (multiple tenants, non-default scope,
+# admin-installed quota policy).  Used as a regression gate.
+[[bench]]
+name = "multi_tenant_perf"
+harness = false
 
 [lints]
 workspace = true

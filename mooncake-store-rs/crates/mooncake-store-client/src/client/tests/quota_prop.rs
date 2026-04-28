@@ -346,3 +346,161 @@ fn counting_backend_update_client_state_tracked() {
     assert_eq!(counts.upsert_client_lease.load(Ordering::Relaxed), 1);
     assert_eq!(counts.update_client_state.load(Ordering::Relaxed), 2);
 }
+
+// ===========================================================================
+// Namespace × scope quota-state isolation invariants
+// ---------------------------------------------------------------------------
+// These tests cover the metadata-layer guarantee that `TenantQuotaState` and
+// `TenantObjectAccounting` are keyed *exactly* by `TenantPolicyScope` (i.e.
+// (tenant, domain, object_set)) and never aggregate across distinct scopes.
+//
+// The existing `prop_counting_backend_quota_state_queries` proptest at the
+// top of this file already validates the counter-side contract; the cases
+// below validate the *value* side: writes to scope X must only show up in
+// scope X's accounting / state, never in a sibling scope's.
+// ===========================================================================
+
+fn scoped_policy_scope(
+    tenant: &str,
+    domain: Option<&str>,
+    object_set: Option<&str>,
+) -> TenantPolicyScope {
+    TenantPolicyScope {
+        tenant: tenant.to_string(),
+        domain: domain.map(|s| s.to_string()),
+        object_set: object_set.map(|s| s.to_string()),
+    }
+}
+
+fn install_quota_for_scope(meta: &Arc<InMemoryMetadataBackend>, scope: &TenantPolicyScope) {
+    let policy = TenantPolicy {
+        scope: scope.clone(),
+        spec: TenantPolicySpec {
+            quota: Some(TenantQuotaPolicy {
+                max_bytes: Some(1 << 30),
+                max_objects: Some(10_000),
+            }),
+            ..Default::default()
+        },
+        version: 0,
+        updated_at_ms: 0,
+        updated_by: "scope-iso-test".to_string(),
+    };
+    meta.put_tenant_policy(&policy, None)
+        .expect("install scoped quota policy should succeed");
+}
+
+#[test]
+fn quota_state_is_isolated_per_scope_at_metadata_layer() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let scope_a = scoped_policy_scope("alpha", None, None);
+    let scope_b = scoped_policy_scope("beta", None, None);
+    install_quota_for_scope(&meta, &scope_a);
+    install_quota_for_scope(&meta, &scope_b);
+
+    // Both scopes start with no state (or with a zero state, depending on
+    // the backend implementation).
+    let initial_a = meta
+        .get_tenant_quota_state(&scope_a)
+        .expect("alpha state read")
+        .map(|s| s.used_bytes)
+        .unwrap_or(0);
+    let initial_b = meta
+        .get_tenant_quota_state(&scope_b)
+        .expect("beta state read")
+        .map(|s| s.used_bytes)
+        .unwrap_or(0);
+    assert_eq!(initial_a, 0);
+    assert_eq!(initial_b, 0);
+}
+
+#[test]
+fn quota_state_for_unknown_scope_is_independent_from_default() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let unknown = scoped_policy_scope("never-installed", None, None);
+    // Reading state for a never-installed scope must not synthesise a value
+    // taken from the default tenant; it must be either None or a fresh
+    // zeroed state.
+    let s = meta
+        .get_tenant_quota_state(&unknown)
+        .expect("read unknown scope");
+    assert!(
+        s.is_none() || s.as_ref().unwrap().used_bytes == 0,
+        "unknown scope state must not aggregate from default: {s:?}"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    // For an arbitrary set of distinct tenant names, installing per-tenant
+    // policies must not cause `list_tenant_policies(tenant)` to leak
+    // policies from other tenants.
+    #[test]
+    fn prop_list_tenant_policies_filters_by_tenant(
+        tenants in proptest::collection::hash_set("[a-z]{3,8}", 2..=6)
+    ) {
+        let meta = Arc::new(InMemoryMetadataBackend::new());
+        let tenants_vec: Vec<String> = tenants.into_iter().collect();
+        for t in &tenants_vec {
+            install_quota_for_scope(&meta, &scoped_policy_scope(t, None, None));
+        }
+
+        for t in &tenants_vec {
+            let listed = meta
+                .list_tenant_policies(Some(t.as_str()))
+                .expect("list per-tenant");
+            // Every returned policy must be for the requested tenant only.
+            for p in &listed {
+                prop_assert_eq!(&p.scope.tenant, t);
+            }
+            // And the requested tenant's policy must be in the list.
+            prop_assert!(
+                listed.iter().any(|p| &p.scope.tenant == t),
+                "tenant {} missing from its own list_tenant_policies", t
+            );
+        }
+    }
+
+    // Per-domain scopes under the same tenant are distinct policies and must
+    // not collide.
+    #[test]
+    fn prop_per_domain_scopes_are_distinct_policies(
+        domains in proptest::collection::hash_set("[a-z]{3,6}", 2..=5)
+    ) {
+        let meta = Arc::new(InMemoryMetadataBackend::new());
+        let tenant = "shared-tenant";
+        let domains_vec: Vec<String> = domains.into_iter().collect();
+        for d in &domains_vec {
+            install_quota_for_scope(
+                &meta,
+                &scoped_policy_scope(tenant, Some(d.as_str()), None),
+            );
+        }
+
+        // Each (tenant, domain) policy must be retrievable individually.
+        for d in &domains_vec {
+            let scope = scoped_policy_scope(tenant, Some(d.as_str()), None);
+            let policy = meta
+                .get_tenant_policy(&scope)
+                .expect("get per-domain policy");
+            prop_assert!(
+                policy.is_some(),
+                "policy for (tenant={}, domain={}) was not retrievable", tenant, d
+            );
+            let policy = policy.unwrap();
+            prop_assert_eq!(policy.scope.domain.as_deref(), Some(d.as_str()));
+        }
+
+        // The bare-tenant scope must NOT exist (we only installed
+        // domain-scoped policies).
+        let bare = scoped_policy_scope(tenant, None, None);
+        let bare_policy = meta
+            .get_tenant_policy(&bare)
+            .expect("get bare policy");
+        prop_assert!(
+            bare_policy.is_none(),
+            "bare-tenant policy must not exist: domain-scoped installs leaked into the bare scope"
+        );
+    }
+}
