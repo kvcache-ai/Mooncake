@@ -1169,7 +1169,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 for (auto& buf : info.bufs) {
                     pinned_buffer_pool_->Release(buf);
                 }
-                disk_staging.erase(staging_it);
                 disk_staging[index].reset();
                 if (copy_failed) {
                     results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
