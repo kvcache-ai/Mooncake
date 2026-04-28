@@ -87,17 +87,14 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         timer.LogResponse("error_code=", result.error());
         if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
             data_manager_.RectifyReadRoute(request.key);
-            if (metrics_) {
+        }
+        if (metrics_) {
+            if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
                 metrics_->peer_request.get_misses.inc();
-                metrics_->peer_request.get_latency_failure.observe(
-                    sw.elapsed_us());
-            }
-        } else {
-            if (metrics_) {
+            } else {
                 metrics_->peer_request.get_failures.inc();
-                metrics_->peer_request.get_latency_failure.observe(
-                    sw.elapsed_us());
             }
+            metrics_->peer_request.get_latency_failure.observe(sw.elapsed_us());
         }
         return result;
     }

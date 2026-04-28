@@ -223,6 +223,7 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     p2p_metrics->local_request.put_bytes.inc(5 * 1024 * 1024);  // 5 MB
     p2p_metrics->local_request.put_latency_success.observe(200);
     p2p_metrics->local_request.put_latency_success.observe(300);
+    p2p_metrics->local_request.put_latency_failure.observe(500);
 
     // Local Get metrics
     p2p_metrics->local_request.get_requests.inc(100);
@@ -232,6 +233,7 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     p2p_metrics->local_request.get_bytes.inc(20 * 1024 * 1024);  // 20 MB
     p2p_metrics->local_request.get_latency_success.observe(100);
     p2p_metrics->local_request.get_latency_success.observe(150);
+    p2p_metrics->local_request.get_latency_failure.observe(400);
 
     // Create and start HTTP server
     coro_http::coro_http_server server(1, test_port);
@@ -280,7 +282,11 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
         EXPECT_TRUE(
             resp.resp_body.find("mooncake_p2p_local_put_latency_success_us") !=
             std::string::npos)
-            << "Metrics should contain P2P put latency metric";
+            << "Metrics should contain P2P put latency success metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_put_latency_failure_us") !=
+            std::string::npos)
+            << "Metrics should contain P2P put latency failure metric";
 
         // Check P2P Get metrics
         EXPECT_TRUE(
@@ -304,7 +310,11 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
         EXPECT_TRUE(
             resp.resp_body.find("mooncake_p2p_local_get_latency_success_us") !=
             std::string::npos)
-            << "Metrics should contain P2P get latency metric";
+            << "Metrics should contain P2P get latency success metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_get_latency_failure_us") !=
+            std::string::npos)
+            << "Metrics should contain P2P get latency failure metric";
 
         // Check labels
         EXPECT_TRUE(resp.resp_body.find("p2p_label") != std::string::npos)
