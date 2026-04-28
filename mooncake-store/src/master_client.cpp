@@ -23,6 +23,21 @@ template <auto Method>
 struct RpcNameTraits;
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::QueryCost> {
+    static constexpr const char* value = "QueryCost";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::InflightBegin> {
+    static constexpr const char* value = "InflightBegin";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::InflightEnd> {
+    static constexpr const char* value = "InflightEnd";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
     static constexpr const char* value = "ExistKey";
 };
@@ -386,6 +401,46 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
     timer.LogRequest("object_key=", object_key);
 
     auto result = invoke_rpc<&WrappedMasterService::ExistKey, bool>(object_key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<QueryCostResponse, ErrorCode> MasterClient::QueryCost(
+    const QueryCostRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::QueryCost");
+    timer.LogRequest("candidates=", request.candidate_segment_names.size(),
+                     ", client_host=", request.client_host,
+                     ", client_zone=", request.client_zone,
+                     ", request_size_bytes=", request.request_size_bytes);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::QueryCost, QueryCostResponse>(
+            request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<InflightUpdateResponse, ErrorCode> MasterClient::InflightBegin(
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "MasterClient::InflightBegin");
+    timer.LogRequest("segment_name=", segment_name);
+
+    InflightUpdateRequest req(segment_name);
+    auto result = invoke_rpc<&WrappedMasterService::InflightBegin,
+                             InflightUpdateResponse>(req);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<InflightUpdateResponse, ErrorCode> MasterClient::InflightEnd(
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "MasterClient::InflightEnd");
+    timer.LogRequest("segment_name=", segment_name);
+
+    InflightUpdateRequest req(segment_name);
+    auto result =
+        invoke_rpc<&WrappedMasterService::InflightEnd, InflightUpdateResponse>(
+            req);
     timer.LogResponseExpected(result);
     return result;
 }

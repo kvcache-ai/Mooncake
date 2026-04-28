@@ -348,6 +348,27 @@ class Client {
         const std::vector<std::string>& keys);
 
     /**
+     * @brief Score and rank candidate segments by fetch cost.
+     *
+     * Cost-aware routing entry point (Forge RL design 02). The router supplies
+     * the candidate segment names — typically those returned by an LPM / index
+     * lookup — and gets back the same set sorted by ascending cost score.
+     *
+     * @param request candidate set + optional client_host/zone + size hint
+     * @return ranked candidate list, or COST_QUERY_DISABLED on the master.
+     */
+    tl::expected<QueryCostResponse, ErrorCode> QueryCost(
+        const QueryCostRequest& request);
+
+    /// Tell the master a fetch is starting against `segment_name`.
+    tl::expected<InflightUpdateResponse, ErrorCode> InflightBegin(
+        const std::string& segment_name);
+
+    /// Tell the master a fetch finished against `segment_name`.
+    tl::expected<InflightUpdateResponse, ErrorCode> InflightEnd(
+        const std::string& segment_name);
+
+    /**
      * @brief Create a copy task to copy an object's replicas to target segments
      * @param key Object key
      * @param targets Target segments

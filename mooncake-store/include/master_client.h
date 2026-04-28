@@ -92,6 +92,26 @@ class MasterClient {
         const std::string& object_key);
 
     /**
+     * @brief Cost-aware routing — score and rank candidate segments.
+     *
+     * Returns the candidate list sorted ascending by cost score plus the
+     * raw inputs (LinkClass, StorageTier, inflight) for each scored entry.
+     * Candidates that are not currently mounted are dropped from the
+     * response unless `request.include_unmounted` is true.
+     */
+    [[nodiscard]] tl::expected<QueryCostResponse, ErrorCode> QueryCost(
+        const QueryCostRequest& request);
+
+    /// Tell the master a fetch is starting against `segment_name` so
+    /// subsequent QueryCost calls account for the load.
+    [[nodiscard]] tl::expected<InflightUpdateResponse, ErrorCode> InflightBegin(
+        const std::string& segment_name);
+
+    /// Counterpart of InflightBegin; pairs are matched by segment_name only.
+    [[nodiscard]] tl::expected<InflightUpdateResponse, ErrorCode> InflightEnd(
+        const std::string& segment_name);
+
+    /**
      * @brief Checks if multiple objects exist
      * @param object_keys Vector of keys to query
      * @return Vector containing existence status for each key

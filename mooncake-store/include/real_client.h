@@ -310,6 +310,20 @@ class RealClient : public PyClient {
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
     /**
+     * @brief Cost-aware routing -- score a caller-supplied candidate set.
+     */
+    tl::expected<std::vector<CostCandidateTuple>, ErrorCode> queryCost(
+        const std::vector<std::string> &candidate_segment_names,
+        const std::string &client_host, const std::string &client_zone,
+        uint64_t request_size_bytes, bool include_unmounted) override;
+
+    tl::expected<uint32_t, ErrorCode> inflightBegin(
+        const std::string &segment_name) override;
+
+    tl::expected<uint32_t, ErrorCode> inflightEnd(
+        const std::string &segment_name) override;
+
+    /**
      * @brief Get the size of an object
      * @param key Key of the object
      * @return Size of the object in bytes, or -1 if error or object doesn't

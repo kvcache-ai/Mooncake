@@ -300,6 +300,12 @@ enum class ErrorCode : int32_t {
     TASK_PENDING_LIMIT_EXCEEDED =
         -1401,              ///< Total pending tasks exceed the limit.
     JOB_NOT_FOUND = -1402,  ///< Job not found.
+
+    // Cost-aware routing errors (Range: -1700 to -1799)
+    COST_QUERY_DISABLED = -1700,     ///< Cost-aware feature flag is off.
+    COST_REQUEST_EMPTY = -1701,      ///< QueryCost called with no candidates.
+    COST_REQUEST_TOO_LARGE = -1702,  ///< Candidate list exceeds limit.
+    COST_INVALID_TOPOLOGY = -1703,   ///< cluster_topology_json failed to parse.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

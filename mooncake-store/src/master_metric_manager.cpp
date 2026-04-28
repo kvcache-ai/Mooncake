@@ -319,7 +319,28 @@ MasterMetricManager::MasterMetricManager()
           "Total number of MarkTaskToComplete requests received"),
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
-          "Total number of failed MarkTaskToComplete requests") {
+          "Total number of failed MarkTaskToComplete requests"),
+      // Cost-aware routing (Forge RL design 02)
+      query_cost_requests_("master_query_cost_requests_total",
+                           "Total number of QueryCost RPCs received"),
+      query_cost_failures_("master_query_cost_failures_total",
+                           "Total number of QueryCost RPCs that returned an "
+                           "error (other than COST_QUERY_DISABLED)"),
+      query_cost_disabled_("master_query_cost_disabled_total",
+                           "Total number of QueryCost RPCs short-circuited "
+                           "because cost-aware routing is disabled"),
+      query_cost_candidate_count_(
+          "master_query_cost_candidate_count",
+          "Distribution of candidate-list lengths for QueryCost RPCs",
+          {1.0, 4.0, 16.0, 64.0, 256.0, 1024.0}),
+      inflight_begin_requests_("master_inflight_begin_requests_total",
+                               "Total number of InflightBegin RPCs received"),
+      inflight_end_requests_("master_inflight_end_requests_total",
+                             "Total number of InflightEnd RPCs received"),
+      total_inflight_fetches_(
+          "master_total_inflight_fetches",
+          "Sum of inflight fetch counters across all tracked segments "
+          "(a single segment with N inflight fetches contributes N)") {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
 }
@@ -376,6 +397,14 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     fetch_tasks_failures_.inc(0);
     mark_task_to_complete_requests_.inc(0);
     mark_task_to_complete_failures_.inc(0);
+
+    // Cost-aware routing (Forge RL design 02)
+    query_cost_requests_.inc(0);
+    query_cost_failures_.inc(0);
+    query_cost_disabled_.inc(0);
+    inflight_begin_requests_.inc(0);
+    inflight_end_requests_.inc(0);
+    total_inflight_fetches_.update(0);
 
     // Update CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // counters
@@ -1210,6 +1239,38 @@ void MasterMetricManager::inc_create_move_task_requests(int64_t val) {
 void MasterMetricManager::inc_create_move_task_failures(int64_t val) {
     create_move_task_failures_.inc(val);
 }
+
+// ---- Cost-aware routing (Forge RL design 02) ----
+void MasterMetricManager::inc_query_cost_requests(int64_t val) {
+    query_cost_requests_.inc(val);
+}
+void MasterMetricManager::inc_query_cost_failures(int64_t val) {
+    query_cost_failures_.inc(val);
+}
+void MasterMetricManager::inc_query_cost_disabled(int64_t val) {
+    query_cost_disabled_.inc(val);
+}
+void MasterMetricManager::observe_query_cost_candidate_count(int64_t count) {
+    query_cost_candidate_count_.observe(static_cast<double>(count));
+}
+void MasterMetricManager::inc_inflight_begin_requests(int64_t val) {
+    inflight_begin_requests_.inc(val);
+}
+void MasterMetricManager::inc_inflight_end_requests(int64_t val) {
+    inflight_end_requests_.inc(val);
+}
+void MasterMetricManager::set_total_inflight_fetches(int64_t total) {
+    total_inflight_fetches_.update(total);
+}
+int64_t MasterMetricManager::get_query_cost_requests() {
+    return query_cost_requests_.value();
+}
+int64_t MasterMetricManager::get_query_cost_failures() {
+    return query_cost_failures_.value();
+}
+int64_t MasterMetricManager::get_query_cost_disabled() {
+    return query_cost_disabled_.value();
+}
 void MasterMetricManager::inc_query_task_requests(int64_t val) {
     query_task_requests_.inc(val);
 }
@@ -1378,6 +1439,15 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(snapshot_duration_ms_);
     serialize_metric(snapshot_success_);
     serialize_metric(snapshot_fail_);
+
+    // Cost-aware routing (Forge RL design 02)
+    serialize_metric(query_cost_requests_);
+    serialize_metric(query_cost_failures_);
+    serialize_metric(query_cost_disabled_);
+    serialize_metric(query_cost_candidate_count_);
+    serialize_metric(inflight_begin_requests_);
+    serialize_metric(inflight_end_requests_);
+    serialize_metric(total_inflight_fetches_);
 
     return ss.str();
 }

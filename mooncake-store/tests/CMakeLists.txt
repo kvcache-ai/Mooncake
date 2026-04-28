@@ -150,3 +150,7 @@ if(STORE_USE_REDIS)
                           PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
   endforeach()
 endif()
+
+# Cost-aware routing tests (Forge RL design 02)
+add_store_test(cost_estimator_test cost_estimator_test.cpp)
+add_store_test(query_cost_test query_cost_test.cpp)

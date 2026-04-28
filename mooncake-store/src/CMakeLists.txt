@@ -3,6 +3,7 @@ add_subdirectory(cachelib_memory_allocator)
 
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
+    cost_estimator.cpp
     master_service.cpp
     client_service.cpp
     client_metric.cpp

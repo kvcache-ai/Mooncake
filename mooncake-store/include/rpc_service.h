@@ -31,6 +31,18 @@ class WrappedMasterService {
 
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
+    // Cost-aware routing (Forge RL design 02). Pure compute over a snapshot
+    // of mounted segments + the in-flight tracker; never holds the segment
+    // mutex across the scoring loop.
+    tl::expected<QueryCostResponse, ErrorCode> QueryCost(
+        const QueryCostRequest& request);
+
+    tl::expected<InflightUpdateResponse, ErrorCode> InflightBegin(
+        const InflightUpdateRequest& request);
+
+    tl::expected<InflightUpdateResponse, ErrorCode> InflightEnd(
+        const InflightUpdateRequest& request);
+
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
