@@ -96,51 +96,29 @@ inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
 //   else                  -> reject (unknown type, e.g. non-standard allocator)
 //
 // Pageable host memory (not tracked by CUDA runtime) is treated as host.
-// On CUDA < 11 where cudaMemoryTypeUnregistered is unavailable,
-// cudaErrorInvalidValue is the expected response for pageable memory.
 inline bool IsHostPointer(const void* ptr) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
     cudaPointerAttributes attr{};
-    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
-    if (err == cudaSuccess) {
-        return attr.type == cudaMemoryTypeHost
-#if CUDART_VERSION >= 11000
-               || attr.type == cudaMemoryTypeUnregistered
-#endif
-            ;
-    }
-    // cudaErrorInvalidValue: pageable host memory not tracked by the runtime.
-    // Clear the sticky error so it does not pollute subsequent CUDA calls.
-    if (err == cudaErrorInvalidValue) {
-        cudaGetLastError();
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        // Query failed: pageable host memory not tracked by the runtime.
+        cudaGetLastError();  // clear sticky error
         return true;
     }
-    cudaGetLastError();  // clear any other unexpected error
-    return false;
+    return attr.type != cudaMemoryTypeDevice;
 #elif defined(USE_HIP)
     hipPointerAttribute_t attr{};
-    hipError_t err = hipPointerGetAttributes(&attr, ptr);
-    if (err == hipSuccess) {
-        return attr.type == hipMemoryTypeHost
-#if HIP_VERSION >= 50000000
-               || attr.type == hipMemoryTypeUnregistered
-#endif
-            ;
-    }
-    if (err == hipErrorInvalidValue) {
-        hipGetLastError();
+    if (hipPointerGetAttributes(&attr, ptr) != hipSuccess) {
+        hipGetLastError();  // clear sticky error
         return true;
     }
-    hipGetLastError();
-    return false;
+    return attr.type != hipMemoryTypeDevice;
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     aclrtPtrAttributes attr{};
-    aclError err = aclrtPointerGetAttributes(const_cast<void*>(ptr), &attr);
-    if (err == ACL_SUCCESS) {
-        return attr.location.type == ACL_MEM_LOCATION_TYPE_HOST;
+    if (aclrtPointerGetAttributes(const_cast<void*>(ptr), &attr) !=
+        ACL_SUCCESS) {
+        return false;  // cannot confirm host; conservative fallback
     }
-    // Ascend: if query fails, we cannot confirm it is host memory.
-    return false;
+    return attr.location.type != ACL_MEM_LOCATION_TYPE_DEVICE;
 #else
     (void)ptr;
     return true;  // CPU-only build: all pointers are host
