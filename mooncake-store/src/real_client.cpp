@@ -1174,6 +1174,14 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids) {
                 continue;
             }
 
+            auto it = mounted_segment_records_.find(segment_id);
+            if (it == mounted_segment_records_.end()) {
+                LOG(ERROR) << "segment_id not found in mounted records: "
+                           << segment_id;
+                if (first_error == 0) first_error = -1;
+                continue;
+            }
+
             auto result = client_->UnmountSegmentById(id);
             if (!result.has_value()) {
                 LOG(ERROR) << "UnmountSegmentById failed for " << segment_id;
@@ -1183,17 +1191,167 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids) {
                 continue;  // Don't release local resources on failure
             }
 
-            auto it = mounted_segment_records_.find(segment_id);
-            if (it != mounted_segment_records_.end()) {
-                to_cleanup.emplace_back(segment_id, it->second);
-                mounted_segment_records_.erase(it);
-            }
+            to_cleanup.emplace_back(segment_id, it->second);
+            mounted_segment_records_.erase(it);
         }
     }
 
     for (auto &p : to_cleanup) {
         if (p.second.mmap_base) {
             munmap(p.second.mmap_base, p.second.size);
+        }
+    }
+
+    return first_error;
+}
+
+int RealClient::allocateAndMountSegment(
+    size_t size, const std::string &protocol, const std::string &location,
+    std::vector<std::string> &out_segment_ids, size_t *out_allocated_size) {
+    if (!client_) {
+        LOG(ERROR) << "Client not initialized";
+        return -1;
+    }
+
+    size_t max_mr_size = globalConfig().max_mr_size;
+    if (max_mr_size == 0) {
+        LOG(ERROR) << "Invalid max_mr_size: 0";
+        return -1;
+    }
+
+    if (size == 0) {
+        LOG(ERROR) << "size is 0";
+        return -1;
+    }
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    size_t page_size = sysconf(_SC_PAGESIZE);
+    if (max_mr_size < page_size) {
+        LOG(ERROR) << "max_mr_size " << max_mr_size
+                   << " is smaller than page_size " << page_size;
+        return -1;
+    }
+
+    size_t aligned_max_chunk = (max_mr_size / page_size) * page_size;
+    if (aligned_max_chunk < slab_size) {
+        LOG(ERROR) << "max_mr_size " << max_mr_size
+                   << " is smaller than slab_size " << slab_size;
+        return -1;
+    }
+    // Round down chunk size to slab_size multiple
+    aligned_max_chunk = (aligned_max_chunk / slab_size) * slab_size;
+
+    // Check overflow before aligning up to slab_size
+    if (size > std::numeric_limits<size_t>::max() - (slab_size - 1)) {
+        LOG(ERROR) << "size " << size
+                   << " overflows when aligning to slab_size";
+        return -1;
+    }
+    // Round up total size to slab_size multiple
+    size_t aligned_total_size =
+        ((size + slab_size - 1) / slab_size) * slab_size;
+    size_t remaining = aligned_total_size;
+    std::vector<std::string> mounted_ids;
+    std::vector<AllocatedSegmentRecord> allocated_records;
+
+    while (remaining > 0) {
+        size_t chunk_size = std::min(remaining, aligned_max_chunk);
+        if (chunk_size == 0) break;
+
+        void *ptr = allocate_buffer_allocator_memory(chunk_size, protocol);
+        if (!ptr) {
+            LOG(ERROR) << "allocate_buffer_allocator_memory failed for size "
+                       << chunk_size;
+            break;
+        }
+
+        auto result =
+            client_->MountSegmentAndGetId(ptr, chunk_size, protocol, location);
+        if (!result.has_value()) {
+            LOG(ERROR) << "MountSegmentAndGetId failed";
+            free_memory(protocol, ptr);
+            break;
+        }
+
+        std::string segment_id = UuidToString(result.value());
+        mounted_ids.push_back(segment_id);
+        allocated_records.push_back({ptr, chunk_size, protocol});
+
+        remaining -= chunk_size;
+    }
+
+    if (remaining > 0) {
+        for (size_t i = 0; i < mounted_ids.size(); ++i) {
+            UUID id;
+            if (StringToUuid(mounted_ids[i], id)) {
+                client_->UnmountSegmentById(id);
+            }
+            if (allocated_records[i].base) {
+                free_memory(allocated_records[i].protocol,
+                            allocated_records[i].base);
+            }
+        }
+        out_segment_ids.clear();
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        for (size_t i = 0; i < mounted_ids.size(); ++i) {
+            allocated_segment_records_[mounted_ids[i]] = allocated_records[i];
+        }
+    }
+    if (out_allocated_size) {
+        *out_allocated_size = aligned_total_size;
+    }
+    out_segment_ids = std::move(mounted_ids);
+    return 0;
+}
+
+int RealClient::unmountAndFreeSegment(
+    const std::vector<std::string> &segment_ids) {
+    if (!client_) {
+        LOG(ERROR) << "Client not initialized";
+        return -1;
+    }
+
+    int first_error = 0;
+    std::vector<std::pair<std::string, AllocatedSegmentRecord>> to_cleanup;
+    {
+        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        for (const auto &segment_id : segment_ids) {
+            UUID id;
+            if (!StringToUuid(segment_id, id)) {
+                LOG(ERROR) << "Invalid segment_id: " << segment_id;
+                if (first_error == 0) first_error = -1;
+                continue;
+            }
+
+            auto it = allocated_segment_records_.find(segment_id);
+            if (it == allocated_segment_records_.end()) {
+                LOG(ERROR) << "segment_id not found in allocated records: "
+                           << segment_id;
+                if (first_error == 0) first_error = -1;
+                continue;
+            }
+
+            auto result = client_->UnmountSegmentById(id);
+            if (!result.has_value()) {
+                LOG(ERROR) << "UnmountSegmentById failed for " << segment_id;
+                if (first_error == 0) {
+                    first_error = static_cast<int>(result.error());
+                }
+                continue;  // Don't release local resources on failure
+            }
+
+            to_cleanup.emplace_back(segment_id, it->second);
+            allocated_segment_records_.erase(it);
+        }
+    }
+
+    for (auto &p : to_cleanup) {
+        if (p.second.base) {
+            free_memory(p.second.protocol, p.second.base);
         }
     }
 

@@ -340,6 +340,47 @@ class MooncakeStorePyWrapper {
         return real_client->unmountSegment(segment_ids);
     }
 
+    py::dict allocate_and_mount_segment(size_t size,
+                                        const std::string &protocol,
+                                        const std::string &location) {
+        py::dict result;
+        result["ret"] = -1;
+        result["segment_ids"] = py::list();
+        result["allocated_size"] = 0;
+
+        auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
+        if (!real_client) {
+            LOG(ERROR) << "allocate_and_mount_segment requires RealClient";
+            return result;
+        }
+        std::vector<std::string> segment_ids;
+        size_t allocated_size = 0;
+        int ret;
+        {
+            py::gil_scoped_release release;
+            ret = real_client->allocateAndMountSegment(
+                size, protocol, location, segment_ids, &allocated_size);
+        }
+        result["ret"] = ret;
+        py::list ids;
+        for (const auto &id : segment_ids) {
+            ids.append(id);
+        }
+        result["segment_ids"] = ids;
+        result["allocated_size"] = allocated_size;
+        return result;
+    }
+
+    int unmount_and_free_segment(const std::vector<std::string> &segment_ids) {
+        auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
+        if (!real_client) {
+            LOG(ERROR) << "unmount_and_free_segment requires RealClient";
+            return -1;
+        }
+        py::gil_scoped_release release;
+        return real_client->unmountAndFreeSegment(segment_ids);
+    }
+
     std::string get_tp_key_name(const std::string &base_key, int rank) const {
         return base_key + "_tp_" + std::to_string(rank);
     }
@@ -1814,6 +1855,13 @@ PYBIND11_MODULE(store, m) {
              py::arg("path"), py::arg("size"), py::arg("offset") = 0,
              py::arg("protocol") = "tcp", py::arg("location") = "")
         .def("unmount_segment", &MooncakeStorePyWrapper::unmount_segment,
+             py::arg("segment_ids"))
+        .def("allocate_and_mount_segment",
+             &MooncakeStorePyWrapper::allocate_and_mount_segment,
+             py::arg("size"), py::arg("protocol") = "tcp",
+             py::arg("location") = "")
+        .def("unmount_and_free_segment",
+             &MooncakeStorePyWrapper::unmount_and_free_segment,
              py::arg("segment_ids"))
         .def("alloc_from_mem_pool",
              [](MooncakeStorePyWrapper &self, size_t size) {
