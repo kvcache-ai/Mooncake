@@ -3225,13 +3225,28 @@ RealClient::batch_get_into_dummy_helper(
 
     // Run batch_get_into_internal (which may block on offload RPC + SSD I/O)
     // on a dedicated thread pool so the coro_rpc IO thread stays free for ping.
-    // The shared_lock is captured to keep SHM pinned until the operation
-    // completes.
-    auto buffers = buffers_result.value();
-    auto try_result = co_await coro_io::post(
-        [this, &keys, buffers = std::move(buffers), &sizes, lock]() {
-            return batch_get_into_internal(keys, buffers, sizes);
-        });
+    //
+    // Pack everything the worker-thread call needs into a single heap-owned
+    // state object so the lambda captures only a raw pointer (trivially
+    // copyable, trivially destructible). Avoids GCC 11 coroutine + coro_io
+    // double-destruction interactions when non-trivial captures end up in
+    // both the OUTER coroutine frame and the post_helper chain.
+    struct CallState {
+        std::vector<std::string> keys;
+        std::vector<size_t> sizes;
+        std::vector<void *> buffers;
+        std::shared_ptr<std::shared_lock<std::shared_mutex>> lock;
+    };
+    auto state = std::make_unique<CallState>();
+    state->keys = keys;
+    state->sizes = sizes;
+    state->buffers = std::move(buffers_result.value());
+    state->lock = std::move(lock);
+
+    auto *s = state.get();
+    auto try_result = co_await coro_io::post([this, s]() {
+        return batch_get_into_internal(s->keys, s->buffers, s->sizes);
+    });
     co_return try_result.value();
 }
 
@@ -4202,12 +4217,22 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
-    // Run SSD I/O on a dedicated thread pool
-    // so the coro_rpc IO thread is free to handle ping and other RPCs.
-    auto try_result =
-        co_await coro_io::post([file_storage = file_storage_, &keys, &sizes]() {
-            return file_storage->BatchGet(keys, sizes);
-        });
+    // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
+    // free to handle ping and other RPCs. Same heap-owned state pattern as
+    // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
+    struct CallState {
+        std::vector<std::string> keys;
+        std::vector<int64_t> sizes;
+        std::shared_ptr<FileStorage> file_storage;
+    };
+    auto state = std::make_unique<CallState>();
+    state->keys = keys;
+    state->sizes = sizes;
+    state->file_storage = file_storage_;
+    auto *s = state.get();
+    auto try_result = co_await coro_io::post([s]() {
+        return s->file_storage->BatchGet(s->keys, s->sizes);
+    });
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
