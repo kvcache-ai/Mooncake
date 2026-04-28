@@ -64,8 +64,8 @@ class FakeStore:
         }
         return {"ret": 0, "segment_ids": [segment_id]}
 
-    def unmount_segment(self, segment_ids):
-        self.unmount_calls.append(list(segment_ids))
+    def unmount_segment(self, segment_ids, grace_period_seconds=0):
+        self.unmount_calls.append((list(segment_ids), grace_period_seconds))
         for segment_id in segment_ids:
             if segment_id in self.unmount_failures:
                 return -1
@@ -82,8 +82,8 @@ class FakeStore:
             "allocated_size": 4096,
         }
 
-    def unmount_and_free_segment(self, segment_ids):
-        self.free_unmount_calls.append(list(segment_ids))
+    def unmount_and_free_segment(self, segment_ids, grace_period_seconds=0):
+        self.free_unmount_calls.append((list(segment_ids), grace_period_seconds))
         return 0
 
 
@@ -138,8 +138,22 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unmount_body["status"], "success")
         self.assertEqual(
             self.fake_store.unmount_calls,
-            [["00000000-0000-0000-0000-000000000001"]],
+            [(["00000000-0000-0000-0000-000000000001"], 0)],
         )
+        self.assertEqual(self.service.current_mode, "prefill")
+
+    async def test_unmount_shm_passes_grace_period(self):
+        segment_id = "00000000-0000-0000-0000-000000000001"
+        self.service.current_mode = "decode"
+        self.service.mounted_segment_ids = [segment_id]
+
+        resp = await self.service.handle_unmount_shm(
+            FakeRequest({"segment_ids": [segment_id], "grace_period_seconds": 3})
+        )
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.fake_store.unmount_calls, [([segment_id], 3)])
+        self.assertEqual(self.service.mounted_segment_ids, [])
         self.assertEqual(self.service.current_mode, "prefill")
 
     async def test_unmount_shm_updates_state_for_partial_success(self):
@@ -158,7 +172,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["failed_segment_ids"], [failed_id])
         self.assertEqual(
             self.fake_store.unmount_calls,
-            [[succeeded_id], [failed_id]],
+            [([succeeded_id], 0), ([failed_id], 0)],
         )
         self.assertEqual(self.service.mounted_segment_ids, [failed_id])
         self.assertEqual(self.service.current_mode, "decode")
@@ -184,7 +198,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.text)
         self.assertEqual(body["mode"], "prefill")
         self.assertIn("rolled back to prefill", body["error"])
-        self.assertEqual(self.fake_store.unmount_calls, [[old_id]])
+        self.assertEqual(self.fake_store.unmount_calls, [([old_id], 0)])
         self.assertEqual(self.service.mounted_segment_ids, [])
         self.assertEqual(self.service.current_mode, "prefill")
         self.assertEqual(self.service.last_mount_info, {})
@@ -212,8 +226,18 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unmount_body["status"], "success")
         self.assertEqual(
             self.fake_store.free_unmount_calls,
-            [["00000000-0000-0000-0000-000000000002"]],
+            [(["00000000-0000-0000-0000-000000000002"], 0)],
         )
+
+    async def test_unmount_allocated_passes_grace_period(self):
+        segment_id = "00000000-0000-0000-0000-000000000002"
+
+        resp = await self.service.handle_unmount(
+            FakeRequest({"segment_ids": [segment_id], "grace_period_seconds": 4})
+        )
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.fake_store.free_unmount_calls, [([segment_id], 4)])
 
     async def test_mount_shm_requires_name_and_size(self):
         resp = await self.service.handle_mount_shm(
