@@ -1041,7 +1041,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         std::vector<size_t> sizes;
         std::vector<int> device_ids;
     };
-    // std::unordered_map<std::string, DiskStagingInfo> disk_staging;
     std::vector<std::optional<DiskStagingInfo>> disk_staging(
         object_keys.size());
     // Submit all transfers in parallel
