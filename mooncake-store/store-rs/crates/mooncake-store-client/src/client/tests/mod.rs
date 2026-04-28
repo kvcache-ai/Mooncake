@@ -12232,6 +12232,187 @@ fn true_client_shrink_waits_for_inflight_route_publish() {
 }
 
 #[test]
+fn evacuate_owned_replicas_reads_the_draining_replica_source() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("drain-source-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("drain-source-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("drain-source-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("drain-source-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("drain-source-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "drain-source-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "drain-source-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "drain-source-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-c build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "drain-source-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "drain-source-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
+
+    let good = b"drain-source-good";
+    let bad = b"drain-source-bad!";
+    let good_route = writer
+        .put_with_policy(
+            "drain-source-good-key",
+            good,
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_a.runtime_id().storage_key()]),
+        )
+        .expect("good source write should land on store-a");
+    let bad_route = writer
+        .put_with_policy(
+            "drain-source-bad-key",
+            bad,
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_b.runtime_id().storage_key()]),
+        )
+        .expect("bad distractor write should land on store-b");
+
+    store_a
+        .route_directory
+        .compare_and_swap_object_route(
+            &store_a.lease,
+            &good_route.key,
+            Some(good_route.version),
+            None,
+        )
+        .expect("good source route delete should succeed");
+    store_a
+        .route_directory
+        .compare_and_swap_object_route(
+            &store_a.lease,
+            &bad_route.key,
+            Some(bad_route.version),
+            None,
+        )
+        .expect("bad source route delete should succeed");
+
+    let target_key = "drain-source-target";
+    let target_id = LogicalObjectId::new(NamespaceScope::default(), target_key);
+    let mut bad_replica = bad_route.replicas[0].clone();
+    bad_replica.priority = 0;
+    bad_replica.checksum = None;
+    let mut good_replica = good_route.replicas[0].clone();
+    good_replica.priority = 1;
+    good_replica.checksum = None;
+    let mut route = ObjectRoute {
+        key: ObjectKey::from_logical_id(&target_id),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: store_a.lease.compatibility.clone(),
+        replicas: vec![bad_replica, good_replica],
+    };
+    mooncake_store_core::apply_route_identity(&mut route, &target_id);
+    store_a
+        .route_directory
+        .compare_and_swap_object_route(&store_a.lease, &route.key, None, Some(&route))
+        .expect("target route publish should succeed");
+    store_a.storage_owner.track_route(&route);
+    store_b.storage_owner.track_route(&route);
+
+    assert_eq!(
+        reader
+            .get(target_key)
+            .expect("precondition should read the primary distractor"),
+        bad
+    );
+
+    let store_a_runtime = store_a.runtime_id().clone();
+    let migrated = store_a
+        .evacuate_owned_replicas()
+        .expect("draining store should migrate from its own source replica");
+    assert_eq!(migrated, 1);
+
+    assert_eq!(
+        reader
+            .get(target_key)
+            .expect("reader should see the draining replica payload after migration"),
+        good
+    );
+    let migrated_route = reader
+        .query_route(target_key)
+        .expect("route query should succeed")
+        .expect("route should exist");
+    assert!(
+        migrated_route
+            .replicas
+            .iter()
+            .all(|replica| replica.owner != store_a_runtime),
+        "drained owner should be removed from the migrated route"
+    );
+}
+
+#[test]
 fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();

@@ -1181,8 +1181,6 @@ impl StoreClient {
         route: &ObjectRoute,
     ) -> Result<bool> {
         let object_id = self.route_object_id(route)?;
-        let tenant = object_id.scope.tenant.clone();
-        let key = object_id.logical_key.clone();
         for _ in 0..4 {
             let Some(observed) = self.query_route_by_object_id(&object_id)? else {
                 return Ok(false);
@@ -1198,14 +1196,6 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let mut object = ObjectRef::new(key.as_str()).tenant(tenant.as_str());
-            if object_id.scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
-                object = object.domain(object_id.scope.domain.as_str());
-            }
-            if object_id.scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
-                object = object.object_set(object_id.scope.object_set.as_str());
-            }
-            let payload = Self::expect_exactly_one(writer.batch_get(&[object])?, "batch_get")?;
             let Some(confirmed) = self.query_route_by_object_id(&object_id)? else {
                 return Ok(false);
             };
@@ -1220,6 +1210,12 @@ impl StoreClient {
                 return Ok(false);
             }
 
+            let Some(source) =
+                Self::matching_owned_replica(&observed, &confirmed, &self.lease.runtime).cloned()
+            else {
+                continue;
+            };
+            let payload = writer.read_payload_from_explicit_source(&object_id, &confirmed, &source)?;
             let policy = writer.migration_policy_for_route(&confirmed)?;
             match writer.put_object_with_policy_current(
                 &object_id,
@@ -1283,8 +1279,8 @@ impl StoreClient {
         route: &ObjectRoute,
     ) -> Result<bool> {
         let object_id = self.route_object_id(route)?;
-        let tenant = object_id.scope.tenant;
-        let key = object_id.logical_key;
+        let tenant = object_id.scope.tenant.clone();
+        let key = object_id.logical_key.clone();
         for _ in 0..4 {
             let Some(observed) = self.query_route_in_tenant(&tenant, &key)? else {
                 return Ok(false);
@@ -1300,7 +1296,6 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let payload = writer.get_in_tenant(&tenant, &key)?;
             let Some(confirmed) = self.query_route_in_tenant(&tenant, &key)? else {
                 return Ok(false);
             };
@@ -1315,6 +1310,12 @@ impl StoreClient {
                 return Ok(false);
             }
 
+            let Some(source) =
+                Self::matching_owned_replica(&observed, &confirmed, &self.lease.runtime).cloned()
+            else {
+                continue;
+            };
+            let payload = writer.read_payload_from_explicit_source(&object_id, &confirmed, &source)?;
             let policy = writer.migration_policy_for_successor_route(&confirmed, successor)?;
             let qos_tier = confirmed.qos_tier.as_deref();
             let object_id = writer.route_object_id(&confirmed)?;
@@ -1359,6 +1360,25 @@ impl StoreClient {
             "client hot-upgrade lost route update race for {}",
             route.key.0
         )))
+    }
+
+    fn matching_owned_replica<'a>(
+        observed: &ObjectRoute,
+        confirmed: &'a ObjectRoute,
+        owner: &ClientRuntimeId,
+    ) -> Option<&'a ReplicaRoute> {
+        observed
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner == *owner)
+            .find_map(|observed| {
+                confirmed.replicas.iter().find(|candidate| {
+                    candidate.owner == observed.owner
+                        && candidate.segment_name == observed.segment_name
+                        && candidate.segment_offset == observed.segment_offset
+                        && candidate.length == observed.length
+                })
+            })
     }
 
     fn current_owned_allocations(&self) -> Result<BTreeSet<AllocationSpan>> {
