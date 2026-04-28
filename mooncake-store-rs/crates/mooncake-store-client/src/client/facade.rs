@@ -1064,7 +1064,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         }
         if !routed_requests.is_empty() {
             if let Some(shared_policy) = Self::shared_batch_put_from_replication_policy(requests) {
-                let result = self.batch_put_scoped_routed(
+                let result = self.batch_put_scoped_routed_accept_existing(
                     &routed_requests,
                     Some(&registered_sources),
                     shared_policy.as_ref(),

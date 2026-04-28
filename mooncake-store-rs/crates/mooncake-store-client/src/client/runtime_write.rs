@@ -28,34 +28,6 @@ impl StoreClient {
             .ok_or_else(|| StoreError::InvalidState("segment_name is not configured".to_string()))
     }
 
-    fn active_route_after_batch_put_conflict(
-        &self,
-        key: &ObjectKey,
-        current: Option<ObjectRoute>,
-    ) -> Result<Option<ObjectRoute>> {
-        if let Some(route) = current.filter(|route| route.state == RouteState::Active) {
-            return Ok(Some(route));
-        }
-
-        for attempt in 0..DEFAULT_BATCH_PUT_CONFLICT_RECHECK_ATTEMPTS {
-            if attempt > 0 {
-                sleep(DEFAULT_BATCH_PUT_CONFLICT_RECHECK_DELAY);
-            }
-            if let Some(route) = self
-                .route_directory
-                .get_object_routes_bounded(&self.lease, std::slice::from_ref(key))?
-                .into_iter()
-                .next()
-                .flatten()
-            {
-                if route.state == RouteState::Active {
-                    return Ok(Some(route));
-                }
-            }
-        }
-        Ok(None)
-    }
-
     fn write_reserved_replicas(
         &self,
         targets: &[ReplicaWriteTarget],
@@ -267,6 +239,35 @@ impl StoreClient {
         requests: &[PutRequest<'_>],
         registered_sources: Option<&[*mut c_void]>,
         policy: Option<&ReplicationPolicy>,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.batch_put_scoped_routed_with_route_conflicts(
+            requests,
+            registered_sources,
+            policy,
+            BatchPutRouteConflictPolicy::Strict,
+        )
+    }
+
+    fn batch_put_scoped_routed_accept_existing(
+        &self,
+        requests: &[PutRequest<'_>],
+        registered_sources: Option<&[*mut c_void]>,
+        policy: Option<&ReplicationPolicy>,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.batch_put_scoped_routed_with_route_conflicts(
+            requests,
+            registered_sources,
+            policy,
+            BatchPutRouteConflictPolicy::AcceptExistingActiveRoute,
+        )
+    }
+
+    fn batch_put_scoped_routed_with_route_conflicts(
+        &self,
+        requests: &[PutRequest<'_>],
+        registered_sources: Option<&[*mut c_void]>,
+        policy: Option<&ReplicationPolicy>,
+        conflict_policy: BatchPutRouteConflictPolicy,
     ) -> Result<Vec<ObjectRoute>> {
         self.ensure_local_memory()?;
         self.flush_due_reclaims()?;
@@ -481,7 +482,7 @@ impl StoreClient {
                 .iter()
                 .zip(plans.iter())
                 .zip(object_refs.iter())
-                .zip(current_routes.into_iter())
+                .zip(current_routes)
             {
                 let tenant = request.tenant.unwrap_or(self.default_tenant());
                 let mut candidates = shared_candidates.clone();
@@ -616,9 +617,9 @@ impl StoreClient {
                 let mut exhausted_candidates = 0usize;
                 for (((index, request), candidate), result) in round_indices
                     .into_iter()
-                    .zip(round_requests.into_iter())
-                    .zip(round_candidates.into_iter())
-                    .zip(round_results.into_iter())
+                    .zip(round_requests)
+                    .zip(round_candidates)
+                    .zip(round_results)
                 {
                     match result {
                         Ok((target, reservation)) => {
@@ -1125,7 +1126,7 @@ impl StoreClient {
         let mut published = Vec::with_capacity(routes.len());
         let mut first_error = None;
         for ((index, pending), cas_result) in
-            routes.into_iter().enumerate().zip(cas_results.into_iter())
+            routes.into_iter().enumerate().zip(cas_results)
         {
             match cas_result {
                 Ok(cas) if cas.applied => {
@@ -1156,7 +1157,7 @@ impl StoreClient {
                     }
                     published.push(pending.route);
                 }
-                Ok(_) => {
+                Ok(cas) => {
                     let _ = self.release_reserved_allocations(
                         &prepared[index].targets,
                         &prepared[index].reservations,
@@ -1165,12 +1166,31 @@ impl StoreClient {
                         prepared[index].quota_reservation.as_ref(),
                         "batch_put_route_compare_and_swap_conflict",
                     );
-                    first_error.get_or_insert_with(|| {
-                        StoreError::Conflict(format!(
-                            "route update lost race for key {}",
-                            pending.key.0
-                        ))
-                    });
+                    match (
+                        conflict_policy,
+                        cas.current.filter(|route| route.state == RouteState::Active),
+                    ) {
+                        (
+                            BatchPutRouteConflictPolicy::AcceptExistingActiveRoute,
+                            Some(current),
+                        ) => {
+                            debug!(
+                                runtime = %self.lease.runtime,
+                                key = %pending.key.0,
+                                route_version = current.version.0,
+                                "batch put route conflict accepted existing active route"
+                            );
+                            published.push(current);
+                        }
+                        _ => {
+                            first_error.get_or_insert_with(|| {
+                                StoreError::Conflict(format!(
+                                    "route update lost race for key {}",
+                                    pending.key.0
+                                ))
+                            });
+                        }
+                    }
                 }
                 Err(error) => {
                     let _ = self.release_reserved_allocations(

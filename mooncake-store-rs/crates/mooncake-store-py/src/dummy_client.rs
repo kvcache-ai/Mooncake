@@ -355,7 +355,7 @@ impl DummySession {
             .rpc(|mut client| async move { client.batch_get_into(request).await })?
             .into_inner()
             .lengths;
-        for ((index, _, _, _), length) in misses.into_iter().zip(miss_lengths.into_iter()) {
+        for ((index, _, _, _), length) in misses.into_iter().zip(miss_lengths) {
             lengths[index] = length;
         }
         Ok(lengths)
@@ -420,7 +420,7 @@ impl DummySession {
             .rpc(|mut client| async move { client.batch_get_into_multi_buffers(request).await })?
             .into_inner()
             .lengths;
-        for ((index, _, _), length) in misses.into_iter().zip(miss_lengths.into_iter()) {
+        for ((index, _, _), length) in misses.into_iter().zip(miss_lengths) {
             lengths[index] = length;
         }
         Ok(lengths)
