@@ -219,8 +219,17 @@ return {1, used}
 
 const CAS_TENANT_POLICY_SCRIPT: &str = r#"
 local key = KEYS[1]
+local index_key = KEYS[2]
 local expected = ARGV[1]
 local payload = ARGV[2]
+
+local index_type = redis.call('TYPE', index_key)
+if type(index_type) == 'table' then
+    index_type = index_type['ok']
+end
+if index_type ~= 'none' and index_type ~= 'set' then
+    return redis.error_reply('tenant policy index has wrong type')
+end
 
 local current_payload = redis.call('GET', key)
 if not current_payload then
@@ -238,10 +247,12 @@ end
 
 if payload == '__delete__' then
     redis.call('DEL', key)
+    redis.call('SREM', index_key, key)
     return {1, current_payload or ''}
 end
 
 redis.call('SET', key, payload)
+redis.call('SADD', index_key, key)
 return {1, payload}
 "#;
 
@@ -2233,15 +2244,44 @@ impl MetadataBackend for RedisMetadataBackend {
     fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
         let mut connection = self.connection("redis list tenant policies")?;
         let keys = if let Some(tenant) = tenant {
-            let root_key = self.keyspace.tenant_policy(&TenantPolicyScope::new(
-                tenant,
-                None::<String>,
-                None::<String>,
-            ));
-            let mut keys = vec![root_key.clone()];
-            keys.extend(scan_keys(&mut connection, &format!("{}/*", root_key))?);
-            keys.sort();
-            keys.dedup();
+            let index_key = self.keyspace.tenant_policy_index(tenant);
+            let ready_key = self.keyspace.tenant_policy_index_ready(tenant);
+            let index_ready: bool = connection
+                .exists(&ready_key)
+                .map_err(|error| metadata_error("redis check tenant policy index ready", error))?;
+            let mut keys: Vec<String> = if index_ready {
+                connection
+                    .smembers(&index_key)
+                    .map_err(|error| metadata_error("redis list tenant policy index", error))?
+            } else {
+                Vec::new()
+            };
+            if !index_ready {
+                // The first scoped list migrates legacy Redis tenant-policy keys into the
+                // per-tenant index. After the ready marker is set, tenant-policy writers
+                // are expected to go through this backend so CAS writes maintain the index.
+                let root_key = self.keyspace.tenant_policy(&TenantPolicyScope::new(
+                    tenant,
+                    None::<String>,
+                    None::<String>,
+                ));
+                keys.push(root_key.clone());
+                keys.extend(scan_keys(&mut connection, &format!("{}/*", root_key))?);
+                keys.sort();
+                keys.dedup();
+                if !keys.is_empty() {
+                    connection
+                        .sadd::<_, _, ()>(&index_key, keys.clone())
+                        .map_err(|error| {
+                            metadata_error("redis backfill tenant policy index", error)
+                        })?;
+                }
+                connection
+                    .set::<_, _, ()>(&ready_key, "1")
+                    .map_err(|error| {
+                        metadata_error("redis mark tenant policy index ready", error)
+                    })?;
+            }
             keys
         } else {
             let prefix = self.keyspace.tenant_policy_prefix(None);
@@ -2249,16 +2289,51 @@ impl MetadataBackend for RedisMetadataBackend {
         };
         let mut policies: Vec<TenantPolicy> = Vec::new();
         for key in keys {
+            let Some(scope) = parse_tenant_policy_scope(&self.keyspace, &key) else {
+                if let Some(tenant) = tenant {
+                    connection
+                        .srem::<_, _, ()>(self.keyspace.tenant_policy_index(tenant), &key)
+                        .map_err(|error| {
+                            metadata_error("redis prune malformed tenant policy index", error)
+                        })?;
+                }
+                continue;
+            };
+            if let Some(tenant) = tenant {
+                if scope.tenant != tenant {
+                    connection
+                        .srem::<_, _, ()>(self.keyspace.tenant_policy_index(tenant), &key)
+                        .map_err(|error| {
+                            metadata_error("redis prune mismatched tenant policy index", error)
+                        })?;
+                    continue;
+                }
+            }
             let payload: Option<String> = connection
                 .get(&key)
                 .map_err(|error| metadata_error("redis get tenant policy", error))?;
             let Some(payload) = payload else {
+                if let Some(tenant) = tenant {
+                    connection
+                        .srem::<_, _, ()>(self.keyspace.tenant_policy_index(tenant), &key)
+                        .map_err(|error| {
+                            metadata_error("redis prune stale tenant policy index", error)
+                        })?;
+                }
                 continue;
             };
-            let Some(_scope) = parse_tenant_policy_scope(&self.keyspace, &key) else {
+            let policy = serde_json::from_str::<TenantPolicy>(&payload).map_err(json_error)?;
+            if policy.scope != scope {
+                if let Some(tenant) = tenant {
+                    connection
+                        .srem::<_, _, ()>(self.keyspace.tenant_policy_index(tenant), &key)
+                        .map_err(|error| {
+                            metadata_error("redis prune inconsistent tenant policy index", error)
+                        })?;
+                }
                 continue;
-            };
-            policies.push(serde_json::from_str(&payload).map_err(json_error)?);
+            }
+            policies.push(policy);
         }
         policies.sort_by(|left, right| left.scope.cmp(&right.scope));
         Ok(policies)
@@ -2272,9 +2347,11 @@ impl MetadataBackend for RedisMetadataBackend {
         policy.validate()?;
         let mut connection = self.connection("redis cas tenant policy")?;
         let key = self.keyspace.tenant_policy(&policy.scope);
+        let index_key = self.keyspace.tenant_policy_index(&policy.scope.tenant);
         let payload = serde_json::to_string(policy).map_err(json_error)?;
         let result = Script::new(CAS_TENANT_POLICY_SCRIPT)
             .key(&key)
+            .key(&index_key)
             .arg(
                 expected_version
                     .map(|version| version.to_string())
@@ -2321,8 +2398,10 @@ impl MetadataBackend for RedisMetadataBackend {
     ) -> Result<bool> {
         let mut connection = self.connection("redis delete tenant policy")?;
         let key = self.keyspace.tenant_policy(scope);
+        let index_key = self.keyspace.tenant_policy_index(&scope.tenant);
         let result = Script::new(CAS_TENANT_POLICY_SCRIPT)
             .key(&key)
+            .key(&index_key)
             .arg(
                 expected_version
                     .map(|version| version.to_string())
@@ -3151,6 +3230,24 @@ mod tests {
 
     fn sample_runtime() -> ClientRuntimeId {
         ClientRuntimeId::new("writer", ClientEpoch(5))
+    }
+
+    fn scan_command_calls(connection: &mut redis::Connection) -> usize {
+        let info: String = redis::cmd("INFO")
+            .arg("commandstats")
+            .query(connection)
+            .expect("redis commandstats should load");
+        info.lines()
+            .find_map(|line| {
+                line.strip_prefix("cmdstat_scan:").and_then(|stats| {
+                    stats.split(',').find_map(|field| {
+                        field
+                            .strip_prefix("calls=")
+                            .and_then(|calls| calls.parse::<usize>().ok())
+                    })
+                })
+            })
+            .unwrap_or(0)
     }
 
     fn sample_lease(state: ClientLifecycleState) -> ClientLease {
@@ -4231,6 +4328,15 @@ mod tests {
                 .expect("tenant policy listing should succeed"),
             vec![other_policy, updated.clone()]
         );
+        let mut connection = redis::Client::open(server.url())
+            .expect("redis client should open")
+            .get_connection()
+            .expect("redis connection should succeed");
+        let tenant_index: Vec<String> = connection
+            .smembers(backend.keyspace.tenant_policy_index("tenant/a"))
+            .expect("tenant policy index should load");
+        assert_eq!(tenant_index, vec![backend.keyspace.tenant_policy(&scope)]);
+
         assert!(backend
             .delete_tenant_policy(&scope, Some(2))
             .expect("tenant policy delete should succeed"));
@@ -4239,6 +4345,263 @@ mod tests {
                 .get_tenant_policy(&scope)
                 .expect("tenant policy read after delete should succeed"),
             None
+        );
+        let tenant_index: Vec<String> = connection
+            .smembers(backend.keyspace.tenant_policy_index("tenant/a"))
+            .expect("tenant policy index should load after delete");
+        assert!(tenant_index.is_empty());
+    }
+
+    #[test]
+    fn redis_backend_backfills_legacy_tenant_policy_indexes_on_first_scoped_list() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-tenant-policy-index-backfill");
+        let scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+        let policy = TenantPolicy {
+            scope: scope.clone(),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "legacy-admin".to_string(),
+        };
+        let mut connection = redis::Client::open(server.url())
+            .expect("redis client should open")
+            .get_connection()
+            .expect("redis connection should succeed");
+        connection
+            .set::<_, _, ()>(
+                keyspace.tenant_policy(&scope),
+                serde_json::to_string(&policy).expect("policy should serialize"),
+            )
+            .expect("legacy tenant policy should be written");
+        assert!(connection
+            .smembers::<_, Vec<String>>(keyspace.tenant_policy_index("tenant-a"))
+            .expect("tenant policy index should load before backfill")
+            .is_empty());
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+
+        assert_eq!(
+            backend
+                .list_tenant_policies(Some("tenant-a"))
+                .expect("tenant-scoped policy listing should succeed"),
+            vec![policy]
+        );
+        assert_eq!(
+            connection
+                .smembers::<_, Vec<String>>(keyspace.tenant_policy_index("tenant-a"))
+                .expect("tenant policy index should load after backfill"),
+            vec![keyspace.tenant_policy(&scope)]
+        );
+        assert!(connection
+            .exists::<_, bool>(keyspace.tenant_policy_index_ready("tenant-a"))
+            .expect("tenant policy index ready marker should exist"));
+    }
+
+    #[test]
+    fn redis_backend_backfills_legacy_tenant_policy_indexes_even_after_new_write() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-tenant-policy-index-mixed-backfill");
+        let legacy_scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+        let legacy_policy = TenantPolicy {
+            scope: legacy_scope.clone(),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "legacy-admin".to_string(),
+        };
+        let mut connection = redis::Client::open(server.url())
+            .expect("redis client should open")
+            .get_connection()
+            .expect("redis connection should succeed");
+        connection
+            .set::<_, _, ()>(
+                keyspace.tenant_policy(&legacy_scope),
+                serde_json::to_string(&legacy_policy).expect("policy should serialize"),
+            )
+            .expect("legacy tenant policy should be written");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+        let new_scope = TenantPolicyScope::new("tenant-a", Some("domain-1"), None::<String>);
+        let new_policy = TenantPolicy {
+            scope: new_scope,
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 11,
+            updated_by: "admin".to_string(),
+        };
+        backend
+            .put_tenant_policy(&new_policy, None)
+            .expect("new tenant policy insert should succeed");
+
+        assert_eq!(
+            backend
+                .list_tenant_policies(Some("tenant-a"))
+                .expect("tenant-scoped policy listing should succeed"),
+            vec![legacy_policy, new_policy]
+        );
+    }
+
+    #[test]
+    fn redis_backend_tenant_scoped_policy_listing_does_not_scan_keyspace() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-tenant-policy-list-index")),
+        )
+        .expect("redis backend should initialize");
+        let target = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+        let target_policy = TenantPolicy {
+            scope: target.clone(),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "admin".to_string(),
+        };
+        backend
+            .put_tenant_policy(&target_policy, None)
+            .expect("target tenant policy insert should succeed");
+        for index in 0..32 {
+            let policy = TenantPolicy {
+                scope: TenantPolicyScope::new(
+                    format!("tenant-{index}"),
+                    None::<String>,
+                    None::<String>,
+                ),
+                spec: TenantPolicySpec::default(),
+                version: 1,
+                updated_at_ms: 20 + index,
+                updated_by: "admin".to_string(),
+            };
+            backend
+                .put_tenant_policy(&policy, None)
+                .expect("other tenant policy insert should succeed");
+        }
+
+        let mut connection = redis::Client::open(server.url())
+            .expect("redis client should open")
+            .get_connection()
+            .expect("redis connection should succeed");
+        redis::cmd("CONFIG")
+            .arg("RESETSTAT")
+            .query::<()>(&mut connection)
+            .expect("redis stats should reset");
+
+        assert_eq!(
+            backend
+                .list_tenant_policies(Some("tenant-a"))
+                .expect("tenant-scoped policy listing should succeed"),
+            vec![target_policy.clone()]
+        );
+        assert!(
+            scan_command_calls(&mut connection) > 0,
+            "first tenant-scoped policy listing may scan once to mark the index ready"
+        );
+
+        redis::cmd("CONFIG")
+            .arg("RESETSTAT")
+            .query::<()>(&mut connection)
+            .expect("redis stats should reset");
+        assert_eq!(
+            backend
+                .list_tenant_policies(Some("tenant-a"))
+                .expect("tenant-scoped policy listing should succeed"),
+            vec![target_policy]
+        );
+        assert_eq!(
+            scan_command_calls(&mut connection),
+            0,
+            "tenant-scoped policy listing must use the ready per-tenant index instead of SCAN MATCH"
+        );
+
+        backend
+            .list_tenant_policies(None)
+            .expect("all-tenant policy listing should succeed");
+        assert!(
+            scan_command_calls(&mut connection) > 0,
+            "all-tenant policy listing still uses SCAN for full keyspace enumeration"
+        );
+    }
+
+    #[test]
+    fn redis_backend_tenant_scoped_policy_listing_prunes_bad_index_entries() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(RedisMetadataConfig::new(server.url()).keyspace(
+            MetadataKeyspace::new("test/redis-tenant-policy-index-prune"),
+        ))
+        .expect("redis backend should initialize");
+        let target_scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+        let target_policy = TenantPolicy {
+            scope: target_scope.clone(),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "admin".to_string(),
+        };
+        let other_scope = TenantPolicyScope::new("tenant-b", None::<String>, None::<String>);
+        let other_policy = TenantPolicy {
+            scope: other_scope.clone(),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 11,
+            updated_by: "admin".to_string(),
+        };
+        backend
+            .put_tenant_policy(&target_policy, None)
+            .expect("target tenant policy insert should succeed");
+        backend
+            .put_tenant_policy(&other_policy, None)
+            .expect("other tenant policy insert should succeed");
+
+        let mut connection = redis::Client::open(server.url())
+            .expect("redis client should open")
+            .get_connection()
+            .expect("redis connection should succeed");
+        let tenant_index = backend.keyspace.tenant_policy_index("tenant-a");
+        let other_key = backend.keyspace.tenant_policy(&other_scope);
+        let missing_key = backend.keyspace.tenant_policy(&TenantPolicyScope::new(
+            "tenant-a",
+            Some("missing"),
+            None::<String>,
+        ));
+        connection
+            .sadd::<_, _, ()>(&tenant_index, &other_key)
+            .expect("wrong-tenant index entry should be added");
+        connection
+            .sadd::<_, _, ()>(&tenant_index, &missing_key)
+            .expect("stale index entry should be added");
+        connection
+            .sadd::<_, _, ()>(&tenant_index, "not-a-tenant-policy-key")
+            .expect("malformed index entry should be added");
+        connection
+            .set::<_, _, ()>(backend.keyspace.tenant_policy_index_ready("tenant-a"), "1")
+            .expect("tenant policy index should be marked ready");
+
+        assert_eq!(
+            backend
+                .list_tenant_policies(Some("tenant-a"))
+                .expect("tenant-scoped policy listing should succeed"),
+            vec![target_policy]
+        );
+        let mut index_members: Vec<String> = connection
+            .smembers(&tenant_index)
+            .expect("tenant policy index should load");
+        index_members.sort();
+        assert_eq!(
+            index_members,
+            vec![backend.keyspace.tenant_policy(&target_scope)]
         );
     }
 
