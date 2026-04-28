@@ -664,8 +664,9 @@ impl StoreClient {
     }
 
     fn route_scan_authorities(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
-        Ok(self
-            .available_compatible_live_clients(force_refresh)?
+        let route_scope = self.lease.endpoints.labels.get("route_scope").cloned();
+        let mut authorities = self
+            .compatible_live_clients(force_refresh)?
             .into_iter()
             .filter(|lease| {
                 lease
@@ -674,8 +675,19 @@ impl StoreClient {
                     .get("route")
                     .is_some_and(|value| value == "true")
             })
+            .filter(|lease| {
+                route_scope.as_ref().is_none_or(|scope| {
+                    lease
+                        .endpoints
+                        .labels
+                        .get("route_scope")
+                        .is_some_and(|candidate| candidate == scope)
+                })
+            })
             .filter(|lease| lease.state == ClientLifecycleState::Active)
-            .collect())
+            .collect::<Vec<_>>();
+        authorities.sort_by(|left, right| left.runtime.cmp(&right.runtime));
+        Ok(authorities)
     }
 
     fn route_sync_authorities(
@@ -1616,33 +1628,22 @@ impl StoreClient {
             &self.metadata.route_namespace(),
             &self.lease.runtime.stable_id,
         )?;
+        let mut authorities = self.route_scan_authorities(false)?;
+        let mut refreshed = false;
         let mut synced = 0usize;
         for route in routes {
-            let mut protected = 0usize;
-            let mut last_error = None;
-            for authority in self.route_scan_authorities(false)? {
-                if authority.runtime.stable_id == self.lease.runtime.stable_id {
+            loop {
+                let (protected, last_error) =
+                    self.sync_local_authority_route_to_authorities(&route, &authorities);
+                if protected != 0 {
+                    synced = synced.saturating_add(1);
+                    break;
+                }
+                if !refreshed {
+                    authorities = self.route_scan_authorities(true)?;
+                    refreshed = true;
                     continue;
                 }
-                match self.ensure_authority_route_not_stale(&authority, &route) {
-                    Ok(()) => protected = protected.saturating_add(1),
-                    Err(error) => {
-                        self.mark_runtime_suspect(
-                            &authority.runtime,
-                            "route_authority_shutdown_sync_failed",
-                        );
-                        warn!(
-                            runtime = %self.lease.runtime,
-                            authority = %authority.runtime,
-                            key = %route.key.0,
-                            error = %error,
-                            "route authority shutdown sync failed"
-                        );
-                        last_error = Some(error);
-                    }
-                }
-            }
-            if protected == 0 {
                 return Err(last_error.unwrap_or_else(|| {
                     StoreError::InvalidState(format!(
                         "local authority route {} has no live mirror",
@@ -1650,9 +1651,40 @@ impl StoreClient {
                     ))
                 }));
             }
-            synced = synced.saturating_add(1);
         }
         Ok(synced)
+    }
+
+    fn sync_local_authority_route_to_authorities(
+        &self,
+        route: &ObjectRoute,
+        authorities: &[ClientLease],
+    ) -> (usize, Option<StoreError>) {
+        let mut protected = 0usize;
+        let mut last_error = None;
+        for authority in authorities {
+            if authority.runtime.stable_id == self.lease.runtime.stable_id {
+                continue;
+            }
+            match self.ensure_authority_route_not_stale(authority, route) {
+                Ok(()) => protected = protected.saturating_add(1),
+                Err(error) => {
+                    self.mark_runtime_suspect(
+                        &authority.runtime,
+                        "route_authority_shutdown_sync_failed",
+                    );
+                    warn!(
+                        runtime = %self.lease.runtime,
+                        authority = %authority.runtime,
+                        key = %route.key.0,
+                        error = %error,
+                        "route authority shutdown sync failed"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        (protected, last_error)
     }
 
     fn release_stale_local_allocations(

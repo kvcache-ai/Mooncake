@@ -11969,6 +11969,11 @@ fn draining_route_authority_mirrors_local_routes_before_restart() {
         Some(&route),
     )
     .expect("test should leave route only on draining authority");
+    // Simulate graceful shutdown with a stale membership snapshot.
+    authority
+        .live_client_cache
+        .lock()
+        .store(vec![authority.lease().clone()]);
 
     let migrated = authority
         .evacuate_owned_replicas()

@@ -378,6 +378,8 @@ Phase 4 extends the same model to routed `batch_put`: the client sorts entries b
 
 These APIs are what the e2e suite uses to validate dynamic membership, elastic expansion, true client shrink, and hot-upgrade handoff.
 
+During full client shrink, a draining route authority mirrors any locally held route records to active route authorities before shutdown. That final durability pass refreshes the live-client snapshot if the cached membership view cannot protect a route, so graceful exit does not depend on a stale local membership cache.
+
 ## Observability
 
 The client contains a built-in typed metrics registry and a lightweight HTTP exporter.
