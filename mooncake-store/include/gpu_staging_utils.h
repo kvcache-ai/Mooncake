@@ -70,13 +70,11 @@ inline bool CopyAuto(void* dst, const void* src, size_t size) {
     return hipMemcpy(dst, src, size, hipMemcpyDefault) == hipSuccess;
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     aclrtPtrAttributes src_attr{}, dst_attr{};
-    bool src_dev =
-        aclrtPointerGetAttributes(const_cast<void*>(src), &src_attr) ==
-            ACL_SUCCESS &&
-        src_attr.location.type == ACL_MEM_LOCATION_TYPE_DEVICE;
-    bool dst_dev =
-        aclrtPointerGetAttributes(dst, &dst_attr) == ACL_SUCCESS &&
-        dst_attr.location.type == ACL_MEM_LOCATION_TYPE_DEVICE;
+    bool src_dev = aclrtPointerGetAttributes(const_cast<void*>(src),
+                                             &src_attr) == ACL_SUCCESS &&
+                   src_attr.location.type == ACL_MEM_LOCATION_TYPE_DEVICE;
+    bool dst_dev = aclrtPointerGetAttributes(dst, &dst_attr) == ACL_SUCCESS &&
+                   dst_attr.location.type == ACL_MEM_LOCATION_TYPE_DEVICE;
     aclrtMemcpyKind kind = ACL_MEMCPY_HOST_TO_HOST;
     if (src_dev && dst_dev)
         kind = ACL_MEMCPY_DEVICE_TO_DEVICE;
