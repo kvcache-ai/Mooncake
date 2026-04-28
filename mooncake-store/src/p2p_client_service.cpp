@@ -580,24 +580,27 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     for (size_t i = 0; i < results.size(); ++i) {
         if (results[i].has_value()) {
             success_count++;
-            if (metrics_) {
-                metrics_->local_request.put_bytes.inc(
-                    ClientService::CalculateSliceSize(batched_slices[i]));
-            }
         }
     }
+
     if (metrics_) {
-        size_t failure_count = keys.size() - success_count;
+        const auto elapsed = stopwatch.elapsed_us();
+        const double avg_latency =
+            keys.empty() ? 0.0 : static_cast<double>(elapsed) / keys.size();
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i].has_value()) {
+                metrics_->local_request.put_bytes.inc(
+                    ClientService::CalculateSliceSize(batched_slices[i]));
+                metrics_->local_request.put_latency_success.observe(
+                    avg_latency);
+            } else {
+                metrics_->local_request.put_latency_failure.observe(
+                    avg_latency);
+            }
+        }
+        const size_t failure_count = keys.size() - success_count;
         if (failure_count > 0) {
             metrics_->local_request.put_failures.inc(failure_count);
-        }
-        const auto elapsed = stopwatch.elapsed_us();
-        if (!keys.empty()) {
-            const double avg_latency =
-                static_cast<double>(elapsed) / keys.size();
-            for (size_t i = 0; i < keys.size(); ++i) {
-                metrics_->local_request.put_latency.observe(avg_latency);
-            }
         }
     }
 
@@ -1105,23 +1108,26 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
     for (size_t i = 0; i < results.size(); ++i) {
         if (results[i].has_value()) {
             success_count++;
-            if (metrics_) {
-                metrics_->local_request.get_bytes.inc(handles[i]->data_size);
-            }
         }
     }
+
     if (metrics_) {
-        size_t failure_count = keys.size() - success_count;
+        const auto elapsed = stopwatch.elapsed_us();
+        const double avg_latency =
+            keys.empty() ? 0.0 : static_cast<double>(elapsed) / keys.size();
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i].has_value()) {
+                metrics_->local_request.get_bytes.inc(handles[i]->data_size);
+                metrics_->local_request.get_latency_success.observe(
+                    avg_latency);
+            } else {
+                metrics_->local_request.get_latency_failure.observe(
+                    avg_latency);
+            }
+        }
+        const size_t failure_count = keys.size() - success_count;
         if (failure_count > 0) {
             metrics_->local_request.get_failures.inc(failure_count);
-        }
-        const auto elapsed = stopwatch.elapsed_us();
-        if (!keys.empty()) {
-            const double avg_latency =
-                static_cast<double>(elapsed) / keys.size();
-            for (size_t i = 0; i < keys.size(); ++i) {
-                metrics_->local_request.get_latency.observe(avg_latency);
-            }
         }
     }
 

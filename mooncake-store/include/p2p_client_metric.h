@@ -12,13 +12,15 @@ struct RequestMetric {
     ylt::metric::counter_t get_misses;
     ylt::metric::counter_t get_failures;
     ylt::metric::counter_t get_bytes;
-    ylt::metric::histogram_t get_latency;
+    ylt::metric::histogram_t get_latency_success;
+    ylt::metric::histogram_t get_latency_failure;
 
     // Put metrics
     ylt::metric::counter_t put_requests;
     ylt::metric::counter_t put_failures;
     ylt::metric::counter_t put_bytes;
-    ylt::metric::histogram_t put_latency;
+    ylt::metric::histogram_t put_latency_success;
+    ylt::metric::histogram_t put_latency_failure;
 
     explicit RequestMetric(
         const std::string& prefix,

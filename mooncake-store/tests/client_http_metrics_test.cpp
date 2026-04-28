@@ -221,8 +221,8 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     // Local Put metrics
     p2p_metrics->local_request.put_requests.inc(10);
     p2p_metrics->local_request.put_bytes.inc(5 * 1024 * 1024);  // 5 MB
-    p2p_metrics->local_request.put_latency.observe(200);
-    p2p_metrics->local_request.put_latency.observe(300);
+    p2p_metrics->local_request.put_latency_success.observe(200);
+    p2p_metrics->local_request.put_latency_success.observe(300);
 
     // Local Get metrics
     p2p_metrics->local_request.get_requests.inc(100);
@@ -230,8 +230,8 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     p2p_metrics->local_request.get_misses.inc(15);
     p2p_metrics->local_request.get_failures.inc(5);
     p2p_metrics->local_request.get_bytes.inc(20 * 1024 * 1024);  // 20 MB
-    p2p_metrics->local_request.get_latency.observe(100);
-    p2p_metrics->local_request.get_latency.observe(150);
+    p2p_metrics->local_request.get_latency_success.observe(100);
+    p2p_metrics->local_request.get_latency_success.observe(150);
 
     // Create and start HTTP server
     coro_http::coro_http_server server(1, test_port);
@@ -277,8 +277,9 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
         EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_put_bytes_total") !=
                     std::string::npos)
             << "Metrics should contain P2P put bytes metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_put_latency_us") !=
-                    std::string::npos)
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_put_latency_success_us") !=
+            std::string::npos)
             << "Metrics should contain P2P put latency metric";
 
         // Check P2P Get metrics
@@ -300,8 +301,9 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
         EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_get_bytes_total") !=
                     std::string::npos)
             << "Metrics should contain P2P get bytes metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_local_get_latency_us") !=
-                    std::string::npos)
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_local_get_latency_success_us") !=
+            std::string::npos)
             << "Metrics should contain P2P get latency metric";
 
         // Check labels
@@ -472,7 +474,7 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
     // Local Put metrics
     p2p_metrics->local_request.put_requests.inc(10);
     p2p_metrics->local_request.put_bytes.inc(5 * 1024 * 1024);  // 5 MB
-    p2p_metrics->local_request.put_latency.observe(200);
+    p2p_metrics->local_request.put_latency_success.observe(200);
 
     // Local Get metrics
     p2p_metrics->local_request.get_requests.inc(100);
@@ -480,13 +482,14 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
     p2p_metrics->local_request.get_misses.inc(15);
     p2p_metrics->local_request.get_failures.inc(5);
     p2p_metrics->local_request.get_bytes.inc(20 * 1024 * 1024);  // 20 MB
-    p2p_metrics->local_request.get_latency.observe(100);
+    p2p_metrics->local_request.get_latency_success.observe(100);
 
     // Peer Put metrics
     p2p_metrics->peer_request.put_requests.inc(30);
     p2p_metrics->peer_request.put_bytes.inc(15 * 1024 * 1024);  // 15 MB
     p2p_metrics->peer_request.put_failures.inc(2);
-    p2p_metrics->peer_request.put_latency.observe(250);
+    p2p_metrics->peer_request.put_latency_success.observe(250);
+    p2p_metrics->peer_request.put_latency_failure.observe(350);
 
     // Peer Get metrics
     p2p_metrics->peer_request.get_requests.inc(200);
@@ -494,7 +497,8 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
     p2p_metrics->peer_request.get_misses.inc(40);
     p2p_metrics->peer_request.get_failures.inc(10);
     p2p_metrics->peer_request.get_bytes.inc(40 * 1024 * 1024);  // 40 MB
-    p2p_metrics->peer_request.get_latency.observe(120);
+    p2p_metrics->peer_request.get_latency_success.observe(120);
+    p2p_metrics->peer_request.get_latency_failure.observe(220);
 
     // Create and start HTTP server
     coro_http::coro_http_server server(1, test_port);
@@ -560,9 +564,14 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
         EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_bytes_total") !=
                     std::string::npos)
             << "Metrics should contain peer get bytes metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_latency_us") !=
-                    std::string::npos)
-            << "Metrics should contain peer get latency metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_get_latency_success_us") !=
+            std::string::npos)
+            << "Metrics should contain peer get latency success metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_get_latency_failure_us") !=
+            std::string::npos)
+            << "Metrics should contain peer get latency failure metric";
         EXPECT_TRUE(
             resp.resp_body.find("mooncake_p2p_peer_put_requests_total") !=
             std::string::npos)
@@ -574,9 +583,14 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
         EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_put_bytes_total") !=
                     std::string::npos)
             << "Metrics should contain peer put bytes metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_put_latency_us") !=
-                    std::string::npos)
-            << "Metrics should contain peer put latency metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_put_latency_success_us") !=
+            std::string::npos)
+            << "Metrics should contain peer put latency success metric";
+        EXPECT_TRUE(
+            resp.resp_body.find("mooncake_p2p_peer_put_latency_failure_us") !=
+            std::string::npos)
+            << "Metrics should contain peer put latency failure metric";
 
         // Check actual values
         EXPECT_TRUE(
