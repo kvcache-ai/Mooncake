@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
-  pull_request_target:
-    branches: [ "main" ]
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch: {}
 
 permissions:
@@ -767,29 +764,13 @@ jobs:
 
   ascend-test:
     needs: [build, check-paths]
-    if: >-
-      needs.check-paths.outputs.should-run-downstream == 'true' &&
-      (
-        github.event_name == 'push' ||
-        github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork) ||
-        (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.fork)
-      )
+    if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/ci_ascend.yml
     secrets: inherit
-    with:
-      checkout_ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || '' }}
 
   integration-test:
     needs: [build, check-paths]
-    if: >-
-      needs.check-paths.outputs.should-run-downstream == 'true' &&
-      (
-        github.event_name == 'push' ||
-        github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork) ||
-        (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.fork)
-      )
+    if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
 
