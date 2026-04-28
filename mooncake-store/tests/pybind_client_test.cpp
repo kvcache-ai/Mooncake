@@ -610,10 +610,14 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
     std::vector<uint32_t> src_host(size);
     std::vector<uint32_t> dst_host(size);
 
-    cudaError_t err = cudaMemcpy(src_host.data(), src_data, size * uint32_size, cudaMemcpyDeviceToHost);
-    ASSERT_EQ(err, cudaSuccess) << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
-    err = cudaMemcpy(dst_host.data(), dst_data, size * uint32_size, cudaMemcpyDeviceToHost);
-    ASSERT_EQ(err, cudaSuccess) << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
+    cudaError_t err = cudaMemcpy(src_host.data(), src_data, size * uint32_size,
+                                 cudaMemcpyDeviceToHost);
+    ASSERT_EQ(err, cudaSuccess)
+        << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
+    err = cudaMemcpy(dst_host.data(), dst_data, size * uint32_size,
+                     cudaMemcpyDeviceToHost);
+    ASSERT_EQ(err, cudaSuccess)
+        << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
 
     EXPECT_EQ(src_host, dst_host) << "Retrieved data should match original";
 

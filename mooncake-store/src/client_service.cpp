@@ -1098,11 +1098,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
 
             future = transfer_submitter_->submit(replica, host_slices,
-                                                    TransferRequest::READ);
+                                                 TransferRequest::READ);
         } else {
             // Submit transfer operation asynchronously
             future = transfer_submitter_->submit(replica, slices_it->second,
-                                                    TransferRequest::READ);
+                                                 TransferRequest::READ);
         }
 
         if (!future) {
