@@ -554,20 +554,20 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
     int* dst_data = nullptr;
 
     size_t size = 1000;
-    size_t uint32_size = sizeof(int);
-    cudaMalloc(&src_data, size * uint32_size);
-    cudaMalloc(&dst_data, size * uint32_size);
+    size_t int_size = sizeof(int);
+    cudaMalloc(&src_data, size * int_size);
+    cudaMalloc(&dst_data, size * int_size);
 
-    cudaMemset(src_data, 1, size * uint32_size);
-    cudaMemset(dst_data, 0, size * uint32_size);
+    cudaMemset(src_data, 1, size * int_size);
+    cudaMemset(dst_data, 0, size * int_size);
 
     // Register buffers for zero-copy operations
     int reg_result_test =
-        py_client_->register_buffer(src_data, size * uint32_size);
+        py_client_->register_buffer(src_data, size * int_size);
     ASSERT_EQ(reg_result_test, 0)
         << "Test data buffer registration should succeed";
     int reg_result_dst =
-        py_client_->register_buffer(dst_data, size * uint32_size);
+        py_client_->register_buffer(dst_data, size * int_size);
     ASSERT_EQ(reg_result_dst, 0)
         << "Dst data buffer registration should succeed";
 
@@ -578,14 +578,14 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
     auto src_ptr = src_data;
     auto dst_ptr = dst_data;
     for (size_t i = 0; i < 10; i++) {
-        keys.emplace_back("test_key_" + std::to_string(i));
+        keys.emplace_back("test_hbm_key_" + std::to_string(i));
         std::vector<void*> ptrs;
         std::vector<void*> dst_ptrs;
         std::vector<size_t> sizes;
         for (size_t j = 0; j < 10; j++) {
             ptrs.emplace_back(src_ptr);
             dst_ptrs.emplace_back(dst_ptr);
-            sizes.emplace_back(10 * uint32_size);
+            sizes.emplace_back(10 * int_size);
             src_ptr += 10;
             dst_ptr += 10;
         }
@@ -604,17 +604,17 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
     std::vector<int> get_results = py_client_->batch_get_into_multi_buffers(
         keys, all_dst_ptrs, all_sizes, false);
     for (auto result : get_results) {
-        EXPECT_EQ(result, 100 * uint32_size) << "Get operation should succeed";
+        EXPECT_EQ(result, 100 * int_size) << "Get operation should succeed";
     }
 
     std::vector<uint32_t> src_host(size);
     std::vector<uint32_t> dst_host(size);
 
-    cudaError_t err = cudaMemcpy(src_host.data(), src_data, size * uint32_size,
+    cudaError_t err = cudaMemcpy(src_host.data(), src_data, size * int_size,
                                  cudaMemcpyDeviceToHost);
     ASSERT_EQ(err, cudaSuccess)
         << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
-    err = cudaMemcpy(dst_host.data(), dst_data, size * uint32_size,
+    err = cudaMemcpy(dst_host.data(), dst_data, size * int_size,
                      cudaMemcpyDeviceToHost);
     ASSERT_EQ(err, cudaSuccess)
         << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
@@ -671,7 +671,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     auto ptr = test_data.data();
     auto dst_ptr = dst_data.data();
     for (size_t i = 0; i < 10; i++) {
-        keys.emplace_back("test_key_" + std::to_string(i));
+        keys.emplace_back("test_host_key_" + std::to_string(i));
         std::vector<void*> ptrs;
         std::vector<void*> dst_ptrs;
         std::vector<size_t> sizes;
