@@ -527,15 +527,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     const c10d::AllgatherOptions& opts) {
     size_t tensorSize = inputBuffer.numel() * inputBuffer.element_size();
     if (isCpu_) {
-        auto numRanks = meta_->size;
         return worker_->putTaskCpu(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_,
             connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputBuffer.data_ptr() + pos, realSize);
             },
-            [=](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(numRanks)) {
+            [=, this](void* src, size_t pos, size_t realSize) {
+                for (int j = 0; j < meta_->size; ++j) {
+                    if (!meta_->activeRanks[j]) continue;
                     memcpy(
                         (char*)outputBuffer.data_ptr() + j * tensorSize + pos,
                         (char*)src + j * realSize, realSize);
@@ -554,7 +554,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
             },
             [=, this](void* src, size_t pos, size_t realSize,
                       const at::cuda::CUDAStream& enq_stream) {
-                for (const auto j : c10::irange(meta_->size)) {
+                for (int j = 0; j < meta_->size; ++j) {
+                    if (!meta_->activeRanks[j]) continue;
                     cudaMemcpyAsync(
                         (char*)outputBuffer.data_ptr() + j * tensorSize + pos,
                         (char*)src + j * realSize, realSize,
@@ -573,8 +574,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
         return worker_->putTaskCpu(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
             connection_ctx_,
-            [=](void* dst, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(numRanks)) {
+            [=, this](void* dst, size_t pos, size_t realSize) {
+                for (int j = 0; j < meta_->size; ++j) {
+                    if (!meta_->activeRanks[j]) continue;
                     memcpy((char*)dst + j * realSize,
                            (char*)inputBuffer.data_ptr() + j * tensorSize + pos,
                            realSize);
@@ -593,7 +595,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             connection_ctx_, stream,
             [=, this](void* dst, size_t pos, size_t realSize,
                       const at::cuda::CUDAStream& enq_stream) {
-                for (const auto j : c10::irange(meta_->size)) {
+                for (int j = 0; j < meta_->size; ++j) {
+                    if (!meta_->activeRanks[j]) continue;
                     cudaMemcpyAsync(
                         (char*)dst + j * realSize,
                         (char*)inputBuffer.data_ptr() + j * tensorSize + pos,
