@@ -326,7 +326,7 @@ The client can publish handoff plans and participate in successor upgrade flows.
 
 ### Elastic capacity
 
-The client can expand local storage, drain segments, retire empty segments, and evacuate all replicas owned by a draining client.
+The client can expand local storage, drain segments, retire empty segments, and evacuate all replicas owned by a draining client. Full client shrink also refreshes membership before the final local route-authority mirror retry, so route handoff is not blocked by a stale cached live-client snapshot.
 
 This allows segment-level shrink, full client shrink, and dynamic storage growth without changing the public API.
 
