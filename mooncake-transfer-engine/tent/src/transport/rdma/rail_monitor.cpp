@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/transport/rdma/rail_monitor.h"
+#include <infiniband/verbs.h>
 
 namespace mooncake {
 namespace tent {
@@ -46,11 +47,25 @@ bool RailMonitor::available(int local_nic, int remote_nic) {
     return true;
 }
 
-void RailMonitor::markFailed(int local_nic, int remote_nic) {
+void RailMonitor::markFailed(int local_nic, int remote_nic,
+                             int transport_error) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
-    if (it == rail_states_.end()) return;
+    if (it == rail_states_.end()) {
+        rail_states_[std::make_pair(local_nic, remote_nic)] = RailState{};
+        it = rail_states_.find(std::make_pair(local_nic, remote_nic));
+    }
+
     auto &st = it->second;
     auto now = std::chrono::steady_clock::now();
+
+    // Check if this is a congestion error (should throttle, not reroute)
+    bool is_congestion = (transport_error == IBV_WC_RETRY_EXC_ERR ||
+                          transport_error == IBV_WC_RNR_RETRY_EXC_ERR);
+
+    // For congestion errors, require more errors before triggering failover
+    int failover_threshold =
+        is_congestion ? error_threshold_ * 2 : error_threshold_;
+
     if (st.error_count == 0 || now - st.last_error > error_window_) {
         st.error_count = 1;
     } else {
@@ -64,9 +79,12 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
         if (st.cooldown > std::chrono::seconds(300))
             st.cooldown = std::chrono::seconds(300);
     }
-    if (st.error_count >= error_threshold_) {
+    if (st.error_count >= failover_threshold) {
         st.paused = true;
         st.resume_time = now + st.cooldown;
+        LOG(INFO) << "Rail " << local_nic << " -> " << remote_nic
+                  << " paused (count=" << st.error_count
+                  << ", cooldown=" << st.cooldown.count() << "s)";
         updateBestMapping();
     }
 }
@@ -79,6 +97,9 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic) {
     st.paused = false;
     st.resume_time = {};
     updateBestMapping();
+
+    LOG(INFO) << "Rail " << local_nic << " -> " << remote_nic
+              << " marked recovered";
 }
 
 int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {

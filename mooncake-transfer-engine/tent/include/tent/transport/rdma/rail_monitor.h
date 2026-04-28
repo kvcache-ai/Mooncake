@@ -40,7 +40,7 @@ class RailMonitor {
 
     bool available(int local_nic, int remote_nic);
 
-    void markFailed(int local_nic, int remote_nic);
+    void markFailed(int local_nic, int remote_nic, int transport_error = 0);
 
     void markRecovered(int local_nic, int remote_nic);
 
@@ -76,7 +76,7 @@ class RailMonitor {
     };
 
     std::unordered_map<std::pair<int, int>, RailState, PairHash> rail_states_;
-    std::unordered_map<int, int> direct_rails_;  // keep static after loaded
+    std::unordered_map<int, int> direct_rails_;
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
 
     int error_threshold_ = 3;

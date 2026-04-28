@@ -38,17 +38,26 @@ namespace tent {
 static constexpr int MAX_DEVICES = 64;
 static constexpr int MAX_PID_SLOTS = 256;
 static constexpr uint64_t SHM_MAGIC = 0x2025082772805202ULL;
-static constexpr int SHM_VERSION = 1;
+static constexpr int SHM_VERSION = 2;  // bumped for QoS support
+
+// Priority levels: 0=high, 1=medium, 2=low
+static constexpr uint8_t PRIO_HIGH = 0;
+static constexpr uint8_t PRIO_MEDIUM = 1;
+static constexpr uint8_t PRIO_LOW = 2;
 
 struct PidUsage {
     pid_t pid;                     // 0 == free slot
     volatile uint64_t used_bytes;  // local used bytes reported by this pid
-    uint8_t reserved[56];          // padding -> total 64B
+    uint8_t priority;              // 0=high, 1=medium, 2=low
+    uint8_t reserved[55];          // padding -> total 64B
 };
 
 struct SharedDeviceEntry {
     char dev_name[56];  // NUL-terminated device name, empty means unused
     volatile uint64_t active_bytes;
+    volatile uint64_t high_prio_bytes;
+    volatile uint64_t medium_prio_bytes;
+    volatile uint64_t low_prio_bytes;
     PidUsage pid_usages[MAX_PID_SLOTS];
 };
 
@@ -70,6 +79,11 @@ class SharedQuotaManager {
     Status detach();
 
     Status diffusion();
+
+    // QoS: get load by priority for a device (returns active_bytes)
+    uint64_t getHighPrioLoad(int dev_id) const;
+    uint64_t getMediumPrioLoad(int dev_id) const;
+    uint64_t getLowPrioLoad(int dev_id) const;
 
    private:
     Status attachProcess();

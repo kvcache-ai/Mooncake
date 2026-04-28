@@ -46,6 +46,10 @@ Workers::Workers(RdmaTransport* transport)
     auto diffusion_interval =
         conf->get("transports/rdma/diffusion_interval", 10);
     device_quota_->setDiffusionInterval(diffusion_interval);
+    auto enable_quota = conf->get("transports/rdma/enable_quota", true);
+    device_quota_->setEnableQuota(enable_quota);
+    auto robust_clamping = conf->get("transports/rdma/robust_clamping", true);
+    device_quota_->setRobustClamping(robust_clamping);
 }
 
 Workers::~Workers() {
@@ -187,7 +191,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     return endpoint;
 }
 
-void Workers::disableEndpoint(RdmaSlice* slice) {
+void Workers::disableEndpoint(RdmaSlice* slice, int ibv_wc_status) {
     SegmentDesc* desc = nullptr;
     auto& segment_manager = transport_->metadata_->segmentManager();
     auto target_id = slice->task->request.target_id;
@@ -200,7 +204,8 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
     if (desc) {
         auto& worker = worker_context_[tl_wid];
         auto& rail = worker.rails[desc->machine_id];
-        rail.markFailed(slice->source_dev_id, slice->target_dev_id);
+        rail.markFailed(slice->source_dev_id, slice->target_dev_id,
+                        ibv_wc_status);
     }
     if (auto ep = slice->ep_weak_ptr.lock()) {
         ep->acknowledge(slice, FAILED);
@@ -304,7 +309,7 @@ void Workers::asyncPollCq() {
                 continue;
             }
             auto num_slices = ep->acknowledge(slice, TIMEOUT);
-            disableEndpoint(slice);
+            disableEndpoint(slice, IBV_WC_RESP_TIMEOUT_ERR);
             worker.inflight_slices.fetch_sub(num_slices);
             slice_to_remove.push_back(slice);
         }
@@ -353,10 +358,10 @@ void Workers::asyncPollCq() {
                     LOG(WARNING)
                         << "Slice " << slice << " failed: retry count exceeded";
                     num_slices += ep->acknowledge(slice, FAILED);
-                    disableEndpoint(slice);
+                    disableEndpoint(slice, wc[i].status);
                 } else {
                     num_slices += ep->acknowledge(slice, PENDING);
-                    disableEndpoint(slice);
+                    disableEndpoint(slice, wc[i].status);
                     submit(slice);
                 }
             } else {

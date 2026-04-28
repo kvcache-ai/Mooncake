@@ -37,6 +37,7 @@
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
+#include "tent/common/utils/os.h"
 #include "tent/metrics/tent_metrics.h"
 #include "tent/metrics/config_loader.h"
 
@@ -299,6 +300,7 @@ Status TransferEngineImpl::construct() {
     }
 
     setLogLevel(conf_->get("log_level", "info"));
+    initFastTimer();
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));

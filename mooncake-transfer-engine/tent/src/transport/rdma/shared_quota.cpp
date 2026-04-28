@@ -254,6 +254,7 @@ Status SharedQuotaManager::detachProcess() { return Status::OK(); }
 Status SharedQuotaManager::diffusion() {
     if (!hdr_) return Status::InvalidArgument("not attached");
     pid_t pid = getpid();
+    uint8_t prio = local_quota_->getPriority();
     int rc = lock();
     if (rc != 0)
         return Status::InternalError("lock failed: " +
@@ -269,16 +270,50 @@ Status SharedQuotaManager::diffusion() {
         }
         auto used_bytes = local_quota_->getActiveBytes(dev_id);
         slot->used_bytes = used_bytes;
-        uint64_t sum = 0;
-        for (int s = 0; s < MAX_PID_SLOTS; ++s)
-            sum += hdr_->devices[d].pid_usages[s].used_bytes;
+        slot->priority = prio;
+        uint64_t high_sum = 0, med_sum = 0, low_sum = 0, total_sum = 0;
+        for (int s = 0; s < MAX_PID_SLOTS; ++s) {
+            pid_t p = hdr_->devices[d].pid_usages[s].pid;
+            if (p == 0) continue;
+            uint64_t bytes = hdr_->devices[d].pid_usages[s].used_bytes;
+            uint8_t p_prio = hdr_->devices[d].pid_usages[s].priority;
+            total_sum += bytes;
+            if (p_prio == PRIO_HIGH)
+                high_sum += bytes;
+            else if (p_prio == PRIO_MEDIUM)
+                med_sum += bytes;
+            else
+                low_sum += bytes;
+        }
+
+        hdr_->devices[d].active_bytes = total_sum;
+        hdr_->devices[d].high_prio_bytes = high_sum;
+        hdr_->devices[d].medium_prio_bytes = med_sum;
+        hdr_->devices[d].low_prio_bytes = low_sum;
+        // For compatibility: set diffusion_active_bytes (sum of other
+        // processes)
         uint64_t diffusion_active_bytes =
-            sum < used_bytes ? 0 : sum - used_bytes;
-        hdr_->devices[d].active_bytes = sum;
+            total_sum < used_bytes ? 0 : total_sum - used_bytes;
         local_quota_->setDiffusionActiveBytes(dev_id, diffusion_active_bytes);
     }
+
     unlock();
     return Status::OK();
+}
+
+uint64_t SharedQuotaManager::getHighPrioLoad(int dev_id) const {
+    if (!hdr_ || dev_id < 0 || dev_id >= hdr_->num_devices) return 0;
+    return hdr_->devices[dev_id].high_prio_bytes;
+}
+
+uint64_t SharedQuotaManager::getMediumPrioLoad(int dev_id) const {
+    if (!hdr_ || dev_id < 0 || dev_id >= hdr_->num_devices) return 0;
+    return hdr_->devices[dev_id].medium_prio_bytes;
+}
+
+uint64_t SharedQuotaManager::getLowPrioLoad(int dev_id) const {
+    if (!hdr_ || dev_id < 0 || dev_id >= hdr_->num_devices) return 0;
+    return hdr_->devices[dev_id].low_prio_bytes;
 }
 
 }  // namespace tent
