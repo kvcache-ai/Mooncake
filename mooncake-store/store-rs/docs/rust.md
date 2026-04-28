@@ -240,6 +240,8 @@ Common calls:
 
 `evacuate_owned_replicas()` drains the local client, rewrites every live route that still references it, immediately reclaims old allocations, and retires emptied local segments.
 
+Before returning, the draining client also mirrors any route-authority records that were only present locally to active route authorities. If its cached live-client snapshot cannot find a mirror, it refreshes membership and retries the mirror pass.
+
 Use `evacuate_owned_replicas_via(writer)` when you want a separate routed client to publish replacement routes during shrink.
 
 These operations are the current control surface for hot-upgrade, elastic growth, segment drain/retire, and full client shrink flows.
