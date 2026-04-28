@@ -462,6 +462,9 @@ class RealClient : public PyClient {
                                                    size_t shm_size,
                                                    bool is_local_buffer,
                                                    const UUID &client_id);
+    tl::expected<void, ErrorCode> map_shm_internal_with_device(
+        int fd, uint64_t shm_base_addr, size_t shm_size, bool is_local_buffer,
+        int32_t physical_device_id, const UUID &client_id);
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
 
@@ -741,7 +744,7 @@ class RealClient : public PyClient {
         bool is_ascend = false;
         bool is_ipc = false;
         // Ascend physical device id from dummy (dummy-real RPC).
-        int32_t device_id = -1;
+        int32_t device_id = kInvalidPhysicalDeviceId;
         uint64_t vmm_handle = 0;
         std::string ipc_key_data;
     };

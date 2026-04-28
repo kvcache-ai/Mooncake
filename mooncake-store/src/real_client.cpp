@@ -53,6 +53,25 @@ bool checkAcl(aclError result, const char *message) {
     }
     return true;
 }
+
+tl::expected<void, ErrorCode> set_context_if_needed(const std::string &protocol,
+                                                    int32_t physical_device_id,
+                                                    const char *action) {
+    if (protocol != "ascend" || !globalConfig().ascend_agent_mode) {
+        return {};
+    }
+    if (physical_device_id == kInvalidPhysicalDeviceId) {
+        LOG(ERROR) << "Missing physical device id for " << action;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            physical_device_id)) {
+        LOG(ERROR) << "Failed to set current context for physical device "
+                   << physical_device_id << " during " << action;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
+}
 #endif
 
 struct PreparedRangedReadRequest {
@@ -877,9 +896,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     // ==================== SINGLE-PROTOCOL LOGIC ====================
     this->protocol = protocol;
-    const bool should_use_hugepage = use_hugepage_ &&
-                                     this->protocol != "ascend" &&
-                                     this->protocol != "ubshmem";
+    const bool should_use_hugepage =
+        use_hugepage_ && this->protocol != "ubshmem";
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
         auto ascend_setup = setup_ascend_internal(local_buffer_size);
@@ -1878,6 +1896,14 @@ int64_t RealClient::getSize(const std::string &key) {
 tl::expected<void, ErrorCode> RealClient::map_shm_internal(
     int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
     const UUID &client_id) {
+    return map_shm_internal_with_device(fd, dummy_base_addr, shm_size,
+                                        is_local_buffer,
+                                        kInvalidPhysicalDeviceId, client_id);
+}
+
+tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
+    int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
+    int32_t physical_device_id, const UUID &client_id) {
     std::stringstream addr_stream;
     addr_stream << "0x" << std::hex << dummy_base_addr;
 
@@ -1886,15 +1912,16 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
         "_" + std::to_string(client_id.second) + "_" + addr_stream.str();
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
 
-    // Check if client context exists, create if not
-    auto &context = shm_contexts_[client_id];
-
     // Check if this shm is already mapped
-    for (const auto &shm : context.mapped_shms) {
-        if (shm.dummy_base_addr == static_cast<uintptr_t>(dummy_base_addr)) {
-            LOG(INFO) << "Segment already mapped: " << shm_name;
-            if (fd >= 0) close(fd);
-            return {};
+    auto context_it = shm_contexts_.find(client_id);
+    if (context_it != shm_contexts_.end()) {
+        for (const auto &shm : context_it->second.mapped_shms) {
+            if (shm.dummy_base_addr ==
+                static_cast<uintptr_t>(dummy_base_addr)) {
+                LOG(INFO) << "Segment already mapped: " << shm_name;
+                if (fd >= 0) close(fd);
+                return {};
+            }
         }
     }
 
@@ -1902,6 +1929,15 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
         LOG(ERROR) << "Invalid file descriptor: " << fd;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+#ifdef USE_ASCEND_DIRECT
+    auto context_result = set_context_if_needed(protocol, physical_device_id,
+                                                "POSIX shm registration");
+    if (!context_result) {
+        close(fd);
+        return context_result;
+    }
+#endif
 
     // Map shared memory from FD
     void *shm_buffer =
@@ -1922,6 +1958,11 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
     shm.dummy_base_addr = static_cast<uintptr_t>(dummy_base_addr);
     shm.shm_addr_offset = reinterpret_cast<uintptr_t>(shm_buffer) -
                           reinterpret_cast<uintptr_t>(dummy_base_addr);
+    shm.is_ascend =
+        false;  // memfd/POSIX path; teardown differs from Ascend VMM/IPC
+    shm.device_id = physical_device_id;
+
+    auto &context = shm_contexts_[client_id];
 
     if (shm_size > 0) {
         auto result = client_->RegisterLocalMemory(
@@ -2197,7 +2238,38 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
         if (!shm.shm_buffer) {
             continue;
         }
-        teardown_ascend_shm_buffer(shm);
+        if (shm.is_ascend) {
+            teardown_ascend_shm_buffer(shm);
+        } else {
+#ifdef USE_ASCEND_DIRECT
+            auto context_result = set_context_if_needed(protocol, shm.device_id,
+                                                        "POSIX shm cleanup");
+            if (!context_result) {
+                LOG(WARNING) << "Skip unregisterLocalMemory for POSIX shm: "
+                             << shm.shm_name
+                             << ", error: " << toString(context_result.error());
+            } else
+#endif
+                // Host POSIX shm mapped via map_shm_internal (memfd); not
+                // Ascend VMM/IPC.
+                if (shm.shm_size > 0 && client_) {
+                    auto res =
+                        client_->unregisterLocalMemory(shm.shm_buffer, true);
+                    if (!res) {
+                        LOG(WARNING) << "Failed to unregister local memory for "
+                                        "POSIX shm: "
+                                     << shm.shm_name
+                                     << ", error: " << toString(res.error());
+                    }
+                }
+            if (munmap(shm.shm_buffer, shm.shm_size) != 0) {
+                LOG(ERROR) << "Failed to munmap POSIX shared memory: "
+                           << shm.shm_name << ", error: " << strerror(errno);
+            } else {
+                LOG(INFO) << "Unmapped POSIX shared memory: " << shm.shm_name
+                          << ", size: " << shm.shm_size;
+            }
+        }
     }
     shm_contexts_.erase(it);
     return {};
@@ -2236,6 +2308,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
         if (shm_it->is_ascend) {
             teardown_ascend_shm_buffer(*shm_it);
         } else {
+#ifdef USE_ASCEND_DIRECT
+            auto context_result = set_context_if_needed(
+                protocol, shm_it->device_id, "POSIX shm unregister");
+            if (!context_result) {
+                return context_result;
+            }
+#endif
             auto rc = client_->unregisterLocalMemory(shm_it->shm_buffer, true);
             if (!rc) {
                 LOG(ERROR) << "Failed to unregister memory: "
@@ -4443,8 +4522,9 @@ void RealClient::handle_ipc_shm_register(int client_sock) {
     }
 
     UUID client_id{req.client_id_first, req.client_id_second};
-    auto result = map_shm_internal(fd, req.dummy_base_addr, req.shm_size,
-                                   req.is_local_buffer, client_id);
+    auto result = map_shm_internal_with_device(
+        fd, req.dummy_base_addr, req.shm_size, req.is_local_buffer,
+        req.device_id, client_id);
 
     int status = result.has_value() ? 0 : -1;
     ::send(client_sock, &status, sizeof(status), 0);
