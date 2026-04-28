@@ -814,4 +814,10 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 };
 
+// Compute GiB-aligned segment sizes that sum exactly to total_bytes.
+// Exposed for unit testing; see real_client.cpp for full documentation.
+std::vector<size_t> computeSegmentSizes(size_t total_bytes,
+                                        size_t max_mr_size,
+                                        bool is_rdma);
+
 }  // namespace mooncake

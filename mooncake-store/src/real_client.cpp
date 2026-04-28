@@ -528,6 +528,67 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+// Compute GiB-aligned segment sizes that sum exactly to total_bytes.
+//
+// For non-RDMA protocols there is no hardware MR size limit, so a single
+// segment of total_bytes is returned.
+//
+// For RDMA/EFA, segments are split to respect the ibv_reg_mr() hardware
+// limit (max_mr_size).  The algorithm uses two parallel trackers:
+//   remaining_gib_ceil  — ceil-rounded GiB quota, drives even splitting
+//   remaining_bytes     — actual bytes remaining, determines real sizes
+//
+// This keeps all non-last segments strictly GiB-aligned while letting the
+// last segment naturally absorb the sub-GiB tail via min(), guaranteeing:
+//   (a) every segment <= max_mr_size
+//   (b) adjacent segments differ by at most 1 GiB
+//   (c) sum of all segments == total_bytes  (no memory wasted)
+//
+// Precondition (RDMA/EFA only): max_mr_size >= 1 GiB. GiB-aligned splitting
+// cannot honor a sub-GiB cap; callers configuring a smaller cap get an empty
+// result and an error log. In practice RDMA hardware always reports
+// max_mr_size well above 1 GiB.
+std::vector<size_t> computeSegmentSizes(size_t total_bytes,
+                                        size_t max_mr_size,
+                                        bool is_rdma) {
+    static constexpr size_t kGiB = 1ULL << 30;
+
+    // Non-RDMA: single segment, no splitting needed.
+    if (!is_rdma) return {total_bytes};
+
+    // RDMA/EFA precondition: GiB-aligned splitting requires at least 1 GiB
+    // of headroom. Sub-GiB caps would force segments that exceed the cap.
+    if (max_mr_size < kGiB) {
+        LOG(ERROR) << "computeSegmentSizes: max_mr_size (" << max_mr_size
+                   << " B) < 1 GiB is not supported for RDMA/EFA";
+        return {};
+    }
+
+    // Round total UP so the sub-GiB tail occupies a full GiB quota slot,
+    // preventing the last segment from exceeding max_mr_size.
+    const size_t total_gib_ceil = (total_bytes + kGiB - 1) / kGiB;
+
+    // Floor division keeps each GiB-aligned segment within max_mr_size
+    // even when max_mr_size itself is not GiB-aligned.
+    const size_t max_seg_gib = max_mr_size / kGiB;
+
+    const size_t num_segments = std::max<size_t>(
+        1, (total_gib_ceil + max_seg_gib - 1) / max_seg_gib);
+
+    std::vector<size_t> sizes;
+    sizes.reserve(num_segments);
+    size_t remaining_gib_ceil = total_gib_ceil;
+    size_t remaining_bytes = total_bytes;
+    for (size_t i = 0; i < num_segments; i++) {
+        size_t seg_gib = remaining_gib_ceil / (num_segments - i);
+        remaining_gib_ceil -= seg_gib;
+        size_t seg_bytes = std::min(seg_gib * kGiB, remaining_bytes);
+        remaining_bytes -= seg_bytes;
+        sizes.push_back(seg_bytes);
+    }
+    return sizes;
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -650,9 +711,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
-    // If global_segment_size is 0, skip mount segment;
-    // If global_segment_size is larger than max_mr_size, split to multiple
-    // mapped_shms.
     if (protocol == "cxl") {
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
@@ -675,11 +733,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
-
+    } else if (global_segment_size == 0) {
+        LOG(INFO) << "Global segment size is 0, skip mounting segment";
     } else {
-        auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
-        uint64_t total_glbseg_size = global_segment_size;  // For logging
-        uint64_t current_glbseg_size = 0;                  // For logging
+        const bool is_rdma = (protocol == "rdma" || protocol == "efa");
+        const std::vector<size_t> seg_sizes = computeSegmentSizes(
+            global_segment_size, globalConfig().max_mr_size, is_rdma);
+        if (seg_sizes.empty()) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const size_t num_segments = seg_sizes.size();
 
         // For RDMA, auto-discover NUMA nodes with NICs and distribute
         // global_segment across them for full NIC utilization.
@@ -699,12 +762,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        while (global_segment_size > 0) {
-            size_t segment_size = std::min(global_segment_size, max_mr_size);
-            global_segment_size -= segment_size;
-            current_glbseg_size += segment_size;
-            LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                      << current_glbseg_size << " of " << total_glbseg_size;
+        static constexpr size_t kGiB = 1ULL << 30;
+        size_t mounted_bytes = 0;
+        for (size_t i = 0; i < num_segments; i++) {
+            size_t segment_size = seg_sizes[i];
+            mounted_bytes += segment_size;
+            LOG(INFO) << "Mounting segment [" << i + 1 << "/" << num_segments
+                      << "]: " << segment_size / kGiB << " GiB"
+                      << (segment_size % kGiB
+                              ? " + " + std::to_string(segment_size % kGiB) +
+                                    " B"
+                              : std::string{})
+                      << " (" << segment_size << " bytes)"
+                      << ", " << mounted_bytes << " of " << global_segment_size
+                      << " total";
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
@@ -752,9 +823,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                            << toString(mount_result.error());
                 return tl::unexpected(mount_result.error());
             }
-        }
-        if (total_glbseg_size == 0) {
-            LOG(INFO) << "Global segment size is 0, skip mounting segment";
         }
     }
 
