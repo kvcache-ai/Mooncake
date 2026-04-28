@@ -532,6 +532,104 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 }
 
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
+TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               32 * 1024 * 1024, 32 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address),
+        0);
+
+    int* src_data = nullptr;
+    int* dst_data = nullptr;
+
+    size_t size = 1000;
+    size_t uint32_size = sizeof(int);
+    cudaMalloc(&src_data, size * uint32_size);
+    cudaMalloc(&dst_data, size * uint32_size);
+
+    cudaMemset(src_data, 1, size * uint32_size);
+    cudaMemset(dst_data, 0, size * uint32_size);
+
+    // Register buffers for zero-copy operations
+    int reg_result_test =
+        py_client_->register_buffer(src_data, size * uint32_size);
+    ASSERT_EQ(reg_result_test, 0)
+        << "Test data buffer registration should succeed";
+    int reg_result_dst =
+        py_client_->register_buffer(dst_data, size * uint32_size);
+    ASSERT_EQ(reg_result_dst, 0)
+        << "Dst data buffer registration should succeed";
+
+    std::vector<std::string> keys;
+    std::vector<std::vector<void*>> all_ptrs;
+    std::vector<std::vector<void*>> all_dst_ptrs;
+    std::vector<std::vector<size_t>> all_sizes;
+    auto src_ptr = src_data;
+    auto dst_ptr = dst_data;
+    for (size_t i = 0; i < 10; i++) {
+        keys.emplace_back("test_key_" + std::to_string(i));
+        std::vector<void*> ptrs;
+        std::vector<void*> dst_ptrs;
+        std::vector<size_t> sizes;
+        for (size_t j = 0; j < 10; j++) {
+            ptrs.emplace_back(src_ptr);
+            dst_ptrs.emplace_back(dst_ptr);
+            sizes.emplace_back(10 * uint32_size);
+            src_ptr += 10 * uint32_size;
+            dst_ptr += 10 * uint32_size;
+        }
+        all_ptrs.emplace_back(ptrs);
+        all_dst_ptrs.emplace_back(dst_ptrs);
+        all_sizes.emplace_back(sizes);
+    }
+
+    ReplicateConfig config;
+    config.prefer_alloc_in_same_node = false;
+    std::vector<int> results = py_client_->batch_put_from_multi_buffers(
+        keys, all_ptrs, all_sizes, config);
+    for (auto result : results) {
+        EXPECT_EQ(result, 0) << "Put operation should succeed";
+    }
+    std::vector<int> get_results = py_client_->batch_get_into_multi_buffers(
+        keys, all_dst_ptrs, all_sizes, false);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, 10 * uint32_size) << "Get operation should succeed";
+    }
+
+    std::vector<uint32_t> src_host(size);
+    std::vector<uint32_t> dst_host(size);
+
+    cudaError_t err = cudaMemcpy(src_host.data(), src_data, size * uint32_size, cudaMemcpyDeviceToHost);
+    ASSERT_EQ(err, cudaSuccess) << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
+    err = cudaMemcpy(dst_host.data(), dst_data, size * uint32_size, cudaMemcpyDeviceToHost);
+    ASSERT_EQ(err, cudaSuccess) << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
+
+    EXPECT_EQ(src_host, dst_host) << "Retrieved data should match original";
+
+    // Unregister buffers
+    int unreg_result_test = py_client_->unregister_buffer(src_data);
+    ASSERT_EQ(unreg_result_test, 0)
+        << "Test data buffer unregistration should succeed";
+    int unreg_result_dst = py_client_->unregister_buffer(dst_data);
+    ASSERT_EQ(unreg_result_dst, 0)
+        << "Dst data buffer unregistration should succeed";
+
+    cudaFree(src_data);
+    cudaFree(dst_data);
+}
+#endif
+
 TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
