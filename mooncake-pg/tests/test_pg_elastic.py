@@ -11,6 +11,9 @@ from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
     MooncakePGCUDABackendTestCase,
     MooncakePGWorkerContext,
+    configure_mooncake_device_filter,
+    get_mooncake_backend,
+    require_test_device,
     wait_until,
 )
 
@@ -101,6 +104,236 @@ def _extension_worker(
             "role": "extension",
             "rank": extension_rank,
         })
+
+
+def _extension_worker_with_subgroups(
+    ctx: MooncakePGWorkerContext,
+    extend_event: mp.Event,
+) -> None:
+    """Multi-subgroup elastic extension test using split-ranks pattern.
+
+    Layout (world_size=4, primary=[0,1], joiners=[2,3]):
+      group_a: primary ranks=[0],   joiner ranks=[0,2],     max_world_size=2
+      group_b: primary ranks=[1],   joiner ranks=[1,3],     max_world_size=2
+      group_c: primary ranks=[0,1], joiner ranks=[0,1,2,3], max_world_size=4
+
+    Primary ranks must initialize WORLD with world_size=initial_world_size and
+    create subgroups using only their current membership; joiners wait for the
+    extend signal, then init WORLD with the full world_size and create subgroups
+    using the full eventual membership. PyTorch's new_group uses a monotonic
+    call counter for the store prefix, so primary and joiner side land on the
+    same prefix as long as the call order matches. backendIndex_ is also
+    process-local and increments only when the rank is an actual member of the
+    new group, so it stays aligned across primaries and joiners that all call
+    new_group in the same order.
+    """
+    configure_mooncake_device_filter(ctx.device_filters)
+    device = require_test_device(ctx.proc_rank, ctx.device_type)
+
+    assert ctx.world_size == 4, "this test assumes world_size=4"
+    initial_world_size = 2
+    join_ranks = [2, 3]
+    is_joiner = ctx.proc_rank >= initial_world_size
+
+    a_active = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    b_active = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    c_active = torch.tensor([1, 1, 0, 0], dtype=torch.int32, device=device)
+
+    if not is_joiner:
+        # Primary ranks: init WORLD with world_size=2, max_world_size=4
+        world_active = torch.tensor([1, 1, 0, 0], dtype=torch.int32, device=device)
+        dist_kwargs = {
+            "backend": ctx.backend_name,
+            "rank": ctx.proc_rank,
+            "world_size": initial_world_size,
+            "pg_options": pg.MooncakeBackendOptions(world_active, False, ctx.world_size),
+        }
+        if ctx.device_type == "cuda":
+            dist_kwargs["device_id"] = device
+        dist.init_process_group(**dist_kwargs)
+        world_backend = get_mooncake_backend(device_type=ctx.device_type)
+
+        # Subgroups with split-ranks pattern. All ranks in WORLD must call
+        # new_group in the same order even for groups they are not members of.
+        group_a = dist.new_group(
+            ranks=[0],
+            backend=ctx.backend_name,
+            pg_options=pg.MooncakeBackendOptions(a_active, False, 2),
+        )
+        group_b = dist.new_group(
+            ranks=[1],
+            backend=ctx.backend_name,
+            pg_options=pg.MooncakeBackendOptions(b_active, False, 2),
+        )
+        group_c = dist.new_group(
+            ranks=[0, 1],
+            backend=ctx.backend_name,
+            pg_options=pg.MooncakeBackendOptions(c_active, False, 4),
+        )
+        a_backend = get_mooncake_backend(group_a, device_type=ctx.device_type) if ctx.proc_rank == 0 else None
+        b_backend = get_mooncake_backend(group_b, device_type=ctx.device_type) if ctx.proc_rank == 1 else None
+        c_backend = get_mooncake_backend(group_c, device_type=ctx.device_type)
+
+        # Pre-activation: WORLD primary ranks sum to 1+2=3
+        t = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        if int(t.cpu().item()) != 3:
+            raise AssertionError(f"WORLD pre: expected 3, got {int(t.cpu().item())}")
+
+        # group_c primaries (ranks [0,1]): sum to 1+2=3
+        tc = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(tc, op=dist.ReduceOp.SUM, group=group_c)
+        if int(tc.cpu().item()) != 3:
+            raise AssertionError(f"group_c pre: expected 3, got {int(tc.cpu().item())}")
+
+        if ctx.proc_rank == 0:
+            extend_event.set()
+
+        # WORLD: wait for joiners then recover
+        wait_until(
+            lambda: all(pg.get_peer_state(world_backend, join_ranks)),
+            timeout_s=60.0,
+            poll_interval_s=0.05,
+            description=f"rank {ctx.proc_rank} waiting for WORLD joiners",
+        )
+        pg.recover_ranks(world_backend, join_ranks)
+
+        # group_a: rank 0 waits for joiner (local rank 1 = global rank 2)
+        if ctx.proc_rank == 0:
+            wait_until(
+                lambda: pg.get_peer_state(a_backend, [1])[0],
+                timeout_s=60.0,
+                poll_interval_s=0.05,
+                description="rank 0 waiting for group_a joiner",
+            )
+            pg.recover_ranks(a_backend, [1])
+
+        # group_b: rank 1 waits for joiner (local rank 1 = global rank 3)
+        if ctx.proc_rank == 1:
+            wait_until(
+                lambda: pg.get_peer_state(b_backend, [1])[0],
+                timeout_s=60.0,
+                poll_interval_s=0.05,
+                description="rank 1 waiting for group_b joiner",
+            )
+            pg.recover_ranks(b_backend, [1])
+
+        # group_c: both primaries wait for both joiners (local ranks 2,3)
+        wait_until(
+            lambda: all(pg.get_peer_state(c_backend, [2, 3])),
+            timeout_s=60.0,
+            poll_interval_s=0.05,
+            description=f"rank {ctx.proc_rank} waiting for group_c joiners",
+        )
+        pg.recover_ranks(c_backend, [2, 3])
+
+        # Post-activation: WORLD all 4 ranks → 1+2+3+4=10
+        t = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        if int(t.cpu().item()) != 10:
+            raise AssertionError(f"WORLD post: expected 10, got {int(t.cpu().item())}")
+
+        # group_a: ranks [0,2], values [1,3], sum=4
+        if ctx.proc_rank == 0:
+            ta = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+            dist.all_reduce(ta, op=dist.ReduceOp.SUM, group=group_a)
+            if int(ta.cpu().item()) != 4:
+                raise AssertionError(f"group_a post: expected 4, got {int(ta.cpu().item())}")
+
+        # group_b: ranks [1,3], values [2,4], sum=6
+        if ctx.proc_rank == 1:
+            tb = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+            dist.all_reduce(tb, op=dist.ReduceOp.SUM, group=group_b)
+            if int(tb.cpu().item()) != 6:
+                raise AssertionError(f"group_b post: expected 6, got {int(tb.cpu().item())}")
+
+        # group_c: all 4 ranks, sum=10
+        tc = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(tc, op=dist.ReduceOp.SUM, group=group_c)
+        if int(tc.cpu().item()) != 10:
+            raise AssertionError(f"group_c post: expected 10, got {int(tc.cpu().item())}")
+
+        ctx.record_result({"role": "extension_subgroups", "rank": ctx.proc_rank})
+    else:
+        # Joiners: wait for extend_event, then init WORLD with world_size=4
+        if not extend_event.wait(timeout=60.0):
+            raise TimeoutError("timed out waiting for extend_event")
+
+        world_active = torch.tensor([1, 1, 0, 0], dtype=torch.int32, device=device)
+        dist_kwargs = {
+            "backend": ctx.backend_name,
+            "rank": ctx.proc_rank,
+            "world_size": ctx.world_size,
+            "pg_options": pg.MooncakeBackendOptions(world_active, True, ctx.world_size),
+        }
+        if ctx.device_type == "cuda":
+            dist_kwargs["device_id"] = device
+        dist.init_process_group(**dist_kwargs)
+        world_backend = get_mooncake_backend(device_type=ctx.device_type)
+
+        # Subgroups: full eventual membership; matching call order with primaries.
+        group_a = dist.new_group(
+            ranks=[0, 2],
+            backend=ctx.backend_name,
+            pg_options=pg.MooncakeBackendOptions(a_active, True, 2),
+        )
+        group_b = dist.new_group(
+            ranks=[1, 3],
+            backend=ctx.backend_name,
+            pg_options=pg.MooncakeBackendOptions(b_active, True, 2),
+        )
+        group_c = dist.new_group(
+            ranks=[0, 1, 2, 3],
+            backend=ctx.backend_name,
+            pg_options=pg.MooncakeBackendOptions(c_active, True, 4),
+        )
+        a_backend = get_mooncake_backend(group_a, device_type=ctx.device_type) if ctx.proc_rank == 2 else None
+        b_backend = get_mooncake_backend(group_b, device_type=ctx.device_type) if ctx.proc_rank == 3 else None
+        c_backend = get_mooncake_backend(group_c, device_type=ctx.device_type)
+
+        # Joiners are local-only until join_group is called
+        t = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        if int(t.cpu().item()) != ctx.proc_rank + 1:
+            raise AssertionError(
+                f"WORLD local-only: expected {ctx.proc_rank + 1}, got {int(t.cpu().item())}"
+            )
+
+        # Join groups in same order primaries created them
+        pg.join_group(world_backend)
+        if ctx.proc_rank == 2:
+            pg.join_group(a_backend)
+        if ctx.proc_rank == 3:
+            pg.join_group(b_backend)
+        pg.join_group(c_backend)
+
+        # Post-activation: WORLD all 4 ranks → 1+2+3+4=10
+        t = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        if int(t.cpu().item()) != 10:
+            raise AssertionError(f"WORLD post: expected 10, got {int(t.cpu().item())}")
+
+        # group_a: ranks [0,2], sum=4
+        if ctx.proc_rank == 2:
+            ta = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+            dist.all_reduce(ta, op=dist.ReduceOp.SUM, group=group_a)
+            if int(ta.cpu().item()) != 4:
+                raise AssertionError(f"group_a post: expected 4, got {int(ta.cpu().item())}")
+
+        # group_b: ranks [1,3], sum=6
+        if ctx.proc_rank == 3:
+            tb = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+            dist.all_reduce(tb, op=dist.ReduceOp.SUM, group=group_b)
+            if int(tb.cpu().item()) != 6:
+                raise AssertionError(f"group_b post: expected 6, got {int(tb.cpu().item())}")
+
+        # group_c: all 4 ranks, sum=10
+        tc = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(tc, op=dist.ReduceOp.SUM, group=group_c)
+        if int(tc.cpu().item()) != 10:
+            raise AssertionError(f"group_c post: expected 10, got {int(tc.cpu().item())}")
+
+        ctx.record_result({"role": "extension_subgroups", "rank": ctx.proc_rank})
 
 
 def _fault_detection_worker(
@@ -283,6 +516,21 @@ class _ElasticMixin:
         expected_baseline = (self.world_size - 1) * self.world_size // 2
         for row in original_rows:
             self.assertEqual(row.get("baseline"), expected_baseline)
+
+    def test_extension_with_subgroups(self) -> None:
+        """Test extension with multiple disjoint subgroups using split-ranks pattern."""
+        spawn_ctx = mp.get_context("spawn")
+        extend_event = spawn_ctx.Event()
+
+        rows = self.spawn_backend_and_collect(
+            _extension_worker_with_subgroups,
+            extend_event,
+            nprocs=self.world_size,
+            timeout_s=30.0,
+        )
+
+        result_rows = [r for r in rows if r.get("role") == "extension_subgroups"]
+        self.assertEqual(len(result_rows), self.world_size)
 
 
 class TestMooncakePGElasticCPU(
