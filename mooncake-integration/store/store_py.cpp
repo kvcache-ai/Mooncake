@@ -1616,6 +1616,9 @@ PYBIND11_MODULE(store, m) {
         .def("is_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_disk_replica))
+        .def("is_local_disk_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_local_disk_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
