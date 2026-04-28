@@ -940,10 +940,7 @@ fn execute_batch_get_values(
         misses.push((index, key.clone()));
     }
     if !objects.is_empty() {
-        for ((index, key), value) in misses
-            .into_iter()
-            .zip(client.batch_get(&objects)?.into_iter())
-        {
+        for ((index, key), value) in misses.into_iter().zip(client.batch_get(&objects)?) {
             insert_hot_cache(
                 hot_cache,
                 HotCacheKey::new(tenant.clone(), key.clone()),
@@ -1293,10 +1290,7 @@ fn execute_batch_get_values_into(
         })
         .collect::<Vec<_>>();
     let sizes = client.batch_get_into(requests.as_mut_slice())?;
-    for (((index, key, _, _), buffer), copied) in misses
-        .into_iter()
-        .zip(buffers.iter())
-        .zip(sizes.into_iter())
+    for (((index, key, _, _), buffer), copied) in misses.into_iter().zip(buffers.iter()).zip(sizes)
     {
         insert_hot_cache(
             hot_cache,
