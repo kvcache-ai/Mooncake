@@ -4171,7 +4171,9 @@ RealClient::batch_get_into_multi_buffers_internal(
                         tl::make_unexpected(read_result.error());
                     continue;
                 }
-                scatter_to_buffers(key, static_cast<char *>(slice.ptr), op);
+                if (!scatter_to_buffers(key, static_cast<char *>(slice.ptr),
+                                        op))
+                    continue;
             }
         }
         // DISK: one batched BatchGet into CPU temp buffers, then scatter.
@@ -4213,8 +4215,10 @@ RealClient::batch_get_into_multi_buffers_internal(
                             tl::make_unexpected(disk_results[di].error());
                         continue;
                     }
-                    scatter_to_buffers(
-                        key, static_cast<char *>(handle_it->second->ptr()), op);
+                    if (!scatter_to_buffers(
+                            key, static_cast<char *>(handle_it->second->ptr()),
+                            op))
+                        continue;
                 }
             }
         }
