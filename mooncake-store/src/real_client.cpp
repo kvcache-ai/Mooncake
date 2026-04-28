@@ -4230,9 +4230,8 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     state->sizes = sizes;
     state->file_storage = file_storage_;
     auto *s = state.get();
-    auto try_result = co_await coro_io::post([s]() {
-        return s->file_storage->BatchGet(s->keys, s->sizes);
-    });
+    auto try_result = co_await coro_io::post(
+        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
