@@ -65,7 +65,7 @@ impl StoreClient {
             .collect::<Vec<_>>();
         let policies = self.metadata.get_tenant_policies(&scopes)?;
         let mut cache = self.live_client_cache.lock();
-        for (tenant, policy) in refresh_tenants.into_iter().zip(policies.into_iter()) {
+        for (tenant, policy) in refresh_tenants.into_iter().zip(policies) {
             let version = policy.as_ref().map(|policy| policy.version);
             let quota = policy.and_then(|policy| policy.spec.quota);
             cache.store_tenant_quota_policy(tenant.clone(), version, quota.clone(), now);
@@ -1930,7 +1930,7 @@ impl StoreClient {
             for (((tenant, _scoped), object), route) in scoped
                 .into_iter()
                 .zip(objects.iter())
-                .zip(routes.into_iter())
+                .zip(routes)
             {
                 let route = route.ok_or_else(|| {
                     StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
