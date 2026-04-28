@@ -1041,7 +1041,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         std::vector<size_t> sizes;
         std::vector<int> device_ids;
     };
-    std::unordered_map<std::string, DiskStagingInfo> disk_staging;
+    // std::unordered_map<std::string, DiskStagingInfo> disk_staging;
+    std::vector<std::optional<DiskStagingInfo>> disk_staging(
+        object_keys.size());
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
@@ -1094,7 +1096,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
 
             if (!staging_info.bufs.empty()) {
-                disk_staging[key] = std::move(staging_info);
+                disk_staging[i] = std::move(staging_info);
             }
 
             future = transfer_submitter_->submit(replica, host_slices,
@@ -1107,12 +1109,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         if (!future) {
             // Release disk staging buffers if submit failed
-            auto staging_it = disk_staging.find(key);
-            if (staging_it != disk_staging.end()) {
-                for (auto& buf : staging_it->second.bufs) {
+            if (disk_staging[i]) {
+                for (auto& buf : disk_staging[i]->bufs) {
                     pinned_buffer_pool_->Release(buf);
                 }
-                disk_staging.erase(staging_it);
+                disk_staging[i].reset();
             }
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
@@ -1142,12 +1143,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
         if (result != ErrorCode::OK) {
             // Release disk staging buffers on transfer failure (no H2D copy)
-            auto staging_it = disk_staging.find(key);
-            if (staging_it != disk_staging.end()) {
-                for (auto& buf : staging_it->second.bufs) {
+            if (disk_staging[index]) {
+                for (auto& buf : disk_staging[index]->bufs) {
                     pinned_buffer_pool_->Release(buf);
                 }
-                disk_staging.erase(staging_it);
+                disk_staging[index].reset();
             }
             LOG(ERROR) << "Transfer failed for key: " << key
                        << " with error: " << static_cast<int>(result);
@@ -1155,20 +1155,26 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         } else {
             // H2D copy: transfer succeeded, copy from host staging → original
             // device buffers
-            auto staging_it = disk_staging.find(key);
-            if (staging_it != disk_staging.end()) {
-                auto& info = staging_it->second;
+            if (disk_staging[index]) {
+                auto& info = *disk_staging[index];
+                bool copy_failed = false;
                 for (size_t s = 0; s < info.bufs.size(); ++s) {
                     SetDevice(info.device_ids[s]);
                     if (!CopyHostToDevice(info.original_ptrs[s],
                                           info.bufs[s].data, info.sizes[s])) {
                         LOG(ERROR) << "H2D copy failed for key: " << key;
+                        copy_failed = true;
                     }
                 }
                 for (auto& buf : info.bufs) {
                     pinned_buffer_pool_->Release(buf);
                 }
                 disk_staging.erase(staging_it);
+                disk_staging[index].reset();
+                if (copy_failed) {
+                    results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                    continue;
+                }
             }
             VLOG(1) << "Transfer completed successfully for key: " << key;
             results[index] = {};

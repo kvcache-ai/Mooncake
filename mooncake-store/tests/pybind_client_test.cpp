@@ -547,7 +547,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
                                32 * 1024 * 1024, 32 * 1024 * 1024,
-                               FLAGS_protocol, rdma_devices, master_address),
+                               FLAGS_protocol, rdma_devices, master_address_),
         0);
 
     int* src_data = nullptr;
@@ -566,8 +566,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
         py_client_->register_buffer(src_data, size * int_size);
     ASSERT_EQ(reg_result_test, 0)
         << "Test data buffer registration should succeed";
-    int reg_result_dst =
-        py_client_->register_buffer(dst_data, size * int_size);
+    int reg_result_dst = py_client_->register_buffer(dst_data, size * int_size);
     ASSERT_EQ(reg_result_dst, 0)
         << "Dst data buffer registration should succeed";
 
