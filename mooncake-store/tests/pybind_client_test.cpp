@@ -136,6 +136,23 @@ TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
     EXPECT_EQ(allocated_size, 0);
 }
 
+TEST_F(RealClientTest, AllocateAndMountSegmentFreesOnTearDown) {
+    StartMasterAndSetupClient();
+
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(1, FLAGS_protocol, "",
+                                                  segment_ids, &allocated_size),
+              0);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_GT(allocated_size, 0);
+
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+
+    GLogMuter muter;
+    EXPECT_NE(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
 TEST_F(RealClientTest, MountAndAllocateUnmountApisRejectForeignSegments) {
     StartMasterAndSetupClient();
 

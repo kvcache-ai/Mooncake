@@ -1010,6 +1010,22 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                 << toString(unregister_result.error());
         }
     }
+
+    std::vector<AllocatedSegmentRecord> allocated_records_to_free;
+    {
+        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        allocated_records_to_free.reserve(allocated_segment_records_.size());
+        for (auto &entry : allocated_segment_records_) {
+            allocated_records_to_free.push_back(entry.second);
+        }
+        allocated_segment_records_.clear();
+    }
+    for (auto &record : allocated_records_to_free) {
+        if (record.base) {
+            free_memory(record.protocol, record.base);
+        }
+    }
+
     // Reset all resources
     client_.reset();
     client_buffer_allocator_.reset();
