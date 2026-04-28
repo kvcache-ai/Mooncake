@@ -25,6 +25,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
+#include "gpu_staging_utils.h"
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
@@ -2175,7 +2176,15 @@ RealClient::batch_get_buffer_internal(
         std::unique_ptr<BufferHandle> buffer_handle;
         std::vector<Slice> slices;
     };
+    struct DiskKeyOp {
+        size_t original_index;
+        std::string key;
+        QueryResult query_result;
+        std::unique_ptr<BufferHandle> buffer_handle;
+        uint64_t total_size;
+    };
     std::vector<KeyOp> valid_ops;
+    std::vector<DiskKeyOp> disk_ops;
     valid_ops.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -2215,6 +2224,18 @@ RealClient::batch_get_buffer_internal(
         std::vector<Slice> slices;
         allocateSlices(slices, replica, buffer_handle->ptr());
 
+        if (replica.is_local_disk_replica()) {
+            // LOCAL_DISK: buffer is allocated and registered via
+            // client_buffer_allocator_, route to SSD RPC path below.
+            disk_ops.emplace_back(
+                DiskKeyOp{.original_index = i,
+                          .key = key,
+                          .query_result = std::move(query_result_values),
+                          .buffer_handle = std::move(buffer_handle),
+                          .total_size = total_size});
+            continue;
+        }
+
         valid_ops.emplace_back(
             KeyOp{.original_index = i,
                   .key = key,
@@ -2223,35 +2244,75 @@ RealClient::batch_get_buffer_internal(
                   .slices = std::move(slices)});
     }
 
-    if (valid_ops.empty()) {
+    if (valid_ops.empty() && disk_ops.empty()) {
         return final_results;
     }
 
-    // 3. Execute batch get
-    std::vector<std::string> batch_keys;
-    std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    batch_keys.reserve(valid_ops.size());
-    batch_query_results.reserve(valid_ops.size());
+    // 3. Execute batch get for memory/disk replicas
+    if (!valid_ops.empty()) {
+        std::vector<std::string> batch_keys;
+        std::vector<QueryResult> batch_query_results;
+        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+        batch_keys.reserve(valid_ops.size());
+        batch_query_results.reserve(valid_ops.size());
 
-    for (auto &op : valid_ops) {
-        batch_keys.push_back(op.key);
-        batch_query_results.push_back(op.query_result);
-        batch_slices[op.key] = op.slices;
+        for (auto &op : valid_ops) {
+            batch_keys.push_back(op.key);
+            batch_query_results.push_back(op.query_result);
+            batch_slices[op.key] = op.slices;
+        }
+
+        auto batch_get_results =
+            client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+
+        // 4. Process results and create BufferHandles
+        for (size_t i = 0; i < valid_ops.size(); ++i) {
+            if (batch_get_results[i]) {
+                auto &op = valid_ops[i];
+                final_results[op.original_index] =
+                    std::make_shared<BufferHandle>(
+                        std::move(*op.buffer_handle));
+            } else {
+                LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
+                           << "': " << toString(batch_get_results[i].error());
+            }
+        }
     }
 
-    auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+    // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
+    if (!disk_ops.empty()) {
+        // Group by transport endpoint
+        std::unordered_map<std::string, std::unordered_map<std::string, Slice>>
+            offload_objects;
+        // Build key -> disk_ops index for result lookup
+        std::unordered_map<std::string, size_t> disk_key_to_idx;
 
-    // 4. Process results and create BufferHandles
-    for (size_t i = 0; i < valid_ops.size(); ++i) {
-        if (batch_get_results[i]) {
-            auto &op = valid_ops[i];
-            final_results[op.original_index] =
-                std::make_shared<BufferHandle>(std::move(*op.buffer_handle));
-        } else {
-            LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
-                       << "': " << toString(batch_get_results[i].error());
+        for (size_t idx = 0; idx < disk_ops.size(); ++idx) {
+            auto &op = disk_ops[idx];
+            const auto &replica = op.query_result.replicas.at(0);
+            offload_objects[replica.get_local_disk_descriptor()
+                                .transport_endpoint]
+                .emplace(op.key, Slice{op.buffer_handle->ptr(), op.total_size});
+            disk_key_to_idx[op.key] = idx;
+        }
+
+        for (auto &[endpoint, objects] : offload_objects) {
+            if (objects.empty()) continue;
+            auto read_result =
+                batch_get_into_offload_object_internal(endpoint, objects);
+            for (auto &[key, slice] : objects) {
+                auto idx_it = disk_key_to_idx.find(key);
+                if (idx_it == disk_key_to_idx.end()) continue;
+                auto &op = disk_ops[idx_it->second];
+                if (read_result) {
+                    final_results[op.original_index] =
+                        std::make_shared<BufferHandle>(
+                            std::move(*op.buffer_handle));
+                } else {
+                    LOG(ERROR) << "SSD read failed for key '" << key
+                               << "': " << toString(read_result.error());
+                }
+            }
         }
     }
 
@@ -2397,6 +2458,59 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     }
 
     if (src_offset == 0 && size == total_size) {
+        // LOCAL_DISK full-object read: destination buffer is passed
+        // directly to SSD RPC (same pattern as single-buffer batch_get_into;
+        // GPU buffers are pre-registered by vLLM via register_buffer).
+        if (replica.is_local_disk_replica()) {
+            const auto &endpoint =
+                replica.get_local_disk_descriptor().transport_endpoint;
+            std::unordered_map<std::string, Slice> objects;
+            objects.emplace(
+                key, Slice{static_cast<char *>(buffer) + dst_offset, size});
+            auto result =
+                batch_get_into_offload_object_internal(endpoint, objects);
+            if (!result) return tl::unexpected(result.error());
+            return static_cast<int64_t>(total_size);
+        }
+
+        if (replica.is_disk_replica()) {
+            // DISK full read: local file I/O (vector_read) cannot write to
+            // GPU memory. Use temp CPU buffer, then scatter to dst.
+            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            if (!alloc_result) {
+                LOG(ERROR) << "Failed to allocate temp buffer for DISK full "
+                           << "read, key: " << key << ", size: " << total_size;
+                return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+            BufferHandle tmp_handle(std::move(*alloc_result));
+            std::vector<mooncake::Slice> tmp_slices;
+            allocateSlices(tmp_slices, replica, tmp_handle.ptr());
+            auto get_result = client_->Get(key, query_result, tmp_slices);
+            if (!get_result) {
+                LOG(ERROR) << "DISK Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
+            }
+            void *dst = static_cast<char *>(buffer) + dst_offset;
+            const void *src = tmp_handle.ptr();
+            int device_id = -1;
+            if (gpu_staging::IsDevicePointer(dst, &device_id)) {
+                gpu_staging::SetDevice(device_id);
+                if (!gpu_staging::CopyHostToDevice(dst, src, total_size)) {
+                    LOG(ERROR) << "H2D copy failed for DISK full read"
+                               << ", key: " << key;
+                    return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                }
+            } else if (gpu_staging::IsHostPointer(dst)) {
+                memcpy(dst, src, total_size);
+            } else {
+                LOG(ERROR) << "Unknown memory type for dst buffer in DISK "
+                           << "full read, key: " << key;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
         std::vector<mooncake::Slice> slices;
         allocateSlices(slices, replica,
                        static_cast<char *>(buffer) + dst_offset);
@@ -2410,8 +2524,86 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return static_cast<int64_t>(total_size);
     }
 
+    // LOCAL_DISK partial read: read full object into temp buffer, then copy
+    // the requested [src_offset, src_offset+size) range to destination.
+    if (replica.is_local_disk_replica()) {
+        auto alloc_result = client_buffer_allocator_->allocate(total_size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temp buffer for SSD ranged "
+                       << "read, key: " << key << ", size: " << total_size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        BufferHandle tmp_handle(std::move(*alloc_result));
+
+        const auto &endpoint =
+            replica.get_local_disk_descriptor().transport_endpoint;
+        std::unordered_map<std::string, Slice> objects;
+        objects.emplace(key, Slice{tmp_handle.ptr(), total_size});
+        auto result = batch_get_into_offload_object_internal(endpoint, objects);
+        if (!result) return tl::unexpected(result.error());
+
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        const void *src =
+            static_cast<const char *>(tmp_handle.ptr()) + src_offset;
+        int device_id = -1;
+        if (gpu_staging::IsDevicePointer(dst, &device_id)) {
+            gpu_staging::SetDevice(device_id);
+            if (!gpu_staging::CopyHostToDevice(dst, src, size)) {
+                LOG(ERROR) << "H2D copy failed for SSD ranged read"
+                           << ", key: " << key;
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        } else if (gpu_staging::IsHostPointer(dst)) {
+            memcpy(dst, src, size);
+        } else {
+            LOG(ERROR) << "Unknown memory type for dst buffer in ranged "
+                       << "read, key: " << key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return static_cast<int64_t>(size);
+    }
+
+    if (replica.is_disk_replica()) {
+        // DISK partial read: read full object into temp CPU buffer, then
+        // copy the requested [src_offset, src_offset+size) range to dst.
+        auto alloc_result = client_buffer_allocator_->allocate(total_size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temp buffer for DISK partial "
+                       << "read, key: " << key << ", size: " << total_size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        BufferHandle tmp_handle(std::move(*alloc_result));
+        std::vector<mooncake::Slice> tmp_slices;
+        allocateSlices(tmp_slices, replica, tmp_handle.ptr());
+        auto get_result = client_->Get(key, query_result, tmp_slices);
+        if (!get_result) {
+            LOG(ERROR) << "DISK Get failed for key: " << key
+                       << " with error: " << toString(get_result.error());
+            return tl::unexpected(get_result.error());
+        }
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        const void *src =
+            static_cast<const char *>(tmp_handle.ptr()) + src_offset;
+        int device_id = -1;
+        if (gpu_staging::IsDevicePointer(dst, &device_id)) {
+            gpu_staging::SetDevice(device_id);
+            if (!gpu_staging::CopyHostToDevice(dst, src, size)) {
+                LOG(ERROR) << "H2D copy failed for DISK partial read"
+                           << ", key: " << key;
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        } else if (gpu_staging::IsHostPointer(dst)) {
+            memcpy(dst, src, size);
+        } else {
+            LOG(ERROR) << "Unknown memory type for dst buffer in DISK "
+                       << "partial read, key: " << key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return static_cast<int64_t>(size);
+    }
+
     if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "ranged reads only support memory replicas";
+        LOG(ERROR) << "ranged reads only support memory/disk replicas";
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
@@ -3794,7 +3986,19 @@ RealClient::batch_get_into_multi_buffers_internal(
         uint64_t total_size;
     };
 
+    struct DiskKeyInfo {
+        std::string key;
+        size_t original_index;
+        QueryResult query_result;
+        std::vector<void *> buffers;
+        std::vector<size_t> sizes;
+        uint64_t total_size;
+        bool is_local_disk;  // true=LOCAL_DISK (offload RPC), false=DISK
+                             // (BatchGet)
+    };
+
     std::vector<ValidKeyInfo> valid_operations;
+    std::unordered_map<std::string, DiskKeyInfo> valid_local_disk_ops;
     valid_operations.reserve(num_keys);
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
@@ -3835,11 +4039,27 @@ RealClient::batch_get_into_multi_buffers_internal(
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
         if (replica.is_memory_replica()) {
+            // MEMORY: RDMA from remote memory directly to GPU (GPUDirect).
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
+        } else if (replica.is_local_disk_replica() ||
+                   replica.is_disk_replica()) {
+            // LOCAL_DISK / DISK: file I/O cannot write to GPU memory.
+            // Route through CPU temp buffer + scatter.
+            valid_local_disk_ops.emplace(
+                key,
+                DiskKeyInfo{.key = key,
+                            .original_index = i,
+                            .query_result = std::move(query_result_values),
+                            .buffers = all_buffers[i],
+                            .sizes = all_sizes[i],
+                            .total_size = total_size,
+                            .is_local_disk = replica.is_local_disk_replica()});
+            results.emplace_back(static_cast<int64_t>(total_size));
+            continue;
         } else {
-            LOG(ERROR) << "Invalid replica type for key: " << key;
+            LOG(ERROR) << "Unsupported replica type for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
@@ -3854,37 +4074,175 @@ RealClient::batch_get_into_multi_buffers_internal(
         results.emplace_back(static_cast<int64_t>(total_size));
     }
     // Early return if no valid operations
-    if (valid_operations.empty()) {
+    if (valid_operations.empty() && valid_local_disk_ops.empty()) {
         return results;
     }
 
-    // Prepare batch transfer data structures
-    std::vector<std::string> batch_keys;
-    std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    batch_keys.reserve(valid_operations.size());
-    batch_query_results.reserve(valid_operations.size());
-    for (auto &op : valid_operations) {
-        batch_keys.push_back(op.key);
-        batch_query_results.push_back(op.query_result);
-        batch_slices[op.key] = op.slices;
-    }
+    // ---- Memory/Disk replica: existing BatchGet path ----
+    if (!valid_operations.empty()) {
+        std::vector<std::string> batch_keys;
+        std::vector<QueryResult> batch_query_results;
+        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+        batch_keys.reserve(valid_operations.size());
+        batch_query_results.reserve(valid_operations.size());
+        for (auto &op : valid_operations) {
+            batch_keys.push_back(op.key);
+            batch_query_results.push_back(op.query_result);
+            batch_slices[op.key] = op.slices;
+        }
 
-    auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                          prefer_alloc_in_same_node);
+        auto batch_get_results =
+            client_->BatchGet(batch_keys, batch_query_results, batch_slices,
+                              prefer_alloc_in_same_node);
 
-    // Process transfer results
-    for (size_t j = 0; j < batch_get_results.size(); ++j) {
-        const auto &op = valid_operations[j];
-
-        if (!batch_get_results[j]) {
-            const auto error = batch_get_results[j].error();
-            LOG(ERROR) << "BatchGet failed for key '" << op.key
-                       << "': " << toString(error);
-            results[op.original_index] = tl::unexpected(error);
+        for (size_t j = 0; j < batch_get_results.size(); ++j) {
+            const auto &op = valid_operations[j];
+            if (!batch_get_results[j]) {
+                const auto error = batch_get_results[j].error();
+                LOG(ERROR) << "BatchGet failed for key '" << op.key
+                           << "': " << toString(error);
+                results[op.original_index] = tl::unexpected(error);
+            }
         }
     }
+
+    // ---- LOCAL_DISK replica: SSD read via RPC + scatter to multi_buffers ----
+    if (!valid_local_disk_ops.empty()) {
+        // Group keys by transport endpoint for batched RPC
+        std::unordered_map<std::string, std::unordered_map<std::string, Slice>>
+            offload_objects;
+        std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
+            temp_handles;
+
+        for (auto &[key, op] : valid_local_disk_ops) {
+            // Allocate temp buffer from client_buffer_allocator_ (already
+            // registered with TransferEngine via RegisterLocalMemory).
+            auto alloc_result =
+                client_buffer_allocator_->allocate(op.total_size);
+            if (!alloc_result) {
+                LOG(ERROR)
+                    << "Failed to allocate temp buffer for SSD read, key: "
+                    << key << ", size: " << op.total_size;
+                results[op.original_index] =
+                    tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                continue;
+            }
+            auto handle =
+                std::make_unique<BufferHandle>(std::move(*alloc_result));
+            const auto &replica = op.query_result.replicas.at(0);
+            if (op.is_local_disk) {
+                offload_objects[replica.get_local_disk_descriptor()
+                                    .transport_endpoint]
+                    .emplace(key, Slice{handle->ptr(), op.total_size});
+            }
+            temp_handles.emplace(key, std::move(handle));
+        }
+
+        for (auto &[endpoint, objects] : offload_objects) {
+            if (objects.empty()) continue;
+            auto read_result =
+                batch_get_into_offload_object_internal(endpoint, objects);
+            for (auto &[key, slice] : objects) {
+                auto disk_it = valid_local_disk_ops.find(key);
+                if (disk_it == valid_local_disk_ops.end()) continue;
+                auto &op = disk_it->second;
+                if (!read_result) {
+                    LOG(ERROR) << "SSD read failed for key '" << key
+                               << "': " << toString(read_result.error());
+                    results[op.original_index] =
+                        tl::make_unexpected(read_result.error());
+                    continue;
+                }
+                // Scatter: temp contiguous buffer -> user's multi_buffers.
+                // Dual-check pointer type to avoid memcpy to GPU addresses.
+                char *src = static_cast<char *>(slice.ptr);
+                size_t offset = 0;
+                bool scatter_ok = true;
+                for (size_t j = 0; j < op.buffers.size() && scatter_ok; ++j) {
+                    if (offset >= op.total_size) break;
+                    size_t sz =
+                        std::min(op.sizes[j],
+                                 static_cast<size_t>(op.total_size - offset));
+                    void *dst = op.buffers[j];
+                    int device_id = -1;
+                    if (gpu_staging::IsDevicePointer(dst, &device_id)) {
+                        gpu_staging::SetDevice(device_id);
+                        if (!gpu_staging::CopyHostToDevice(dst, src + offset,
+                                                           sz)) {
+                            LOG(ERROR) << "H2D copy failed during scatter"
+                                       << ", key: " << key;
+                            results[op.original_index] =
+                                tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+                            scatter_ok = false;
+                        }
+                    } else if (gpu_staging::IsHostPointer(dst)) {
+                        memcpy(dst, src + offset, sz);
+                    } else {
+                        LOG(ERROR) << "Unknown memory type for dst buffer"
+                                   << ", key: " << key;
+                        results[op.original_index] =
+                            tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                        scatter_ok = false;
+                    }
+                    offset += sz;
+                }
+            }
+        }
+        // DISK: read via BatchGet into CPU temp buffer, then scatter.
+        // (storage_backend::vector_read cannot write directly to GPU memory)
+        for (auto &[key, op] : valid_local_disk_ops) {
+            if (op.is_local_disk) continue;
+            auto handle_it = temp_handles.find(key);
+            if (handle_it == temp_handles.end()) continue;
+            const auto &replica = op.query_result.replicas.at(0);
+            std::vector<Slice> disk_slices;
+            allocateSlices(disk_slices, replica, handle_it->second->ptr());
+            std::vector<std::string> dk = {key};
+            std::vector<QueryResult> dqr = {op.query_result};
+            std::unordered_map<std::string, std::vector<Slice>> dbs;
+            dbs[key] = std::move(disk_slices);
+            auto disk_results =
+                client_->BatchGet(dk, dqr, dbs, prefer_alloc_in_same_node);
+            if (!disk_results[0]) {
+                LOG(ERROR) << "DISK BatchGet failed for key '" << key
+                           << "': " << toString(disk_results[0].error());
+                results[op.original_index] =
+                    tl::make_unexpected(disk_results[0].error());
+                continue;
+            }
+            // Scatter from temp CPU buffer to user GPU/CPU multi_buffers
+            char *src = static_cast<char *>(handle_it->second->ptr());
+            size_t offset = 0;
+            for (size_t j = 0; j < op.buffers.size(); ++j) {
+                if (offset >= op.total_size) break;
+                size_t sz = std::min(
+                    op.sizes[j], static_cast<size_t>(op.total_size - offset));
+                void *dst = op.buffers[j];
+                int device_id = -1;
+                if (gpu_staging::IsDevicePointer(dst, &device_id)) {
+                    gpu_staging::SetDevice(device_id);
+                    if (!gpu_staging::CopyHostToDevice(dst, src + offset, sz)) {
+                        LOG(ERROR) << "H2D copy failed for DISK scatter"
+                                   << ", key: " << key;
+                        results[op.original_index] =
+                            tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+                        break;
+                    }
+                } else if (gpu_staging::IsHostPointer(dst)) {
+                    memcpy(dst, src + offset, sz);
+                } else {
+                    LOG(ERROR) << "Unknown memory type for dst buffer"
+                               << ", key: " << key;
+                    results[op.original_index] =
+                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    break;
+                }
+                offset += sz;
+            }
+        }
+        // temp_handles: BufferHandle RAII releases allocator memory
+    }
+
     return results;
 }
 
