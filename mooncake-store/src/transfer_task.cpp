@@ -476,33 +476,28 @@ std::optional<TransferFuture> TransferSubmitter::submit(
             return std::nullopt;
         }
 
-        if (op_code == TransferRequest::READ) {
-            future = submitMemoryReadOperation(handle, slices, 0);
-        } else {
-            TransferStrategy strategy = selectStrategy(handle, slices);
-
-            switch (strategy) {
-                case TransferStrategy::LOCAL_MEMCPY:
-                    future = submitMemcpyOperation(handle, slices, op_code);
-                    break;
-                case TransferStrategy::TRANSFER_ENGINE:
+        TransferStrategy strategy = selectStrategy(handle, slices);
+        switch (strategy) {
+            case TransferStrategy::LOCAL_MEMCPY:
+                future = submitMemcpyOperation(handle, slices, op_code);
+                break;
+            case TransferStrategy::TRANSFER_ENGINE:
 #ifdef ENABLE_MULTI_PROTOCOL
-                    if (level_protocols_.size() > 1) {
-                        std::string proto =
-                            level_protocols_[replica.get_storage_level()];
-                        future = mp_submitTransferEngineOperation(
-                            handle, slices, op_code, proto);
-                    } else
+                if (level_protocols_.size() > 1) {
+                    std::string proto =
+                        level_protocols_[replica.get_storage_level()];
+                    future = mp_submitTransferEngineOperation(handle, slices,
+                                                              op_code, proto);
+                } else
 #endif
-                    {
-                        future = submitTransferEngineOperation(handle, slices,
-                                                               op_code);
-                    }
-                    break;
-                default:
-                    LOG(ERROR) << "Unknown transfer strategy: " << strategy;
-                    return std::nullopt;
-            }
+                {
+                    future =
+                        submitTransferEngineOperation(handle, slices, op_code);
+                }
+                break;
+            default:
+                LOG(ERROR) << "Unknown transfer strategy: " << strategy;
+                return std::nullopt;
         }
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
