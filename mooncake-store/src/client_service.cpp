@@ -32,7 +32,6 @@
 namespace mooncake {
 
 using gpu_staging::CopyDeviceToHost;
-using gpu_staging::CopyHostToDevice;
 using gpu_staging::IsDevicePointer;
 using gpu_staging::SetDevice;
 
@@ -1035,14 +1034,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
 
-    struct DiskStagingInfo {
-        std::vector<PinnedBufferPool::Buffer> bufs;
-        std::vector<void*> original_ptrs;
-        std::vector<size_t> sizes;
-        std::vector<int> device_ids;
-    };
-    std::vector<std::optional<DiskStagingInfo>> disk_staging(
-        object_keys.size());
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
@@ -1075,45 +1066,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
 
-        std::optional<TransferFuture> future;
-        if (replica.is_disk_replica()) {
-            std::vector<Slice> host_slices;
-            DiskStagingInfo staging_info;
-            for (const auto& slice : slices_it->second) {
-                int device_id = -1;
-                if (IsDevicePointer(slice.ptr, &device_id)) {
-                    SetDevice(device_id);
-                    auto buf = pinned_buffer_pool_->Acquire(slice.size);
-                    host_slices.emplace_back(Slice{buf.data, slice.size});
-                    staging_info.bufs.push_back(buf);
-                    staging_info.original_ptrs.push_back(slice.ptr);
-                    staging_info.sizes.push_back(slice.size);
-                    staging_info.device_ids.push_back(device_id);
-                } else {
-                    host_slices.push_back(slice);
-                }
-            }
-
-            if (!staging_info.bufs.empty()) {
-                disk_staging[i] = std::move(staging_info);
-            }
-
-            future = transfer_submitter_->submit(replica, host_slices,
-                                                 TransferRequest::READ);
-        } else {
-            // Submit transfer operation asynchronously
-            future = transfer_submitter_->submit(replica, slices_it->second,
-                                                 TransferRequest::READ);
-        }
-
+        // Submit transfer operation asynchronously
+        auto future = transfer_submitter_->submit(replica, slices_it->second,
+                                                  TransferRequest::READ);
         if (!future) {
-            // Release disk staging buffers if submit failed
-            if (disk_staging[i]) {
-                for (auto& buf : disk_staging[i]->bufs) {
-                    pinned_buffer_pool_->Release(buf);
-                }
-                disk_staging[i].reset();
-            }
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
                 hot_cache_->ReleaseHotKey(key);
@@ -1141,39 +1097,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             hot_cache_->ReleaseHotKey(key);
         }
         if (result != ErrorCode::OK) {
-            // Release disk staging buffers on transfer failure (no H2D copy)
-            if (disk_staging[index]) {
-                for (auto& buf : disk_staging[index]->bufs) {
-                    pinned_buffer_pool_->Release(buf);
-                }
-                disk_staging[index].reset();
-            }
             LOG(ERROR) << "Transfer failed for key: " << key
                        << " with error: " << static_cast<int>(result);
             results[index] = tl::unexpected(result);
         } else {
-            // H2D copy: transfer succeeded, copy from host staging → original
-            // device buffers
-            if (disk_staging[index]) {
-                auto& info = *disk_staging[index];
-                bool copy_failed = false;
-                for (size_t s = 0; s < info.bufs.size(); ++s) {
-                    SetDevice(info.device_ids[s]);
-                    if (!CopyHostToDevice(info.original_ptrs[s],
-                                          info.bufs[s].data, info.sizes[s])) {
-                        LOG(ERROR) << "H2D copy failed for key: " << key;
-                        copy_failed = true;
-                    }
-                }
-                for (auto& buf : info.bufs) {
-                    pinned_buffer_pool_->Release(buf);
-                }
-                disk_staging[index].reset();
-                if (copy_failed) {
-                    results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
-                    continue;
-                }
-            }
             VLOG(1) << "Transfer completed successfully for key: " << key;
             results[index] = {};
 
