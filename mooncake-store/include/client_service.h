@@ -403,7 +403,8 @@ class Client {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batch_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batch_slices);
 
     /**
      * @brief Notifies the master that offloading of specified objects has

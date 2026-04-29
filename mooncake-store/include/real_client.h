@@ -674,7 +674,7 @@ class RealClient : public PyClient {
      */
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
-        std::unordered_map<std::string, Slice> &objects);
+        std::unordered_map<std::string, std::vector<Slice>> &objects);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
