@@ -3813,7 +3813,7 @@ std::vector<int64_t> RealClient::batch_get_into(
     return results;
 }
 
-std::vector<tl::expected<int64_t, ErrorCode>>
+async_simple::coro::Lazy<std::vector<tl::expected<int64_t, ErrorCode>>>
 RealClient::batch_get_into_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<uint64_t> &dummy_buffers,
@@ -3823,16 +3823,19 @@ RealClient::batch_get_into_dummy_helper(
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
             device_id)) {
         LOG(ERROR) << "Failed to set context for physical device " << device_id;
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
+        co_return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 #endif
 
-    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    // Hold shared_lock for the entire operation to prevent SHM from being
+    // unmapped while batch_get_into_internal is using the translated buffers.
+    auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(
+        dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
+        co_return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
     auto &context = it->second;
@@ -3840,10 +3843,35 @@ RealClient::batch_get_into_dummy_helper(
     auto buffers_result =
         map_dummy_addrs_to_real_ptrs(context, dummy_buffers, sizes, client_id);
     if (!buffers_result) {
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
+        co_return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(buffers_result.error()));
     }
-    return batch_get_into_internal(keys, buffers_result.value(), sizes);
+
+    // Run batch_get_into_internal (which may block on offload RPC + SSD I/O)
+    // on a dedicated thread pool so the coro_rpc IO thread stays free for ping.
+    //
+    // Pack everything the worker-thread call needs into a single heap-owned
+    // state object so the lambda captures only a raw pointer (trivially
+    // copyable, trivially destructible). Avoids GCC 11 coroutine + coro_io
+    // double-destruction interactions when non-trivial captures end up in
+    // both the OUTER coroutine frame and the post_helper chain.
+    struct CallState {
+        std::vector<std::string> keys;
+        std::vector<size_t> sizes;
+        std::vector<void *> buffers;
+        std::shared_ptr<std::shared_lock<std::shared_mutex>> lock;
+    };
+    auto state = std::make_unique<CallState>();
+    state->keys = keys;
+    state->sizes = sizes;
+    state->buffers = std::move(buffers_result.value());
+    state->lock = std::move(lock);
+
+    auto *s = state.get();
+    auto try_result = co_await coro_io::post([this, s]() {
+        return batch_get_into_internal(s->keys, s->buffers, s->sizes);
+    });
+    co_return try_result.value();
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -4811,16 +4839,31 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     const UUID &task_id) {
     return client_->QueryTask(task_id);
 }
-tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
-    auto result = file_storage_->BatchGet(keys, sizes);
+    // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
+    // free to handle ping and other RPCs. Same heap-owned state pattern as
+    // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
+    struct CallState {
+        std::vector<std::string> keys;
+        std::vector<int64_t> sizes;
+        std::shared_ptr<FileStorage> file_storage;
+    };
+    auto state = std::make_unique<CallState>();
+    state->keys = keys;
+    state->sizes = sizes;
+    state->file_storage = file_storage_;
+    auto *s = state.get();
+    auto try_result = co_await coro_io::post(
+        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
+    auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
                    << result.error();
-        return tl::make_unexpected(result.error());
+        co_return tl::make_unexpected(result.error());
     }
-    return BatchGetOffloadObjectResponse(
+    co_return BatchGetOffloadObjectResponse(
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetTransportEndpoint(),
         file_storage_->config_.client_buffer_gc_ttl_ms);
