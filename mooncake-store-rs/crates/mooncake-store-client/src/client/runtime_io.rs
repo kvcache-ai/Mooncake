@@ -689,6 +689,57 @@ impl StoreClient {
         Ok(authorities)
     }
 
+    fn route_sync_authorities(
+        &self,
+        force_refresh: bool,
+        included_readable: Option<&ClientStableId>,
+    ) -> Result<Vec<ClientLease>> {
+        let route_scope = self.lease.endpoints.labels.get("route_scope").cloned();
+        let mut authorities = BTreeMap::<ClientStableId, ClientLease>::new();
+        for authority in self.route_scan_authorities(force_refresh)? {
+            authorities.insert(authority.runtime.stable_id.clone(), authority);
+        }
+
+        if let Some(included) = included_readable {
+            let mut snapshots = vec![self.compatible_live_clients(force_refresh)?];
+            if !force_refresh {
+                snapshots.push(self.compatible_live_clients(true)?);
+            }
+            for lease in snapshots.into_iter().flatten() {
+                if authorities.contains_key(&lease.runtime.stable_id) {
+                    continue;
+                }
+                if lease.runtime.stable_id != *included {
+                    continue;
+                }
+                if lease
+                    .endpoints
+                    .labels
+                    .get("route")
+                    .is_none_or(|value| value != "true")
+                {
+                    continue;
+                }
+                if route_scope.as_ref().is_some_and(|scope| {
+                    lease.endpoints
+                        .labels
+                        .get("route_scope")
+                        .is_none_or(|candidate| candidate != scope)
+                }) {
+                    continue;
+                }
+                if !lease.state.serves_reads() {
+                    continue;
+                }
+                authorities
+                    .entry(lease.runtime.stable_id.clone())
+                    .or_insert(lease);
+            }
+        }
+
+        Ok(authorities.into_values().collect())
+    }
+
     fn active_compatible_runtimes(&self, force_refresh: bool) -> Result<BTreeSet<ClientRuntimeId>> {
         Ok(self
             .available_compatible_live_clients(force_refresh)?
@@ -717,12 +768,16 @@ impl StoreClient {
         mooncake_store_core::route_logical_object_id(route)
     }
 
-    fn migration_policy_for_route(&self, route: &ObjectRoute) -> Result<ReplicationPolicy> {
+    fn migration_policy_for_route(
+        &self,
+        route: &ObjectRoute,
+        source_owner: &ClientRuntimeId,
+    ) -> Result<ReplicationPolicy> {
         let active = self.active_compatible_runtimes_with_refresh_fallback()?;
         let preferred = route
             .replicas
             .iter()
-            .filter(|replica| replica.owner != self.lease.runtime)
+            .filter(|replica| replica.owner != *source_owner)
             .filter(|replica| active.contains(&replica.owner))
             .map(|replica| replica.owner.storage_key())
             .collect::<BTreeSet<_>>();
@@ -736,6 +791,7 @@ impl StoreClient {
     fn migration_policy_for_successor_route(
         &self,
         route: &ObjectRoute,
+        source_owner: &ClientRuntimeId,
         successor: &ClientRuntimeId,
     ) -> Result<ReplicationPolicy> {
         let active = self.active_compatible_runtimes_with_refresh_fallback()?;
@@ -747,7 +803,7 @@ impl StoreClient {
         preferred.push(successor_key);
 
         for replica in route.replicas.iter().filter(|replica| {
-            replica.owner != self.lease.runtime
+            replica.owner != *source_owner
                 && replica.owner != *successor
                 && active.contains(&replica.owner)
         }) {
@@ -842,15 +898,43 @@ impl StoreClient {
             fallback_replicas: VecDeque::new(),
         };
         let deadline = self.request_deadline_for_transfer(source.length, 1);
-        let mut checked_runtimes = BTreeSet::new();
-        self.execute_selected_replica_direct(
-            transport,
-            &resolved,
-            &mut payload,
-            &mut checked_runtimes,
-            deadline,
-        )?;
+        let length = source.length as usize;
+        if !self.copy_local_replica_direct(source, &mut payload, length)? {
+            self.ensure_explicit_source_reachable(source)?;
+            self.execute_remote_get_direct(transport, &resolved, &mut payload, length, deadline)?;
+        }
+        validate_replica_checksum(source, &payload[..length])?;
         Ok(payload)
+    }
+
+    fn ensure_explicit_source_reachable(&self, source: &ReplicaRoute) -> Result<()> {
+        if source.owner == self.lease.runtime {
+            return Ok(());
+        }
+        let lease = self
+            .metadata
+            .get_client_lease(&source.owner)?
+            .filter(|lease| compatibility_matches(&self.lease, lease))
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("runtime {} is not available", source.owner))
+            })?;
+        if !lease.state.serves_reads() {
+            return Err(StoreError::InvalidState(format!(
+                "runtime {} is not readable while {:?}",
+                source.owner, lease.state
+            )));
+        }
+        match self.control_client.probe_reachability(&lease) {
+            crate::control_plane::ControlPlaneReachability::Reachable => Ok(()),
+            crate::control_plane::ControlPlaneReachability::Unreachable => {
+                self.mark_runtime_suspect(&source.owner, "explicit_source_control_unreachable");
+                Err(StoreError::Transport(format!(
+                    "explicit source runtime {} is unreachable before opening {}",
+                    source.owner, source.segment_name.0
+                )))
+            }
+            crate::control_plane::ControlPlaneReachability::Unknown(error) => Err(error),
+        }
     }
 
     fn explicit_migration_object_ref<'a>(
@@ -1216,7 +1300,7 @@ impl StoreClient {
                 continue;
             };
             let payload = writer.read_payload_from_explicit_source(&object_id, &confirmed, &source)?;
-            let policy = writer.migration_policy_for_route(&confirmed)?;
+            let policy = writer.migration_policy_for_route(&confirmed, &self.lease.runtime)?;
             match writer.put_object_with_policy_current(
                 &object_id,
                 confirmed.qos_tier.as_deref(),
@@ -1233,7 +1317,7 @@ impl StoreClient {
                         &next,
                         Some(&self.lease.runtime.stable_id),
                     )?;
-                    writer.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
+                    self.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
                     registry::record_rebalance_route("migrate", "ok");
                     registry::record_rebalance_bytes(
                         "migrate",
@@ -1316,7 +1400,11 @@ impl StoreClient {
                 continue;
             };
             let payload = writer.read_payload_from_explicit_source(&object_id, &confirmed, &source)?;
-            let policy = writer.migration_policy_for_successor_route(&confirmed, successor)?;
+            let policy = writer.migration_policy_for_successor_route(
+                &confirmed,
+                &self.lease.runtime,
+                successor,
+            )?;
             let qos_tier = confirmed.qos_tier.as_deref();
             let object_id = writer.route_object_id(&confirmed)?;
             match writer.put_object_with_policy_current(
@@ -1335,7 +1423,7 @@ impl StoreClient {
                         &next,
                         Some(&self.lease.runtime.stable_id),
                     )?;
-                    writer.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
+                    self.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
                     registry::record_rebalance_route("migrate", "ok");
                     registry::record_rebalance_bytes(
                         "migrate",
@@ -1478,7 +1566,7 @@ impl StoreClient {
         }
         let mut force_refresh = false;
         loop {
-            let authorities = self.route_scan_authorities(force_refresh)?;
+            let authorities = self.route_sync_authorities(force_refresh, excluded)?;
             let mut protected = 0usize;
             let mut last_error = None;
 
@@ -1727,14 +1815,37 @@ impl StoreClient {
         route: &ObjectRoute,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
     ) -> Option<ReplicaRoute> {
+        let local_segments = self.local_readable_segments_for_route(route);
         route
             .replicas
             .iter()
             .filter(|replica| {
                 replica.owner == self.lease.runtime || readable_runtimes.contains(&replica.owner)
             })
-            .min_by_key(|replica| replica.priority)
+            .min_by_key(|replica| {
+                (
+                    !local_segments.contains(&replica.segment_name),
+                    replica.priority,
+                )
+            })
             .cloned()
+    }
+
+    fn local_readable_segments_for_route(&self, route: &ObjectRoute) -> BTreeSet<SegmentName> {
+        let state = self.state.lock();
+        state
+            .memory_ref()
+            .ok()
+            .map(|memory| {
+                route
+                    .replicas
+                    .iter()
+                    .filter(|replica| replica.owner == self.lease.runtime)
+                    .filter(|replica| memory.has_storage_segment(&replica.segment_name))
+                    .map(|replica| replica.segment_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn prune_unreadable_replicas_best_effort(
@@ -1851,14 +1962,23 @@ impl StoreClient {
         selected: &ReplicaRoute,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
     ) -> VecDeque<ReplicaRoute> {
-        route.replicas
+        let local_segments = self.local_readable_segments_for_route(route);
+        let mut replicas = route
+            .replicas
             .iter()
             .filter(|replica| !Self::has_same_replica(replica, selected))
             .filter(|replica| {
                 replica.owner == self.lease.runtime || readable_runtimes.contains(&replica.owner)
             })
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        replicas.sort_by_key(|replica| {
+            (
+                !local_segments.contains(&replica.segment_name),
+                replica.priority,
+            )
+        });
+        replicas.into()
     }
 
     fn try_advance_resolved_replica(
@@ -3267,28 +3387,38 @@ impl StoreClient {
                 buffer.len()
             )));
         }
-        let local = {
-            let state = self.state.lock();
-            let memory = state.memory_ref()?;
-            resolved.replica.owner == self.lease.runtime
-                && memory.has_storage_segment(&resolved.replica.segment_name)
-        };
-        if local {
-            let source = {
-                let state = self.state.lock();
-                state.memory_ref()?.storage_address(
-                    &resolved.replica.segment_name,
-                    resolved.replica.segment_offset as usize,
-                )?
-            };
-            unsafe {
-                ptr::copy_nonoverlapping(source.cast::<u8>(), buffer.as_mut_ptr(), length);
-            }
-        } else {
+        if !self.copy_local_replica_direct(&resolved.replica, buffer, length)? {
             self.ensure_remote_replica_reachable_once(&resolved.replica, checked_runtimes)?;
             self.execute_remote_get_direct(transport, resolved, buffer, length, request_deadline)?;
         }
         validate_replica_checksum(&resolved.replica, &buffer[..length])
+    }
+
+    fn copy_local_replica_direct(
+        &self,
+        replica: &ReplicaRoute,
+        buffer: &mut [u8],
+        length: usize,
+    ) -> Result<bool> {
+        let local = {
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            replica.owner == self.lease.runtime && memory.has_storage_segment(&replica.segment_name)
+        };
+        if !local {
+            return Ok(false);
+        }
+        let source = {
+            let state = self.state.lock();
+            state.memory_ref()?.storage_address(
+                &replica.segment_name,
+                replica.segment_offset as usize,
+            )?
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(source.cast::<u8>(), buffer.as_mut_ptr(), length);
+        }
+        Ok(true)
     }
 
     fn read_single_object_with_failover(
