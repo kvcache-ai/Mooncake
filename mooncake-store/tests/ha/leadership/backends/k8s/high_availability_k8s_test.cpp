@@ -194,5 +194,65 @@ TEST_F(HighAvailabilityTest, K8sCanReacquireAfterRelease) {
               coordinator->ReleaseLeadership(*second_acquire->session));
 }
 
+// --- Connstring validation ---
+
+TEST_F(HighAvailabilityTest, K8sConnstringEmptyIsRejected) {
+    auto coordinator = CreateK8sCoordinatorOrNull("", "");
+    ASSERT_EQ(coordinator, nullptr);
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringEmptyNamespaceIsRejected) {
+    auto spec = ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = "/lease-name",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    ASSERT_FALSE(coordinator.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, coordinator.error());
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringEmptyLeaseNameIsRejected) {
+    auto spec = ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = "default/",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    ASSERT_FALSE(coordinator.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, coordinator.error());
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringMultipleSlashesIsRejected) {
+    auto spec = ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = "a/b/c",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    ASSERT_FALSE(coordinator.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, coordinator.error());
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringValidFormatPassesParsing) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator =
+        CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, "parse-valid");
+    ASSERT_NE(coordinator, nullptr);
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringNoSlashDefaultsNamespace) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto spec = ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = FLAGS_k8s_lease_name + "-parse-noslash",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    ASSERT_TRUE(coordinator.has_value());
+}
+
 }  // namespace testing
 }  // namespace mooncake

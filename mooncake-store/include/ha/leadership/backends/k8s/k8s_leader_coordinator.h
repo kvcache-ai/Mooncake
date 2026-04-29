@@ -45,8 +45,8 @@ class K8sLeaderCoordinator final : public LeaderCoordinator {
     void ClearLeadershipMonitorStateLocked();
     bool IsSameViewVersion(const std::optional<MasterView>& current_view,
                            std::optional<ViewVersionId> known_version) const;
-    static std::pair<std::string, std::string> ParseConnstring(
-        const std::string& connstring);
+    static tl::expected<std::pair<std::string, std::string>, ErrorCode>
+    ParseConnstring(const std::string& connstring);
 
     HABackendSpec spec_;
     std::string namespace_;

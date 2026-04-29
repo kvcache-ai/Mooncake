@@ -55,11 +55,7 @@ class K8sLeadershipMonitorHandle final : public LeadershipMonitorHandle {
 }  // namespace
 
 K8sLeaderCoordinator::K8sLeaderCoordinator(const HABackendSpec& spec)
-    : spec_(spec) {
-    auto [ns, name] = ParseConnstring(spec.connstring);
-    namespace_ = std::move(ns);
-    lease_name_ = std::move(name);
-}
+    : spec_(spec) {}
 
 K8sLeaderCoordinator::~K8sLeaderCoordinator() { ShutdownElection(); }
 
@@ -67,6 +63,13 @@ ErrorCode K8sLeaderCoordinator::Connect() {
     if (connected_) {
         return ErrorCode::OK;
     }
+
+    auto parsed = ParseConnstring(spec_.connstring);
+    if (!parsed) {
+        return parsed.error();
+    }
+    namespace_ = std::move(parsed->first);
+    lease_name_ = std::move(parsed->second);
 
     auto err = K8sLeaseHelper::Init();
     if (err == ErrorCode::OK) {
@@ -416,15 +419,35 @@ bool K8sLeaderCoordinator::IsSameViewVersion(
     return current_view->view_version == known_version.value();
 }
 
-std::pair<std::string, std::string> K8sLeaderCoordinator::ParseConnstring(
-    const std::string& connstring) {
-    // Format: "namespace/lease-name"
-    auto pos = connstring.find('/');
-    if (pos == std::string::npos) {
-        // Default namespace
-        return {"default", connstring};
+tl::expected<std::pair<std::string, std::string>, ErrorCode>
+K8sLeaderCoordinator::ParseConnstring(const std::string& connstring) {
+    // Format: "namespace/lease-name" or just "lease-name" (default namespace).
+    // Exactly zero or one '/' is allowed.
+    if (connstring.empty()) {
+        LOG(ERROR) << "K8s HA connstring is empty";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return {connstring.substr(0, pos), connstring.substr(pos + 1)};
+
+    auto first_slash = connstring.find('/');
+    if (first_slash == std::string::npos) {
+        // No slash — use default namespace
+        return std::pair<std::string, std::string>{"default", connstring};
+    }
+
+    // Reject multiple slashes (e.g. "a/b/c")
+    if (connstring.find('/', first_slash + 1) != std::string::npos) {
+        LOG(ERROR) << "K8s HA connstring contains multiple '/': " << connstring;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto ns = connstring.substr(0, first_slash);
+    auto name = connstring.substr(first_slash + 1);
+    if (ns.empty() || name.empty()) {
+        LOG(ERROR) << "K8s HA connstring has empty namespace or lease name: "
+                   << connstring;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return std::pair<std::string, std::string>{std::move(ns), std::move(name)};
 }
 
 }  // namespace k8s
