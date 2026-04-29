@@ -47,7 +47,16 @@ inline void SetSingleAscendDeviceId(int device_id) {
 
 // Helper function to set device context
 inline bool AclSetDevice(int device_id, const char* operation_name) {
-    auto ret = aclrtSetDevice(device_id);
+    // Stub: Reuse the existing device context of the process, skip
+    // configuration if already set
+    int current_device = -1;
+    auto ret = aclrtGetDevice(&current_device);
+    if (ret == ACL_SUCCESS) {
+        // Device context already configured for this process, skip
+        return true;
+    }
+
+    ret = aclrtSetDevice(device_id);
     if (ret != ACL_SUCCESS) {
         LOG(ERROR) << operation_name
                    << ": aclrtSetDevice failed, device: " << device_id
