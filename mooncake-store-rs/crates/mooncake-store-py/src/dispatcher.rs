@@ -829,6 +829,7 @@ fn run_health_update(
             "store dispatcher {context} is still in flight"
         )));
     }
+    let inflight_for_timeout = inflight.clone();
     let executor_for_task = executor.clone();
     executor.block_on(async move {
         match tokio::time::timeout(
@@ -844,7 +845,13 @@ fn run_health_update(
             Ok(Err(error)) => Err(StoreError::Transport(format!(
                 "store dispatcher worker failed: {error}"
             ))),
-            Err(_) => Err(dispatcher_timeout(context, timeout)),
+            Err(_) => {
+                // Timeout fired but spawn_blocking task still holds InflightGuard.
+                // Reset flag to prevent livelock — the orphaned guard's Drop will
+                // harmlessly store(false) again when it eventually completes.
+                inflight_for_timeout.store(false, Ordering::SeqCst);
+                Err(dispatcher_timeout(context, timeout))
+            }
         }
     })
 }
@@ -1478,14 +1485,24 @@ fn run_heartbeat_loop(
 ) {
     let runtime = publisher.runtime.clone();
     let mut next_heartbeat = current_time_ms().saturating_add(initial_delay_ms);
+    let mut consecutive_failures: u64 = 0;
+    let mut last_success_ms = current_time_ms();
     while !stop.load(Ordering::SeqCst) && !publisher.closed.load(Ordering::SeqCst) {
         let now_ms = current_time_ms();
         if now_ms >= next_heartbeat {
             match publisher.heartbeat(now_ms.saturating_add(lease_ttl_ms)) {
                 Ok(()) => {
+                    if consecutive_failures > 0 {
+                        eprintln!(
+                            "[mooncake-store] [{runtime}] heartbeat recovered after {consecutive_failures} consecutive failures"
+                        );
+                    }
+                    consecutive_failures = 0;
+                    last_success_ms = now_ms;
                     next_heartbeat = now_ms.saturating_add(heartbeat_interval_ms);
                 }
                 Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                     let retry_after_ms = heartbeat_retry_delay_ms(heartbeat_interval_ms);
                     warn!(
                         runtime,
@@ -1493,6 +1510,21 @@ fn run_heartbeat_loop(
                         error = %error,
                         "store dispatcher heartbeat failed"
                     );
+                    let since_last_success_ms = now_ms.saturating_sub(last_success_ms);
+                    if since_last_success_ms >= lease_ttl_ms {
+                        eprintln!(
+                            "[mooncake-store] [{runtime}] CRITICAL: heartbeat failing for {since_last_success_ms}ms \
+                             (>= lease TTL {lease_ttl_ms}ms), lease may have expired. \
+                             failures={consecutive_failures}, last error: {error}"
+                        );
+                    } else if consecutive_failures == 3
+                        || (consecutive_failures > 3 && consecutive_failures % 10 == 0)
+                    {
+                        eprintln!(
+                            "[mooncake-store] [{runtime}] WARNING: heartbeat failed {consecutive_failures} times \
+                             ({since_last_success_ms}ms since last success), error: {error}"
+                        );
+                    }
                     next_heartbeat = now_ms.saturating_add(retry_after_ms);
                 }
             }
