@@ -491,8 +491,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     for (size_t i = 0; i < staging_entries.size(); ++i) {
         const auto& entry = staging_entries[i];
         gpu_staging::SetDevice(entry.device_id);
-        if (!gpu_staging::CopyHostToDevice(entry.original_ptr,
-                                           entry.host_ptr,
+        if (!gpu_staging::CopyHostToDevice(entry.original_ptr, entry.host_ptr,
                                            entry.size)) {
             LOG(ERROR) << "H2D copy failed for path: " << path;
             for (size_t j = i; j < staging_entries.size(); ++j) {
