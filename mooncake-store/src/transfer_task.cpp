@@ -778,6 +778,35 @@ TransferStrategy TransferSubmitter::selectStrategy(
     return TransferStrategy::TRANSFER_ENGINE;
 }
 
+namespace {
+// Helper function to extract IP address from endpoint string (ip:port format).
+// Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats.
+std::string extractIpAddress(const std::string& endpoint) {
+    if (endpoint.empty()) {
+        return "";
+    }
+
+    // Handle IPv6 format: [ipv6]:port
+    if (endpoint[0] == '[') {
+        size_t closing_bracket = endpoint.find(']');
+        if (closing_bracket == std::string::npos) {
+            LOG(WARNING) << "Invalid IPv6 endpoint format: " << endpoint;
+            return "";
+        }
+        return endpoint.substr(1, closing_bracket - 1);
+    }
+
+    // Handle IPv4 or hostname:port format.
+    size_t colon_pos = endpoint.rfind(':');
+    if (colon_pos != std::string::npos) {
+        return endpoint.substr(0, colon_pos);
+    }
+
+    // No colon found, return the whole string (might be just IP or hostname).
+    return endpoint;
+}
+}  // namespace
+
 bool TransferSubmitter::isSameProcessEndpoint(
     const std::string& handle_endpoint, const std::string& local_endpoint) {
     // Local memcpy requires that handle.buffer_address_ is a virtual address
@@ -789,7 +818,19 @@ bool TransferSubmitter::isSameProcessEndpoint(
     if (handle_endpoint.empty() || local_endpoint.empty()) {
         return false;
     }
-    return handle_endpoint == local_endpoint;
+    if (handle_endpoint == local_endpoint) {
+        return true;
+    }
+
+    const std::string handle_ip = extractIpAddress(handle_endpoint);
+    const std::string local_ip = extractIpAddress(local_endpoint);
+    if (!handle_ip.empty() && handle_ip == local_ip) {
+        VLOG(2) << "Disabling local memcpy for same-host endpoints with "
+                   "different process endpoints: handle="
+                << handle_endpoint << ", local=" << local_endpoint;
+    }
+
+    return false;
 }
 
 bool TransferSubmitter::isLocalTransfer(
