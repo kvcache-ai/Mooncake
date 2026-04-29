@@ -133,10 +133,21 @@ membership snapshot, and retries placement when the request is not pinned to a h
 segment. This keeps transient storage-owner transport failures from escaping into Python backup
 threads as fatal exceptions.
 
-Remote transfer planning splits each request at both local registration limits and remote segment
-buffer boundaries. The route still records one logical replica, but the transport only receives
-slices that fit inside one registered target buffer, matching classic RDMA transfer-engine
-requirements when a segment is backed by multiple contiguous registrations.
+Remote transfer planning splits each request at both local registration limits and the storage
+target chunks published in the target segment announcement. The route still records one logical
+replica, but the transport only receives slices that fit inside one registered storage target
+chunk, matching classic RDMA transfer-engine requirements when a segment is backed by multiple
+contiguous registrations.
+
+Replica routes keep two separate coordinates. `ReplicaRoute::offset` is the actual transport
+target address used by TE/TENT and is the byte location of the stored payload in the segment
+storage target map. `segment_offset` belongs to the local allocator and reclaim path. Segment
+announcements publish the exact `logical_offset -> target_offset` storage chunks derived during
+local registration; writers use those chunks as the only allocator-to-transport mapping source.
+Scratch buffers are registered for staging only and are never published as object-addressable
+storage. Local direct reads, batch reads, and drain migration translate `offset` through the
+selected segment's storage target map before copying from local storage, so local and remote reads
+observe the same bytes even when the transport target coordinate is not the process virtual address.
 
 ```mermaid
 sequenceDiagram
@@ -187,6 +198,7 @@ This lets each storage owner update its local eviction clock from the published 
 ## Read Path
 
 For reads, the client first resolves the object route, then groups reads by remote segment and submits transfer requests through TE/TENT.
+When the selected replica is local, the client still resolves the same `ReplicaRoute::offset` target coordinate that remote TE reads use, then maps that coordinate back to the local storage registration.
 
 ```mermaid
 sequenceDiagram

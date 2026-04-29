@@ -494,6 +494,7 @@ impl SegmentAllocator {
         self.announcement.owner = next.owner.clone();
         self.announcement.segment_name = next.segment_name.clone();
         self.announcement.capacity_bytes = next.capacity_bytes;
+        self.announcement.target_chunks = next.target_chunks.clone();
         self.announcement.tags = next.tags.clone();
         self.announcement.state = next.state;
         self.announcement.alignment_bytes = next.alignment_bytes.max(1);
@@ -690,6 +691,7 @@ enum WriteMode {
 struct ReplicaWriteTarget {
     storage_runtime: ClientRuntimeId,
     segment_name: SegmentName,
+    target_chunks: Vec<mooncake_store_core::SegmentTargetChunk>,
 }
 
 struct PreparedObjectWrite<'a> {

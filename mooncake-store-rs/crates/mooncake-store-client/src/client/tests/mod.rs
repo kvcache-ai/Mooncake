@@ -12,7 +12,7 @@ use mooncake_store_core::{
     ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
     NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
+    SegmentTargetChunk, StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
     TenantObjectAccounting, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
     TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy,
     TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, encode_lifecycle_state, flatten_slices, now_ms,
-    record_success_metric, resolve_effective_route_policy, scatter_into_buffers,
+    payload_checksum, record_success_metric, resolve_effective_route_policy, scatter_into_buffers,
     shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan, LiveClientCache,
     LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
     ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
@@ -2322,6 +2322,20 @@ fn publish_labeled_storage_node_with_capacity(
     runtime
 }
 
+fn test_segment_target_chunks(
+    transport: &TestTransport,
+    segment_name: &str,
+) -> Vec<SegmentTargetChunk> {
+    let (base, len) = transport
+        .segment_bounds(segment_name)
+        .expect("test transport segment should expose target bounds");
+    vec![SegmentTargetChunk {
+        logical_offset: 0,
+        target_offset: base,
+        length_bytes: len,
+    }]
+}
+
 fn test_storage_nodes() -> &'static Mutex<Vec<Arc<StoreClient>>> {
     static STORAGE_NODES: OnceLock<Mutex<Vec<Arc<StoreClient>>>> = OnceLock::new();
     STORAGE_NODES.get_or_init(|| Mutex::new(Vec::new()))
@@ -3638,6 +3652,8 @@ fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
         .routed_writes(planner, 2)
         .build(test_future_expiry_ms())
         .expect("client build should succeed");
+    wait_for_runtime_visibility(&client, &owner_a);
+    wait_for_runtime_visibility(&client, &owner_b);
 
     let payload = b"routed-payload";
     let routes = client
@@ -8400,6 +8416,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
     let transport = Arc::new(TestTransport::new("writer-prefer-segment"));
     let remote_transport = Arc::new(transport.peer("seg-prefer"));
     remote_transport.add_external_segment("seg-prefer", 8);
+    let remote_target_chunks = test_segment_target_chunks(&remote_transport, "seg-prefer");
     let remote_owner = ClientRuntimeId::new("storage-prefer", ClientEpoch(1));
     let remote_allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
     remote_allocator.lock().upsert(&SegmentAnnouncement {
@@ -8407,6 +8424,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         segment_name: SegmentName::new("seg-prefer"),
         capacity_bytes: 8,
         used_bytes: 0,
+        target_chunks: remote_target_chunks.clone(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 1,
         tags: vec!["dram".to_string()],
@@ -8457,6 +8475,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
             segment_name: SegmentName::new("seg-prefer"),
             capacity_bytes: 8,
             used_bytes: 0,
+            target_chunks: remote_target_chunks,
             state: SegmentLifecycleState::Active,
             alignment_bytes: 1,
             tags: vec!["dram".to_string()],
@@ -11244,6 +11263,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             &[ReplicaWriteTarget {
                 storage_runtime: client.runtime_id().clone(),
                 segment_name: primary.clone(),
+                target_chunks: Vec::new(),
             }],
             std::slice::from_ref(&reservation),
         )
@@ -11253,6 +11273,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             &[ReplicaWriteTarget {
                 storage_runtime: client.runtime_id().clone(),
                 segment_name: primary,
+                target_chunks: Vec::new(),
             }],
             &[],
         ),
@@ -11349,12 +11370,12 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .expect("true client shrink should succeed");
     assert_eq!(migrated, owned_keys.len());
     assert_eq!(store_a.lease().state, ClientLifecycleState::Draining);
+    let remaining_segments = store_a
+        .list_segments()
+        .expect("segment listing should succeed");
     assert!(
-        store_a
-            .list_segments()
-            .expect("segment listing should succeed")
-            .is_empty(),
-        "all drained local segments should retire after shrink"
+        remaining_segments.is_empty(),
+        "all drained local segments should retire after shrink: {remaining_segments:?}"
     );
 
     for key in owned_keys {
@@ -11658,6 +11679,87 @@ fn remote_put_refreshes_cached_segment_handle_after_restart() {
             .get("restart-write-key-2")
             .expect("reader should see post-restart data"),
         b"after-restart"
+    );
+}
+
+#[test]
+fn local_read_prefers_replica_target_offset_over_segment_offset() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("local-target-offset-segment"));
+    let store = StoreClientBuilder::new(metadata, "local-target-offset-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(256))
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    let segment = store.segment_name().expect("store segment should exist");
+    let key = "local-target-offset-key";
+    let payload = b"target-offset-payload";
+    let distractor = b"wrong-offset-payload!";
+    assert_eq!(payload.len(), distractor.len());
+
+    let base = {
+        let state = store.state.lock();
+        state
+            .memory_ref()
+            .expect("memory should exist")
+            .storage_address(&segment, 0)
+            .expect("segment base should resolve")
+    };
+    let target_offset = 64usize;
+    unsafe {
+        ptr::copy_nonoverlapping(distractor.as_ptr(), base.cast::<u8>(), distractor.len());
+        ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            base.cast::<u8>().add(target_offset),
+            payload.len(),
+        );
+    }
+
+    let object_id = LogicalObjectId::new(NamespaceScope::default(), key);
+    let mut route = ObjectRoute {
+        key: ObjectKey::from_logical_id(&object_id),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: store.lease.compatibility.clone(),
+        replicas: vec![ReplicaRoute {
+            owner: store.runtime_id().clone(),
+            segment_name: segment,
+            offset: base as u64 + target_offset as u64,
+            segment_offset: 0,
+            length: payload.len() as u64,
+            checksum: Some(payload_checksum(payload)),
+            tier: mooncake_store_core::ReplicaTier::Dram,
+            priority: 0,
+        }],
+    };
+    mooncake_store_core::apply_route_identity(&mut route, &object_id);
+    store
+        .route_directory
+        .compare_and_swap_object_route(&store.lease, &route.key, None, Some(&route))
+        .expect("route publish should succeed");
+
+    assert_eq!(
+        store.get(key).expect("local get should use target offset"),
+        payload
+    );
+    assert_eq!(
+        store
+            .batch_get(&[ObjectRef::new(key)])
+            .expect("local batch get should use target offset"),
+        vec![payload.to_vec()]
     );
 }
 
@@ -12956,6 +13058,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         segment_name: SegmentName::new("alloc-primary"),
         capacity_bytes: 128,
         used_bytes: 0,
+        target_chunks: Vec::new(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 16,
         tags: vec!["dram".to_string()],
@@ -13030,6 +13133,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         .expect("release should succeed");
     let next_announcement = SegmentAnnouncement {
         used_bytes: 64,
+        target_chunks: Vec::new(),
         alignment_bytes: 1,
         state: SegmentLifecycleState::Active,
         tags: vec!["nvme".to_string()],
@@ -13245,6 +13349,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         segment_name: SegmentName::new("pending-primary"),
         capacity_bytes: 128,
         used_bytes: 0,
+        target_chunks: Vec::new(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 16,
         tags: vec!["dram".to_string()],
