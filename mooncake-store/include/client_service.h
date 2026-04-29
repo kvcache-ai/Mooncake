@@ -24,6 +24,7 @@
 #include "master_metric_manager.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
+#include "pinned_buffer_pool.h"
 
 namespace mooncake {
 
@@ -295,6 +296,20 @@ class Client {
                                                  size_t size);
 
     /**
+     * @brief Mounts a memory segment and returns its generated Segment UUID.
+     *        Logic is identical to MountSegment, but returns the segment id.
+     */
+    tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
+
+    /**
+     * @brief Unmounts a segment by its UUID.
+     *        Logic is identical to UnmountSegment, but looks up by id.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentById(const UUID& segment_id);
+
+    /**
      * @brief Registers memory buffer with TransferEngine for data transfer
      * @param addr Memory address to register
      * @param length Size of the memory region
@@ -444,6 +459,15 @@ class Client {
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats() {
         return master_client_.CalcCacheStats();
+    }
+
+    void ObserveTransferOperation(TransferOperationKind kind,
+                                  const std::string& op_name, uint64_t bytes,
+                                  uint64_t latency_us) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveTransferOperation(kind, op_name, bytes,
+                                               latency_us);
+        }
     }
 
     // For Prometheus-style metrics
@@ -656,12 +680,22 @@ class Client {
     std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
+    /**
+     * @brief Internal helper to unmount a segment by iterator.
+     *        Caller must hold mounted_segments_mutex_.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentImpl(
+        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
     const std::string protocol_;
 
     // Client persistent thread pool for async operations
+    // Pinned host memory pool for GPU D2H staging (must outlive
+    // write_thread_pool_)
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
 

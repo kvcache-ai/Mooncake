@@ -114,6 +114,8 @@ design/transfer-engine/index
 design/tent/overview
 design/tent/tebench
 design/hicache-design
+design/conductor/conductor-architecture-design
+design/conductor/indexer-api-design
 :::
 
 % Q&A for Mooncake

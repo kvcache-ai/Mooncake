@@ -2,11 +2,14 @@
 
 #include <atomic>
 #include <csignal>
+#include <mutex>
+#include <unordered_map>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "pyclient.h"
 #include "real_client.h"
 #include "shm_helper.h"
+#include "client_metric.h"
 #include <memory>
 
 namespace mooncake {
@@ -178,6 +181,15 @@ class DummyClient : public PyClient {
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
 
+#if defined(USE_ASCEND_DIRECT)
+    int register_device_buffer_for_reconnect(void *buffer, size_t size);
+
+    int unregister_device_buffer_for_reconnect(void *buffer);
+
+    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
+    get_registered_device_buffers() const;
+#endif
+
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -202,6 +214,22 @@ class DummyClient : public PyClient {
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args &&...args);
+
+    template <auto ServiceMethod, typename... Args>
+    int invoke_observed_void_rpc(TransferOperationKind kind,
+                                 const char *op_name, size_t bytes, bool batch,
+                                 Args &&...args) {
+        auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
+            [&]() {
+                return invoke_rpc<ServiceMethod, void>(
+                    std::forward<Args>(args)...);
+            },
+            [](const auto &ret) { return ret.has_value(); },
+            [&](uint64_t latency_us, const auto &) {
+                ObserveTransferMetric(kind, op_name, bytes, latency_us, batch);
+            });
+        return to_py_ret(result);
+    }
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client
@@ -259,8 +287,18 @@ class DummyClient : public PyClient {
     void ping_thread_main();
     std::atomic<bool> connected_{false};
 
+#if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex registered_device_buffers_mutex_;
+    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+#endif
+
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
     int32_t device_id_ = 0;
+
+    std::unique_ptr<ClientMetric> metrics_;
+
+    void ObserveTransferMetric(TransferOperationKind kind, const char *op_name,
+                               size_t bytes, uint64_t latency_us, bool batch);
 };
 
 }  // namespace mooncake

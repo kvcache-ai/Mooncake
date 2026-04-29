@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -90,6 +91,13 @@ class RdmaContext {
     int registerMemoryRegionInternal(void *addr, size_t length, int access,
                                      MemoryRegionMeta &mrMeta);
 
+    using MemoryRegionMap = std::map<uintptr_t, MemoryRegionMeta>;
+
+    MemoryRegionMap::iterator findMemoryRegionContaining(uintptr_t addr);
+
+    MemoryRegionMap::const_iterator findMemoryRegionContaining(
+        uintptr_t addr) const;
+
    public:
     bool active() const { return active_; }
 
@@ -99,7 +107,25 @@ class RdmaContext {
     // EndPoint Management
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
 
+    std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr);
+
     int deleteEndpoint(const std::string &peer_nic_path);
+
+    // Drain the endpoint store's waiting list. Safe to call on any thread;
+    // intended to be invoked periodically from monitorWorker so reclaim is
+    // not gated on new endpoint insertions (which can stall under failure
+    // load while evictions/deletions continue). See issue #1845.
+    void reclaimEndpoints();
+
+    // Number of endpoints awaiting reclaim. For tests and operator
+    // observability.
+    size_t waitingListSize() const;
+
+    // Test-only: push a pre-constructed endpoint into the store's
+    // waiting_list_ so the reclaim path can be exercised without standing up
+    // a real RDMA QP.
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep);
 
     int disconnectAllEndpoints();
 
@@ -184,7 +210,7 @@ class RdmaContext {
     ibv_gid gid_;
 
     RWSpinlock memory_regions_lock_;
-    std::vector<struct MemoryRegionMeta> memory_region_list_;
+    MemoryRegionMap memory_region_map_;
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;

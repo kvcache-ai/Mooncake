@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <vector>
 #include <string>
 #include <thread>
 #include <csignal>
@@ -35,17 +37,44 @@ class InProcMaster {
             int needed = (!config.rpc_port.has_value()) +
                          (!config.http_metrics_port.has_value()) +
                          (!config.http_metadata_port.has_value());
-            auto free_ports = getFreeTcpPorts(needed);
-            if (static_cast<int>(free_ports.size()) < needed) return false;
+            std::vector<int> available_ports;
+            if (needed > 0) {
+                std::vector<int> reserved_ports;
+                if (config.rpc_port.has_value()) {
+                    reserved_ports.push_back(config.rpc_port.value());
+                }
+                if (config.http_metrics_port.has_value()) {
+                    reserved_ports.push_back(config.http_metrics_port.value());
+                }
+                if (config.http_metadata_port.has_value()) {
+                    reserved_ports.push_back(config.http_metadata_port.value());
+                }
+                auto free_ports = getFreeTcpPorts(
+                    needed + static_cast<int>(reserved_ports.size()));
+                available_ports.reserve(needed);
+                for (int port : free_ports) {
+                    if (std::find(reserved_ports.begin(), reserved_ports.end(),
+                                  port) == reserved_ports.end()) {
+                        available_ports.push_back(port);
+                        if (static_cast<int>(available_ports.size()) ==
+                            needed) {
+                            break;
+                        }
+                    }
+                }
+                if (static_cast<int>(available_ports.size()) < needed) {
+                    return false;
+                }
+            }
             int idx = 0;
             rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
-                                                    : free_ports[idx++];
+                                                    : available_ports[idx++];
             http_metrics_port_ = config.http_metrics_port.has_value()
                                      ? config.http_metrics_port.value()
-                                     : free_ports[idx++];
+                                     : available_ports[idx++];
             http_metadata_port_ = config.http_metadata_port.has_value()
                                       ? config.http_metadata_port.value()
-                                      : free_ports[idx++];
+                                      : available_ports[idx++];
 
             // Optional HTTP metadata server
             if (http_metadata_port_ > 0) {

@@ -105,6 +105,8 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        const char *ip_or_host_name,
                                        uint64_t rpc_port, int auto_discover);
 
+int discoverTopology(transfer_engine_t engine);
+
 int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len);
 
 transport_t installTransport(transfer_engine_t engine, const char *proto,
@@ -118,6 +120,11 @@ segment_id_t openSegmentNoCache(transfer_engine_t engine,
                                 const char *segment_name);
 
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id);
+
+// Eagerly pre-connect all EFA endpoints to `segment_name`. Eliminates the
+// first-batch fi_av_insert stall (observed ~6 s for 16 local NICs × N peer
+// NICs). No-op on non-EFA installs. Idempotent. Returns 0 on success.
+int warmupEfaSegment(transfer_engine_t engine, const char *segment_name);
 
 int removeLocalSegment(transfer_engine_t engine, const char *segment_name);
 

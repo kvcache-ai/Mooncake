@@ -19,6 +19,9 @@
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_transport.h"
+#endif
 
 using namespace mooncake;
 
@@ -34,6 +37,11 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
         return nullptr;
     }
     return (transfer_engine_t)native;
+}
+
+int discoverTopology(transfer_engine_t engine) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return native->getLocalTopology()->discover({});
 }
 
 int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len) {
@@ -75,6 +83,21 @@ segment_id_t openSegmentNoCache(transfer_engine_t engine,
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->closeSegment(segment_id);
+}
+
+int warmupEfaSegment(transfer_engine_t engine, const char *segment_name) {
+#ifdef USE_EFA
+    TransferEngine *native = (TransferEngine *)engine;
+    auto *t = native->getTransport("efa");
+    if (!t) return 0;  // Non-EFA build or EFA not installed; nothing to do.
+    auto *efa = dynamic_cast<EfaTransport *>(t);
+    if (!efa) return 0;
+    return efa->warmupSegment(segment_name ? segment_name : "");
+#else
+    (void)engine;
+    (void)segment_name;
+    return 0;
+#endif
 }
 
 int removeLocalSegment(transfer_engine_t engine, const char *segment_name) {

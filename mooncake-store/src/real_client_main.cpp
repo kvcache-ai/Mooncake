@@ -91,6 +91,10 @@ int main(int argc, char *argv[]) {
     mooncake::ResourceTracker::getInstance();
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    if (!FLAGS_log_dir.empty()) {
+        google::InitGoogleLogging(argv[0]);
+    }
+
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.

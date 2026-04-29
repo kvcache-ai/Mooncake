@@ -79,9 +79,10 @@ enum TransportType {
     IOURING,
     TCP,
     AscendDirect,
+    SUNRISE_LINK,
     UNSPEC
 };
-const static int kSupportedTransportTypes = 8;
+const static int kSupportedTransportTypes = (int)TransportType::UNSPEC;
 
 struct MemoryOptions {
     Location location = kWildcardLocation;

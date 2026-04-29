@@ -40,6 +40,7 @@ struct NVLinkTask {
     uint64_t target_addr = 0;
     bool is_cuda_ipc;
     int cuda_id = 0;
+    cudaEvent_t completion_event = nullptr;
 };
 
 struct NVLinkSubBatch : public Transport::SubBatch {
@@ -81,7 +82,7 @@ class NVLinkTransport : public Transport {
     virtual const char *getName() const { return "nvlink"; }
 
    private:
-    void startTransfer(NVLinkTask *task, NVLinkSubBatch *batch);
+    void startTransfer(std::vector<NVLinkTask *> &tasks, NVLinkSubBatch *batch);
 
     void *createSharedMemory(const std::string &path, size_t size);
 

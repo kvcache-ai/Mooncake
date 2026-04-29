@@ -24,7 +24,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <queue>
 #include <string>
 #include <vector>
 
@@ -37,34 +36,36 @@ namespace mooncake {
 
 class EfaContext;
 
-// Custom context for libfabric operations - stores slice pointer for completion
-// handling This struct MUST have fi_context as its first member
+// Custom context for libfabric operations - stores slice pointer for
+// completion handling.  This struct MUST have fi_context as its first member.
 struct EfaOpContext {
     struct fi_context fi_ctx;  // Must be first member
     Transport::Slice* slice;   // Slice pointer for completion handling
-    volatile int* wr_depth;    // Pointer to endpoint's wr_depth_ for CQ
-                               // completion decrement
+    // Pointer to the context's wr_depth_ for CQ completion decrement.
+    // std::atomic<int> (not volatile int) so the CQ-poller decrement
+    // and the submit-path fetch_add play by the C++ memory model.
+    std::atomic<int>* wr_depth;
 };
 
-// EfaEndPoint represents a libfabric endpoint for EFA communication.
-// Unlike RDMA QPs, EFA uses RDM (Reliable Datagram) endpoints with
-// an address vector for peer addressing.
+// Per-peer handle in the shared-endpoint SRD model.
+//
+// This class does NOT own an fid_ep.  A single `shared_ep_` on the owning
+// EfaContext services every peer; each EfaEndPoint just carries one
+// fi_addr_t (AV index) plus the handshake state needed to populate it.
+//
+// Lifecycle:
+//   1. construct()            : trivial; no libfabric resources allocated.
+//   2. setupConnectionsByActive(peer): handshake -> fi_av_insert -> CONNECTED.
+//   3. submitPostSend()       : delegates to EfaContext::submitSlicesOnPeer.
+//   4. disconnect() / dtor    : fi_av_remove(peer_fi_addr_).
 class EfaEndPoint {
    public:
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
     enum Status { INITIALIZING, UNCONNECTED, CONNECTED };
 
-    EfaEndPoint(EfaContext& context);
+    explicit EfaEndPoint(EfaContext& context);
     ~EfaEndPoint();
-
-    // Construct endpoint with specified completion queue
-    int construct(struct fid_cq* cq, volatile int* cq_outstanding,
-                  size_t num_qp_list = 1, size_t max_sge = 4,
-                  size_t max_wr = 256, size_t max_inline = 64);
-
-   private:
-    int deconstruct();
 
    public:
     void setPeerNicPath(const std::string& peer_nic_path);
@@ -79,34 +80,22 @@ class EfaEndPoint {
     int setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                   HandShakeDesc& local_desc);
 
-    bool hasOutstandingSlice() const;
+    // Always false under the shared-endpoint model: outstanding work is
+    // tracked at the context (shared) level, not per-peer.  Retained for
+    // API compatibility with callers that still ask.
+    bool hasOutstandingSlice() const { return false; }
 
-    bool active() const { return active_; }
-
-    void set_active(bool flag) {
-        RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag;
-        if (!flag) inactive_time_ = getCurrentTimeInNano();
-    }
-
-    double inactiveTime() {
-        if (active_) return 0.0;
-        return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
-    }
-
-    void touchLastUsed() { last_used_time_ = getCurrentTimeInNano(); }
-
-    double lastUsedAge() const {
-        return (getCurrentTimeInNano() - last_used_time_) / 1000000000.0;
-    }
-
-   public:
     bool connected() const {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
     void disconnect();
-    int destroyQP();
+
+    // Called during EfaContext teardown: forget the AV slot WITHOUT calling
+    // fi_av_remove().  The AV itself is about to be closed, which invalidates
+    // every slot in one shot; calling fi_av_remove after the shared endpoint
+    // has been closed trips an assertion inside the EFA provider.
+    void markDetachedForTeardown();
 
    private:
     void disconnectUnlocked();
@@ -114,57 +103,27 @@ class EfaEndPoint {
    public:
     const std::string toString() const;
 
-    // Submit RDMA write/read operations via libfabric
+    // Submit a batch of slices bound for this peer.  Internally establishes
+    // the connection if needed, then delegates to
+    // EfaContext::submitSlicesOnPeer using this peer's fi_addr_t.
     int submitPostSend(std::vector<Transport::Slice*>& slice_list,
                        std::vector<Transport::Slice*>& failed_slice_list);
 
-    // Get the number of endpoints (always 1 for EFA RDM)
+    // Always 1: the shared endpoint backs every peer.  Kept so callers that
+    // sum "QP count" across endpoints don't break.
     size_t getQPNumber() const { return 1; }
 
-    // Get local endpoint address for handshake
-    std::string getLocalAddr() const;
-
-    // Get peer's fi_addr
     fi_addr_t getPeerFiAddr() const { return peer_fi_addr_; }
 
     EfaContext& context() { return context_; }
 
    private:
-    // Setup connection using peer's address from handshake
-    int doSetupConnection(const std::string& peer_addr,
-                          std::string* reply_msg = nullptr);
-
-    // Insert peer address into address vector
-    int insertPeerAddr(const std::string& peer_addr);
-
-   private:
     EfaContext& context_;
     std::atomic<Status> status_;
 
-    RWSpinlock lock_;
+    RWSpinlock lock_;  // protects peer_nic_path_ and status_
     std::string peer_nic_path_;
-
-    // Libfabric endpoint
-    struct fid_ep* ep_;
-    struct fid_cq* tx_cq_;
-    struct fid_cq* rx_cq_;
-    fi_addr_t peer_fi_addr_;  // Peer's address in the AV
-
-    // Local endpoint address (for handshake)
-    std::vector<uint8_t> local_addr_;
-    size_t local_addr_len_;
-
-    volatile int wr_depth_;
-    int max_wr_depth_;
-    volatile int* cq_outstanding_;
-
-    // Spinlock to serialize fi_write/fi_read calls on this endpoint.
-    // libfabric RDM endpoints are not thread-safe by default.
-    std::atomic_flag post_lock_ = ATOMIC_FLAG_INIT;
-
-    volatile bool active_;
-    volatile uint64_t inactive_time_;
-    volatile uint64_t last_used_time_;  // Updated on connection and I/O
+    fi_addr_t peer_fi_addr_;  // slot in context_.av()
 };
 
 }  // namespace mooncake

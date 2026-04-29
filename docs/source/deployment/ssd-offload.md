@@ -88,10 +88,11 @@ store.setup(
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
+| `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval for offload heartbeat to master (seconds) |
-| `MOONCAKE_USE_URING` | `false` | Enable io_uring for async file I/O |
+| `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
 
 ### Bucket backend settings
 
@@ -101,8 +102,8 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 |---|---|---|
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
-| `MOONCAKE_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
-| `MOONCAKE_BUCKET_EVICTION_POLICY` | `none` | Eviction policy: `none` / `fifo` / `lru` |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
+| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `none` | Eviction policy: `none` / `fifo` / `lru` |
 
 ---
 
@@ -127,6 +128,11 @@ Best for: general-purpose use, large-scale deployments.
 
 Stores each object in an individual file. Simple and easy to inspect, but generates many small files at scale.
 
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` where objects are stored |
+| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enable disk eviction when the total size exceeds the quota |
+
 Best for: debugging or small-scale deployments.
 
 ### `offset_allocator_storage_backend`
@@ -143,7 +149,7 @@ Best for: high-concurrency scenarios with many small objects where restart durab
 
 ## Eviction (Bucket Backend Only)
 
-When `MOONCAKE_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit.
+When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit.
 
 | Policy | Behavior |
 |--------|----------|
@@ -178,8 +184,8 @@ mooncake_master \
 ```bash
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
-export MOONCAKE_BUCKET_MAX_TOTAL_SIZE=$((200 * 1024 * 1024 * 1024))  # 200 GB
-export MOONCAKE_BUCKET_EVICTION_POLICY=lru
+export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((200 * 1024 * 1024 * 1024))  # 200 GB
+export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
 
 mooncake_client \
     --master_server_address="192.168.1.10:50051" \
@@ -250,7 +256,7 @@ mooncake_client \
 
 ### "Failed to register buffer with UringFile" warning in logs
 
-This warning appears when `MOONCAKE_USE_URING=true` and the io_uring fixed-buffer registration fails. The most common cause is that `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` exceeds the process's locked-memory limit (`RLIMIT_MEMLOCK`). io_uring requires the registered buffer to be pinned in physical memory, which counts against this limit.
+This warning appears when `MOONCAKE_OFFLOAD_USE_URING=true` and the io_uring fixed-buffer registration fails. The most common cause is that `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` exceeds the process's locked-memory limit (`RLIMIT_MEMLOCK`). io_uring requires the registered buffer to be pinned in physical memory, which counts against this limit.
 
 Check the current limit:
 

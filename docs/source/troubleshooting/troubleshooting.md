@@ -110,9 +110,10 @@ Errors in this part usually indicate that the error occurred within the `mooncak
      *    hard    memlock    unlimited
      ```
 
-7. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
+7. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. Possible ways to resolve this issue:
    - Update Mooncake to version v0.3.5 or later
    - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
+   - If the leak persists under sustained peer failures (many `endpoint evicted` log lines accompanying the QP growth), update to a version that includes the fix for [issue #1845](https://github.com/kvcache-ai/Mooncake/issues/1845). Prior to that fix, the endpoint store's `waiting_list_` only drained when new endpoints were inserted, so evictions under failure load accumulated QPs until the driver limit was hit. The fix adds a periodic reclaim tick to `monitorWorker`.
 
 ## RDMA Transfer Period
 ### Recommended Troubleshooting Directions
@@ -122,6 +123,49 @@ If the network state is unstable, some requests may not be delivered, displaying
 Note: In most cases, the errors output, except for the first occurrence, are `work request flushed error`. This is because when the first error occurs, the RDMA driver sets the connection to an unavailable state, so tasks in the submission queue are blocked from execution and subsequent errors are reported. Therefore, it is recommended to locate the first occurrence of the error and check it.
 
 In addition, if the error `Failed to get description of XXX` is displayed, it indicates that the Segment name input by the user when calling the `openSegment` interface cannot be found in the etcd database. For memory read/write scenarios, the Segment name needs to strictly match the `local_hostname` field filled in by the other node during initialization.
+
+## TCP Transport
+### Recommended Troubleshooting Directions
+
+1. If sustained, high-concurrency TCP traffic (for example, PD-disaggregated KV transfers over the TCP transport) fails with `connect: Cannot assign requested address`, the initiator side has exhausted its ephemeral port range. Each transfer opens a fresh short-lived socket, and ports held in `TIME_WAIT` accumulate faster than the kernel can reclaim them.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Confirm large numbers of TIME_WAIT sockets to the peer
+   ss -tan state time-wait | wc -l
+
+   # Check the local ephemeral port range
+   sysctl net.ipv4.ip_local_port_range
+   ```
+
+   **Solutions:**
+   - Enable the TCP connection pool so that long-lived sockets are reused across transfers instead of being opened per transfer:
+     ```bash
+     export MC_TCP_ENABLE_CONNECTION_POOL=1
+     ```
+   - Widen the ephemeral port range if the workload genuinely needs many distinct connections:
+     ```bash
+     sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+     ```
+   - As a last resort, enable `TIME_WAIT` reuse on the initiator. `tcp_tw_reuse` only affects outbound connections and requires TCP timestamps to be enabled on both sides:
+     ```bash
+     sysctl -w net.ipv4.tcp_tw_reuse=1
+     ```
+
+2. The TCP connection pool (`MC_TCP_ENABLE_CONNECTION_POOL=1`) has two known limitations in the current implementation. The pool is functional for most workloads, but operators running long-lived services should be aware of them:
+
+   * **Idle-expired connections are not always reclaimed.** `cleanupIdleConnections()` only inspects the tail of each endpoint's deque. When a newer `in_use` entry has been pushed behind an older idle-expired entry, the loop terminates at the tail and the idle entry is never removed. The pool's reported state diverges from reality: it still lists the connection as idle while the socket has been sitting past `kConnectionIdleTimeout`, may have been half-closed by the peer, and will fail on the next `getConnection()` that tries to reuse it. In long-running services this also leaks sockets and file descriptors until the process is restarted.
+
+     **Diagnostic Commands:**
+     ```bash
+     # Watch for unbounded growth of open sockets from the process
+     ls /proc/$PID/fd | wc -l
+     ss -tan | awk '$1=="ESTAB"' | wc -l
+     ```
+
+     **Workaround:** restart the process periodically if fd usage climbs without bound.
+
+   * **`asio::socket::close()` runs under `pool_mutex_`.** `close()` cancels outstanding async operations and posts completion handlers to the io_context. Handlers such as `returnConnection()` also acquire `pool_mutex_`, so the current code is one scheduling step away from a circular wait. No deadlock has been observed in practice, but if the transfer engine hangs with all worker threads stuck waiting on `pool_mutex_`, this is the first place to look.
 
 ## SGLang Common Questions
 

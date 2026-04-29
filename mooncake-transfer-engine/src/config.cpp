@@ -67,6 +67,24 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_GID_INDEX";
     }
 
+    const char* pkey_index_env = std::getenv("MC_PKEY_INDEX");
+    if (pkey_index_env) {
+        try {
+            int val = std::stoi(pkey_index_env);
+            if (val >= 0 && val <= UINT16_MAX) {
+                config.pkey_index = static_cast<uint16_t>(val);
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_PKEY_INDEX, "
+                    << "value " << pkey_index_env
+                    << " out of range (should be 0-65535)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_PKEY_INDEX environment value: "
+                         << pkey_index_env << ". Error: " << e.what();
+        }
+    }
+
     const char* max_cqe_per_ctx_env = std::getenv("MC_MAX_CQE_PER_CTX");
     if (max_cqe_per_ctx_env) {
         size_t val = atoi(max_cqe_per_ctx_env);
@@ -193,16 +211,6 @@ void loadGlobalConfig(GlobalConfig& config) {
             LOG(WARNING)
                 << "Ignore value from environment variable MC_MAX_MR_SIZE";
         }
-    }
-
-    const char* efa_striping_env = std::getenv("MC_EFA_STRIPING_THRESHOLD");
-    if (efa_striping_env) {
-        size_t val = strtoull(efa_striping_env, nullptr, 10);
-        if (val > 0)
-            config.efa_striping_threshold = val;
-        else
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_EFA_STRIPING_THRESHOLD";
     }
 
     const char* retry_cnt_env = std::getenv("MC_RETRY_CNT");
@@ -409,6 +417,7 @@ void dumpGlobalConfig() {
               << config.num_comp_channels_per_ctx;
     LOG(INFO) << "port = " << config.port;
     LOG(INFO) << "gid_index = " << config.gid_index;
+    LOG(INFO) << "pkey_index = " << config.pkey_index;
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;

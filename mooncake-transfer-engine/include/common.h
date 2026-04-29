@@ -113,6 +113,10 @@ static inline int64_t getCurrentTimeInNano() {
     return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
 }
 
+static inline int64_t getCurrentTimeInMilli() {
+    return getCurrentTimeInNano() / 1000 / 1000;
+}
+
 static inline std::string getCurrentDateTime() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
@@ -327,9 +331,13 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
 }
 
 static inline ssize_t readFully(int fd, void *buf, size_t len) {
+    // Set a timeout for read to avoid hanging forever.
+    constexpr std::chrono::seconds kReadTimeout = std::chrono::seconds(300);
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + kReadTimeout;
     char *pos = (char *)buf;
     size_t nbytes = len;
-    while (nbytes) {
+    while (nbytes && std::chrono::steady_clock::now() < deadline) {
         ssize_t rc = read(fd, pos, nbytes);
         if (rc < 0 && (errno == EAGAIN || errno == EINTR))
             continue;
@@ -344,7 +352,14 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
         pos += rc;
         nbytes -= rc;
     }
-    return len;
+    if (nbytes != 0) {
+        LOG(WARNING) << "Socket read timed out, timeout: "
+                     << kReadTimeout.count()
+                     << ", deadline: " << deadline.time_since_epoch().count()
+                     << ", read " << len - nbytes << " out of " << len
+                     << " bytes";
+    }
+    return len - nbytes;
 }
 
 static inline int writeString(int fd, const HandShakeRequestType type,

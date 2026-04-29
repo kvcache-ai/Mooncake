@@ -150,6 +150,11 @@ class TransferEnginePy {
 
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
 
+    // Pre-connect every (local_ctx, peer_nic) pair for `segment_name` so the
+    // first submitTransfer does not stall on handshake RPC + fi_av_insert.
+    // No-op on non-EFA builds or when the EFA transport is not installed.
+    int warmupEfaSegment(const std::string &segment_name);
+
     int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr,
                            size_t length) {
         memcpy((void *)dest_address, (void *)src_ptr, length);

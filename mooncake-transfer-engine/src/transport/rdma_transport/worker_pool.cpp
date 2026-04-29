@@ -161,9 +161,8 @@ int WorkerPool::submitPostSend(
         slice_queue_lock_[shard_id].unlock();
     }
 
-    submitted_slice_count_.fetch_add(submitted_slice_count,
-                                     std::memory_order_relaxed);
-    if (suspended_flag_.load(std::memory_order_relaxed)) {
+    submitted_slice_count_.fetch_add(submitted_slice_count);
+    if (suspended_flag_.load()) {
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
     }
@@ -398,7 +397,7 @@ void WorkerPool::transferWorker(int thread_id) {
                 // Double-check condition after acquiring lock to avoid lost
                 // wakeup
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
-                    submitted_slice_count_.load(std::memory_order_relaxed)) {
+                    submitted_slice_count_.load()) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
                 suspended_flag_.fetch_sub(1);
@@ -415,19 +414,62 @@ void WorkerPool::transferWorker(int thread_id) {
 
 int WorkerPool::doProcessContextEvents() {
     ibv_async_event event;
+    bool event_acked = false;
     if (ibv_get_async_event(context_.context(), &event) < 0) return ERR_CONTEXT;
     LOG(WARNING) << "Worker: Received context async event "
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context_.deviceName();
     if (event.event_type == IBV_EVENT_QP_FATAL) {
-        auto endpoint = (RdmaEndPoint *)event.element.qp->qp_context;
-        endpoint->set_active(false);
+        auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
+
+        /**
+         * There might be a deadlock if we call endpoint->set_active(false)
+         * before ack the event:
+         *
+         * Thread A:
+         *     Holding endpoint->lock_ and calling ibv_destroy_qp (if using
+         * eRDMA), ibv_destroy_qp will block until the event is acked.
+         *
+         * Thread B (this thread):
+         *     Calling endpoint->set_active(false), which blocks as
+         * endpoint->lock_ is held by Thread A.
+         */
+        ibv_ack_async_event(&event);
+        event_acked = true;
+
+        /**
+         * After ack the event, the endpoint might be destroyed if it happened
+         * to be destroying event.element.qp. Therefore, we cannot just
+         * dereference endpoint_ptr. Instead, we need to get the shared_ptr of
+         * the endpoint from context_ and use that shared_ptr to access the
+         * endpoint.
+         */
+        auto endpoint = context_.getEndpointByPtr(endpoint_ptr);
+        if (endpoint) {
+            endpoint->set_active(false);
+        }
     } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
                event.event_type == IBV_EVENT_CQ_ERR ||
                event.event_type == IBV_EVENT_WQ_FATAL ||
                event.event_type == IBV_EVENT_PORT_ERR ||
                event.event_type == IBV_EVENT_LID_CHANGE) {
         context_.set_active(false);
+
+        /**
+         * Similar deadlock might happen if we call
+         * context_.disconnectAllEndpoints() before ack the event:
+         *
+         * Thread A:
+         *     Holding endpoint->lock_ and calling ibv_destroy_qp (if using
+         * eRDMA), ibv_destroy_qp will block until the event is acked.
+         *
+         * Thread B (this thread):
+         *     Calling endpoint->disconnect(), which blocks as endpoint->lock_
+         * is held by Thread A.
+         */
+        ibv_ack_async_event(&event);
+        event_acked = true;
+
         context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now inactive";
@@ -436,7 +478,11 @@ int WorkerPool::doProcessContextEvents() {
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now active";
     }
-    ibv_ack_async_event(&event);
+
+    if (!event_acked) {
+        ibv_ack_async_event(&event);
+    }
+
     return 0;
 }
 
@@ -447,6 +493,11 @@ void WorkerPool::monitorWorker() {
         auto current_ts = getCurrentTimeInNano();
         if (current_ts - last_reset_ts > 1000000000ll) {
             context_.set_active(true);
+            // Drain endpoint_store_->waiting_list_ even when no new
+            // insertions are happening. Without this, reclaim only runs
+            // from RdmaContext::endpoint() and the waiting list grows
+            // unboundedly under failure load. See issue #1845.
+            context_.reclaimEndpoints();
             last_reset_ts = current_ts;
         }
         struct epoll_event event;

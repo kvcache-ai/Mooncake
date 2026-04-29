@@ -3,6 +3,7 @@
 #include "client_service.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
+#include "pinned_buffer_pool.h"
 
 namespace mooncake {
 
@@ -105,6 +106,8 @@ class FileStorage {
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
+    // Pinned host memory pool for GPU D2H staging in OffloadObjects
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;

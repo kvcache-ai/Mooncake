@@ -106,6 +106,7 @@ Status NVLinkTransport::submitTransferTasks(
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
     if (request_list.size() + shm_batch->task_list.size() > shm_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+    std::vector<NVLinkTask*> new_tasks;
     for (auto& request : request_list) {
         shm_batch->task_list.push_back(NVLinkTask{});
         auto& task = shm_batch->task_list[shm_batch->task_list.size() - 1];
@@ -118,72 +119,83 @@ Status NVLinkTransport::submitTransferTasks(
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
-        startTransfer(&task, shm_batch);
+        new_tasks.push_back(&task);
     }
+    startTransfer(new_tasks, shm_batch);
     return Status::OK();
 }
 
-void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
+void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
+                                    NVLinkSubBatch* batch) {
+    if (tasks.empty()) return;
+
+    std::vector<void*> srcs;
+    std::vector<void*> dsts;
+    std::vector<size_t> sizes;
+    for (auto* task : tasks) {
+        void *src = nullptr, *dst = nullptr;
+        if (task->request.opcode == Request::READ) {
+            dst = task->request.source;      // read into source buffer
+            src = (void*)task->target_addr;  // from remote
+        } else {
+            src = task->request.source;      // write from source buffer
+            dst = (void*)task->target_addr;  // to remote
+        }
+        srcs.push_back(src);
+        dsts.push_back(dst);
+        sizes.push_back(task->request.length);
+    }
+
     cudaError_t err;
-    void *src = nullptr, *dst = nullptr;
 
-    // Determine direction and addresses
-    if (task->request.opcode == Request::READ) {
-        dst = task->request.source;      // read into source buffer
-        src = (void*)task->target_addr;  // from remote
-    } else {
-        src = task->request.source;      // write from source buffer
-        dst = (void*)task->target_addr;  // to remote
+#if CUDART_VERSION >= 13000
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    err = cudaMemcpyBatchAsync(const_cast<const void**>(dsts.data()),
+                               const_cast<const void**>(srcs.data()),
+                               sizes.data(), srcs.size(), &attr, &attrs_idx, 1,
+                               batch->async_stream.get());
+#elif CUDART_VERSION >= 12080
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    size_t fail_idx = tasks.size();
+    err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                               srcs.size(), &attr, &attrs_idx, 1, &fail_idx,
+                               batch->async_stream.get());
+    if (err != cudaSuccess && fail_idx < tasks.size()) {
+        LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
+                   << "cudaMemcpyBatchAsync failed at task index " << fail_idx
+                   << " (src=" << srcs[fail_idx] << ", dst=" << dsts[fail_idx]
+                   << ", size=" << sizes[fail_idx]
+                   << "): " << cudaGetErrorString(err);
+        tasks[fail_idx]->status_word = TransferStatusEnum::FAILED;
     }
-
-    bool is_async = (task->request.length >= async_memcpy_threshold_);
-
-    cudaPointerAttributes src_attr_info, dst_attr_info;
-    cudaMemoryType src_type = cudaMemoryTypeHost, dst_type = cudaMemoryTypeHost;
-    if (cudaPointerGetAttributes(&src_attr_info, src) == cudaSuccess) {
-        src_type = src_attr_info.type;
-    }
-    if (cudaPointerGetAttributes(&dst_attr_info, dst) == cudaSuccess) {
-        dst_type = dst_attr_info.type;
-    }
-
-    cudaMemcpyKind kind = cudaMemcpyDefault;
-    if (src_type == cudaMemoryTypeDevice && dst_type == cudaMemoryTypeHost) {
-        kind = cudaMemcpyDeviceToHost;
-    } else if (src_type == cudaMemoryTypeHost &&
-               dst_type == cudaMemoryTypeDevice) {
-        kind = cudaMemcpyHostToDevice;
-    } else if (src_type == cudaMemoryTypeDevice &&
-               dst_type == cudaMemoryTypeDevice) {
-        kind = cudaMemcpyDeviceToDevice;
-    } else if (src_type == cudaMemoryTypeHost &&
-               dst_type == cudaMemoryTypeHost) {
-        kind = cudaMemcpyHostToHost;
-    }
-
-    if (!is_async) {
-        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                              batch->sync_stream.get());
-        if (err != cudaSuccess) {
-            task->status_word = TransferStatusEnum::FAILED;
-            return;
+#else
+    err = cudaSuccess;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        auto single_err =
+            cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
+                            batch->async_stream.get());
+        if (single_err != cudaSuccess) {
+            tasks[i]->status_word = TransferStatusEnum::FAILED;
+            err = single_err;
         }
+    }
+#endif
 
-        err = cudaStreamSynchronize(batch->sync_stream.get());
-        if (err != cudaSuccess) {
-            task->status_word = TransferStatusEnum::FAILED;
-            return;
+    if (err != cudaSuccess) {
+        for (auto* task : tasks) {
+            if (task->status_word == TransferStatusEnum::PENDING)
+                task->status_word = TransferStatusEnum::FAILED;
         }
-
-        task->transferred_bytes = task->request.length;
-        task->status_word = TransferStatusEnum::COMPLETED;
-        return;
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                          batch->async_stream.get());
-
-    if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
+    cudaEvent_t event;
+    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    cudaEventRecord(event, batch->async_stream.get());
+    for (auto* task : tasks) task->completion_event = event;
 }
 
 Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -195,9 +207,8 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto& task = shm_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
-        auto err = cudaStreamQuery(shm_batch->async_stream.get());
+        auto err = cudaEventQuery(task.completion_event);
         if (err == cudaSuccess) {
-            cudaStreamSynchronize(shm_batch->async_stream.get());
             task.transferred_bytes = task.request.length;
             task.status_word = TransferStatusEnum::COMPLETED;
         } else if (err != cudaErrorNotReady) {
