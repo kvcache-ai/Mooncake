@@ -109,10 +109,11 @@ inline void PackDiskReplica(
     MsgpackPacker& packer,
     std::string_view file_path = kDefaultTestDiskFilePath,
     uint64_t object_size = kDefaultTestObjectSize) {
-    packer.pack_array(4);
+    packer.pack_array(5);
     packer.pack(uint64_t{1});
     packer.pack(static_cast<int16_t>(ReplicaStatus::COMPLETE));
     packer.pack(static_cast<int8_t>(ReplicaType::DISK));
+    packer.pack(static_cast<int8_t>(StorageLevel::SSD));
     packer.pack_array(2);
     packer.pack(std::string(file_path));
     packer.pack(object_size);
