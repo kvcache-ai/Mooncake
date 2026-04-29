@@ -679,7 +679,8 @@ Use these environment variables for SGLang real mode:
 - `MC_STORE_RS_TRANSPORT_METADATA_URL` (`redis://...` by default, or `P2PHANDSHAKE` with `classic_te`), `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
-- `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC capacity; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC client capacity; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS=<n>` to tune embedded control-plane gRPC server capacity; default `4`
 
 `MC_STORE_RS_LABELS` accepts either a JSON object or comma-separated `key=value` pairs, for example `MC_STORE_RS_LABELS='storage=false,pool=rw'`.
 

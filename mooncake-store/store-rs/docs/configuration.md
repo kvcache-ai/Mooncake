@@ -427,11 +427,16 @@ Standalone clients now retry failed heartbeat publishes instead of exiting on
 the first timeout. When cloud metadata links or long transfers need more head
 room, raise the matching timeout scope instead of stretching every timeout.
 
-Control-plane RPCs now run on a dedicated shared Tokio runtime instead of a
+Control-plane RPC clients run on a dedicated shared Tokio runtime instead of a
 single global caller lock. Use `MC_STORE_RS_CONTROL_PLANE_THREADS` to tune the
-worker count when a deployment needs more concurrent route / allocator RPCs or
-when an embedded client should keep its thread footprint smaller. The default
-is `2`; values must be positive integers.
+client worker count when a deployment needs more concurrent route / allocator
+RPCs or when an embedded client should keep its thread footprint smaller. The
+default is `2`; values must be positive integers.
+
+Each runtime also serves peer control-plane requests on a separate multi-thread
+Tokio runtime. Use `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS` to tune the
+server worker count when routed writers create high allocator / route-authority
+fanout. The default is `4`; values must be positive integers.
 
 ## Python Local Hot Cache
 
@@ -504,6 +509,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRANSFER_TIMEOUT_MS` | legacy compatibility alias | deprecated alias of `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` |
 | `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` | dummy compatibility clients | dummy gRPC timeout; falls back to `MC_STORE_RS_REQUEST_TIMEOUT_MS` when unset |
 | `MC_STORE_RS_CONTROL_PLANE_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the shared control-plane RPC runtime; default `2`; must be `> 0` |
+| `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the embedded control-plane gRPC server; default `4`; must be `> 0` |
 | `MC_STORE_LOCAL_HOT_CACHE_SIZE` | Python compatibility runtime, standalone dummy daemon, and local e2e | total byte budget for the daemon-local hot read cache; unset disables it |
 | `MC_STORE_LOCAL_HOT_BLOCK_SIZE` | Python compatibility runtime, standalone dummy daemon, and local e2e | cache block size and maximum cached object size; default `16777216` (`16 MiB`) |
 | `MC_STORE_LOCAL_HOT_CACHE_USE_SHM` | standalone dummy daemon, dummy compatibility clients, and local e2e | set to `1` to back cached payloads with shm so dummy clients attached to the same daemon can reuse them |

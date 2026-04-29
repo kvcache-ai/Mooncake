@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -25,6 +25,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_CONTROL_REQUEST_TIMEOUT_MS";
 const CONTROL_PLANE_THREADS_ENV: &str = "MC_STORE_RS_CONTROL_PLANE_THREADS";
+const DEFAULT_CONTROL_PLANE_SERVER_THREADS: usize = 4;
+const CONTROL_PLANE_SERVER_THREADS_ENV: &str = "MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS";
 
 pub(crate) trait AuthorityService: Send + Sync {
     fn get_route(
@@ -299,7 +301,9 @@ use self::codec::{
     try_route_state, try_runtime_id, try_segment_reservation,
 };
 #[cfg(test)]
-use self::server::{handle_control_stream_request, GrpcControlPlaneService};
+use self::server::{
+    control_plane_server_threads_from_env, handle_control_stream_request, GrpcControlPlaneService,
+};
 
 #[cfg(test)]
 mod tests;
