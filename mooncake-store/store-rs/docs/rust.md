@@ -186,6 +186,7 @@ Behavior boundary:
 - `put_from` and `batch_put_from` send remote writes from the registered source buffer directly
 - `batch_get_into` reads remote payloads directly into registered destination buffers
 - routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races, releases its own temporary reservation, and returns a route entry for that key without failing the batch
+- `ReplicaRoute::offset` is the transport target address for the payload; `segment_offset` is allocator bookkeeping, so writers translate allocator reservations through the segment announcement's published storage target chunks, and local reads plus drain migration translate `offset` back through the same storage target map before copying from local storage
 - unregistered `get_into` targets and `batch_put_from_multi_buffers` still fall back to the staged copy paths
 
 ## Hugepage-Backed Local Memory
@@ -241,6 +242,7 @@ Common calls:
 `evacuate_owned_replicas()` drains the local client, rewrites every live route that still references it, immediately reclaims old allocations, and retires emptied local segments.
 
 During evacuation, payload copy is pinned to the exact local replica being removed. The writer does not satisfy the migration read from another live mirror, because that would publish the wrong bytes when replicas temporarily diverge during a shrink.
+The migration read uses the replica's transport target offset, not the allocator reservation offset, and maps that target coordinate through the storage target map before touching local memory.
 
 Before returning, the draining client also mirrors any route-authority records that were only present locally to active route authorities. If its cached live-client snapshot cannot find a mirror, it refreshes membership and retries the mirror pass.
 

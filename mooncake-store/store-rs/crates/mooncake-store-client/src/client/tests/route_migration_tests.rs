@@ -1522,9 +1522,9 @@ fn control_plane_submit_migration_task_executes_explicit_copy_to_multiple_target
 
     let started = Instant::now();
     loop {
-        let state = reader
+        let detail = reader
             .control_client
-            .get_migration_execution_status(
+            .get_migration_execution_status_detail(
                 &executor_lease,
                 crate::control_plane::pb::GetMigrationExecutionStatusRequest {
                     namespace: metadata.route_namespace(),
@@ -1533,10 +1533,15 @@ fn control_plane_submit_migration_task_executes_explicit_copy_to_multiple_target
                 },
             )
             .expect("copy migration status query should succeed");
+        let state = crate::control_plane::pb::MigrationExecutionState::try_from(detail.state)
+            .expect("copy migration status should be valid");
         match state {
             crate::control_plane::pb::MigrationExecutionState::Succeeded => break,
             crate::control_plane::pb::MigrationExecutionState::Failed => {
-                panic!("same-owner copy migration task should not fail")
+                panic!(
+                    "same-owner copy migration task should not fail: {}",
+                    detail.last_error
+                )
             }
             _ => {
                 assert!(

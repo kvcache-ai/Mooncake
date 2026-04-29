@@ -5,10 +5,14 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mooncake_store_core::{HugePageConfig, Result, SegmentLifecycleState, SegmentName, StoreError};
+use mooncake_store_core::{
+    ClientRuntimeId, HugePageConfig, Result, SegmentAnnouncement, SegmentLifecycleState,
+    SegmentName, SegmentTargetChunk, StoreError,
+};
+use mooncake_transport::SegmentInfo;
 use parking_lot::Mutex;
 
-use crate::transport::StoreTransport;
+use crate::transport::{registration_chunks, StoreTransport};
 use mooncake_store_transport_core::MemoryRegistration;
 
 const DEFAULT_STORAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -408,6 +412,37 @@ impl LocalMemoryState {
             .address_at(relative_offset)
     }
 
+    pub fn copy_storage_target_to(
+        &self,
+        segment: &SegmentName,
+        target_info: &SegmentInfo,
+        target_offset: u64,
+        destination: *mut u8,
+        length: usize,
+        max_registration_bytes: Option<usize>,
+    ) -> Result<()> {
+        self
+            .storage
+            .get(segment)
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("storage segment {} not found", segment.0))
+            })?
+            .region
+            .copy_target_to(
+                target_info,
+                target_offset,
+                destination,
+                length,
+                max_registration_bytes,
+            )
+            .map_err(|error| {
+                StoreError::Allocator(format!(
+                    "target offset {target_offset} length {length} is outside local storage segment {}: {error}",
+                    segment.0
+                ))
+            })
+    }
+
     pub fn update_storage_state(
         &mut self,
         segment: &SegmentName,
@@ -427,6 +462,7 @@ impl LocalMemoryState {
                 segment_name: segment_name.clone(),
                 capacity_bytes: extent.region.capacity as u64,
                 alignment_bytes: extent.region.alignment as u64,
+                target_chunks: extent.region.target_chunks.clone(),
                 state: extent.state,
                 tags: extent.tags.clone(),
             })
@@ -454,8 +490,28 @@ pub struct StorageExtentInfo {
     pub segment_name: SegmentName,
     pub capacity_bytes: u64,
     pub alignment_bytes: u64,
+    pub target_chunks: Vec<SegmentTargetChunk>,
     pub state: SegmentLifecycleState,
     pub tags: Vec<String>,
+}
+
+impl StorageExtentInfo {
+    pub(crate) fn announcement(
+        &self,
+        owner: ClientRuntimeId,
+        used_bytes: u64,
+    ) -> SegmentAnnouncement {
+        SegmentAnnouncement {
+            owner,
+            segment_name: self.segment_name.clone(),
+            capacity_bytes: self.capacity_bytes,
+            used_bytes,
+            target_chunks: self.target_chunks.clone(),
+            state: self.state,
+            alignment_bytes: self.alignment_bytes,
+            tags: self.tags.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -732,11 +788,34 @@ pub struct RegionAllocation {
     pub addr: *mut c_void,
 }
 
+fn storage_target_chunks(
+    base: *mut c_void,
+    capacity: usize,
+    max_registration_bytes: Option<usize>,
+) -> Result<Vec<SegmentTargetChunk>> {
+    let base_addr = base as usize;
+    registration_chunks(base, capacity, max_registration_bytes)?
+        .into_iter()
+        .map(|(chunk_addr, chunk_len)| {
+            let chunk_base = chunk_addr as usize;
+            let logical_offset = chunk_base.checked_sub(base_addr).ok_or_else(|| {
+                StoreError::Allocator("storage registration chunk precedes region base".to_string())
+            })?;
+            Ok(SegmentTargetChunk {
+                logical_offset: logical_offset as u64,
+                target_offset: chunk_base as u64,
+                length_bytes: chunk_len as u64,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub(crate) struct RegisteredRegion {
     base_addr: usize,
     capacity: usize,
     alignment: usize,
+    target_chunks: Vec<SegmentTargetChunk>,
     owner: RegionOwner,
 }
 
@@ -837,10 +916,13 @@ impl RegisteredRegion {
             let _ = owner.release(transport, base);
             return Err(error);
         }
+        let target_chunks =
+            storage_target_chunks(base, capacity, transport.max_registration_bytes())?;
         Ok(Self {
             base_addr: base as usize,
             capacity,
             alignment,
+            target_chunks,
             owner,
         })
     }
@@ -887,11 +969,174 @@ impl RegisteredRegion {
         Ok(unsafe { (self.base_addr as *mut u8).add(offset).cast::<c_void>() })
     }
 
+    fn copy_target_to(
+        &self,
+        target_info: &SegmentInfo,
+        target_offset: u64,
+        destination: *mut u8,
+        length: usize,
+        max_registration_bytes: Option<usize>,
+    ) -> Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let mut mappings =
+            self.target_mappings(target_info, target_offset, length, max_registration_bytes)?;
+        mappings.sort_by_key(|mapping| mapping.target_start);
+
+        let total_len = u64::try_from(length).map_err(|_| {
+            StoreError::Allocator("copy length does not fit target coordinate".to_string())
+        })?;
+        let target_end = target_offset
+            .checked_add(total_len)
+            .ok_or_else(|| StoreError::Allocator("target range overflow".to_string()))?;
+        let mut cursor = target_offset;
+        let mut written = 0usize;
+        while cursor < target_end {
+            let mapping = mappings
+                .iter()
+                .find(|mapping| cursor >= mapping.target_start && cursor < mapping.target_end)
+                .ok_or_else(|| {
+                    StoreError::Allocator(format!("target cursor {cursor} is outside target map"))
+                })?;
+            let target_available = mapping.target_end - cursor;
+            let remaining = target_end - cursor;
+            let copy_len = usize::try_from(target_available.min(remaining)).map_err(|_| {
+                StoreError::Allocator("target copy span does not fit usize".to_string())
+            })?;
+            let local_offset = usize::try_from(cursor - mapping.target_start).map_err(|_| {
+                StoreError::Allocator("target-to-local offset does not fit usize".to_string())
+            })?;
+            let source = mapping
+                .local_start
+                .checked_add(local_offset)
+                .ok_or_else(|| StoreError::Allocator("local source overflow".to_string()))?
+                as *const u8;
+            unsafe {
+                ptr::copy_nonoverlapping(source, destination.add(written), copy_len);
+            }
+            written = written
+                .checked_add(copy_len)
+                .ok_or_else(|| StoreError::Allocator("destination offset overflow".to_string()))?;
+            cursor = cursor
+                .checked_add(copy_len as u64)
+                .ok_or_else(|| StoreError::Allocator("target cursor overflow".to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn target_mappings(
+        &self,
+        target_info: &SegmentInfo,
+        target_offset: u64,
+        length: usize,
+        max_registration_bytes: Option<usize>,
+    ) -> Result<Vec<TargetMapping>> {
+        let local_chunks =
+            registration_chunks(self.base_ptr(), self.capacity, max_registration_bytes)?;
+        let mut target_buffers = target_info.buffers.iter().collect::<Vec<_>>();
+        target_buffers.sort_by_key(|buffer| buffer.base);
+        if local_chunks.is_empty() || target_buffers.len() < local_chunks.len() {
+            return Err(StoreError::Allocator(format!(
+                "local chunk count {} cannot match target buffer count {}",
+                local_chunks.len(),
+                target_buffers.len()
+            )));
+        }
+        let target_len = u64::try_from(length)
+            .map_err(|_| StoreError::Allocator("copy length does not fit u64".to_string()))?;
+        let target_end = target_offset
+            .checked_add(target_len)
+            .ok_or_else(|| StoreError::Allocator("target range overflow".to_string()))?;
+
+        let mut selected = None;
+        for window in target_buffers.windows(local_chunks.len()) {
+            let Some(mappings) = build_target_mappings(&local_chunks, window)? else {
+                continue;
+            };
+            if target_range_covered_by_mappings(&mappings, target_offset, target_end) {
+                if selected.is_some() {
+                    return Err(StoreError::Allocator(
+                        "target range matches multiple local storage extents".to_string(),
+                    ));
+                }
+                selected = Some(mappings);
+            }
+        }
+        selected.ok_or_else(|| {
+            StoreError::Allocator(format!(
+                "target range [{target_offset}, {target_end}) does not match local storage extent \
+                 local_chunks={:?} target_buffers={:?}",
+                local_chunks
+                    .iter()
+                    .map(|(addr, len)| (*addr as usize, *len))
+                    .collect::<Vec<_>>(),
+                target_buffers
+                    .iter()
+                    .map(|buffer| (buffer.base, buffer.length))
+                    .collect::<Vec<_>>()
+            ))
+        })
+    }
+
     pub(crate) fn release(self, transport: &dyn StoreTransport) -> Result<()> {
         let base = self.base_ptr();
         transport.unregister_memory(base, self.capacity)?;
         self.owner.release(transport, base)
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TargetMapping {
+    target_start: u64,
+    target_end: u64,
+    local_start: usize,
+}
+
+fn build_target_mappings(
+    local_chunks: &[(*mut c_void, usize)],
+    target_buffers: &[&mooncake_transport::SegmentBuffer],
+) -> Result<Option<Vec<TargetMapping>>> {
+    let mut mappings = Vec::with_capacity(local_chunks.len());
+    for ((local_addr, local_len), target_buffer) in local_chunks.iter().zip(target_buffers.iter()) {
+        let target_len = usize::try_from(target_buffer.length).map_err(|_| {
+            StoreError::Allocator("target buffer length does not fit usize".to_string())
+        })?;
+        if *local_len != target_len {
+            return Ok(None);
+        }
+        let target_end = target_buffer
+            .base
+            .checked_add(target_buffer.length)
+            .ok_or_else(|| StoreError::Allocator("target buffer end overflow".to_string()))?;
+        mappings.push(TargetMapping {
+            target_start: target_buffer.base,
+            target_end,
+            local_start: *local_addr as usize,
+        });
+    }
+    Ok(Some(mappings))
+}
+
+fn target_range_covered_by_mappings(
+    mappings: &[TargetMapping],
+    target_start: u64,
+    target_end: u64,
+) -> bool {
+    let mut cursor = target_start;
+    while cursor < target_end {
+        let Some(mapping) = mappings
+            .iter()
+            .find(|mapping| cursor >= mapping.target_start && cursor < mapping.target_end)
+        else {
+            return false;
+        };
+        if mapping.target_end <= cursor {
+            return false;
+        }
+        cursor = mapping.target_end.min(target_end);
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1167,7 +1412,9 @@ mod tests {
     use std::sync::Arc;
 
     use mooncake_store_core::{HugePageConfig, SegmentLifecycleState, SegmentName, StoreError};
-    use mooncake_transport::{SegmentInfo, TransferProgress, TransferRequest, TransferStatus};
+    use mooncake_transport::{
+        SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest, TransferStatus,
+    };
     use parking_lot::Mutex;
 
     use super::{
@@ -1782,6 +2029,7 @@ mod tests {
             base_addr: 0x1000,
             capacity: 64,
             alignment: 16,
+            target_chunks: Vec::new(),
             owner: RegionOwner::Transport,
         };
 
@@ -1804,6 +2052,49 @@ mod tests {
             .address_at(64)
             .expect_err("address_at should enforce capacity");
         assert!(matches!(error, StoreError::Allocator(_)));
+    }
+
+    #[test]
+    fn registered_region_copies_from_transport_target_map() {
+        let mut storage = vec![0u8; 64];
+        let payload = b"mapped-target";
+        storage[16..16 + payload.len()].copy_from_slice(payload);
+        let region = RegisteredRegion {
+            base_addr: storage.as_mut_ptr() as usize,
+            capacity: storage.len(),
+            alignment: 8,
+            target_chunks: Vec::new(),
+            owner: RegionOwner::Transport,
+        };
+        let target_base = 0xabc0_0000u64;
+        let target_info = SegmentInfo {
+            kind: SegmentKind::Memory,
+            buffers: vec![
+                SegmentBuffer {
+                    base: target_base - 0x1000,
+                    length: 8,
+                    location: "cpu:0".to_string(),
+                },
+                SegmentBuffer {
+                    base: target_base,
+                    length: storage.len() as u64,
+                    location: "cpu:0".to_string(),
+                },
+            ],
+        };
+        let mut out = vec![0u8; payload.len()];
+
+        region
+            .copy_target_to(
+                &target_info,
+                target_base + 16,
+                out.as_mut_ptr(),
+                out.len(),
+                None,
+            )
+            .expect("target map should translate to local storage");
+
+        assert_eq!(out, payload);
     }
 
     #[test]
@@ -2297,6 +2588,7 @@ mod tests {
             base_addr: 0x1000,
             capacity: usize::MAX,
             alignment: 8,
+            target_chunks: Vec::new(),
             owner: RegionOwner::Transport,
         };
         let error = region

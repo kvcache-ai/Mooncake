@@ -17,10 +17,45 @@ use parking_lot::Mutex;
 // Internal segment and state types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TestSegment {
     pub base: usize,
     pub len: usize,
+    pub buffers: Vec<TestSegmentBuffer>,
+}
+
+#[derive(Clone, Copy)]
+pub struct TestSegmentBuffer {
+    pub base: usize,
+    pub len: usize,
+}
+
+impl TestSegment {
+    fn new(base: usize, len: usize) -> Self {
+        Self {
+            base,
+            len,
+            buffers: vec![TestSegmentBuffer { base, len }],
+        }
+    }
+
+    fn add_buffer(&mut self, base: usize, len: usize) {
+        if !self.buffers.iter().any(|buffer| buffer.base == base) {
+            self.buffers.push(TestSegmentBuffer { base, len });
+        }
+    }
+
+    fn remove_buffer(&mut self, base: usize) -> bool {
+        let Some(index) = self.buffers.iter().position(|buffer| buffer.base == base) else {
+            return false;
+        };
+        self.buffers.remove(index);
+        if let Some(buffer) = self.buffers.first().copied() {
+            self.base = buffer.base;
+            self.len = buffer.len;
+        }
+        true
+    }
 }
 
 pub struct TestTransportState {
@@ -124,17 +159,13 @@ impl TestTransport {
             .segments_by_handle
             .remove(&handle)
             .expect("segment handle should exist before restart");
-        let snapshot = state
-            .allocations
-            .remove(&segment.base)
-            .map(|buffer| buffer.into_vec())
-            .unwrap_or_else(|| vec![0u8; segment.len]);
-        let base = allocate_boxed_region(&mut state, segment.len);
-        if let Some(buffer) = state.allocations.get_mut(&base) {
-            let copy_len = snapshot.len().min(buffer.len());
-            buffer[..copy_len].copy_from_slice(&snapshot[..copy_len]);
-        }
-        register_segment(&mut state, segment_name.to_string(), base, segment.len)
+        let next_handle = state.next_handle;
+        state.next_handle += 1;
+        state
+            .segments_by_name
+            .insert(segment_name.to_string(), next_handle);
+        state.segments_by_handle.insert(next_handle, segment);
+        next_handle
     }
 
     pub fn fail_next_submit_for_segment(&self, segment_name: &str) {
@@ -211,22 +242,28 @@ impl StoreTransport for TestTransport {
         let segment = state
             .segments_by_handle
             .get(&handle)
-            .copied()
             .ok_or_else(|| StoreError::NotFound(format!("segment handle {handle} not found")))?;
         Ok(SegmentInfo {
             kind: SegmentKind::Memory,
-            buffers: vec![SegmentBuffer {
-                base: segment.base as u64,
-                length: segment.len as u64,
-                location: "cpu:0".to_string(),
-            }],
+            buffers: segment
+                .buffers
+                .iter()
+                .map(|buffer| SegmentBuffer {
+                    base: buffer.base as u64,
+                    length: buffer.len as u64,
+                    location: "cpu:0".to_string(),
+                })
+                .collect(),
         })
     }
 
     fn adopt_local_memory(&self, addr: *mut c_void, size: usize, _location: &str) -> Result<()> {
         let mut state = self.state.lock();
         let segment_name = self.local_segment.clone();
-        if state.segments_by_name.contains_key(&segment_name) {
+        if let Some(handle) = state.segments_by_name.get(&segment_name).copied() {
+            if let Some(segment) = state.segments_by_handle.get_mut(&handle) {
+                segment.add_buffer(addr as usize, size);
+            }
             return Ok(());
         }
         register_segment(&mut state, segment_name, addr as usize, size);
@@ -236,7 +273,11 @@ impl StoreTransport for TestTransport {
     fn allocate_memory(&self, size: usize, _location: &str) -> Result<*mut c_void> {
         let mut state = self.state.lock();
         let base = allocate_boxed_region(&mut state, size);
-        if !state.segments_by_name.contains_key(&self.local_segment) {
+        if let Some(handle) = state.segments_by_name.get(&self.local_segment).copied() {
+            if let Some(segment) = state.segments_by_handle.get_mut(&handle) {
+                segment.add_buffer(base, size);
+            }
+        } else {
             register_segment(&mut state, self.local_segment.clone(), base, size);
         }
         Ok(base as *mut c_void)
@@ -251,17 +292,7 @@ impl StoreTransport for TestTransport {
                 addr
             )));
         }
-        let orphaned = state
-            .segments_by_handle
-            .iter()
-            .filter_map(|(handle, segment)| (segment.base == key).then_some(*handle))
-            .collect::<Vec<_>>();
-        for handle in orphaned {
-            state.segments_by_handle.remove(&handle);
-            state
-                .segments_by_name
-                .retain(|_, current_handle| *current_handle != handle);
-        }
+        remove_segment_buffer(&mut state, key);
         state.registered_memory.remove(&key);
         Ok(())
     }
@@ -305,17 +336,7 @@ impl StoreTransport for TestTransport {
             )));
         }
         state.registered_memory.remove(&key);
-        let orphaned = state
-            .segments_by_handle
-            .iter()
-            .filter_map(|(handle, segment)| (segment.base == addr as usize).then_some(*handle))
-            .collect::<Vec<_>>();
-        for handle in orphaned {
-            state.segments_by_handle.remove(&handle);
-            state
-                .segments_by_name
-                .retain(|_, current_handle| *current_handle != handle);
-        }
+        remove_segment_buffer(&mut state, key);
         Ok(())
     }
 
@@ -400,7 +421,7 @@ impl StoreTransport for TestTransport {
                 .ok_or_else(|| {
                     StoreError::NotFound(format!("segment handle {} not found", request.target_id))
                 })?;
-            validate_request_bounds(*segment, request)?;
+            validate_request_bounds(segment, request)?;
             unsafe {
                 match request.opcode {
                     Opcode::Write => ptr::copy_nonoverlapping(
@@ -456,27 +477,48 @@ pub fn register_segment(
     state.segments_by_name.insert(segment_name, handle);
     state
         .segments_by_handle
-        .insert(handle, TestSegment { base, len: size });
+        .insert(handle, TestSegment::new(base, size));
     handle
 }
 
-fn validate_request_bounds(segment: TestSegment, request: &TransferRequest) -> Result<()> {
+fn remove_segment_buffer(state: &mut TestTransportState, base: usize) {
+    let empty_handles = state
+        .segments_by_handle
+        .iter_mut()
+        .filter_map(|(handle, segment)| {
+            (segment.remove_buffer(base) && segment.buffers.is_empty()).then_some(*handle)
+        })
+        .collect::<Vec<_>>();
+    for handle in empty_handles {
+        state.segments_by_handle.remove(&handle);
+        state
+            .segments_by_name
+            .retain(|_, current_handle| *current_handle != handle);
+    }
+}
+
+fn validate_request_bounds(segment: &TestSegment, request: &TransferRequest) -> Result<()> {
     let start = usize::try_from(request.target_offset)
         .map_err(|_| StoreError::Transport("target offset does not fit usize".to_string()))?;
     let end = start
         .checked_add(request.length as usize)
         .ok_or_else(|| StoreError::Transport("request length overflow".to_string()))?;
-    let segment_end = segment
-        .base
-        .checked_add(segment.len)
-        .ok_or_else(|| StoreError::Transport("segment length overflow".to_string()))?;
-    if start < segment.base || end > segment_end {
-        return Err(StoreError::Transport(format!(
-            "request out of segment bounds: start={start} end={end} segment={}..{}",
-            segment.base, segment_end
-        )));
+    if segment.buffers.iter().any(|buffer| {
+        buffer
+            .base
+            .checked_add(buffer.len)
+            .is_some_and(|buffer_end| start >= buffer.base && end <= buffer_end)
+    }) {
+        return Ok(());
     }
-    Ok(())
+    Err(StoreError::Transport(format!(
+        "request out of segment bounds: start={start} end={end} buffers={:?}",
+        segment
+            .buffers
+            .iter()
+            .map(|buffer| (buffer.base, buffer.len))
+            .collect::<Vec<_>>()
+    )))
 }
 
 // ---------------------------------------------------------------------------

@@ -81,8 +81,8 @@ impl StoreClient {
                     let mut state = self.state.lock();
                     state.open_segment_with_info(transport, &target.segment_name.0)?
                 };
-                let target_offset = Self::segment_relative_target_offset(
-                    &info,
+                let target_offset = Self::storage_target_offset(
+                    &target.target_chunks,
                     &target.segment_name,
                     reservation.offset_bytes,
                     value.len() as u64,
@@ -764,8 +764,8 @@ impl StoreClient {
                             let mut state = self.state.lock();
                             state.open_segment_with_info(transport, &target.segment_name.0)?
                         };
-                        let target_offset = Self::segment_relative_target_offset(
-                            &info,
+                        let target_offset = Self::storage_target_offset(
+                            &target.target_chunks,
                             &target.segment_name,
                             reservation.offset_bytes,
                             entry.value.len() as u64,
