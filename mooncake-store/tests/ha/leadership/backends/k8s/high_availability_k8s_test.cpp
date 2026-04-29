@@ -154,6 +154,45 @@ TEST_F(HighAvailabilityTest, K8sLeadershipMonitorIgnoresExplicitRelease) {
     EXPECT_FALSE(callback_fired->load());
 }
 
+TEST_F(HighAvailabilityTest, K8sLeadershipMonitorReportsElectionCancellation) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto lease_name = MakeK8sTestLeaseName("monitor-loss");
+    auto coordinator =
+        CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("127.0.0.1:9955");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    auto callback_fired = std::make_shared<std::atomic<bool>>(false);
+    auto monitor = coordinator->StartLeadershipMonitor(
+        session, [callback_fired](ha::LeadershipLossReason) {
+            callback_fired->store(true);
+        });
+    ASSERT_TRUE(monitor.has_value());
+
+    // Cancel the election goroutine directly, bypassing ReleaseLeadership.
+    // This simulates leadership loss: WaitLost returns while
+    // election_shutdown_requested_ is still false, so the monitor fires.
+    K8sLeaseHelper::CancelElection(FLAGS_k8s_namespace, lease_name);
+
+    // Wait for the monitor thread to detect the loss and fire the callback
+    for (int i = 0; i < 50 && !callback_fired->load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    EXPECT_TRUE(callback_fired->load());
+}
+
 TEST_F(HighAvailabilityTest, K8sCanReacquireAfterRelease) {
     if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
@@ -192,6 +231,56 @@ TEST_F(HighAvailabilityTest, K8sCanReacquireAfterRelease) {
 
     ASSERT_EQ(ErrorCode::OK,
               coordinator->ReleaseLeadership(*second_acquire->session));
+}
+
+TEST_F(HighAvailabilityTest, K8sContendedLeadershipAndHandover) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto lease_name = MakeK8sTestLeaseName("contention");
+
+    // Coordinator A acquires leadership
+    auto coord_a = CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coord_a, nullptr);
+
+    auto acquire_a = coord_a->TryAcquireLeadership("127.0.0.1:7701");
+    ASSERT_TRUE(acquire_a.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire_a->status);
+    ASSERT_TRUE(acquire_a->session.has_value());
+
+    auto renew_a = coord_a->RenewLeadership(*acquire_a->session);
+    ASSERT_TRUE(renew_a.has_value());
+    ASSERT_TRUE(renew_a.value());
+
+    // Coordinator B attempts acquisition on the same lease — should be
+    // contended
+    auto coord_b = CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coord_b, nullptr);
+
+    auto acquire_b = coord_b->TryAcquireLeadership("127.0.0.1:7702");
+    ASSERT_TRUE(acquire_b.has_value());
+    EXPECT_EQ(ha::AcquireLeadershipStatus::CONTENDED, acquire_b->status);
+    ASSERT_TRUE(acquire_b->observed_view.has_value());
+    EXPECT_EQ(acquire_a->session->view.view_version,
+              acquire_b->observed_view->view_version);
+
+    // A releases leadership
+    ASSERT_EQ(ErrorCode::OK, coord_a->ReleaseLeadership(*acquire_a->session));
+
+    // Wait for lease to expire so B can take over
+    auto view_changed = coord_b->WaitForViewChange(
+        acquire_a->session->view.view_version, std::chrono::seconds(10));
+    ASSERT_TRUE(view_changed.has_value());
+    ASSERT_TRUE(view_changed->changed);
+
+    // B acquires leadership
+    auto acquire_b2 = coord_b->TryAcquireLeadership("127.0.0.1:7702");
+    ASSERT_TRUE(acquire_b2.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire_b2->status);
+    ASSERT_TRUE(acquire_b2->session.has_value());
+
+    ASSERT_EQ(ErrorCode::OK, coord_b->ReleaseLeadership(*acquire_b2->session));
 }
 
 // --- Connstring validation ---
