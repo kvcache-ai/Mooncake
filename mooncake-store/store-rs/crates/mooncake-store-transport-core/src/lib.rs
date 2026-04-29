@@ -41,6 +41,11 @@ pub trait StoreTransport: Send + Sync {
     }
 
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
+
+    fn register_scratch_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
+        self.register_memory(addr, size)
+    }
+
     fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
 
     fn register_memory_batch(&self, entries: &[MemoryRegistration]) -> Result<()> {
