@@ -17,6 +17,14 @@
 #include "types.h"
 
 namespace mooncake {
+
+struct GpuStagingEntry {
+    void* original_ptr = nullptr;  // GPU device pointer (destination for H2D)
+    void* host_ptr = nullptr;      // Host staging buffer (source for H2D)
+    size_t size = 0;               // Size of the staging buffer
+    int device_id = -1;            // GPU device ID
+};
+
 struct FileRecord {
     std::string path;
     uint64_t size;
