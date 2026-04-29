@@ -13,16 +13,24 @@ RequestMetric::RequestMetric(const std::string& prefix,
       get_failures(prefix + "_get_failures_total",
                    "Total number of failed Get requests", labels),
       get_bytes(prefix + "_get_bytes_total", "Total bytes read by Get", labels),
-      get_latency(prefix + "_get_latency_us", "Get latency (us)",
-                  kLatencyBucket, labels),
+      get_latency_success(prefix + "_get_latency_success_us",
+                          "Get latency for successful requests (us)",
+                          kLatencyBucket, labels),
+      get_latency_failure(prefix + "_get_latency_failure_us",
+                          "Get latency for failed requests (us)",
+                          kLatencyBucket, labels),
       put_requests(prefix + "_put_requests_total",
                    "Total number of Put requests", labels),
       put_failures(prefix + "_put_failures_total",
                    "Total number of failed Put requests", labels),
       put_bytes(prefix + "_put_bytes_total", "Total bytes written by Put",
                 labels),
-      put_latency(prefix + "_put_latency_us", "Put latency (us)",
-                  kLatencyBucket, labels) {}
+      put_latency_success(prefix + "_put_latency_success_us",
+                          "Put latency for successful requests (us)",
+                          kLatencyBucket, labels),
+      put_latency_failure(prefix + "_put_latency_failure_us",
+                          "Put latency for failed requests (us)",
+                          kLatencyBucket, labels) {}
 
 void RequestMetric::serialize(std::string& str) {
     get_requests.serialize(str);
@@ -30,11 +38,13 @@ void RequestMetric::serialize(std::string& str) {
     get_misses.serialize(str);
     get_failures.serialize(str);
     get_bytes.serialize(str);
-    get_latency.serialize(str);
+    get_latency_success.serialize(str);
+    get_latency_failure.serialize(str);
     put_requests.serialize(str);
     put_failures.serialize(str);
     put_bytes.serialize(str);
-    put_latency.serialize(str);
+    put_latency_success.serialize(str);
+    put_latency_failure.serialize(str);
 }
 
 std::string RequestMetric::summary_metrics() {

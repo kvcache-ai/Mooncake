@@ -72,6 +72,7 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         if (metrics_) {
             metrics_->peer_request.get_failures.inc();
+            metrics_->peer_request.get_latency_failure.observe(sw.elapsed_us());
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -86,13 +87,14 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         timer.LogResponse("error_code=", result.error());
         if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
             data_manager_.RectifyReadRoute(request.key);
-            if (metrics_) {
+        }
+        if (metrics_) {
+            if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
                 metrics_->peer_request.get_misses.inc();
-            }
-        } else {
-            if (metrics_) {
+            } else {
                 metrics_->peer_request.get_failures.inc();
             }
+            metrics_->peer_request.get_latency_failure.observe(sw.elapsed_us());
         }
         return result;
     }
@@ -102,7 +104,7 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         metrics_->peer_request.get_hits.inc();
         metrics_->peer_request.get_bytes.inc(
             CalculateBufferSize(request.dest_buffers));
-        metrics_->peer_request.get_latency.observe(sw.elapsed_us());
+        metrics_->peer_request.get_latency_success.observe(sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
@@ -124,6 +126,7 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         if (metrics_) {
             metrics_->peer_request.put_failures.inc();
+            metrics_->peer_request.put_latency_failure.observe(sw.elapsed_us());
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -138,6 +141,7 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
         timer.LogResponse("error_code=", result.error());
         if (metrics_) {
             metrics_->peer_request.put_failures.inc();
+            metrics_->peer_request.put_latency_failure.observe(sw.elapsed_us());
         }
         return result;
     }
@@ -146,7 +150,7 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
     if (metrics_) {
         metrics_->peer_request.put_bytes.inc(
             CalculateBufferSize(request.src_buffers));
-        metrics_->peer_request.put_latency.observe(sw.elapsed_us());
+        metrics_->peer_request.put_latency_success.observe(sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
