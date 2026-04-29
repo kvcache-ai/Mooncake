@@ -121,6 +121,7 @@ Status MultiTransport::submitTransfer(
         assert(transport);
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
@@ -192,6 +193,38 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         return Status::InvalidArgument("Task ID out of range");
     }
     auto& task = batch_desc.task_list[task_id];
+
+    // If the task has an associated transport, delegate to its
+    // getTransferStatus() to trigger transport-specific completion
+    // polling. For example, the NVLink async transport polls CUDA
+    // streams via cudaStreamQuery() here; without this call the
+    // slice statuses (and therefore success/failed_slice_count)
+    // would never be updated.
+    if (task.transport_) {
+        auto ret =
+            task.transport_->getTransferStatus(batch_id, task_id, status);
+        if (!ret.ok()) return ret;
+
+        // Apply timeout check on top of the transport's result.
+        if (status.s == Transport::TransferStatusEnum::WAITING &&
+            globalConfig().slice_timeout > 0) {
+            auto current_ts = getCurrentTimeInNano();
+            const int64_t kPacketDeliveryTimeout =
+                globalConfig().slice_timeout * 1000000000;
+            for (auto& slice : task.slice_list) {
+                auto ts = slice->ts;
+                if (ts > 0 && current_ts > ts &&
+                    current_ts - ts > kPacketDeliveryTimeout) {
+                    LOG(INFO) << "Slice timeout detected";
+                    status.s = Transport::TransferStatusEnum::TIMEOUT;
+                    return Status::OK();
+                }
+            }
+        }
+        return Status::OK();
+    }
+
+    // Fallback for tasks without a transport pointer (legacy path)
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;

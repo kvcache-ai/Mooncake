@@ -36,16 +36,32 @@ namespace {
 struct CudaStreamNVLinkRAII {
     cudaStream_t stream_;
     CudaStreamNVLinkRAII() : stream_(nullptr) {
-        auto err =
-            cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+        auto err = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
-            LOG(FATAL) << "Failed to create NVLink CUDA stream: "
-                       << err << " - " << cudaGetErrorString(err);
+            LOG(FATAL) << "Failed to create NVLink CUDA stream: " << err
+                       << " - " << cudaGetErrorString(err);
         }
     }
     ~CudaStreamNVLinkRAII() { cudaStreamDestroy(stream_); }
 };
 static thread_local CudaStreamNVLinkRAII tl_nvlink_stream;
+
+// Thread-local CUDA event used to synchronize the NVLink stream with
+// the default (legacy) CUDA stream before issuing cudaMemcpyAsync.
+// This prevents the NVLink stream from reading source data that
+// PyTorch has not yet finished writing on the default stream.
+struct CudaSyncEventRAII {
+    cudaEvent_t event_;
+    CudaSyncEventRAII() {
+        auto err = cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            LOG(FATAL) << "Failed to create NVLink sync CUDA event: " << err
+                       << " - " << cudaGetErrorString(err);
+        }
+    }
+    ~CudaSyncEventRAII() { cudaEventDestroy(event_); }
+};
+static thread_local CudaSyncEventRAII tl_nvlink_sync_event;
 }  // anonymous namespace
 
 static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
@@ -216,12 +232,12 @@ Status IntraNodeNvlinkTransport::submitTransfer(
         cudaError_t err;
         if (slice->opcode == TransferRequest::READ)
             err = cudaMemcpyAsync(slice->source_addr,
-                                  (void *)slice->local.dest_addr,
-                                  slice->length, cudaMemcpyDefault, stream);
+                                  (void *)slice->local.dest_addr, slice->length,
+                                  cudaMemcpyDefault, stream);
         else
             err = cudaMemcpyAsync((void *)slice->local.dest_addr,
-                                  slice->source_addr,
-                                  slice->length, cudaMemcpyDefault, stream);
+                                  slice->source_addr, slice->length,
+                                  cudaMemcpyDefault, stream);
         if (err != cudaSuccess) {
             slice->markFailed();
         } else {
@@ -296,16 +312,19 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
+        task.slice_list.push_back(slice);
+        __sync_fetch_and_add(&task.slice_count, 1);
         cudaStream_t stream = tl_nvlink_stream.stream_;
+
         cudaError_t err;
         if (slice->opcode == TransferRequest::READ)
             err = cudaMemcpyAsync(slice->source_addr,
-                                  (void *)slice->local.dest_addr,
-                                  slice->length, cudaMemcpyDefault, stream);
+                                  (void *)slice->local.dest_addr, slice->length,
+                                  cudaMemcpyDefault, stream);
         else
             err = cudaMemcpyAsync((void *)slice->local.dest_addr,
-                                  slice->source_addr,
-                                  slice->length, cudaMemcpyDefault, stream);
+                                  slice->source_addr, slice->length,
+                                  cudaMemcpyDefault, stream);
         if (err != cudaSuccess) {
             slice->markFailed();
         } else {
