@@ -444,7 +444,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
                 if (!host_buf) {
                     for (auto& p : staging_host_ptrs) std::free(p);
                     LOG(ERROR) << "Failed to allocate host staging buffer for: "
-                            << path;
+                               << path;
                     return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                 }
                 iovs_chunk.push_back({host_buf, slice.size});
@@ -488,8 +488,8 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     for (size_t i = 0; i < staging_host_ptrs.size(); ++i) {
         gpu_staging::SetDevice(staging_device_ids[i]);
         if (!gpu_staging::CopyHostToDevice(staging_original_ptrs[i],
-                                            staging_host_ptrs[i],
-                                            staging_sizes[i])) {
+                                           staging_host_ptrs[i],
+                                           staging_sizes[i])) {
             LOG(ERROR) << "H2D copy failed for path: " << path;
             for (size_t j = i; j < staging_host_ptrs.size(); ++j) {
                 std::free(staging_host_ptrs[j]);
