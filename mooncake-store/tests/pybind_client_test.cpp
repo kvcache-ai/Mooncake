@@ -555,11 +555,20 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
 
     size_t size = 1000;
     size_t int_size = sizeof(int);
-    cudaMalloc(&src_data, size * int_size);
-    cudaMalloc(&dst_data, size * int_size);
+    cudaError_t err;
+    err = cudaMalloc(&src_data, size * int_size);
+    ASSERT_EQ(err, cudaSuccess)
+        << "cudaMalloc failed for src_data: " << cudaGetErrorString(err);
+    err = cudaMalloc(&dst_data, size * int_size);
+    ASSERT_EQ(err, cudaSuccess)
+        << "cudaMalloc failed for dst_data: " << cudaGetErrorString(err);
 
-    cudaMemset(src_data, 1, size * int_size);
-    cudaMemset(dst_data, 0, size * int_size);
+    err = cudaMemset(src_data, 1, size * int_size);
+    ASSERT_EQ(err, cudaSuccess)
+        << "cudaMemset failed for src_data: " << cudaGetErrorString(err);
+    err = cudaMemset(dst_data, 0, size * int_size);
+    ASSERT_EQ(err, cudaSuccess)
+        << "cudaMemset failed for dst_data: " << cudaGetErrorString(err);
 
     // Register buffers for zero-copy operations
     int reg_result_test =
@@ -606,11 +615,11 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffersFromHBM) {
         EXPECT_EQ(result, 100 * int_size) << "Get operation should succeed";
     }
 
-    std::vector<uint32_t> src_host(size);
-    std::vector<uint32_t> dst_host(size);
+    std::vector<int> src_host(size);
+    std::vector<int> dst_host(size);
 
-    cudaError_t err = cudaMemcpy(src_host.data(), src_data, size * int_size,
-                                 cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(src_host.data(), src_data, size * int_size,
+                     cudaMemcpyDeviceToHost);
     ASSERT_EQ(err, cudaSuccess)
         << "cudaMemcpy DeviceToHost failed: " << cudaGetErrorString(err);
     err = cudaMemcpy(dst_host.data(), dst_data, size * int_size,
