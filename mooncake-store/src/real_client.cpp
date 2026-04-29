@@ -4050,8 +4050,9 @@ RealClient::batch_get_into_multi_buffers_internal(
             }
         } else if (replica.is_local_disk_replica() ||
                    replica.is_disk_replica()) {
-            // LOCAL_DISK / DISK: file I/O cannot write to GPU memory.
-            // Route through CPU temp buffer + scatter.
+            // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
+            // (zero-copy). DISK: file I/O cannot write to GPU memory; temp CPU
+            // buffer used at read time.
             valid_local_disk_ops.emplace(
                 key,
                 DiskKeyInfo{.key = key,
