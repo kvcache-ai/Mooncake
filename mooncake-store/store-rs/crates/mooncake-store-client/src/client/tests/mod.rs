@@ -3292,7 +3292,7 @@ fn embedded_wrh_evacuation_reuses_live_authority_snapshot() {
 
     let after_seed = metadata.list_live_clients_calls();
     let policy = router
-        .migration_policy_for_route(&route)
+        .migration_policy_for_route(&route, router.runtime_id())
         .expect("migration policy should resolve from the shared snapshot");
     let after_policy = metadata.list_live_clients_calls();
     assert!(
@@ -11976,6 +11976,183 @@ fn draining_route_authority_mirrors_local_routes_before_restart() {
             .expect("reader should find route after authority restart"),
         value
     );
+}
+
+#[test]
+fn drain_migration_refreshes_the_draining_route_authority() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let victim_transport = Arc::new(TestTransport::new("drain-sync-victim-segment"));
+    let survivor_transport = Arc::new(victim_transport.peer("drain-sync-survivor-segment"));
+    let writer_transport = Arc::new(victim_transport.peer("drain-sync-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut victim = StoreClientBuilder::new(metadata.clone(), "drain-sync-victim")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "true")
+        .label("route_scope", "drain-sync-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(victim_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("victim build should succeed");
+    let survivor = StoreClientBuilder::new(metadata.clone(), "drain-sync-survivor")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "true")
+        .label("route_scope", "drain-sync-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(survivor_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("survivor build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "drain-sync-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "drain-sync-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    victim
+        .register_local_memory()
+        .expect("victim memory should register");
+    survivor
+        .register_local_memory()
+        .expect("survivor memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&victim, &survivor, &writer]);
+
+    let key = "drain-sync-key";
+    let value = b"drain-sync-value";
+    let route = writer
+        .put_with_policy(
+            key,
+            value,
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([victim.runtime_id().storage_key()]),
+        )
+        .expect("seed route should write to victim");
+    assert_eq!(route.replicas[0].owner, *victim.runtime_id());
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new(format!("default::{key}"));
+    authority_replace(
+        &namespace,
+        &victim.runtime_id().stable_id,
+        &scoped_key,
+        Some(&route),
+    )
+    .expect("test should leave a stale local authority route on victim");
+
+    let migrated = victim
+        .evacuate_owned_replicas()
+        .expect("victim drain should migrate owned route");
+    assert_eq!(migrated, 1);
+
+    let refreshed = authority_get(&namespace, &victim.runtime_id().stable_id, &scoped_key)
+        .expect("victim authority should remain readable during drain")
+        .expect("victim authority should retain the refreshed route");
+    assert!(
+        refreshed
+            .replicas
+            .iter()
+            .all(|replica| replica.owner != *victim.runtime_id()),
+        "draining authority must not keep advertising the evacuated replica"
+    );
+    assert_eq!(writer.get(key).expect("migrated value should read"), value);
+}
+
+#[test]
+fn readable_replica_selection_prefers_local_survivor() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let remote_transport = Arc::new(TestTransport::new("local-survivor-remote-segment"));
+    let local_transport = Arc::new(remote_transport.peer("local-survivor-local-segment"));
+
+    let remote = StoreClientBuilder::new(metadata.clone(), "local-survivor-remote")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "local-survivor-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(remote_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("remote build should succeed");
+    let local = StoreClientBuilder::new(metadata, "local-survivor-local")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "local-survivor-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(local_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("local build should succeed");
+
+    remote
+        .register_local_memory()
+        .expect("remote memory should register");
+    local
+        .register_local_memory()
+        .expect("local memory should register");
+    wait_for_membership_convergence(&[&remote, &local]);
+
+    let remote_segment = remote.segment_name().expect("remote segment should exist");
+    let local_segment = local.segment_name().expect("local segment should exist");
+    let route = ObjectRoute {
+        key: ObjectKey::new("default::local-survivor-key"),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: local.lease().compatibility,
+        replicas: vec![
+            ReplicaRoute {
+                owner: remote.runtime_id().clone(),
+                segment_name: remote_segment,
+                offset: 0,
+                segment_offset: 0,
+                length: 8,
+                checksum: None,
+                tier: mooncake_store_core::ReplicaTier::Dram,
+                priority: 0,
+            },
+            ReplicaRoute {
+                owner: local.runtime_id().clone(),
+                segment_name: local_segment.clone(),
+                offset: 0,
+                segment_offset: 0,
+                length: 8,
+                checksum: None,
+                tier: mooncake_store_core::ReplicaTier::Dram,
+                priority: 1,
+            },
+        ],
+    };
+
+    let readable = local
+        .readable_runtime_set(true)
+        .expect("readable runtimes should resolve");
+    let selected = local
+        .select_readable_replica(&route, &readable)
+        .expect("route should expose a readable replica");
+    assert_eq!(selected.segment_name, local_segment);
+    assert_eq!(selected.owner, *local.runtime_id());
 }
 
 #[test]

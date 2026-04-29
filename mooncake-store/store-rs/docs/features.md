@@ -331,6 +331,8 @@ The client can expand local storage, drain segments, retire empty segments, and 
 
 This allows segment-level shrink, full client shrink, and dynamic storage growth without changing the public API.
 
+During full-client drain, replacement routes are also written back to the draining route authority while it still serves reads. The draining authority is not counted as a protected live mirror, but stale readers that still include it in their membership snapshot no longer see routes pointing at evacuated allocations. Explicit drain migration reads the selected source replica through an exact readable lease lookup instead of the suspect-runtime placement cache, so allocator quarantine for new writes does not block copying the source bytes that are being evacuated. Migration placement excludes the draining source owner even when a separate writer performs the copy, and the source owner releases its old allocations after publication. Read selection also prefers a local readable replica before remote replicas with lower route priority, so replica-protected reads avoid a dead remote primary when the survivor already has the data locally.
+
 ## Control Plane
 
 The runtime includes a dedicated control plane for two domains:
