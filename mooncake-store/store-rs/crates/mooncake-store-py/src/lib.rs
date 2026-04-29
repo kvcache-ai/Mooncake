@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use dispatcher::StoreDispatcher;
 use dummy_client::DummySession;
@@ -697,6 +698,7 @@ impl PyMooncakeDistributedStore {
                 let cache_tenant = tenant.clone();
                 let statuses = run_without_gil(move || {
                     dispatcher.run(move |client| {
+                        let total_bytes = items.iter().map(|(_, _, size)| *size).sum::<usize>();
                         let requests = items
                             .iter()
                             .map(|(key, buffer_ptr, size)| {
@@ -714,9 +716,18 @@ impl PyMooncakeDistributedStore {
                                 request
                             })
                             .collect::<Vec<_>>();
+                        let batch_started = Instant::now();
                         match client.batch_put_from(&requests) {
                             Ok(_) => Ok(vec![0; item_count]),
                             Err(batch_error) => {
+                                eprintln!(
+                                    "[mooncake-store] batch_put_from failed runtime={} items={} bytes={} elapsed_ms={} error={}",
+                                    client.runtime_id(),
+                                    item_count,
+                                    total_bytes,
+                                    batch_started.elapsed().as_millis(),
+                                    batch_error
+                                );
                                 tracing::debug!(
                                     error = %batch_error,
                                     "batch_put_from falling back to per-key best-effort status"
@@ -724,6 +735,7 @@ impl PyMooncakeDistributedStore {
                                 let statuses = items
                                     .iter()
                                     .map(|(key, buffer_ptr, size)| {
+                                        let item_started = Instant::now();
                                         let result = match (tenant.as_deref(), policy.as_ref()) {
                                             (Some(tenant), Some(policy)) => client
                                                 .put_from_in_tenant_with_policy(
@@ -754,6 +766,14 @@ impl PyMooncakeDistributedStore {
                                         match result {
                                             Ok(_) | Err(StoreError::Conflict(_)) => 0,
                                             Err(error) => {
+                                                eprintln!(
+                                                    "[mooncake-store] batch_put_from per-key failed runtime={} key={} bytes={} elapsed_ms={} error={}",
+                                                    client.runtime_id(),
+                                                    key,
+                                                    size,
+                                                    item_started.elapsed().as_millis(),
+                                                    error
+                                                );
                                                 tracing::debug!(
                                                     key = %key,
                                                     error = %error,

@@ -8,6 +8,18 @@ impl StoreClient {
         }
     }
 
+    fn describe_write_targets(targets: &[ReplicaWriteTarget]) -> String {
+        let mut parts = targets
+            .iter()
+            .take(8)
+            .map(|target| format!("{}:{}", target.storage_runtime, target.segment_name.0))
+            .collect::<Vec<_>>();
+        if targets.len() > parts.len() {
+            parts.push(format!("+{} more", targets.len() - parts.len()));
+        }
+        parts.join(",")
+    }
+
     fn segment_name(&self) -> Result<SegmentName> {
         self.lease
             .endpoints
@@ -141,18 +153,45 @@ impl StoreClient {
                         );
                         let submit_result = transport.submit_with_hints(batch_id, chunk, &hints);
                         if let Err(error) = submit_result {
+                            eprintln!(
+                                "[mooncake-store] remote put submit failed runtime={} batch_id={} transfers={} bytes={} targets={} error={}",
+                                self.lease.runtime,
+                                batch_id,
+                                chunk.len(),
+                                chunk.len() * value.len(),
+                                Self::describe_write_targets(targets),
+                                error
+                            );
                             let _ = transport.free_batch(batch_id);
                             return Err(error);
                         }
+                        let request_timeout_ms = request_deadline
+                            .instant()
+                            .saturating_duration_since(Instant::now())
+                            .as_millis();
                         let wait_result = wait_for_batch_completion_detailed(
                             transport,
                             batch_id,
                             self.transfer_stall_timeout,
                             request_deadline.instant(),
-                        )
-                        .map_err(StoreError::from);
+                        );
                         let free_result = transport.free_batch(batch_id);
-                        wait_result?;
+                        if let Err(error) = wait_result {
+                            let store_error = StoreError::from(error.clone());
+                            eprintln!(
+                                "[mooncake-store] remote put wait failed runtime={} batch_id={} transfers={} bytes={} stall_timeout_ms={} request_timeout_ms={} mark_suspect={} targets={} error={}",
+                                self.lease.runtime,
+                                batch_id,
+                                chunk.len(),
+                                chunk.len() * value.len(),
+                                self.transfer_stall_timeout.as_millis(),
+                                request_timeout_ms,
+                                error.marks_runtime_suspect(),
+                                Self::describe_write_targets(targets),
+                                store_error
+                            );
+                            return Err(store_error);
+                        }
                         free_result?;
                     }
                     Ok(())
@@ -668,6 +707,8 @@ impl StoreClient {
                     }
 
                     struct RemoteBatchTarget {
+                        owner: ClientRuntimeId,
+                        segment_name: SegmentName,
                         segment: u64,
                         offset: u64,
                         length: u64,
@@ -730,6 +771,8 @@ impl StoreClient {
                             entry.value.len() as u64,
                         )?;
                         remote_requests.push(RemoteBatchTarget {
+                            owner: target.storage_runtime.clone(),
+                            segment_name: target.segment_name.clone(),
                             segment: handle,
                             offset: target_offset,
                             length: entry.value.len() as u64,
@@ -889,6 +932,23 @@ impl StoreClient {
                         scratch_position += 1;
                     }
                 }
+                let mut target_parts = selected
+                    .iter()
+                    .flat_map(|index| {
+                        remote_writes[*index].requests.iter().map(|request| {
+                            format!("{}:{}", request.owner, request.segment_name.0)
+                        })
+                    })
+                    .take(8)
+                    .collect::<Vec<_>>();
+                let target_count = selected
+                    .iter()
+                    .map(|index| remote_writes[*index].requests.len())
+                    .sum::<usize>();
+                if target_count > target_parts.len() {
+                    target_parts.push(format!("+{} more", target_count - target_parts.len()));
+                }
+                let target_summary = target_parts.join(",");
                 let batch_id = transport.allocate_batch(transfer_requests.len())?;
                 let request_deadline =
                     self.request_deadline_for_transfer(remote_bytes, transfer_requests.len());
@@ -900,18 +960,49 @@ impl StoreClient {
                 let submit_result =
                     transport.submit_with_hints(batch_id, &transfer_requests, &hints);
                 if let Err(error) = submit_result {
+                    eprintln!(
+                        "[mooncake-store] remote batch put submit failed runtime={} batch_id={} tenant={} items={} transfers={} bytes={} targets={} error={}",
+                        self.lease.runtime,
+                        batch_id,
+                        tenant,
+                        selected.len(),
+                        transfer_requests.len(),
+                        remote_bytes,
+                        target_summary,
+                        error
+                    );
                     let _ = transport.free_batch(batch_id);
                     return Err(error);
                 }
+                let request_timeout_ms = request_deadline
+                    .instant()
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
                 let wait_result = wait_for_batch_completion_detailed(
                     transport,
                     batch_id,
                     self.transfer_stall_timeout,
                     request_deadline.instant(),
-                )
-                .map_err(StoreError::from);
+                );
                 let free_result = transport.free_batch(batch_id);
-                wait_result?;
+                if let Err(error) = wait_result {
+                    let store_error = StoreError::from(error.clone());
+                    eprintln!(
+                        "[mooncake-store] remote batch put wait failed runtime={} batch_id={} tenant={} items={} transfers={} bytes={} stall_timeout_ms={} request_timeout_ms={} mark_suspect={} targets={} error={}",
+                        self.lease.runtime,
+                        batch_id,
+                        tenant,
+                        selected.len(),
+                        transfer_requests.len(),
+                        remote_bytes,
+                        self.transfer_stall_timeout.as_millis(),
+                        request_timeout_ms,
+                        error.marks_runtime_suspect(),
+                        target_summary,
+                        store_error
+                    );
+                    return Err(store_error);
+                }
                 free_result?;
                 registry::record_transport_bytes("write", "storage", remote_bytes);
                 cursor += selected.len();

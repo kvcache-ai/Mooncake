@@ -4,7 +4,7 @@ use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
     record_heartbeat_health, stable_phase_spread_ms, GetRequest, HealthChannel, HealthUpdate,
@@ -829,7 +829,6 @@ fn run_health_update(
             "store dispatcher {context} is still in flight"
         )));
     }
-    let inflight_for_timeout = inflight.clone();
     let executor_for_task = executor.clone();
     executor.block_on(async move {
         match tokio::time::timeout(
@@ -845,13 +844,7 @@ fn run_health_update(
             Ok(Err(error)) => Err(StoreError::Transport(format!(
                 "store dispatcher worker failed: {error}"
             ))),
-            Err(_) => {
-                // Timeout fired but spawn_blocking task still holds InflightGuard.
-                // Reset flag to prevent livelock — the orphaned guard's Drop will
-                // harmlessly store(false) again when it eventually completes.
-                inflight_for_timeout.store(false, Ordering::SeqCst);
-                Err(dispatcher_timeout(context, timeout))
-            }
+            Err(_) => Err(dispatcher_timeout(context, timeout)),
         }
     })
 }
@@ -1058,6 +1051,7 @@ fn execute_batch_put_from(
                 let regions = regions.lock();
                 match resolve_shared_slice(&regions, client_id, buffer) {
                     Ok(payload) => {
+                        let started = Instant::now();
                         let result = match policy.as_ref() {
                             Some(policy) => client
                                 .put_in_tenant_with_policy(&tenant, &item.key, payload, policy),
@@ -1066,6 +1060,16 @@ fn execute_batch_put_from(
                         if result.is_ok() {
                             0
                         } else {
+                            if let Err(error) = result {
+                                eprintln!(
+                                    "[mooncake-store] dummy batch_put_from per-key failed runtime={} key={} bytes={} elapsed_ms={} error={}",
+                                    client.runtime_id(),
+                                    item.key,
+                                    payload.len(),
+                                    started.elapsed().as_millis(),
+                                    error
+                                );
+                            }
                             -1
                         }
                     }
@@ -1118,9 +1122,21 @@ fn execute_batch_put_from_multi_buffers(
                     if let Some(policy) = policy.clone() {
                         request = request.replication(policy);
                     }
+                    let bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+                    let started = Instant::now();
                     match client.batch_put_from_multi_buffers(std::slice::from_ref(&request)) {
                         Ok(_) => 0,
-                        Err(_) => -1,
+                        Err(error) => {
+                            eprintln!(
+                                "[mooncake-store] dummy batch_put_from_multi_buffers per-key failed runtime={} key={} bytes={} elapsed_ms={} error={}",
+                                client.runtime_id(),
+                                item.key,
+                                bytes,
+                                started.elapsed().as_millis(),
+                                error
+                            );
+                            -1
+                        }
                     }
                 }
             }
