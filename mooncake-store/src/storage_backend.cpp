@@ -1764,6 +1764,13 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
+    // When eviction is enabled, always allow offloading since PrepareEviction
+    // will manage capacity by evicting old buckets as needed.
+    if (bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE &&
+        bucket_backend_config_.max_total_size > 0) {
+        return true;
+    }
+
     auto store_metadata_result = GetStoreMetadata();
     if (!store_metadata_result) {
         LOG(ERROR) << "Failed to get store metadata: "

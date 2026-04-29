@@ -2135,10 +2135,40 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                    << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    local_disk_segment_it->second->enable_offloading = enable_offloading;
-    if (enable_offloading) {
-        return std::move(local_disk_segment_it->second->offloading_objects);
+    std::unordered_map<std::string, int64_t> offloading_objects_copy;
+    {
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        local_disk_segment_it->second->enable_offloading = enable_offloading;
+        if (enable_offloading) {
+            return std::move(local_disk_segment_it->second->offloading_objects);
+        }
+        // Offloading is disabled: clear the pending queue to prevent
+        // unbounded growth that would trigger KEYS_ULTRA_LIMIT in
+        // PushOffloadingQueue. We must also clean up corresponding
+        // offloading_tasks and decrement source replica refcounts to avoid
+        // resource leaks and blocked writes (OBJECT_HAS_REPLICATION_TASK).
+        // Copy keys out before releasing the mutex to avoid lock order
+        // violation: the lock order is Shard Lock -> offloading_mutex_, so we
+        // must release offloading_mutex_ before taking shard locks via
+        // MetadataAccessorRW.
+        offloading_objects_copy =
+            std::move(local_disk_segment_it->second->offloading_objects);
+    }
+
+    for (auto& [key, size] : offloading_objects_copy) {
+        MetadataAccessorRW accessor(this, key);
+        if (accessor.Exists()) {
+            auto& shard = accessor.GetShard();
+            auto task_it = shard->offloading_tasks.find(key);
+            if (task_it != shard->offloading_tasks.end()) {
+                auto source =
+                    accessor.Get().GetReplicaByID(task_it->second.source_id);
+                if (source) {
+                    source->dec_refcnt();
+                }
+                shard->offloading_tasks.erase(task_it);
+            }
+        }
     }
     return {};
 }

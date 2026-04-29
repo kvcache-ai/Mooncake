@@ -58,6 +58,19 @@ add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
 target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main)
 add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
 
+if(USE_SUNRISE)
+  add_executable(tent_sunrise_link_transport_test
+                 sunrise_link_transport_test.cpp)
+  target_link_libraries(tent_sunrise_link_transport_test PRIVATE gtest
+                                                                 gtest_main
+                                                                 tent_link_group)
+  target_include_directories(
+    tent_sunrise_link_transport_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+  add_test(NAME tent_sunrise_link_transport_test
+           COMMAND tent_sunrise_link_transport_test)
+endif()
 add_executable(tent_fault_proxy_test fault_proxy_test.cpp)
 target_link_libraries(tent_fault_proxy_test PRIVATE gtest gtest_main
                                                      tent_link_group)

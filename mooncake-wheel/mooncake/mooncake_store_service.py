@@ -23,6 +23,15 @@ def _timed_handler(operation_name, handler):
     return wrapper
 
 
+def _shm_name_to_path(name):
+    if not isinstance(name, str) or not name:
+        return None
+    normalized = name[1:] if name.startswith("/") else name
+    if not normalized or "/" in normalized or normalized in {".", ".."}:
+        return None
+    return f"/dev/shm/{normalized}"
+
+
 class MooncakeStoreService:
     """
     Mooncake Store Service with REST API.
@@ -52,6 +61,12 @@ class MooncakeStoreService:
         self.store = None
         self.config = None
         self._setup_logging()
+
+        # State for /api/reconfigure (Prefill/Decode mode switch)
+        self.current_mode = "prefill"          # "prefill" or "decode"
+        self.mounted_segment_ids = []          # persisted segment_ids from last decode mount
+        self.last_mount_info = {}              # last mount parameters for debugging
+        self._state_lock = asyncio.Lock()      # serialize reconfigure/mount/unmount state changes
 
         try:
             if config_path:
@@ -143,6 +158,9 @@ class MooncakeStoreService:
     async def start_http_service(self, port: int = 8080):
         app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
         app.add_routes([
+            web.post('/api/reconfigure', _timed_handler("RECONFIGURE", self.handle_reconfigure)),
+            web.post('/api/mount_shm', _timed_handler("MOUNT_SHM", self.handle_mount_shm)),
+            web.post('/api/unmount_shm', _timed_handler("UNMOUNT_SHM", self.handle_unmount_shm)),
             web.put('/api/put', _timed_handler("PUT", self.handle_put)),
             web.get('/api/get/{key}', _timed_handler("GET", self.handle_get)),
             web.get('/api/exist/{key}', _timed_handler("EXIST", self.handle_exist)),
@@ -157,6 +175,202 @@ class MooncakeStoreService:
         return True
 
     # REST API handlers
+    async def handle_reconfigure(self, request):
+        try:
+            data = await request.json()
+            mode = data.get("mode", "").lower()
+
+            if mode == "decode":
+                path = data.get("path")
+                size = data.get("size")
+                offset = data.get("offset", 0)
+                protocol = data.get("protocol", self.config.protocol)
+                location = data.get("location", "")
+
+                if not path or size is None:
+                    return web.Response(
+                        status=400,
+                        text=json.dumps({"error": "Missing path or size for decode mode"}),
+                        content_type="application/json"
+                    )
+
+                async with self._state_lock:
+                    # If already in decode mode with mounted segments, unmount them first
+                    if self.mounted_segment_ids:
+                        logging.info("Reconfigure decode: unmounting previous segments before remount")
+                        ret = self.store.unmount_segment(self.mounted_segment_ids)
+                        if ret != 0:
+                            return web.Response(
+                                status=500,
+                                text=json.dumps({"error": f"Unmount of previous segments failed, ret={ret}"}),
+                                content_type="application/json"
+                            )
+                        self.mounted_segment_ids.clear()
+
+                    result = self.store.mount_segment(path, size, offset, protocol, location)
+                    if result["ret"] != 0:
+                        self.current_mode = "prefill"
+                        self.mounted_segment_ids.clear()
+                        self.last_mount_info.clear()
+                        return web.Response(
+                            status=500,
+                            text=json.dumps(
+                                {
+                                    "error": (
+                                        f"Mount failed, ret={result['ret']}; "
+                                        "rolled back to prefill"
+                                    ),
+                                    "mode": self.current_mode,
+                                }
+                            ),
+                            content_type="application/json"
+                        )
+
+                    self.mounted_segment_ids = list(result["segment_ids"])
+                    self.current_mode = "decode"
+                    self.last_mount_info = {
+                        "path": path, "offset": offset, "size": size,
+                        "protocol": protocol, "location": location
+                    }
+
+                return web.Response(
+                    status=200,
+                    text=json.dumps({
+                        "status": "success",
+                        "mode": self.current_mode,
+                        "segment_ids": self.mounted_segment_ids,
+                    }),
+                    content_type="application/json"
+                )
+
+            elif mode == "prefill":
+                async with self._state_lock:
+                    if self.mounted_segment_ids:
+                        ret = self.store.unmount_segment(self.mounted_segment_ids)
+                        if ret != 0:
+                            return web.Response(
+                                status=500,
+                                text=json.dumps({"error": f"Unmount failed, ret={ret}"}),
+                                content_type="application/json"
+                            )
+                        self.mounted_segment_ids.clear()
+
+                    self.current_mode = "prefill"
+                    self.last_mount_info.clear()
+
+                return web.Response(
+                    status=200,
+                    text=json.dumps({"status": "success", "mode": self.current_mode}),
+                    content_type="application/json"
+                )
+
+            else:
+                return web.Response(
+                    status=400,
+                    text=json.dumps({"error": "Invalid mode. Use 'decode' or 'prefill'"}),
+                    content_type="application/json"
+                )
+        except Exception as e:
+            logging.error("RECONFIGURE error: %s", e)
+            return web.Response(
+                status=500,
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json"
+            )
+
+    async def handle_mount_shm(self, request):
+        try:
+            data = await request.json()
+            name = data.get("name")
+            path = _shm_name_to_path(name)
+            offset = data.get("offset", 0)
+            size = data.get("size")
+            protocol = data.get("protocol", self.config.protocol)
+            location = data.get("location", "")
+
+            if not path or size is None:
+                return web.Response(
+                    status=400,
+                    text=json.dumps({"error": "Missing or invalid name or size"}),
+                    content_type="application/json"
+                )
+
+            result = self.store.mount_segment(path, size, offset, protocol, location)
+            if result["ret"] != 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({"error": f"Mount failed, ret={result['ret']}"}),
+                    content_type="application/json"
+                )
+
+            return web.Response(
+                status=200,
+                text=json.dumps(
+                    {
+                        "status": "success",
+                        "segment_ids": list(result["segment_ids"]),
+                    }
+                ),
+                content_type="application/json",
+            )
+        except Exception as e:
+            logging.error("MOUNT_SHM error: %s", e)
+            return web.Response(
+                status=500,
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json"
+            )
+
+    async def handle_unmount_shm(self, request):
+        try:
+            data = await request.json()
+            segment_ids = data.get("segment_ids", [])
+            if isinstance(segment_ids, str):
+                segment_ids = [segment_ids]
+            if not segment_ids:
+                return web.Response(
+                    status=400,
+                    text=json.dumps({"error": "Missing segment_ids"}),
+                    content_type="application/json",
+                )
+
+            failed_segment_ids = []
+            async with self._state_lock:
+                for sid in segment_ids:
+                    ret = self.store.unmount_segment([sid])
+                    if ret != 0:
+                        failed_segment_ids.append(sid)
+                        continue
+                    if sid in self.mounted_segment_ids:
+                        self.mounted_segment_ids.remove(sid)
+                if not self.mounted_segment_ids:
+                    self.current_mode = "prefill"
+
+            if failed_segment_ids:
+                return web.Response(
+                    status=500,
+                    text=json.dumps(
+                        {
+                            "error": "Unmount failed for one or more segments",
+                            "failed_segment_ids": failed_segment_ids,
+                        }
+                    ),
+                    content_type="application/json",
+                )
+
+            return web.Response(
+                status=200,
+                text=json.dumps({"status": "success"}),
+                content_type="application/json",
+            )
+        except Exception as e:
+            logging.error("UNMOUNT_SHM error: %s", e)
+            return web.Response(
+                status=500,
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json"
+            )
+
     async def handle_put(self, request):
         try:
             data = await request.json()

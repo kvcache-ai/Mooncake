@@ -167,7 +167,7 @@ Transfer Engine provides batch-based read/write transfers between segments (DRAM
 ### Multi-Transport Management
 
 The `TransferEngine` class internally manages multiple backend `Transport` classes.
-And it will discover the toplogy between CPU/CUDA and RDMA devices automatically
+And it will discover the topology between CPU/CUDA and RDMA devices automatically
 (more device types are working in progress, feedbacks are welcome when the automatic discovery mechanism is not accurate),
 and it will install `Transport` automatically based on the topology.
 
@@ -305,7 +305,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
-- `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets. 
+- `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
 
 ## C++ API Reference
 
@@ -331,6 +331,14 @@ efa_transport
 ascend_direct_transport
 ascend_transport
 heterogeneous_ascend
+:::
+
+## Sunrise Link Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+sunrise_link_transport
 :::
 
 ## Benchmark and Tuning Guide

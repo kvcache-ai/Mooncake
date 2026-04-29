@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <csignal>
+#include <mutex>
+#include <unordered_map>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "pyclient.h"
@@ -179,6 +181,15 @@ class DummyClient : public PyClient {
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
 
+#if defined(USE_ASCEND_DIRECT)
+    int register_device_buffer_for_reconnect(void *buffer, size_t size);
+
+    int unregister_device_buffer_for_reconnect(void *buffer);
+
+    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
+    get_registered_device_buffers() const;
+#endif
+
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -275,6 +286,11 @@ class DummyClient : public PyClient {
     std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
     std::atomic<bool> connected_{false};
+
+#if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex registered_device_buffers_mutex_;
+    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+#endif
 
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
     int32_t device_id_ = 0;

@@ -14,6 +14,103 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
+
+fn push_existing_dir(search_dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if dir.is_dir() && !search_dirs.iter().any(|existing| existing == &dir) {
+        search_dirs.push(dir);
+    }
+}
+
+fn push_env_paths(search_dirs: &mut Vec<PathBuf>, name: &str) {
+    if let Some(value) = env::var_os(name) {
+        for dir in env::split_paths(&value) {
+            push_existing_dir(search_dirs, dir);
+        }
+    }
+}
+
+fn has_library(search_dirs: &[PathBuf], candidates: &[&str]) -> bool {
+    search_dirs.iter().any(|dir| {
+        candidates.iter().any(|candidate| {
+            ["a", "so", "dylib"]
+                .into_iter()
+                .map(|ext| dir.join(format!("lib{candidate}.{ext}")))
+                .any(|path| path.exists())
+        })
+    })
+}
+
+fn emit_link_searches(search_dirs: &[PathBuf]) {
+    for dir in search_dirs {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+}
+
+fn emit_runtime_rpaths(search_dirs: &[PathBuf]) {
+    for dir in search_dirs {
+        let dir_str = dir.display();
+        println!("cargo:rustc-link-arg-tests=-Wl,-rpath,{dir_str}");
+        println!("cargo:rustc-link-arg-examples=-Wl,-rpath,{dir_str}");
+    }
+}
+
+fn compiler_candidates() -> Vec<String> {
+    let mut tools = Vec::new();
+
+    for env_var in ["CC", "CXX"] {
+        if let Ok(value) = env::var(env_var) {
+            let tool = value.trim();
+            if !tool.is_empty() && !tools.iter().any(|existing| existing == tool) {
+                tools.push(tool.to_string());
+            }
+        }
+    }
+
+    for tool in ["gcc", "cc", "clang", "c++"] {
+        if !tools.iter().any(|existing| existing == tool) {
+            tools.push(tool.to_string());
+        }
+    }
+
+    tools
+}
+
+fn compiler_runtime_library(file_name: &str) -> Option<PathBuf> {
+    for tool in compiler_candidates() {
+        let output = Command::new(&tool)
+            .arg(format!("-print-file-name={file_name}"))
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let path = String::from_utf8(output.stdout).ok()?;
+        let path = PathBuf::from(path.trim());
+        if path.as_os_str().is_empty() || path == PathBuf::from(file_name) || !path.exists() {
+            continue;
+        }
+
+        return Some(path);
+    }
+
+    None
+}
+
+fn add_compiler_runtime_search_dir(search_dirs: &mut Vec<PathBuf>, file_name: &str) -> bool {
+    let Some(path) = compiler_runtime_library(file_name) else {
+        return false;
+    };
+
+    if let Some(parent) = path.parent() {
+        push_existing_dir(search_dirs, parent.to_path_buf());
+        return true;
+    }
+
+    false
+}
 
 fn main() {
     // -----------------------------------------------------------------------
@@ -88,19 +185,116 @@ fn main() {
     // -----------------------------------------------------------------------
     // Header path for bindgen
     // -----------------------------------------------------------------------
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
+    let mut search_dirs = Vec::new();
+
+    let explicit_lib_dir = env::var("MOONCAKE_STORE_LIB_DIR").ok().map(PathBuf::from);
+    if let Some(dir) = explicit_lib_dir.clone() {
+        push_existing_dir(&mut search_dirs, dir);
+    }
+
+    if let Ok(build_dir) = env::var("MOONCAKE_BUILD_DIR") {
+        let build_dir = PathBuf::from(build_dir);
+        for dir in [
+            build_dir.join("mooncake-store/src"),
+            build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
+            build_dir.join("mooncake-transfer-engine/src"),
+            build_dir.join("mooncake-transfer-engine/src/common/base"),
+            build_dir.join("mooncake-asio"),
+            build_dir.join("mooncake-common/etcd"),
+        ] {
+            push_existing_dir(&mut search_dirs, dir);
+        }
+    }
+
+    let default_build_dir = manifest_dir.join("../../build");
+    for dir in [
+        default_build_dir.join("mooncake-store/src"),
+        default_build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
+        default_build_dir.join("mooncake-transfer-engine/src"),
+        default_build_dir.join("mooncake-transfer-engine/src/common/base"),
+        default_build_dir.join("mooncake-asio"),
+        default_build_dir.join("mooncake-common/etcd"),
+        PathBuf::from("/usr/local/lib"),
+        PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+        PathBuf::from("/lib/x86_64-linux-gnu"),
+    ] {
+        push_existing_dir(&mut search_dirs, dir);
+    }
+
+    push_env_paths(&mut search_dirs, "LD_LIBRARY_PATH");
+    push_env_paths(&mut search_dirs, "LIBRARY_PATH");
+
+    let asan_runtime_so = compiler_runtime_library("libasan.so");
+    if let Some(path) = asan_runtime_so.as_ref() {
+        if let Some(parent) = path.parent() {
+            push_existing_dir(&mut search_dirs, parent.to_path_buf());
+        }
+    }
+    let has_asan_runtime = asan_runtime_so.is_some()
+        || add_compiler_runtime_search_dir(&mut search_dirs, "libasan.a");
+    let has_gcov_runtime = add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.a")
+        || add_compiler_runtime_search_dir(&mut search_dirs, "libgcov.so");
+
+    emit_link_searches(&search_dirs);
+    emit_runtime_rpaths(&search_dirs);
+
+    if has_asan_runtime || has_library(&search_dirs, &["asan"]) {
+        println!("cargo:rustc-link-lib=asan");
+    }
+
+    for library in [
+        "mooncake_store",
+        "cachelib_memory_allocator",
+        "transfer_engine",
+        "base",
+        "asio",
+        "stdc++",
+        "glog",
+        "gflags",
+        "pthread",
+        "xxhash",
+        "numa",
+        "ibverbs",
+        "jsoncpp",
+        "zstd",
+        "m",
+    ] {
+        println!("cargo:rustc-link-lib={library}");
+    }
+
+    for (link_name, candidates) in [
+        ("etcd_wrapper", &["etcd_wrapper"] as &[&str]),
+        ("hiredis", &["hiredis"]),
+        ("curl", &["curl"]),
+        ("cudart", &["cudart"]),
+        ("uring", &["uring"]),
+    ] {
+        if has_library(&search_dirs, candidates) {
+            println!("cargo:rustc-link-lib={link_name}");
+        }
+    }
+
+    if has_gcov_runtime || has_library(&search_dirs, &["gcov"]) {
+        println!("cargo:rustc-link-lib=gcov");
+    }
+
     let include_dir = env::var("MOONCAKE_STORE_INCLUDE_DIR")
         .unwrap_or_else(|_| "../include".to_string());
 
     let header = format!("{include_dir}/store_c.h");
 
-    // Re-run this build script if the C header changes.
     println!("cargo:rerun-if-changed={header}");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=MOONCAKE_STORE_LIB_DIR");
     println!("cargo:rerun-if-env-changed=MOONCAKE_STORE_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=CXX");
 
     let bindings = bindgen::Builder::default()
         .header(&header)
-        // Only pull in declarations from store_c.h (no transitive system headers).
         .allowlist_function("mooncake_store_.*")
         .allowlist_type("mooncake_.*")
         .generate()

@@ -118,7 +118,7 @@ if(USE_3FS)
   if(NOT HF3FS_API_LIB)
     message(FATAL_ERROR "hf3fs_api_shared library not found in /usr/lib")
   endif()
-  set(EXTRA_LIBS ${HF3FS_API_LIB})
+  list(APPEND EXTRA_LIBS ${HF3FS_API_LIB})
 endif()
 
 # io_uring support (auto-detected)

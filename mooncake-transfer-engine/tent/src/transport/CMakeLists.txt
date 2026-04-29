@@ -7,18 +7,22 @@ add_subdirectory(gds)
 add_subdirectory(io_uring)
 add_subdirectory(bufio)
 add_subdirectory(ascend)
+add_subdirectory(sunrise_link)
 
 add_library(tent_transport_all INTERFACE)
-foreach(tgt tent_xport_gds
-            tent_xport_uring
-            tent_xport_bufio
-            tent_xport_mnnvl
-            tent_xport_nvlink
-            tent_xport_rdma
-            tent_xport_shm
-            tent_xport_tcp
-            tent_xport_ascend_direct)
-    if (TARGET ${tgt})
-        target_link_libraries(tent_transport_all INTERFACE ${tgt})
-    endif()
+foreach(
+  tgt
+  tent_xport_gds
+  tent_xport_uring
+  tent_xport_bufio
+  tent_xport_mnnvl
+  tent_xport_nvlink
+  tent_xport_rdma
+  tent_xport_shm
+  tent_xport_tcp
+  tent_xport_ascend_direct
+  tent_xport_sunrise_link)
+  if(TARGET ${tgt})
+    target_link_libraries(tent_transport_all INTERFACE ${tgt})
+  endif()
 endforeach()
