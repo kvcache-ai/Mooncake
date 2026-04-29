@@ -1812,6 +1812,10 @@ impl StoreClient {
             }
         }
         for runtime in failed_runtimes {
+            eprintln!(
+                "[mooncake-store] marking remote write target suspect runtime={} context={} error={}",
+                runtime, context, error
+            );
             self.mark_runtime_suspect(&runtime, context);
         }
         let _ = refresh_live_client_cache(
