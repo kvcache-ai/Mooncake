@@ -276,7 +276,8 @@ These are compatibility bridges because current upstream SGLang does not forward
 - `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
 - `MC_STORE_RS_TRACE_FILE=/path/to/real-client.log` to append real-client Rust logs to a dedicated file instead of the SGLang process stream
-- `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC capacity; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC client capacity; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS=<n>` to tune embedded control-plane gRPC server capacity; default `4`
 
 `MC_STORE_RS_LABELS` accepts either a JSON object or comma-separated `key=value` pairs, for example `MC_STORE_RS_LABELS='storage=false,pool=rw'`.
 

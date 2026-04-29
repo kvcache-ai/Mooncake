@@ -277,7 +277,8 @@ Heartbeat behavior:
 - heartbeat publish uses a dedicated timeout instead of the generic request deadline
 - a single failed heartbeat no longer exits the standalone client process
 - failed heartbeat publishes are retried on a short backoff
-- `MC_STORE_RS_CONTROL_PLANE_THREADS` sets the worker count of the shared control-plane RPC runtime; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_THREADS` sets the worker count of the shared control-plane RPC client runtime; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS` sets the worker count of the embedded control-plane gRPC server runtime; default `4`
 
 ## Metadata Maintenance
 
@@ -747,7 +748,8 @@ Current upstream SGLang only forwards legacy Mooncake setup fields. When SGLang 
 - `MC_STORE_RS_TRANSPORT_METADATA_URL` (`redis://...` by default, or `P2PHANDSHAKE` with `classic_te`), `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port`
-- `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC capacity; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC client capacity; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS=<n>` to tune embedded control-plane gRPC server capacity; default `4`
 
 Explicit `setup(...)` arguments still take precedence. `MC_STORE_RS_METRICS_ADDR` starts the Python real-client `/metrics` endpoint after `setup(...)`. `MC_STORE_RS_LABELS` accepts either JSON (`{"storage":"false","pool":"rw"}`) or comma-separated pairs (`storage=false,pool=rw`).
 

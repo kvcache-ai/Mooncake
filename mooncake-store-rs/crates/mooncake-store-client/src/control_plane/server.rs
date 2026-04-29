@@ -1,6 +1,9 @@
 use super::codec::*;
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
+use std::time::Instant;
+
+const SLOW_CONTROL_REQUEST_LOG_THRESHOLD: Duration = Duration::from_millis(1000);
 
 pub(crate) struct ControlPlaneHandle {
     address: String,
@@ -44,7 +47,10 @@ impl ControlPlaneHandle {
                 StoreError::Transport(format!("control plane local addr failed: {error}"))
             })?
             .to_string();
-        let runtime = RuntimeBuilder::new_current_thread()
+        let server_threads = control_plane_server_threads_from_env();
+        let runtime = RuntimeBuilder::new_multi_thread()
+            .worker_threads(server_threads)
+            .thread_name("mooncake-control-server")
             .enable_all()
             .build()
             .map_err(|error| {
@@ -83,6 +89,44 @@ impl ControlPlaneHandle {
             let _ = shutdown.send(());
         }
         let _ = self.thread.take();
+    }
+}
+
+pub(super) fn control_plane_server_threads_from_env() -> usize {
+    let Some(raw) = std::env::var(CONTROL_PLANE_SERVER_THREADS_ENV).ok() else {
+        return DEFAULT_CONTROL_PLANE_SERVER_THREADS;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_CONTROL_PLANE_SERVER_THREADS;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(threads) if threads > 0 => threads,
+        _ => {
+            warn!(
+                env = CONTROL_PLANE_SERVER_THREADS_ENV,
+                value = trimmed,
+                default = DEFAULT_CONTROL_PLANE_SERVER_THREADS,
+                "invalid control-plane server runtime thread count; falling back to default"
+            );
+            DEFAULT_CONTROL_PLANE_SERVER_THREADS
+        }
+    }
+}
+
+#[derive(Default)]
+struct ControlPlaneServerStats {
+    active_streams: AtomicUsize,
+    inflight_requests: AtomicUsize,
+}
+
+struct ActiveControlStream {
+    stats: Arc<ControlPlaneServerStats>,
+}
+
+impl Drop for ActiveControlStream {
+    fn drop(&mut self) {
+        self.stats.active_streams.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -128,6 +172,7 @@ pub(super) struct GrpcControlPlaneService {
     allocator: Arc<dyn AllocatorService>,
     eviction: Arc<dyn EvictionService>,
     migration: Arc<dyn MigrationService>,
+    stats: Arc<ControlPlaneServerStats>,
 }
 
 impl GrpcControlPlaneService {
@@ -155,6 +200,7 @@ impl GrpcControlPlaneService {
             allocator,
             eviction,
             migration,
+            stats: Arc::new(ControlPlaneServerStats::default()),
         }
     }
 }
@@ -722,10 +768,37 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         );
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
+        let stats = self.stats.clone();
+        let active_streams = stats.active_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        debug!(active_streams, "control stream opened");
         tokio::spawn(async move {
+            let _active = ActiveControlStream {
+                stats: stats.clone(),
+            };
             loop {
                 let reply = match inbound.next().await {
-                    Some(Ok(request)) => handle_control_stream_request(&service, request).await,
+                    Some(Ok(request)) => {
+                        let operation = control_stream_request_operation(&request);
+                        let started = Instant::now();
+                        let inflight = stats.inflight_requests.fetch_add(1, Ordering::Relaxed) + 1;
+                        let reply = handle_control_stream_request(&service, request).await;
+                        let elapsed = started.elapsed();
+                        let remaining = stats
+                            .inflight_requests
+                            .fetch_sub(1, Ordering::Relaxed)
+                            .saturating_sub(1);
+                        if elapsed >= SLOW_CONTROL_REQUEST_LOG_THRESHOLD {
+                            warn!(
+                                operation,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                inflight_at_start = inflight,
+                                inflight_after = remaining,
+                                active_streams = stats.active_streams.load(Ordering::Relaxed),
+                                "slow control stream request"
+                            );
+                        }
+                        reply
+                    }
                     Some(Err(status)) => {
                         let _ = tx.send(Err(status)).await;
                         break;
@@ -738,6 +811,29 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+fn control_stream_request_operation(request: &pb::ControlStreamRequest) -> &'static str {
+    match request.body.as_ref() {
+        Some(pb::control_stream_request::Body::RouteGet(_)) => "batch_get_routes",
+        Some(pb::control_stream_request::Body::RouteCas(_)) => "batch_compare_and_swap_routes",
+        Some(pb::control_stream_request::Body::RouteListByReplicaOwner(_)) => {
+            "list_routes_by_replica_owner"
+        }
+        Some(pb::control_stream_request::Body::EvictionReportRouteHits(_)) => {
+            "batch_report_route_hits"
+        }
+        Some(pb::control_stream_request::Body::EvictionTrackReplicaRoutes(_)) => {
+            "batch_track_replica_routes"
+        }
+        Some(pb::control_stream_request::Body::RouteReplace(_)) => "batch_replace_routes",
+        Some(pb::control_stream_request::Body::AllocatorReserveAny(_)) => "batch_reserve_any",
+        Some(pb::control_stream_request::Body::AllocatorReserveSpecific(_)) => {
+            "batch_reserve_specific"
+        }
+        Some(pb::control_stream_request::Body::AllocatorRelease(_)) => "batch_release",
+        None => "missing_body",
     }
 }
 

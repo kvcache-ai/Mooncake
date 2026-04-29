@@ -10,14 +10,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 
 use super::{
-    control_address, control_address_label, decode_error, ensure_batch_len, fail_stream_session,
-    handle_control_stream_request, normalize_control_uri, pb_cas_result, pb_compatibility,
-    pb_error, pb_object_route, pb_replica_route, pb_replica_tier, pb_route_state, pb_runtime_id,
-    pb_segment_reservation, status_to_store_error, store_error_from_pb, try_cas_result,
-    try_compatibility, try_object_route, try_replica_route, try_replica_tier, try_route_state,
-    try_runtime_id, try_segment_reservation, AllocatorService, AuthorityService,
-    ControlPlaneClient, ControlPlaneHandle, ControlStreamSession, EvictionService,
-    GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp, CONTROL_PLANE_THREADS_ENV,
+    control_address, control_address_label, control_plane_server_threads_from_env, decode_error,
+    ensure_batch_len, fail_stream_session, handle_control_stream_request, normalize_control_uri,
+    pb_cas_result, pb_compatibility, pb_error, pb_object_route, pb_replica_route, pb_replica_tier,
+    pb_route_state, pb_runtime_id, pb_segment_reservation, status_to_store_error,
+    store_error_from_pb, try_cas_result, try_compatibility, try_object_route, try_replica_route,
+    try_replica_tier, try_route_state, try_runtime_id, try_segment_reservation, AllocatorService,
+    AuthorityService, ControlPlaneClient, ControlPlaneHandle, ControlStreamSession,
+    EvictionService, GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp,
+    CONTROL_PLANE_SERVER_THREADS_ENV, CONTROL_PLANE_THREADS_ENV,
 };
 use crate::control_plane::pb;
 use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
@@ -1305,6 +1306,25 @@ fn control_plane_client_runtime_threads_are_configurable_via_env() {
     with_env_var(CONTROL_PLANE_THREADS_ENV, Some("bad"), || {
         let client = ControlPlaneClient::new().expect("invalid env should fall back to default");
         drop(client);
+    });
+}
+
+#[test]
+fn control_plane_server_runtime_threads_are_configurable_via_env() {
+    with_env_var(CONTROL_PLANE_SERVER_THREADS_ENV, None, || {
+        assert_eq!(control_plane_server_threads_from_env(), 4);
+    });
+
+    with_env_var(CONTROL_PLANE_SERVER_THREADS_ENV, Some("16"), || {
+        assert_eq!(control_plane_server_threads_from_env(), 16);
+    });
+
+    with_env_var(CONTROL_PLANE_SERVER_THREADS_ENV, Some("0"), || {
+        assert_eq!(control_plane_server_threads_from_env(), 4);
+    });
+
+    with_env_var(CONTROL_PLANE_SERVER_THREADS_ENV, Some("bad"), || {
+        assert_eq!(control_plane_server_threads_from_env(), 4);
     });
 }
 
