@@ -438,6 +438,9 @@ impl MooncakeStore {
         config: Option<&ReplicateConfig>,
     ) -> Result<Vec<i32>, StoreError> {
         let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         if buffers.len() != count || sizes.len() != count {
             return Err(StoreError::InvalidArgument(
                 "keys, buffers, and sizes must have the same length".to_string(),
@@ -490,6 +493,9 @@ impl MooncakeStore {
         sizes: &[usize],
     ) -> Result<Vec<i64>, StoreError> {
         let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         if buffers.len() != count || sizes.len() != count {
             return Err(StoreError::InvalidArgument(
                 "keys, buffers, and sizes must have the same length".to_string(),

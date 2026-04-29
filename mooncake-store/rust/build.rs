@@ -177,8 +177,6 @@ fn main() {
     println!("cargo:rustc-link-lib=numa");   // NUMA binding
     println!("cargo:rustc-link-lib=curl");    // HTTP metadata plugin
     println!("cargo:rustc-link-lib=ibverbs"); // RDMA transport
-    println!("cargo:rustc-link-lib=cuda");
-    println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=xxhash");
 
@@ -267,6 +265,7 @@ fn main() {
         ("etcd_wrapper", &["etcd_wrapper"] as &[&str]),
         ("hiredis", &["hiredis"]),
         ("curl", &["curl"]),
+        ("cuda", &["cuda"]),
         ("cudart", &["cudart"]),
         ("uring", &["uring"]),
     ] {
