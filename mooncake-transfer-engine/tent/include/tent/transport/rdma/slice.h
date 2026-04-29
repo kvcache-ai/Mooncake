@@ -39,15 +39,8 @@ struct RdmaSliceList {
     int num_slices = 0;
 };
 
-struct RdmaTask {
-    int num_slices;
-    Request request;
-    volatile TransferStatusEnum status_word;
-    volatile size_t transferred_bytes;
-    volatile int success_slices;
-    volatile int resolved_slices;
-    volatile TransferStatusEnum first_error = PENDING;
-};
+// Forward declaration
+struct RdmaTask;
 
 class RdmaEndPoint;
 
@@ -74,6 +67,28 @@ struct RdmaSlice {
 };
 
 using RdmaSliceStorage = Slab<RdmaSlice>;
+using RdmaTaskStorage = Slab<RdmaTask>;
+
+struct RdmaTask {
+    int num_slices;
+    Request request;
+    volatile TransferStatusEnum status_word;
+    volatile size_t transferred_bytes;
+    volatile int success_slices;
+    volatile int resolved_slices;
+    volatile TransferStatusEnum first_error = PENDING;
+
+    // Reference counting for independent lifecycle management
+    // When ref_count reaches 0, the task is deallocated from Slab
+    std::atomic<int> ref_count{0};
+
+    void ref() { ref_count.fetch_add(1, std::memory_order_relaxed); }
+    void deref() {
+        if (ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            RdmaTaskStorage::Get().deallocate(this);
+        }
+    }
+};
 
 static inline void updateSliceStatus(RdmaSlice* slice,
                                      TransferStatusEnum status) {

@@ -300,6 +300,11 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
             slice = next;
         }
     }
+    rdma_batch->slice_chain.clear();
+    for (auto task : rdma_batch->task_list) {
+        task->deref();
+    }
+    rdma_batch->task_list.clear();
     Slab<RdmaSubBatch>::Get().deallocate(rdma_batch);
     batch = nullptr;
     return Status::OK();
@@ -336,12 +341,22 @@ Status RdmaTransport::submitTransferTasks(
         size_t max_slice_count = 64;
         if (type == MTYPE_CUDA || opcode == Request::WRITE)
             max_slice_count = 32;
-        rdma_batch->task_list.push_back(RdmaTask{});
-        auto& task = rdma_batch->task_list.back();
-        task.request = request;
-        task.num_slices = 0;
-        task.status_word = PENDING;
-        task.transferred_bytes = 0;
+        // Allocate task independently from Slab for separate lifecycle
+        // management
+        auto* task = RdmaTaskStorage::Get().allocate();
+        if (!task)
+            return Status::InternalError("Failed to allocate task" LOC_MARK);
+
+        task->request = request;
+        task->num_slices = 0;
+        task->status_word = PENDING;
+        task->transferred_bytes = 0;
+        task->success_slices = 0;
+        task->resolved_slices = 0;
+        task->first_error = PENDING;
+        task->ref_count = 0;
+
+        rdma_batch->task_list.push_back(task);
 
         const double merge_ratio = 0.25;
         uint64_t base_block = default_block_size;
@@ -371,13 +386,17 @@ Status RdmaTransport::submitTransferTasks(
             slice->source_addr = (char*)request.source + offset;
             slice->target_addr = request.target_offset + offset;
             slice->length = length;
-            slice->task = &task;
+            slice->task = task;
+            slice->priority = request.priority;
+            slice->device_mask = rdma_batch->device_mask;
             slice->retry_count = 0;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
             slice->next = nullptr;
             slice->enqueue_ts = enqueue_ts;
-            task.num_slices++;
+            slice->source_dev_id = slice_dev_ids[slice_idx];
+            task->num_slices++;
+            task->ref();  // Each slice holds a reference to the task
             offset += length;
             int part_id =
                 ((enable_spray ? submit_slices : static_cast<int>(slice_idx)) /
@@ -411,8 +430,8 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
     if (task_id < 0 || task_id >= (int)rdma_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
-    auto& task = rdma_batch->task_list[task_id];
-    status = TransferStatus{task.status_word, task.transferred_bytes};
+    auto* task = rdma_batch->task_list[task_id];
+    status = TransferStatus{task->status_word, task->transferred_bytes};
     return Status::OK();
 }
 
