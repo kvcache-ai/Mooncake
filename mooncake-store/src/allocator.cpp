@@ -6,7 +6,6 @@
 #include <memory>
 
 #include "master_metric_manager.h"
-#include "replica.h"
 
 namespace mooncake {
 

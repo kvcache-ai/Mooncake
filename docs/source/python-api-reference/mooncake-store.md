@@ -1429,6 +1429,79 @@ def init_all(self, protocol: str, device_name: str, mount_segment_size: int = 16
 
 ---
 
+#### mount_segment()
+Mount a local file or shared-memory region as one or more Mooncake store
+segments.
+
+```python
+def mount_segment(
+    self,
+    path: str,
+    size: int,
+    offset: int = 0,
+    protocol: str = "tcp",
+    location: str = "",
+) -> dict
+```
+
+**Parameters:**
+- `path` (str): File path to map and mount.
+- `size` (int): Number of bytes to mount.
+- `offset` (int, optional): File offset in bytes. Defaults to `0`.
+- `protocol` (str, optional): Transfer protocol. Defaults to `"tcp"`.
+- `location` (str, optional): Device or locality hint. Defaults to an empty
+  string.
+
+**Returns:**
+- `dict`: A result dictionary with:
+  - `ret` (int): Status code (0 = success, non-zero = error code)
+  - `segment_ids` (List[str]): Segment ids created by the mount operation
+
+**Example:**
+```python
+result = store.mount_segment(
+    "/dev/shm/mooncake_segment",
+    16 * 1024 * 1024,
+    offset=0,
+    protocol="tcp",
+    location="",
+)
+
+if result["ret"] == 0:
+    segment_ids = list(result["segment_ids"])
+    print("Mounted segments:", segment_ids)
+else:
+    print("Mount failed:", result["ret"])
+```
+
+The corresponding HTTP endpoints are `/api/mount_shm` and
+`/api/unmount_shm`, but the HTTP API is intentionally narrower: it accepts a
+named shared memory object name instead of an arbitrary path.
+
+---
+
+#### unmount_segment()
+Unmount one or more file or shared-memory segments by segment id.
+
+```python
+def unmount_segment(self, segment_ids: List[str]) -> int
+```
+
+**Parameters:**
+- `segment_ids` (List[str]): Segment ids returned by `mount_segment()`.
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+ret = store.unmount_segment(segment_ids)
+if ret != 0:
+    print("Unmount failed:", ret)
+```
+
+---
+
 #### get_hostname()
 Get the hostname of the current store instance.
 
