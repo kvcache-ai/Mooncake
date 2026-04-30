@@ -480,12 +480,7 @@ fn routes_for_distinct_scope_tuples_have_distinct_object_keys() {
         for d in &domains {
             for s in &sets {
                 for k in &keys {
-                    requests.push(
-                        PutRequest::new(*k, b"v")
-                            .tenant(*t)
-                            .domain(*d)
-                            .object_set(*s),
-                    );
+                    requests.push(PutRequest::new(k, b"v").tenant(t).domain(d).object_set(s));
                 }
             }
         }

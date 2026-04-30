@@ -467,12 +467,12 @@ impl StoreClientBuilder {
         let prewarm_delay = startup_prewarm_delay(&runtime, self.startup_prewarm_max_delay);
         if !prewarm_delay.is_zero() {
             std::thread::sleep(prewarm_delay);
+            refresh_live_client_cache(
+                self.metadata.as_ref(),
+                &live_client_cache,
+                "live_client_snapshot_prewarm",
+            )?;
         }
-        refresh_live_client_cache(
-            self.metadata.as_ref(),
-            &live_client_cache,
-            "live_client_snapshot_prewarm",
-        )?;
         live_client_cache.lock().store_tenant_quota_policy(
             self.default_tenant.clone(),
             None,

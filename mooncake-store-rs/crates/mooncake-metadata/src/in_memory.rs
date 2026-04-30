@@ -1676,10 +1676,9 @@ mod tests {
             .expect_err("older epoch should be rejected");
         assert!(matches!(stale, StoreError::StaleEpoch(_)));
 
-        let equal = metadata
+        metadata
             .upsert_client_lease(&make_lease("client-a", 5))
             .expect("same (stable_id, epoch) is a refresh and must succeed");
-        let _ = equal;
 
         metadata
             .upsert_client_lease(&make_lease("client-a", 6))
@@ -1768,10 +1767,9 @@ mod tests {
             .upsert_client_lease(&make_lease("client-a", 3))
             .expect("publish epoch 3 (handoff window)");
 
-        let stale = metadata
+        metadata
             .upsert_client_lease(&make_lease("client-a", 3))
             .expect("epoch 3 refresh under handoff must succeed");
-        let _ = stale;
 
         let rejected = metadata
             .upsert_client_lease(&make_lease("client-a", 1))
