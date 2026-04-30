@@ -45,24 +45,7 @@ struct CudaStreamNVLinkRAII {
     ~CudaStreamNVLinkRAII() { cudaStreamDestroy(stream_); }
 };
 static thread_local CudaStreamNVLinkRAII tl_nvlink_stream;
-
-// Thread-local CUDA event used to synchronize the NVLink stream with
-// the default (legacy) CUDA stream before issuing cudaMemcpyAsync.
-// This prevents the NVLink stream from reading source data that
-// PyTorch has not yet finished writing on the default stream.
-struct CudaSyncEventRAII {
-    cudaEvent_t event_;
-    CudaSyncEventRAII() {
-        auto err = cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
-        if (err != cudaSuccess) {
-            LOG(FATAL) << "Failed to create NVLink sync CUDA event: " << err
-                       << " - " << cudaGetErrorString(err);
-        }
-    }
-    ~CudaSyncEventRAII() { cudaEventDestroy(event_); }
-};
-static thread_local CudaSyncEventRAII tl_nvlink_sync_event;
-}  // anonymous namespace
+}  // namespace
 
 static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
@@ -226,6 +209,7 @@ Status IntraNodeNvlinkTransport::submitTransfer(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
+        slice->ts = 0;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         cudaStream_t stream = tl_nvlink_stream.stream_;
@@ -312,6 +296,7 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
+        slice->ts = 0;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         cudaStream_t stream = tl_nvlink_stream.stream_;
