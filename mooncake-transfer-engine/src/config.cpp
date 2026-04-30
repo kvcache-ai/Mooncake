@@ -286,23 +286,14 @@ void loadGlobalConfig(GlobalConfig& config) {
     }
 
     const char* min_port_env = std::getenv("MC_MIN_PRC_PORT");
-    if (min_port_env) {
-        int val = atoi(min_port_env);
-        if (val > 0 && val < 65536)
-            config.rpc_min_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PRC_MIN_PORT";
-    }
-
     const char* max_port_env = std::getenv("MC_MAX_PRC_PORT");
-    if (max_port_env) {
-        int val = atoi(max_port_env);
-        if (val > 0 && val < 65536)
-            config.rpc_max_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PRC_MAX_PORT";
+    {
+        int raw_min = min_port_env ? atoi(min_port_env) : config.rpc_min_port;
+        int raw_max = max_port_env ? atoi(max_port_env) : config.rpc_max_port;
+        auto [validated_min, validated_max] =
+            ValidatePortRange(raw_min, raw_max, 15000, 17000);
+        config.rpc_min_port = validated_min;
+        config.rpc_max_port = validated_max;
     }
 
     if (std::getenv("MC_USE_IPV6")) {
@@ -438,4 +429,26 @@ GlobalConfig& globalConfig() {
 }
 
 uint16_t getDefaultHandshakePort() { return globalConfig().handshake_port; }
+
+std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                      int default_min, int default_max) {
+    constexpr int kMinAllowed = 1024;
+    constexpr int kEphemeralStart = 32768;
+    constexpr int kEphemeralEnd = 60999;
+    constexpr int kMaxAllowed = 65535;
+
+    auto is_valid_port = [&](int p) {
+        return p >= kMinAllowed && p <= kMaxAllowed &&
+               !(p >= kEphemeralStart && p <= kEphemeralEnd);
+    };
+
+    if (!is_valid_port(min_port) || !is_valid_port(max_port) ||
+        min_port > max_port) {
+        LOG(WARNING) << "Invalid port range [" << min_port << ", " << max_port
+                     << "], falling back to default [" << default_min << ", "
+                     << default_max << "]";
+        return {default_min, default_max};
+    }
+    return {min_port, max_port};
+}
 }  // namespace mooncake
