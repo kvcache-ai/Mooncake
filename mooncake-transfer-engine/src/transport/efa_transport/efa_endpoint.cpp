@@ -165,11 +165,26 @@ int EfaEndPoint::submitPostSend(
         }
     }
 
-    fi_addr_t peer;
-    {
-        RWSpinlock::ReadGuard guard(lock_);
-        peer = peer_fi_addr_;
+    // Hold a read lock for the entire submit window so setPeerNicPath() /
+    // disconnect() (which take the write lock) cannot fi_av_remove() our
+    // slot while an fi_write() inside submitSlicesOnPeer is still in
+    // flight.  The previous code latched peer_fi_addr_ under the lock and
+    // released it before calling into the context, leaving a race: a
+    // concurrent peer reconnect could remove the AV entry after the latch,
+    // and libfabric would segfault on the stale fi_addr_t.  Read locks
+    // stack, so multiple senders to the same peer still submit in parallel.
+    RWSpinlock::ReadGuard guard(lock_);
+
+    // Re-check status under the lock — a racing disconnect() could have
+    // flipped us to UNCONNECTED between the outer check and acquiring the
+    // lock.  Fail the batch so the caller retries with a fresh setup.
+    if (status_.load(std::memory_order_acquire) != CONNECTED) {
+        for (auto* slice : slice_list) failed_slice_list.push_back(slice);
+        slice_list.clear();
+        return ERR_ENDPOINT;
     }
+
+    fi_addr_t peer = peer_fi_addr_;
     if (peer == FI_ADDR_UNSPEC) {
         for (auto* slice : slice_list) failed_slice_list.push_back(slice);
         slice_list.clear();
