@@ -337,8 +337,8 @@ mod state_store_tests {
     #[test]
     fn cache_stale_detects_outside_segment_error() {
         let error = StoreError::Transport(
-            "segment offset 53686206464 length 1540096 is outside segment \
-             sm-16--487fdbe0-ext-1 (total_capacity=34359738368, num_buffers=1)"
+            "replica target offset 53686206464 length 1540096 is outside segment \
+             sm-16--487fdbe0-ext-1 (num_buffers=1)"
                 .to_string(),
         );
         assert!(
