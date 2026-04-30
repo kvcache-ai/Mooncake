@@ -50,8 +50,10 @@ fn emit_link_searches(search_dirs: &[PathBuf]) {
 fn emit_runtime_rpaths(search_dirs: &[PathBuf]) {
     for dir in search_dirs {
         let dir_str = dir.display();
-        println!("cargo:rustc-link-arg-tests=-Wl,-rpath,{dir_str}");
-        println!("cargo:rustc-link-arg-examples=-Wl,-rpath,{dir_str}");
+        // Use rustc-link-arg (not -tests) so that the rpath is also applied
+        // to the lib-test binary produced by `cargo test` for #[cfg(test)]
+        // modules inside src/lib.rs.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir_str}");
     }
 }
 
