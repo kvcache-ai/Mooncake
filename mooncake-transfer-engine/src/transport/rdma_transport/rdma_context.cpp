@@ -14,8 +14,10 @@
 
 #include "transport/rdma_transport/rdma_context.h"
 
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cassert>
@@ -278,6 +280,13 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.mr = ibv_reg_dmabuf_mr(
             pd_, (uintptr_t)addr - (uintptr_t)allocBase, length,
             (uintptr_t)addr, dmabuf_fd, access);
+        const int regErrno = errno;
+        if (close(dmabuf_fd) != 0) {
+            PLOG(WARNING) << "Failed to close dmabuf fd";
+        }
+        if (!mrMeta.mr) {
+            errno = regErrno;
+        }
     }
 #else
     mrMeta.addr = addr;
