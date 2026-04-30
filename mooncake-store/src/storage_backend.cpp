@@ -17,7 +17,6 @@
 
 #include <ylt/struct_pb.hpp>
 
-#include "gpu_staging_utils.h"
 #include "mutex.h"
 #include "utils.h"
 
@@ -429,37 +428,16 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
         return {};
     };
 
-    std::vector<GpuStagingEntry> staging_entries;
     for (const auto& slice : slices) {
         if (slice.ptr != nullptr) {
             if (iovs_chunk.empty()) {
                 chunk_start_offset = current_offset;
             }
-            int device_id = -1;
-            if (gpu_staging::IsDevicePointer(slice.ptr, &device_id)) {
-                void* host_buf = std::malloc(slice.size);
-                if (!host_buf) {
-                    for (auto& entry : staging_entries) {
-                        std::free(entry.host_ptr);
-                    }
-                    LOG(ERROR) << "Failed to allocate host staging buffer for: "
-                               << path;
-                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-                }
-                iovs_chunk.push_back({host_buf, slice.size});
-
-                staging_entries.push_back(
-                    {slice.ptr, host_buf, slice.size, device_id});
-            } else {
-                iovs_chunk.push_back({slice.ptr, slice.size});
-            }
+            iovs_chunk.push_back({slice.ptr, slice.size});
             chunk_length += slice.size;
         } else {
             auto result = process_chunk();
             if (!result) {
-                for (auto& entry : staging_entries) {
-                    std::free(entry.host_ptr);
-                }
                 return result;
             }
 
@@ -471,9 +449,6 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
 
     auto result = process_chunk();
     if (!result) {
-        for (auto& entry : staging_entries) {
-            std::free(entry.host_ptr);
-        }
         return result;
     }
 
@@ -481,25 +456,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
         LOG(ERROR) << "Total read size mismatch for: " << path
                    << ", expected: " << length
                    << ", got: " << total_bytes_processed;
-        for (auto& entry : staging_entries) {
-            std::free(entry.host_ptr);
-        }
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    }
-
-    // H2D copy from host buffers to device pointers
-    for (size_t i = 0; i < staging_entries.size(); ++i) {
-        const auto& entry = staging_entries[i];
-        gpu_staging::SetDevice(entry.device_id);
-        if (!gpu_staging::CopyHostToDevice(entry.original_ptr, entry.host_ptr,
-                                           entry.size)) {
-            LOG(ERROR) << "H2D copy failed for path: " << path;
-            for (size_t j = i; j < staging_entries.size(); ++j) {
-                std::free(staging_entries[j].host_ptr);
-            }
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        std::free(entry.host_ptr);
     }
 
     return {};

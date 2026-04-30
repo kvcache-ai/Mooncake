@@ -60,23 +60,6 @@ inline bool CopyDeviceToHost(void* dst, const void* src, size_t size) {
 #endif
 }
 
-// Copy host memory to device. Caller must have called SetDevice first.
-inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
-    return cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice) == cudaSuccess;
-#elif defined(USE_HIP)
-    return hipMemcpy(dst, src, size, hipMemcpyHostToDevice) == hipSuccess;
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-    return aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_HOST_TO_DEVICE) ==
-           ACL_SUCCESS;
-#else
-    (void)dst;
-    (void)src;
-    (void)size;
-    return false;
-#endif
-}
-
 // Bind the calling thread to the given device context.
 inline void SetDevice(int device_id) {
     if (device_id < 0) return;
