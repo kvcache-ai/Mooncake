@@ -12,19 +12,6 @@
 namespace mooncake {
 
 /**
- * @struct AscendUnifiedPointer
- * @brief Encapsulates Ascend device pointer information.
- *
- * Contains the device pointer along with device ID and size,
- * enabling proper device context management for multi-device scenarios.
- */
-struct AscendUnifiedPointer {
-    void* device_ptr;  // The actual device memory pointer
-    int device_id;     // The device ID this pointer belongs to
-    size_t size;       // Size of the allocated memory in bytes
-};
-
-/**
  * @class AscendBuffer
  * @brief Ascend NPU memory buffer wrapper inheriting from BufferBase.
  *
@@ -35,10 +22,8 @@ class AscendBuffer : public BufferBase {
    public:
     /**
      * @brief Constructs an AscendBuffer taking ownership of device memory.
-     * @param unified_ptr unique_ptr to AscendUnifiedPointer containing device
-     * memory info.
      */
-    explicit AscendBuffer(std::unique_ptr<AscendUnifiedPointer> unified_ptr);
+    explicit AscendBuffer(void* device_ptr, size_t size);
 
     /**
      * @brief Destructor that automatically releases device memory.
@@ -56,8 +41,7 @@ class AscendBuffer : public BufferBase {
     /**
      * @brief Returns the device pointer address as uint64_t.
      *
-     * Returns the raw device memory pointer. For accessing device context
-     * information (device_id), use GetUnifiedPointer() or GetDeviceId().
+     * Returns the raw device memory pointer.
      */
     uint64_t data() const override;
 
@@ -67,25 +51,14 @@ class AscendBuffer : public BufferBase {
     std::size_t size() const override;
 
     /**
-     * @brief Gets the device ID for this buffer.
-     * @return Device ID, or -1 if buffer is invalid.
-     */
-    int GetDeviceId() const;
-
-    /**
      * @brief Gets the actual device pointer.
      * @return Device pointer, or nullptr if buffer is invalid.
      */
     void* GetDevicePtr() const;
 
-    /**
-     * @brief Gets the complete AscendUnifiedPointer structure.
-     * @return Pointer to AscendUnifiedPointer, or nullptr if invalid.
-     */
-    const AscendUnifiedPointer* GetUnifiedPointer() const;
-
    private:
-    std::unique_ptr<AscendUnifiedPointer> unified_ptr_;
+    void* device_ptr_{nullptr};
+    size_t size_{0};
 
     // Internal function to release device memory
     void ReleaseMemory();
@@ -152,7 +125,7 @@ class AscendCacheTier : public CacheTier {
     mutable std::mutex init_mutex_;
 
     // Internal device memory allocation
-    std::unique_ptr<AscendUnifiedPointer> AllocateDeviceMemory(size_t size);
+    void* AllocateDeviceMemory(size_t size);
 
     // Check if sufficient space is available
     bool HasSpace(size_t size) const;
