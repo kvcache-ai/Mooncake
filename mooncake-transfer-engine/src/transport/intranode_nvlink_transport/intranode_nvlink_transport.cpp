@@ -208,6 +208,31 @@ Status IntraNodeNvlinkTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
+    // Synchronize with the caller's CUDA stream before issuing any memcpy.
+    // PyTorch uses cudaStreamPerThread (per-thread default stream), NOT the
+    // legacy default stream (nullptr). Recording the event on
+    // cudaStreamPerThread ensures that all previously submitted PyTorch
+    // operations on source/dest buffers have completed before cudaMemcpyAsync
+    // starts on tl_nvlink_stream. Using nullptr (legacy default stream) would
+    // miss PyTorch's work and could cause deadlocks with blocking streams.
+    cudaStream_t stream = tl_nvlink_stream.stream_;
+    cudaError_t sync_err =
+        cudaEventRecord(tl_nvlink_sync_event.event_, cudaStreamPerThread);
+    if (sync_err != cudaSuccess) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord on "
+                      "cudaStreamPerThread failed: "
+                   << cudaGetErrorString(sync_err);
+        return Status::Context("cudaEventRecord failed: " +
+                               std::string(cudaGetErrorString(sync_err)));
+    }
+    sync_err = cudaStreamWaitEvent(stream, tl_nvlink_sync_event.event_, 0);
+    if (sync_err != cudaSuccess) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaStreamWaitEvent failed: "
+                   << cudaGetErrorString(sync_err);
+        return Status::Context("cudaStreamWaitEvent failed: " +
+                               std::string(cudaGetErrorString(sync_err)));
+    }
+
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
@@ -292,6 +317,26 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
 
 Status IntraNodeNvlinkTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+    // Synchronize with the caller's CUDA stream before issuing any memcpy.
+    // See submitTransfer() for detailed rationale on using cudaStreamPerThread.
+    cudaStream_t stream = tl_nvlink_stream.stream_;
+    cudaError_t sync_err =
+        cudaEventRecord(tl_nvlink_sync_event.event_, cudaStreamPerThread);
+    if (sync_err != cudaSuccess) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord on "
+                      "cudaStreamPerThread failed: "
+                   << cudaGetErrorString(sync_err);
+        return Status::Context("cudaEventRecord failed: " +
+                               std::string(cudaGetErrorString(sync_err)));
+    }
+    sync_err = cudaStreamWaitEvent(stream, tl_nvlink_sync_event.event_, 0);
+    if (sync_err != cudaSuccess) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaStreamWaitEvent failed: "
+                   << cudaGetErrorString(sync_err);
+        return Status::Context("cudaStreamWaitEvent failed: " +
+                               std::string(cudaGetErrorString(sync_err)));
+    }
+
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
