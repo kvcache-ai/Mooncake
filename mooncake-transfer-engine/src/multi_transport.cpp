@@ -14,6 +14,7 @@
 
 #include "multi_transport.h"
 #include <algorithm>
+#include <cstring>
 #include <sstream>
 #include <string>
 
@@ -218,7 +219,8 @@ Status MultiTransport::submitTransfer(
         while (i < resolved.size()) {
             const auto& req = entries[resolved[i].request_idx];
             Transport* tp = resolved[i].transport;
-            if (req.task_group_id != TransferRequest::kNoTaskGroup) {
+            if (req.task_group_id != TransferRequest::kNoTaskGroup &&
+                std::strcmp(tp->getName(), "rdma") == 0) {
                 size_t group_start = i;
                 uint64_t gid = req.task_group_id;
                 while (i < resolved.size() &&
@@ -299,13 +301,31 @@ Status MultiTransport::mp_submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::string& proto) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        return Status::TooManyRequests(
-            "Exceed the limitation of batch capacity");
-    }
+    size_t task_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+        if (batch_desc.sealed.load(std::memory_order_acquire)) {
+            return Status::InvalidArgument(
+                "Cannot append transfers to a sealed batch");
+        }
+        const size_t submitted_task_count = static_cast<size_t>(
+            batch_desc.submitted_task_count.load(std::memory_order_acquire));
+        if (submitted_task_count + entries.size() > batch_desc.batch_size) {
+            return Status::TooManyRequests(
+                "Exceed the limitation of batch capacity");
+        }
 
-    size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
+        task_id = submitted_task_count;
+        batch_desc.task_list.resize(task_id + entries.size());
+        const size_t new_submitted_task_count = task_id + entries.size();
+        batch_desc.submitted_task_count.store(new_submitted_task_count,
+                                              std::memory_order_release);
+        if (new_submitted_task_count == batch_desc.batch_size) {
+            batch_desc.sealed.store(true, std::memory_order_release);
+        }
+        batch_desc.is_finished.store(false, std::memory_order_release);
+        batch_desc.publish_completion_if_ready_locked();
+    }
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
         submit_tasks;
@@ -328,8 +348,6 @@ Status MultiTransport::mp_submitTransfer(
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
-            // LOG(ERROR) << "Failed to submit transfer task to "
-            //            << entry.first->getName();
             overall_status = status;
         }
     }

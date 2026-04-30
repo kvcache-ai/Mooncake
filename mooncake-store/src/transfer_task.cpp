@@ -350,7 +350,7 @@ void TransferEngineOperationState::wait_for_completion() {
         // avoid missed notifications. The predicate is re-checked under the
         // lock. Under the mutex, relaxed is sufficient; the mutex acquire
         // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+        std::unique_lock<std::mutex> lock(batch_desc.lifecycle_mutex);
         const int64_t elapsed_milliseconds =
             getCurrentTimeInMilli() - start_ts_;
         if (elapsed_milliseconds < timeout_milliseconds) {
@@ -363,7 +363,7 @@ void TransferEngineOperationState::wait_for_completion() {
                         std::memory_order_relaxed);
                 });
         }
-    }  // Explicitly release completion_mutex before acquiring mutex_
+    }  // Explicitly release lifecycle_mutex before acquiring mutex_
 
     // Once completion is observed, read failure flag.
     if (completed) {
@@ -642,8 +642,6 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     std::vector<TransferRequest>& requests, size_t batch_task_count) {
-    // Allocate batch ID using the actual logical task count when callers
-    // intentionally group multiple requests into one transfer task.
     const size_t batch_size =
         batch_task_count == 0 ? requests.size() : batch_task_count;
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -724,7 +722,7 @@ using ScatterKeyRanges =
 
 struct ScatterReadBuildResult {
     std::vector<TransferRequest> flat_requests;
-    std::vector<std::vector<TransferRequest>> logical_groups;
+    size_t logical_task_count = 0;
 };
 
 std::optional<ScatterReadBuildResult> buildScatterReadRequests(
@@ -737,11 +735,8 @@ std::optional<ScatterReadBuildResult> buildScatterReadRequests(
         total_ranges += ranges.size();
     }
     result.flat_requests.reserve(total_ranges);
-    if (enable_task_grouping) {
-        result.logical_groups.reserve(key_ranges.size());
-    }
 
-    uint64_t next_task_group_id = 0;
+    uint64_t next_task_group_id = TransferRequest::kNoTaskGroup + 1;
     char* dest_base = static_cast<char*>(dest_buffer);
 
     for (const auto& [replica, ranges] : key_ranges) {
@@ -763,13 +758,10 @@ std::optional<ScatterReadBuildResult> buildScatterReadRequests(
         }
 
         uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-        std::vector<TransferRequest> group_requests;
-        if (enable_task_grouping) {
-            group_requests.reserve(ranges.size());
-        }
         const uint64_t task_group_id = enable_task_grouping
                                            ? next_task_group_id++
                                            : TransferRequest::kNoTaskGroup;
+        size_t non_empty_range_count = 0;
 
         for (const auto& [dest_offset, src_offset, size] : ranges) {
             if (size == 0) {
@@ -783,13 +775,12 @@ std::optional<ScatterReadBuildResult> buildScatterReadRequests(
             request.length = size;
             request.task_group_id = task_group_id;
             result.flat_requests.emplace_back(request);
-            if (enable_task_grouping) {
-                group_requests.emplace_back(request);
-            }
+            ++non_empty_range_count;
         }
 
-        if (enable_task_grouping && !group_requests.empty()) {
-            result.logical_groups.emplace_back(std::move(group_requests));
+        if (non_empty_range_count > 0) {
+            result.logical_task_count +=
+                enable_task_grouping ? 1 : non_empty_range_count;
         }
     }
 
@@ -865,9 +856,8 @@ std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
         return TransferFuture(std::make_shared<EmptyOperationState>());
     }
 
-    const size_t grouped_task_count = build_result->logical_groups.size();
-    auto future =
-        submitTransfer(requests, enable_task_grouping ? grouped_task_count : 0);
+    auto future = submitTransfer(
+        requests, enable_task_grouping ? build_result->logical_task_count : 0);
     if (future && transfer_metric_) {
         size_t total_bytes = 0;
         for (const auto& request : requests) {
