@@ -140,8 +140,8 @@ curl -s http://<master_host>:9003/metrics/summary
 - Client metrics (enabled by default)
   - `MC_STORE_CLIENT_METRIC` (default `1`): Client-side metrics on by default; set `0` to disable entirely.
   - `MC_STORE_CLIENT_METRIC_INTERVAL` (default `0`): Reporting interval in seconds; `0` collects but does not periodically report.
-  - `MC_STORE_CLIENT_MIN_PORT` (default `12300`): Minimum local port for client connections.
-  - `MC_STORE_CLIENT_MAX_PORT` (default `14300`): Maximum local port for client connections.
+  - `MC_STORE_CLIENT_MIN_PORT` (default `12300`): Minimum local port for client connections. Must be in range 1024–32767 or 61000–65535 (well-known and ephemeral ports are excluded). Falls back to default on invalid input.
+  - `MC_STORE_CLIENT_MAX_PORT` (default `14300`): Maximum local port for client connections. Same range constraints as `MC_STORE_CLIENT_MIN_PORT`; must be ≥ `MC_STORE_CLIENT_MIN_PORT`.
 
 - Local memcpy optimization (Store transfer path)
   - `MC_STORE_MEMCPY` (default `0`/false): Set to `1` to prefer local memcpy when source/destination are on the same client.

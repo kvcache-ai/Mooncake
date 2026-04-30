@@ -6,6 +6,7 @@
 #include <linux/mman.h>
 #include <string>
 #include <limits>
+#include <utility>
 #include <ylt/util/tl/expected.hpp>
 
 #include "rpc_types.h"
@@ -424,6 +425,30 @@ T GetEnvOr(const char* name, T default_value) {
     } catch (...) {
         return default_value;
     }
+}
+
+// Validates a port range. Returns {default_min, default_max} on invalid input.
+// Rejects: min > max, well-known ports (0-1023), ephemeral ports (32768-60999).
+inline std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                             int default_min, int default_max) {
+    constexpr int kMinAllowed = 1024;
+    constexpr int kEphemeralStart = 32768;
+    constexpr int kEphemeralEnd = 60999;
+    constexpr int kMaxAllowed = 65535;
+
+    auto is_valid_port = [&](int p) {
+        return p >= kMinAllowed && p <= kMaxAllowed &&
+               !(p >= kEphemeralStart && p <= kEphemeralEnd);
+    };
+
+    if (!is_valid_port(min_port) || !is_valid_port(max_port) ||
+        min_port > max_port) {
+        LOG(WARNING) << "Invalid port range [" << min_port << ", " << max_port
+                     << "], falling back to default [" << default_min << ", "
+                     << default_max << "]";
+        return {default_min, default_max};
+    }
+    return {min_port, max_port};
 }
 
 std::string GetEnvStringOr(const char* name, const std::string& default_value);

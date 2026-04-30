@@ -835,8 +835,8 @@ The HTTP metadata server can be configured using the following parameters:
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
-- MC_STORE_CLIENT_MIN_PORT: Minimum local port for client connections.
-- MC_STORE_CLIENT_MAX_PORT: Maximum local port for client connections.
+- MC_STORE_CLIENT_MIN_PORT: Minimum local port for client connections (default 12300). Must be in range 1024–32767 or 61000–65535; falls back to default on invalid input.
+- MC_STORE_CLIENT_MAX_PORT: Maximum local port for client connections (default 14300). Same range constraints; must be ≥ MC_STORE_CLIENT_MIN_PORT.
 - MC_STORE_USE_HUGEPAGE: Enables huge page support, disabled by default.
 - MC_STORE_HUGEPAGE_SIZE: Specifies the page size of the huge page to use, default 2M.
 #### Usage Example
