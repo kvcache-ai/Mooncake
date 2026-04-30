@@ -212,6 +212,7 @@ fn main() {
         default_build_dir.join("mooncake-transfer-engine/src"),
         default_build_dir.join("mooncake-transfer-engine/src/common/base"),
         default_build_dir.join("mooncake-asio"),
+        default_build_dir.join("mooncake-common"),
         default_build_dir.join("mooncake-common/etcd"),
         PathBuf::from("/usr/local/lib"),
         PathBuf::from("/usr/lib/x86_64-linux-gnu"),
