@@ -190,6 +190,32 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
+     * @brief Forge RL Design 01 — chained-prefix LPM lookup.
+     *
+     * Walks the supplied chain of block-level hashes against `metadata_shards_`
+     * in order; the deepest entry that has at least one COMPLETE replica
+     * defines the LPM length. The response carries every segment owning a
+     * COMPLETE replica of that deepest entry (no ranking — routing decisions
+     * are pushed up to the caller) plus a lease TTL hint matching
+     * `default_kv_lease_ttl_`.
+     *
+     * @return PREFIX_QUERY_DISABLED   when the feature flag is off
+     *         PREFIX_CHAIN_EMPTY      when the chain is empty
+     *         PREFIX_CHAIN_TOO_LONG   when the chain length exceeds
+     *                                 `kMaxPrefixChainLength`
+     */
+    auto QueryPrefixMatch(const QueryPrefixMatchRequest& request)
+        -> tl::expected<QueryPrefixMatchResponse, ErrorCode>;
+
+    /**
+     * @brief Toggle the prefix-query feature flag at runtime. Test-only seam;
+     * production code should configure via `MasterServiceConfig`.
+     */
+    void SetPrefixQueryEnabledForTesting(bool enabled) {
+        enable_prefix_query_ = enabled;
+    }
+
+    /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for the
      * slice
@@ -1191,6 +1217,10 @@ class MasterService {
     const uint64_t quota_bytes_;
 
     bool use_disk_replica_{false};
+
+    // Forge RL Design 01 §3.7: feature flag for QueryPrefixMatch.
+    // `std::atomic` so the test-only setter and the read path don't race.
+    std::atomic<bool> enable_prefix_query_{true};
 
     // Segment management
     SegmentManager segment_manager_;

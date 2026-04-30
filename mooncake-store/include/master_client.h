@@ -163,6 +163,17 @@ class MasterClient {
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**
+     * @brief Forge RL Design 01 — chained-prefix LPM lookup.
+     *
+     * Sends a per-block prefix-hash chain to the master and gets back the
+     * longest matched prefix length together with the unranked list of
+     * candidate replicas owning the deepest matched key. Returns
+     * PREFIX_QUERY_DISABLED when the feature flag is off on the master.
+     */
+    [[nodiscard]] tl::expected<QueryPrefixMatchResponse, ErrorCode>
+    QueryPrefixMatch(const QueryPrefixMatchRequest& request);
+
+    /**
      * @brief Starts a put operation
      * @param key Object key
      * @param slice_lengths Vector of slice lengths

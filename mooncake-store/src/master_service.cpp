@@ -13,6 +13,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "master_metric_manager.h"
+#include "prefix_key.h"
 #include "segment.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
@@ -119,6 +120,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl) {
+    enable_prefix_query_.store(config.enable_prefix_query,
+                               std::memory_order_relaxed);
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
@@ -5192,6 +5195,96 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// Forge RL Design 01 §3.3 — server-side LPM lookup over the chained-prefix
+// hash. We walk the chain from the *deepest* end backwards so the first hit
+// already gives us the LPM length without having to keep per-segment state
+// across iterations.
+//
+// Concurrency: every iteration takes the metadata-shard read lock through
+// `MetadataAccessorRO` (which acquires `metadata_shards_[shard].mutex`) and
+// releases it before stepping to the next chain element. This honours the
+// project-wide lock order (`client_mutex_` -> `metadata_shards_[shard].mutex`
+// -> `segment_mutex_`) without introducing any new lock layer.
+// ---------------------------------------------------------------------------
+auto MasterService::QueryPrefixMatch(const QueryPrefixMatchRequest& request)
+    -> tl::expected<QueryPrefixMatchResponse, ErrorCode> {
+    if (!enable_prefix_query_.load(std::memory_order_relaxed)) {
+        return tl::make_unexpected(ErrorCode::PREFIX_QUERY_DISABLED);
+    }
+    if (request.chain.empty()) {
+        return tl::make_unexpected(ErrorCode::PREFIX_CHAIN_EMPTY);
+    }
+    if (request.chain.size() > kMaxPrefixChainLength) {
+        return tl::make_unexpected(ErrorCode::PREFIX_CHAIN_TOO_LONG);
+    }
+
+    QueryPrefixMatchResponse response;
+    response.query_lease_ms = default_kv_lease_ttl_;
+
+    // Walk from the deepest hash backwards. The chain has the property that
+    // `chain[i+1]` only makes semantic sense if `chain[i]` is also present, so
+    // the first iteration that finds at least one COMPLETE replica is also the
+    // LPM. We stop immediately and emit every owning segment as a candidate.
+    for (size_t i = request.chain.size(); i > 0; --i) {
+        const std::string key = EncodePrefixKey(request.chain[i - 1]);
+
+        std::vector<PrefixMatchCandidate> candidates;
+        {
+            MetadataAccessorRO accessor(this, key);
+            if (!accessor.Exists()) {
+                continue;
+            }
+            const ObjectMetadata& metadata = accessor.Get();
+
+            // Each completed replica may live on multiple slices that map to
+            // distinct segments. We emit one candidate per unique segment_name
+            // and dedupe via `seen_segments` so the response stays compact.
+            //
+            // We deliberately leave `segment_id` at the default zero UUID:
+            // resolving name -> id would require taking `segment_mutex_`
+            // inside the metadata-shard read lock and break the
+            // metadata_shards_ -> segment_mutex_ acquisition order. Routing
+            // callers (Forge, vLLM) already key on segment_name, so the id
+            // field is reserved for a future extension that walks segments
+            // first and shards second.
+            std::unordered_set<std::string> seen_segments;
+            metadata.VisitReplicas(
+                &Replica::fn_is_completed,
+                [&candidates, &seen_segments](const Replica& replica) {
+                    const auto seg_names = replica.get_segment_names();
+                    const int32_t replica_type =
+                        static_cast<int32_t>(replica.type());
+                    for (const auto& opt_name : seg_names) {
+                        if (!opt_name.has_value() || opt_name->empty()) {
+                            continue;
+                        }
+                        if (!seen_segments.insert(*opt_name).second) {
+                            continue;
+                        }
+                        PrefixMatchCandidate cand;
+                        cand.segment_name = *opt_name;
+                        cand.replica_type = replica_type;
+                        candidates.emplace_back(std::move(cand));
+                    }
+                });
+        }
+
+        if (candidates.empty()) {
+            // The metadata exists but no replica is COMPLETE yet; treat this
+            // chain entry as a miss and keep walking shorter prefixes — the
+            // caller still gets the longest fully-COMPLETE prefix.
+            continue;
+        }
+
+        response.matched_blocks = static_cast<uint32_t>(i);
+        response.candidates = std::move(candidates);
+        break;
+    }
+
+    return response;
 }
 
 }  // namespace mooncake

@@ -85,7 +85,18 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+
+    // Forge RL Design 01 — chained-prefix LPM lookup. When false, the
+    // QueryPrefixMatch RPC short-circuits with PREFIX_QUERY_DISABLED and the
+    // master pays no extra cost on the read path.
+    bool enable_prefix_query = true;
 };
+
+// Forge RL Design 01 §3.8: hard upper bound on the chain length accepted by
+// QueryPrefixMatch. A typical vLLM rollout has well under 256 blocks; 1024
+// keeps headroom for long-context agent traces while still bounding the
+// per-RPC CPU and lock-acquire count.
+inline constexpr uint32_t kMaxPrefixChainLength = 1024;
 
 class MasterServiceSupervisorConfig {
    public:
@@ -146,6 +157,7 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool enable_prefix_query = true;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -214,6 +226,7 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_prefix_query = config.enable_prefix_query;
         validate();
     }
 
@@ -312,6 +325,7 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    bool enable_prefix_query = true;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -390,6 +404,7 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_prefix_query = config.enable_prefix_query;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -448,6 +463,7 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_prefix_query = config.enable_prefix_query;
     }
 };
 
@@ -501,8 +517,16 @@ class MasterServiceConfigBuilder {
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
 
+    // Forge RL Design 01 §3.7 — chained-prefix LPM lookup feature flag.
+    bool enable_prefix_query_ = true;
+
    public:
     MasterServiceConfigBuilder() = default;
+
+    MasterServiceConfigBuilder& set_enable_prefix_query(bool enabled) {
+        enable_prefix_query_ = enabled;
+        return *this;
+    }
 
     MasterServiceConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
         default_kv_lease_ttl_ = ttl;
@@ -787,6 +811,10 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // Forge RL Design 01 §3.7 — chained-prefix LPM lookup feature flag.
+    bool enable_prefix_query = true;
+
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -843,6 +871,7 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_prefix_query = config.enable_prefix_query;
     }
 
     // Static factory method to create a builder
@@ -896,6 +925,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.enable_prefix_query = enable_prefix_query_;
     return config;
 }
 

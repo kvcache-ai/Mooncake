@@ -885,6 +885,22 @@ WrappedMasterService::GetReplicaList(const std::string& key) {
         });
 }
 
+tl::expected<QueryPrefixMatchResponse, ErrorCode>
+WrappedMasterService::QueryPrefixMatch(const QueryPrefixMatchRequest& request) {
+    return execute_rpc(
+        "QueryPrefixMatch",
+        [&] { return master_service_.QueryPrefixMatch(request); },
+        [&](auto& timer) {
+            timer.LogRequest("chain_len=", request.chain.size());
+        },
+        [] {
+            MasterMetricManager::instance().inc_query_prefix_match_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_query_prefix_match_failures();
+        });
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(
     const std::vector<std::string>& keys) {
@@ -1700,6 +1716,8 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::QueryPrefixMatch>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(

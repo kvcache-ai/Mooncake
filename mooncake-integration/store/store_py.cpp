@@ -2617,7 +2617,60 @@ PYBIND11_MODULE(store, m) {
             "    task_id: UUID of the task to query.\n\n"
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
-            "success, error code: 0 if success, non-zero if failure)");
+            "success, error code: 0 if success, non-zero if failure)")
+        .def(
+            "query_prefix_match",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<uint64_t> &chain) -> py::tuple {
+                if (!self.is_client_initialized() || self.use_dummy_client_) {
+                    // Per Gemini review: signal "no data" with py::none()
+                    // for both the matched_blocks and candidates slots so
+                    // Python callers can use the idiomatic
+                    //   data, _, _, err = store.query_prefix_match(chain)
+                    //   if err: ...
+                    // pattern without having to special-case zero-valued
+                    // sentinels (which are valid hit-but-empty responses).
+                    return py::make_tuple(py::none(), py::none(), 0,
+                                          toInt(ErrorCode::INVALID_PARAMS));
+                }
+                QueryPrefixMatchRequest request;
+                request.chain = chain;
+                tl::expected<QueryPrefixMatchResponse, ErrorCode> result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.store_->client_->QueryPrefixMatch(request);
+                }
+                if (!result.has_value()) {
+                    // See note above: error path returns py::none() for
+                    // the payload slots so callers don't conflate "RPC
+                    // failed" with "RPC succeeded but matched nothing".
+                    return py::make_tuple(py::none(), py::none(), 0,
+                                          toInt(result.error()));
+                }
+                py::list candidates;
+                for (const auto &cand : result.value().candidates) {
+                    candidates.append(py::make_tuple(
+                        cand.segment_name,
+                        static_cast<int32_t>(cand.replica_type)));
+                }
+                return py::make_tuple(result.value().matched_blocks,
+                                      std::move(candidates),
+                                      result.value().query_lease_ms, 0);
+            },
+            py::arg("chain"),
+            "Forge RL Design 01 - chained-prefix LPM lookup.\n\n"
+            "Args:\n"
+            "    chain: List[int] of per-block prefix hashes (uint64). "
+            "Empty chain returns PREFIX_CHAIN_EMPTY.\n\n"
+            "Returns:\n"
+            "    tuple[int | None, list[tuple[str, int]] | None, int, int]:\n"
+            "        - matched_blocks: number of leading blocks that hit a "
+            "stored prefix key, or None on error.\n"
+            "        - candidates: list of (segment_name, replica_type) for "
+            "the deepest matched key (unranked), or None on error.\n"
+            "        - query_lease_ms: advisory lease for the query result.\n"
+            "        - err_code: 0 on success, non-zero error code on failure "
+            "(e.g. PREFIX_QUERY_DISABLED, PREFIX_CHAIN_TOO_LONG).");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

@@ -135,6 +135,17 @@ class Client {
     QueryByRegex(const std::string& str);
 
     /**
+     * @brief Forge RL Design 01 - chained-prefix LPM lookup.
+     *
+     * Forwards the per-block prefix-hash chain to the master and returns the
+     * unranked candidate replicas that hold the deepest matched prefix key.
+     * Returns ErrorCode::PREFIX_QUERY_DISABLED when the master has the
+     * feature flag turned off.
+     */
+    tl::expected<QueryPrefixMatchResponse, ErrorCode> QueryPrefixMatch(
+        const QueryPrefixMatchRequest& request);
+
+    /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
      * @return Vector of QueryResult objects containing replicas and lease

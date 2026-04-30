@@ -57,6 +57,10 @@ class WrappedMasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys);
 
+    // Forge RL Design 01 — chained-prefix LPM lookup.
+    tl::expected<QueryPrefixMatchResponse, ErrorCode> QueryPrefixMatch(
+        const QueryPrefixMatchRequest& request);
+
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config);
