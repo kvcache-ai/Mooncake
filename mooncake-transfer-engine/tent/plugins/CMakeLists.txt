@@ -11,3 +11,7 @@ target_compile_features(tent_plugin INTERFACE cxx_std_20)
 if (USE_CUDA)
     add_subdirectory(cuda)
 endif()
+
+if (USE_HIP)
+    add_subdirectory(rocm)
+endif()

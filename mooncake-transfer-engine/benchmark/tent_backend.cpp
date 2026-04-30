@@ -22,6 +22,10 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef USE_HIP
+#include <hip/hip_runtime.h>
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -96,6 +100,20 @@ int TENTBenchRunner::allocateBuffers() {
         device_prefix = "cuda";
         int gpu_count = 0;
         cudaGetDeviceCount(&gpu_count);
+        start_idx = 0;
+        num_buffers = gpu_count;
+        if (XferBenchConfig::local_gpu_id != -1) {
+            start_idx = XferBenchConfig::local_gpu_id;
+            num_buffers = 1;
+            LOG_ASSERT(start_idx >= 0 && start_idx < gpu_count)
+                << "local_gpu_id " << start_idx << " out of range [0, "
+                << gpu_count << ")";
+        }
+#elif defined(USE_HIP)
+    } else if (seg_type == "VRAM") {
+        device_prefix = "rocm";
+        int gpu_count = 0;
+        hipGetDeviceCount(&gpu_count);
         start_idx = 0;
         num_buffers = gpu_count;
         if (XferBenchConfig::local_gpu_id != -1) {
@@ -200,7 +218,6 @@ int TENTBenchRunner::stopInitiator() {
     return 0;
 }
 
-#ifdef USE_CUDA
 static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     std::string sysfs_path = "/sys/bus/pci/devices/" + pci_bdf + "/numa_node";
     std::ifstream numa_file(sysfs_path);
@@ -210,9 +227,11 @@ static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     if (numa_file.fail()) return -1;
     return numa_node;
 }
-static inline int getCudaDeviceNumaID(int cuda_id) {
+
+#ifdef USE_CUDA
+static inline int getGpuDeviceNumaID(int gpu_id) {
     char pci_bus_id[20];
-    auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuda_id);
+    auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
     if (err != cudaSuccess) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
@@ -220,8 +239,17 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
     for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
+#elif defined(USE_HIP)
+static inline int getGpuDeviceNumaID(int gpu_id) {
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, gpu_id) != hipSuccess) return 0;
+    char pci_bus_id[20];
+    snprintf(pci_bus_id, sizeof(pci_bus_id), "%04x:%02x:%02x.0",
+             prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+    return getNumaNodeFromPciDevice(pci_bus_id);
+}
 #else
-static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
+static inline int getGpuDeviceNumaID(int gpu_id) { return 0; }
 #endif
 
 void TENTBenchRunner::pinThread(int thread_id) {
@@ -232,9 +260,9 @@ void TENTBenchRunner::pinThread(int thread_id) {
     if (location.type() == "cpu") {
         auto socket_id = location.index();
         bindToSocket(socket_id);
-    } else if (location.type() == "cuda") {
+    } else if (location.type() == "cuda" || location.type() == "rocm") {
         auto device_id = location.index();
-        auto socket_id = getCudaDeviceNumaID(device_id);
+        auto socket_id = getGpuDeviceNumaID(device_id);
         bindToSocket(socket_id);
     }
 }

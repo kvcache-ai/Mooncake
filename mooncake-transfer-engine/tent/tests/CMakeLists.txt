@@ -58,6 +58,17 @@ add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
 target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main)
 add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
 
+if(USE_HIP)
+  find_package(HIP REQUIRED)
+  add_executable(tent_rocm_platform_test rocm_platform_test.cpp)
+  target_link_libraries(tent_rocm_platform_test PRIVATE gtest gtest_main
+                                                        tent_link_group
+                                                        hip::host)
+  target_include_directories(tent_rocm_platform_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_rocm_platform_test COMMAND tent_rocm_platform_test)
+endif()
+
 if(USE_SUNRISE)
   add_executable(tent_sunrise_link_transport_test
                  sunrise_link_transport_test.cpp)
