@@ -285,9 +285,11 @@ local by_stable_index = KEYS[2]
 local hwm_key = KEYS[3]
 local global_index = KEYS[4]
 local expiry_index = KEYS[5]
+local stable_key = KEYS[6]
 local payload_template = ARGV[1]
 local ttl_ms = tonumber(ARGV[2])
 local expires_at_ms = tonumber(ARGV[3])
+local stable_id = ARGV[4]
 
 local active_max = 0
 local members = redis.call('SMEMBERS', by_stable_index)
@@ -327,6 +329,12 @@ redis.call('SADD', global_index, lease_key)
 redis.call('SADD', by_stable_index, tostring(new_epoch))
 redis.call('SET', hwm_key, tostring(new_epoch))
 redis.call('ZADD', expiry_index, expires_at_ms, lease_key)
+local runtime_key = stable_id .. ':' .. tostring(new_epoch)
+if lease['state'] == 'Active' then
+    redis.call('SET', stable_key, runtime_key, 'PX', ttl_ms)
+elseif redis.call('GET', stable_key) == runtime_key then
+    redis.call('DEL', stable_key)
+end
 return tostring(new_epoch)
 "#;
 
@@ -337,16 +345,28 @@ local by_stable_index = KEYS[3]
 local hwm_key = KEYS[4]
 local global_index = KEYS[5]
 local expiry_index = KEYS[6]
+local stable_key = KEYS[7]
 local new_epoch = tonumber(ARGV[1])
 local payload = ARGV[2]
 local ttl_ms = tonumber(ARGV[3])
 local expires_at_ms = tonumber(ARGV[4])
+local runtime_key = ARGV[5]
+
+local function update_stable_runtime_index()
+    local lease = cjson.decode(payload)
+    if lease['state'] == 'Active' then
+        redis.call('SET', stable_key, runtime_key, 'PX', ttl_ms)
+    elseif redis.call('GET', stable_key) == runtime_key then
+        redis.call('DEL', stable_key)
+    end
+end
 
 if redis.call('EXISTS', lease_key) == 1 then
     redis.call('SET', lease_key, payload, 'PX', ttl_ms)
     redis.call('SADD', global_index, lease_key)
     redis.call('SADD', by_stable_index, tostring(new_epoch))
     redis.call('ZADD', expiry_index, expires_at_ms, lease_key)
+    update_stable_runtime_index()
     return {1, ''}
 end
 
@@ -387,12 +407,16 @@ redis.call('SADD', global_index, lease_key)
 redis.call('SADD', by_stable_index, tostring(new_epoch))
 redis.call('SET', hwm_key, tostring(math.max(new_epoch, hwm_value)))
 redis.call('ZADD', expiry_index, expires_at_ms, lease_key)
+update_stable_runtime_index()
 return {1, ''}
 "#;
 
 const UPDATE_CLIENT_STATE_SCRIPT: &str = r#"
 local lease_key = KEYS[1]
+local stable_key = KEYS[2]
 local next_state = ARGV[1]
+local runtime_key = ARGV[2]
+local now_ms = tonumber(ARGV[3])
 
 local payload = redis.call('GET', lease_key)
 if not payload then
@@ -403,11 +427,20 @@ local ttl_ms = redis.call('PTTL', lease_key)
 local lease = cjson.decode(payload)
 lease['state'] = next_state
 local next_payload = cjson.encode(lease)
+local stable_ttl_ms = tonumber(lease['expires_at_ms'] or 0) - now_ms
+if stable_ttl_ms < 1 then
+    stable_ttl_ms = 1
+end
 
 if ttl_ms > 0 then
     redis.call('SET', lease_key, next_payload, 'PX', ttl_ms)
 else
     redis.call('SET', lease_key, next_payload)
+end
+if next_state == 'Active' then
+    redis.call('SET', stable_key, runtime_key, 'PX', stable_ttl_ms)
+elseif redis.call('GET', stable_key) == runtime_key then
+    redis.call('DEL', stable_key)
 end
 return {1, next_payload}
 "#;
@@ -1543,24 +1576,13 @@ impl MetadataBackend for RedisMetadataBackend {
                 .key(&hwm_key)
                 .key(&global_index_key)
                 .key(&expiry_index_key)
+                .key(&stable_key)
                 .arg(new_epoch.to_string())
                 .arg(payload.as_str())
                 .arg(ttl_ms.to_string())
                 .arg(lease.expires_at_ms.to_string())
+                .arg(lease.runtime.storage_key())
                 .invoke::<(i32, String)>(connection)?;
-            if result.0 != 1 {
-                return Ok(result);
-            }
-            if lease.state == ClientLifecycleState::Active {
-                redis::cmd("SET")
-                    .arg(&stable_key)
-                    .arg(lease.runtime.storage_key())
-                    .arg("PX")
-                    .arg(ttl_ms)
-                    .query::<()>(connection)?;
-            } else {
-                connection.del::<_, ()>(&stable_key)?;
-            }
             Ok(result)
         })?;
         if result.0 == 1 {
@@ -1590,40 +1612,12 @@ impl MetadataBackend for RedisMetadataBackend {
                     .key(&hwm_key)
                     .key(&global_index_key)
                     .key(&expiry_index_key)
+                    .key(&stable_key)
                     .arg(payload_template.as_str())
                     .arg(ttl_ms.to_string())
                     .arg(template.expires_at_ms.to_string())
+                    .arg(stable_id.0.as_str())
                     .invoke::<String>(connection)?;
-                let epoch = assigned_epoch.parse::<u64>().map_err(|error| {
-                    redis::RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "invalid epoch payload",
-                        format!("{assigned_epoch:?}: {error}"),
-                    ))
-                })?;
-                let runtime = ClientRuntimeId {
-                    stable_id: stable_id.clone(),
-                    epoch: ClientEpoch(epoch),
-                };
-                let lease_key = self.keyspace.client(&runtime);
-                let payload: String = connection.get(&lease_key)?;
-                let lease: ClientLease = serde_json::from_str(&payload).map_err(|error| {
-                    redis::RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "invalid lease payload",
-                        error.to_string(),
-                    ))
-                })?;
-                if lease.state == ClientLifecycleState::Active {
-                    redis::cmd("SET")
-                        .arg(&stable_key)
-                        .arg(runtime.storage_key())
-                        .arg("PX")
-                        .arg(ttl_ms)
-                        .query::<()>(connection)?;
-                } else {
-                    connection.del::<_, ()>(&stable_key)?;
-                }
                 Ok(assigned_epoch)
             })?;
         let epoch = assigned_epoch.parse::<u64>().map_err(|error| {
@@ -1655,24 +1649,11 @@ impl MetadataBackend for RedisMetadataBackend {
             self.query_idempotent_write("redis update client state", |connection| {
                 let result: (i32, String) = Script::new(UPDATE_CLIENT_STATE_SCRIPT)
                     .key(&key)
+                    .key(&stable_key)
                     .arg(next_state)
+                    .arg(runtime.storage_key())
+                    .arg(now_ms().to_string())
                     .invoke(connection)?;
-                if result.0 != 1 {
-                    return Ok(result);
-                }
-                let lease: ClientLease = serde_json::from_str(&result.1)
-                    .map_err(|error| store_error_to_redis_error(json_error(error)))?;
-                let ttl_ms = lease.expires_at_ms.saturating_sub(now_ms()).max(1);
-                if next == ClientLifecycleState::Active {
-                    redis::cmd("SET")
-                        .arg(&stable_key)
-                        .arg(runtime.storage_key())
-                        .arg("PX")
-                        .arg(ttl_ms)
-                        .query::<()>(connection)?;
-                } else {
-                    connection.del::<_, ()>(&stable_key)?;
-                }
                 Ok(result)
             })?;
         if result.0 == 1 {
@@ -1742,12 +1723,11 @@ impl MetadataBackend for RedisMetadataBackend {
                 .map_err(|error| metadata_error("redis sadd legacy client index", error))?;
         }
         let entries = self.query_readonly("redis fetch client leases", |connection| {
-            let mut entries = Vec::with_capacity(keys.len());
-            for key in &keys {
-                let payload: Option<String> = connection.get(key.as_str())?;
-                entries.push((key.clone(), payload));
+            if keys.is_empty() {
+                return Ok(Vec::new());
             }
-            Ok(entries)
+            let payloads: Vec<Option<String>> = redis::cmd("MGET").arg(&keys).query(connection)?;
+            Ok(keys.iter().cloned().zip(payloads).collect::<Vec<_>>())
         })?;
         let now = now_ms();
         let mut stale = Vec::new();
@@ -3840,10 +3820,9 @@ mod tests {
             .expect_err("older epoch must be rejected");
         assert!(matches!(rejection, StoreError::StaleEpoch(_)));
 
-        let equal = backend
+        backend
             .upsert_client_lease(&make_lease(5))
             .expect("same (stable_id, epoch) is a refresh");
-        let _ = equal;
 
         backend
             .upsert_client_lease(&make_lease(6))

@@ -79,7 +79,7 @@ fn canonical_prefix_unicode_lookalikes_are_distinct() {
 
 #[test]
 fn canonical_key_with_extremely_long_tenant_does_not_panic() {
-    let long_tenant: String = std::iter::repeat('t').take(8 * 1024).collect();
+    let long_tenant = "t".repeat(8 * 1024);
     let scope = NamespaceScope::with_defaults(Some(&long_tenant), None, None);
     let oid = LogicalObjectId::new(scope, "k");
     let _ = oid.canonical_key(); // must not panic / overflow
