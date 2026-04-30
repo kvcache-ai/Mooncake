@@ -24,13 +24,13 @@ struct rocm_plugin_ctx_t {
     // reserved
 };
 
-#define CHECK_HIP(call)                                                        \
-    do {                                                                       \
-        auto err = call;                                                       \
-        if (err != hipSuccess) {                                               \
+#define CHECK_HIP(call)                                                       \
+    do {                                                                      \
+        auto err = call;                                                      \
+        if (err != hipSuccess) {                                              \
             LOG(ERROR) << std::string(#call) + ": " + hipGetErrorString(err); \
-            return -1;                                                         \
-        }                                                                      \
+            return -1;                                                        \
+        }                                                                     \
     } while (0)
 
 class LocationParser {
@@ -125,8 +125,8 @@ static int rocm_get_device_pci_bus_id(void* ctx_, int device_index,
     (void)ctx_;
     hipDeviceProp_t prop;
     CHECK_HIP(hipGetDeviceProperties(&prop, device_index));
-    snprintf(bus_id, bus_id_len, "%04x:%02x:%02x.0",
-             prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+    snprintf(bus_id, bus_id_len, "%04x:%02x:%02x.0", prop.pciDomainID,
+             prop.pciBusID, prop.pciDeviceID);
     return 0;
 }
 

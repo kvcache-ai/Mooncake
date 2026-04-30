@@ -98,9 +98,7 @@ class RocmPlatformTest : public ::testing::Test {
     std::shared_ptr<RocmPlatform> platform_;
 };
 
-TEST_F(RocmPlatformTest, TypeString) {
-    EXPECT_EQ(platform_->type(), "rocm");
-}
+TEST_F(RocmPlatformTest, TypeString) { EXPECT_EQ(platform_->type(), "rocm"); }
 
 TEST_F(RocmPlatformTest, ProbeDiscoversMems) {
     std::vector<Topology::NicEntry> nics;

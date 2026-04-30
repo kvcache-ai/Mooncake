@@ -18,22 +18,22 @@
 #include <algorithm>
 #include <vector>
 
-#define CHECK_HIP(call)                                                        \
-    do {                                                                       \
-        hipError_t err = (call);                                               \
-        if (err != hipSuccess) {                                               \
-            fprintf(stderr, "HIP error %s:%d: %s\n", __FILE__, __LINE__,      \
-                    hipGetErrorString(err));                                    \
-            exit(EXIT_FAILURE);                                                \
-        }                                                                      \
+#define CHECK_HIP(call)                                                  \
+    do {                                                                 \
+        hipError_t err = (call);                                         \
+        if (err != hipSuccess) {                                         \
+            fprintf(stderr, "HIP error %s:%d: %s\n", __FILE__, __LINE__, \
+                    hipGetErrorString(err));                             \
+            exit(EXIT_FAILURE);                                          \
+        }                                                                \
     } while (0)
 
 static const size_t kWarmupIter = 5;
-static const size_t kBenchIter  = 20;
+static const size_t kBenchIter = 20;
 
 // Returns elapsed microseconds for `iters` copies of `bytes`.
 static double benchCopy(void* dst, const void* src, size_t bytes,
-                         hipMemcpyKind kind, hipStream_t stream, size_t iters) {
+                        hipMemcpyKind kind, hipStream_t stream, size_t iters) {
     // warmup
     for (size_t i = 0; i < kWarmupIter; i++)
         CHECK_HIP(hipMemcpyAsync(dst, src, bytes, kind, stream));
@@ -57,14 +57,13 @@ static double benchCopy(void* dst, const void* src, size_t bytes,
 }
 
 static void printHeader() {
-    printf("\n%-18s  %10s  %12s  %12s\n",
-           "Size", "Iters", "BW (GB/s)", "Lat (us)");
+    printf("\n%-18s  %10s  %12s  %12s\n", "Size", "Iters", "BW (GB/s)",
+           "Lat (us)");
     printf("%s\n", std::string(58, '-').c_str());
 }
 
-static void runBench(const char* label,
-                     void* dst, const void* src, size_t max_bytes,
-                     hipMemcpyKind kind, hipStream_t stream) {
+static void runBench(const char* label, void* dst, const void* src,
+                     size_t max_bytes, hipMemcpyKind kind, hipStream_t stream) {
     printf("\n[%s]\n", label);
     printHeader();
 
@@ -85,8 +84,8 @@ int main(int argc, char** argv) {
     for (int g = 0; g < gpu_count; g++) {
         hipDeviceProp_t prop;
         CHECK_HIP(hipGetDeviceProperties(&prop, g));
-        printf("  GPU %d: %s  VRAM %.0f GiB  PCIe %04x:%02x:%02x.0\n",
-               g, prop.name,
+        printf("  GPU %d: %s  VRAM %.0f GiB  PCIe %04x:%02x:%02x.0\n", g,
+               prop.name,
                (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0),
                prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
     }
@@ -95,7 +94,7 @@ int main(int argc, char** argv) {
     int dst_gpu = (argc >= 3) ? atoi(argv[2]) : (gpu_count > 1 ? 1 : 0);
 
     const size_t kMaxBytes = 4ULL * 1024 * 1024 * 1024;  // 4 GiB
-    const size_t kHostBytes = 512ULL * 1024 * 1024;       // 512 MiB host
+    const size_t kHostBytes = 512ULL * 1024 * 1024;      // 512 MiB host
 
     // --- allocate host pinned ---
     void* h_src = nullptr;
@@ -129,16 +128,18 @@ int main(int argc, char** argv) {
     // ----------------------------------------------------------------
     printf("\n=== H2D: Host → GPU %d ===\n", src_gpu);
     CHECK_HIP(hipSetDevice(src_gpu));
-    runBench("H2D", d_src, h_src, kHostBytes, hipMemcpyHostToDevice, stream_src);
+    runBench("H2D", d_src, h_src, kHostBytes, hipMemcpyHostToDevice,
+             stream_src);
 
     // ----------------------------------------------------------------
     printf("\n=== D2H: GPU %d → Host ===\n", src_gpu);
-    runBench("D2H", h_dst, d_src, kHostBytes, hipMemcpyDeviceToHost, stream_src);
+    runBench("D2H", h_dst, d_src, kHostBytes, hipMemcpyDeviceToHost,
+             stream_src);
 
     // ----------------------------------------------------------------
     printf("\n=== D2D (intra-GPU %d): same-device copy ===\n", src_gpu);
-    runBench("D2D intra", (char*)d_src + kMaxBytes / 2, d_src,
-             kMaxBytes / 2, hipMemcpyDeviceToDevice, stream_src);
+    runBench("D2D intra", (char*)d_src + kMaxBytes / 2, d_src, kMaxBytes / 2,
+             hipMemcpyDeviceToDevice, stream_src);
 
     // ----------------------------------------------------------------
     if (dst_gpu != src_gpu) {
@@ -151,21 +152,21 @@ int main(int argc, char** argv) {
         }
 
         char label[64];
-        snprintf(label, sizeof(label), "GPU %d → GPU %d (P2P %s)",
-                 src_gpu, dst_gpu, can_access ? "enabled" : "disabled");
+        snprintf(label, sizeof(label), "GPU %d → GPU %d (P2P %s)", src_gpu,
+                 dst_gpu, can_access ? "enabled" : "disabled");
         printf("\n=== %s ===\n", label);
 
         CHECK_HIP(hipSetDevice(src_gpu));
-        runBench(label, d_dst, d_src, kMaxBytes,
-                 hipMemcpyDeviceToDevice, stream_src);
+        runBench(label, d_dst, d_src, kMaxBytes, hipMemcpyDeviceToDevice,
+                 stream_src);
 
         // Reverse direction
-        snprintf(label, sizeof(label), "GPU %d → GPU %d (reverse)",
-                 dst_gpu, src_gpu);
+        snprintf(label, sizeof(label), "GPU %d → GPU %d (reverse)", dst_gpu,
+                 src_gpu);
         printf("\n=== %s ===\n", label);
         CHECK_HIP(hipSetDevice(dst_gpu));
-        runBench(label, d_src, d_dst, kMaxBytes,
-                 hipMemcpyDeviceToDevice, stream_dst);
+        runBench(label, d_src, d_dst, kMaxBytes, hipMemcpyDeviceToDevice,
+                 stream_dst);
     }
 
     // ----------------------------------------------------------------
@@ -185,7 +186,10 @@ int main(int argc, char** argv) {
         const size_t kP2PBytes = 1ULL * 1024 * 1024 * 1024;
         for (int s = 0; s < gpu_count; s++) {
             for (int d = 0; d < gpu_count; d++) {
-                if (s == d) { printf("GPU%-5d  GPU%-5d  %12s\n", s, d, "-"); continue; }
+                if (s == d) {
+                    printf("GPU%-5d  GPU%-5d  %12s\n", s, d, "-");
+                    continue;
+                }
                 CHECK_HIP(hipSetDevice(s));
                 int ca = 0;
                 hipDeviceCanAccessPeer(&ca, s, d);

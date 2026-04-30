@@ -174,7 +174,8 @@ static void discoverRocmTopology(std::vector<Topology::NicEntry>& nic_list,
         hipDeviceProp_t prop;
         err = hipGetDeviceProperties(&prop, i);
         if (err != hipSuccess) {
-            LOG(WARNING) << "hipGetDeviceProperties: " << hipGetErrorString(err);
+            LOG(WARNING) << "hipGetDeviceProperties: "
+                         << hipGetErrorString(err);
             continue;
         }
         // Format PCI bus ID as lowercase: domain:bus:device.function
@@ -254,7 +255,8 @@ MemoryType RocmPlatform::getMemoryType(void* addr) {
     hipPointerAttribute_t attributes;
     hipError_t result = hipPointerGetAttributes(&attributes, addr);
     if (result != hipSuccess) {
-        LOG(WARNING) << "hipPointerGetAttributes: " << hipGetErrorString(result);
+        LOG(WARNING) << "hipPointerGetAttributes: "
+                     << hipGetErrorString(result);
         return MTYPE_UNKNOWN;
     }
     if (attributes.type == hipMemoryTypeDevice) return MTYPE_ROCM;
@@ -285,7 +287,8 @@ const std::vector<RangeLocation> RocmPlatform::getLocation(void* start,
     hipPointerAttribute_t attributes;
     hipError_t result = hipPointerGetAttributes(&attributes, start);
     if (result != hipSuccess) {
-        LOG(WARNING) << "hipPointerGetAttributes: " << hipGetErrorString(result);
+        LOG(WARNING) << "hipPointerGetAttributes: "
+                     << hipGetErrorString(result);
         entries.push_back({(uint64_t)start, len, kWildcardLocation});
         return entries;
     }
