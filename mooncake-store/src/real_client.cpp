@@ -2573,13 +2573,8 @@ RealClient::resolve_registered_buffer(void *buffer) const {
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
-RealClient::resolve_ranged_read_metadata(const std::string &key) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto query_result = client_->Query(key);
+RealClient::build_ranged_read_metadata_from_query_result(
+    const std::string &key, tl::expected<QueryResult, ErrorCode> query_result) {
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -2596,10 +2591,22 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const auto &res = client_->GetPreferredReplica(replica_list);
+    std::vector<Replica::Descriptor> complete_replicas;
+    complete_replicas.reserve(replica_list.size());
+    for (const auto &replica : replica_list) {
+        if (replica.status == ReplicaStatus::COMPLETE) {
+            complete_replicas.push_back(replica);
+        }
+    }
+    if (complete_replicas.empty()) {
+        LOG(ERROR) << "no_complete_replicas_found key=" << key;
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    const auto &res = client_->GetPreferredReplica(complete_replicas);
     if (!res) {
-        LOG(ERROR) << "Internal error: replica_list is empty";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(ERROR) << "Failed to select preferred replica for key: " << key;
+        return tl::unexpected(res.error());
     }
 
     auto query_value = std::move(query_result.value());
@@ -2607,6 +2614,95 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
     return RangedReadMetadata{.query_result = std::move(query_value),
                               .replica = std::move(replica),
                               .total_size = calculate_total_size(replica)};
+}
+
+tl::expected<RealClient::RangedReadMetadata, ErrorCode>
+RealClient::resolve_ranged_read_metadata(const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return build_ranged_read_metadata_from_query_result(key,
+                                                        client_->Query(key));
+}
+
+std::unordered_map<std::string,
+                   tl::expected<RealClient::RangedReadMetadata, ErrorCode>>
+RealClient::batch_resolve_ranged_read_metadata(
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<bool>>> &valid_fragments,
+    const std::vector<size_t> &buffer_capacities,
+    bool skip_zero_capacity_buffers) {
+    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
+        metadata_cache;
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return metadata_cache;
+    }
+
+    if (all_keys.size() != valid_fragments.size() ||
+        all_keys.size() != buffer_capacities.size()) {
+        LOG(ERROR) << "get_into_ranges: metadata input size mismatch";
+        return metadata_cache;
+    }
+
+    size_t key_count_hint = 0;
+    for (const auto &keys : all_keys) {
+        key_count_hint += keys.size();
+    }
+    metadata_cache.reserve(key_count_hint);
+
+    std::vector<std::string> unique_keys;
+    unique_keys.reserve(key_count_hint);
+    for (size_t i = 0; i < valid_fragments.size(); ++i) {
+        if (skip_zero_capacity_buffers && buffer_capacities[i] == 0 &&
+            !all_keys[i].empty()) {
+            continue;
+        }
+        if (all_keys[i].size() != valid_fragments[i].size()) {
+            LOG(ERROR) << "get_into_ranges: metadata key-group size mismatch";
+            continue;
+        }
+        for (size_t j = 0; j < valid_fragments[i].size(); ++j) {
+            bool has_valid_fragment = false;
+            for (bool valid_fragment : valid_fragments[i][j]) {
+                if (valid_fragment) {
+                    has_valid_fragment = true;
+                    break;
+                }
+            }
+            if (!has_valid_fragment) {
+                continue;
+            }
+            auto [_, inserted] = metadata_cache.emplace(
+                all_keys[i][j], tl::unexpected(ErrorCode::INVALID_PARAMS));
+            if (inserted) {
+                unique_keys.push_back(all_keys[i][j]);
+            }
+        }
+    }
+    if (unique_keys.empty()) {
+        return metadata_cache;
+    }
+
+    auto query_results = client_->BatchQuery(unique_keys);
+    if (query_results.size() != unique_keys.size()) {
+        LOG(ERROR) << "BatchQuery result size mismatch in get_into_ranges";
+        for (const auto &key : unique_keys) {
+            metadata_cache.erase(key);
+            metadata_cache.emplace(key, tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return metadata_cache;
+    }
+
+    for (size_t i = 0; i < unique_keys.size(); ++i) {
+        metadata_cache.erase(unique_keys[i]);
+        metadata_cache.emplace(
+            unique_keys[i], build_ranged_read_metadata_from_query_result(
+                                unique_keys[i], std::move(query_results[i])));
+    }
+    return metadata_cache;
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -2743,8 +2839,9 @@ RealClient::get_into_ranges_internal(
         }
     }
 
-    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
-        metadata_cache;
+    auto metadata_cache = batch_resolve_ranged_read_metadata(
+        all_keys, prepared.valid_fragments, resolved_buffer_capacities,
+        buffer_capacities == nullptr);
 
     struct PendingFragment {
         size_t key_index;
@@ -2766,9 +2863,18 @@ RealClient::get_into_ranges_internal(
         std::unordered_map<std::string, size_t> key_to_range_index;
 
         for (size_t j = 0; j < key_count; ++j) {
-            auto [metadata_it, inserted] = metadata_cache.try_emplace(
-                all_keys[i][j], resolve_ranged_read_metadata(all_keys[i][j]));
-            (void)inserted;
+            auto metadata_it = metadata_cache.find(all_keys[i][j]);
+            if (metadata_it == metadata_cache.end()) {
+                LOG(ERROR) << "get_into_ranges: metadata not found for key "
+                           << all_keys[i][j];
+                for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
+                    if (prepared.valid_fragments[i][j][k]) {
+                        prepared.results[i][j][k] =
+                            tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                }
+                continue;
+            }
             auto &metadata_result = metadata_it->second;
 
             for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {

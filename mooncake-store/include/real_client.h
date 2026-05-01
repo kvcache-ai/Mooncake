@@ -529,6 +529,18 @@ class RealClient : public PyClient {
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key);
 
+    tl::expected<RangedReadMetadata, ErrorCode>
+    build_ranged_read_metadata_from_query_result(
+        const std::string &key,
+        tl::expected<QueryResult, ErrorCode> query_result);
+
+    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
+    batch_resolve_ranged_read_metadata(
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<bool>>> &valid_fragments,
+        const std::vector<size_t> &buffer_capacities,
+        bool skip_zero_capacity_buffers);
+
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,
