@@ -110,23 +110,35 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
 void BucketBackendConfig::MergeFromJson(const Json::Value& v) {
     if (v.isMember("bucket_size_limit")) {
         const auto& node = v["bucket_size_limit"];
-        bucket_size_limit =
-            node.isString()
-                ? static_cast<int64_t>(string_to_byte_size(node.asString()))
-                : node.asInt64();
+        if (node.isString()) {
+            bucket_size_limit =
+                static_cast<int64_t>(string_to_byte_size(node.asString()));
+        } else if (node.isIntegral()) {
+            bucket_size_limit = node.asInt64();
+        } else {
+            LOG(WARNING) << "bucket_size_limit has unexpected type, ignored";
+        }
     }
     if (v.isMember("bucket_keys_limit")) {
-        bucket_keys_limit = v["bucket_keys_limit"].asInt64();
+        const auto& node = v["bucket_keys_limit"];
+        if (node.isIntegral()) {
+            bucket_keys_limit = node.asInt64();
+        } else {
+            LOG(WARNING) << "bucket_keys_limit has unexpected type, ignored";
+        }
     }
 }
 
 void FileStorageConfig::MergeFromJson(const Json::Value& v) {
     if (v.isMember("storage_backend_type")) {
         const std::string t = v["storage_backend_type"].asString();
-        if (t == "file_per_key") {
+        if (t == "file_per_key_storage_backend") {
             storage_backend_type = StorageBackendType::kFilePerKey;
-        } else {
+        } else if (t == "bucket_storage_backend") {
             storage_backend_type = StorageBackendType::kBucket;
+        } else {
+            LOG(WARNING) << "Unknown storage_backend_type: " << t
+                         << ", keeping current value";
         }
     }
     if (v.isMember("storage_filepath")) {
@@ -134,17 +146,25 @@ void FileStorageConfig::MergeFromJson(const Json::Value& v) {
     }
     if (v.isMember("local_buffer_size")) {
         const auto& node = v["local_buffer_size"];
-        local_buffer_size =
-            node.isString()
-                ? static_cast<int64_t>(string_to_byte_size(node.asString()))
-                : node.asInt64();
+        if (node.isString()) {
+            local_buffer_size =
+                static_cast<int64_t>(string_to_byte_size(node.asString()));
+        } else if (node.isIntegral()) {
+            local_buffer_size = node.asInt64();
+        } else {
+            LOG(WARNING) << "local_buffer_size has unexpected type, ignored";
+        }
     }
     if (v.isMember("total_size_limit")) {
         const auto& node = v["total_size_limit"];
-        total_size_limit =
-            node.isString()
-                ? static_cast<int64_t>(string_to_byte_size(node.asString()))
-                : node.asInt64();
+        if (node.isString()) {
+            total_size_limit =
+                static_cast<int64_t>(string_to_byte_size(node.asString()));
+        } else if (node.isIntegral()) {
+            total_size_limit = node.asInt64();
+        } else {
+            LOG(WARNING) << "total_size_limit has unexpected type, ignored";
+        }
     }
 }
 

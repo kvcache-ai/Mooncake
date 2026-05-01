@@ -1159,9 +1159,8 @@ TEST_F(TieredBackendTest, ConcurrentAllocations) {
 
 // Test Interaction between DRAM and Storage Tier
 TEST_F(TieredBackendTest, MultiTierInteraction) {
-    // defaults to file_per_key for this test
     setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-           "file_per_key_storage_backend", 1);
+           "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_test_multitier",
            1);
     std::filesystem::remove_all("/tmp/mooncake_test_multitier");
@@ -1249,17 +1248,19 @@ TEST_F(TieredBackendTest, MultiTierInteraction) {
     ASSERT_TRUE(get_hot_storage.has_value());
     EXPECT_EQ(get_hot_storage.value()->loc.tier->GetTierId(), storage_id);
 
-    // Flux Storage to verify persistence
+    // Flush Storage to verify persistence
     const_cast<CacheTier*>(backend.GetTier(storage_id))->Flush();
-    // Check file exists for hot_key (since it was copied there)
-    // Filename in FilePerKey is hashed, but we can search.
+    // BucketStorageBackend writes data into bucket files named by bucket ID
+    // (e.g. "7281256148992.bucket"), not per-key files.
+    // Verify that at least one .bucket file was created, which confirms the
+    // flush wrote data to disk.
     bool found = false;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(
              "/tmp/mooncake_test_multitier")) {
-        // key might be sanitized or hashed, but let's check if we find any file
-        // created recently? Actually, FilePerKey backend sanitizes key.
-        // "hot_key" -> "hot_key" usually.
-        if (entry.path().filename() == "hot_key") found = true;
+        if (entry.path().extension() == ".bucket") {
+            found = true;
+            break;
+        }
     }
     EXPECT_TRUE(found) << "hot_key should be present in storage backend";
 }
@@ -1288,12 +1289,11 @@ TEST_F(TieredBackendTest, StoragePrefetch) {
 
     TieredBackend backend;
 
-    // Configure Storage Backend (FilePerKey)
-    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "file_per_key", 1);
-    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
-           "/tmp/mooncake_test_prefetch/file_per_key_dir", 1);
-    std::filesystem::create_directories(
-        "/tmp/mooncake_test_prefetch/file_per_key_dir");
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_test_prefetch",
+           1);
+    std::filesystem::create_directories("/tmp/mooncake_test_prefetch");
 
     ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 

@@ -78,13 +78,12 @@ tl::expected<void, ErrorCode> StorageTier::Init(
     static_cast<void>(engine);
     backend_ = backend;
     try {
-        // Validate backend type before creation: StorageTier only supports
-        // bucket backend (file_per_key lacks eviction support).
         {
             auto fs_config = FileStorageConfig::FromEnvironment();
             if (!tier_config.isNull()) {
                 fs_config.MergeFromJson(tier_config);
             }
+            // StorageTier only supports bucket backend
             if (fs_config.storage_backend_type != StorageBackendType::kBucket) {
                 LOG(ERROR)
                     << "StorageTier only supports bucket storage backend. "
