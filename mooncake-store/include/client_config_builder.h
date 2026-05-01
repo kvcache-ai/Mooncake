@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+#include <fstream>
+#include <sstream>
 
 #include <glog/logging.h>
 #include <json/json.h>
@@ -180,6 +182,9 @@ struct P2PClientConfig : RealClientConfigBase {
  */
 class ClientConfigBuilder {
    public:
+    static constexpr const char* kDefaultTieredBackendConfigPath =
+        "conf/tiered_backend.json";
+
     static DummyClientConfig build_dummy(size_t mem_pool_size,
                                          size_t local_buffer_size,
                                          const std::string& real_client_addr,
@@ -219,7 +224,8 @@ class ClientConfigBuilder {
         const std::string& protocol = "tcp",
         const std::optional<std::string>& rdma_devices = std::nullopt,
         const std::string& master_server_entry = "127.0.0.1:50051",
-        const std::string& tiered_backend_config_json = "",
+        const std::string& tiered_backend_config_json =
+            kDefaultTieredBackendConfigPath,
         uint64_t local_buffer_size = 0,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         const std::string& ipc_socket_path = "",
@@ -253,32 +259,15 @@ class ClientConfigBuilder {
         config.async_max_batch_size = async_max_batch_size;
         config.async_route_queue_size = async_route_queue_size;
 
-        Json::Value tiered_config;
-        std::string actual_json = tiered_backend_config_json;
-        if (actual_json.empty()) {
-            if (const char* env_p = std::getenv("MOONCAKE_TIERED_CONFIG")) {
-                actual_json = env_p;
-            }
-        }
-
-        if (!actual_json.empty()) {
-            Json::CharReaderBuilder builder;
-            auto reader =
-                std::unique_ptr<Json::CharReader>(builder.newCharReader());
-            std::string errors;
-            if (!reader->parse(actual_json.data(),
-                               actual_json.data() + actual_json.length(),
-                               &tiered_config, &errors)) {
-                LOG(ERROR) << "Failed to parse tiered config: " << errors;
-            }
-        }
+        Json::Value tiered_config =
+            LoadTieredConfig(tiered_backend_config_json);
 
         if (tiered_config.isNull() || !tiered_config.isMember("tiers") ||
             tiered_config["tiers"].empty()) {
             throw std::runtime_error(
-                "Tiered backend configuration is missing. Please provide "
-                "tiered_backend_config_json or set MOONCAKE_TIERED_CONFIG "
-                "environment variable.");
+                "Tiered backend configuration is missing or invalid. Please "
+                "provide a valid JSON string or a path to a JSON config file "
+                "via tiered_backend_config_json parameter.");
         }
         config.tiered_backend_config = tiered_config;
 
@@ -286,6 +275,46 @@ class ClientConfigBuilder {
     }
 
    private:
+    static Json::Value LoadTieredConfig(const std::string& json_or_path) {
+        Json::Value config;
+        std::string json_content;
+
+        // Determine if input is a JSON string or a file path
+        std::string trimmed = json_or_path;
+        size_t start = trimmed.find_first_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+            trimmed = trimmed.substr(start);
+        }
+
+        if (!trimmed.empty() && trimmed[0] == '{') {
+            // Treat as JSON string
+            json_content = json_or_path;
+        } else {
+            // Treat as file path
+            std::ifstream file(json_or_path);
+            if (!file.is_open()) {
+                LOG(ERROR) << "Failed to open tiered backend config file: "
+                           << json_or_path;
+                return config;  // Returns null Json::Value
+            }
+            std::ostringstream ss;
+            ss << file.rdbuf();
+            json_content = ss.str();
+        }
+
+        // Parse JSON
+        Json::CharReaderBuilder builder;
+        auto reader =
+            std::unique_ptr<Json::CharReader>(builder.newCharReader());
+        std::string errors;
+        if (!reader->parse(json_content.data(),
+                           json_content.data() + json_content.length(), &config,
+                           &errors)) {
+            LOG(ERROR) << "Failed to parse tiered config: " << errors;
+        }
+        return config;
+    }
+
     static void fill_real_client_config_base(
         RealClientConfigBase& config, const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,

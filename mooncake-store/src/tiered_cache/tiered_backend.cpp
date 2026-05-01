@@ -11,8 +11,16 @@
 #endif
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/scheduler/client_scheduler.h"
+#include "utils.h"
 
 namespace mooncake {
+
+static size_t ParseByteSize(const Json::Value& v) {
+    if (v.isString()) {
+        return static_cast<size_t>(string_to_byte_size(v.asString()));
+    }
+    return static_cast<size_t>(v.asUInt64());
+}
 
 AllocationEntry::~AllocationEntry() {
     if (loc.tier) {
@@ -125,7 +133,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         }
 
         std::string type = tier_config["type"].asString();
-        size_t capacity = tier_config["capacity"].asUInt64();
+        size_t capacity = ParseByteSize(tier_config["capacity"]);
         int priority = tier_config["priority"].asInt();
 
         // Validate capacity
@@ -224,7 +232,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             LOG(INFO) << "Creating Storage tier: id=" << id
                       << ", capacity=" << capacity << ", priority=" << priority;
             auto tier = std::make_shared<StorageTier>(id, tags, capacity);
-            auto init_result = tier->Init(this, engine);
+            auto init_result = tier->Init(this, engine, tier_config);
             if (!init_result) {
                 LOG(ERROR) << "Failed to initialize Storage tier: id=" << id
                            << ", error=" << init_result.error();

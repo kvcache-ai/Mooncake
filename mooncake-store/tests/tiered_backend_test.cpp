@@ -1353,4 +1353,50 @@ TEST_F(TieredBackendTest, StoragePrefetch) {
     std::filesystem::remove_all("/tmp/mooncake_test_prefetch");
 }
 
+// ---- ParseByteSize: capacity accepts human-readable string ----
+
+TEST_F(TieredBackendTest, CapacityAsHumanReadableString) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": "1GB",
+                "priority": 10
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto result = InitTieredBackendForTest(backend, config);
+    EXPECT_TRUE(result.has_value());
+
+    auto tier_views = backend.GetTierViews();
+    ASSERT_EQ(tier_views.size(), 1u);
+    EXPECT_EQ(tier_views[0].capacity, 1024ULL * 1024 * 1024);
+}
+
+TEST_F(TieredBackendTest, CapacityAsPlainInteger) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 536870912,
+                "priority": 10
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto result = InitTieredBackendForTest(backend, config);
+    EXPECT_TRUE(result.has_value());
+
+    auto tier_views = backend.GetTierViews();
+    ASSERT_EQ(tier_views.size(), 1u);
+    EXPECT_EQ(tier_views[0].capacity, 512ULL * 1024 * 1024);
+}
+
 }  // namespace mooncake

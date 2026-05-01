@@ -1006,7 +1006,8 @@ PYBIND11_MODULE(store, m) {
             "setup_p2p_real_client",
             [](MooncakeStorePyWrapper& self, const std::string& local_hostname,
                const std::string& metadata_server,
-               const std::string& tiered_backend_config_json = "",
+               const std::string& tiered_backend_config_json =
+                   "conf/tiered_backend.json",
                size_t local_buffer_size = 1024 * 1024 * 16,
                const std::string& protocol = "tcp",
                const std::string& rdma_devices = "",

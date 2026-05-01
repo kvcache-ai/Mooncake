@@ -107,6 +107,47 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     return config;
 }
 
+void BucketBackendConfig::MergeFromJson(const Json::Value& v) {
+    if (v.isMember("bucket_size_limit")) {
+        const auto& node = v["bucket_size_limit"];
+        bucket_size_limit =
+            node.isString()
+                ? static_cast<int64_t>(string_to_byte_size(node.asString()))
+                : node.asInt64();
+    }
+    if (v.isMember("bucket_keys_limit")) {
+        bucket_keys_limit = v["bucket_keys_limit"].asInt64();
+    }
+}
+
+void FileStorageConfig::MergeFromJson(const Json::Value& v) {
+    if (v.isMember("storage_backend_type")) {
+        const std::string t = v["storage_backend_type"].asString();
+        if (t == "file_per_key") {
+            storage_backend_type = StorageBackendType::kFilePerKey;
+        } else {
+            storage_backend_type = StorageBackendType::kBucket;
+        }
+    }
+    if (v.isMember("storage_filepath")) {
+        storage_filepath = v["storage_filepath"].asString();
+    }
+    if (v.isMember("local_buffer_size")) {
+        const auto& node = v["local_buffer_size"];
+        local_buffer_size =
+            node.isString()
+                ? static_cast<int64_t>(string_to_byte_size(node.asString()))
+                : node.asInt64();
+    }
+    if (v.isMember("total_size_limit")) {
+        const auto& node = v["total_size_limit"];
+        total_size_limit =
+            node.isString()
+                ? static_cast<int64_t>(string_to_byte_size(node.asString()))
+                : node.asInt64();
+    }
+}
+
 StorageBackendInterface::StorageBackendInterface(
     const FileStorageConfig& config)
     : file_storage_config_(config) {}
@@ -2610,10 +2651,12 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::HasNext() {
 }
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config) {
+CreateStorageBackend(const FileStorageConfig& config,
+                     const Json::Value& tier_config) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
+            bucket_backend_config.MergeFromJson(tier_config);
             if (!bucket_backend_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid StorageBackend configuration");
@@ -2636,6 +2679,13 @@ CreateStorageBackend(const FileStorageConfig& config) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
+}
+
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const Json::Value& tier_config) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.MergeFromJson(tier_config);
+    return CreateStorageBackend(config, tier_config);
 }
 
 }  // namespace mooncake

@@ -16,11 +16,11 @@ DEFINE_string(master_server_address, "127.0.0.1:50051",
 DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
-DEFINE_int32(threads, 1, "Number of threads for client service");
+DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
-DEFINE_string(tiered_backend_config, "",
-              "Tiered backend config json. Empty means load from env "
-              "MOONCAKE_TIERED_CONFIG");
+DEFINE_string(tiered_backend_config, "conf/tiered_backend.json",
+              "Tiered backend config: accepts a JSON string or a path to a "
+              "JSON config file.");
 DEFINE_string(deployment_mode, "Centralization",
               "Client type: 'Centralization' or 'P2P'");
 DEFINE_uint32(client_rpc_port, 12345, "Client RPC service port (P2P mode)");

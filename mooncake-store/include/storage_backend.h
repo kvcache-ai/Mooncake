@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+#include <json/json.h>
+
 #include "file_interface.h"
 #include "mutex.h"
 #include "types.h"
@@ -73,6 +75,8 @@ struct BucketBackendConfig {
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
+
+    void MergeFromJson(const Json::Value& v);
 };
 
 struct FileStorageConfig {
@@ -112,6 +116,8 @@ struct FileStorageConfig {
      * @return FileStorageConfig with values from env or defaults
      */
     static FileStorageConfig FromEnvironment();
+
+    void MergeFromJson(const Json::Value& v);
 };
 
 class StorageBackendInterface {
@@ -852,6 +858,10 @@ class BucketStorageBackend : public StorageBackendInterface {
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config);
+CreateStorageBackend(const FileStorageConfig& config,
+                     const Json::Value& tier_config = Json::Value{});
+
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const Json::Value& tier_config);
 
 }  // namespace mooncake

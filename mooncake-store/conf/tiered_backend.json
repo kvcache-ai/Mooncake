@@ -1,0 +1,16 @@
+{
+    "tiers": [
+        {
+            "type": "DRAM",
+            "capacity": "100GB",
+            "priority": 10,
+            "allocator_type": "OFFSET"
+        }
+    ],
+    "scheduler": {
+        "policy": "LRU",
+        "low_watermark": 0.6,
+        "high_watermark": 0.8,
+        "eviction_mode": "sync"
+    }
+}
