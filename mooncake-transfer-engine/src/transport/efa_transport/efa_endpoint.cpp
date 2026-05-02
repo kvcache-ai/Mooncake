@@ -109,28 +109,29 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
         return ERR_REJECT_HANDSHAKE;
     }
 
-    // Idempotent fast path: under bilateral sglang PD traffic, both peers
-    // initiate handshakes, so each side's passive handler fires *after* the
-    // active side has already connected.  The peer address in that second
-    // handshake is identical to what we already inserted — no need to churn
-    // the AV (fi_av_remove + fi_av_insert), which was only noisy and
-    // introduced a brief window where in-flight fi_write could see a stale
-    // fi_addr_t.  Just echo our local desc back.
-    if (status_.load(std::memory_order_relaxed) == CONNECTED &&
-        peer_desc.efa_addr == cached_peer_addr_) {
-        local_desc.local_nic_path = context_.nicPath();
-        local_desc.peer_nic_path = peer_nic_path_;
-        local_desc.efa_addr = context_.localEpAddr();
-        VLOG(1) << "EFA passive handshake (idempotent): " << toString();
-        return 0;
-    }
-
-    // Peer address genuinely changed (peer process restart, AV slot reshuffle).
-    // Tear down the old slot and reinsert.  INFO level — this is rare and
-    // operationally interesting, unlike the bilateral-handshake case above.
+    // Classify this passive handshake so we can emit the right log level
+    // without changing functional behavior: the AV reinsert below must
+    // still happen on every handshake because libfabric's EFA provider
+    // tracks per-peer transport state that depends on a fresh
+    // fi_av_insert (e.g. provider-internal AH activation and RNR state).
+    // Skipping reinsert caused request-level stalls under bilateral
+    // sglang P/D load even when the peer EFA address was unchanged.
+    //
+    // Log semantics:
+    //   * Same cached peer address → benign symmetric handshake under
+    //     bilateral traffic.  Demote to INFO to keep decode logs readable
+    //     without hiding real reconnects.
+    //   * Different cached peer address → genuine reconnect (peer
+    //     restart, port reshuffle that reached disconnect first, etc.).
+    //     Keep at WARNING so it stays visible.
     if (status_.load(std::memory_order_relaxed) == CONNECTED) {
-        LOG(INFO) << "Peer EFA address changed, re-establishing: "
-                  << toString();
+        if (!cached_peer_addr_.empty() &&
+            peer_desc.efa_addr == cached_peer_addr_) {
+            VLOG(1) << "EFA passive handshake (same peer addr): "
+                    << toString();
+        } else {
+            LOG(WARNING) << "Re-establish EFA connection: " << toString();
+        }
         disconnectUnlocked();
     }
 
