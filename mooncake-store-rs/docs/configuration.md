@@ -514,8 +514,9 @@ The current repository uses these environment variables.
 | `MC_STORE_LOCAL_HOT_BLOCK_SIZE` | Python compatibility runtime, standalone dummy daemon, and local e2e | cache block size and maximum cached object size; default `16777216` (`16 MiB`) |
 | `MC_STORE_LOCAL_HOT_CACHE_USE_SHM` | standalone dummy daemon, dummy compatibility clients, and local e2e | set to `1` to back cached payloads with shm so dummy clients attached to the same daemon can reuse them |
 | `MC_STORE_RS_TRACE` | Python wrapper setup fallback, e2e, and applications | enable tracing initialization from env |
-| `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |
+| `MC_STORE_RS_TRACE_FILTER` | standalone client, Python wrapper setup fallback, e2e, and applications | `tracing_subscriber` filter string; `--trace-filter` overrides it for the standalone client |
 | `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |
+| `MC_STORE_RS_TRACE_SPAN_EVENTS` | standalone client, Python real mode, e2e, and applications | tracing span lifecycle events; `close` keeps operation close timing logs, `none` suppresses those synthetic close lines |
 | `MC_BENCH_TRACE_FILE` | `mooncake-store-bench` | append bench tracing logs to this file; bench otherwise logs to `stderr` and does not use `MC_STORE_RS_TRACE_FILE` for its own output |
 | `MC_BENCH_INTERFACES` | `mooncake-store-bench` | combined write/read interface selector; accepts `<write>,<read>`, `<write>:<read>`, or `write=<...>,read=<...>`; when set it overrides non-CLI interface defaults |
 | `MC_BENCH_WRITE_INTERFACE` | `mooncake-store-bench` | measured write-side bench API; `put`, `batch_put`, or `batch_put_from`; default `batch_put_from` |

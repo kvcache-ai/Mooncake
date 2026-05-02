@@ -24,6 +24,7 @@ use mooncake_store_client::{
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
 };
+use tracing::debug;
 
 fn dummy_worker_scope(keyspace: Option<&str>) -> String {
     keyspace
@@ -153,7 +154,7 @@ struct RunArgs {
     use_hugepage: bool,
     #[arg(long, value_parser = parse_hugepage_size_arg)]
     hugepage_size: Option<usize>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_TRACE_FILTER")]
     trace_filter: Option<String>,
     #[arg(long, value_enum, default_value_t = RouteControlArg::EmbeddedWrh, help = "Compatibility fallback route-control mode; prefer admin-managed tenant policy in metadata")]
     route_control: RouteControlArg,
@@ -213,7 +214,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     validate_args(&args)?;
-    init_tracing(args.trace_filter.as_deref())?;
+    init_tracing(normalize_trace_filter(args.trace_filter.as_deref()))?;
     emit_compat_warnings(&args);
 
     let timeouts = resolve_timeout_config(&args)?;
@@ -319,6 +320,10 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     }
     eprintln!("{}", stopped_message(&stable_id));
     Ok(())
+}
+
+fn normalize_trace_filter(filter: Option<&str>) -> Option<&str> {
+    filter.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn parse_cli() -> Result<Cli, clap::Error> {
@@ -708,6 +713,11 @@ fn refresh_lease_or_retry(
 ) -> u64 {
     match client.heartbeat(now_ms.saturating_add(lease_ttl_ms)) {
         Ok(()) => {
+            debug!(
+                stable_id,
+                expires_at_ms = now_ms.saturating_add(lease_ttl_ms),
+                "mooncake-store-client heartbeat refreshed"
+            );
             let recovered = state.record_success(now_ms);
             if recovered != 0 {
                 eprintln!(
@@ -770,6 +780,7 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     use clap::error::ErrorKind;
@@ -784,11 +795,11 @@ mod tests {
     use super::{
         build_runtime_args, compat_warnings, drained_message, dummy_worker_scope,
         effective_heartbeat_interval, emit_compat_warnings, fetch_stats_body,
-        heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, now_ms, parse_cli_from,
-        parse_hugepage_size_arg, parse_label, requested_initial_state, resolve_timeout_config,
-        should_activate_after_ready, start_metrics_if_needed, started_message,
-        startup_initial_state, stopped_message, validate_args, Command, HeartbeatLoopState,
-        InitialStateArg, RouteControlArg, RunArgs,
+        heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, normalize_trace_filter, now_ms,
+        parse_cli_from, parse_hugepage_size_arg, parse_label, requested_initial_state,
+        resolve_timeout_config, should_activate_after_ready, start_metrics_if_needed,
+        started_message, startup_initial_state, stopped_message, validate_args, Command,
+        HeartbeatLoopState, InitialStateArg, RouteControlArg, RunArgs,
     };
     use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
 
@@ -836,6 +847,26 @@ mod tests {
             route_control: RouteControlArg::EmbeddedWrh,
             drain_on_exit: false,
         }
+    }
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = env_test_lock().lock().expect("env test lock poisoned");
+        let old_value = std::env::var_os(key);
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
+        match old_value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        result
     }
 
     #[test]
@@ -967,6 +998,31 @@ mod tests {
         assert_eq!(args.hugepage_size, Some(2 * 1024 * 1024));
         assert_eq!(args.trace_filter.as_deref(), Some("info"));
         assert!(args.drain_on_exit);
+    }
+
+    #[test]
+    fn args_parser_reads_trace_filter_from_env_when_cli_omits_it() {
+        with_env_var("MC_STORE_RS_TRACE_FILTER", Some("debug"), || {
+            let cli = parse_cli_from([
+                "mooncake-store-client",
+                "--local-hostname",
+                "10.0.0.1",
+                "--metadata-url",
+                "redis://127.0.0.1:6379/0",
+            ])
+            .expect("legacy root run args should parse");
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            assert_eq!(args.trace_filter.as_deref(), Some("debug"));
+        });
+    }
+
+    #[test]
+    fn blank_trace_filter_normalizes_to_default() {
+        assert_eq!(normalize_trace_filter(Some("  ")), None);
+        assert_eq!(normalize_trace_filter(Some(" debug ")), Some("debug"));
+        assert_eq!(normalize_trace_filter(None), None);
     }
 
     #[test]

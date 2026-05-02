@@ -30,6 +30,7 @@ static TEST_PROCESS_LOCK: OnceLock<ReentrantMutex<()>> = OnceLock::new();
 const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const TRACE_FILE_ENV: &str = "MC_STORE_RS_TRACE_FILE";
+const TRACE_SPAN_EVENTS_ENV: &str = "MC_STORE_RS_TRACE_SPAN_EVENTS";
 
 struct MetricsHttpServer {
     address: String,
@@ -194,6 +195,7 @@ pub fn init_tracing(filter: Option<&str>) -> Result<()> {
     };
 
     let trace_file = trace_file_from_env(TRACE_FILE_ENV)?;
+    let span_events = trace_span_events_from_env(TRACE_SPAN_EVENTS_ENV)?;
     let use_ansi = trace_file.is_none() && std::io::stdout().is_terminal();
 
     let init_result = match trace_file {
@@ -206,7 +208,7 @@ pub fn init_tracing(filter: Option<&str>) -> Result<()> {
                 .with_target(true)
                 .with_thread_ids(true)
                 .with_ansi(false)
-                .with_span_events(FmtSpan::CLOSE)
+                .with_span_events(span_events)
                 .with_writer(writer)
                 .try_init()
         }
@@ -215,7 +217,7 @@ pub fn init_tracing(filter: Option<&str>) -> Result<()> {
             .with_target(true)
             .with_thread_ids(true)
             .with_ansi(use_ansi)
-            .with_span_events(FmtSpan::CLOSE)
+            .with_span_events(span_events)
             .try_init(),
     };
 
@@ -262,6 +264,20 @@ fn trace_file_from_env(name: &str) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     Ok(Some(path))
+}
+
+fn trace_span_events_from_env(name: &str) -> Result<FmtSpan> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(FmtSpan::CLOSE);
+    };
+    let value = value.to_string_lossy();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "close" | "1" | "true" | "yes" | "on" => Ok(FmtSpan::CLOSE),
+        "none" | "off" | "0" | "false" | "no" => Ok(FmtSpan::NONE),
+        other => Err(StoreError::InvalidState(format!(
+            "invalid tracing span events value {other:?}; expected close or none"
+        ))),
+    }
 }
 
 fn open_trace_file(path: &Path) -> Result<File> {
@@ -872,6 +888,40 @@ mod tests {
 
         let _ = std::fs::remove_file(&trace_path);
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn trace_span_events_from_env_accepts_none_and_close() {
+        let _guard = metrics_test_lock().lock();
+        let env = "MOONCAKE_TEST_TRACE_SPAN_EVENTS";
+
+        with_env_var(env, None, || {
+            assert_eq!(
+                trace_span_events_from_env(env).expect("missing span events env should parse"),
+                FmtSpan::CLOSE
+            );
+        });
+
+        with_env_var(env, Some("none"), || {
+            assert_eq!(
+                trace_span_events_from_env(env).expect("none span events env should parse"),
+                FmtSpan::NONE
+            );
+        });
+
+        with_env_var(env, Some("close"), || {
+            assert_eq!(
+                trace_span_events_from_env(env).expect("close span events env should parse"),
+                FmtSpan::CLOSE
+            );
+        });
+
+        with_env_var(env, Some("bad"), || {
+            assert!(matches!(
+                trace_span_events_from_env(env),
+                Err(StoreError::InvalidState(_))
+            ));
+        });
     }
 
     #[test]
