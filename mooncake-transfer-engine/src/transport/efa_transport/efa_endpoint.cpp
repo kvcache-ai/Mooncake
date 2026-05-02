@@ -31,31 +31,6 @@ EfaEndPoint::~EfaEndPoint() { disconnect(); }
 void EfaEndPoint::setPeerNicPath(const std::string& peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
     if (peer_nic_path_ == peer_nic_path) return;  // No change
-
-    // The P2PHANDSHAKE transport assigns a fresh RPC port per bootstrap,
-    // so every sglang KV transfer arrives with a different peer_nic_path
-    // string ("host:PORT@nicX") even though the EFA peer has not moved.
-    // The RPC port is pure metadata — EFA SRD addressing is keyed on the
-    // binary efa_addr (GID/QPN) returned by fi_getname(), which only
-    // changes on actual peer process restart.  Treating a port change as
-    // a reconnect would fi_av_remove + fi_av_insert on every KV transfer,
-    // tearing down the provider's AH activation / RNR state and paying a
-    // first-packet AH warm-up latency each time.
-    //
-    // If the normalized nic path (host+NIC, no port) is unchanged, keep
-    // the AV slot intact and only refresh the stored string.  A real peer
-    // restart still gets caught in setupConnectionsByPassive by comparing
-    // peer_desc.efa_addr against cached_peer_addr_.
-    if (normalizeNicPath(peer_nic_path_) == normalizeNicPath(peer_nic_path)) {
-        VLOG(1) << "Peer RPC port rotated, keeping AV slot: " << peer_nic_path_
-                << " -> " << peer_nic_path;
-        peer_nic_path_ = peer_nic_path;
-        return;
-    }
-
-    // Different host or different NIC reached the same endpoint slot — this
-    // should not normally happen because EfaContext::endpoint() keys the map
-    // by normalized nic path, but handle it defensively.
     if (status_.load(std::memory_order_relaxed) == CONNECTED) {
         LOG(INFO) << "Peer reconnected with new address, re-establishing: "
                   << peer_nic_path_ << " -> " << peer_nic_path;
@@ -117,12 +92,8 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                            HandShakeDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
 
-    // Compare against the normalized peer path so RPC port rotation (see
-    // setPeerNicPath()) does not trip this sanity check.  context_.nicPath()
-    // has no port to begin with, so a direct string compare is fine for it.
     if (peer_desc.peer_nic_path != context_.nicPath() ||
-        normalizeNicPath(peer_desc.local_nic_path) !=
-            normalizeNicPath(peer_nic_path_)) {
+        peer_desc.local_nic_path != peer_nic_path_) {
         local_desc.reply_msg = "EFA nic path inconsistency";
         LOG(ERROR) << "Invalid argument: peer EFA nic path inconsistency"
                    << " peer_nic_path=" << peer_desc.peer_nic_path
