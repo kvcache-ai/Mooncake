@@ -127,8 +127,7 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
     if (status_.load(std::memory_order_relaxed) == CONNECTED) {
         if (!cached_peer_addr_.empty() &&
             peer_desc.efa_addr == cached_peer_addr_) {
-            VLOG(1) << "EFA passive handshake (same peer addr): "
-                    << toString();
+            VLOG(1) << "EFA passive handshake (same peer addr): " << toString();
         } else {
             LOG(WARNING) << "Re-establish EFA connection: " << toString();
         }
