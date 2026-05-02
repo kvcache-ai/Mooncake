@@ -62,6 +62,24 @@ fn worker_key_index(shard: WorkerKeyShard, offset: usize) -> usize {
     shard.start + (offset % shard.count)
 }
 
+fn operation_key_offset(iteration: usize, width: usize, shard: WorkerKeyShard) -> usize {
+    iteration.saturating_mul(width.max(1)) % shard.count
+}
+
+fn split_mixed_shards(shard: WorkerKeyShard) -> (WorkerKeyShard, WorkerKeyShard) {
+    let read_count = (shard.count / 2).max(1);
+    let write_count = shard.count.saturating_sub(read_count).max(1);
+    let read_shard = WorkerKeyShard {
+        start: shard.start,
+        count: read_count,
+    };
+    let write_shard = WorkerKeyShard {
+        start: shard.start + shard.count.saturating_sub(write_count),
+        count: write_count,
+    };
+    (read_shard, write_shard)
+}
+
 fn request_replication_policy(replica_count: usize) -> Option<ReplicationPolicy> {
     (replica_count > 1).then(|| ReplicationPolicy::default().replica_count(replica_count))
 }
@@ -478,6 +496,7 @@ pub fn run_bench(
                 let mut get_rec = LatencyRecorder::with_capacity(total_ops.min(1 << 20));
 
                 let shard = worker_key_shard(worker_id, concurrency, key_space_size);
+                let (mixed_read_shard, mixed_write_shard) = split_mixed_shards(shard);
                 let replication_policy = request_replication_policy(replica_count);
                 let mut batch_put_from_buffers =
                     matches!(write_interface, WriteInterface::BatchPutFrom).then(|| {
@@ -550,14 +569,23 @@ pub fn run_bench(
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
+                    let warmup_shard = if matches!(worker_mode, BenchMode::Mixed) {
+                        mixed_write_shard
+                    } else {
+                        shard
+                    };
                     let _ = execute_write(
                         writer,
                         write_interface,
                         WriteOperation {
                             target: OperationTarget {
                                 worker_id,
-                                shard,
-                                key_offset: wi,
+                                shard: warmup_shard,
+                                key_offset: operation_key_offset(
+                                    wi,
+                                    write_operation_width(write_interface, batch_size),
+                                    warmup_shard,
+                                ),
                                 width: write_operation_width(write_interface, batch_size),
                                 tenant: &tenant,
                             },
@@ -587,7 +615,6 @@ pub fn run_bench(
                         break;
                     }
 
-                    let key_offset = iter % shard.count;
                     let is_read = match worker_mode {
                         BenchMode::Put => false,
                         BenchMode::Get => true,
@@ -595,15 +622,21 @@ pub fn run_bench(
                     };
 
                     if is_read {
+                        let read_shard = if matches!(worker_mode, BenchMode::Mixed) {
+                            mixed_read_shard
+                        } else {
+                            shard
+                        };
+                        let read_width = read_operation_width(read_interface, batch_size);
                         let t0 = Instant::now();
                         match execute_read_with_retry(
                             reader,
                             read_interface,
                             OperationTarget {
                                 worker_id,
-                                shard,
-                                key_offset,
-                                width: read_operation_width(read_interface, batch_size),
+                                shard: read_shard,
+                                key_offset: operation_key_offset(iter, read_width, read_shard),
+                                width: read_width,
                                 tenant: &tenant,
                             },
                             batch_get_into_buffers.as_mut(),
@@ -622,6 +655,12 @@ pub fn run_bench(
                             }
                         }
                     } else {
+                        let write_shard = if matches!(worker_mode, BenchMode::Mixed) {
+                            mixed_write_shard
+                        } else {
+                            shard
+                        };
+                        let write_width = write_operation_width(write_interface, batch_size);
                         let t0 = Instant::now();
                         match execute_write(
                             writer,
@@ -629,9 +668,13 @@ pub fn run_bench(
                             WriteOperation {
                                 target: OperationTarget {
                                     worker_id,
-                                    shard,
-                                    key_offset,
-                                    width: write_operation_width(write_interface, batch_size),
+                                    shard: write_shard,
+                                    key_offset: operation_key_offset(
+                                        iter,
+                                        write_width,
+                                        write_shard,
+                                    ),
+                                    width: write_width,
                                     tenant: &tenant,
                                 },
                                 global_seed,
@@ -747,6 +790,37 @@ mod tests {
         assert_eq!(
             keys,
             vec![2_500, 2_501, 2_502, 2_503, 2_504, 2_505, 2_506, 2_507]
+        );
+    }
+
+    #[test]
+    fn batched_operations_advance_by_batch_width() {
+        let shard = worker_key_shard(0, 1, 128);
+
+        assert_eq!(operation_key_offset(0, 6, shard), 0);
+        assert_eq!(operation_key_offset(1, 6, shard), 6);
+        assert_eq!(operation_key_offset(21, 6, shard), 126);
+        assert_eq!(operation_key_offset(22, 6, shard), 4);
+    }
+
+    #[test]
+    fn mixed_mode_splits_stable_read_and_write_shards() {
+        let shard = worker_key_shard(2, 8, 10_000);
+        let (read_shard, write_shard) = split_mixed_shards(shard);
+
+        assert_eq!(
+            read_shard,
+            WorkerKeyShard {
+                start: 2_500,
+                count: 625
+            }
+        );
+        assert_eq!(
+            write_shard,
+            WorkerKeyShard {
+                start: 3_125,
+                count: 625
+            }
         );
     }
 

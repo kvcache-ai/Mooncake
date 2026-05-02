@@ -99,6 +99,11 @@ mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 bench \
 - `--read-interface` selects `get`, `batch_get`, or `batch_get_into` for measured reads
 - defaults benchmark `batch_put_from` + `batch_get_into`
 - `MC_BENCH_INTERFACES` can set both env defaults at once, for example `MC_BENCH_INTERFACES=put,get`
+- batched operations advance their key cursor by the batch width, so adjacent
+  batch calls do not repeatedly rewrite or reread the same object window
+- mixed mode splits each worker's key shard into a stable read half and a write
+  half; this keeps the benchmark from turning ordinary read traffic into
+  immediate read-after-overwrite route churn
 - measured reads retry bounded route-readiness misses, such as a freshly written object route
   not yet being readable; the wait is included in read latency and persistent misses still count
   as read errors
