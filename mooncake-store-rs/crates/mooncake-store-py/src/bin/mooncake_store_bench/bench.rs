@@ -19,6 +19,8 @@ use crate::setup::{now_ms, BenchCluster, LEASE_MS};
 const HEARTBEAT_EVERY: usize = 64;
 const PREFILL_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const PREFILL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const READ_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
+const READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 fn is_heartbeat_tick(iteration: usize) -> bool {
     iteration.checked_rem(HEARTBEAT_EVERY) == Some(0)
@@ -290,6 +292,51 @@ fn is_retryable_prefill_error(message: &str) -> bool {
         || message.contains("not connected")
 }
 
+fn is_retryable_read_error(message: &str) -> bool {
+    is_retryable_prefill_error(message)
+        || message.contains("is not readable")
+        || message.contains("object not found")
+        || message.contains("has no readable replica owner")
+}
+
+fn execute_read_with_retry(
+    reader: &StoreClient,
+    interface: ReadInterface,
+    target: OperationTarget<'_>,
+    batch_get_into_buffers: Option<&mut ReadBuffers>,
+) -> StoreResult<u64> {
+    let retry_started = Instant::now();
+    let mut attempts = 0usize;
+    let mut batch_get_into_buffers = batch_get_into_buffers;
+    loop {
+        attempts += 1;
+        let buffers = match batch_get_into_buffers {
+            Some(ref mut buffers) => Some(&mut **buffers),
+            None => None,
+        };
+        match execute_read(reader, interface, target, buffers) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                let message = error.to_string();
+                if !is_retryable_read_error(&message)
+                    || retry_started.elapsed() >= READ_RETRY_TIMEOUT
+                {
+                    return Err(error);
+                }
+                if attempts == 1 {
+                    debug!(
+                        worker = target.worker_id,
+                        key_offset = target.key_offset,
+                        width = target.width,
+                        "read route not ready; retrying until route becomes readable"
+                    );
+                }
+                thread::sleep(READ_RETRY_INTERVAL);
+            }
+        }
+    }
+}
+
 struct LiveCounters {
     put_ops: AtomicU64,
     get_ops: AtomicU64,
@@ -549,7 +596,7 @@ pub fn run_bench(
 
                     if is_read {
                         let t0 = Instant::now();
-                        match execute_read(
+                        match execute_read_with_retry(
                             reader,
                             read_interface,
                             OperationTarget {
@@ -721,6 +768,22 @@ mod tests {
         ));
         assert!(!is_retryable_prefill_error(
             "invalid state: no placement candidates available"
+        ));
+    }
+
+    #[test]
+    fn read_retry_accepts_route_readiness_errors_only() {
+        assert!(is_retryable_read_error(
+            "object not found: tenant=bench key=bench-w0-k0 is not readable"
+        ));
+        assert!(is_retryable_read_error(
+            "object not found: tenant=bench key=bench-w0-k0 has no readable replica owner"
+        ));
+        assert!(is_retryable_read_error(
+            "transport error: tent_get_segment_info failed with rc=-1"
+        ));
+        assert!(!is_retryable_read_error(
+            "checksum mismatch for tenant=bench key=bench-w0-k0"
         ));
     }
 
