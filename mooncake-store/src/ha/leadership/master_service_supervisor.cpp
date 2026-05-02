@@ -13,6 +13,7 @@
 
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/standby_controller.h"
+#include "k8s_lease_helper.h"
 #include "rpc_service.h"
 
 namespace mooncake {
@@ -23,13 +24,40 @@ namespace {
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
 constexpr auto kRenewCheckInterval = std::chrono::seconds(1);
 constexpr auto kSupervisorRetryInterval = std::chrono::seconds(1);
+constexpr char kLeaderLabelKey[] = "mooncake.io/store-role";
+constexpr char kLeaderLabelValue[] = "leader";
+
+bool HasPodIdentity(const MasterServiceSupervisorConfig& config) {
+    return !config.pod_name.empty() && !config.pod_namespace.empty() &&
+           config.ha_backend_type == "k8s";
+}
+
+void TrySetLeaderLabel(const MasterServiceSupervisorConfig& config) {
+    if (!HasPodIdentity(config)) return;
+    auto err =
+        K8sLeaseHelper::SetPodLabel(config.pod_namespace, config.pod_name,
+                                    kLeaderLabelKey, kLeaderLabelValue);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "Failed to set leader label on pod " << config.pod_name
+                     << ": " << toString(err);
+    }
+}
+
+void TryClearLeaderLabel(const MasterServiceSupervisorConfig& config) {
+    if (!HasPodIdentity(config)) return;
+    auto err = K8sLeaseHelper::ClearPodLabel(config.pod_namespace,
+                                             config.pod_name, kLeaderLabelKey);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "Failed to clear leader label on pod "
+                     << config.pod_name << ": " << toString(err);
+    }
+}
 
 std::string ResolveHABackendConnstring(
     const MasterServiceSupervisorConfig& config) {
-    if (!config.ha_backend_connstring.empty()) {
-        return config.ha_backend_connstring;
-    }
-    return config.etcd_endpoints;
+    return ResolveConfiguredHABackendConnstring(config.ha_backend_type,
+                                                config.ha_backend_connstring,
+                                                config.etcd_endpoints);
 }
 
 tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
@@ -126,17 +154,20 @@ void SetRuntimeState(MasterAdminServer& admin_server,
               << ", role=" << MasterRuntimeRoleToString(state);
 }
 
-void ActivateServingState(
-    MasterAdminServer& admin_server,
-    const std::shared_ptr<WrappedMasterService>& service) {
+void ActivateServingState(MasterAdminServer& admin_server,
+                          const std::shared_ptr<WrappedMasterService>& service,
+                          const MasterServiceSupervisorConfig& config) {
     admin_server.SetServiceDelegate(service);
     admin_server.SetServiceAvailable(true);
     SetRuntimeState(admin_server, MasterRuntimeState::kServing);
+    TrySetLeaderLabel(config);
 }
 
-void DeactivateServingState(MasterAdminServer& admin_server) {
+void DeactivateServingState(MasterAdminServer& admin_server,
+                            const MasterServiceSupervisorConfig& config) {
     admin_server.SetServiceAvailable(false);
     admin_server.SetServiceDelegate(nullptr);
+    TryClearLeaderLabel(config);
 }
 
 void StopLeadershipMonitor(std::unique_ptr<LeadershipMonitorHandle>& monitor) {
@@ -186,6 +217,7 @@ void EnterStandbyMode(MasterAdminServer& admin_server,
 int RunSupervisorLoop(const HABackendSpec& spec,
                       const MasterServiceSupervisorConfig& config,
                       MasterAdminServer& admin_server) {
+    TryClearLeaderLabel(config);
     SetRuntimeState(admin_server, MasterRuntimeState::kStarting);
     auto standby_controller = CreateStandbyController(spec, config);
     std::atomic<bool> accept_standby_runtime_updates{false};
@@ -353,7 +385,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto serve_preflight =
             leader_coordinator.RenewLeadership(*leadership_session);
         if (!serve_preflight) {
-            DeactivateServingState(admin_server);
+            DeactivateServingState(admin_server, config);
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates,
                              leadership_session->view);
@@ -366,7 +398,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
         if (!serve_preflight.value()) {
-            DeactivateServingState(admin_server);
+            DeactivateServingState(admin_server, config);
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates, std::nullopt);
             LogLeadershipReleaseWarning(
@@ -380,16 +412,18 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         std::atomic<bool> serve_shutdown_requested{false};
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
             *leadership_session,
-            [&server, &admin_server, &serve_shutdown_requested](auto reason) {
+            [&server, &admin_server, &serve_shutdown_requested,
+             &config](auto reason) {
                 serve_shutdown_requested.store(true, std::memory_order_release);
                 admin_server.SetServiceAvailable(false);
+                TryClearLeaderLabel(config);
                 SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
                 LOG(INFO) << "Trying to stop server, reason="
                           << LeadershipLossReasonToString(reason);
                 server.stop();
             });
         if (!leadership_monitor) {
-            DeactivateServingState(admin_server);
+            DeactivateServingState(admin_server, config);
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates,
                              leadership_session->view);
@@ -408,7 +442,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
             StopLeadershipMonitor(leadership_monitor_handle);
-            DeactivateServingState(admin_server);
+            DeactivateServingState(admin_server, config);
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates,
                              leadership_session->view);
@@ -421,14 +455,14 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 
         if (!serve_shutdown_requested.load(std::memory_order_acquire)) {
-            ActivateServingState(admin_server, wrapped_master_service);
+            ActivateServingState(admin_server, wrapped_master_service, config);
         }
 
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);
-        DeactivateServingState(admin_server);
+        DeactivateServingState(admin_server, config);
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);
         auto current_view = leader_coordinator.ReadCurrentView();

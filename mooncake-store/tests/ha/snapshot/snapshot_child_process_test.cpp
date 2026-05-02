@@ -423,6 +423,27 @@ TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
               legacy_config.etcd_endpoints);
 }
 
+TEST_F(SnapshotChildProcessTest, NonEtcdBackendsDoNotFallbackToEtcdEndpoints) {
+    EXPECT_TRUE(
+        ResolveConfiguredHABackendConnstring("k8s", "", "127.0.0.1:2379")
+            .empty());
+    EXPECT_TRUE(
+        ResolveConfiguredHABackendConnstring("redis", "", "127.0.0.1:2379")
+            .empty());
+
+    MasterConfig config;
+    config.enable_ha = true;
+    config.ha_backend_type = "k8s";
+    config.ha_backend_connstring.clear();
+    config.etcd_endpoints = "127.0.0.1:2379";
+
+    WrappedMasterServiceConfig wrapped_config(config, 12);
+    EXPECT_TRUE(wrapped_config.ha_backend_connstring.empty());
+
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_TRUE(service_config.ha_backend_connstring.empty());
+}
+
 #ifdef STORE_USE_ETCD
 TEST_F(SnapshotChildProcessTest,
        PersistState_UsesEtcdOplogBoundaryInSnapshotDescriptor) {

@@ -34,10 +34,14 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--eviction_high_watermark_ratio` (double, default `0.95`): Usage ratio to trigger eviction.
 
 - High Availability (optional)
-  - `--enable_ha` (bool, default `false`): Enable HA (requires etcd).
-  - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
+  - `--enable_ha` (bool, default `false`): Enable HA mode.
+  - `--ha_backend_type` (str, default `etcd`): HA backend type. Supported values: `etcd`, `redis`, `k8s`.
+  - `--ha_backend_connstring` (str, default empty): Connection string for the HA backend. For etcd: semicolon-separated endpoints. For K8s Lease: `<namespace>/<lease-name>`. If empty, falls back to `--etcd_endpoints`.
+  - `--etcd_endpoints` (str, default empty): etcd endpoints, semicolon separated. Used as fallback when `--ha_backend_connstring` is empty.
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
+
+  > **Note:** For K8s-native deployments using Lease-based leader election, see the [Kubernetes HA Deployment Guide](k8s-ha-deployment.md).
 
 - Task Manager (optional)
   - `--max_total_finished_tasks` (uint32, default `10000`): Maximum number of finished tasks to keep in memory. When this limit is reached, the oldest finished tasks will be pruned from memory.

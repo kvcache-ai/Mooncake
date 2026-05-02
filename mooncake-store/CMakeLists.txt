@@ -10,13 +10,18 @@ if (STORE_USE_ETCD)
     set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/libetcd_wrapper.so)
 endif()
 
+if (STORE_USE_K8S_LEASE)
+    set(K8S_LEASE_WRAPPER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/k8s-lease/)
+    set(K8S_LEASE_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/k8s-lease/libk8s_lease_wrapper.so)
+endif()
+
 if (STORE_USE_REDIS)
     find_path(MOONCAKE_STORE_HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
     find_library(MOONCAKE_STORE_HIREDIS_LIBRARY hiredis REQUIRED)
     message(STATUS "Redis HA backend: Enabled")
 endif()
 
-if (NOT STORE_USE_ETCD AND NOT STORE_USE_REDIS)
+if (NOT STORE_USE_ETCD AND NOT STORE_USE_REDIS AND NOT STORE_USE_K8S_LEASE)
     message(STATUS "Store HA backends are disabled")
 endif()
 
