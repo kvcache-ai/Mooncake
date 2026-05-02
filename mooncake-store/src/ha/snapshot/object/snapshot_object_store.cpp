@@ -4,12 +4,25 @@
 #ifdef HAVE_AWS_SDK
 #include "ha/snapshot/object/backends/s3/s3_snapshot_object_store.h"
 #endif
+#ifdef STORE_USE_ETCD
+#include "ha/snapshot/object/backends/etcd/etcd_snapshot_object_store.h"
+#endif
 
 namespace mooncake {
 
 std::unique_ptr<SnapshotObjectStore> SnapshotObjectStore::Create(
-    SnapshotObjectStoreType type) {
-    switch (type) {
+    const CreateConfig& config) {
+    switch (config.type) {
+#ifdef STORE_USE_ETCD
+        case SnapshotObjectStoreType::ETCD:
+            return std::make_unique<EtcdSnapshotObjectStore>(config.etcd_endpoints);
+#else
+        case SnapshotObjectStoreType::ETCD:
+            throw std::runtime_error(
+                "ETCD snapshot object store requested but STORE_USE_ETCD "
+                "is not enabled. Please rebuild with STORE_USE_ETCD or "
+                "use the 'local' object store.");
+#endif
 #ifdef HAVE_AWS_SDK
         case SnapshotObjectStoreType::S3:
             return std::make_unique<S3SnapshotObjectStore>();

@@ -36,6 +36,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
+    ha/snapshot/object/backends/etcd/etcd_snapshot_object_store.cpp
     ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
     ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
     utils/type_util.cpp

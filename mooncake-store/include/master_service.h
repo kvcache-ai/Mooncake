@@ -535,6 +535,14 @@ class MasterService {
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id);
 
+    // ETCD backend: child process serializes and writes to socketpair
+    tl::expected<void, SerializationError> PersistStateViaChildSerialize(
+        int socket_fd, const ha::SnapshotDescriptor& descriptor);
+
+    // ETCD backend: parent process reads from socketpair and uploads
+    tl::expected<void, SerializationError> PersistStateViaParentUpload(
+        int socket_fd, const ha::SnapshotDescriptor& descriptor);
+
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
     ha::SnapshotCatalogStore* GetSnapshotCatalogStore();
@@ -1206,6 +1214,9 @@ class MasterService {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    SnapshotObjectStoreType snapshot_object_store_type_ =
+        SnapshotObjectStoreType::LOCAL_FILE;
+    std::string etcd_endpoints_;
     std::string snapshot_catalog_store_type_{};
     std::string snapshot_catalog_store_connstring_;
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;

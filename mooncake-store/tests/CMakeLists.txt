@@ -65,6 +65,8 @@ add_store_test(embedded_snapshot_catalog_store_test
 add_store_test(zstd_util_test zstd_util_test.cpp)
 add_store_test(local_file_snapshot_object_store_test
                ha/snapshot/object/backends/local/local_file_snapshot_object_store_test.cpp)
+add_store_test(snapshot_socket_util_test
+               ha/snapshot/snapshot_socket_util_test.cpp)
 add_store_test(file_util_test file_util_test.cpp)
 add_store_test(snapshot_child_process_test
                ha/snapshot/snapshot_child_process_test.cpp)
@@ -149,4 +151,9 @@ if(STORE_USE_REDIS)
     target_link_libraries(${target}
                           PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
   endforeach()
+endif()
+
+if(STORE_USE_ETCD)
+  add_ha_test(etcd_snapshot_object_store_test
+              ha/snapshot/object/backends/etcd/etcd_snapshot_object_store_test.cpp)
 endif()

@@ -296,7 +296,8 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
 
         auto object_store_type =
             ParseSnapshotObjectStoreType(config.snapshot_object_store_type);
-        object_store_ = SnapshotObjectStore::Create(object_store_type);
+        object_store_ = SnapshotObjectStore::Create(
+            {object_store_type, config.etcd_endpoints});
 
         switch (catalog_kind.value()) {
             case SnapshotCatalogBackendKind::kEmbedded:
