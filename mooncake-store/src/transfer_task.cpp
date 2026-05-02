@@ -558,6 +558,8 @@ TransferSubmitter::submit_batch_get_offload_object(
     SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
     if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
         LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+        // nullopt = failure (caller checks !future).  The function returns
+        // std::optional so tl::unexpected is not available here.
         return std::nullopt;
     }
     for (size_t i = 0; i < keys.size(); ++i) {
