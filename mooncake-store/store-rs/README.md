@@ -975,7 +975,8 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 ### Tracing
 
 - `MC_STORE_RS_TRACE=1`
-- `MC_STORE_RS_TRACE_FILTER=info` or any `tracing_subscriber` filter string
+- `MC_STORE_RS_TRACE_FILTER=info` or any `tracing_subscriber` filter string; `mooncake-store-client --trace-filter ...` overrides the environment value
+- `MC_STORE_RS_TRACE_SPAN_EVENTS=none` suppresses synthetic span close lines such as `close time.busy=...`; omit it or set `close` to keep them
 - Python real clients auto-initialize Rust tracing before `setup(...)` when `MC_STORE_RS_TRACE=1`
 - `mooncake-store-bench` uses its own tracing init, writes to `stderr` by default, and falls back to `info` when neither `--trace-filter`, `MC_STORE_RS_TRACE_FILTER`, nor `RUST_LOG` is set
 - use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for bench logs; keep `MC_STORE_RS_TRACE_FILE` for standalone-client and Python real-client logging
