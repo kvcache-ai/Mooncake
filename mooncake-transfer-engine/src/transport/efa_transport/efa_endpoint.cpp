@@ -80,6 +80,7 @@ int EfaEndPoint::setupConnectionsByActive() {
 
     rc = context_.insertPeerAddr(peer_desc.efa_addr, peer_fi_addr_);
     if (rc != 0) return rc;
+    cached_peer_addr_ = peer_desc.efa_addr;
 
     status_.store(CONNECTED, std::memory_order_release);
     VLOG(1) << "EFA connection established: " << toString()
@@ -90,10 +91,6 @@ int EfaEndPoint::setupConnectionsByActive() {
 int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                            HandShakeDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (status_.load(std::memory_order_relaxed) == CONNECTED) {
-        LOG(WARNING) << "Re-establish EFA connection: " << toString();
-        disconnectUnlocked();
-    }
 
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {
@@ -112,11 +109,37 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
         return ERR_REJECT_HANDSHAKE;
     }
 
+    // Idempotent fast path: under bilateral sglang PD traffic, both peers
+    // initiate handshakes, so each side's passive handler fires *after* the
+    // active side has already connected.  The peer address in that second
+    // handshake is identical to what we already inserted — no need to churn
+    // the AV (fi_av_remove + fi_av_insert), which was only noisy and
+    // introduced a brief window where in-flight fi_write could see a stale
+    // fi_addr_t.  Just echo our local desc back.
+    if (status_.load(std::memory_order_relaxed) == CONNECTED &&
+        peer_desc.efa_addr == cached_peer_addr_) {
+        local_desc.local_nic_path = context_.nicPath();
+        local_desc.peer_nic_path = peer_nic_path_;
+        local_desc.efa_addr = context_.localEpAddr();
+        VLOG(1) << "EFA passive handshake (idempotent): " << toString();
+        return 0;
+    }
+
+    // Peer address genuinely changed (peer process restart, AV slot reshuffle).
+    // Tear down the old slot and reinsert.  INFO level — this is rare and
+    // operationally interesting, unlike the bilateral-handshake case above.
+    if (status_.load(std::memory_order_relaxed) == CONNECTED) {
+        LOG(INFO) << "Peer EFA address changed, re-establishing: "
+                  << toString();
+        disconnectUnlocked();
+    }
+
     int ret = context_.insertPeerAddr(peer_desc.efa_addr, peer_fi_addr_);
     if (ret != 0) {
         local_desc.reply_msg = "Failed to insert peer address";
         return ret;
     }
+    cached_peer_addr_ = peer_desc.efa_addr;
 
     local_desc.local_nic_path = context_.nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
@@ -138,12 +161,14 @@ void EfaEndPoint::disconnectUnlocked() {
         context_.removePeerAddr(peer_fi_addr_);
         peer_fi_addr_ = FI_ADDR_UNSPEC;
     }
+    cached_peer_addr_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);
 }
 
 void EfaEndPoint::markDetachedForTeardown() {
     RWSpinlock::WriteGuard guard(lock_);
     peer_fi_addr_ = FI_ADDR_UNSPEC;
+    cached_peer_addr_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);
 }
 
