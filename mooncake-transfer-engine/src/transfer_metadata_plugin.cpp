@@ -1077,8 +1077,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             LOG(ERROR) << "SocketHandShakePlugin: failed to encode notify";
             return ERR_MALFORMED_JSON;
         }
-        int ret = writeStringGathered(
-            connection->fd, HandShakeRequestType::Notify, request_payload);
+        int ret = writeString(connection->fd, HandShakeRequestType::Notify,
+                              request_payload);
         if (ret) {
             closeNotifyConnection(*connection);
             LOG(ERROR)
@@ -1303,7 +1303,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 response_payload = Json::FastWriter{}.write(local);
             }
             int ret = (type == HandShakeRequestType::Notify)
-                          ? writeStringGathered(conn_fd, type, response_payload)
+                          ? writeString(conn_fd, type, response_payload)
                           : writeString(conn_fd, type, response_payload);
             if (ret) {
                 LOG(ERROR) << "SocketHandShakePlugin: failed to send message: "

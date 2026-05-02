@@ -135,6 +135,12 @@ struct ShmFdResponse {
     uint64_t shm_size;  // size of the shm region
 };
 
+struct BatchQueryResultItem {
+    int error_code;
+    std::vector<Replica::Descriptor> replicas;
+    uint64_t lease_ttl_ms;
+};
+
 class ClientRequester {
    public:
     ClientRequester();
@@ -237,7 +243,7 @@ class PyClient {
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 
-    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+    virtual std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
         const std::vector<void *> &buffers,
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,

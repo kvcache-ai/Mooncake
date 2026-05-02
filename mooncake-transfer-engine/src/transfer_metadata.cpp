@@ -183,16 +183,13 @@ std::string TransferMetadata::getFullMetadataKey(
     }
 }
 
-int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
-                                        Json::Value &local_json) {
+int TransferMetadata::receivePeerNotify(const NotifyDesc &peer_desc,
+                                        NotifyDesc &local_desc) {
     RWSpinlock::WriteGuard guard(notify_lock_);
-    TransferMetadata::NotifyDesc peer_notify, local_reply;
-    TransferNotifyUtil::decode(peer_json, peer_notify);
-    notifys.push_back(peer_notify);
+    notifys.push_back(peer_desc);
     // reply
-    local_reply.name = "";
-    local_reply.notify_msg = "success";
-    local_json = TransferNotifyUtil::encode(local_reply);
+    local_desc.name = "";
+    local_desc.notify_msg = "success";
     return 0;
 }
 
@@ -1108,7 +1105,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
                 return receivePeerMetadata(peer, local);
             });
         handshake_plugin_->registerOnNotifyCallBack(
-            [this](const Json::Value &peer, Json::Value &local) -> int {
+            [this](const NotifyDesc &peer, NotifyDesc &local) -> int {
                 return receivePeerNotify(peer, local);
             });
         handshake_plugin_->registerOnProbeCallBack(
@@ -1188,7 +1185,7 @@ int TransferMetadata::startHandshakeDaemon(
             return 0;
         });
     handshake_plugin_->registerOnNotifyCallBack(
-        [this](const Json::Value &peer, Json::Value &local) -> int {
+        [this](const NotifyDesc &peer, NotifyDesc &local) -> int {
             return receivePeerNotify(peer, local);
         });
     handshake_plugin_->registerOnProbeCallBack(
@@ -1231,12 +1228,10 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
     if (getRpcMetaEntry(peer_server_name, peer_location)) {
         return ERR_METADATA;
     }
-    auto local = TransferNotifyUtil::encode(local_desc);
-    Json::Value peer;
-    int ret = handshake_plugin_->sendNotify(
-        peer_location.ip_or_host_name, peer_location.rpc_port, local, peer);
+    int ret = handshake_plugin_->sendNotify(peer_location.ip_or_host_name,
+                                            peer_location.rpc_port, local_desc,
+                                            peer_desc);
     if (ret) return ret;
-    TransferNotifyUtil::decode(peer, peer_desc);
     if (peer_desc.notify_msg.empty()) {
         LOG(ERROR) << "Notify rejected by " << peer_server_name << ": "
                    << peer_desc.notify_msg;

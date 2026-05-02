@@ -1,7 +1,7 @@
 #include "engram/engram.h"
 
-#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -40,31 +40,8 @@ Engram::Engram(int layer_id, const EngramConfig& config,
     }
 }
 
-bool Engram::load_tables(std::vector<std::shared_ptr<BufferHandle>>& tables,
-                         size_t row_bytes) const {
-    if (store_ == nullptr) {
-        return false;
-    }
-
-    tables = store_->batch_get_buffer(embed_keys_);
-    if (tables.size() != embed_keys_.size()) {
-        return false;
-    }
-
-    for (size_t head_idx = 0; head_idx < tables.size(); ++head_idx) {
-        const size_t expected_table_bytes =
-            static_cast<size_t>(table_vocab_sizes_[head_idx]) * row_bytes;
-        if (!tables[head_idx] ||
-            tables[head_idx]->size() < expected_table_bytes) {
-            return false;
-        }
-    }
-    return true;
-}
-
-int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
-                                   void* output_buffer,
-                                   size_t output_size) const {
+int Engram::lookup_rows_flat(const int64_t* row_ids, int B, int L,
+                             void* output_buffer, size_t output_size) const {
     if (store_ == nullptr || row_ids == nullptr || output_buffer == nullptr ||
         B <= 0 || L <= 0) {
         return -1;
@@ -73,8 +50,17 @@ int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
     const int num_heads = static_cast<int>(table_vocab_sizes_.size());
     const size_t row_bytes =
         static_cast<size_t>(embedding_dim_) * sizeof(float);
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (static_cast<size_t>(B) > max_size / static_cast<size_t>(L)) {
+        return -1;
+    }
+    const size_t token_count = static_cast<size_t>(B) * static_cast<size_t>(L);
+    if (token_count > max_size / static_cast<size_t>(num_heads) ||
+        token_count * static_cast<size_t>(num_heads) > max_size / row_bytes) {
+        return -1;
+    }
     const size_t expected_size =
-        static_cast<size_t>(B) * L * num_heads * embedding_dim_ * sizeof(float);
+        token_count * static_cast<size_t>(num_heads) * row_bytes;
     if (output_size < expected_size) {
         return -1;
     }
@@ -84,12 +70,27 @@ int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
         return -1;
     };
 
-    std::vector<std::shared_ptr<BufferHandle>> tables;
-    if (!load_tables(tables, row_bytes)) {
-        return fail_lookup();
+    std::vector<void*> buffers{output_buffer};
+    std::vector<std::vector<std::string>> all_keys(1);
+    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets(1);
+    std::vector<std::vector<std::vector<size_t>>> all_src_offsets(1);
+    std::vector<std::vector<std::vector<size_t>>> all_sizes(1);
+
+    all_keys[0].reserve(static_cast<size_t>(num_heads));
+    all_dst_offsets[0].reserve(static_cast<size_t>(num_heads));
+    all_src_offsets[0].reserve(static_cast<size_t>(num_heads));
+    all_sizes[0].reserve(static_cast<size_t>(num_heads));
+
+    for (int h = 0; h < num_heads; ++h) {
+        all_keys[0].push_back(embed_keys_[h]);
+        all_dst_offsets[0].emplace_back();
+        all_src_offsets[0].emplace_back();
+        all_sizes[0].emplace_back();
+        all_dst_offsets[0].back().reserve(static_cast<size_t>(B) * L);
+        all_src_offsets[0].back().reserve(static_cast<size_t>(B) * L);
+        all_sizes[0].back().reserve(static_cast<size_t>(B) * L);
     }
 
-    float* output = static_cast<float*>(output_buffer);
     for (int b = 0; b < B; ++b) {
         for (int l = 0; l < L; ++l) {
             const size_t token_index = static_cast<size_t>(b) * L + l;
@@ -101,19 +102,49 @@ int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
                 if (idx < 0 || idx >= table_vocab_sizes_[h]) {
                     return fail_lookup();
                 }
+                all_dst_offsets[0][h].push_back(
+                    (row_offset + static_cast<size_t>(h)) * row_bytes);
+                all_src_offsets[0][h].push_back(static_cast<size_t>(idx) *
+                                                row_bytes);
+                all_sizes[0][h].push_back(row_bytes);
+            }
+        }
+    }
 
-                const float* table =
-                    static_cast<const float*>(tables[h]->ptr());
-                const float* src =
-                    table + static_cast<size_t>(idx) * embedding_dim_;
-                float* dst = output + (row_offset + static_cast<size_t>(h)) *
-                                          embedding_dim_;
-                std::memcpy(dst, src, row_bytes);
+    const int register_ret =
+        store_->register_buffer(output_buffer, expected_size);
+    if (register_ret != 0) {
+        return fail_lookup();
+    }
+
+    auto results = store_->get_into_ranges(buffers, all_keys, all_dst_offsets,
+                                           all_src_offsets, all_sizes);
+    const int unregister_ret = store_->unregister_buffer(output_buffer);
+    if (unregister_ret != 0) {
+        return fail_lookup();
+    }
+    if (results.size() != 1 ||
+        results[0].size() != static_cast<size_t>(num_heads)) {
+        return fail_lookup();
+    }
+    for (int h = 0; h < num_heads; ++h) {
+        if (results[0][h].size() != all_sizes[0][h].size()) {
+            return fail_lookup();
+        }
+        for (int64_t bytes_read : results[0][h]) {
+            if (bytes_read != static_cast<int64_t>(row_bytes)) {
+                return fail_lookup();
             }
         }
     }
 
     return 0;
+}
+
+int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
+                                   void* output_buffer,
+                                   size_t output_size) const {
+    return lookup_rows_flat(row_ids, B, L, output_buffer, output_size);
 }
 
 int Engram::lookup_rows(
@@ -127,55 +158,23 @@ int Engram::lookup_rows(
     const int B = static_cast<int>(row_ids.size());
     const int L = static_cast<int>(row_ids[0].size());
     const int num_heads = static_cast<int>(table_vocab_sizes_.size());
-    const size_t row_bytes =
-        static_cast<size_t>(embedding_dim_) * sizeof(float);
-    const size_t expected_size =
-        static_cast<size_t>(B) * L * num_heads * embedding_dim_ * sizeof(float);
-    if (output_size < expected_size) {
-        return -1;
-    }
-
-    auto fail_lookup = [&]() {
-        std::memset(output_buffer, 0, expected_size);
-        return -1;
-    };
-
-    std::vector<std::shared_ptr<BufferHandle>> tables;
-    if (!load_tables(tables, row_bytes)) {
-        return fail_lookup();
-    }
-
-    float* output = static_cast<float*>(output_buffer);
+    std::vector<int64_t> flat_row_ids;
+    flat_row_ids.reserve(static_cast<size_t>(B) * L * num_heads);
     for (int b = 0; b < B; ++b) {
         if (static_cast<int>(row_ids[b].size()) != L) {
-            return fail_lookup();
+            return -1;
         }
         for (int l = 0; l < L; ++l) {
             if (static_cast<int>(row_ids[b][l].size()) != num_heads) {
-                return fail_lookup();
+                return -1;
             }
-
-            const size_t token_index = static_cast<size_t>(b) * L + l;
-            const size_t row_offset =
-                token_index * static_cast<size_t>(num_heads);
-            for (int h = 0; h < num_heads; ++h) {
-                const int64_t idx = row_ids[b][l][h];
-                if (idx < 0 || idx >= table_vocab_sizes_[h]) {
-                    return fail_lookup();
-                }
-
-                const float* table =
-                    static_cast<const float*>(tables[h]->ptr());
-                const float* src =
-                    table + static_cast<size_t>(idx) * embedding_dim_;
-                float* dst = output + (row_offset + static_cast<size_t>(h)) *
-                                          embedding_dim_;
-                std::memcpy(dst, src, row_bytes);
-            }
+            flat_row_ids.insert(flat_row_ids.end(), row_ids[b][l].begin(),
+                                row_ids[b][l].end());
         }
     }
 
-    return 0;
+    return lookup_rows_flat(flat_row_ids.data(), B, L, output_buffer,
+                            output_size);
 }
 
 std::vector<int64_t> Engram::get_table_vocab_sizes() const {

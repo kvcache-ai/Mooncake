@@ -3116,56 +3116,6 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
     return results;
 }
 
-tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
-    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
-    size_t size) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto query_result = client_->Query(key);
-    if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
-            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            return tl::unexpected(query_result.error());
-        }
-        LOG(ERROR) << "Query failed for key: " << key;
-        return tl::unexpected(query_result.error());
-    }
-
-    const auto &replica_list = query_result.value().replicas;
-    if (replica_list.empty()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    const auto &res = client_->GetPreferredReplica(replica_list);
-    if (!res) return tl::unexpected(ErrorCode::INVALID_PARAMS);
-
-    const auto &replica = res.value();
-    if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "get_into_range only supports memory replicas";
-        return tl::unexpected(ErrorCode::INVALID_REPLICA);
-    }
-
-    uint64_t total_size = calculate_total_size(replica);
-    if (src_offset + size > total_size) {
-        LOG(ERROR) << "Range overflow: src_offset=" << src_offset
-                   << " + size=" << size << " > total=" << total_size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::vector<Slice> slices;
-    slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
-
-    auto get_result =
-        client_->Get(key, query_result.value(), slices, src_offset);
-    if (!get_result) {
-        return tl::unexpected(get_result.error());
-    }
-    return static_cast<int64_t>(size);
-}
-
 int64_t RealClient::get_into_range(const std::string &key, void *buffer,
                                    size_t dst_offset, size_t src_offset,
                                    size_t size) {

@@ -110,11 +110,11 @@ the keys written by the failed populate attempt before returning an error.
 Each lookup follows the same simplified backend flow:
 
 1. validate the `row_ids` shape and bounds
-2. fetch per-head tables with the existing `batch_get_buffer(...)` interface
-3. materialize the requested rows into the output buffer
+2. build per-head byte ranges for the requested rows
+3. issue one `get_into_ranges(...)` call to materialize those rows into the output buffer
 
-For NumPy `row_ids`, the binding uses a contiguous fast path and copies rows
-directly into the output tensor without first converting the entire input into a
+For NumPy `row_ids`, the binding uses a contiguous fast path and builds ranges
+directly from the input tensor without first converting the entire input into a
 nested C++ container.
 
 ## Validation

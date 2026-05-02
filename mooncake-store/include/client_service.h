@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include <chrono>
@@ -168,6 +169,25 @@ class Client {
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices,
+                                      uint64_t src_offset);
+
+    ErrorCode BatchTransferReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
+    ErrorCode BatchTransferReadBuffers(
+        const std::vector<AllocatedBuffer::Descriptor>& src_buffers,
+        const std::vector<void*>& dest_buffers,
+        const std::vector<size_t>& sizes);
+    ErrorCode BatchTransferWriteBuffers(
+        const std::vector<AllocatedBuffer::Descriptor>& dest_buffers,
+        const std::vector<void*>& src_buffers,
+        const std::vector<size_t>& sizes);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -543,6 +563,15 @@ class Client {
     }
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+    tl::expected<void*, ErrorCode> ResolveLocalBufferAddress(
+        const AllocatedBuffer::Descriptor& desc, size_t min_size);
+    tl::expected<void*, ErrorCode> ResolveLocalMemoryAddress(
+        const QueryResult& query_result, size_t min_size);
+    int SendTransferNotifyByName(const std::string& remote_agent,
+                                 const std::string& name,
+                                 const std::string& notify_msg);
+    int GetTransferNotifies(
+        std::vector<TransferMetadata::NotifyDesc>& notifies);
 
    private:
     /**
@@ -567,6 +596,9 @@ class Client {
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
+    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
+                                std::vector<Slice>& slices,
+                                uint64_t src_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,

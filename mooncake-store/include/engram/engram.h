@@ -9,7 +9,6 @@
 
 namespace mooncake {
 
-class BufferHandle;
 class PyClient;
 
 namespace engram {
@@ -71,13 +70,13 @@ class Engram {
                  const std::vector<size_t>& buffer_sizes);
 
    private:
+    int lookup_rows_flat(const int64_t* row_ids, int B, int L, void* output,
+                         size_t output_size) const;
+
     std::shared_ptr<PyClient> store_;
     std::vector<int64_t> table_vocab_sizes_;
     int embedding_dim_;
     std::vector<std::string> embed_keys_;
-
-    bool load_tables(std::vector<std::shared_ptr<BufferHandle>>& tables,
-                     size_t row_bytes) const;
 };
 
 }  // namespace engram
