@@ -69,32 +69,60 @@ StorageTier::~StorageTier() {
 
 tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
                                                 TransferEngine* engine) {
+    return Init(backend, engine, Json::Value{});
+}
+
+tl::expected<void, ErrorCode> StorageTier::Init(
+    TieredBackend* backend, TransferEngine* engine,
+    const Json::Value& tier_config) {
     static_cast<void>(engine);
     backend_ = backend;
     try {
-        auto config = FileStorageConfig::FromEnvironment();
-        if (!config.Validate()) {
-            LOG(ERROR) << "Invalid FileStorageConfig for StorageTier";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        {
+            auto fs_config = FileStorageConfig::FromEnvironment();
+            if (!tier_config.isNull()) {
+                fs_config.MergeFromJson(tier_config);
+            }
+            // StorageTier only supports bucket backend
+            if (fs_config.storage_backend_type != StorageBackendType::kBucket) {
+                LOG(ERROR)
+                    << "StorageTier only supports bucket storage backend. "
+                       "Check MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR "
+                       "or the storage_backend_type field in tier config.";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
         }
-        if (config.local_buffer_size <= 0) {
-            LOG(ERROR) << "StorageTier local buffer size must be positive, got "
-                       << config.local_buffer_size;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+
+        if (!tier_config.isNull()) {
+            if (tier_config.isMember("staging_buffer_capacity")) {
+                const auto& node = tier_config["staging_buffer_capacity"];
+                staging_buffer_capacity_ =
+                    node.isString() ? static_cast<size_t>(
+                                          string_to_byte_size(node.asString()))
+                                    : static_cast<size_t>(node.asUInt64());
+            }
+            if (tier_config.isMember("batch_size_threshold")) {
+                const auto& node = tier_config["batch_size_threshold"];
+                batch_size_threshold_ =
+                    node.isString() ? static_cast<size_t>(
+                                          string_to_byte_size(node.asString()))
+                                    : static_cast<size_t>(node.asUInt64());
+            }
+            if (tier_config.isMember("batch_count_threshold")) {
+                batch_count_threshold_ = static_cast<size_t>(
+                    tier_config["batch_count_threshold"].asUInt64());
+            }
         }
 
         constexpr size_t kStagingAlignment = 64;
         staging_memory_.reset(
             static_cast<char*>(allocate_buffer_allocator_memory(
-                static_cast<size_t>(config.local_buffer_size), "",
-                kStagingAlignment)));
+                staging_buffer_capacity_, "", kStagingAlignment)));
         if (!staging_memory_) {
             LOG(ERROR) << "Failed to preallocate storage staging pool, size="
-                       << config.local_buffer_size;
+                       << staging_buffer_capacity_;
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-        staging_buffer_capacity_ =
-            static_cast<size_t>(config.local_buffer_size);
         std::string segment_name = "storage_tier_staging_" +
                                    std::to_string(tier_id_.first) + "-" +
                                    std::to_string(tier_id_.second);
@@ -102,7 +130,7 @@ tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
             segment_name, reinterpret_cast<uintptr_t>(staging_memory_.get()),
             staging_buffer_capacity_, segment_name, tier_id_);
 
-        auto backend_res = CreateStorageBackend(config);
+        auto backend_res = CreateStorageBackend(tier_config);
         if (!backend_res) {
             LOG(ERROR) << "Failed to create underlying storage backend: "
                        << backend_res.error();

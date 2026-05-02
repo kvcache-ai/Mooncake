@@ -51,6 +51,12 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
         }
     }
 
+    if (config.isMember("scheduler") &&
+        config["scheduler"].isMember("loop_interval_ms")) {
+        const auto v = config["scheduler"]["loop_interval_ms"].asInt();
+        if (v > 0) loop_interval_ms_ = v;
+    }
+
     if (policy_type == "LRU") {
         // Initialize LRU components
         stats_collector_ = std::make_unique<LRUStatsCollector>(

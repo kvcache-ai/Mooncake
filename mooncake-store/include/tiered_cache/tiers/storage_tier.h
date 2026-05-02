@@ -11,6 +11,8 @@
 #include <thread>
 #include <condition_variable>
 
+#include <json/json.h>
+
 #include "tiered_cache/tiers/cache_tier.h"
 #include "storage_backend.h"
 
@@ -63,7 +65,6 @@ class StorageBuffer : public BufferBase {
         return Slice{static_cast<char*>(staging_buffer_->data()), size_};
     }
 
-    void SetKey(const std::string& key) { key_ = key; }
     void SetKey(std::string_view key) { key_ = key; }
     const std::string& GetKey() const { return key_; }
 
@@ -140,6 +141,10 @@ class StorageTier : public CacheTier {
     tl::expected<void, ErrorCode> Init(TieredBackend* backend,
                                        TransferEngine* engine) override;
 
+    tl::expected<void, ErrorCode> Init(TieredBackend* backend,
+                                       TransferEngine* engine,
+                                       const Json::Value& tier_config);
+
     tl::expected<void, ErrorCode> Allocate(size_t size,
                                            DataSource& data) override;
 
@@ -195,15 +200,15 @@ class StorageTier : public CacheTier {
     std::mutex flush_trigger_mutex_;
     std::atomic<bool> flush_requested_{false};
 
-    // Configurable thresholds
-    size_t batch_size_threshold_ = 64 * 1024 * 1024;  // 64MB
-    size_t batch_count_threshold_ = 1000;
+    // Flush aggregation thresholds
+    size_t batch_size_threshold_ = 64 * 1024 * 1024;  // default 64MB
+    size_t batch_count_threshold_ = 1000;             // default 64MB
 
     // Preallocated local staging pool for SSD writes.
     std::shared_ptr<BufferAllocatorBase> staging_allocator_;
     std::unique_ptr<char, void (*)(char*)> staging_memory_{
         nullptr, &StorageTier::FreeStagingMemory};
-    size_t staging_buffer_capacity_ = 0;
+    size_t staging_buffer_capacity_ = 128 * 1024 * 1024;  // default 128MB
 
     // Live persisted value bytes. This excludes backend metadata and any
     // bucket files already unlinked from the cache namespace but still pending
