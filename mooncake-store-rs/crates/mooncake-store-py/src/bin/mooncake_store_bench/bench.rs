@@ -349,10 +349,7 @@ fn execute_read_with_retry(
     let mut batch_get_into_buffers = batch_get_into_buffers;
     loop {
         attempts += 1;
-        let buffers = match batch_get_into_buffers {
-            Some(ref mut buffers) => Some(&mut **buffers),
-            None => None,
-        };
+        let buffers = batch_get_into_buffers.as_deref_mut();
         match execute_read(reader, interface, target, buffers) {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
