@@ -268,12 +268,12 @@ fn trace_file_from_env(name: &str) -> Result<Option<PathBuf>> {
 
 fn trace_span_events_from_env(name: &str) -> Result<FmtSpan> {
     let Some(value) = std::env::var_os(name) else {
-        return Ok(FmtSpan::CLOSE);
+        return Ok(FmtSpan::NONE);
     };
     let value = value.to_string_lossy();
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "close" | "1" | "true" | "yes" | "on" => Ok(FmtSpan::CLOSE),
-        "none" | "off" | "0" | "false" | "no" => Ok(FmtSpan::NONE),
+        "" | "none" | "off" | "0" | "false" | "no" => Ok(FmtSpan::NONE),
+        "close" | "1" | "true" | "yes" | "on" => Ok(FmtSpan::CLOSE),
         other => Err(StoreError::InvalidState(format!(
             "invalid tracing span events value {other:?}; expected close or none"
         ))),
@@ -891,14 +891,14 @@ mod tests {
     }
 
     #[test]
-    fn trace_span_events_from_env_accepts_none_and_close() {
+    fn trace_span_events_from_env_defaults_to_none_and_accepts_close() {
         let _guard = metrics_test_lock().lock();
         let env = "MOONCAKE_TEST_TRACE_SPAN_EVENTS";
 
         with_env_var(env, None, || {
             assert_eq!(
                 trace_span_events_from_env(env).expect("missing span events env should parse"),
-                FmtSpan::CLOSE
+                FmtSpan::NONE
             );
         });
 
