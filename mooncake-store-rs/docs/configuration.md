@@ -516,7 +516,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRACE` | Python wrapper setup fallback, e2e, and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | standalone client, Python wrapper setup fallback, e2e, and applications | `tracing_subscriber` filter string; `--trace-filter` overrides it for the standalone client |
 | `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |
-| `MC_STORE_RS_TRACE_SPAN_EVENTS` | standalone client, Python real mode, e2e, and applications | tracing span lifecycle events; `close` keeps operation close timing logs, `none` suppresses those synthetic close lines |
+| `MC_STORE_RS_TRACE_SPAN_EVENTS` | standalone client, Python real mode, e2e, and applications | tracing span lifecycle events; unset suppresses synthetic span close lines, `close` enables operation close timing logs |
 | `MC_BENCH_TRACE_FILE` | `mooncake-store-bench` | append bench tracing logs to this file; bench otherwise logs to `stderr` and does not use `MC_STORE_RS_TRACE_FILE` for its own output |
 | `MC_BENCH_INTERFACES` | `mooncake-store-bench` | combined write/read interface selector; accepts `<write>,<read>`, `<write>:<read>`, or `write=<...>,read=<...>`; when set it overrides non-CLI interface defaults |
 | `MC_BENCH_WRITE_INTERFACE` | `mooncake-store-bench` | measured write-side bench API; `put`, `batch_put`, or `batch_put_from`; default `batch_put_from` |
