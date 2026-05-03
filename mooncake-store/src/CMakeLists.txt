@@ -54,7 +54,8 @@ set(MOONCAKE_STORE_SOURCES
     hot_standby_service.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp
-    store_c.cpp)
+    store_c.cpp
+    prefix_index.cpp)
 
 set(EXTRA_LIBS "")
 
