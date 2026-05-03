@@ -634,7 +634,7 @@ impl StoreClient {
     }
 
     fn publish_local_segment(&self, segment: &StorageExtentInfo, used_bytes: u64) -> Result<()> {
-        debug!(
+        info!(
             runtime = %self.lease.runtime,
             segment = %segment.segment_name.0,
             capacity_bytes = segment.capacity_bytes,
