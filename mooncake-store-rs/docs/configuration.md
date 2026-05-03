@@ -353,6 +353,51 @@ If both forms are present, credentials in the URL take precedence. Prefer enviro
 
 For Redis 5 password-only deployments, the metadata backend also tolerates connections where a username was supplied by configuration but the server accepts only legacy `AUTH <password>`; the client retries with password-only auth after the server rejects the username form.
 
+## Standalone Client Configuration
+
+`mooncake-store-client run` accepts its runtime knobs either as CLI flags or as
+environment variables. Explicit CLI flags override environment values. For
+environment-only startup, keep the `run` subcommand because the root command with
+no arguments still renders help.
+
+| CLI flag | Environment variable | Default | Meaning |
+|----------|----------------------|---------|---------|
+| `--local-hostname` | `MOONCAKE_LOCAL_HOSTNAME` | required | hostname or IP published for this runtime |
+| `--metadata-url` | `MC_STORE_RS_METADATA_URL` | required | Redis or etcd metadata endpoint for store state |
+| `--transport-metadata-url` | `MC_STORE_RS_TRANSPORT_METADATA_URL` | store metadata URL, with backend-specific fallback | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
+| `--storage-bytes` | `MC_STORE_RS_STORAGE_BYTES` | `67108864` | local storage capacity published by this runtime |
+| `--scratch-bytes` | `MC_STORE_RS_SCRATCH_BYTES` | `4194304` | local scratch capacity for transfer staging |
+| `--protocol` | `MOONCAKE_PROTOCOL` | `tcp` | transport protocol such as `tcp` or `rdma` |
+| `--rdma-devices` | `MC_STORE_RS_RDMA_DEVICES` | empty | RDMA device list passed through compatibility setup |
+| `--transport-rpc-port` / `--rpc-server-port` | `MC_STORE_RS_TRANSPORT_RPC_PORT` | backend chooses | fixed real data-plane transport port |
+| `--transport-backend` | `MC_STORE_RS_TRANSPORT_BACKEND` | `classic_te` | real transport backend; accepts `tent`, `classic_te`, `classic-te`, `classic`, or `te` |
+| `--stable-id` | `MC_STORE_RS_STABLE_ID` | generated | persistent runtime identity |
+| `--initial-state` | `MC_STORE_RS_INITIAL_STATE` | `active` | startup lifecycle state |
+| `--tenant` | `MC_STORE_RS_TENANT` | `default` | default tenant scope |
+| `--label key=value` | `MC_STORE_RS_LABELS` | none | comma-separated runtime labels such as `pool=a,storage=true` |
+| `--routed-writes` | `MC_STORE_RS_ROUTED_WRITES` | `false` | enable routed writer mode; env accepts falsey values such as `0`, `false`, `no`, or `off`, and treats other non-empty values as true |
+| `--replica-count` | `MC_STORE_RS_REPLICA_COUNT` | `1` | default routed-writer replica count |
+| `--route-topk` | `MC_STORE_RS_ROUTE_TOPK` | `2` | WRH route-authority fanout; must be `>= 2` |
+| `--keyspace` | `MC_STORE_RS_KEYSPACE` | default keyspace | metadata keyspace |
+| `--local-segment-name` | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | generated from transport/runtime | explicit local segment name |
+| `--lease-ttl-ms` | `MC_STORE_RS_LEASE_TTL_MS` | `30000` | lease TTL published by the standalone heartbeat loop |
+| `--heartbeat-interval-ms` | `MC_STORE_RS_HEARTBEAT_INTERVAL_MS` | `30000`, normalized below TTL | heartbeat loop interval |
+| `--request-timeout-ms` | `MC_STORE_RS_REQUEST_TIMEOUT_MS` | `65000` | dispatcher and routed operation timeout |
+| `--startup-timeout-ms` | `MC_STORE_RS_STARTUP_TIMEOUT_MS` | adaptive | compatibility-managed registration timeout override |
+| `--heartbeat-timeout-ms` | `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | `15000` | heartbeat publish timeout |
+| `--transfer-stall-timeout-ms` | `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` | `10000` | transfer no-progress timeout |
+| `--metrics-addr` | `MC_STORE_RS_METRICS_ADDR` | disabled | in-process metrics bind address |
+| `--client-server-address` | `MC_STORE_RS_CLIENT_SERVER_ADDRESS` | disabled | dummy compatibility gRPC server address |
+| `--use-hugepage` | `MC_STORE_USE_HUGEPAGE` | disabled | enable hugepage-backed local store memory; standalone env accepts falsey values such as `0`, `false`, `no`, or `off` |
+| `--hugepage-size` | `MC_STORE_HUGEPAGE_SIZE` | backend default | hugepage size such as `2M` or `1G` |
+| `--trace-filter` | `MC_STORE_RS_TRACE_FILTER` | tracing default | standalone tracing filter |
+| `--route-control` | `MC_STORE_RS_ROUTE_CONTROL` | `embedded_wrh` | route-control fallback; accepts `embedded_wrh` / `embedded-wrh` or `metadata_only` / `metadata-only` |
+| `--drain-on-exit` | `MC_STORE_RS_DRAIN_ON_EXIT` | `false` | drain owned routes during graceful shutdown; env accepts falsey values such as `0`, `false`, `no`, or `off`, and treats other non-empty values as true |
+
+`mooncake-store-client stats` also supports `MC_STORE_RS_STATS_SERVER` for
+`--server` and `MC_STORE_RS_STATS_JSON` for `--json`; the JSON switch uses the
+same falsey-value parsing as the standalone runtime boolean flags.
+
 ## Python Compatibility Configuration
 
 `MooncakeDistributedStore.setup(...)` accepts the core store knobs plus Python-specific convenience parameters.
@@ -486,28 +531,39 @@ The current repository uses these environment variables.
 
 | Variable | Used By | Meaning |
 |----------|---------|---------|
+| `MOONCAKE_LOCAL_HOSTNAME` | standalone client and bench | hostname or IP published by the runtime |
+| `MOONCAKE_PROTOCOL` | standalone client and bench | transport protocol such as `tcp` or `rdma` |
 | `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
-| `MC_STORE_RS_METADATA_URL` | bench | store metadata endpoint used by `mooncake-store-bench --metadata-url` |
-| `MC_STORE_RS_KEYSPACE` | Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace`; this also defines Python compatibility read/write visibility and local hot-cache partitioning |
-| `MC_STORE_RS_STABLE_ID` | Python wrapper setup fallback | stable client id used when SGLang cannot pass `stable_id` |
-| `MC_STORE_RS_INITIAL_STATE` | Python wrapper setup fallback | initial lifecycle state, for example `active`, `standby`, `draining`, or `offline` |
-| `MC_STORE_RS_TENANT` | Python wrapper setup fallback | default tenant used when SGLang cannot pass `tenant` |
-| `MC_STORE_RS_LABELS` | Python wrapper setup fallback | labels as JSON object or comma-separated `key=value` pairs |
-| `MC_STORE_RS_ROUTED_WRITES` | Python wrapper setup fallback | enable routed writer mode when set to `1`, `true`, `yes`, or `on` |
-| `MC_STORE_RS_REPLICA_COUNT` | Python wrapper setup fallback | default routed-writer replica count |
-| `MC_STORE_RS_ROUTE_TOPK` | Python wrapper setup fallback | WRH route-authority fanout; must be `>= 2` |
-| `MC_STORE_RS_ROUTE_CONTROL` | Python wrapper setup fallback | route control mode, usually `embedded_wrh` |
-| `MC_STORE_RS_TRANSPORT_METADATA_URL` | Python wrapper setup fallback, bench | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
+| `MC_STORE_RS_METADATA_URL` | standalone client and bench | store metadata endpoint used by `mooncake-store-client --metadata-url` and `mooncake-store-bench --metadata-url` |
+| `MC_STORE_RS_STORAGE_BYTES` | standalone client | local storage bytes for `mooncake-store-client run` |
+| `MC_STORE_RS_SCRATCH_BYTES` | standalone client and bench | local scratch bytes for compatibility-managed clients |
+| `MC_STORE_RS_RDMA_DEVICES` | standalone client and Rust e2e | RDMA device list |
+| `MC_STORE_RS_KEYSPACE` | standalone client and Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace`; this also defines Python compatibility read/write visibility and local hot-cache partitioning |
+| `MC_STORE_RS_STABLE_ID` | standalone client and Python wrapper setup fallback | stable client id used when SGLang cannot pass `stable_id` |
+| `MC_STORE_RS_INITIAL_STATE` | standalone client and Python wrapper setup fallback | initial lifecycle state, for example `active`, `standby`, `draining`, or `offline` |
+| `MC_STORE_RS_TENANT` | standalone client, Python wrapper setup fallback, and bench | default tenant used when SGLang cannot pass `tenant` |
+| `MC_STORE_RS_LABELS` | standalone client and Python wrapper setup fallback | standalone labels as comma-separated `key=value` pairs; Python also accepts a JSON object |
+| `MC_STORE_RS_ROUTED_WRITES` | standalone client and Python wrapper setup fallback | enable routed writer mode when set to `1`, `true`, `yes`, or `on`; standalone also treats `0`, `false`, `no`, or `off` as false |
+| `MC_STORE_RS_REPLICA_COUNT` | standalone client, Python wrapper setup fallback, and bench | default routed-writer replica count |
+| `MC_STORE_RS_ROUTE_TOPK` | standalone client, Python wrapper setup fallback, and bench | WRH route-authority fanout; must be `>= 2` |
+| `MC_STORE_RS_ROUTE_CONTROL` | standalone client, Python wrapper setup fallback, and bench | route control mode, usually `embedded_wrh` |
+| `MC_STORE_RS_TRANSPORT_METADATA_URL` | standalone client, Python wrapper setup fallback, bench | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
 | `MC_STORE_RS_GID_INDEX` | compatibility layer, standalone client, Python wrapper, and bench | `classic_te` RDMA GID index override; forwarded to upstream `MC_GID_INDEX` |
-| `MC_STORE_RS_TRANSPORT_RPC_PORT` | Python wrapper setup fallback | fixed real data-plane transport port |
-| `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |
+| `MC_STORE_RS_TRANSPORT_RPC_PORT` | standalone client and Python wrapper setup fallback | fixed real data-plane transport port |
+| `MC_STORE_RS_LOCAL_SEGMENT_NAME` | standalone client and Python wrapper setup fallback | explicit local segment name |
 | `MC_STORE_RS_EXPIRES_AT_MS` | Python wrapper setup fallback | absolute lease expiry timestamp in milliseconds |
+| `MC_STORE_RS_LEASE_TTL_MS` | standalone client | lease TTL for the standalone heartbeat loop |
+| `MC_STORE_RS_HEARTBEAT_INTERVAL_MS` | standalone client | heartbeat interval for the standalone heartbeat loop |
 | `MC_STORE_RS_REQUEST_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | outer per-request deadline for dispatcher requests and routed client operations |
 | `MC_STORE_RS_STARTUP_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | explicit override for compatibility-managed memory registration work; when unset the runtime uses `max(20s, ceil(registration_bytes / 1 GiB))` |
 | `MC_STORE_RS_HEARTBEAT_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | dedicated dispatcher timeout for heartbeat publish |
 | `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` | standalone client, Python compatibility runtime, applications | inner transfer stall detector for TENT / classic TE |
 | `MC_STORE_RS_TRANSFER_TIMEOUT_MS` | legacy compatibility alias | deprecated alias of `MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS` |
 | `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` | dummy compatibility clients | dummy gRPC timeout; falls back to `MC_STORE_RS_REQUEST_TIMEOUT_MS` when unset |
+| `MC_STORE_RS_CLIENT_SERVER_ADDRESS` | standalone client | dummy compatibility gRPC server address |
+| `MC_STORE_RS_DRAIN_ON_EXIT` | standalone client | drain owned routes during graceful shutdown; accepts falsey values such as `0`, `false`, `no`, or `off` |
+| `MC_STORE_RS_STATS_SERVER` | standalone client stats command | server address used by `mooncake-store-client stats --server` |
+| `MC_STORE_RS_STATS_JSON` | standalone client stats command | emit compact JSON from the stats command; accepts falsey values such as `0`, `false`, `no`, or `off` |
 | `MC_STORE_RS_CONTROL_PLANE_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the shared control-plane RPC runtime; default `2`; must be `> 0` |
 | `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the embedded control-plane gRPC server; default `4`; must be `> 0` |
 | `MC_STORE_LOCAL_HOT_CACHE_SIZE` | Python compatibility runtime, standalone dummy daemon, and local e2e | total byte budget for the daemon-local hot read cache; unset disables it |
@@ -535,7 +591,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count; default `64` |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |
 | `MC_STORE_RS_TENT_REDIS_URL` | Python compatibility layer | Redis URL used by TENT when store metadata is etcd |
-| `MC_STORE_USE_HUGEPAGE` | local memory and Python shm allocator | enable hugepage-backed allocation |
+| `MC_STORE_USE_HUGEPAGE` | local memory, standalone client, and Python shm allocator | enable hugepage-backed allocation; standalone client treats `0`, `false`, `no`, or `off` as an explicit disable |
 | `MC_STORE_HUGEPAGE_SIZE` | local memory and Python shm allocator | hugepage size; `2MB` or `1GB` |
 | `MOONCAKE_UPSTREAM_DIR` | local scripts | upstream Mooncake source tree |
 | `MOONCAKE_UPSTREAM_BUILD_DIR` | local scripts | upstream Mooncake build output tree |

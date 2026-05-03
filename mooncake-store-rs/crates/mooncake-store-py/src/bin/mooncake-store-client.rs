@@ -16,7 +16,7 @@ use _store_rs::runtime::{
     CompatRuntimeArgs, CompatSetupArgs, CompatTimeoutCliOverrides, CompatTimeoutConfig,
 };
 use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_store_client::{
     init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
     RouteControlMode,
@@ -86,87 +86,98 @@ impl TransportBackendArg {
 
 #[derive(ClapArgs, Debug)]
 struct RunArgs {
-    #[arg(long)]
+    #[arg(long, env = "MOONCAKE_LOCAL_HOSTNAME")]
     local_hostname: String,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_METADATA_URL")]
     metadata_url: String,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_TRANSPORT_METADATA_URL")]
     transport_metadata_url: Option<String>,
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    #[arg(long, default_value_t = 64 * 1024 * 1024, env = "MC_STORE_RS_STORAGE_BYTES")]
     storage_bytes: usize,
-    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    #[arg(long, default_value_t = 4 * 1024 * 1024, env = "MC_STORE_RS_SCRATCH_BYTES")]
     scratch_bytes: usize,
-    #[arg(long, default_value = "tcp")]
+    #[arg(long, default_value = "tcp", env = "MOONCAKE_PROTOCOL")]
     protocol: String,
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", env = "MC_STORE_RS_RDMA_DEVICES")]
     rdma_devices: String,
-    #[arg(long, alias = "rpc-server-port")]
+    #[arg(
+        long,
+        alias = "rpc-server-port",
+        env = "MC_STORE_RS_TRANSPORT_RPC_PORT"
+    )]
     transport_rpc_port: Option<u16>,
     #[arg(
         long,
-        value_enum,
+        value_parser = parse_transport_backend_arg,
+        env = "MC_STORE_RS_TRANSPORT_BACKEND",
         help = "Real transport backend; defaults to classic_te"
     )]
     transport_backend: Option<TransportBackendArg>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_STABLE_ID")]
     stable_id: Option<String>,
-    #[arg(long, value_enum, default_value_t = InitialStateArg::Active)]
+    #[arg(long, value_enum, default_value_t = InitialStateArg::Active, env = "MC_STORE_RS_INITIAL_STATE")]
     initial_state: InitialStateArg,
     #[arg(
         long,
         default_value = "default",
+        env = "MC_STORE_RS_TENANT",
         help = "Default tenant scope for startup policy lookup and request defaults"
     )]
     tenant: String,
-    #[arg(long = "label", value_parser = parse_label, help = "Runtime identity and placement labels; use admin-managed tenant policy for tenant-scoped routing/resource policy")]
+    #[arg(long = "label", value_parser = parse_label, value_delimiter = ',', env = "MC_STORE_RS_LABELS", help = "Runtime identity and placement labels; use admin-managed tenant policy for tenant-scoped routing/resource policy")]
     labels: Vec<(String, String)>,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_RS_ROUTED_WRITES")]
     routed_writes: bool,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, env = "MC_STORE_RS_REPLICA_COUNT")]
     replica_count: usize,
     #[arg(
         long,
         default_value_t = 2,
+        env = "MC_STORE_RS_ROUTE_TOPK",
         help = "Compatibility fallback WRH route-authority fanout; prefer admin-managed tenant policy in metadata"
     )]
     route_topk: usize,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_KEYSPACE")]
     keyspace: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_LOCAL_SEGMENT_NAME")]
     local_segment_name: Option<String>,
-    #[arg(long, default_value_t = 30_000)]
+    #[arg(long, default_value_t = 30_000, env = "MC_STORE_RS_LEASE_TTL_MS")]
     lease_ttl_ms: u64,
-    #[arg(long, default_value_t = 30_000)]
+    #[arg(
+        long,
+        default_value_t = 30_000,
+        env = "MC_STORE_RS_HEARTBEAT_INTERVAL_MS"
+    )]
     heartbeat_interval_ms: u64,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_REQUEST_TIMEOUT_MS")]
     request_timeout_ms: Option<u64>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_STARTUP_TIMEOUT_MS")]
     startup_timeout_ms: Option<u64>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_HEARTBEAT_TIMEOUT_MS")]
     heartbeat_timeout_ms: Option<u64>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS")]
     transfer_stall_timeout_ms: Option<u64>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_METRICS_ADDR")]
     metrics_addr: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_CLIENT_SERVER_ADDRESS")]
     client_server_address: Option<String>,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_USE_HUGEPAGE")]
     use_hugepage: bool,
-    #[arg(long, value_parser = parse_hugepage_size_arg)]
+    #[arg(long, value_parser = parse_hugepage_size_arg, env = "MC_STORE_HUGEPAGE_SIZE")]
     hugepage_size: Option<usize>,
     #[arg(long, env = "MC_STORE_RS_TRACE_FILTER")]
     trace_filter: Option<String>,
-    #[arg(long, value_enum, default_value_t = RouteControlArg::EmbeddedWrh, help = "Compatibility fallback route-control mode; prefer admin-managed tenant policy in metadata")]
+    #[arg(long, value_parser = parse_route_control_arg, default_value = "embedded-wrh", env = "MC_STORE_RS_ROUTE_CONTROL", help = "Compatibility fallback route-control mode; prefer admin-managed tenant policy in metadata")]
     route_control: RouteControlArg,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_RS_DRAIN_ON_EXIT")]
     drain_on_exit: bool,
 }
 
 #[derive(ClapArgs, Debug)]
 struct StatsArgs {
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_STATS_SERVER")]
     server: String,
-    #[arg(long, help = "Emit compact JSON instead of pretty JSON")]
+    #[arg(long, value_parser = FalseyValueParser::new(), env = "MC_STORE_RS_STATS_JSON", help = "Emit compact JSON instead of pretty JSON")]
     json: bool,
 }
 
@@ -524,8 +535,44 @@ fn parse_label(input: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.trim().to_string()))
 }
 
+fn parse_route_control_arg(input: &str) -> Result<RouteControlArg, String> {
+    match input.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "embedded-wrh" => Ok(RouteControlArg::EmbeddedWrh),
+        "metadata-only" => Ok(RouteControlArg::MetadataOnly),
+        other => Err(format!(
+            "unsupported route control {other:?}; expected embedded-wrh or metadata-only"
+        )),
+    }
+}
+
+fn parse_transport_backend_arg(input: &str) -> Result<TransportBackendArg, String> {
+    match input.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "tent" => Ok(TransportBackendArg::Tent),
+        "classic" | "classic-te" | "te" => Ok(TransportBackendArg::ClassicTe),
+        other => Err(format!(
+            "unsupported transport backend {other:?}; expected tent or classic-te"
+        )),
+    }
+}
+
 fn parse_hugepage_size_arg(input: &str) -> Result<usize, String> {
     parse_hugepage_size(input).map_err(|error| error.to_string())
+}
+
+fn explicit_hugepage_setting(args: &RunArgs) -> Option<bool> {
+    if args.use_hugepage {
+        return Some(true);
+    }
+    std::env::var("MC_STORE_USE_HUGEPAGE")
+        .ok()
+        .map(|value| parse_falsey_env_bool(&value))
+}
+
+fn parse_falsey_env_bool(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "f" | "false" | "n" | "no" | "off"
+    )
 }
 
 fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRuntimeArgs {
@@ -550,7 +597,7 @@ fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRu
             route_topk: args.route_topk,
             keyspace: args.keyspace.clone(),
             expires_at_ms: Some(now_ms().saturating_add(args.lease_ttl_ms)),
-            use_hugepage: args.use_hugepage.then_some(true),
+            use_hugepage: explicit_hugepage_setting(args),
             hugepage_size_bytes: args.hugepage_size,
             timeouts: Some(timeouts),
         },
@@ -819,10 +866,11 @@ mod tests {
         build_runtime_args, compat_warnings, drained_message, dummy_worker_scope,
         effective_heartbeat_interval, emit_compat_warnings, fetch_stats_body,
         heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, normalize_trace_filter, now_ms,
-        parse_cli_from, parse_hugepage_size_arg, parse_label, requested_initial_state,
+        parse_cli_from, parse_falsey_env_bool, parse_hugepage_size_arg, parse_label,
+        parse_route_control_arg, parse_transport_backend_arg, requested_initial_state,
         resolve_timeout_config, should_activate_after_ready, start_metrics_if_needed,
         started_message, startup_initial_state, stopped_message, validate_args, Command,
-        HeartbeatLoopState, InitialStateArg, RouteControlArg, RunArgs,
+        HeartbeatLoopState, InitialStateArg, RouteControlArg, RunArgs, TransportBackendArg,
     };
     use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
 
@@ -878,16 +926,31 @@ mod tests {
     }
 
     fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        with_env_vars([(key, value)], f)
+    }
+
+    fn with_env_vars<'a, T>(
+        vars: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+        f: impl FnOnce() -> T,
+    ) -> T {
         let _guard = env_test_lock().lock().expect("env test lock poisoned");
-        let old_value = std::env::var_os(key);
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+        let vars = vars.into_iter().collect::<Vec<_>>();
+        let old_values = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for (key, value) in &vars {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
         let result = f();
-        match old_value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+        for (key, old_value) in old_values {
+            match old_value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
         result
     }
@@ -906,48 +969,50 @@ mod tests {
 
     #[test]
     fn args_parser_accepts_core_flags() {
-        let cli = parse_cli_from([
-            "mooncake-store-client",
-            "--local-hostname",
-            "127.0.0.1",
-            "--metadata-url",
-            "redis://127.0.0.1:6379/0",
-            "--storage-bytes",
-            "2048",
-            "--scratch-bytes",
-            "1024",
-            "--protocol",
-            "tcp",
-            "--tenant",
-            "tenant-a",
-            "--label",
-            "pool=pool-a",
-            "--routed-writes",
-            "--replica-count",
-            "2",
-            "--route-topk",
-            "4",
-            "--route-control",
-            "metadata-only",
-        ])
-        .expect("legacy root run args should parse");
-        let Command::Run(args) = cli.command else {
-            panic!("expected run command");
-        };
-        assert_eq!(args.local_hostname, "127.0.0.1");
-        assert_eq!(args.metadata_url, "redis://127.0.0.1:6379/0");
-        assert_eq!(args.storage_bytes, 2048);
-        assert_eq!(args.scratch_bytes, 1024);
-        assert_eq!(args.tenant, "tenant-a");
-        assert_eq!(
-            args.labels,
-            vec![("pool".to_string(), "pool-a".to_string())]
-        );
-        assert!(args.routed_writes);
-        assert_eq!(args.replica_count, 2);
-        assert_eq!(args.route_topk, 4);
-        assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
-        assert_eq!(args.initial_state, InitialStateArg::Active);
+        with_env_var("MC_STORE_RS_INITIAL_STATE", None, || {
+            let cli = parse_cli_from([
+                "mooncake-store-client",
+                "--local-hostname",
+                "127.0.0.1",
+                "--metadata-url",
+                "redis://127.0.0.1:6379/0",
+                "--storage-bytes",
+                "2048",
+                "--scratch-bytes",
+                "1024",
+                "--protocol",
+                "tcp",
+                "--tenant",
+                "tenant-a",
+                "--label",
+                "pool=pool-a",
+                "--routed-writes",
+                "--replica-count",
+                "2",
+                "--route-topk",
+                "4",
+                "--route-control",
+                "metadata-only",
+            ])
+            .expect("legacy root run args should parse");
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            assert_eq!(args.local_hostname, "127.0.0.1");
+            assert_eq!(args.metadata_url, "redis://127.0.0.1:6379/0");
+            assert_eq!(args.storage_bytes, 2048);
+            assert_eq!(args.scratch_bytes, 1024);
+            assert_eq!(args.tenant, "tenant-a");
+            assert_eq!(
+                args.labels,
+                vec![("pool".to_string(), "pool-a".to_string())]
+            );
+            assert!(args.routed_writes);
+            assert_eq!(args.replica_count, 2);
+            assert_eq!(args.route_topk, 4);
+            assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
+            assert_eq!(args.initial_state, InitialStateArg::Active);
+        });
     }
 
     #[test]
@@ -1021,6 +1086,171 @@ mod tests {
         assert_eq!(args.hugepage_size, Some(2 * 1024 * 1024));
         assert_eq!(args.trace_filter.as_deref(), Some("info"));
         assert!(args.drain_on_exit);
+    }
+
+    #[test]
+    fn args_parser_reads_runtime_config_from_env_when_cli_omits_flags() {
+        with_env_vars(
+            [
+                ("MOONCAKE_LOCAL_HOSTNAME", Some("10.1.0.5")),
+                ("MC_STORE_RS_METADATA_URL", Some("redis://127.0.0.1:6380/4")),
+                (
+                    "MC_STORE_RS_TRANSPORT_METADATA_URL",
+                    Some("redis://127.0.0.1:6380/5"),
+                ),
+                ("MC_STORE_RS_STORAGE_BYTES", Some("4096")),
+                ("MC_STORE_RS_SCRATCH_BYTES", Some("2048")),
+                ("MOONCAKE_PROTOCOL", Some("rdma")),
+                ("MC_STORE_RS_RDMA_DEVICES", Some("mlx5_0,mlx5_1")),
+                ("MC_STORE_RS_TRANSPORT_RPC_PORT", Some("17121")),
+                ("MC_STORE_RS_TRANSPORT_BACKEND", Some("classic_te")),
+                ("MC_STORE_RS_STABLE_ID", Some("env-node")),
+                ("MC_STORE_RS_INITIAL_STATE", Some("standby")),
+                ("MC_STORE_RS_TENANT", Some("tenant-env")),
+                ("MC_STORE_RS_LABELS", Some("pool=env,storage=true")),
+                ("MC_STORE_RS_ROUTED_WRITES", Some("1")),
+                ("MC_STORE_RS_REPLICA_COUNT", Some("3")),
+                ("MC_STORE_RS_ROUTE_TOPK", Some("5")),
+                ("MC_STORE_RS_KEYSPACE", Some("env/keyspace")),
+                ("MC_STORE_RS_LOCAL_SEGMENT_NAME", Some("env-segment")),
+                ("MC_STORE_RS_LEASE_TTL_MS", Some("12000")),
+                ("MC_STORE_RS_HEARTBEAT_INTERVAL_MS", Some("4000")),
+                ("MC_STORE_RS_REQUEST_TIMEOUT_MS", Some("70000")),
+                ("MC_STORE_RS_STARTUP_TIMEOUT_MS", Some("180000")),
+                ("MC_STORE_RS_HEARTBEAT_TIMEOUT_MS", Some("20000")),
+                ("MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS", Some("9000")),
+                ("MC_STORE_RS_METRICS_ADDR", Some("127.0.0.1:19090")),
+                ("MC_STORE_RS_CLIENT_SERVER_ADDRESS", Some("127.0.0.1:19091")),
+                ("MC_STORE_USE_HUGEPAGE", Some("on")),
+                ("MC_STORE_HUGEPAGE_SIZE", Some("2M")),
+                ("MC_STORE_RS_TRACE_FILTER", Some("debug")),
+                ("MC_STORE_RS_ROUTE_CONTROL", Some("metadata_only")),
+                ("MC_STORE_RS_DRAIN_ON_EXIT", Some("yes")),
+            ],
+            || {
+                let cli = parse_cli_from(["mooncake-store-client", "run"])
+                    .expect("env-backed run args should parse");
+                let Command::Run(args) = cli.command else {
+                    panic!("expected run command");
+                };
+                assert_eq!(args.local_hostname, "10.1.0.5");
+                assert_eq!(args.metadata_url, "redis://127.0.0.1:6380/4");
+                assert_eq!(
+                    args.transport_metadata_url.as_deref(),
+                    Some("redis://127.0.0.1:6380/5")
+                );
+                assert_eq!(args.storage_bytes, 4096);
+                assert_eq!(args.scratch_bytes, 2048);
+                assert_eq!(args.protocol, "rdma");
+                assert_eq!(args.rdma_devices, "mlx5_0,mlx5_1");
+                assert_eq!(args.transport_rpc_port, Some(17121));
+                assert_eq!(args.transport_backend, Some(TransportBackendArg::ClassicTe));
+                assert_eq!(args.stable_id.as_deref(), Some("env-node"));
+                assert_eq!(args.initial_state, InitialStateArg::Standby);
+                assert_eq!(args.tenant, "tenant-env");
+                assert_eq!(
+                    args.labels,
+                    vec![
+                        ("pool".to_string(), "env".to_string()),
+                        ("storage".to_string(), "true".to_string())
+                    ]
+                );
+                assert!(args.routed_writes);
+                assert_eq!(args.replica_count, 3);
+                assert_eq!(args.route_topk, 5);
+                assert_eq!(args.keyspace.as_deref(), Some("env/keyspace"));
+                assert_eq!(args.local_segment_name.as_deref(), Some("env-segment"));
+                assert_eq!(args.lease_ttl_ms, 12_000);
+                assert_eq!(args.heartbeat_interval_ms, 4_000);
+                assert_eq!(args.request_timeout_ms, Some(70_000));
+                assert_eq!(args.startup_timeout_ms, Some(180_000));
+                assert_eq!(args.heartbeat_timeout_ms, Some(20_000));
+                assert_eq!(args.transfer_stall_timeout_ms, Some(9_000));
+                assert_eq!(args.metrics_addr.as_deref(), Some("127.0.0.1:19090"));
+                assert_eq!(
+                    args.client_server_address.as_deref(),
+                    Some("127.0.0.1:19091")
+                );
+                assert!(args.use_hugepage);
+                assert_eq!(args.hugepage_size, Some(2 * 1024 * 1024));
+                assert_eq!(args.trace_filter.as_deref(), Some("debug"));
+                assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
+                assert!(args.drain_on_exit);
+            },
+        );
+    }
+
+    #[test]
+    fn cli_values_override_env_backed_runtime_config() {
+        with_env_vars(
+            [
+                ("MOONCAKE_LOCAL_HOSTNAME", Some("10.1.0.5")),
+                ("MC_STORE_RS_METADATA_URL", Some("redis://127.0.0.1:6380/4")),
+                ("MC_STORE_RS_ROUTE_CONTROL", Some("metadata_only")),
+                ("MC_STORE_RS_TRANSPORT_BACKEND", Some("tent")),
+                ("MC_STORE_RS_LABELS", Some("pool=env")),
+            ],
+            || {
+                let cli = parse_cli_from([
+                    "mooncake-store-client",
+                    "run",
+                    "--local-hostname",
+                    "127.0.0.1",
+                    "--metadata-url",
+                    "redis://127.0.0.1:6379/0",
+                    "--route-control",
+                    "embedded-wrh",
+                    "--transport-backend",
+                    "classic-te",
+                    "--label",
+                    "pool=cli",
+                ])
+                .expect("cli args should override env");
+                let Command::Run(args) = cli.command else {
+                    panic!("expected run command");
+                };
+                assert_eq!(args.local_hostname, "127.0.0.1");
+                assert_eq!(args.metadata_url, "redis://127.0.0.1:6379/0");
+                assert_eq!(args.route_control, RouteControlArg::EmbeddedWrh);
+                assert_eq!(args.transport_backend, Some(TransportBackendArg::ClassicTe));
+                assert_eq!(args.labels, vec![("pool".to_string(), "cli".to_string())]);
+            },
+        );
+    }
+
+    #[test]
+    fn env_backed_bool_flags_accept_falsey_values() {
+        with_env_vars(
+            [
+                ("MOONCAKE_LOCAL_HOSTNAME", Some("10.1.0.5")),
+                ("MC_STORE_RS_METADATA_URL", Some("redis://127.0.0.1:6380/4")),
+                ("MC_STORE_RS_ROUTED_WRITES", Some("0")),
+                ("MC_STORE_USE_HUGEPAGE", Some("off")),
+                ("MC_STORE_RS_DRAIN_ON_EXIT", Some("no")),
+                ("MC_STORE_RS_STATS_SERVER", Some("127.0.0.1:19090")),
+                ("MC_STORE_RS_STATS_JSON", Some("false")),
+            ],
+            || {
+                let cli = parse_cli_from(["mooncake-store-client", "run"])
+                    .expect("falsey env-backed run args should parse");
+                let Command::Run(args) = cli.command else {
+                    panic!("expected run command");
+                };
+                assert!(!args.routed_writes);
+                assert!(!args.use_hugepage);
+                assert!(!args.drain_on_exit);
+                let runtime_args = build_runtime_args(&args, sample_timeouts());
+                assert_eq!(runtime_args.setup.use_hugepage, Some(false));
+
+                let cli = parse_cli_from(["mooncake-store-client", "stats"])
+                    .expect("falsey env-backed stats args should parse");
+                let Command::Stats(args) = cli.command else {
+                    panic!("expected stats command");
+                };
+                assert_eq!(args.server, "127.0.0.1:19090");
+                assert!(!args.json);
+            },
+        );
     }
 
     #[test]
@@ -1224,6 +1454,35 @@ mod tests {
         );
         assert!(parse_label("missing-delimiter").is_err());
         assert!(parse_label(" =value").is_err());
+
+        assert_eq!(
+            parse_route_control_arg("embedded_wrh").expect("underscore route mode should parse"),
+            RouteControlArg::EmbeddedWrh
+        );
+        assert_eq!(
+            parse_route_control_arg("metadata-only").expect("hyphen route mode should parse"),
+            RouteControlArg::MetadataOnly
+        );
+        assert!(parse_route_control_arg("other").is_err());
+
+        assert_eq!(
+            parse_transport_backend_arg("classic_te").expect("underscore backend should parse"),
+            TransportBackendArg::ClassicTe
+        );
+        assert_eq!(
+            parse_transport_backend_arg("te").expect("te alias should parse"),
+            TransportBackendArg::ClassicTe
+        );
+        assert_eq!(
+            parse_transport_backend_arg("tent").expect("tent should parse"),
+            TransportBackendArg::Tent
+        );
+        assert!(parse_transport_backend_arg("other").is_err());
+
+        assert!(!parse_falsey_env_bool("0"));
+        assert!(!parse_falsey_env_bool("off"));
+        assert!(!parse_falsey_env_bool(""));
+        assert!(parse_falsey_env_bool("1"));
 
         assert_eq!(
             parse_hugepage_size_arg("2M").expect("2M should parse"),
