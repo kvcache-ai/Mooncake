@@ -995,7 +995,7 @@ impl ControlPlaneClient {
                     "control plane connect to {address} failed: {error}"
                 ))
             })?;
-        debug!(address, "opened new control plane channel");
+        trace!(address, "opened new control plane channel");
         self.channels.lock().insert(address, channel.clone());
         Ok(channel)
     }
