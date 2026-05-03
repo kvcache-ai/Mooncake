@@ -545,6 +545,9 @@ it has its own trace-file surface. Use `MC_BENCH_TRACE_FILE` for bench logs and
 keep `MC_STORE_RS_TRACE_FILE` for standalone-client or Python real-client
 logging.
 
+Standalone-client heartbeat success refreshes are trace-level routine events.
+Heartbeat recovery and failure messages remain explicit stderr output.
+
 ## Observability
 
 The Rust client exposes:

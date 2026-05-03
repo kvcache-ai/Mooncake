@@ -24,7 +24,7 @@ use mooncake_store_client::{
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
 };
-use tracing::debug;
+use tracing::trace;
 
 fn dummy_worker_scope(keyspace: Option<&str>) -> String {
     keyspace
@@ -713,7 +713,7 @@ fn refresh_lease_or_retry(
 ) -> u64 {
     match client.heartbeat(now_ms.saturating_add(lease_ttl_ms)) {
         Ok(()) => {
-            debug!(
+            trace!(
                 stable_id,
                 expires_at_ms = now_ms.saturating_add(lease_ttl_ms),
                 "mooncake-store-client heartbeat refreshed"
