@@ -22,7 +22,7 @@ use mooncake_transport::{
     Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
 };
 use parking_lot::Mutex;
-use tracing::{debug, info, info_span, warn};
+use tracing::{debug, info, info_span, trace, warn};
 
 use crate::control_plane::pb;
 use crate::control_plane::{

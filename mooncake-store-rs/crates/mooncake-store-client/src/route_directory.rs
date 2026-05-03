@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::client::{SharedLiveClientCache, SharedSuspectRuntimeCache};
 use crate::{
@@ -587,7 +587,7 @@ impl EmbeddedWrhRouteDirectory {
                     for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
                         match result {
                             Ok(Some(route)) => {
-                                debug!(
+                                trace!(
                                     namespace = %self.namespace,
                                     key = %key.0,
                                     authority = %authority.runtime,

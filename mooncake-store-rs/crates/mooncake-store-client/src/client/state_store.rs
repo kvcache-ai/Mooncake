@@ -776,7 +776,7 @@ impl StorageOwnerState {
             evicted_replica.length,
         )?;
         self.sync_route(&next);
-        debug!(
+        trace!(
             runtime = %self.runtime,
             key = %route.key.0,
             segment = %evicted_replica.segment_name.0,
