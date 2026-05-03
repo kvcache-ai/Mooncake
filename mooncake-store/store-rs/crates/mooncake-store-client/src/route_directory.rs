@@ -1905,7 +1905,7 @@ fn stable_hash(parts: &[&str]) -> u64 {
 }
 
 fn sampled_per_key_debug_log(parts: &[&str]) -> bool {
-    stable_hash(parts) % PER_KEY_DEBUG_SAMPLE_MODULUS == 0
+    stable_hash(parts).is_multiple_of(PER_KEY_DEBUG_SAMPLE_MODULUS)
 }
 
 #[cfg(test)]
