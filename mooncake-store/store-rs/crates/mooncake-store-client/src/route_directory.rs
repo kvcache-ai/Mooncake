@@ -22,6 +22,7 @@ const ROUTE_REPAIR_MISSING_AUTHORITY: &str = "route_repair_missing_authority";
 const ROUTE_REPAIR_STALE_AUTHORITY: &str = "route_repair_stale_authority";
 const ROUTE_REPAIR_DIVERGENT_AUTHORITY: &str = "route_repair_divergent_authority";
 const SUSPECT_AUTHORITY_TTL: Duration = Duration::from_secs(5);
+const PER_KEY_DEBUG_SAMPLE_MODULUS: u64 = 128;
 
 pub(crate) fn build_route_directory(
     mode: RouteControlMode,
@@ -597,6 +598,21 @@ impl EmbeddedWrhRouteDirectory {
                                     replica_count = route.replicas.len(),
                                     "route authority returned object route"
                                 );
+                                if sampled_per_key_debug_log(&[
+                                    "route_authority_object_route",
+                                    &self.namespace,
+                                    &key.0,
+                                    &authority.runtime.stable_id.0,
+                                ]) {
+                                    debug!(
+                                        key = %key.0,
+                                        authority = %authority.runtime,
+                                        source = route_read_source(rank, self.route_topk),
+                                        route_version = route.version.0,
+                                        replica_count = route.replicas.len(),
+                                        "sampled route authority object route"
+                                    );
+                                }
                                 if let Some(states) = repairs.as_mut() {
                                     Self::set_repair_observation(
                                         &mut states[index],
@@ -1886,6 +1902,10 @@ fn stable_hash(parts: &[&str]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+fn sampled_per_key_debug_log(parts: &[&str]) -> bool {
+    stable_hash(parts) % PER_KEY_DEBUG_SAMPLE_MODULUS == 0
 }
 
 #[cfg(test)]
