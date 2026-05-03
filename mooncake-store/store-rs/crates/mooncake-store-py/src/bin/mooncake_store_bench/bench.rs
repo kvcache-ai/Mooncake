@@ -26,6 +26,27 @@ fn is_heartbeat_tick(iteration: usize) -> bool {
     iteration.checked_rem(HEARTBEAT_EVERY) == Some(0)
 }
 
+fn heartbeat_client(client_ptr: usize) {
+    let expires_at = now_ms().saturating_add(LEASE_MS);
+    // SAFETY: called only for per-worker clients that are not shared by other workers.
+    let client = unsafe { &mut *(client_ptr as *mut StoreClient) };
+    let _ = client.heartbeat(expires_at);
+}
+
+fn heartbeat_worker_clients(
+    writer_ptr: usize,
+    reader_ptr: usize,
+    writer_enabled: bool,
+    reader_enabled: bool,
+) {
+    if writer_enabled {
+        heartbeat_client(writer_ptr);
+    }
+    if reader_enabled {
+        heartbeat_client(reader_ptr);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WorkerKeyShard {
     start: usize,
@@ -473,6 +494,7 @@ pub fn run_bench(
         .map(|i| cluster.reader(i) as *const StoreClient as usize)
         .collect();
     let worker_heartbeats_enabled = cluster.writers.len() >= concurrency;
+    let reader_heartbeats_enabled = cluster.readers.len() >= concurrency;
 
     let scoped_result = thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -488,9 +510,15 @@ pub fn run_bench(
             let handle = scope.spawn(move || {
                 // SAFETY: cluster (and its StoreClients) lives for the entire thread::scope.
                 // Worker heartbeats take &mut StoreClient and therefore run only when
-                // each worker maps to a distinct writer client.
+                // each worker maps to distinct writer/reader clients.
                 let writer = unsafe { &*(writer_ptr as *const StoreClient) };
                 let reader = unsafe { &*(reader_ptr as *const StoreClient) };
+                heartbeat_worker_clients(
+                    writer_ptr,
+                    reader_ptr,
+                    worker_heartbeats_enabled,
+                    reader_heartbeats_enabled,
+                );
 
                 let mut put_rec = LatencyRecorder::with_capacity(total_ops.min(1 << 20));
                 let mut get_rec = LatencyRecorder::with_capacity(total_ops.min(1 << 20));
@@ -512,37 +540,61 @@ pub fn run_bench(
                 };
                 let mut batch_put_from_buffers = batch_put_from_buffers;
 
-                // Pre-populate keys for get-only or mixed modes
+                // Pre-populate keys for get-only or mixed modes.
                 if matches!(worker_mode, BenchMode::Get | BenchMode::Mixed) {
-                    for ki in 0..shard.count {
+                    let prefill_shard = if matches!(worker_mode, BenchMode::Mixed) {
+                        mixed_read_shard
+                    } else {
+                        shard
+                    };
+
+                    for ki in 0..prefill_shard.count {
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
+
+                        let key = make_key(
+                            "bench",
+                            worker_id,
+                            worker_key_index(prefill_shard, ki),
+                        );
                         let retry_started = Instant::now();
                         let mut attempts = 0usize;
+
                         loop {
                             attempts += 1;
-                            let key = make_key("bench", worker_id, worker_key_index(shard, ki));
-                            match execute_write(
-                                writer,
-                                write_interface,
-                                WriteOperation {
-                                    target: OperationTarget {
-                                        worker_id,
-                                        shard,
-                                        key_offset: ki,
-                                        width: 1,
-                                        tenant: &tenant,
+                            let operation = WriteOperation {
+                                target: OperationTarget {
+                                    worker_id,
+                                    shard: prefill_shard,
+                                    key_offset: ki,
+                                    width: 1,
+                                    tenant: &tenant,
                                 },
                                 global_seed,
                                 iteration: 0,
                                 value_size,
-                            },
-                            replication_policy.as_ref(),
-                            batch_put_from_buffers.as_mut(),
-                        ) {
-                            Ok(_) => break,
-                            Err(error) => {
+                            };
+
+                            match execute_write(
+                                writer,
+                                write_interface,
+                                operation,
+                                replication_policy.as_ref(),
+                                batch_put_from_buffers.as_mut(),
+                            ) {
+                                Ok(_) => {
+                                    if is_heartbeat_tick(ki + 1) {
+                                        heartbeat_worker_clients(
+                                            writer_ptr,
+                                            reader_ptr,
+                                            worker_heartbeats_enabled,
+                                            reader_heartbeats_enabled,
+                                        );
+                                    }
+                                    break;
+                                }
+                                Err(error) => {
                                     let message = error.to_string();
                                     if !is_retryable_prefill_error(&message)
                                         || retry_started.elapsed() >= PREFILL_RETRY_TIMEOUT
@@ -558,10 +610,25 @@ pub fn run_bench(
                                         );
                                     }
                                     thread::sleep(PREFILL_RETRY_INTERVAL);
+                                    if is_heartbeat_tick(attempts) {
+                                        heartbeat_worker_clients(
+                                            writer_ptr,
+                                            reader_ptr,
+                                            worker_heartbeats_enabled,
+                                            reader_heartbeats_enabled,
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
+
+                    heartbeat_worker_clients(
+                        writer_ptr,
+                        reader_ptr,
+                        worker_heartbeats_enabled,
+                        reader_heartbeats_enabled,
+                    );
                 }
 
                 // Warmup (excluded from stats)
@@ -596,6 +663,14 @@ pub fn run_bench(
                         replication_policy.as_ref(),
                         batch_put_from_buffers.as_mut(),
                     );
+                    if is_heartbeat_tick(wi + 1) {
+                        heartbeat_worker_clients(
+                            writer_ptr,
+                            reader_ptr,
+                            worker_heartbeats_enabled,
+                            reader_heartbeats_enabled,
+                        );
+                    }
                 }
 
                 put_rec.reset_start();
@@ -700,10 +775,13 @@ pub fn run_bench(
                     }
 
                     iter += 1;
-                    if worker_heartbeats_enabled && is_heartbeat_tick(iter) {
-                        let expires_at = now_ms().saturating_add(LEASE_MS);
-                        let writer_mut = unsafe { &mut *(writer_ptr as *mut StoreClient) };
-                        let _ = writer_mut.heartbeat(expires_at);
+                    if is_heartbeat_tick(iter) {
+                        heartbeat_worker_clients(
+                            writer_ptr,
+                            reader_ptr,
+                            worker_heartbeats_enabled,
+                            reader_heartbeats_enabled,
+                        );
                     }
                 }
 

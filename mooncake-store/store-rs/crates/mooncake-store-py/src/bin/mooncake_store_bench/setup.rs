@@ -31,6 +31,10 @@ fn unique_suffix() -> u64 {
     now_ms() ^ (std::process::id() as u64)
 }
 
+fn bench_client_stable_id(role: &str, index: usize, run_id: u64) -> String {
+    format!("bench-{role}-{index}-{run_id}")
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum StorageSegmentNamingMode {
     LogicalSegmentName,
@@ -612,7 +616,7 @@ pub struct ClientHandle {
 
 struct RuntimeBuildSpec<'a> {
     role: &'a str,
-    index: usize,
+    stable_id: String,
     segment: String,
     keyspace: Option<String>,
     routed_writes: bool,
@@ -670,14 +674,16 @@ impl BenchCluster {
             )?;
         }
 
+        let run_id = unique_suffix();
         let mut writers = Vec::with_capacity(writer_count);
         for i in 0..writer_count {
-            let segment = format!("bench-writer-{i}-{}", unique_suffix());
+            let stable_id = bench_client_stable_id("writer", i, run_id);
+            let segment = format!("{stable_id}-{}", unique_suffix());
             let runtime = build_runtime(
                 global,
                 RuntimeBuildSpec {
                     role: "writer",
-                    index: i,
+                    stable_id,
                     segment,
                     keyspace: runtime_keyspace.clone(),
                     routed_writes: !has_storage,
@@ -691,12 +697,13 @@ impl BenchCluster {
 
         let mut readers = Vec::with_capacity(reader_count);
         for i in 0..reader_count {
-            let segment = format!("bench-reader-{i}-{}", unique_suffix());
+            let stable_id = bench_client_stable_id("reader", i, run_id);
+            let segment = format!("{stable_id}-{}", unique_suffix());
             let runtime = build_runtime(
                 global,
                 RuntimeBuildSpec {
                     role: "reader",
-                    index: i,
+                    stable_id,
                     segment,
                     keyspace: runtime_keyspace.clone(),
                     routed_writes: false,
@@ -735,7 +742,6 @@ fn build_runtime(
     global: &GlobalArgs,
     spec: RuntimeBuildSpec<'_>,
 ) -> Result<CompatRuntime, Box<dyn std::error::Error>> {
-    let stable_id = format!("bench-{}-{}", spec.role, spec.index);
     let mut labels = BTreeMap::new();
     labels.insert("role".to_string(), spec.role.to_string());
     labels.insert("storage".to_string(), spec.storage_label.to_string());
@@ -750,7 +756,7 @@ fn build_runtime(
         _rdma_devices: String::new(),
         transport_rpc_port: None,
         transport_backend: Some(transport_backend_name(&global.transport_backend).to_string()),
-        stable_id: Some(stable_id),
+        stable_id: Some(spec.stable_id),
         tenant: global.tenant.clone(),
         labels,
         routed_writes: spec.routed_writes,
@@ -815,6 +821,18 @@ mod tests {
         metadata
             .allocate_client_lease(&template)
             .expect("lease should publish");
+    }
+
+    #[test]
+    fn bench_client_stable_id_contains_run_identity() {
+        assert_eq!(
+            bench_client_stable_id("writer", 3, 1777768097580),
+            "bench-writer-3-1777768097580"
+        );
+        assert_eq!(
+            bench_client_stable_id("reader", 7, 1777768097580),
+            "bench-reader-7-1777768097580"
+        );
     }
 
     #[test]
