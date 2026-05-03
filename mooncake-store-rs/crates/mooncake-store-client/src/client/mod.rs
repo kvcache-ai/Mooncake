@@ -387,7 +387,7 @@ fn stable_phase_hash64(identity: &str, salt: &str) -> u64 {
 }
 
 fn stable_debug_log_sample(parts: &[&str]) -> bool {
-    stable_joined_hash64(parts) % DEBUG_PER_KEY_SAMPLE_MODULUS == 0
+    stable_joined_hash64(parts).is_multiple_of(DEBUG_PER_KEY_SAMPLE_MODULUS)
 }
 
 fn stable_joined_hash64(parts: &[&str]) -> u64 {
