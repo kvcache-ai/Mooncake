@@ -2,13 +2,15 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <memory>
-#include <string>
-#include <random>
 #include <barrier>
+#include <chrono>
 #include <cstdio>
 #include <fcntl.h>
 #include <limits>
+#include <memory>
+#include <random>
+#include <string>
+#include <thread>
 #include <unistd.h>
 
 #include "real_client.h"
@@ -811,16 +813,31 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     config.preferred_segment = client1_addr;
     ASSERT_EQ(py_client_->put(key, data_span, config), 0);
 
+    auto wait_for_task = [this](const UUID& task_id) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto query_res = py_client_->query_task(task_id);
+            if (query_res.has_value() &&
+                is_finished_status(query_res->status)) {
+                return query_res;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return py_client_->query_task(task_id);
+    };
+
     // Test create copy task from client 1 to client 2
     auto copy_res = py_client_->create_copy_task(key, {client2_addr});
     ASSERT_TRUE(copy_res.has_value()) << "Copy should return a task ID";
     UUID copy_task_id = copy_res.value();
 
-    // Query Copy Task
-    auto query_copy_res = py_client_->query_task(copy_task_id);
+    auto query_copy_res = wait_for_task(copy_task_id);
     ASSERT_TRUE(query_copy_res.has_value()) << "QueryTask should succeed";
     EXPECT_EQ(query_copy_res->id, copy_task_id);
     EXPECT_EQ(query_copy_res->type, TaskType::REPLICA_COPY);
+    EXPECT_EQ(query_copy_res->status, TaskStatus::SUCCESS)
+        << query_copy_res->message;
 
     // Test create move task from client 1 to client 2
     auto move_res =
@@ -828,11 +845,12 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     ASSERT_TRUE(move_res.has_value()) << "Move should return a task ID";
     UUID move_task_id = move_res.value();
 
-    // Query Move Task
-    auto query_move_res = py_client_->query_task(move_task_id);
+    auto query_move_res = wait_for_task(move_task_id);
     ASSERT_TRUE(query_move_res.has_value()) << "QueryTask should succeed";
     EXPECT_EQ(query_move_res->id, move_task_id);
     EXPECT_EQ(query_move_res->type, TaskType::REPLICA_MOVE);
+    EXPECT_EQ(query_move_res->status, TaskStatus::SUCCESS)
+        << query_move_res->message;
 
     py_client2->tearDownAll();
 }
