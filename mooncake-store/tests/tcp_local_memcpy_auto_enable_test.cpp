@@ -158,7 +158,8 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
         }
 
         runtime.client = client_opt.value();
-        runtime.io_allocator = std::make_unique<SimpleAllocator>(16 * 1024 * 1024);
+        runtime.io_allocator =
+            std::make_unique<SimpleAllocator>(16 * 1024 * 1024);
         auto reg = runtime.client->RegisterLocalMemory(
             runtime.io_allocator->getBase(), 16 * 1024 * 1024, "cpu:0", false,
             false);
@@ -166,15 +167,15 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
             << "RegisterLocalMemory failed: " << toString(reg.error());
 
         runtime.segment_size = 64 * 1024 * 1024;
-        runtime.segment_ptr = allocate_buffer_allocator_memory(runtime.segment_size);
+        runtime.segment_ptr =
+            allocate_buffer_allocator_memory(runtime.segment_size);
         EXPECT_NE(runtime.segment_ptr, nullptr);
         if (runtime.segment_ptr == nullptr) {
             return runtime;
         }
 
         auto mount = runtime.client->MountSegment(runtime.segment_ptr,
-                                                  runtime.segment_size,
-                                                  "tcp");
+                                                  runtime.segment_size, "tcp");
         EXPECT_TRUE(mount.has_value())
             << "MountSegment failed: " << toString(mount.error());
         if (!mount.has_value()) {
@@ -187,8 +188,8 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
 
     void CleanupRuntime(ClientRuntime& runtime) {
         if (runtime.client && runtime.segment_ptr) {
-            auto unmount =
-                runtime.client->UnmountSegment(runtime.segment_ptr, runtime.segment_size);
+            auto unmount = runtime.client->UnmountSegment(runtime.segment_ptr,
+                                                          runtime.segment_size);
             EXPECT_TRUE(unmount.has_value())
                 << "UnmountSegment failed: " << toString(unmount.error());
         }
@@ -225,8 +226,7 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
 
         auto put = runtime.client->Put(key, write_slices, config);
         runtime.io_allocator->deallocate(write_buf, payload.size());
-        EXPECT_TRUE(put.has_value())
-            << "Put failed: " << toString(put.error());
+        EXPECT_TRUE(put.has_value()) << "Put failed: " << toString(put.error());
 
         auto query = runtime.client->Query(key);
         EXPECT_TRUE(query.has_value())
@@ -239,14 +239,12 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
 
     void LogReplicaDiagnostics(const std::string& label,
                                const Replica::Descriptor& replica) {
-        const auto& endpoint =
-            replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+        const auto& endpoint = replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
         LOG(INFO) << label << " replica endpoint=" << endpoint;
-        LOG(INFO) << label
-                  << " client transport endpoint="
+        LOG(INFO) << label << " client transport endpoint="
                   << runtime_.client->GetTransportEndpoint();
-        LOG(INFO) << label
-                  << " is local replica="
+        LOG(INFO) << label << " is local replica="
                   << runtime_.client->IsReplicaOnLocalMemory(replica);
     }
 
@@ -274,17 +272,17 @@ TEST_F(TcpLocalMemcpyAutoEnableTest, P2PLocalReplicaUsesLocalMemcpy) {
     std::vector<Slice> read_slices;
     read_slices.emplace_back(Slice{out.data(), out.size()});
 
-    auto get = runtime_.client->Get(prepared.key, prepared.query_result, read_slices);
+    auto get =
+        runtime_.client->Get(prepared.key, prepared.query_result, read_slices);
 
     google::RemoveLogSink(&sink);
 
-    ASSERT_TRUE(get.has_value())
-        << "Get failed: " << toString(get.error());
+    ASSERT_TRUE(get.has_value()) << "Get failed: " << toString(get.error());
     ASSERT_EQ(std::memcmp(out.data(), prepared.payload.data(), out.size()), 0);
     ASSERT_TRUE(runtime_.client->IsReplicaOnLocalMemory(prepared.replica));
 
-    const auto& replica_endpoint =
-        prepared.replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    const auto& replica_endpoint = prepared.replica.get_memory_descriptor()
+                                       .buffer_descriptor.transport_endpoint_;
     EXPECT_EQ(replica_endpoint, runtime_.client->GetTransportEndpoint());
     EXPECT_EQ(sink.strategy(), "LOCAL_MEMCPY");
 }
@@ -293,14 +291,15 @@ TEST_F(TcpLocalMemcpyAutoEnableTest, MetadataLocalReplicaUsesLocalMemcpy) {
     runtime_ = CreateRuntime("localhost", metadata_url_);
     ASSERT_TRUE(runtime_.client != nullptr);
 
-    auto prepared = PrepareLocalObject("metadata_local_memcpy_key",
-                                       "hello-local-memcpy");
+    auto prepared =
+        PrepareLocalObject("metadata_local_memcpy_key", "hello-local-memcpy");
     LogReplicaDiagnostics("[METADATA]", prepared.replica);
 
-    const auto& replica_endpoint =
-        prepared.replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    const auto& replica_endpoint = prepared.replica.get_memory_descriptor()
+                                       .buffer_descriptor.transport_endpoint_;
     const auto client_endpoint = runtime_.client->GetTransportEndpoint();
-    const bool is_local = runtime_.client->IsReplicaOnLocalMemory(prepared.replica);
+    const bool is_local =
+        runtime_.client->IsReplicaOnLocalMemory(prepared.replica);
 
     StrategyCaptureSink sink;
     google::AddLogSink(&sink);
@@ -309,12 +308,12 @@ TEST_F(TcpLocalMemcpyAutoEnableTest, MetadataLocalReplicaUsesLocalMemcpy) {
     std::vector<Slice> read_slices;
     read_slices.emplace_back(Slice{out.data(), out.size()});
 
-    auto get = runtime_.client->Get(prepared.key, prepared.query_result, read_slices);
+    auto get =
+        runtime_.client->Get(prepared.key, prepared.query_result, read_slices);
 
     google::RemoveLogSink(&sink);
 
-    ASSERT_TRUE(get.has_value())
-        << "Get failed: " << toString(get.error());
+    ASSERT_TRUE(get.has_value()) << "Get failed: " << toString(get.error());
     ASSERT_EQ(std::memcmp(out.data(), prepared.payload.data(), out.size()), 0);
     ASSERT_TRUE(is_local);
     EXPECT_NE(replica_endpoint, client_endpoint);
@@ -332,8 +331,8 @@ TEST_F(TcpLocalMemcpyAutoEnableTest,
         remote_runtime_, "p2p_remote_same_host_key", "hello-remote-transfer");
     LogReplicaDiagnostics("[P2P_REMOTE]", prepared.replica);
 
-    const auto& replica_endpoint =
-        prepared.replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    const auto& replica_endpoint = prepared.replica.get_memory_descriptor()
+                                       .buffer_descriptor.transport_endpoint_;
     const auto client_endpoint = runtime_.client->GetTransportEndpoint();
     ASSERT_NE(replica_endpoint, client_endpoint);
     ASSERT_FALSE(runtime_.client->IsReplicaOnLocalMemory(prepared.replica));
@@ -362,13 +361,13 @@ TEST_F(TcpLocalMemcpyAutoEnableTest,
     ASSERT_TRUE(remote_runtime_.client != nullptr);
     ASSERT_TRUE(runtime_.client != nullptr);
 
-    auto prepared = PrepareObjectOnRuntime(
-        remote_runtime_, "metadata_remote_same_host_key",
-        "hello-metadata-remote-transfer");
+    auto prepared =
+        PrepareObjectOnRuntime(remote_runtime_, "metadata_remote_same_host_key",
+                               "hello-metadata-remote-transfer");
     LogReplicaDiagnostics("[METADATA_REMOTE]", prepared.replica);
 
-    const auto& replica_endpoint =
-        prepared.replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    const auto& replica_endpoint = prepared.replica.get_memory_descriptor()
+                                       .buffer_descriptor.transport_endpoint_;
     const auto client_endpoint = runtime_.client->GetTransportEndpoint();
     ASSERT_EQ(replica_endpoint, remote_runtime_.host_name);
     ASSERT_NE(replica_endpoint, runtime_.host_name);

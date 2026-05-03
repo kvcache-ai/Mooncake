@@ -809,7 +809,8 @@ bool TransferSubmitter::isLocalTransfer(
 
     // Metadata-service descriptors use the client hostname as the segment ID.
     // If it matches this client's hostname, the buffer address is local.
-    if (!local_hostname_.empty() && local_hostname_ == handle.transport_endpoint_) {
+    if (!local_hostname_.empty() &&
+        local_hostname_ == handle.transport_endpoint_) {
         return true;
     }
 
