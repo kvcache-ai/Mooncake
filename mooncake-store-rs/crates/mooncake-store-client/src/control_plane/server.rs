@@ -770,7 +770,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         let (tx, rx) = mpsc::channel(128);
         let stats = self.stats.clone();
         let active_streams = stats.active_streams.fetch_add(1, Ordering::Relaxed) + 1;
-        debug!(active_streams, "control stream opened");
+        trace!(active_streams, "control stream opened");
         tokio::spawn(async move {
             let _active = ActiveControlStream {
                 stats: stats.clone(),
