@@ -1121,6 +1121,12 @@ impl StoreClient {
                         first_error.get_or_insert(error);
                         continue;
                     }
+                    log_route_publish_sample(
+                        &self.lease.runtime,
+                        &pending.route,
+                        prepared[index].value.len(),
+                        "batch_put",
+                    );
                     self.storage_owner.track_route(&pending.route);
                     if let Some(previous) = pending.previous.as_ref() {
                         if let Err(error) = self.schedule_route_reclaim(previous) {
