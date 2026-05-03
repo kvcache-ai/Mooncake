@@ -548,6 +548,7 @@ logging.
 Standalone-client heartbeat success refreshes are trace-level routine events.
 Heartbeat recovery and failure messages remain explicit stderr output.
 Standalone-client local segment publication is an info-level startup registration event.
+Standalone-client startup emits one debug-level state snapshot after ready.
 Control-plane stream open events are trace-level connection churn.
 
 ## Observability

@@ -24,7 +24,7 @@ use mooncake_store_client::{
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
 };
-use tracing::trace;
+use tracing::{debug, trace};
 
 fn dummy_worker_scope(keyspace: Option<&str>) -> String {
     keyspace
@@ -264,6 +264,29 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
             metrics_addr.as_deref(),
             dummy_server.as_ref().map(|server| server.address()),
         )
+    );
+    debug!(
+        stable_id,
+        runtime = %format_args!("{stable_id}:{}", epoch.0),
+        epoch = epoch.0,
+        state = %lifecycle_state_label(requested_initial_state),
+        segment = %segment_name,
+        storage_bytes = args.storage_bytes,
+        scratch_bytes = args.scratch_bytes,
+        lease_ttl_ms = args.lease_ttl_ms,
+        heartbeat_interval_ms = heartbeat_interval,
+        request_timeout_ms = timeouts.request_timeout.as_millis(),
+        startup_timeout_ms = client.startup_timeout().as_millis(),
+        heartbeat_timeout_ms = timeouts.heartbeat_timeout.as_millis(),
+        transfer_stall_timeout_ms = timeouts.transfer_stall_timeout.as_millis(),
+        metrics_addr = metrics_addr.as_deref().unwrap_or("disabled"),
+        client_server_address = dummy_server
+            .as_ref()
+            .map(|server| server.address())
+            .unwrap_or("disabled"),
+        route_control = ?args.route_control,
+        replica_count = args.replica_count,
+        "mooncake-store-client state snapshot"
     );
 
     let mut heartbeat_state = HeartbeatLoopState::new(now_ms());
