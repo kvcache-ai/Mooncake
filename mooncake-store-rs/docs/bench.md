@@ -104,6 +104,12 @@ mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 bench \
 - mixed mode splits each worker's key shard into a stable read half and a write
   half; this keeps the benchmark from turning ordinary read traffic into
   immediate read-after-overwrite route churn
+- prefill, warmup, and measured phases heartbeat per-worker writer/reader
+  clients so long scratch-only benchmark setup does not let route authorities
+  expire before measured reads start
+- writer/reader runtime stable IDs include a per-process run ID, so rerunning
+  the same Kubernetes Job before old leases expire does not collide with the
+  previous run's still-active bench clients
 - measured reads retry bounded route-readiness misses, such as a freshly written object route
   not yet being readable; the wait is included in read latency and persistent misses still count
   as read errors
