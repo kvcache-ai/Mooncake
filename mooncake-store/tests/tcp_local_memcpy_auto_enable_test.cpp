@@ -179,7 +179,7 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
         EXPECT_TRUE(mount.has_value())
             << "MountSegment failed: " << toString(mount.error());
         if (!mount.has_value()) {
-            std::free(runtime.segment_ptr);
+            free_memory("", runtime.segment_ptr);
             runtime.segment_ptr = nullptr;
         }
 
@@ -198,7 +198,7 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
         runtime.io_allocator.reset();
 
         if (runtime.segment_ptr) {
-            std::free(runtime.segment_ptr);
+            free_memory("", runtime.segment_ptr);
             runtime.segment_ptr = nullptr;
         }
         runtime.segment_size = 0;
