@@ -403,5 +403,34 @@ fn stable_joined_hash64(parts: &[&str]) -> u64 {
     hash
 }
 
+fn log_route_publish_sample(
+    runtime: &ClientRuntimeId,
+    route: &ObjectRoute,
+    value_bytes: usize,
+    operation: &'static str,
+) {
+    trace!(
+        runtime = %runtime,
+        key = %route.key.0,
+        route_version = route.version.0,
+        replica_count = route.replicas.len(),
+        value_bytes,
+        operation,
+        replicas = ?route.replicas,
+        "route publish completed"
+    );
+    if stable_debug_log_sample(&["route_publish", operation, &route.key.0]) {
+        debug!(
+            runtime = %runtime,
+            key = %route.key.0,
+            route_version = route.version.0,
+            replica_count = route.replicas.len(),
+            value_bytes,
+            operation,
+            "sampled route publish"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests;

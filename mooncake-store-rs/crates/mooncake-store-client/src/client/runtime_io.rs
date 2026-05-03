@@ -532,6 +532,7 @@ impl StoreClient {
             let finalize_result =
                 self.finalize_tenant_quota_put(quota_reservation.as_ref(), &route, value.len());
             finalize_result?;
+            log_route_publish_sample(&self.lease.runtime, &route, value.len(), "put");
             if let Some(previous) = current.as_ref() {
                 if let Err(error) = self.reclaim_route(previous, reclaim_mode) {
                     warn!(
