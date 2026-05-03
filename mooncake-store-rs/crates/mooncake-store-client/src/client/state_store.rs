@@ -640,7 +640,7 @@ impl StorageOwnerState {
             }
             if evicted != 0 {
                 let (used_bytes, _) = self.allocator.lock().usage_bytes();
-                debug!(
+                info!(
                     runtime = %self.runtime,
                     evicted,
                     high_percent,
@@ -784,6 +784,19 @@ impl StorageOwnerState {
             length_bytes = evicted_replica.length,
             "storage-owner evicted replica via route-owner cas"
         );
+        if stable_debug_log_sample(&[
+            "storage_owner_evicted_replica",
+            &route.key.0,
+            &evicted_replica.segment_name.0,
+        ]) {
+            debug!(
+                runtime = %self.runtime,
+                key = %route.key.0,
+                segment = %evicted_replica.segment_name.0,
+                length_bytes = evicted_replica.length,
+                "sampled storage-owner replica eviction"
+            );
+        }
         Ok(true)
     }
 

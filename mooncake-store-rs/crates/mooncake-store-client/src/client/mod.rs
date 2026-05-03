@@ -60,6 +60,7 @@ const DEFAULT_PUT_WRITE_RETRY_LIMIT: usize = 4;
 const DEFAULT_TENANT_QUOTA_RESERVATION_TTL_MS: u64 = 60_000;
 const DEFAULT_TENANT_POLICY_CACHE_TTL_MS: u64 = 1_000;
 const DEFAULT_TENANT_POLICY_CACHE_IDLE_TTL_MS: u64 = 30_000;
+const DEBUG_PER_KEY_SAMPLE_MODULUS: u64 = 128;
 const STABLE_PHASE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const STABLE_PHASE_HASH_PRIME: u64 = 0x0000_0001_0000_01b3;
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
@@ -380,6 +381,23 @@ fn stable_phase_hash64(identity: &str, salt: &str) -> u64 {
     hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
     for byte in identity.as_bytes() {
         hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
+    }
+    hash
+}
+
+fn stable_debug_log_sample(parts: &[&str]) -> bool {
+    stable_joined_hash64(parts) % DEBUG_PER_KEY_SAMPLE_MODULUS == 0
+}
+
+fn stable_joined_hash64(parts: &[&str]) -> u64 {
+    let mut hash = STABLE_PHASE_HASH_OFFSET;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
+        }
+        hash ^= u64::from(b'|');
         hash = hash.wrapping_mul(STABLE_PHASE_HASH_PRIME);
     }
     hash

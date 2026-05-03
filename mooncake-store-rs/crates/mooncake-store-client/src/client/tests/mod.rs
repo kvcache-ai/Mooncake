@@ -24,10 +24,10 @@ use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, encode_lifecycle_state, flatten_slices, now_ms,
     payload_checksum, record_success_metric, resolve_effective_route_policy, scatter_into_buffers,
-    shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan, LiveClientCache,
-    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
-    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
-    SuspectRuntimeCache,
+    shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
+    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
+    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
+    StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -3455,6 +3455,20 @@ fn startup_prewarm_delay_is_stably_spread_and_bounded() {
         startup_prewarm_delay(&runtime, Duration::ZERO),
         Duration::ZERO
     );
+}
+
+#[test]
+fn stable_debug_log_sample_is_deterministic_and_sparse() {
+    let key = ["route_authority_object_route", "namespace", "key-42"];
+    assert_eq!(stable_debug_log_sample(&key), stable_debug_log_sample(&key));
+
+    let sampled = (0..1024)
+        .filter(|index| {
+            let key = format!("key-{index}");
+            stable_debug_log_sample(&["storage_owner_evicted_replica", &key])
+        })
+        .count();
+    assert!((1..32).contains(&sampled), "sampled={sampled}");
 }
 
 #[test]

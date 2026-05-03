@@ -548,7 +548,10 @@ logging.
 Standalone-client heartbeat success refreshes are trace-level routine events.
 Heartbeat recovery and failure messages remain explicit stderr output.
 Standalone-client local segment publication is an info-level startup registration event.
+Background storage-owner eviction completion is an info-level aggregate state change.
 Standalone-client startup emits one debug-level state snapshot after ready.
+Debug output keeps bounded per-key summary samples.
+Trace output keeps full per-key route and eviction details.
 Control-plane stream open events are trace-level connection churn.
 
 ## Observability
