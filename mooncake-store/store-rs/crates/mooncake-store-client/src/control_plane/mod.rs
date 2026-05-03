@@ -16,7 +16,7 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_stream::StreamExt;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::observability::OperationTracker;
 
