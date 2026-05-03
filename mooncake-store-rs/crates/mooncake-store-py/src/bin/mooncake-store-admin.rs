@@ -16,7 +16,7 @@ use _store_rs::admin::{
     RouteMigrationTaskListResponse, RouteMigrationTaskState, RouteMigrationTaskStatusResponse,
     RouteMigrationTaskSubmitRequest, TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
 };
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::MetadataKeyspace;
 use mooncake_store_client::{init_tracing, RouteControlMode};
 use mooncake_store_core::{
@@ -31,13 +31,13 @@ use url::Url;
 #[command(name = "mooncake-store-admin")]
 #[command(about = "Run explicit Mooncake store metadata maintenance tasks")]
 struct Args {
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_METADATA_URL")]
     metadata_url: String,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_URL")]
     admin_url: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_RS_KEYSPACE")]
     keyspace: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_TRACE_FILTER")]
     trace_filter: Option<String>,
     #[command(subcommand)]
     command: Command,
@@ -67,7 +67,7 @@ enum PolicyCommand {
     Get {
         #[command(flatten)]
         scope: OptionalPolicyScopeArgs,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_EFFECTIVE")]
         effective: bool,
     },
     Set {
@@ -75,19 +75,19 @@ enum PolicyCommand {
         scope: PolicyScopeArgs,
         #[command(flatten)]
         values: PolicyValueArgs,
-        #[arg(long)]
+        #[arg(long, env = "MC_STORE_ADMIN_EXPECTED_VERSION")]
         expected_version: Option<u64>,
-        #[arg(long, default_value = "admin")]
+        #[arg(long, default_value = "admin", env = "MC_STORE_ADMIN_UPDATED_BY")]
         updated_by: String,
     },
     Delete {
         #[command(flatten)]
         scope: PolicyScopeArgs,
-        #[arg(long)]
+        #[arg(long, env = "MC_STORE_ADMIN_EXPECTED_VERSION")]
         expected_version: Option<u64>,
     },
     List {
-        #[arg(long)]
+        #[arg(long, env = "MC_STORE_ADMIN_TENANT")]
         tenant: Option<String>,
     },
 }
@@ -101,27 +101,27 @@ enum QuotaCommand {
     Object {
         #[command(flatten)]
         scope: PolicyScopeArgs,
-        #[arg(long)]
+        #[arg(long, env = "MC_STORE_ADMIN_KEY")]
         key: String,
     },
     Reservations {
         #[command(flatten)]
         scope: PolicyScopeArgs,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, env = "MC_STORE_ADMIN_RESERVATION_STATE")]
         state: Option<ReservationStateArg>,
     },
     Abort {
         #[command(flatten)]
         scope: PolicyScopeArgs,
-        #[arg(long)]
+        #[arg(long, env = "MC_STORE_ADMIN_RESERVATION_ID")]
         reservation_id: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_DRY_RUN")]
         dry_run: bool,
     },
     Reconcile {
         #[command(flatten)]
         scope: PolicyScopeArgs,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_DRY_RUN")]
         dry_run: bool,
     },
 }
@@ -131,13 +131,18 @@ enum MigrateCommand {
     Copy {
         #[command(flatten)]
         common: RouteMigrationArgs,
-        #[arg(long = "target-segment", required = true)]
+        #[arg(
+            long = "target-segment",
+            required = true,
+            value_delimiter = ',',
+            env = "MC_STORE_ADMIN_TARGET_SEGMENTS"
+        )]
         target_segments: Vec<String>,
     },
     Move {
         #[command(flatten)]
         common: RouteMigrationArgs,
-        #[arg(long = "target-segment")]
+        #[arg(long = "target-segment", env = "MC_STORE_ADMIN_TARGET_SEGMENT")]
         target_segment: String,
     },
     Task {
@@ -150,92 +155,108 @@ enum MigrateCommand {
 enum MigrateTaskCommand {
     List,
     Get {
-        #[arg(long)]
+        #[arg(long, env = "MC_STORE_ADMIN_TASK_ID")]
         task_id: String,
     },
 }
 
 #[derive(ClapArgs, Clone, Debug)]
 struct ServerArgs {
-    #[arg(long, default_value = "127.0.0.1:0")]
+    #[arg(long, default_value = "127.0.0.1:0", env = "MC_STORE_ADMIN_BIND_ADDR")]
     bind_addr: String,
-    #[arg(long, default_value_t = 5_000)]
+    #[arg(
+        long,
+        default_value_t = 5_000,
+        env = "MC_STORE_ADMIN_CLEANUP_INTERVAL_MS"
+    )]
     cleanup_interval_ms: u64,
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 128, env = "MC_STORE_ADMIN_CLEANUP_BATCH_SIZE")]
     cleanup_batch_size: usize,
-    #[arg(long, default_value_t = 0)]
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "MC_STORE_ADMIN_QUOTA_RECONCILE_INTERVAL_MS"
+    )]
     quota_reconcile_interval_ms: u64,
-    #[arg(long = "quota-reconcile-tenant")]
+    #[arg(
+        long = "quota-reconcile-tenant",
+        value_delimiter = ',',
+        env = "MC_STORE_ADMIN_QUOTA_RECONCILE_TENANTS"
+    )]
     quota_reconcile_tenants: Vec<String>,
 }
 
 #[derive(ClapArgs, Clone, Debug)]
 struct RouteMigrationArgs {
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_AUTHORITY")]
     authority: String,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_TENANT")]
     tenant: String,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_DOMAIN")]
     domain: Option<String>,
-    #[arg(long = "object-set")]
+    #[arg(long = "object-set", env = "MC_STORE_ADMIN_OBJECT_SET")]
     object_set: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_KEY")]
     key: String,
-    #[arg(long = "source-segment")]
+    #[arg(long = "source-segment", env = "MC_STORE_ADMIN_SOURCE_SEGMENT")]
     source_segment: String,
-    #[arg(long = "task-executor")]
+    #[arg(long = "task-executor", env = "MC_STORE_ADMIN_TASK_EXECUTOR")]
     task_executor: String,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_MIGRATION_TASK_MAX_RETRIES")]
     max_retries: Option<u32>,
 }
 
 #[derive(ClapArgs, Clone, Debug)]
 struct OptionalPolicyScopeArgs {
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_TENANT")]
     tenant: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_DOMAIN")]
     domain: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_OBJECT_SET")]
     object_set: Option<String>,
 }
 
 #[derive(ClapArgs, Clone, Debug)]
 struct PolicyScopeArgs {
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_TENANT")]
     tenant: String,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_DOMAIN")]
     domain: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_OBJECT_SET")]
     object_set: Option<String>,
 }
 
 #[derive(ClapArgs, Clone, Debug, Default)]
 struct PolicyValueArgs {
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_ROUTE_TOPK")]
     route_topk: Option<u32>,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, env = "MC_STORE_ADMIN_ROUTE_CONTROL")]
     route_control: Option<RouteControlArg>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_MAX_BYTES")]
     max_bytes: Option<u64>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_MAX_OBJECTS")]
     max_objects: Option<usize>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_MAX_REMOTE_BATCH_ITEMS_PER_TENANT")]
     max_remote_batch_items_per_tenant: Option<usize>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_MAX_REMOTE_BATCH_BYTES")]
     max_remote_batch_bytes: Option<usize>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_MAX_REMOTE_BATCH_BURST_ITEMS")]
     max_remote_batch_burst_items: Option<usize>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_MAX_INFLIGHT_BYTES_PER_BATCH")]
     max_inflight_bytes_per_batch: Option<u64>,
-    #[arg(long)]
+    #[arg(long, env = "MC_STORE_ADMIN_DEFAULT_REPLICA_COUNT")]
     default_replica_count: Option<usize>,
-    #[arg(long)]
+    #[arg(long, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_PREFER_LOCAL")]
     prefer_local: Option<bool>,
-    #[arg(long)]
+    #[arg(long, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_PREFER_ALLOC_IN_SAME_NODE")]
     prefer_alloc_in_same_node: Option<bool>,
-    #[arg(long, value_delimiter = ',')]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        env = "MC_STORE_ADMIN_PREFERRED_STORAGE_OWNERS"
+    )]
     preferred_storage_owners: Option<Vec<String>>,
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', env = "MC_STORE_ADMIN_PREFERRED_SEGMENTS")]
     preferred_segments: Option<Vec<String>>,
 }
 
@@ -1205,7 +1226,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
@@ -1214,6 +1235,37 @@ mod tests {
     use mooncake_store_core::{MetadataBackend, TenantQuotaPolicy, TenantRoutePolicy};
 
     use super::*;
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_env_vars<'a, T>(
+        vars: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = env_test_lock().lock().expect("env test lock poisoned");
+        let vars = vars.into_iter().collect::<Vec<_>>();
+        let old_values = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for (key, value) in &vars {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let result = f();
+        for (key, old_value) in old_values {
+            match old_value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        result
+    }
 
     #[test]
     fn route_control_arg_maps_to_runtime_mode() {
@@ -1269,6 +1321,239 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn admin_global_and_server_args_read_env_when_cli_omits_flags() {
+        with_env_vars(
+            [
+                ("MC_STORE_RS_METADATA_URL", Some("redis://127.0.0.1:6380/4")),
+                ("MC_STORE_ADMIN_URL", Some("http://127.0.0.1:18080")),
+                ("MC_STORE_RS_KEYSPACE", Some("admin/env-keyspace")),
+                ("MC_STORE_ADMIN_TRACE_FILTER", Some("debug")),
+                ("MC_STORE_ADMIN_BIND_ADDR", Some("127.0.0.1:18081")),
+                ("MC_STORE_ADMIN_CLEANUP_INTERVAL_MS", Some("2000")),
+                ("MC_STORE_ADMIN_CLEANUP_BATCH_SIZE", Some("64")),
+                ("MC_STORE_ADMIN_QUOTA_RECONCILE_INTERVAL_MS", Some("3000")),
+                (
+                    "MC_STORE_ADMIN_QUOTA_RECONCILE_TENANTS",
+                    Some("tenant-a,tenant-b"),
+                ),
+            ],
+            || {
+                let args = Args::parse_from(["mooncake-store-admin", "server"]);
+                assert_eq!(args.metadata_url, "redis://127.0.0.1:6380/4");
+                assert_eq!(args.admin_url.as_deref(), Some("http://127.0.0.1:18080"));
+                assert_eq!(args.keyspace.as_deref(), Some("admin/env-keyspace"));
+                assert_eq!(args.trace_filter.as_deref(), Some("debug"));
+                match args.command {
+                    Command::Server(server_args) => {
+                        assert_eq!(server_args.bind_addr, "127.0.0.1:18081");
+                        assert_eq!(server_args.cleanup_interval_ms, 2_000);
+                        assert_eq!(server_args.cleanup_batch_size, 64);
+                        assert_eq!(server_args.quota_reconcile_interval_ms, 3_000);
+                        assert_eq!(
+                            server_args.quota_reconcile_tenants,
+                            vec!["tenant-a".to_string(), "tenant-b".to_string()]
+                        );
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn policy_set_reads_all_values_from_env_when_cli_omits_flags() {
+        with_env_vars(
+            [
+                ("MC_STORE_RS_METADATA_URL", Some("redis://127.0.0.1:6380/4")),
+                ("MC_STORE_ADMIN_TENANT", Some("tenant-env")),
+                ("MC_STORE_ADMIN_DOMAIN", Some("domain-env")),
+                ("MC_STORE_ADMIN_OBJECT_SET", Some("set-env")),
+                ("MC_STORE_ADMIN_ROUTE_TOPK", Some("5")),
+                ("MC_STORE_ADMIN_ROUTE_CONTROL", Some("metadata-only")),
+                ("MC_STORE_ADMIN_MAX_BYTES", Some("1024")),
+                ("MC_STORE_ADMIN_MAX_OBJECTS", Some("7")),
+                (
+                    "MC_STORE_ADMIN_MAX_REMOTE_BATCH_ITEMS_PER_TENANT",
+                    Some("8"),
+                ),
+                ("MC_STORE_ADMIN_MAX_REMOTE_BATCH_BYTES", Some("4096")),
+                ("MC_STORE_ADMIN_MAX_REMOTE_BATCH_BURST_ITEMS", Some("9")),
+                ("MC_STORE_ADMIN_MAX_INFLIGHT_BYTES_PER_BATCH", Some("8192")),
+                ("MC_STORE_ADMIN_DEFAULT_REPLICA_COUNT", Some("3")),
+                ("MC_STORE_ADMIN_PREFER_LOCAL", Some("false")),
+                ("MC_STORE_ADMIN_PREFER_ALLOC_IN_SAME_NODE", Some("true")),
+                (
+                    "MC_STORE_ADMIN_PREFERRED_STORAGE_OWNERS",
+                    Some("owner-a,owner-b"),
+                ),
+                (
+                    "MC_STORE_ADMIN_PREFERRED_SEGMENTS",
+                    Some("segment-a,segment-b"),
+                ),
+                ("MC_STORE_ADMIN_EXPECTED_VERSION", Some("11")),
+                ("MC_STORE_ADMIN_UPDATED_BY", Some("env-user")),
+            ],
+            || {
+                let args = Args::parse_from(["mooncake-store-admin", "policy", "set"]);
+                match args.command {
+                    Command::Policy {
+                        command:
+                            PolicyCommand::Set {
+                                scope,
+                                values,
+                                expected_version,
+                                updated_by,
+                            },
+                    } => {
+                        assert_eq!(scope.tenant, "tenant-env");
+                        assert_eq!(scope.domain.as_deref(), Some("domain-env"));
+                        assert_eq!(scope.object_set.as_deref(), Some("set-env"));
+                        assert_eq!(values.route_topk, Some(5));
+                        assert_eq!(values.route_control, Some(RouteControlArg::MetadataOnly));
+                        assert_eq!(values.max_bytes, Some(1024));
+                        assert_eq!(values.max_objects, Some(7));
+                        assert_eq!(values.max_remote_batch_items_per_tenant, Some(8));
+                        assert_eq!(values.max_remote_batch_bytes, Some(4096));
+                        assert_eq!(values.max_remote_batch_burst_items, Some(9));
+                        assert_eq!(values.max_inflight_bytes_per_batch, Some(8192));
+                        assert_eq!(values.default_replica_count, Some(3));
+                        assert_eq!(values.prefer_local, Some(false));
+                        assert_eq!(values.prefer_alloc_in_same_node, Some(true));
+                        assert_eq!(
+                            values.preferred_storage_owners,
+                            Some(vec!["owner-a".to_string(), "owner-b".to_string()])
+                        );
+                        assert_eq!(
+                            values.preferred_segments,
+                            Some(vec!["segment-a".to_string(), "segment-b".to_string()])
+                        );
+                        assert_eq!(expected_version, Some(11));
+                        assert_eq!(updated_by, "env-user");
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn route_migration_and_task_args_read_env_when_cli_omits_flags() {
+        with_env_vars(
+            [
+                ("MC_STORE_RS_METADATA_URL", Some("redis://127.0.0.1:6380/4")),
+                ("MC_STORE_ADMIN_AUTHORITY", Some("authority-env")),
+                ("MC_STORE_ADMIN_TENANT", Some("tenant-env")),
+                ("MC_STORE_ADMIN_DOMAIN", Some("domain-env")),
+                ("MC_STORE_ADMIN_OBJECT_SET", Some("set-env")),
+                ("MC_STORE_ADMIN_KEY", Some("key-env")),
+                ("MC_STORE_ADMIN_SOURCE_SEGMENT", Some("source-env")),
+                ("MC_STORE_ADMIN_TARGET_SEGMENTS", Some("target-a,target-b")),
+                ("MC_STORE_ADMIN_TASK_EXECUTOR", Some("executor-env")),
+                ("MC_STORE_ADMIN_MIGRATION_TASK_MAX_RETRIES", Some("6")),
+                ("MC_STORE_ADMIN_TASK_ID", Some("task-env")),
+            ],
+            || {
+                let args = Args::parse_from(["mooncake-store-admin", "migrate", "copy"]);
+                match args.command {
+                    Command::Migrate {
+                        command:
+                            MigrateCommand::Copy {
+                                common,
+                                target_segments,
+                            },
+                    } => {
+                        assert_eq!(common.authority, "authority-env");
+                        assert_eq!(common.tenant, "tenant-env");
+                        assert_eq!(common.domain.as_deref(), Some("domain-env"));
+                        assert_eq!(common.object_set.as_deref(), Some("set-env"));
+                        assert_eq!(common.key, "key-env");
+                        assert_eq!(common.source_segment, "source-env");
+                        assert_eq!(common.task_executor, "executor-env");
+                        assert_eq!(common.max_retries, Some(6));
+                        assert_eq!(
+                            target_segments,
+                            vec!["target-a".to_string(), "target-b".to_string()]
+                        );
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+
+                let args = Args::parse_from(["mooncake-store-admin", "migrate", "task", "get"]);
+                match args.command {
+                    Command::Migrate {
+                        command:
+                            MigrateCommand::Task {
+                                command: MigrateTaskCommand::Get { task_id },
+                            },
+                    } => assert_eq!(task_id, "task-env"),
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn quota_args_read_env_when_cli_omits_flags() {
+        with_env_vars(
+            [
+                ("MC_STORE_RS_METADATA_URL", Some("redis://127.0.0.1:6380/4")),
+                ("MC_STORE_ADMIN_TENANT", Some("tenant-env")),
+                ("MC_STORE_ADMIN_DOMAIN", Some("domain-env")),
+                ("MC_STORE_ADMIN_OBJECT_SET", Some("set-env")),
+                ("MC_STORE_ADMIN_KEY", Some("key-env")),
+                ("MC_STORE_ADMIN_RESERVATION_STATE", Some("aborted")),
+                ("MC_STORE_ADMIN_RESERVATION_ID", Some("reservation-env")),
+                ("MC_STORE_ADMIN_DRY_RUN", Some("yes")),
+            ],
+            || {
+                let args = Args::parse_from(["mooncake-store-admin", "quota", "reservations"]);
+                match args.command {
+                    Command::Quota {
+                        command:
+                            QuotaCommand::Reservations {
+                                scope,
+                                state: Some(state),
+                            },
+                    } => {
+                        assert_eq!(scope.tenant, "tenant-env");
+                        assert_eq!(scope.domain.as_deref(), Some("domain-env"));
+                        assert_eq!(scope.object_set.as_deref(), Some("set-env"));
+                        assert_eq!(state, ReservationStateArg::Aborted);
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+
+                let args = Args::parse_from(["mooncake-store-admin", "quota", "object"]);
+                match args.command {
+                    Command::Quota {
+                        command: QuotaCommand::Object { scope, key },
+                    } => {
+                        assert_eq!(scope.tenant, "tenant-env");
+                        assert_eq!(key, "key-env");
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+
+                let args = Args::parse_from(["mooncake-store-admin", "quota", "abort"]);
+                match args.command {
+                    Command::Quota {
+                        command:
+                            QuotaCommand::Abort {
+                                reservation_id,
+                                dry_run,
+                                ..
+                            },
+                    } => {
+                        assert_eq!(reservation_id, "reservation-env");
+                        assert!(dry_run);
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            },
+        );
     }
 
     #[test]

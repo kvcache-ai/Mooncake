@@ -71,6 +71,71 @@ Server maintenance defaults:
 - `--quota-reconcile-interval-ms 0` disables background tenant quota reconcile
 - `--quota-reconcile-tenant <tenant>` can be repeated; when unset, no tenant quota reconcile worker is started
 
+`mooncake-store-admin` accepts every CLI parameter through an environment
+variable as a fallback. Explicit CLI flags override environment values.
+
+Global admin knobs:
+
+| CLI flag | Environment variable | Default | Meaning |
+|----------|----------------------|---------|---------|
+| `--metadata-url` | `MC_STORE_RS_METADATA_URL` | required | Redis or etcd metadata endpoint for admin operations |
+| `--admin-url` | `MC_STORE_ADMIN_URL` | command-dependent | admin HTTP endpoint used by route-migration client commands |
+| `--keyspace` | `MC_STORE_RS_KEYSPACE` | default keyspace | metadata keyspace |
+| `--trace-filter` | `MC_STORE_ADMIN_TRACE_FILTER` | tracing default | tracing filter for the admin process |
+
+Server and migration knobs:
+
+| CLI flag | Environment variable | Default | Meaning |
+|----------|----------------------|---------|---------|
+| `server --bind-addr` | `MC_STORE_ADMIN_BIND_ADDR` | `127.0.0.1:0` | admin HTTP bind address |
+| `server --cleanup-interval-ms` | `MC_STORE_ADMIN_CLEANUP_INTERVAL_MS` | `5000` | stale-segment maintenance interval; `0` disables it |
+| `server --cleanup-batch-size` | `MC_STORE_ADMIN_CLEANUP_BATCH_SIZE` | `128` | stale-segment cleanup batch size |
+| `server --quota-reconcile-interval-ms` | `MC_STORE_ADMIN_QUOTA_RECONCILE_INTERVAL_MS` | `0` | tenant-quota reconcile interval; `0` disables it |
+| `server --quota-reconcile-tenant` | `MC_STORE_ADMIN_QUOTA_RECONCILE_TENANTS` | none | comma-separated tenants for background quota reconcile |
+| `migrate --authority` | `MC_STORE_ADMIN_AUTHORITY` | required | route authority runtime id |
+| `migrate --tenant` | `MC_STORE_ADMIN_TENANT` | required | tenant scope |
+| `migrate --domain` | `MC_STORE_ADMIN_DOMAIN` | none | optional domain scope |
+| `migrate --object-set` | `MC_STORE_ADMIN_OBJECT_SET` | none | optional object-set scope |
+| `migrate --key` | `MC_STORE_ADMIN_KEY` | required | logical object key |
+| `migrate --source-segment` | `MC_STORE_ADMIN_SOURCE_SEGMENT` | required | source segment for route migration |
+| `migrate copy --target-segment` | `MC_STORE_ADMIN_TARGET_SEGMENTS` | required | comma-separated copy target segments |
+| `migrate move --target-segment` | `MC_STORE_ADMIN_TARGET_SEGMENT` | required | move target segment |
+| `migrate --task-executor` | `MC_STORE_ADMIN_TASK_EXECUTOR` | required | executor runtime id |
+| `migrate --max-retries` | `MC_STORE_ADMIN_MIGRATION_TASK_MAX_RETRIES` | admin queue default | per-task retry override |
+| `migrate task get --task-id` | `MC_STORE_ADMIN_TASK_ID` | required | route-migration task id |
+
+Policy and quota knobs:
+
+| CLI flag | Environment variable | Default | Meaning |
+|----------|----------------------|---------|---------|
+| `policy --tenant` / `quota --tenant` | `MC_STORE_ADMIN_TENANT` | command-dependent | tenant scope |
+| `policy --domain` / `quota --domain` | `MC_STORE_ADMIN_DOMAIN` | none | optional domain scope |
+| `policy --object-set` / `quota --object-set` | `MC_STORE_ADMIN_OBJECT_SET` | none | optional object-set scope |
+| `policy get --effective` | `MC_STORE_ADMIN_EFFECTIVE` | `false` | resolve effective policy fallback chain |
+| `policy set/delete --expected-version` | `MC_STORE_ADMIN_EXPECTED_VERSION` | none | optimistic policy version guard |
+| `policy set --updated-by` | `MC_STORE_ADMIN_UPDATED_BY` | `admin` | policy audit author |
+| `policy list --tenant` | `MC_STORE_ADMIN_TENANT` | none | optional tenant filter |
+| `policy set --route-topk` | `MC_STORE_ADMIN_ROUTE_TOPK` | unchanged | WRH route-authority fanout |
+| `policy set --route-control` | `MC_STORE_ADMIN_ROUTE_CONTROL` | unchanged | route control mode |
+| `policy set --max-bytes` | `MC_STORE_ADMIN_MAX_BYTES` | unchanged | tenant quota byte limit |
+| `policy set --max-objects` | `MC_STORE_ADMIN_MAX_OBJECTS` | unchanged | tenant quota object limit |
+| `policy set --max-remote-batch-items-per-tenant` | `MC_STORE_ADMIN_MAX_REMOTE_BATCH_ITEMS_PER_TENANT` | unchanged | routed batch per-tenant item cap |
+| `policy set --max-remote-batch-bytes` | `MC_STORE_ADMIN_MAX_REMOTE_BATCH_BYTES` | unchanged | routed batch byte cap |
+| `policy set --max-remote-batch-burst-items` | `MC_STORE_ADMIN_MAX_REMOTE_BATCH_BURST_ITEMS` | unchanged | routed batch burst item cap |
+| `policy set --max-inflight-bytes-per-batch` | `MC_STORE_ADMIN_MAX_INFLIGHT_BYTES_PER_BATCH` | unchanged | per-batch inflight byte cap |
+| `policy set --default-replica-count` | `MC_STORE_ADMIN_DEFAULT_REPLICA_COUNT` | unchanged | default placement replica count |
+| `policy set --prefer-local` | `MC_STORE_ADMIN_PREFER_LOCAL` | unchanged | default local placement preference |
+| `policy set --prefer-alloc-in-same-node` | `MC_STORE_ADMIN_PREFER_ALLOC_IN_SAME_NODE` | unchanged | default same-node allocation preference |
+| `policy set --preferred-storage-owners` | `MC_STORE_ADMIN_PREFERRED_STORAGE_OWNERS` | unchanged | comma-separated preferred storage owners |
+| `policy set --preferred-segments` | `MC_STORE_ADMIN_PREFERRED_SEGMENTS` | unchanged | comma-separated preferred segments |
+| `quota object --key` | `MC_STORE_ADMIN_KEY` | required | logical object key |
+| `quota reservations --state` | `MC_STORE_ADMIN_RESERVATION_STATE` | none | reservation state filter |
+| `quota abort --reservation-id` | `MC_STORE_ADMIN_RESERVATION_ID` | required | quota reservation id |
+| `quota abort/reconcile --dry-run` | `MC_STORE_ADMIN_DRY_RUN` | `false` | inspect without changing metadata |
+
+Boolean admin environment variables use falsey parsing: `0`, `false`, `no`,
+and `off` disable the flag; other non-empty values enable it.
+
 ## Admin route-migration queue
 
 The standalone admin HTTP server keeps explicit route-migration tasks in process memory and retries transient executor failures automatically while the server remains alive.
@@ -534,11 +599,11 @@ The current repository uses these environment variables.
 | `MOONCAKE_LOCAL_HOSTNAME` | standalone client and bench | hostname or IP published by the runtime |
 | `MOONCAKE_PROTOCOL` | standalone client and bench | transport protocol such as `tcp` or `rdma` |
 | `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
-| `MC_STORE_RS_METADATA_URL` | standalone client and bench | store metadata endpoint used by `mooncake-store-client --metadata-url` and `mooncake-store-bench --metadata-url` |
+| `MC_STORE_RS_METADATA_URL` | standalone client, standalone admin, and bench | store metadata endpoint used by `mooncake-store-client --metadata-url`, `mooncake-store-admin --metadata-url`, and `mooncake-store-bench --metadata-url` |
 | `MC_STORE_RS_STORAGE_BYTES` | standalone client | local storage bytes for `mooncake-store-client run` |
 | `MC_STORE_RS_SCRATCH_BYTES` | standalone client and bench | local scratch bytes for compatibility-managed clients |
 | `MC_STORE_RS_RDMA_DEVICES` | standalone client and Rust e2e | RDMA device list |
-| `MC_STORE_RS_KEYSPACE` | standalone client and Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace`; this also defines Python compatibility read/write visibility and local hot-cache partitioning |
+| `MC_STORE_RS_KEYSPACE` | standalone client, standalone admin, and Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace`; this also defines Python compatibility read/write visibility and local hot-cache partitioning |
 | `MC_STORE_RS_STABLE_ID` | standalone client and Python wrapper setup fallback | stable client id used when SGLang cannot pass `stable_id` |
 | `MC_STORE_RS_INITIAL_STATE` | standalone client and Python wrapper setup fallback | initial lifecycle state, for example `active`, `standby`, `draining`, or `offline` |
 | `MC_STORE_RS_TENANT` | standalone client, Python wrapper setup fallback, and bench | default tenant used when SGLang cannot pass `tenant` |
