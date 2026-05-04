@@ -241,6 +241,17 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
+        // Ensure a CUDA context is current — worker threads or callers
+        // from non-CUDA threads may lack one.
+        unsigned int devOrd = 0;
+        cuPointerGetAttribute(&devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                              (CUdeviceptr)addr);
+        CUdevice cuDev;
+        CUcontext cuCtx;
+        cuDeviceGet(&cuDev, devOrd);
+        cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
+        cuCtxSetCurrent(cuCtx);
+
         size_t allocSize;
         result = cuPointerGetAttribute(
             &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
@@ -249,6 +260,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to call cuPointerGetAttribute for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
+            cuDevicePrimaryCtxRelease(cuDev);
             return ERR_CONTEXT;
         }
 
@@ -261,11 +273,13 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
                        << " cuda error=" << errStr;
+            cuDevicePrimaryCtxRelease(cuDev);
             return ERR_CONTEXT;
         }
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
                                       (uintptr_t)addr, dmabuf_fd, access);
+        cuDevicePrimaryCtxRelease(cuDev);
     }
 #else
     mrMeta.addr = addr;
