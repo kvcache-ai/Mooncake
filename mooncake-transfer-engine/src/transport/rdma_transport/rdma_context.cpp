@@ -217,7 +217,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-#if defined(USE_MLU) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
+#if defined(USE_MLU) || defined(USE_TPU) || \
+    (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
     // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
@@ -560,7 +561,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             return ERR_CONTEXT;
         }
 
-#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+#if defined(USE_TPU) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
         // Verify dmabuf support which is required if not using nvidia-peermem.
         // Assume device index matches.
         CUdevice cuDevice;

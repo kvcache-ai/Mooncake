@@ -36,13 +36,13 @@
 #endif
 
 #include "cuda_alike.h"
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_TPU)
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
     defined(USE_MACA) || defined(USE_UBSHMEM)
 #include <cassert>
 
@@ -106,7 +106,7 @@ DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
     defined(USE_MACA) || defined(USE_UBSHMEM)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU/NPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
@@ -118,7 +118,7 @@ using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
     defined(USE_MACA) || defined(USE_UBSHMEM)
     if (from_vram) {
         int gpu_id;
@@ -132,7 +132,7 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on NPU " << gpu_id;
         checkAclError(aclrtSetDevice(gpu_id), "Failed to set device");
 #else
-        LOG(INFO) << "Allocating memory on GPU " << gpu_id;
+        LOG(INFO) << "Allocating memory on accelerator " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #endif
         if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
@@ -189,7 +189,7 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
     defined(USE_MACA) || defined(USE_UBSHMEM)
     if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
 #ifdef USE_MNNVL
@@ -273,18 +273,19 @@ std::atomic<size_t> total_batch_count(0);
 
 // Common helper to determine buffer count based on GPU/NUMA configuration
 static int determineBufferCount() {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MACA)
     if (FLAGS_use_vram) {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
         if (FLAGS_gpu_id == -1 && cudaGetDeviceCount(&gpu_num) == cudaSuccess) {
-            LOG(INFO) << "GPU ID is not specified, found " << gpu_num
-                      << " GPUs to use";
+            LOG(INFO) << "Device ID is not specified, found " << gpu_num
+                      << " accelerator devices to use";
             return gpu_num;
         } else {
-            LOG(INFO) << "GPU ID is specified or failed to get GPU count, use "
-                      << FLAGS_gpu_id << " GPU";
+            LOG(INFO)
+                << "Device ID is specified or failed to get device count, use "
+                << FLAGS_gpu_id << " accelerator";
             return 1;
         }
     }
@@ -304,7 +305,7 @@ static int determineBufferCount() {
 static std::vector<void *> allocateBuffers() {
     buffer_num = determineBufferCount();
     std::vector<void *> addr(buffer_num);
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
     defined(USE_MACA) || defined(USE_UBSHMEM)
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
@@ -327,7 +328,7 @@ static void freeBuffers(std::vector<void *> &addr) {
 
 // Helper to get location name for classic backend
 static std::string getLocationName(int buffer_id) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
     defined(USE_MACA) || defined(USE_UBSHMEM)
     if (FLAGS_use_vram) {
         int name_suffix = (FLAGS_gpu_id == -1) ? buffer_id : FLAGS_gpu_id;
@@ -440,6 +441,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"cuda:0\": [[" +
+           device_names +
+           "], []], "
+           " \"tpu:0\": [[" +
            device_names +
            "], []], "
            " \"musa:0\": [[" +

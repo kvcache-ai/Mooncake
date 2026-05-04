@@ -31,13 +31,13 @@
 #include "transport/transport.h"
 
 #include "cuda_alike.h"
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_TPU)
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
     defined(USE_MACA)
 #include <cassert>
 
@@ -58,8 +58,8 @@ static void checkCudaError(cudaError_t result, const char *message) {
 }
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MACA)
 const static int NR_SOCKETS = 4;
 #else
 const static int NR_SOCKETS =
@@ -91,8 +91,8 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MACA)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
@@ -102,8 +102,8 @@ using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MACA)
     if (from_vram) {
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
@@ -128,8 +128,8 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MACA)
 #ifdef USE_MNNVL
     if (FLAGS_use_vram) {
         freeFabricMemory(addr);
@@ -298,6 +298,9 @@ std::string loadNicPriorityMatrix() {
            " \"cuda:0\": [[" +
            device_names +
            "], []], "
+           " \"tpu:0\": [[" +
+           device_names +
+           "], []], "
            " \"musa:0\": [[" +
            device_names +
            "], []], "
@@ -341,8 +344,8 @@ int initiator() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MACA)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
@@ -441,8 +444,8 @@ int target() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MACA)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
