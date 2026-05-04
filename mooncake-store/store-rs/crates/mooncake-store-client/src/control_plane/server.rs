@@ -1,7 +1,8 @@
 use super::codec::*;
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
-use std::time::Instant;
+use crate::observability::registry;
+use std::time::{Duration, Instant};
 
 const SLOW_CONTROL_REQUEST_LOG_THRESHOLD: Duration = Duration::from_millis(1000);
 
@@ -324,7 +325,8 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
     ) -> std::result::Result<Response<pb::CompareAndSwapRouteReply>, Status> {
         let request = request.into_inner();
         let next = request.next.as_ref().map(try_object_route_ref).transpose();
-        let reply = match next.and_then(|next| {
+        let started = Instant::now();
+        let result = next.and_then(|next| {
             self.authority.compare_and_swap_route(
                 &request.namespace,
                 &ClientStableId::new(request.authority),
@@ -332,7 +334,9 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 request.expected_version.map(RouteVersion),
                 next.as_ref(),
             )
-        }) {
+        });
+        registry::record_replication_publish(route_cas_result_label(&result), started.elapsed());
+        let reply = match result {
             Ok(result) => pb::CompareAndSwapRouteReply {
                 result: Some(pb_cas_result(&result)),
                 error: None,
@@ -389,10 +393,20 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             .map(ObjectKey::new)
             .collect::<Vec<_>>();
         let reply = match self.eviction.batch_report_route_hits(&keys) {
-            Ok(accepted) => pb::BatchReportRouteHitsReply {
-                accepted: accepted as u64,
-                error: None,
-            },
+            Ok(report) => {
+                registry::record_request_bytes(
+                    "storage_owner_report_route_hits",
+                    "read",
+                    "control",
+                    report.bytes,
+                );
+                registry::record_transport_bytes("read", "client", report.bytes);
+                registry::record_checksum_validations("ok", report.accepted as u64);
+                pb::BatchReportRouteHitsReply {
+                    accepted: report.accepted as u64,
+                    error: None,
+                }
+            }
             Err(error) => pb::BatchReportRouteHitsReply {
                 accepted: 0,
                 error: Some(pb_error(error)),
@@ -412,10 +426,19 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             .map(try_object_route)
             .collect::<Result<Vec<_>>>();
         let reply = match routes.and_then(|routes| self.eviction.batch_track_routes(&routes)) {
-            Ok(accepted) => pb::BatchTrackReplicaRoutesReply {
-                accepted: accepted as u64,
-                error: None,
-            },
+            Ok(report) => {
+                registry::record_request_bytes(
+                    "storage_owner_track_replica_routes",
+                    "write",
+                    "control",
+                    report.bytes,
+                );
+                registry::record_transport_bytes("write", "client", report.bytes);
+                pb::BatchTrackReplicaRoutesReply {
+                    accepted: report.accepted as u64,
+                    error: None,
+                }
+            }
             Err(error) => pb::BatchTrackReplicaRoutesReply {
                 accepted: 0,
                 error: Some(pb_error(error)),
@@ -448,22 +471,33 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             })
             .collect::<Result<Vec<_>>>();
         let replies = match entries {
-            Ok(entries) => self
-                .authority
-                .batch_compare_and_swap_routes(&request.namespace, &authority, &entries)
-                .into_iter()
-                .map(|result| match result {
-                    Ok(result) => pb::CompareAndSwapRouteReply {
-                        result: Some(pb_cas_result(&result)),
-                        error: None,
-                    },
-                    Err(error) => pb::CompareAndSwapRouteReply {
-                        result: None,
-                        error: Some(pb_error(error)),
-                    },
-                })
-                .collect(),
+            Ok(entries) => {
+                let started = Instant::now();
+                let results = self.authority.batch_compare_and_swap_routes(
+                    &request.namespace,
+                    &authority,
+                    &entries,
+                );
+                registry::record_replication_publish(
+                    batch_route_cas_result_label(&results),
+                    started.elapsed(),
+                );
+                results
+                    .into_iter()
+                    .map(|result| match result {
+                        Ok(result) => pb::CompareAndSwapRouteReply {
+                            result: Some(pb_cas_result(&result)),
+                            error: None,
+                        },
+                        Err(error) => pb::CompareAndSwapRouteReply {
+                            result: None,
+                            error: Some(pb_error(error)),
+                        },
+                    })
+                    .collect()
+            }
             Err(error) => {
+                registry::record_replication_publish("error", Duration::ZERO);
                 let detail = pb_error(error);
                 (0..item_count)
                     .map(|_| pb::CompareAndSwapRouteReply {
@@ -835,6 +869,30 @@ fn control_stream_request_operation(request: &pb::ControlStreamRequest) -> &'sta
         Some(pb::control_stream_request::Body::AllocatorRelease(_)) => "batch_release",
         None => "missing_body",
     }
+}
+
+fn route_cas_result_label(result: &Result<CasResult>) -> &'static str {
+    match result {
+        Ok(cas) if cas.applied => "ok",
+        Ok(_) | Err(StoreError::Conflict(_)) => "conflict",
+        Err(_) => "error",
+    }
+}
+
+fn batch_route_cas_result_label(results: &[Result<CasResult>]) -> &'static str {
+    if results
+        .iter()
+        .any(|result| matches!(result, Err(error) if !matches!(error, StoreError::Conflict(_))))
+    {
+        return "error";
+    }
+    if results.iter().any(|result| {
+        matches!(result, Err(StoreError::Conflict(_)))
+            || result.as_ref().is_ok_and(|cas| !cas.applied)
+    }) {
+        return "conflict";
+    }
+    "ok"
 }
 
 fn validate_submit_migration_task_request(

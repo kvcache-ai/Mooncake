@@ -348,11 +348,11 @@ impl AllocatorService for LocalAllocatorAdapter {
 }
 
 impl EvictionService for LocalAllocatorAdapter {
-    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> Result<usize> {
+    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> Result<RouteTrafficReport> {
         Ok(self.storage_owner.report_route_hits(keys))
     }
 
-    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<usize> {
+    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<RouteTrafficReport> {
         Ok(self.storage_owner.track_routes(routes))
     }
 }

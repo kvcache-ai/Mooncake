@@ -577,12 +577,15 @@ impl StorageOwnerState {
         }
     }
 
-    fn report_route_hits(&self, keys: &[ObjectKey]) -> usize {
-        self.clock.lock().mark_hot_keys(keys);
-        keys.len()
+    fn report_route_hits(&self, keys: &[ObjectKey]) -> RouteTrafficReport {
+        self.clock.lock().mark_hot_keys(keys)
     }
 
-    fn track_routes(&self, routes: &[ObjectRoute]) -> usize {
+    fn track_routes(&self, routes: &[ObjectRoute]) -> RouteTrafficReport {
+        let bytes = routes
+            .iter()
+            .map(|route| route_storage_bytes(route, &self.runtime))
+            .sum();
         {
             let mut allocator = self.allocator.lock();
             for route in routes {
@@ -593,7 +596,7 @@ impl StorageOwnerState {
         for route in routes {
             clock.sync_route(route, &self.runtime);
         }
-        routes.len()
+        RouteTrafficReport::new(routes.len(), bytes)
     }
 
     fn track_route(&self, route: &ObjectRoute) {
@@ -824,7 +827,15 @@ impl StorageOwnerState {
         self.route_directory
             .list_routes_by_replica_owner(&self.observer, owner)
     }
+}
 
+fn route_storage_bytes(route: &ObjectRoute, runtime: &ClientRuntimeId) -> u64 {
+    route
+        .replicas
+        .iter()
+        .filter(|replica| replica.owner == *runtime)
+        .map(|replica| replica.length)
+        .sum()
 }
 
 impl StorageClockState {
@@ -853,12 +864,18 @@ impl StorageClockState {
         self.track_route(route, runtime);
     }
 
-    fn mark_hot_keys(&mut self, keys: &[ObjectKey]) {
+    fn mark_hot_keys(&mut self, keys: &[ObjectKey]) -> RouteTrafficReport {
         let mut slots = Vec::new();
+        let mut bytes = 0u64;
         for key in keys {
             self.pending_hot_keys.insert(key.clone());
             if let Some(indices) = self.by_key.get(key) {
-                slots.extend(indices.iter().copied());
+                for index in indices {
+                    if let Some(entry) = self.entries.get(*index).and_then(Option::as_ref) {
+                        bytes = bytes.saturating_add(entry.length_bytes);
+                        slots.push(*index);
+                    }
+                }
             }
         }
         for index in slots {
@@ -866,6 +883,7 @@ impl StorageClockState {
                 entry.hot = true;
             }
         }
+        RouteTrafficReport::new(keys.len(), bytes)
     }
 
     fn pick_victim(&mut self, preferred_segment: Option<&SegmentName>) -> Option<ClockEntryId> {

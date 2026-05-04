@@ -17,11 +17,12 @@ use super::{
     store_error_from_pb, try_cas_result, try_compatibility, try_object_route, try_replica_route,
     try_replica_tier, try_route_state, try_runtime_id, try_segment_reservation, AllocatorService,
     AuthorityService, ControlPlaneClient, ControlPlaneHandle, ControlStreamSession,
-    EvictionService, GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp,
+    EvictionService, GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp, RouteTrafficReport,
     CONTROL_PLANE_SERVER_THREADS_ENV, CONTROL_PLANE_THREADS_ENV,
 };
 use crate::control_plane::pb;
 use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
+use crate::observability::{metrics_test_lock, render_prometheus_metrics, reset_metrics};
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
@@ -171,16 +172,27 @@ struct TestEviction {
 }
 
 impl EvictionService for TestEviction {
-    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> mooncake_store_core::Result<usize> {
+    fn batch_report_route_hits(
+        &self,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<RouteTrafficReport> {
         self.reported.lock().extend_from_slice(keys);
-        Ok(keys.len())
+        Ok(RouteTrafficReport::new(keys.len(), keys.len() as u64 * 16))
     }
 
-    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> mooncake_store_core::Result<usize> {
+    fn batch_track_routes(
+        &self,
+        routes: &[ObjectRoute],
+    ) -> mooncake_store_core::Result<RouteTrafficReport> {
         self.reported
             .lock()
             .extend(routes.iter().map(|route| route.key.clone()));
-        Ok(routes.len())
+        let bytes = routes
+            .iter()
+            .flat_map(|route| route.replicas.iter())
+            .map(|replica| replica.length)
+            .sum();
+        Ok(RouteTrafficReport::new(routes.len(), bytes))
     }
 }
 
@@ -1525,6 +1537,8 @@ fn control_plane_client_short_circuits_empty_batches_and_rejects_bad_uris() {
 
 #[test]
 fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
     let eviction = Arc::new(TestEviction::default());
@@ -1547,6 +1561,20 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .expect("unary get_route should succeed")
             .into_inner();
         assert!(get_reply.route.is_some());
+
+        let valid_route = sample_route("beta", 1, &owner);
+        let valid_cas_reply = service
+            .compare_and_swap_route(Request::new(pb::CompareAndSwapRouteRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                key: "beta".to_string(),
+                expected_version: None,
+                next: Some(pb_object_route(&valid_route)),
+            }))
+            .await
+            .expect("valid compare_and_swap_route should reply")
+            .into_inner();
+        assert!(valid_cas_reply.error.is_none());
 
         let invalid_route = pb::ObjectRoute {
             key: "broken".to_string(),
@@ -1715,6 +1743,22 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .into_inner();
         assert_eq!(track_reply.accepted, 1);
         assert_eq!(eviction.reported.lock().len(), 3);
+
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains(
+            "mooncake_store_request_bytes_total{operation=\"storage_owner_report_route_hits\",direction=\"read\",scope=\"control\"} 32"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_request_bytes_total{operation=\"storage_owner_track_replica_routes\",direction=\"write\",scope=\"control\"} 16"
+        ));
+        assert!(metrics
+            .contains("mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"client\"} 32"));
+        assert!(metrics
+            .contains("mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"client\"} 16"));
+        assert!(metrics.contains("mooncake_store_checksum_validation_total{result=\"ok\"} 2"));
+        assert!(metrics.contains(
+            "mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"} 1"
+        ));
 
         let stream_reply = handle_control_stream_request(
             &service,

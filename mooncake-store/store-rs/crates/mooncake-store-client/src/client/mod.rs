@@ -28,7 +28,7 @@ use crate::control_plane::pb;
 use crate::control_plane::{
     control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
     ControlPlaneHandle, EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp,
-    ReserveSpecificOp,
+    ReserveSpecificOp, RouteTrafficReport,
 };
 use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, ScratchReservation, StorageExtentInfo,

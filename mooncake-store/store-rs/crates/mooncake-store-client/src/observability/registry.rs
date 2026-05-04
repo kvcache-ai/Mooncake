@@ -574,6 +574,25 @@ pub(crate) fn record_request_with_registry(
         .record_request(operation, scope, result, bytes_in, bytes_out, duration);
 }
 
+pub(crate) fn record_request_bytes(
+    operation: &'static str,
+    direction: &'static str,
+    scope: &'static str,
+    bytes: u64,
+) {
+    if bytes == 0 {
+        return;
+    }
+    global_metrics_registry().lock().request_bytes.add(
+        RequestBytesKey {
+            operation,
+            direction,
+            scope,
+        },
+        bytes,
+    );
+}
+
 pub(crate) fn increment_inflight_with_registry(
     registry: &SharedMetricsRegistry,
     operation: &'static str,
@@ -615,6 +634,16 @@ pub(crate) fn record_checksum_validation(result: &'static str) {
         .lock()
         .checksum_validation
         .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_checksum_validations(result: &'static str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    global_metrics_registry()
+        .lock()
+        .checksum_validation
+        .add(ResultKey { result }, count);
 }
 
 pub(crate) fn record_tenant_quota_reservation(result: &'static str) {
