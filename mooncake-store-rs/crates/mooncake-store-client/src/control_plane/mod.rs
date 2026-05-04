@@ -164,10 +164,22 @@ pub(crate) trait AllocatorService: Send + Sync {
     }
 }
 
-pub(crate) trait EvictionService: Send + Sync {
-    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> Result<usize>;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RouteTrafficReport {
+    pub accepted: usize,
+    pub bytes: u64,
+}
 
-    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<usize>;
+impl RouteTrafficReport {
+    pub(crate) fn new(accepted: usize, bytes: u64) -> Self {
+        Self { accepted, bytes }
+    }
+}
+
+pub(crate) trait EvictionService: Send + Sync {
+    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> Result<RouteTrafficReport>;
+
+    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<RouteTrafficReport>;
 }
 
 #[derive(Clone, Debug)]

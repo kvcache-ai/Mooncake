@@ -182,12 +182,21 @@ impl AllocatorService for StaticAllocatorAdapter {
 struct NoopEvictionService;
 
 impl crate::control_plane::EvictionService for NoopEvictionService {
-    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> mooncake_store_core::Result<usize> {
-        Ok(keys.len())
+    fn batch_report_route_hits(
+        &self,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<crate::control_plane::RouteTrafficReport> {
+        Ok(crate::control_plane::RouteTrafficReport::new(keys.len(), 0))
     }
 
-    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> mooncake_store_core::Result<usize> {
-        Ok(routes.len())
+    fn batch_track_routes(
+        &self,
+        routes: &[ObjectRoute],
+    ) -> mooncake_store_core::Result<crate::control_plane::RouteTrafficReport> {
+        Ok(crate::control_plane::RouteTrafficReport::new(
+            routes.len(),
+            0,
+        ))
     }
 }
 

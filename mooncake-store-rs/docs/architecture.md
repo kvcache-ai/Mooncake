@@ -400,6 +400,7 @@ Examples include:
 - bytes in and bytes out
 - accumulated latency and max latency
 - tenant quota reservation / finalize / abort / reconcile outcomes
+- route-authority publish latency and storage-owner read/write traffic observed from control-plane route CAS, route-hit, and replica-track handlers
 
 The same tracker framework also covers eviction-related work such as:
 
