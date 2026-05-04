@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "python3 .github/hooks/require-feature-worktree.py",
+        "timeout": 10
+      }
+    ]
+  }
+}
