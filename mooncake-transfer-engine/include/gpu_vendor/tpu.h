@@ -5,8 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
-#include <mutex>
 #include <string>
 
 const static std::string GPU_PREFIX = "tpu:";
@@ -242,9 +240,7 @@ inline AdapterApi loadApi() {
 
     const int init_ret = api.init(kAdapterAbiVersion);
     if (init_ret != cudaSuccess) {
-        api.load_error = init_ret == cudaSuccess
-                             ? cudaErrorSharedObjectInitFailed
-                             : init_ret;
+        api.load_error = init_ret;
         dlclose(api.handle);
         api.handle = nullptr;
     }

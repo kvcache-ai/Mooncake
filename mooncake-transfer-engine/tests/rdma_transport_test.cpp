@@ -101,7 +101,7 @@ std::string pickBackend() {
     return "mlu";
 #elif defined(USE_TPU)
     return FLAGS_use_vram ? "tpu" : "cpu";
-#elif defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+#elif defined(USE_CUDA) || defined(USE_MUSA) || \
     defined(USE_MACA)
     return FLAGS_use_vram ? "gpu" : "cpu";
 #else
@@ -133,7 +133,7 @@ void validateBackend(const std::string &backend) {
         return;
     }
 #endif
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || \
     defined(USE_MACA)
     if (backend == "gpu") {
         return;
