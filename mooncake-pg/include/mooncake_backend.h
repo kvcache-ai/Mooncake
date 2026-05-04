@@ -210,7 +210,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
 struct ExtensionState {
     std::vector<bool> activeRanks;
-    std::vector<uint32_t> p2pGenerations;
+    std::vector<uint32_t> p2pEpochs;
     int taskCount = -1;
 };
 std::vector<uint8_t> serialize(const ExtensionState& state);

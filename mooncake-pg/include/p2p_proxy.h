@@ -35,46 +35,46 @@ namespace mooncake {
 //   |  | 8 MiB   |  | 8 MiB   |        | 8 MiB   |            |
 //   |  +---------+  +---------+        +---------+            |
 //   +---------------------------------------------------------+
-//   |  Publish Control Region                                 |
+//   |  Credit Control Region                                  |
 //   |  [peer 0 lane : 64 slots][peer 1 lane : 64 slots] ...   |
 //   +---------------------------------------------------------+
-//   |  Completion Control Region                              |
+//   |  Ack Control Region                                     |
 //   |  [peer 0 lane : 64 slots][peer 1 lane : 64 slots] ...   |
 //   +---------------------------------------------------------+
 //
 // Control lane addressing (isolated per sender-receiver pair):
 //
-//      Rank R wants to write a PublishSlot to peer P
+//      Rank R wants to write a CreditSlot to peer P
 //      -----------------------------------------------------
-//      Target = P's publish base
-//               + (R * kP2PControlRingSize + seq % 64) * sizeof(PublishSlot)
+//      Target = P's credit base
+//               + (R * kP2PControlRingSize + seq % 64) * sizeof(CreditSlot)
 //
-//      Rank R wants to write a CompletionSlot to peer P
+//      Rank R wants to write an AckSlot to peer P
 //      -----------------------------------------------------
-//      Target = P's completion base
-//               + (R * kP2PControlRingSize + seq % 64) * sizeof(CompletionSlot)
+//      Target = P's ack base
+//               + (R * kP2PControlRingSize + seq % 64) * sizeof(AckSlot)
 //
 //
 // P2PProxy implements a credit-based RDMA pull protocol.
 //
 // Protocol overview:
 //   - The RECEIVER drives the flow. It allocates chunks from its RecvPool and
-//     writes PublishSlots into the sender's PublishLane to invite the sender
-//     to write data into the designated RecvPool offset.
-//   - The SENDER is passive. It polls its local PublishLane (written by the
-//     receiver via RDMA). Only after receiving an invitation does it allocate
+//     writes CreditSlots into the sender's CreditLane to grant credit to the
+//     sender to write data into the designated RecvPool offset.
+//   - The SENDER is passive. It polls its local CreditLane (written by the
+//     receiver via RDMA). Only after receiving a credit does it allocate
 //     a staging buffer from SendPool, copy user tensor data into it, and
 //     perform the RDMA Write to the remote RecvPool.
-//   - After the RDMA Write finishes, the sender writes a CompletionSlot back
-//     to the receiver's CompletionLane to acknowledge the transfer.
+//   - After the RDMA Write finishes, the sender writes an AckSlot back
+//     to the receiver's AckLane to acknowledge the transfer.
 //
 // Memory model:
 //   - SendPool / RecvPool are fixed-size chunk pools.
 //   - Control lanes are ring buffers.
 //
 // Per-chunk state machines:
-//   Sender:  Fetch Invite -> Copy-In (staging) -> RDMA Write -> Acknowledge
-//   Receiver: Advertise -> Poll Completion -> Copy-Out -> Free Chunk
+//   Sender:  Fetch Credit -> Copy-In (staging) -> RDMA Write -> Acknowledge
+//   Receiver: IssueCredit -> Poll Ack -> Copy-Out -> Free Chunk
 //
 // Concurrency rules:
 //   - All pool allocations are non-blocking. If a pool is exhausted the step
@@ -88,11 +88,11 @@ namespace mooncake {
 // The five steps below are separated between Sender (Rank 0) and
 // Receiver (Rank 1) to make the protocol explicit.
 //
-//   Step 1 -- Rank 1 advertises free RecvPool chunks to Rank 0
+//   Step 1 -- Rank 1 issues credits for free RecvPool chunks to Rank 0
 //   ------------------------------------------------------------------------
 //   Rank 1 (Receiver)                RDMA Write
 //   +-----------------------+              +-------------------------------+
-//   | RecvPool              |              | Rank 0's PublishLane[1]       |
+//   | RecvPool              |              | Rank 0's CreditLane[1]        |
 //   | chunk 7 : free        | -----------> | slot 0 : {seq=0,off=7,len=8M} |
 //   | chunk 2 : free        | -----------> | slot 1 : {seq=1,off=2,len=8M} |
 //   | chunk 1 : free        | -----------> | slot 2 : {seq=2,off=1,len=8M} |
@@ -124,15 +124,15 @@ namespace mooncake {
 //   | chunk 5 : [16..24M) | ------------------------> | chunk 1 : [16..24M) |
 //   +---------------------+                           +---------------------+
 //
-//   Step 4 -- Rank 0 acknowledges with CompletionSlots
+//   Step 4 -- Rank 0 acknowledges with AckSlots
 //   ------------------------------------------------------------------------
 //   Rank 0 (Sender)                      RDMA Write       Rank 1 (Receiver)
-//   +-----------------------+               +-------------------------------+
-//   | CompletionLane[0]     |               | Rank 1's CompletionLane[0]    |
-//   | (local cache only)    | ------------> | slot 0 : {seq=0,len=8M,gen=G} |
-//   +-----------------------+               | slot 1 : {seq=1,len=8M,gen=G} |
-//                                           | slot 2 : {seq=2,len=8M,gen=G} |
-//                                           +-------------------------------+
+//   +-----------------------+             +---------------------------------+
+//   | AckLane[0]            |             | Rank 1's AckLane[0]             |
+//   | (local cache only)    | ----------> | slot 0 : {seq=0,len=8M,epoch=G} |
+//   +-----------------------+             | slot 1 : {seq=1,len=8M,epoch=G} |
+//                                         | slot 2 : {seq=2,len=8M,epoch=G} |
+//                                         +---------------------------------+
 //
 //   Step 5 -- Rank 1 copies out and recycles chunks
 //   ------------------------------------------------------------------------
@@ -170,18 +170,18 @@ inline constexpr uint64_t kDefaultPoolSize = 128u * 1024 * 1024;  // 128 MiB
 inline constexpr uint64_t kDefaultChunkSize = 16u * 1024 * 1024;  // 16 MiB
 
 // Single-word atomic publication token.
-// Combines generation and sequence to avoid torn reads.
+// Combines epoch and sequence to avoid torn reads.
 // kInvalidControlToken (all 1s) means "slot empty / not yet published".
 using ControlToken = uint64_t;
 inline constexpr ControlToken kInvalidControlToken =
     std::numeric_limits<uint64_t>::max();
 
-inline ControlToken makeControlToken(uint32_t generation, uint32_t sequence) {
-    return (static_cast<ControlToken>(generation) << 32) |
+inline ControlToken makeControlToken(uint32_t epoch, uint32_t sequence) {
+    return (static_cast<ControlToken>(epoch) << 32) |
            static_cast<ControlToken>(sequence & 0xFFFFFFFFu);
 }
 
-// PublishSlot
+// CreditSlot
 //
 // Header-Footer double-token guard:
 //   We store the same token at both ends of the 64-byte block.
@@ -193,12 +193,12 @@ inline ControlToken makeControlToken(uint32_t generation, uint32_t sequence) {
 // consumer safely retries on the next poll iteration.
 //
 // Layout:
-//   [0..7]   header_token  (generation << 32 | sequence)
+//   [0..7]   header_token  (epoch << 32 | sequence)
 //   [8..15]  recv_addr     (payload)
 //   [16..19] chunk_len     (payload)
 //   [20..55] padding       (kept zero, reserved for future use)
 //   [56..63] footer_token  (identical to header_token)
-struct alignas(64) PublishSlot {
+struct alignas(64) CreditSlot {
    private:
     uint64_t header_token = kInvalidControlToken;
     uint64_t recv_addr = 0;
@@ -211,22 +211,22 @@ struct alignas(64) PublishSlot {
     // Consumer-side reliable read.  Returns true when a consistent slot is
     // observed (header == footer != kInvalidControlToken).
     bool tryLoad(uint64_t& out_recv_addr, uint32_t& out_chunk_len,
-                 uint32_t& out_generation, uint32_t& out_sequence) const;
+                 uint32_t& out_epoch, uint32_t& out_sequence) const;
 
     // Producer-side reliable publish.  Writes payload and footer first,
     // then releases header so consumers see a consistent slot.
-    void publish(uint32_t gen, uint32_t seq, uint64_t addr, uint32_t len);
+    void publish(uint32_t epoch, uint32_t seq, uint64_t addr, uint32_t len);
 
     // Reset both tokens to kInvalidControlToken.
     void reset();
 };
 
-// CompletionSlot Layout:
-//   [0..7]   header_token  (generation << 32 | sequence)
+// AckSlot Layout:
+//   [0..7]   header_token  (epoch << 32 | sequence)
 //   [8..11]  chunk_len     (payload)
 //   [12..55] padding       (kept zero, reserved for future use)
 //   [56..63] footer_token  (identical to header_token)
-struct alignas(64) CompletionSlot {
+struct alignas(64) AckSlot {
    private:
     uint64_t header_token = kInvalidControlToken;
     uint32_t chunk_len = 0;
@@ -235,12 +235,12 @@ struct alignas(64) CompletionSlot {
     uint64_t footer_token = kInvalidControlToken;
 
    public:
-    // See PublishSlot::tryLoad().
-    bool tryLoad(uint32_t& out_chunk_len, uint32_t& out_generation,
+    // See CreditSlot::tryLoad().
+    bool tryLoad(uint32_t& out_chunk_len, uint32_t& out_epoch,
                  uint32_t& out_sequence) const;
 
-    // See PublishSlot::publish().
-    void publish(uint32_t gen, uint32_t seq, uint32_t len);
+    // See CreditSlot::publish().
+    void publish(uint32_t epoch, uint32_t seq, uint32_t len);
 
     // Reset both tokens to kInvalidControlToken.
     void reset();
@@ -302,10 +302,8 @@ class P2PProxy {
     P2PProxy(TransferEngine* engine, const Options& options);
     ~P2PProxy();
 
-    PublishSlot* publish_region() const { return resources_.publish_region_; }
-    CompletionSlot* completion_region() const {
-        return resources_.completion_region_;
-    }
+    CreditSlot* credit_region() const { return resources_.credit_region_; }
+    AckSlot* ack_region() const { return resources_.ack_region_; }
     void bindMeta(const std::shared_ptr<TransferGroupMeta>& meta);
     void extendGroupSizeTo(int new_size);
 
@@ -334,14 +332,13 @@ class P2PProxy {
      */
     void abandonResources();
 
-    // Generation for fault recovery.  All control slots carry this
+    // Epoch for fault recovery.  All control slots carry this
     // value so that stale messages from before a Reset can be detected.
-    uint32_t getGeneration(int peer_rank) const {
-        return peer_generation_[peer_rank].load(std::memory_order_acquire);
+    uint32_t getEpoch(int peer_rank) const {
+        return peer_epoch_[peer_rank].load(std::memory_order_acquire);
     }
-    void setGeneration(int peer_rank, uint32_t generation) {
-        peer_generation_[peer_rank].store(generation,
-                                          std::memory_order_release);
+    void setEpoch(int peer_rank, uint32_t epoch) {
+        peer_epoch_[peer_rank].store(epoch, std::memory_order_release);
     }
 
    private:
@@ -351,18 +348,18 @@ class P2PProxy {
                   // On CPU this is synchronous; on GPU we record a
                   // cudaEvent on the op's stream and poll it.
         kWriteRemote,  // Write from SendPool -> remote RecvPool.
-        kCompletion,   // Writing CompletionSlot back to the receiver.
-        kFinished,     // CompletionSlot write done, staging buffer freed.
+        kAck,          // Writing AckSlot back to the receiver.
+        kFinished,     // AckSlot write done, staging buffer freed.
         kFailed,       // Transport error or timeout; staging buffer freed.
     };
 
     // Receiver-side per-chunk state machine.
     enum class RecvTaskState {
-        kAdvertise,       // PublishSlot Write is in flight.
-        kWaitCompletion,  // Waiting for sender's CompletionSlot.
-        kCopyOut,         // GPU: cudaMemcpyAsync RecvPool -> tensor in flight.
-        kFinished,        // Copy-out done, chunk returned to pool.
-        kFailed,          // Transport error or timeout; chunk returned to pool.
+        kIssueCredit,  // CreditSlot Write is in flight.
+        kWaitAck,      // Waiting for sender's AckSlot.
+        kCopyOut,      // GPU: cudaMemcpyAsync RecvPool -> tensor in flight.
+        kFinished,     // Copy-out done, chunk returned to pool.
+        kFailed,       // Transport error or timeout; chunk returned to pool.
     };
 
     struct SendOpContext;
@@ -370,12 +367,12 @@ class P2PProxy {
 
     // One chunk of a SendOp.  The sender copies data from the user tensor
     // into a SendPool staging buffer and then RDMA-writes it to the remote
-    // RecvPool offset that the receiver advertised in the PublishSlot.
+    // RecvPool offset that the receiver issued in the CreditSlot.
     struct SendTransferTask {
         SendTransferTask() = default;
         SendTransferTask(uint64_t tensor_offset_in, uint32_t chunk_len_in,
                          void* staging_addr_in, uint64_t remote_addr_in,
-                         uint32_t sequence_in, uint32_t generation_in);
+                         uint32_t sequence_in, uint32_t epoch_in);
 
         SendTaskState state_ = SendTaskState::kCopyIn;
         uint64_t tensor_offset_ = 0;  // Offset inside the user tensor.
@@ -383,16 +380,15 @@ class P2PProxy {
         void* staging_addr_ = nullptr;  // Address inside SendPool.
         uint64_t remote_addr_ = 0;      // Address inside REMOTE RecvPool.
         uint32_t sequence_ = 0;         // Sequence number in the control ring.
-        uint32_t generation_ = 0;       // Generation for Reset detection.
+        uint32_t epoch_ = 0;            // Epoch for Reset detection.
         std::optional<BatchID> transfer_batch_id_;  // RDMA Write batch id.
-        std::optional<BatchID>
-            completion_batch_id_;  // CompletionSlot write batch id.
+        std::optional<BatchID> ack_batch_id_;       // AckSlot write batch id.
         cudaEvent_t copy_ready_event_ = nullptr;  // Signals Copy-In done (GPU).
         std::chrono::steady_clock::time_point last_update_time_;
     };
 
     // Active send operation state.  Tasks are created in order and advance
-    // through the sender state machine (kCopyIn -> kWriteRemote -> kCompletion
+    // through the sender state machine (kCopyIn -> kWriteRemote -> kAck
     // -> kFinished).
     struct SendOpContext {
         SendOpContext() = default;
@@ -414,31 +410,31 @@ class P2PProxy {
     };
 
     // One chunk of a RecvOp.  The receiver allocates a RecvPool chunk,
-    // advertises it to the sender via a PublishSlot, waits for the sender
+    // issues it to the sender via a CreditSlot, waits for the sender
     // to RDMA-write data into it, and finally copies the data into the user
     // tensor before returning the chunk to RecvPool.
     struct RecvTransferTask {
         RecvTransferTask() = default;
         RecvTransferTask(uint64_t tensor_offset_in, uint32_t chunk_len_in,
                          void* local_addr_in, uint32_t sequence_in,
-                         uint32_t generation_in);
+                         uint32_t epoch_in);
 
-        RecvTaskState state_ = RecvTaskState::kAdvertise;
+        RecvTaskState state_ = RecvTaskState::kIssueCredit;
         uint64_t tensor_offset_ = 0;  // Offset inside the user tensor.
         uint32_t chunk_len_ = 0;      // Bytes in this chunk.
         void* local_addr_ = nullptr;  // Address inside local RecvPool.
         uint32_t sequence_ = 0;       // Sequence number in the control ring.
-        uint32_t generation_ = 0;     // Generation for Reset detection.
+        uint32_t epoch_ = 0;          // Epoch for Reset detection.
         std::optional<BatchID>
-            publish_batch_id_;  // PublishSlot RDMA Write batch id.
+            credit_batch_id_;  // CreditSlot RDMA Write batch id.
         cudaEvent_t copy_ready_event_ =
             nullptr;  // Signals Copy-Out done (GPU).
         std::chrono::steady_clock::time_point last_update_time_;
     };
 
     // Active receive operation state.  Tasks are created in order and
-    // advance through the receiver state machine (kAdvertise ->
-    // kWaitCompletion -> kCopyOut -> kFinished).
+    // advance through the receiver state machine (kIssueCredit ->
+    // kWaitAck -> kCopyOut -> kFinished).
     struct RecvOpContext {
         RecvOpContext() = default;
         RecvOpContext(RecvOp&& op_in);
@@ -452,32 +448,32 @@ class P2PProxy {
         cudaStream_t cuda_stream_ = nullptr;
         uint64_t total_bytes_ = 0;
         // Number of bytes for which a RecvPool chunk has been reserved and a
-        // PublishSlot has been sent to the peer.  When bytes_advertised_ ==
+        // CreditSlot has been sent to the peer.  When bytes_credited_ ==
         // total_bytes_ the entire tensor has been offered to the sender.
-        uint64_t bytes_advertised_ = 0;
+        uint64_t bytes_credited_ = 0;
     };
 
-    // Per-peer sender state.  The sender consumes PublishSlots that the
-    // receiver writes into our local PublishLane for this peer.
+    // Per-peer sender state.  The sender consumes CreditSlots that the
+    // receiver writes into our local CreditLane for this peer.
     struct SendPeerLane {
         std::deque<SendOpContext> pending_send_ops_;
         std::optional<SendOpContext> active_send_op_;
-        // Sequence number of the next PublishSlot to consume from this peer.
+        // Sequence number of the next CreditSlot to consume from this peer.
         // Monotonically increases; wraps around the ring via modulo.
-        uint64_t publish_consume_seq_ = 0;
+        uint64_t credit_consume_seq_ = 0;
         std::array<cudaEvent_t, kP2PControlRingSize> copy_ready_events_;
     };
 
-    // Per-peer receiver state.  The receiver issues PublishSlots to invite
-    // the peer to write data, and consumes CompletionSlots that the peer
-    // writes back to acknowledge finished transfers.
+    // Per-peer receiver state.  The receiver issues CreditSlots to grant credit
+    // to the peer to write data, and consumes AckSlots that the peer writes
+    // back to acknowledge finished transfers.
     struct RecvPeerLane {
         std::deque<RecvOp> pending_recv_ops_;
         std::optional<RecvOpContext> active_recv_op_;
-        // Sequence number of the next PublishSlot to issue to this peer.
-        uint64_t publish_issue_seq_ = 0;
-        // Sequence number of the next CompletionSlot to consume from this peer.
-        uint64_t completion_consume_seq_ = 0;
+        // Sequence number of the next CreditSlot to issue to this peer.
+        uint64_t credit_issue_seq_ = 0;
+        // Sequence number of the next AckSlot to consume from this peer.
+        uint64_t ack_consume_seq_ = 0;
         std::array<cudaEvent_t, kP2PControlRingSize> copy_ready_events_;
     };
 
@@ -496,9 +492,9 @@ class P2PProxy {
     bool tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane);
     bool stepRecvTask(RecvTransferTask& task);
     bool stepRecvCopyOut(RecvTransferTask& task);
-    bool stepRecvAdvertise(RecvTransferTask& task);
-    bool pollRecvCompletionSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
-                                RecvTransferTask& head_task);
+    bool stepRecvIssueCredit(RecvTransferTask& task);
+    bool pollRecvAckSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
+                         RecvTransferTask& head_task);
     bool isRecvOpCompleted(const RecvOpContext& op_ctx) const;
     void performRecvReset(int peer_rank);
 
@@ -506,7 +502,7 @@ class P2PProxy {
     bool stepSendTask(SendOpContext& op_ctx, SendTransferTask& task);
     bool stepSendCopyIn(SendTransferTask& task);
     bool stepSendWriteRemote(SendOpContext& op_ctx, SendTransferTask& task);
-    bool stepSendCompletion(SendOpContext& op_ctx, SendTransferTask& task);
+    bool stepSendAck(SendOpContext& op_ctx, SendTransferTask& task);
     bool isSendOpCompleted(const SendOpContext& op_ctx) const;
     void performSendReset(int peer_rank);
 
@@ -523,23 +519,22 @@ class P2PProxy {
 
     // Control lane addressing.
     //
-    // Each rank owns one contiguous Publish region and one Completion region.
+    // Each rank owns one contiguous Credit region and one Ack region.
     // Within each region there are kMaxNumRanks lanes, one per peer.
     // Lane index == peer rank.  Each lane has kP2PControlRingSize slots.
     //
-    // Example: rank R wants to write a PublishSlot to peer P.
-    //   target = P's publish base + (R * kRingSize + seq % kRingSize) * sizeof
+    // Example: rank R wants to write a CreditSlot to peer P.
+    //   target = P's credit base + (R * kRingSize + seq % kRingSize) * sizeof
     //
     // This isolates control traffic per (sender, receiver) pair.
-    PublishSlot* getLocalPublishLane(int peer_rank) const;
-    CompletionSlot* getLocalCompletionLane(int peer_rank) const;
-    uint64_t getRemotePublishSlot(int peer_rank, uint32_t sequence) const;
-    uint64_t getRemoteCompletionSlot(int peer_rank, uint32_t sequence) const;
+    CreditSlot* getLocalCreditLane(int peer_rank) const;
+    AckSlot* getLocalAckLane(int peer_rank) const;
+    uint64_t getRemoteCreditSlot(int peer_rank, uint32_t sequence) const;
+    uint64_t getRemoteAckSlot(int peer_rank, uint32_t sequence) const;
 
-    PublishSlot* getLocalPublishStagingBuf(int peer_rank,
-                                           uint32_t sequence) const;
-    CompletionSlot* getLocalCompletionStagingBuf(int peer_rank,
-                                                 uint32_t sequence) const;
+    CreditSlot* getLocalCreditStagingBuf(int peer_rank,
+                                         uint32_t sequence) const;
+    AckSlot* getLocalAckStagingBuf(int peer_rank, uint32_t sequence) const;
 
     template <typename T>
     bool isTimeout(const T& obj) const {
@@ -549,11 +544,11 @@ class P2PProxy {
 
    private:
     struct P2PResources {
-        PublishSlot* publish_region_ = nullptr;
-        CompletionSlot* completion_region_ = nullptr;
+        CreditSlot* credit_region_ = nullptr;
+        AckSlot* ack_region_ = nullptr;
         // Serve as RDMA write source address
-        PublishSlot* publish_staging_buf_ = nullptr;
-        CompletionSlot* completion_staging_buf_ = nullptr;
+        CreditSlot* credit_staging_buf_ = nullptr;
+        AckSlot* ack_staging_buf_ = nullptr;
     };
 
     P2PDeviceWorker* device_worker_ = nullptr;
@@ -585,10 +580,10 @@ class P2PProxy {
     std::atomic<int> active_send_tasks_{0};
     std::atomic<int> active_recv_tasks_{0};
 
-    // Per-peer generation for fault recovery.  Incremented in resetPeerState
+    // Per-peer epoch for fault recovery.  Incremented in resetPeerState
     // and performSend/RecvReset so that stale messages from a previous epoch
     // can be detected on a per-peer basis.
-    std::array<std::atomic<uint32_t>, kMaxNumRanks> peer_generation_;
+    std::array<std::atomic<uint32_t>, kMaxNumRanks> peer_epoch_;
 
     std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_;
     std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_;

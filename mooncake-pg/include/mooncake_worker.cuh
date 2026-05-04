@@ -25,8 +25,8 @@ static constexpr size_t kMaxNumRanks = 64;
 struct SegmentInfo {
     uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
         warmup_buffer[2];
-    uint64_t p2p_publish_region;
-    uint64_t p2p_completion_region;
+    uint64_t p2p_credit_region;
+    uint64_t p2p_ack_region;
 };
 
 struct TransferGroupMeta {

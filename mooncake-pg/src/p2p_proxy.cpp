@@ -68,9 +68,8 @@ void P2PChunkPool::release(void* ptr) { free_stack_.push_back(ptr); }
 //    the footer load that follows.
 // 5. Load footer_token.
 // 6. Accept the payload only when header == footer.
-bool PublishSlot::tryLoad(uint64_t& out_recv_addr, uint32_t& out_chunk_len,
-                          uint32_t& out_generation,
-                          uint32_t& out_sequence) const {
+bool CreditSlot::tryLoad(uint64_t& out_recv_addr, uint32_t& out_chunk_len,
+                         uint32_t& out_epoch, uint32_t& out_sequence) const {
     uint64_t h = std::atomic_ref(header_token).load(std::memory_order_acquire);
     if (h == kInvalidControlToken) return false;
 
@@ -86,7 +85,7 @@ bool PublishSlot::tryLoad(uint64_t& out_recv_addr, uint32_t& out_chunk_len,
     if (h == f) {
         out_recv_addr = addr;
         out_chunk_len = len;
-        out_generation = static_cast<uint32_t>(h >> 32);
+        out_epoch = static_cast<uint32_t>(h >> 32);
         out_sequence = static_cast<uint32_t>(h);
         return true;
     }
@@ -100,9 +99,9 @@ bool PublishSlot::tryLoad(uint64_t& out_recv_addr, uint32_t& out_chunk_len,
 //   payload -> footer (relaxed) -> header (release).
 // The release store to header_token guarantees that every prior store is
 // visible to any consumer that sees the new header value.
-void PublishSlot::publish(uint32_t gen, uint32_t seq, uint64_t addr,
-                          uint32_t len) {
-    uint64_t new_token = makeControlToken(gen, seq);
+void CreditSlot::publish(uint32_t epoch, uint32_t seq, uint64_t addr,
+                         uint32_t len) {
+    uint64_t new_token = makeControlToken(epoch, seq);
 
     recv_addr = addr;
     chunk_len = len;
@@ -113,7 +112,7 @@ void PublishSlot::publish(uint32_t gen, uint32_t seq, uint64_t addr,
     std::atomic_ref(header_token).store(new_token, std::memory_order_release);
 }
 
-void PublishSlot::reset() {
+void CreditSlot::reset() {
     recv_addr = 0;
     chunk_len = 0;
     uint64_t inv = kInvalidControlToken;
@@ -121,9 +120,9 @@ void PublishSlot::reset() {
     std::atomic_ref(header_token).store(inv, std::memory_order_release);
 }
 
-// See PublishSlot::tryLoad() for the detailed description.
-bool CompletionSlot::tryLoad(uint32_t& out_chunk_len, uint32_t& out_generation,
-                             uint32_t& out_sequence) const {
+// See CreditSlot::tryLoad() for the detailed description.
+bool AckSlot::tryLoad(uint32_t& out_chunk_len, uint32_t& out_epoch,
+                      uint32_t& out_sequence) const {
     uint64_t h = std::atomic_ref(header_token).load(std::memory_order_acquire);
     if (h == kInvalidControlToken) return false;
 
@@ -135,16 +134,16 @@ bool CompletionSlot::tryLoad(uint32_t& out_chunk_len, uint32_t& out_generation,
 
     if (h == f) {
         out_chunk_len = len;
-        out_generation = static_cast<uint32_t>(h >> 32);
+        out_epoch = static_cast<uint32_t>(h >> 32);
         out_sequence = static_cast<uint32_t>(h);
         return true;
     }
     return false;
 }
 
-// See PublishSlot::publish() for the detailed description.
-void CompletionSlot::publish(uint32_t gen, uint32_t seq, uint32_t len) {
-    uint64_t new_token = makeControlToken(gen, seq);
+// See CreditSlot::publish() for the detailed description.
+void AckSlot::publish(uint32_t epoch, uint32_t seq, uint32_t len) {
+    uint64_t new_token = makeControlToken(epoch, seq);
 
     chunk_len = len;
 
@@ -152,7 +151,7 @@ void CompletionSlot::publish(uint32_t gen, uint32_t seq, uint32_t len) {
     std::atomic_ref(header_token).store(new_token, std::memory_order_release);
 }
 
-void CompletionSlot::reset() {
+void AckSlot::reset() {
     chunk_len = 0;
     uint64_t inv = kInvalidControlToken;
     std::atomic_ref(footer_token).store(inv, std::memory_order_relaxed);
@@ -201,8 +200,8 @@ void P2PProxy::extendGroupSizeTo(int new_size) {
 // multiple P2PProxy instances on the same device.
 void P2PProxy::allocateResources() {
     TORCH_CHECK(engine_, "P2PProxy engine is null.");
-    if (resources_.publish_region_ != nullptr ||
-        resources_.completion_region_ != nullptr) {
+    if (resources_.credit_region_ != nullptr ||
+        resources_.ack_region_ != nullptr) {
         return;
     }
 
@@ -212,28 +211,28 @@ void P2PProxy::allocateResources() {
 
     const size_t ctrl_slots =
         kMaxNumRanks * static_cast<size_t>(kP2PControlRingSize);
-    resources_.publish_region_ = new PublishSlot[ctrl_slots]{};
-    resources_.completion_region_ = new CompletionSlot[ctrl_slots]{};
+    resources_.credit_region_ = new CreditSlot[ctrl_slots]{};
+    resources_.ack_region_ = new AckSlot[ctrl_slots]{};
 
     for (size_t i = 0; i < ctrl_slots; ++i) {
-        resources_.publish_region_[i].reset();
-        resources_.completion_region_[i].reset();
+        resources_.credit_region_[i].reset();
+        resources_.ack_region_[i].reset();
     }
 
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
-        peer_generation_[i].store(1, std::memory_order_release);
+        peer_epoch_[i].store(1, std::memory_order_release);
     }
 
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         send_peer_lanes_[i].pending_send_ops_.clear();
         send_peer_lanes_[i].active_send_op_.reset();
-        send_peer_lanes_[i].publish_consume_seq_ = 0;
+        send_peer_lanes_[i].credit_consume_seq_ = 0;
         send_peer_lanes_[i].copy_ready_events_.fill(nullptr);
 
         recv_peer_lanes_[i].pending_recv_ops_.clear();
         recv_peer_lanes_[i].active_recv_op_.reset();
-        recv_peer_lanes_[i].publish_issue_seq_ = 0;
-        recv_peer_lanes_[i].completion_consume_seq_ = 0;
+        recv_peer_lanes_[i].credit_issue_seq_ = 0;
+        recv_peer_lanes_[i].ack_consume_seq_ = 0;
         recv_peer_lanes_[i].copy_ready_events_.fill(nullptr);
     }
 
@@ -259,29 +258,29 @@ void P2PProxy::allocateResources() {
         }
     }
 
-    int rc = engine_->registerLocalMemory(resources_.publish_region_,
-                                          ctrl_slots * sizeof(PublishSlot),
+    int rc = engine_->registerLocalMemory(resources_.credit_region_,
+                                          ctrl_slots * sizeof(CreditSlot),
                                           kWildcardLocation);
-    TORCH_CHECK(rc == 0, "Failed to register P2P publish region");
+    TORCH_CHECK(rc == 0, "Failed to register P2P credit region");
 
-    rc = engine_->registerLocalMemory(resources_.completion_region_,
-                                      ctrl_slots * sizeof(CompletionSlot),
+    rc = engine_->registerLocalMemory(resources_.ack_region_,
+                                      ctrl_slots * sizeof(AckSlot),
                                       kWildcardLocation);
-    TORCH_CHECK(rc == 0, "Failed to register P2P completion region");
+    TORCH_CHECK(rc == 0, "Failed to register P2P ack region");
 
     // Staging buffers for control messages.  RDMA requires every
     // transfer source to live in a registered MR.
-    resources_.publish_staging_buf_ = new PublishSlot[ctrl_slots]{};
-    rc = engine_->registerLocalMemory(resources_.publish_staging_buf_,
-                                      ctrl_slots * sizeof(PublishSlot),
+    resources_.credit_staging_buf_ = new CreditSlot[ctrl_slots]{};
+    rc = engine_->registerLocalMemory(resources_.credit_staging_buf_,
+                                      ctrl_slots * sizeof(CreditSlot),
                                       kWildcardLocation);
-    TORCH_CHECK(rc == 0, "Failed to register P2P publish staging region");
+    TORCH_CHECK(rc == 0, "Failed to register P2P credit staging region");
 
-    resources_.completion_staging_buf_ = new CompletionSlot[ctrl_slots]{};
-    rc = engine_->registerLocalMemory(resources_.completion_staging_buf_,
-                                      ctrl_slots * sizeof(CompletionSlot),
+    resources_.ack_staging_buf_ = new AckSlot[ctrl_slots]{};
+    rc = engine_->registerLocalMemory(resources_.ack_staging_buf_,
+                                      ctrl_slots * sizeof(AckSlot),
                                       kWildcardLocation);
-    TORCH_CHECK(rc == 0, "Failed to register P2P completion staging region");
+    TORCH_CHECK(rc == 0, "Failed to register P2P ack staging region");
 }
 
 void P2PProxy::resetPeerState(int peer_rank) {
@@ -289,11 +288,11 @@ void P2PProxy::resetPeerState(int peer_rank) {
                 "ResetPeerState: peer_rank out of range: ", peer_rank,
                 " size: ", size_);
 
-    // Generation update:
-    //   We bump generation_ so that any slots still in flight from the
+    // Epoch update:
+    //   We bump epoch_ so that any slots still in flight from the
     //   old session (written by the sender/receiver before it learned about
     //   the Reset) are recognized as stale and skipped.
-    peer_generation_[peer_rank].fetch_add(1, std::memory_order_acq_rel);
+    peer_epoch_[peer_rank].fetch_add(1, std::memory_order_acq_rel);
 
     // Request reset
     reset_send_req_[peer_rank].store(true, std::memory_order_release);
@@ -337,9 +336,9 @@ void P2PProxy::releaseSendTaskResources(SendTransferTask& task) const {
         if (engine_) engine_->freeBatchID(task.transfer_batch_id_.value());
         task.transfer_batch_id_.reset();
     }
-    if (task.completion_batch_id_.has_value()) {
-        if (engine_) engine_->freeBatchID(task.completion_batch_id_.value());
-        task.completion_batch_id_.reset();
+    if (task.ack_batch_id_.has_value()) {
+        if (engine_) engine_->freeBatchID(task.ack_batch_id_.value());
+        task.ack_batch_id_.reset();
     }
 }
 
@@ -348,9 +347,9 @@ void P2PProxy::releaseRecvTaskResources(RecvTransferTask& task) const {
         if (recv_pool_) recv_pool_->release(task.local_addr_);
         task.local_addr_ = nullptr;
     }
-    if (task.publish_batch_id_.has_value()) {
-        if (engine_) engine_->freeBatchID(task.publish_batch_id_.value());
-        task.publish_batch_id_.reset();
+    if (task.credit_batch_id_.has_value()) {
+        if (engine_) engine_->freeBatchID(task.credit_batch_id_.value());
+        task.credit_batch_id_.reset();
     }
 }
 
@@ -371,7 +370,7 @@ void P2PProxy::resetSendLane(SendPeerLane& lane) {
         active_send_tasks_.fetch_sub(1, std::memory_order_release);
         lane.active_send_op_.reset();
     }
-    lane.publish_consume_seq_ = 0;
+    lane.credit_consume_seq_ = 0;
 }
 
 void P2PProxy::resetRecvLane(RecvPeerLane& lane) {
@@ -391,16 +390,16 @@ void P2PProxy::resetRecvLane(RecvPeerLane& lane) {
         active_recv_tasks_.fetch_sub(1, std::memory_order_release);
         lane.active_recv_op_.reset();
     }
-    lane.publish_issue_seq_ = 0;
-    lane.completion_consume_seq_ = 0;
+    lane.credit_issue_seq_ = 0;
+    lane.ack_consume_seq_ = 0;
 }
 
 void P2PProxy::resetPeerControlLanes(int peer_rank) {
-    auto* publish_lane = getLocalPublishLane(peer_rank);
-    auto* completion_lane = getLocalCompletionLane(peer_rank);
+    auto* credit_lane = getLocalCreditLane(peer_rank);
+    auto* ack_lane = getLocalAckLane(peer_rank);
     for (uint32_t i = 0; i < kP2PControlRingSize; ++i) {
-        publish_lane[i].reset();
-        completion_lane[i].reset();
+        credit_lane[i].reset();
+        ack_lane[i].reset();
     }
 }
 
@@ -433,31 +432,30 @@ void P2PProxy::releaseResources() {
         destroyEvents(recv_lane.copy_ready_events_);
     }
 
-    if (resources_.publish_staging_buf_ != nullptr) {
+    if (resources_.credit_staging_buf_ != nullptr) {
         if (engine_)
-            engine_->unregisterLocalMemory(resources_.publish_staging_buf_);
-        delete[] resources_.publish_staging_buf_;
-        resources_.publish_staging_buf_ = nullptr;
+            engine_->unregisterLocalMemory(resources_.credit_staging_buf_);
+        delete[] resources_.credit_staging_buf_;
+        resources_.credit_staging_buf_ = nullptr;
     }
 
-    if (resources_.completion_staging_buf_ != nullptr) {
+    if (resources_.ack_staging_buf_ != nullptr) {
         if (engine_)
-            engine_->unregisterLocalMemory(resources_.completion_staging_buf_);
-        delete[] resources_.completion_staging_buf_;
-        resources_.completion_staging_buf_ = nullptr;
+            engine_->unregisterLocalMemory(resources_.ack_staging_buf_);
+        delete[] resources_.ack_staging_buf_;
+        resources_.ack_staging_buf_ = nullptr;
     }
 
-    if (resources_.publish_region_ != nullptr) {
-        if (engine_) engine_->unregisterLocalMemory(resources_.publish_region_);
-        delete[] resources_.publish_region_;
-        resources_.publish_region_ = nullptr;
+    if (resources_.credit_region_ != nullptr) {
+        if (engine_) engine_->unregisterLocalMemory(resources_.credit_region_);
+        delete[] resources_.credit_region_;
+        resources_.credit_region_ = nullptr;
     }
 
-    if (resources_.completion_region_ != nullptr) {
-        if (engine_)
-            engine_->unregisterLocalMemory(resources_.completion_region_);
-        delete[] resources_.completion_region_;
-        resources_.completion_region_ = nullptr;
+    if (resources_.ack_region_ != nullptr) {
+        if (engine_) engine_->unregisterLocalMemory(resources_.ack_region_);
+        delete[] resources_.ack_region_;
+        resources_.ack_region_ = nullptr;
     }
 }
 
@@ -486,13 +484,13 @@ void P2PProxy::enqueueRecv(RecvOp op) {
 
 P2PProxy::SendTransferTask::SendTransferTask(
     uint64_t tensor_offset_in, uint32_t chunk_len_in, void* staging_addr_in,
-    uint64_t remote_addr_in, uint32_t sequence_in, uint32_t generation_in)
+    uint64_t remote_addr_in, uint32_t sequence_in, uint32_t epoch_in)
     : tensor_offset_(tensor_offset_in),
       chunk_len_(chunk_len_in),
       staging_addr_(staging_addr_in),
       remote_addr_(remote_addr_in),
       sequence_(sequence_in),
-      generation_(generation_in) {
+      epoch_(epoch_in) {
     last_update_time_ = std::chrono::steady_clock::now();
 }
 
@@ -510,12 +508,12 @@ P2PProxy::RecvTransferTask::RecvTransferTask(uint64_t tensor_offset_in,
                                              uint32_t chunk_len_in,
                                              void* local_addr_in,
                                              uint32_t sequence_in,
-                                             uint32_t generation_in)
+                                             uint32_t epoch_in)
     : tensor_offset_(tensor_offset_in),
       chunk_len_(chunk_len_in),
       local_addr_(local_addr_in),
       sequence_(sequence_in),
-      generation_(generation_in) {
+      epoch_(epoch_in) {
     last_update_time_ = std::chrono::steady_clock::now();
 }
 
@@ -529,59 +527,56 @@ P2PProxy::RecvOpContext::RecvOpContext(RecvOp&& op_in)
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
 }
 
-PublishSlot* P2PProxy::getLocalPublishLane(int peer_rank) const {
-    return resources_.publish_region_ +
+CreditSlot* P2PProxy::getLocalCreditLane(int peer_rank) const {
+    return resources_.credit_region_ +
            static_cast<size_t>(peer_rank) * kP2PControlRingSize;
 }
 
-CompletionSlot* P2PProxy::getLocalCompletionLane(int peer_rank) const {
-    return resources_.completion_region_ +
+AckSlot* P2PProxy::getLocalAckLane(int peer_rank) const {
+    return resources_.ack_region_ +
            static_cast<size_t>(peer_rank) * kP2PControlRingSize;
 }
 
-uint64_t P2PProxy::getRemotePublishSlot(int peer_rank,
-                                        uint32_t sequence) const {
+uint64_t P2PProxy::getRemoteCreditSlot(int peer_rank, uint32_t sequence) const {
     const uint64_t slot_index = sequence % kP2PControlRingSize;
-    return meta_->segmentInfos[peer_rank].p2p_publish_region +
+    return meta_->segmentInfos[peer_rank].p2p_credit_region +
            (static_cast<uint64_t>(rank_) * kP2PControlRingSize + slot_index) *
-               sizeof(PublishSlot);
+               sizeof(CreditSlot);
 }
 
-uint64_t P2PProxy::getRemoteCompletionSlot(int peer_rank,
-                                           uint32_t sequence) const {
+uint64_t P2PProxy::getRemoteAckSlot(int peer_rank, uint32_t sequence) const {
     const uint64_t slot_index = sequence % kP2PControlRingSize;
-    return meta_->segmentInfos[peer_rank].p2p_completion_region +
+    return meta_->segmentInfos[peer_rank].p2p_ack_region +
            (static_cast<uint64_t>(rank_) * kP2PControlRingSize + slot_index) *
-               sizeof(CompletionSlot);
+               sizeof(AckSlot);
 }
 
-PublishSlot* P2PProxy::getLocalPublishStagingBuf(int peer_rank,
-                                                 uint32_t sequence) const {
+CreditSlot* P2PProxy::getLocalCreditStagingBuf(int peer_rank,
+                                               uint32_t sequence) const {
     const size_t staging_idx =
         static_cast<size_t>(peer_rank) * kP2PControlRingSize +
         sequence % kP2PControlRingSize;
-    return resources_.publish_staging_buf_ + staging_idx;
+    return resources_.credit_staging_buf_ + staging_idx;
 }
-CompletionSlot* P2PProxy::getLocalCompletionStagingBuf(
-    int peer_rank, uint32_t sequence) const {
+AckSlot* P2PProxy::getLocalAckStagingBuf(int peer_rank,
+                                         uint32_t sequence) const {
     const size_t staging_idx =
         static_cast<size_t>(peer_rank) * kP2PControlRingSize +
         static_cast<size_t>(sequence % kP2PControlRingSize);
-    return resources_.completion_staging_buf_ + staging_idx;
+    return resources_.ack_staging_buf_ + staging_idx;
 }
 
-// Receiver advertise.
+// Receiver issues credit.
 //
-// Grab a free chunk from RecvPool and invite the sender to write into it.
-// We (RDMA) write a PublishSlot into the sender's PublishLane so the sender
-// knows:
+// Grab a free chunk from RecvPool and grant the sender credit to write into it.
+// We write a CreditSlot into the sender's CreditLane so the sender knows:
 //   (a) which sequence this is,
 //   (b) the RecvPool offset to write to,
 //   (c) how many bytes we expect.
 // If the pool is exhausted we return false and retry on the next polling
 // iteration (non-blocking).
 bool P2PProxy::tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane) {
-    if (op_ctx.bytes_advertised_ >= op_ctx.total_bytes_) {
+    if (op_ctx.bytes_credited_ >= op_ctx.total_bytes_) {
         return false;
     }
 
@@ -597,47 +592,47 @@ bool P2PProxy::tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane) {
     }
 
     const uint32_t chunk_len = static_cast<uint32_t>(std::min<uint64_t>(
-        chunk_size_, op_ctx.total_bytes_ - op_ctx.bytes_advertised_));
-    const uint64_t seq = lane.publish_issue_seq_;
-    const uint64_t remote_publish_offset =
-        getRemotePublishSlot(op_ctx.peer_rank_, seq);
+        chunk_size_, op_ctx.total_bytes_ - op_ctx.bytes_credited_));
+    const uint64_t seq = lane.credit_issue_seq_;
+    const uint64_t remote_credit_offset =
+        getRemoteCreditSlot(op_ctx.peer_rank_, seq);
 
-    const uint32_t current_gen =
-        peer_generation_[op_ctx.peer_rank_].load(std::memory_order_acquire);
-    op_ctx.tasks_.emplace_back(op_ctx.bytes_advertised_, chunk_len, local_addr,
-                               seq, current_gen);
+    const uint32_t curr_epoch =
+        peer_epoch_[op_ctx.peer_rank_].load(std::memory_order_acquire);
+    op_ctx.tasks_.emplace_back(op_ctx.bytes_credited_, chunk_len, local_addr,
+                               seq, curr_epoch);
     auto& task = op_ctx.tasks_.back();
 
-    auto* publish_buf = getLocalPublishStagingBuf(op_ctx.peer_rank_, seq);
-    publish_buf->publish(current_gen, seq,
-                         reinterpret_cast<uint64_t>(local_addr), chunk_len);
+    auto* credit_staging_buf = getLocalCreditStagingBuf(op_ctx.peer_rank_, seq);
+    credit_staging_buf->publish(
+        curr_epoch, seq, reinterpret_cast<uint64_t>(local_addr), chunk_len);
     const BatchID batch_id = engine_->allocateBatchID(1);
     engine_->submitTransfer(
         batch_id, {TransferRequest{
                       .opcode = TransferRequest::WRITE,
-                      .source = static_cast<void*>(publish_buf),
+                      .source = static_cast<void*>(credit_staging_buf),
                       .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                      .target_offset = remote_publish_offset,
-                      .length = sizeof(PublishSlot),
+                      .target_offset = remote_credit_offset,
+                      .length = sizeof(CreditSlot),
                   }});
-    task.publish_batch_id_ = batch_id;
+    task.credit_batch_id_ = batch_id;
     task.last_update_time_ = std::chrono::steady_clock::now();
 
-    ++lane.publish_issue_seq_;
-    op_ctx.bytes_advertised_ += chunk_len;
+    ++lane.credit_issue_seq_;
+    op_ctx.bytes_credited_ += chunk_len;
     return true;
 }
 
 // Drive a single receiver chunk through its state machine.
 //
-// kAdvertise -> kWaitCompletion -> kCopyOut -> kFinished -> erase.
+// kIssueCredit -> kWaitAck -> kCopyOut -> kFinished -> erase.
 bool P2PProxy::stepRecvTask(RecvTransferTask& task) {
     switch (task.state_) {
-        case RecvTaskState::kAdvertise:
-            return stepRecvAdvertise(task);
+        case RecvTaskState::kIssueCredit:
+            return stepRecvIssueCredit(task);
 
-        case RecvTaskState::kWaitCompletion:
-            // kWaitCompletion is polled in stepRecv
+        case RecvTaskState::kWaitAck:
+            // kWaitAck is polled in stepRecv
             return false;
 
         case RecvTaskState::kCopyOut:
@@ -650,27 +645,26 @@ bool P2PProxy::stepRecvTask(RecvTransferTask& task) {
     return false;
 }
 
-bool P2PProxy::stepRecvAdvertise(RecvTransferTask& task) {
-    TORCH_CHECK(task.publish_batch_id_.has_value(),
-                "Expected a publish_batch_id in tryIssueRecvTask");
+bool P2PProxy::stepRecvIssueCredit(RecvTransferTask& task) {
+    TORCH_CHECK(task.credit_batch_id_.has_value(),
+                "Expected a credit_batch_id in tryIssueRecvTask");
 
-    TransferStatus publish_status;
-    engine_->getTransferStatus(task.publish_batch_id_.value(), 0,
-                               publish_status);
+    TransferStatus credit_status;
+    engine_->getTransferStatus(task.credit_batch_id_.value(), 0, credit_status);
 
-    if (publish_status.s == TransferStatusEnum::COMPLETED) {
-        engine_->freeBatchID(task.publish_batch_id_.value());
-        task.publish_batch_id_.reset();
-        task.state_ = RecvTaskState::kWaitCompletion;
+    if (credit_status.s == TransferStatusEnum::COMPLETED) {
+        engine_->freeBatchID(task.credit_batch_id_.value());
+        task.credit_batch_id_.reset();
+        task.state_ = RecvTaskState::kWaitAck;
         task.last_update_time_ = std::chrono::steady_clock::now();
         return true;
     }
 
-    if (publish_status.s == TransferStatusEnum::FAILED || isTimeout(task)) {
-        LOG(ERROR) << "P2P publish transfer failed/timeout, seq="
+    if (credit_status.s == TransferStatusEnum::FAILED || isTimeout(task)) {
+        LOG(ERROR) << "P2P credit transfer failed/timeout, seq="
                    << task.sequence_;
-        engine_->freeBatchID(task.publish_batch_id_.value());
-        task.publish_batch_id_.reset();
+        engine_->freeBatchID(task.credit_batch_id_.value());
+        task.credit_batch_id_.reset();
         task.state_ = RecvTaskState::kFailed;
         return true;
     }
@@ -679,7 +673,7 @@ bool P2PProxy::stepRecvAdvertise(RecvTransferTask& task) {
 
 // Poll the GPU Copy-Out event.
 //
-// After the CompletionSlot arrives we initiate cudaMemcpyAsync from the
+// After the AckSlot arrives we initiate cudaMemcpyAsync from the
 // RecvPool chunk to the user tensor and record an event.  This function
 // waits for that event and returns the chunk to RecvPool.
 bool P2PProxy::stepRecvCopyOut(RecvTransferTask& task) {
@@ -703,17 +697,17 @@ bool P2PProxy::stepRecvCopyOut(RecvTransferTask& task) {
     return false;
 }
 
-// Sender fetch invitation
+// Sender fetches credits.
 //
-// Poll the local PublishLane for the next expected sequence.  If the slot
-// matches our consume cursor we accept the invitation: allocate a staging
+// Poll the local CreditLane for the next expected sequence.  If the slot
+// matches our consume cursor we accept the credit: allocate a staging
 // chunk from SendPool, copy the corresponding slice of the user tensor into
-// it, and advance the cursor.  If the pool is full or no invitation has
+// it, and advance the cursor.  If the pool is full or no credit has
 // arrived we return false immediately (non-blocking).
 bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
-    // Check for timeout while waiting for the peer's PublishSlot.
+    // Check for timeout while waiting for the peer's CreditSlot.
     if (isTimeout(op_ctx)) {
-        LOG(ERROR) << "P2P wait invitation timeout peer=" << op_ctx.peer_rank_;
+        LOG(ERROR) << "P2P wait-for-credit timeout, peer=" << op_ctx.peer_rank_;
         op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
         return false;
     }
@@ -726,29 +720,29 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
         return false;
     }
 
-    PublishSlot* local_publish = getLocalPublishLane(op_ctx.peer_rank_);
-    const uint64_t seq = lane.publish_consume_seq_;
-    auto& slot = local_publish[static_cast<size_t>(seq % kP2PControlRingSize)];
+    CreditSlot* local_credit = getLocalCreditLane(op_ctx.peer_rank_);
+    const uint64_t seq = lane.credit_consume_seq_;
+    auto& slot = local_credit[static_cast<size_t>(seq % kP2PControlRingSize)];
 
     // Step 1 -- Try load the slot
     uint64_t recv_addr = 0;
     uint32_t chunk_len = 0;
-    uint32_t slot_gen = 0;
+    uint32_t slot_epoch = 0;
     uint32_t slot_seq = 0;
-    if (!slot.tryLoad(recv_addr, chunk_len, slot_gen, slot_seq)) {
+    if (!slot.tryLoad(recv_addr, chunk_len, slot_epoch, slot_seq)) {
         // Slot is either empty or torn (partial RDMA write). Retry next poll.
         return false;
     }
 
     // Step 2 -- Stale packet: the slot carries data from a previous epoch
-    // (before a Reset).  Clear it so the fresh invitation can land safely.
-    const uint32_t current_gen =
-        peer_generation_[op_ctx.peer_rank_].load(std::memory_order_acquire);
-    if (slot_gen != current_gen) {
+    // (before a Reset).  Clear it so the fresh credit can land safely.
+    const uint32_t curr_epoch =
+        peer_epoch_[op_ctx.peer_rank_].load(std::memory_order_acquire);
+    if (slot_epoch != curr_epoch) {
         LOG(WARNING) << "[P2PProxy][Send] tryIssueSendTask peer="
-                     << op_ctx.peer_rank_ << " STALE_GEN seq=" << seq
-                     << " slot.gen=" << slot_gen
-                     << " current_gen=" << current_gen;
+                     << op_ctx.peer_rank_ << " STALE_EPOCH seq=" << seq
+                     << " slot.epoch=" << slot_epoch
+                     << " curr_epoch=" << curr_epoch;
         slot.reset();
         return true;
     }
@@ -767,10 +761,10 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
         static_cast<uint32_t>(std::min<uint64_t>(
             chunk_size_, op_ctx.total_bytes_ - op_ctx.bytes_staged_));
     TORCH_CHECK(chunk_len <= expected_chunk_len,
-                "P2P send got invalid chunk_len in publish slot.");
+                "P2P send got invalid chunk_len in credit slot.");
 
     op_ctx.tasks_.emplace_back(op_ctx.bytes_staged_, chunk_len, staging_addr,
-                               recv_addr, seq, slot_gen);
+                               recv_addr, seq, slot_epoch);
     auto& task = op_ctx.tasks_.back();
 
     slot.reset();
@@ -803,7 +797,7 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
         }
     }
 
-    ++lane.publish_consume_seq_;
+    ++lane.credit_consume_seq_;
     op_ctx.bytes_staged_ += task.chunk_len_;
     task.last_update_time_ = std::chrono::steady_clock::now();
     return true;
@@ -811,7 +805,7 @@ bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
 
 // Drive a single sender chunk through its state machine.
 //
-// kCopyIn -> kWriteRemote -> kCompletion -> kFinished -> erase.
+// kCopyIn -> kWriteRemote -> kAck -> kFinished -> erase.
 bool P2PProxy::stepSendTask(SendOpContext& op_ctx, SendTransferTask& task) {
     switch (task.state_) {
         case SendTaskState::kCopyIn:
@@ -820,8 +814,8 @@ bool P2PProxy::stepSendTask(SendOpContext& op_ctx, SendTransferTask& task) {
         case SendTaskState::kWriteRemote:
             return stepSendWriteRemote(op_ctx, task);
 
-        case SendTaskState::kCompletion:
-            return stepSendCompletion(op_ctx, task);
+        case SendTaskState::kAck:
+            return stepSendAck(op_ctx, task);
 
         case SendTaskState::kFinished:
         case SendTaskState::kFailed:
@@ -886,7 +880,7 @@ bool P2PProxy::stepSendWriteRemote(SendOpContext& op_ctx,
     if (transfer_status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(task.transfer_batch_id_.value());
         task.transfer_batch_id_.reset();
-        task.state_ = SendTaskState::kCompletion;
+        task.state_ = SendTaskState::kAck;
         task.last_update_time_ = std::chrono::steady_clock::now();
         did_work = true;
     } else if (transfer_status.s == TransferStatusEnum::FAILED ||
@@ -902,51 +896,47 @@ bool P2PProxy::stepSendWriteRemote(SendOpContext& op_ctx,
     return did_work;
 }
 
-// Write the CompletionSlot back to the receiver.
+// Write the AckSlot back to the receiver.
 //
 // This tells the receiver that the data is present in its RecvPool and it
-// may begin the Copy-Out.  When the CompletionSlot write finishes we free
+// may begin the Copy-Out.  When the AckSlot write finishes we free
 // the staging chunk and transition to kFinished.
-bool P2PProxy::stepSendCompletion(SendOpContext& op_ctx,
-                                  SendTransferTask& task) {
+bool P2PProxy::stepSendAck(SendOpContext& op_ctx, SendTransferTask& task) {
     bool did_work = false;
-    if (!task.completion_batch_id_.has_value()) {
-        auto* completion_buf =
-            getLocalCompletionStagingBuf(op_ctx.peer_rank_, task.sequence_);
-        completion_buf->publish(task.generation_, task.sequence_,
-                                task.chunk_len_);
+    if (!task.ack_batch_id_.has_value()) {
+        auto* ack_staging_buf =
+            getLocalAckStagingBuf(op_ctx.peer_rank_, task.sequence_);
+        ack_staging_buf->publish(task.epoch_, task.sequence_, task.chunk_len_);
 
         const BatchID batch_id = engine_->allocateBatchID(1);
         engine_->submitTransfer(
             batch_id, {TransferRequest{
                           .opcode = TransferRequest::WRITE,
-                          .source = static_cast<void*>(completion_buf),
+                          .source = static_cast<void*>(ack_staging_buf),
                           .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                          .target_offset = getRemoteCompletionSlot(
-                              op_ctx.peer_rank_, task.sequence_),
-                          .length = sizeof(CompletionSlot),
+                          .target_offset = getRemoteAckSlot(op_ctx.peer_rank_,
+                                                            task.sequence_),
+                          .length = sizeof(AckSlot),
                       }});
-        task.completion_batch_id_ = batch_id;
+        task.ack_batch_id_ = batch_id;
         task.last_update_time_ = std::chrono::steady_clock::now();
         did_work = true;
     }
 
-    TransferStatus completion_status;
-    engine_->getTransferStatus(task.completion_batch_id_.value(), 0,
-                               completion_status);
-    if (completion_status.s == TransferStatusEnum::COMPLETED) {
-        engine_->freeBatchID(task.completion_batch_id_.value());
-        task.completion_batch_id_.reset();
+    TransferStatus ack_status;
+    engine_->getTransferStatus(task.ack_batch_id_.value(), 0, ack_status);
+    if (ack_status.s == TransferStatusEnum::COMPLETED) {
+        engine_->freeBatchID(task.ack_batch_id_.value());
+        task.ack_batch_id_.reset();
         send_pool_->release(task.staging_addr_);
         task.staging_addr_ = nullptr;
         task.state_ = SendTaskState::kFinished;
         did_work = true;
-    } else if (completion_status.s == TransferStatusEnum::FAILED ||
-               isTimeout(task)) {
-        LOG(ERROR) << "P2P completion transfer failed/timeout, peer="
+    } else if (ack_status.s == TransferStatusEnum::FAILED || isTimeout(task)) {
+        LOG(ERROR) << "P2P ack transfer failed/timeout, peer="
                    << op_ctx.peer_rank_ << ", seq=" << task.sequence_;
-        engine_->freeBatchID(task.completion_batch_id_.value());
-        task.completion_batch_id_.reset();
+        engine_->freeBatchID(task.ack_batch_id_.value());
+        task.ack_batch_id_.reset();
         task.state_ = SendTaskState::kFailed;
         did_work = true;
     }
@@ -959,7 +949,7 @@ bool P2PProxy::isSendOpCompleted(const SendOpContext& op_ctx) const {
 }
 
 bool P2PProxy::isRecvOpCompleted(const RecvOpContext& op_ctx) const {
-    return op_ctx.bytes_advertised_ == op_ctx.total_bytes_ &&
+    return op_ctx.bytes_credited_ == op_ctx.total_bytes_ &&
            op_ctx.tasks_.empty();
 }
 
@@ -968,10 +958,10 @@ bool P2PProxy::isRecvOpCompleted(const RecvOpContext& op_ctx) const {
 // Pipeline per peer:
 //   1. Drain the shared send_queue_ into the peer's pending_send_ops_.
 //   2. Promote the first pending op to active_send_op_.
-//   3. While we have invitations (PublishSlots) and staging buffers,
+//   3. While we have credits (CreditSlots) and staging buffers,
 //      pull more tensor slices into SendPool (TryIssueSendTask).
 //   4. Advance every active chunk through its state machine
-//      (Copy-In -> Write Remote -> Completion write).
+//      (Copy-In -> Write Remote -> Ack write).
 //   5. Erase fully-acknowledged chunks.  When the op is empty and all
 //      bytes have been staged, mark it complete.
 bool P2PProxy::stepSend() {
@@ -1026,13 +1016,13 @@ bool P2PProxy::stepSend() {
         }
         auto& op_ctx = lane.active_send_op_.value();
 
-        // Pull as many invitations as we have free chunks
+        // Pull as many credits as we have free chunks
         while (tryIssueSendTask(op_ctx, lane)) {
             did_work = true;
         }
 
         // Advance every chunk through the sender state machine.
-        // send op may fail due to wait invitation timeout in tryIssueSendTask.
+        // send op may fail due to credit-wait timeout in tryIssueSendTask.
         auto op_status = op_ctx.status_->load(std::memory_order_acquire);
         bool op_failed = op_status == OpStatus::kFailed;
         if (!op_failed) {
@@ -1070,47 +1060,47 @@ bool P2PProxy::stepSend() {
     return did_work;
 }
 
-// Poll the local CompletionLane for the head task and initiate Copy-Out.
+// Poll the local AckLane for the head task and initiate Copy-Out.
 //
-// Returns true if a completion was processed (including stale-slot clearing).
-bool P2PProxy::pollRecvCompletionSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
-                                      RecvTransferTask& head_task) {
-    // Check for timeout while waiting for the peer's CompletionSlot.
+// Returns true if an ack was processed (including stale-slot clearing).
+bool P2PProxy::pollRecvAckSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
+                               RecvTransferTask& head_task) {
+    // Check for timeout while waiting for the peer's AckSlot.
     if (isTimeout(head_task)) {
-        LOG(ERROR) << "P2P recv completion timeout peer=" << op_ctx.peer_rank_
+        LOG(ERROR) << "P2P wait-for-ack timeout, peer=" << op_ctx.peer_rank_
                    << " seq=" << head_task.sequence_;
         head_task.state_ = RecvTaskState::kFailed;
         return true;
     }
 
-    auto* completion_lane = getLocalCompletionLane(op_ctx.peer_rank_);
-    auto& slot = completion_lane[head_task.sequence_ % kP2PControlRingSize];
+    auto* ack_lane = getLocalAckLane(op_ctx.peer_rank_);
+    auto& slot = ack_lane[head_task.sequence_ % kP2PControlRingSize];
 
     // Step 1 -- Try load the slot
-    uint32_t completed_len = 0;
-    uint32_t slot_gen = 0;
+    uint32_t ack_len = 0;
+    uint32_t slot_epoch = 0;
     uint32_t slot_seq = 0;
-    if (!slot.tryLoad(completed_len, slot_gen, slot_seq)) {
+    if (!slot.tryLoad(ack_len, slot_epoch, slot_seq)) {
         // Slot is either empty or torn. Retry next poll.
         return false;
     }
 
-    const uint32_t current_gen =
-        peer_generation_[op_ctx.peer_rank_].load(std::memory_order_acquire);
+    const uint32_t curr_epoch =
+        peer_epoch_[op_ctx.peer_rank_].load(std::memory_order_acquire);
 
     // Step 2 -- Stale packet: data from a previous epoch (before Reset).
-    // Clear the slot so the fresh completion can land safely.
-    if (slot_gen != current_gen) {
-        LOG(WARNING) << "[P2PProxy][Recv] pollRecvCompletionSlot peer="
+    // Clear the slot so the fresh ack can land safely.
+    if (slot_epoch != curr_epoch) {
+        LOG(WARNING) << "[P2PProxy][Recv] pollRecvAckSlot peer="
                      << op_ctx.peer_rank_
                      << " front-seq=" << head_task.sequence_
-                     << " GEN_MISMATCH slot.gen=" << slot_gen
-                     << " current_gen=" << current_gen;
+                     << " EPOCH_MISMATCH slot.epoch=" << slot_epoch
+                     << " curr_epoch=" << curr_epoch;
         slot.reset();
         return true;
     }
 
-    // Step 3 -- Sequence check: make sure this is the exact completion
+    // Step 3 -- Sequence check: make sure this is the exact ack
     // we are waiting for.
     if (slot_seq != head_task.sequence_) {
         return false;
@@ -1149,7 +1139,7 @@ bool P2PProxy::pollRecvCompletionSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
 
     head_task.last_update_time_ = std::chrono::steady_clock::now();
     slot.reset();
-    ++lane.completion_consume_seq_;
+    ++lane.ack_consume_seq_;
     return true;
 }
 
@@ -1158,12 +1148,12 @@ bool P2PProxy::pollRecvCompletionSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
 // Pipeline per peer:
 //   1. Drain the shared recv_queue_ into the peer's pending_recv_ops_.
 //   2. Promote the first pending op to active_recv_op_.
-//   3. While we have free RecvPool chunks, issue PublishSlots to the sender
+//   3. While we have free RecvPool chunks, issue CreditSlots to the sender
 //      (TryIssueRecvTask).
-//   4. Poll the local CompletionLane in order.  When a CompletionSlot
+//   4. Poll the local AckLane in order.  When an AckSlot
 //      arrives, initiate Copy-Out from RecvPool to the user tensor.
 //   5. Advance every active chunk through its state machine
-//      (Advertise -> Copy-Out -> erase).
+//      (IssueCredit -> Copy-Out -> erase).
 //   6. When all chunks are copied out, mark the op complete.
 bool P2PProxy::stepRecv() {
     bool did_work = false;
@@ -1218,13 +1208,13 @@ bool P2PProxy::stepRecv() {
             did_work = true;
         }
 
-        // In-order completion polling: we only look at the head of the queue
+        // In-order ack polling: we only look at the head of the queue
         // because the sender acknowledges chunks in the same order it
-        // consumes invitations.
+        // consumes credits.
         if (!op_ctx.tasks_.empty()) {
             auto& head = op_ctx.tasks_.front();
-            if (head.state_ == RecvTaskState::kWaitCompletion) {
-                if (pollRecvCompletionSlot(op_ctx, lane, head)) {
+            if (head.state_ == RecvTaskState::kWaitAck) {
+                if (pollRecvAckSlot(op_ctx, lane, head)) {
                     did_work = true;
                 }
             }

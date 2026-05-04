@@ -40,9 +40,9 @@ std::vector<uint8_t> serialize(const ExtensionState& state) {
     // nearest byte
     size_t bitmapSize = (rankCount + 7) / 8;
 
-    // Total size = count field + bitmap + p2pGenerations[] + taskCount
+    // Total size = count field + bitmap + p2pEpochs[] + taskCount
     size_t totalSize = sizeof(uint32_t) + bitmapSize +
-                       sizeof(uint32_t) * rankCount + sizeof(int);
+                       sizeof(uint32_t) * rankCount + sizeof(int32_t);
 
     std::vector<uint8_t> buffer(totalSize, 0);
     uint8_t* ptr = buffer.data();
@@ -60,15 +60,16 @@ std::vector<uint8_t> serialize(const ExtensionState& state) {
     }
     ptr += bitmapSize;
 
-    // 3. Store per-peer p2pGenerations
+    // 3. Store per-peer p2pEpochs
     for (size_t i = 0; i < rankCount; ++i) {
-        std::memcpy(ptr + i * sizeof(uint32_t), &state.p2pGenerations[i],
+        std::memcpy(ptr + i * sizeof(uint32_t), &state.p2pEpochs[i],
                     sizeof(uint32_t));
     }
     ptr += sizeof(uint32_t) * rankCount;
 
     // 4. Store taskCount
-    std::memcpy(ptr, &state.taskCount, sizeof(int));
+    int32_t taskCount = static_cast<int32_t>(state.taskCount);
+    std::memcpy(ptr, &taskCount, sizeof(int32_t));
 
     return buffer;
 }
@@ -88,7 +89,7 @@ ExtensionState deserialize(const std::vector<uint8_t>& buffer) {
     // proceeding with further reads.
     size_t bitmapSize = (rankCount + 7) / 8;
     size_t expectedSize = sizeof(uint32_t) + bitmapSize +
-                          sizeof(uint32_t) * rankCount + sizeof(int);
+                          sizeof(uint32_t) * rankCount + sizeof(int32_t);
     if (buffer.size() < expectedSize) return state;
 
     // 2. Read the bitmap and reconstruct the activeRanks vector
@@ -100,15 +101,17 @@ ExtensionState deserialize(const std::vector<uint8_t>& buffer) {
     }
     ptr += bitmapSize;
 
-    // 3. Read per-peer p2pGenerations
-    state.p2pGenerations.resize(rankCount);
+    // 3. Read per-peer p2pEpochs
+    state.p2pEpochs.resize(rankCount);
     for (size_t i = 0; i < rankCount; ++i) {
-        std::memcpy(&state.p2pGenerations[i], ptr, sizeof(uint32_t));
+        std::memcpy(&state.p2pEpochs[i], ptr, sizeof(uint32_t));
         ptr += sizeof(uint32_t);
     }
 
     // 4. Read taskCount
-    std::memcpy(&state.taskCount, ptr, sizeof(int));
+    int32_t taskCount = 0;
+    std::memcpy(&taskCount, ptr, sizeof(int32_t));
+    state.taskCount = static_cast<int>(taskCount);
 
     return state;
 }
@@ -316,8 +319,8 @@ MooncakeBackend::MooncakeBackend(
         (uint64_t)connection_ctx_->warmup_send_region();
     rank_info.warmup_buffer[1] =
         (uint64_t)connection_ctx_->warmup_recv_region();
-    rank_info.p2p_publish_region = (uint64_t)p2p_proxy_->publish_region();
-    rank_info.p2p_completion_region = (uint64_t)p2p_proxy_->completion_region();
+    rank_info.p2p_credit_region = (uint64_t)p2p_proxy_->credit_region();
+    rank_info.p2p_ack_region = (uint64_t)p2p_proxy_->ack_region();
 
     // Sync metadata
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
@@ -986,11 +989,11 @@ void MooncakeBackend::waitForExtensionState() {
     // taskCount
     meta_->taskCount = state.taskCount;
 
-    // p2pGenerations
-    TORCH_CHECK(static_cast<size_t>(meta_->size) == state.p2pGenerations.size(),
-                "Invalid p2pGenerations size");
+    // p2pEpochs
+    TORCH_CHECK(static_cast<size_t>(meta_->size) == state.p2pEpochs.size(),
+                "Invalid p2pEpochs size");
     for (int i = 0; i < meta_->size; ++i) {
-        p2p_proxy_->setGeneration(i, state.p2pGenerations[i]);
+        p2p_proxy_->setEpoch(i, state.p2pEpochs[i]);
     }
 
     // activeRanks
@@ -1107,14 +1110,14 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
     }
 
     syncActiveRanksTensor();
-    std::vector<uint32_t> generations(meta_->size);
+    std::vector<uint32_t> epochs(meta_->size);
     for (int i = 0; i < meta_->size; ++i) {
-        generations[i] = p2p_proxy_->getGeneration(i);
+        epochs[i] = p2p_proxy_->getEpoch(i);
     }
     ExtensionState state{
         .activeRanks =
             std::vector(meta_->activeRanks, meta_->activeRanks + meta_->size),
-        .p2pGenerations = std::move(generations),
+        .p2pEpochs = std::move(epochs),
         .taskCount = meta_->taskCount};
     auto state_data = serialize(state);
     for (const int rank : ranks) {
