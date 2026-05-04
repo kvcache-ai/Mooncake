@@ -16,7 +16,7 @@
 #include <cassert>
 #include <cstddef>
 #include "config.h"
-#include "transport/kunpeng_transport/urma_endpoint.h"
+#include "transport/kunpeng_transport/urma/urma_endpoint.h"
 
 namespace mooncake {
 static int isNullEid(urma_eid_t* eid) {
@@ -162,6 +162,21 @@ int UrmaContext::deconstruct() {
         }
     }
     seg_region_list_.clear();
+
+    for (auto& seg : imported_seg_list_) {
+        int ret = urma_unimport_seg(seg);
+        if (ret) {
+            PLOG(ERROR) << "Failed to unimport segment";
+        }
+    }
+    imported_seg_list_.clear();
+
+    for (auto& seg : remote_seg_list_) {
+        free(seg);
+    }
+    remote_seg_list_.clear();
+
+    import_tseg_map.clear();
 
     for (size_t i = 0; i < jfr_list_.size(); i++) {
         if (!jfr_list_[i].native) continue;
@@ -404,10 +419,16 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             urma_free_device_list(devices);
             return ERR_CONTEXT;
         }
+        for (int p = 0; p < MAX_PORT_CNT; p++) {
+            if (dev_attr_.port_attr[p].state == URMA_PORT_ACTIVE) {
+                port_ = p;
+                break;
+            }
+        }
         if (dev_attr_.port_cnt != 0 &&
-            dev_attr_.port_attr[port].state != URMA_PORT_ACTIVE) {
-            LOG(WARNING) << "Device " << device_name << " port( " << port
-                         << " ) not active";
+            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE) {
+            LOG(WARNING) << "Device " << device_name
+                         << " not found active port";
             if (urma_delete_context(context)) {
                 PLOG(ERROR)
                     << "urma_delete_context(" << device_name << ") failed";
@@ -433,10 +454,9 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
 
         urma_context_ = context;
         eid_index_ = eid_index;
-        port_ = port;
         if (dev_attr_.port_cnt != 0) {
-            active_mtu_ = dev_attr_.port_attr[port].active_mtu;
-            active_speed_ = dev_attr_.port_attr[port].active_speed;
+            active_mtu_ = dev_attr_.port_attr[port_].active_mtu;
+            active_speed_ = dev_attr_.port_attr[port_].active_speed;
         } else {
             active_mtu_ = URMA_MTU_4096;  // default mtu and speed
             active_speed_ = URMA_SP_100G;
@@ -505,6 +525,9 @@ int UrmaContext::poll(int num_entries, Transport::Slice** slices,
     Transport::Slice s[nr_poll];
     for (int i = 0; i < nr_poll; ++i) {
         auto slice = (Transport::Slice*)cr[i].user_ctx;
+        if (!slice) {
+            continue;
+        }
         if (cr[i].status == URMA_CR_SUCCESS) {
             slice->markSuccess();
             slices[i] = slice;
@@ -558,9 +581,7 @@ bool UrmaContext::uninit() {
 }
 
 bool UrmaContext::init() {
-    urma_init_attr_t init_attr = {
-        .uasid = 0,
-    };
+    urma_init_attr_t init_attr = {};
     auto ret = urma_init(&init_attr);
     if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
         LOG(ERROR) << "Failed to urma init, ret = " << ret;
@@ -637,6 +658,8 @@ int UrmaEndpoint::deconstruct() {
             ret = urma_unimport_jetty(imported_jetty);
             if (ret) PLOG(ERROR) << "Failed to unimport jetty";
         }
+        ret = urma_delete_jetty(jetty_list_[i]);
+        if (ret) PLOG(ERROR) << "Failed to delete jetty";
         // After destroying QP, the wr_depth_list_ won't change
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
@@ -651,6 +674,7 @@ int UrmaEndpoint::deconstruct() {
     }
     jetty_list_.clear();
     delete[] wr_depth_list_;
+    imported_jetty_map_.clear();
     return 0;
 }
 
@@ -860,7 +884,14 @@ int UrmaEndpoint::submitPostSend(
         wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
         wr.flag.bs.complete_enable = 1;
         wr.flag.bs.inline_flag = 0;
-        wr.tjetty = imported_jetty_map_[jetty_list_[jetty_index]];
+        // Check if the jetty is in the imported_jetty_map_
+        auto it = imported_jetty_map_.find(jetty_list_[jetty_index]);
+        if (it != imported_jetty_map_.end()) {
+            wr.tjetty = it->second;
+        } else {
+            // If not found, use a dummy value
+            wr.tjetty = nullptr;
+        }
         slice->ts = getCurrentTimeInNano();
         slice->status = Transport::Slice::POSTED;
         slice->ub.jetty_depth = &wr_depth_list_[jetty_index];

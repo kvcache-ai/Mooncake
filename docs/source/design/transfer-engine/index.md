@@ -75,6 +75,8 @@ If a connection fails due to link errors, it is removed from the
 endpoint pools on both sides and re-established during the
 next data transfer attempt.
 
+Evicted and deleted endpoints are moved to an internal `waiting_list_` and reclaimed asynchronously once their outstanding slices drain. Reclaim runs on every new endpoint insertion, and additionally on a ~1 Hz heartbeat from the per-context `monitorWorker`, so the waiting list drains even under failure load where new insertions stall while evictions continue.
+
 ### Fault Handling
 In a multi-NIC environment, one common failure scenario is the temporary unavailability of a specific NIC, while other routes may still connect two nodes.
 Mooncake Store is designed to adeptly manage such temporary
@@ -165,7 +167,7 @@ Transfer Engine provides batch-based read/write transfers between segments (DRAM
 ### Multi-Transport Management
 
 The `TransferEngine` class internally manages multiple backend `Transport` classes.
-And it will discover the toplogy between CPU/CUDA and RDMA devices automatically
+And it will discover the topology between CPU/CUDA and RDMA devices automatically
 (more device types are working in progress, feedbacks are welcome when the automatic discovery mechanism is not accurate),
 and it will install `Transport` automatically based on the topology.
 
@@ -274,6 +276,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_IB_TC` Adjust RDMA NIC Traffic Class when switch/NIC defaults differ or for traffic planning. Default value -1
 - `MC_IB_PCI_RELAXED_ORDERING` Setting the PCIe ordering to relaxed for the network adapter sometimes results in better performance. Can set 1 to enable RO function. Default value 0
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
+- `MC_PKEY_INDEX` The QP `pkey_index` (partition key table index) used when transitioning the QP to the INIT state. Valid range: 0 to 65535. Default value 0. Set this when the partition key required for your fabric is not at index 0 of the HCA's pkey table
 - `MC_MAX_CQE_PER_CTX` The CQ buffer size per device instance, default value 4096
 - `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 65536. **Note:** For versions prior to 0.3.7.post1, the default value is 256, and it cannot be manually set to 65536. The maximum supported value is 65535!
 - `MC_NUM_QP_PER_EP` The number of QPs per EndPoint, the more the number, the better the fine-grained I/O performance, default value 2
@@ -302,7 +305,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
-- `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets. 
+- `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
 
 ## C++ API Reference
 
@@ -328,6 +331,14 @@ efa_transport
 ascend_direct_transport
 ascend_transport
 heterogeneous_ascend
+:::
+
+## Sunrise Link Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+sunrise_link_transport
 :::
 
 ## Benchmark and Tuning Guide

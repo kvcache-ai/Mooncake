@@ -1,72 +1,85 @@
-SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 add_library(tent_interface INTERFACE)
-target_include_directories(tent_interface
-    INTERFACE
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
-        $<INSTALL_INTERFACE:include>
-)
+target_include_directories(
+  tent_interface
+  INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+            $<INSTALL_INTERFACE:include>)
 target_compile_features(tent_interface INTERFACE cxx_std_20)
 
-if (TARGET asio_shared)
-    target_link_libraries(tent_interface INTERFACE asio_shared)
+if(TARGET asio_shared)
+  target_link_libraries(tent_interface INTERFACE asio_shared)
 endif()
 
 # CUDA
-if (USE_CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    message(STATUS "CUDA: Enabled")
-    target_compile_definitions(tent_interface INTERFACE USE_CUDA)
-    target_include_directories(tent_interface INTERFACE ${CUDAToolkit_INCLUDE_DIRS})
-    target_link_libraries(tent_interface INTERFACE CUDA::cudart)
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "CUDA: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_CUDA)
+  target_include_directories(tent_interface
+                             INTERFACE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(tent_interface INTERFACE CUDA::cudart)
 else()
-    message(STATUS "CUDA: Disabled")
+  message(STATUS "CUDA: Disabled")
 endif()
 
 # GDS
 find_library(CUFILE_LIB cufile PATHS /usr/local/cuda/lib64)
 find_path(CUFILE_INCLUDE cufile.h PATHS /usr/local/cuda/include)
-if (USE_CUDA AND CUDAToolkit_FOUND AND CUFILE_LIB AND CUFILE_INCLUDE)
-    message(STATUS "GDS: Enabled")
-    target_compile_definitions(tent_interface INTERFACE USE_GDS)
-    target_include_directories(tent_interface INTERFACE ${CUFILE_INCLUDE})
-    target_link_libraries(tent_interface INTERFACE ${CUFILE_LIB})
+if(USE_CUDA
+   AND CUDAToolkit_FOUND
+   AND CUFILE_LIB
+   AND CUFILE_INCLUDE)
+  message(STATUS "GDS: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_GDS)
+  target_include_directories(tent_interface INTERFACE ${CUFILE_INCLUDE})
+  target_link_libraries(tent_interface INTERFACE ${CUFILE_LIB})
 else()
-    message(STATUS "GDS: Disabled")
+  message(STATUS "GDS: Disabled")
 endif()
 
 # RDMA (ibverbs)
-find_library(IBVERBS_LIB ibverbs PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64)
-find_path(IBVERBS_INCLUDE infiniband/verbs.h PATHS /usr/include /usr/local/include)
-if (IBVERBS_LIB AND IBVERBS_INCLUDE)
-    message(STATUS "RDMA: Enabled")
-    target_compile_definitions(tent_interface INTERFACE USE_RDMA)
-    target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
-    target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
+find_library(IBVERBS_LIB ibverbs PATHS /usr/lib /usr/lib64 /usr/local/lib
+                                       /usr/local/lib64)
+find_path(IBVERBS_INCLUDE infiniband/verbs.h PATHS /usr/include
+                                                   /usr/local/include)
+if(IBVERBS_LIB AND IBVERBS_INCLUDE)
+  message(STATUS "RDMA: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_RDMA)
+  target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
+  target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
 else()
-    message(STATUS "RDMA: Disabled")
+  message(STATUS "RDMA: Disabled")
 endif()
 
 # io_uring
-find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64)
+find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib
+                                   /usr/local/lib64)
 find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
-if (URING_LIB AND URING_INCLUDE)
-    message(STATUS "Uring: Enabled")
-    target_compile_definitions(tent_interface INTERFACE USE_URING)
-    target_include_directories(tent_interface INTERFACE ${URING_INCLUDE})
-    target_link_libraries(tent_interface INTERFACE ${URING_LIB})
+if(URING_LIB AND URING_INCLUDE)
+  message(STATUS "Uring: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_URING)
+  target_include_directories(tent_interface INTERFACE ${URING_INCLUDE})
+  target_link_libraries(tent_interface INTERFACE ${URING_LIB})
 else()
-    message(STATUS "Uring: Disabled")
+  message(STATUS "Uring: Disabled")
+endif()
+
+if(USE_SUNRISE)
+  target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
+  target_include_directories(tent_interface INTERFACE /usr/local/tangrt/include)
+  target_link_directories(tent_interface INTERFACE
+                          /usr/local/tangrt/lib/linux-x86_64)
+  target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
 endif()
 
 set(YALANTING_TARGET yalantinglibs::yalantinglibs)
-if (NOT TARGET ${YALANTING_TARGET})
-    if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-        find_package(yalantinglibs CONFIG REQUIRED)
-    else()
-        message(FATAL_ERROR
-            "yalantinglibs::yalantinglibs target not found")
-    endif()
+if(NOT TARGET ${YALANTING_TARGET})
+  if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    find_package(yalantinglibs CONFIG REQUIRED)
+  else()
+    message(FATAL_ERROR "yalantinglibs::yalantinglibs target not found")
+  endif()
 endif()
 
 add_subdirectory(common)
@@ -81,22 +94,40 @@ add_subdirectory(python)
 file(GLOB TENT_ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 add_library(tent STATIC ${TENT_ENGINE_SOURCES})
-target_link_libraries(
-    tent
-    PUBLIC
-        tent_runtime
-        tent_interface
-)
+target_link_libraries(tent PUBLIC tent_runtime tent_interface)
 
 add_library(tent_shared SHARED ${TENT_ENGINE_SOURCES})
-target_link_libraries(
-    tent_shared
-    PUBLIC
-        tent_runtime
-        tent_interface
-)
+target_link_libraries(tent_shared PUBLIC tent_runtime tent_interface)
 
-install(TARGETS tent_shared
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
-    RUNTIME DESTINATION bin)
+add_library(tent_link_group INTERFACE)
+target_link_libraries(tent_link_group INTERFACE "-Wl,--start-group" tent)
+foreach(
+  tgt
+  metastore_redis
+  metastore_http
+  metastore_etcd
+  tent_platform_all
+  platform_cuda
+  platform_ascend
+  platform_sunrise
+  tent_xport_gds
+  tent_xport_uring
+  tent_xport_bufio
+  tent_xport_mnnvl
+  tent_xport_nvlink
+  tent_xport_rdma
+  tent_xport_shm
+  tent_xport_tcp
+  tent_xport_ascend_direct
+  tent_xport_sunrise_link
+  tent_metrics)
+  if(TARGET ${tgt})
+    target_link_libraries(tent_link_group INTERFACE ${tgt})
+  endif()
+endforeach()
+target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
+install(
+  TARGETS tent_shared
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin)

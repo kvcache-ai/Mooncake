@@ -70,15 +70,10 @@ if(USE_CUDA)
 endif()
 
 if(USE_MACA)
-  if(DEFINED ENV{MACA_HOME})
-    set(MACA_HOME $ENV{MACA_HOME})
-  else()
-    set(MACA_HOME /opt/maca)
-  endif()
   if(NOT DEFINED MACA_RUNTIME_LIBS)
     set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
   endif()
-  target_include_directories(transfer_engine PRIVATE ${MACA_HOME}/include)
+  target_include_directories(transfer_engine PRIVATE ${MACA_INCLUDE_DIR})
   target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
 endif()
 
@@ -105,6 +100,7 @@ if(USE_ASCEND)
                                                MPI::MPI)
 endif()
 
+
 if(USE_ASCEND_DIRECT)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
@@ -123,7 +119,7 @@ endif()
 
 if(USE_TENT)
   add_compile_definitions(transfer_engine PUBLIC USE_TENT)
-  target_link_libraries(transfer_engine PUBLIC tent)
+  target_link_libraries(transfer_engine PUBLIC tent_link_group)
 endif()
 
 if(USE_INTRA_NVLINK)

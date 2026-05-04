@@ -220,8 +220,29 @@ docker build -f docker/mooncake.Dockerfile \
 The resulting image already has a virtual environment at `/opt/venv` with the freshly built wheel installed. Launch it with GPU/RDMA access as needed, for example:
 
 ```bash
-docker run --gpus all --network host -it mooncake:from-source /bin/bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+
+docker run --gpus all \
+  --network host \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --shm-size=128g \
+  -e MC_STORE_USE_HUGEPAGE=1 \
+  -e MC_STORE_HUGEPAGE_SIZE=2MB \
+  -e MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb \
+  -e MC_MMAP_ARENA_POOL_SIZE=56gb \
+  -it mooncake:from-source /bin/bash
 ```
+
+The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not allocator defaults. The arena is off by default. Setting `MC_MMAP_ARENA_POOL_SIZE=...` explicitly both enables and sizes the arena; if you enable it via gflag instead, the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) instead when you want the baseline direct-`mmap()` path. Like the arena size itself, this must be set before the first Mooncake mmap-buffer allocation in the process. Arena bring-up is a one-shot lazy init, so after a failed first attempt you need to restart the process to retry with corrected env / hugepage settings. Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is present, Mooncake instead preserves the strict hugepage contract for both arena and direct-`mmap()` host-buffer allocation instead of silently downgrading to regular pages.
 
 > [!NOTE]
 > Make sure you build the image from the repository root so that Git metadata and submodules are available inside the build context.

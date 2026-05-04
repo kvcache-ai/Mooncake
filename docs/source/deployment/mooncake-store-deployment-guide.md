@@ -144,6 +144,28 @@ curl -s http://<master_host>:9003/metrics/summary
 - Local memcpy optimization (Store transfer path)
   - `MC_STORE_MEMCPY` (default `0`/false): Set to `1` to prefer local memcpy when source/destination are on the same client.
 
+- Memory allocator (mmap buffer path)
+  - `MC_STORE_USE_HUGEPAGE` (default unset): Set to `1` to request HugeTLB-backed `mmap()` allocations for the direct allocation path. This requires hugepages to be reserved on the host first.
+  - `MC_STORE_HUGEPAGE_SIZE` (default `2MB`): Hugepage size to request when hugepages are enabled. Supported values are `2MB` and `1GB`.
+  - `MC_MMAP_ARENA_POOL_SIZE` (default unset): Size of the pre-allocated arena pool for mmap buffer allocations. Accepts human-readable sizes (e.g., `8gb`, `20gb`). Setting this variable explicitly enables the arena; if the arena is enabled via gflag instead, the default pool size is `8gb`. The arena is allocated once at first use and serves subsequent allocations via lock-free atomic bump pointer. Set this to match available hugepage capacity.
+  - `MC_DISABLE_MMAP_ARENA` (default unset): Set to `1` to disable the arena and fall back to per-call `mmap()`, even if the arena was explicitly requested. Also accepts `true`, `yes`, or `on`. This must be set before the first Mooncake mmap-buffer allocation in the process. Useful for debugging or when hugepage capacity is limited. Lazy arena initialization is one-shot per process, so after a failed first attempt you need to restart the process to retry arena bring-up.
+
+For HiCache-style deployments or other large buffer allocations, pre-flight the host with the sizing helper before reserving hugepages:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+```
+
+The `64gb` / `56gb` inputs above are tuned examples for large HiCache deployments, not defaults. The arena remains disabled unless you explicitly enable it. If you enable it via gflag without an env override, the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper.
+
 ## Set the Log Level for yalantinglibs coro_rpc and coro_http
 By default, the log level is set to warning. You can customize it using the following environment variable:
 

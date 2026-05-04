@@ -373,7 +373,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->length = length;
             slice->task = &task;
             slice->retry_count = 0;
-            slice->ep_weak_ptr = nullptr;
+            slice->ep_weak_ptr.reset();
             slice->word = PENDING;
             slice->next = nullptr;
             slice->enqueue_ts = enqueue_ts;

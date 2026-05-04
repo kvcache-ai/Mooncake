@@ -56,6 +56,7 @@ struct TaskInfo {
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
     std::chrono::steady_clock::time_point start_time{};  // For latency tracking
+    int failover_count{0};  // Number of cross-transport failover attempts
 };
 
 class TransferEngineImpl {
@@ -157,6 +158,18 @@ class TransferEngineImpl {
 
     Status unlockStageBuffer(uint64_t addr);
 
+    // Test-only hook: replace the transport in a given slot after construct().
+    // Production code never calls this. Used by failover integration tests to
+    // inject a FaultProxyTransport without bypassing resubmitTransferTask,
+    // resolveTransport, or any other engine state. Not thread-safe with any
+    // in-flight transfer on that slot.
+    void swapTransportForTest(TransportType type,
+                              std::shared_ptr<Transport> xport) {
+        if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
+            transport_list_[type] = std::move(xport);
+        }
+    }
+
    private:
     Status construct();
 
@@ -222,6 +235,7 @@ class TransferEngineImpl {
 
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
+    int max_failover_attempts_{3};
 };
 }  // namespace tent
 }  // namespace mooncake

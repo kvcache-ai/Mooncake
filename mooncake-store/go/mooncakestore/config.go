@@ -18,6 +18,7 @@ package mooncakestore
 type ReplicateConfig struct {
 	ReplicaNum        int
 	WithSoftPin       bool
+	WithHardPin       bool
 	PreferredSegments []string
 }
 
@@ -26,5 +27,6 @@ func DefaultReplicateConfig() ReplicateConfig {
 	return ReplicateConfig{
 		ReplicaNum:  1,
 		WithSoftPin: false,
+		WithHardPin: false,
 	}
 }

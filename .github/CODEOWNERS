@@ -17,6 +17,7 @@
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q
 /mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov
 /mooncake-transfer-engine/*/transport/ascend_transport/ @alogfans @ascend-direct-dev
+/mooncake-transfer-engine/*/transport/efa_transport/ @alogfans @whn09
 /mooncake-wheel @ShangmingCai @stmatengss
 /scripts/tone_tests @luketong777
 /scripts/ascend/ @ascend-direct-dev @VNightMare @MingYang119

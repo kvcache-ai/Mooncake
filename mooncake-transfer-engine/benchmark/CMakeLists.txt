@@ -9,11 +9,12 @@ endif()
 
 file(GLOB TEBENCH_SOURCES "*.cpp")
 add_executable(tebench ${TEBENCH_SOURCES})
-target_link_libraries(tebench PUBLIC transfer_engine tent)
+target_link_libraries(tebench PUBLIC transfer_engine tent_link_group)
 if(USE_CUDA)
   target_link_libraries(tebench PUBLIC CUDA::cudart)
 endif()
 
 # Set RPATH for finding libasio.so at runtime
-set_target_properties(tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-                                         INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-asio")
+set_target_properties(
+  tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+                     INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common")

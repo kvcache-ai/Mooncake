@@ -170,6 +170,12 @@ class ScopedSegmentAccess {
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 
+    /**
+     * @brief Remove the local disk segment entry for a client.
+     * Called when a client expires to clean up its local disk segment.
+     */
+    void UnmountLocalDiskSegment(const UUID& client_id);
+
    private:
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;

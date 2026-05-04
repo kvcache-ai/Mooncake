@@ -1734,6 +1734,40 @@ TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
     }
 }
 
+TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
+    // Allocate a small buffer for this test
+    size_t test_size = 16 * 1024 * 1024;  // 16 MB
+    void* test_buffer = allocate_buffer_allocator_memory(test_size);
+    ASSERT_NE(test_buffer, nullptr);
+
+    // Test MountSegmentAndGetId returns a valid UUID
+    auto mount_result = test_client_->MountSegmentAndGetId(
+        test_buffer, test_size, FLAGS_protocol);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountSegmentAndGetId failed: " << toString(mount_result.error());
+    UUID segment_id = mount_result.value();
+    EXPECT_NE(segment_id.first, 0u);
+    EXPECT_NE(segment_id.second, 0u);
+
+    // Test UnmountSegmentById succeeds
+    auto unmount_result = test_client_->UnmountSegmentById(segment_id);
+    EXPECT_TRUE(unmount_result.has_value())
+        << "UnmountSegmentById failed: " << toString(unmount_result.error());
+
+    // Test MountSegment delegates to MountSegmentAndGetId (equivalent behavior)
+    auto mount2 =
+        test_client_->MountSegment(test_buffer, test_size, FLAGS_protocol);
+    EXPECT_TRUE(mount2.has_value())
+        << "MountSegment failed: " << toString(mount2.error());
+
+    // Test UnmountSegment delegates to UnmountSegmentImpl (equivalent behavior)
+    auto unmount2 = test_client_->UnmountSegment(test_buffer, test_size);
+    EXPECT_TRUE(unmount2.has_value())
+        << "UnmountSegment failed: " << toString(unmount2.error());
+
+    free(test_buffer);
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

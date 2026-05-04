@@ -2,9 +2,12 @@
 
 #include <glog/logging.h>
 
+#include <boost/functional/hash.hpp>
+
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 #include <unordered_map>
@@ -280,6 +283,36 @@ class Replica {
             return !mem_data.buffer->isAllocatorValid();
         }
         return false;  // DiskReplicaData does not have handles
+    }
+
+    /**
+     * @brief Check if a local_disk replica's owner client is still alive.
+     * Used by CleanupStaleHandles to remove replicas belonging to expired
+     * clients. For non-local_disk replicas, always returns false.
+     * @param alive_clients Set of currently alive client IDs.
+     * @return true if this is a local_disk replica whose client is not alive.
+     */
+    [[nodiscard]] bool has_stale_local_disk_client(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients)
+        const {
+        auto client_id = get_local_disk_client_id();
+        if (client_id.has_value()) {
+            return alive_clients.find(client_id.value()) == alive_clients.end();
+        }
+        return false;
+    }
+
+    /**
+     * @brief Get the client_id for local_disk replicas.
+     * @return The client_id if this is a local_disk replica, std::nullopt
+     * otherwise.
+     */
+    [[nodiscard]] std::optional<UUID> get_local_disk_client_id() const {
+        if (is_local_disk_replica()) {
+            const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+            return disk_data.client_id;
+        }
+        return std::nullopt;
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {
