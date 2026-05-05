@@ -371,10 +371,17 @@ Tracing can be enabled from code or environment variables.
 Jaeger profiling exports OTLP spans for the same operation and stage boundaries
 used by metrics, including request APIs, route lookup, allocation, transfer,
 route publication, metadata backend calls, heartbeat, membership refresh, and
-storage-owner eviction. The in-process metrics HTTP server exposes `/tracing`
-to turn OTLP profiling on or off dynamically when an endpoint is configured.
-Set `MC_STORE_RS_OTLP_SAMPLE_RATIO` or the `/tracing?sample_ratio=...` query
-before enabling export when profiling a high-throughput workload against a
+storage-owner eviction. The spans are named by profiling phase rather than raw
+implementation hook: API roots use `store.*`, control-plane stages use
+`control.*`, data-plane stages use `data.*`, and backend calls use
+`metadata.*`. A put/get request therefore appears in Jaeger as one in-process
+waterfall with `mooncake.phase`, `mooncake.flow`, request id, item count, byte
+count, replica count, and local/remote target-count attributes.
+
+The in-process metrics HTTP server exposes `/tracing` to turn OTLP profiling on
+or off dynamically when an endpoint is configured. Set
+`MC_STORE_RS_OTLP_SAMPLE_RATIO` or the `/tracing?sample_ratio=...` query before
+enabling export when profiling a high-throughput workload against a
 memory-backed Jaeger collector.
 
 ### Metrics

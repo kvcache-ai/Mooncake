@@ -73,7 +73,6 @@ impl OperationTracker {
             registry: registry::global_metrics_registry().clone(),
             profiling_span: {
                 let mut span = ProfilingSpan::start(operation);
-                span.set_str("mooncake.operation", operation);
                 span.set_str("mooncake.scope", scope);
                 span
             },
@@ -92,7 +91,6 @@ impl OperationTracker {
             registry: registry.clone(),
             profiling_span: {
                 let mut span = ProfilingSpan::start(operation);
-                span.set_str("mooncake.operation", operation);
                 span.set_str("mooncake.scope", scope);
                 span
             },
@@ -113,6 +111,16 @@ impl OperationTracker {
     pub fn input_bytes(mut self, bytes_in: u64) -> Self {
         self.bytes_in = bytes_in;
         self.profiling_span.set_u64("mooncake.bytes_in", bytes_in);
+        self
+    }
+
+    pub fn attribute_str(mut self, key: &'static str, value: &str) -> Self {
+        self.profiling_span.set_str(key, value);
+        self
+    }
+
+    pub fn attribute_u64(mut self, key: &'static str, value: u64) -> Self {
+        self.profiling_span.set_u64(key, value);
         self
     }
 

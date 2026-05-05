@@ -804,7 +804,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             bytes = value.len()
         )
         .entered();
-        let tracker = OperationTracker::new("put").input_bytes(value.len() as u64);
+        let tracker = OperationTracker::new("put")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1)
+            .input_bytes(value.len() as u64);
         let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, None);
         tracker.finish(&result, value.len() as u64);
         result
@@ -834,7 +837,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             bytes = value.len()
         )
         .entered();
-        let tracker = OperationTracker::new("put").input_bytes(value.len() as u64);
+        let tracker = OperationTracker::new("put")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1)
+            .input_bytes(value.len() as u64);
         let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, Some(policy));
         tracker.finish(&result, value.len() as u64);
         result
@@ -859,7 +865,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             size
         )
         .entered();
-        let tracker = OperationTracker::new("put_from").input_bytes(size as u64);
+        let tracker = OperationTracker::new("put_from")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1)
+            .input_bytes(size as u64);
         if buffer.is_null() {
             let result = Err(StoreError::Allocator(
                 "put_from buffer must not be null".to_string(),
@@ -913,7 +922,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             size
         )
         .entered();
-        let tracker = OperationTracker::new("put_from").input_bytes(size as u64);
+        let tracker = OperationTracker::new("put_from")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1)
+            .input_bytes(size as u64);
         if buffer.is_null() {
             let result = Err(StoreError::Allocator(
                 "put_from buffer must not be null".to_string(),
@@ -953,7 +965,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             bytes_in
         )
         .entered();
-        let tracker = OperationTracker::new("batch_put").input_bytes(bytes_in);
+        let tracker = OperationTracker::new("batch_put")
+            .attribute_u64("mooncake.item_count", requests.len() as u64)
+            .input_bytes(bytes_in);
         if matches!(self.write_mode, WriteMode::Routed { .. }) {
             if let Some(shared_policy) = Self::shared_batch_replication_policy(requests) {
                 let result = self.batch_put_scoped_routed(requests, None, shared_policy.as_ref());
@@ -1115,7 +1129,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             bytes_in
         )
         .entered();
-        let tracker = OperationTracker::new("batch_put_from_multi_buffers").input_bytes(bytes_in);
+        let tracker = OperationTracker::new("batch_put_from_multi_buffers")
+            .attribute_u64("mooncake.item_count", requests.len() as u64)
+            .input_bytes(bytes_in);
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let payload = flatten_slices(request.buffers);
@@ -1151,7 +1167,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             key
         )
         .entered();
-        let tracker = OperationTracker::new("get");
+        let tracker = OperationTracker::new("get")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1);
         let objects = [ObjectRef::new(key).tenant(tenant)];
         let result = Self::expect_exactly_one(self.batch_get(&objects)?, "batch_get");
         let bytes_out = result.as_ref().map(|value| value.len() as u64).unwrap_or(0);
@@ -1172,7 +1190,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             buffer_capacity = buffer.len()
         )
         .entered();
-        let tracker = OperationTracker::new("get_into");
+        let tracker = OperationTracker::new("get_into")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1)
+            .attribute_u64("mooncake.buffer_capacity", buffer.len() as u64);
         let mut requests = [GetRequest::new(key, buffer).tenant(tenant)];
         let result = Self::expect_exactly_one(self.batch_get_into(&mut requests)?, "batch_get_into");
         let bytes_out = result.as_ref().copied().unwrap_or(0) as u64;
@@ -1187,7 +1208,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             items = objects.len()
         )
         .entered();
-        let tracker = OperationTracker::new("batch_get");
+        let tracker = OperationTracker::new("batch_get")
+            .attribute_u64("mooncake.item_count", objects.len() as u64);
         let mut resolved = self.resolve_objects(objects)?;
         let mut buffers = resolved
             .iter()
@@ -1218,7 +1240,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             items = requests.len()
         )
         .entered();
-        let tracker = OperationTracker::new("batch_get_into");
+        let tracker = OperationTracker::new("batch_get_into")
+            .attribute_u64("mooncake.item_count", requests.len() as u64);
         let objects = requests
             .iter()
             .map(|request| {
@@ -1260,7 +1283,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             items = requests.len()
         )
         .entered();
-        let tracker = OperationTracker::new("batch_get_into_multi_buffers");
+        let tracker = OperationTracker::new("batch_get_into_multi_buffers")
+            .attribute_u64("mooncake.item_count", requests.len() as u64);
         let objects = requests
             .iter()
             .map(|request| {

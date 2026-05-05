@@ -112,8 +112,9 @@ impl StoreClient {
             } else {
                 let remote_bytes = (remote_requests.len() * value.len()) as u64;
                 let request_deadline = self.request_deadline_for_transfer(remote_bytes, 1);
-                let tracker =
-                    OperationTracker::new("put_remote_batch_write").input_bytes(remote_bytes);
+                let tracker = OperationTracker::new("put_remote_batch_write")
+                    .attribute_u64("mooncake.remote_target_count", remote_requests.len() as u64)
+                    .input_bytes(remote_bytes);
                 let result = (|| {
                     let requests = if let Some(source) = registered_source {
                         let mut requests = Vec::new();
@@ -317,7 +318,8 @@ impl StoreClient {
                 object
             })
             .collect::<Vec<_>>();
-        let rank_tracker = OperationTracker::new("batch_put_stage_rank");
+        let rank_tracker = OperationTracker::new("batch_put_stage_rank")
+            .attribute_u64("mooncake.item_count", object_refs.len() as u64);
         let rank_result = planner.rank_many(self, &object_refs);
         rank_tracker.finish(&rank_result, 0);
         let plans = rank_result?;
@@ -370,7 +372,9 @@ impl StoreClient {
                 .iter()
                 .map(|request| request.value.len())
                 .sum::<usize>() as u64,
-        );
+        )
+        .attribute_u64("mooncake.item_count", requests.len() as u64)
+        .attribute_u64("mooncake.replica_count", resolved_policy.replica_count as u64);
         let reserve_result = (|| {
             let mut shared_candidates = Vec::new();
             let mut shared_seen = BTreeSet::new();
@@ -464,7 +468,8 @@ impl StoreClient {
                 });
             }
 
-            let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
+            let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes")
+                .attribute_u64("mooncake.item_count", object_refs.len() as u64);
             let object_keys = object_refs
                 .iter()
                 .map(|object_ref| {
@@ -685,7 +690,8 @@ impl StoreClient {
         })();
         reserve_tracker.finish(&reserve_result, 0);
         let prepared = reserve_result?;
-        let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
+        let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes")
+            .attribute_u64("mooncake.item_count", prepared.len() as u64);
         let current_routes_result = self.route_directory.get_object_routes(
             &self.lease,
             &prepared
@@ -701,12 +707,26 @@ impl StoreClient {
                 return Err(error);
             }
         };
-        let write_tracker = OperationTracker::new("batch_put_stage_write").input_bytes(
-            prepared
-                .iter()
-                .map(|entry| entry.value.len())
-                .sum::<usize>() as u64,
-        );
+        let write_bytes = prepared
+            .iter()
+            .map(|entry| entry.value.len())
+            .sum::<usize>() as u64;
+        let total_target_count = prepared
+            .iter()
+            .map(|entry| entry.targets.len())
+            .sum::<usize>();
+        let remote_target_count = prepared
+            .iter()
+            .flat_map(|entry| entry.targets.iter())
+            .filter(|target| target.storage_runtime != self.lease.runtime)
+            .count();
+        let local_target_count = total_target_count.saturating_sub(remote_target_count);
+        let write_tracker = OperationTracker::new("batch_put_stage_write")
+            .attribute_u64("mooncake.item_count", prepared.len() as u64)
+            .attribute_u64("mooncake.replica_count", total_target_count as u64)
+            .attribute_u64("mooncake.local_target_count", local_target_count as u64)
+            .attribute_u64("mooncake.remote_target_count", remote_target_count as u64)
+            .input_bytes(write_bytes);
         let has_remote_targets = prepared.iter().any(|entry| {
             entry
                 .targets
