@@ -756,6 +756,32 @@ mod tests {
     }
 
     #[test]
+    fn sparse_operational_counters_render_zero_baselines() {
+        let _guard = metrics_test_lock().lock();
+        registry::reset_metrics();
+
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains("mooncake_store_tenant_quota_reservation_total{result=\"ok\"} 0"));
+        assert!(
+            metrics.contains("mooncake_store_tenant_quota_finalize_total{result=\"conflict\"} 0")
+        );
+        assert!(metrics.contains("mooncake_store_tenant_quota_abort_total{result=\"error\"} 0"));
+        assert!(
+            metrics.contains("mooncake_store_tenant_quota_reconcile_total{result=\"aborted\"} 0")
+        );
+        assert!(metrics.contains("mooncake_store_tenant_local_eviction_total{result=\"miss\"} 0"));
+        assert!(metrics.contains(
+            "mooncake_store_preferred_segment_skip_total{source=\"tenant_policy\",reason=\"not_found\"} 0"
+        ));
+        assert!(metrics
+            .contains("mooncake_store_rebalance_routes_total{phase=\"migrate\",result=\"ok\"} 0"));
+        assert!(metrics.contains("mooncake_store_rebalance_bytes_total{phase=\"migrate\"} 0"));
+        assert!(metrics.contains(
+            "mooncake_store_segment_lifecycle_total{action=\"mount_segment\",result=\"ok\"} 0"
+        ));
+    }
+
+    #[test]
     fn process_metrics_are_rendered_with_request_snapshot() {
         let _guard = metrics_test_lock().lock();
         let registry = registry::new_metrics_registry();

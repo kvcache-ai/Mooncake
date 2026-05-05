@@ -708,6 +708,8 @@ Exporter families:
 - `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`
 
 All metrics use the `mooncake_store_` prefix to reflect the store cluster perspective. Each runtime instance exports its own view through the `/metrics` endpoint regardless of its role (storage node or routed client).
+
+Sparse operational counter families emit zero-valued baseline series for their known label set. This makes steady-state dashboards report an explicit zero for tenant quota, tenant-local eviction, preferred-segment skip, rebalance, and segment lifecycle activity until the corresponding real event occurs and increments the counter.
 Storage and route-authority clients also record control-plane-derived traffic: route CAS handlers observe replication publish latency, replica-route tracking records storage-owner write bytes, and route-hit reports record storage-owner read bytes plus successful checksum-validated hits. Scratch-only benchmark workers therefore do not need to expose their own metrics endpoint for the long-running store clients to show benchmark traffic.
 
 Recommended recording queries:

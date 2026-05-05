@@ -234,6 +234,23 @@ impl<K: Ord + Clone> CounterFamily<K> {
         *counter = counter.saturating_add(value);
     }
 
+    fn snapshot_with_defaults<I>(&self, defaults: I) -> Vec<CounterSample<K>>
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let mut inner = self.inner.clone();
+        for key in defaults {
+            inner.entry(key).or_default();
+        }
+        inner
+            .iter()
+            .map(|(key, value)| CounterSample {
+                key: key.clone(),
+                value: *value,
+            })
+            .collect()
+    }
+
     fn snapshot(&self) -> Vec<CounterSample<K>> {
         self.inner
             .iter()
@@ -478,15 +495,33 @@ impl MetricsRegistry {
             replication_publish: self.replication_publish.snapshot(),
             replication_publish_duration: self.replication_publish_duration.snapshot(),
             checksum_validation: self.checksum_validation.snapshot(),
-            tenant_quota_reservation: self.tenant_quota_reservation.snapshot(),
-            tenant_quota_finalize: self.tenant_quota_finalize.snapshot(),
-            tenant_quota_abort: self.tenant_quota_abort.snapshot(),
-            tenant_quota_reconcile: self.tenant_quota_reconcile.snapshot(),
-            tenant_local_eviction: self.tenant_local_eviction.snapshot(),
-            preferred_segment_skip: self.preferred_segment_skip.snapshot(),
-            rebalance_routes: self.rebalance_routes.snapshot(),
-            rebalance_bytes: self.rebalance_bytes.snapshot(),
-            segment_lifecycle: self.segment_lifecycle.snapshot(),
+            tenant_quota_reservation: self
+                .tenant_quota_reservation
+                .snapshot_with_defaults(result_keys(RESULT_OK_CONFLICT_ERROR)),
+            tenant_quota_finalize: self
+                .tenant_quota_finalize
+                .snapshot_with_defaults(result_keys(RESULT_OK_CONFLICT_ERROR)),
+            tenant_quota_abort: self
+                .tenant_quota_abort
+                .snapshot_with_defaults(result_keys(RESULT_OK_CONFLICT_ERROR)),
+            tenant_quota_reconcile: self
+                .tenant_quota_reconcile
+                .snapshot_with_defaults(result_keys(RESULT_TENANT_QUOTA_RECONCILE)),
+            tenant_local_eviction: self
+                .tenant_local_eviction
+                .snapshot_with_defaults(result_keys(RESULT_TENANT_LOCAL_EVICTION)),
+            preferred_segment_skip: self
+                .preferred_segment_skip
+                .snapshot_with_defaults(preferred_segment_skip_keys()),
+            rebalance_routes: self
+                .rebalance_routes
+                .snapshot_with_defaults(phase_result_keys("migrate", RESULT_OK_CONFLICT_ERROR)),
+            rebalance_bytes: self
+                .rebalance_bytes
+                .snapshot_with_defaults(phase_keys(REBALANCE_PHASES)),
+            segment_lifecycle: self
+                .segment_lifecycle
+                .snapshot_with_defaults(segment_lifecycle_keys()),
             eviction: self.eviction.snapshot(),
             eviction_duration: self.eviction_duration.snapshot(),
             transport_operations: self.transport_operations.snapshot(),
@@ -564,6 +599,63 @@ impl MetricsRegistry {
             })
             .collect()
     }
+}
+
+const RESULT_OK_CONFLICT_ERROR: &[&str] = &["ok", "conflict", "error"];
+const RESULT_TENANT_LOCAL_EVICTION: &[&str] = &["ok", "miss"];
+const RESULT_TENANT_QUOTA_RECONCILE: &[&str] = &["aborted", "finalized", "error"];
+const PREFERRED_SEGMENT_SKIP_REASONS: &[&str] = &[
+    "not_found",
+    "owner_unavailable",
+    "allocator",
+    "transport",
+    "other",
+];
+const REBALANCE_PHASES: &[&str] = &["migrate"];
+const SEGMENT_LIFECYCLE_ACTIONS: &[&str] = &[
+    "mount_segment",
+    "expand_local_memory",
+    "drain_segment",
+    "retire_segment",
+];
+
+fn result_keys(results: &'static [&'static str]) -> impl Iterator<Item = ResultKey> {
+    results.iter().copied().map(|result| ResultKey { result })
+}
+
+fn phase_keys(phases: &'static [&'static str]) -> impl Iterator<Item = PhaseKey> {
+    phases.iter().copied().map(|phase| PhaseKey { phase })
+}
+
+fn phase_result_keys(
+    phase: &'static str,
+    results: &'static [&'static str],
+) -> impl Iterator<Item = PhaseResultKey> {
+    results
+        .iter()
+        .copied()
+        .map(move |result| PhaseResultKey { phase, result })
+}
+
+fn preferred_segment_skip_keys() -> impl Iterator<Item = PreferredSegmentSkipKey> {
+    PREFERRED_SEGMENT_SKIP_REASONS
+        .iter()
+        .copied()
+        .map(|reason| PreferredSegmentSkipKey {
+            source: "tenant_policy",
+            reason,
+        })
+}
+
+fn segment_lifecycle_keys() -> impl Iterator<Item = ActionResultKey> {
+    SEGMENT_LIFECYCLE_ACTIONS
+        .iter()
+        .copied()
+        .flat_map(|action| {
+            ["ok", "error"]
+                .into_iter()
+                .map(move |result| ActionResultKey { action, result })
+        })
 }
 
 static METRICS: OnceLock<SharedMetricsRegistry> = OnceLock::new();
