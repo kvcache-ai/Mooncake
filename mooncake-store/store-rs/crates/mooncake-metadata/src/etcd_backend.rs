@@ -443,6 +443,10 @@ impl MetadataBackend for EtcdMetadataBackend {
         )
     }
 
+    fn backend_kind(&self) -> &'static str {
+        "etcd"
+    }
+
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
         let stable_id = lease.runtime.stable_id.clone();
         let new_epoch = lease.runtime.epoch.0;

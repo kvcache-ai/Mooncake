@@ -170,6 +170,10 @@ impl MetadataBackend for InMemoryMetadataBackend {
         format!("inmemory://{}", self.namespace_id)
     }
 
+    fn backend_kind(&self) -> &'static str {
+        "in_memory"
+    }
+
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
         use std::collections::btree_map::Entry;
 

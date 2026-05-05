@@ -399,6 +399,7 @@ Examples include:
 - control-plane batch operations
 - bytes in and bytes out
 - accumulated latency and max latency
+- metadata backend operation latency, inflight calls, and typed outcomes for Redis, etcd, or another `MetadataBackend`
 - tenant quota reservation / finalize / abort / reconcile outcomes
 - route-authority publish latency and storage-owner read/write traffic observed from control-plane route CAS, route-hit, and replica-track handlers
 

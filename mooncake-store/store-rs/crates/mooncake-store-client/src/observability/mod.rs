@@ -1,4 +1,5 @@
 mod exporter;
+mod metadata;
 mod process;
 pub(crate) mod registry;
 
@@ -20,6 +21,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::{fmt, EnvFilter};
 
+pub(crate) use metadata::observe_metadata_backend;
 pub use registry::{MetricsSnapshot, OperationMetricSnapshot};
 
 static TRACING_STATE: OnceLock<()> = OnceLock::new();
@@ -676,9 +678,10 @@ struct StatsSegmentSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        CompatibilityDescriptor,
+        CompatibilityDescriptor, MetadataBackend, StoreError,
     };
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -738,6 +741,58 @@ mod tests {
         let idle = render_prometheus_metrics_with_registry(&registry);
         assert!(idle
             .contains("mooncake_store_request_inflight{operation=\"put\",scope=\"foreground\"} 0"));
+    }
+
+    #[test]
+    fn metadata_backend_metrics_include_backend_operation_result_and_inflight() {
+        let _guard = metrics_test_lock().lock();
+        let registry = registry::new_metrics_registry();
+        let metadata: Arc<dyn MetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        let metadata = metadata::observe_metadata_backend_with_registry(metadata, registry.clone());
+        let metadata = metadata::observe_metadata_backend_with_registry(metadata, registry.clone());
+        let lease = ClientLease {
+            runtime: ClientRuntimeId::new("metadata-observed", ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms: u64::MAX,
+        };
+
+        metadata
+            .upsert_client_lease(&lease)
+            .expect("lease publish should succeed");
+        let fetched = metadata
+            .get_client_lease(&lease.runtime)
+            .expect("lease lookup should succeed");
+
+        assert!(fetched.is_some());
+        let metrics = render_prometheus_metrics_with_registry(&registry);
+        assert!(metrics.contains(
+            "mooncake_store_metadata_operation_total{backend=\"in_memory\",operation=\"upsert_client_lease\",result=\"ok\"} 1"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_metadata_operation_duration_seconds_bucket{backend=\"in_memory\",operation=\"upsert_client_lease\",result=\"ok\",le=\"+Inf\"} 1"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_metadata_operation_inflight{backend=\"in_memory\",operation=\"upsert_client_lease\"} 0"
+        ));
+    }
+
+    #[test]
+    fn metadata_result_label_keeps_backend_errors_actionable() {
+        let metadata_error: Result<()> =
+            Err(StoreError::Metadata("redis connection lost".to_string()));
+        let transport_error: Result<()> =
+            Err(StoreError::Transport("tcp connect timeout".to_string()));
+
+        assert_eq!(
+            metadata::metadata_result_label(&metadata_error),
+            "metadata_error"
+        );
+        assert_eq!(
+            metadata::metadata_result_label(&transport_error),
+            "transport_error"
+        );
     }
 
     #[test]
