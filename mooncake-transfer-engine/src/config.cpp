@@ -285,8 +285,10 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    const char* min_port_env = std::getenv("MC_MIN_PRC_PORT");
-    const char* max_port_env = std::getenv("MC_MAX_PRC_PORT");
+    const char* min_port_env = std::getenv("MC_MIN_RPC_PORT");
+    if (!min_port_env) min_port_env = std::getenv("MC_MIN_PRC_PORT");
+    const char* max_port_env = std::getenv("MC_MAX_RPC_PORT");
+    if (!max_port_env) max_port_env = std::getenv("MC_MAX_PRC_PORT");
     {
         int raw_min = min_port_env ? atoi(min_port_env) : config.rpc_min_port;
         int raw_max = max_port_env ? atoi(max_port_env) : config.rpc_max_port;
