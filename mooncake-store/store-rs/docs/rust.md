@@ -289,7 +289,7 @@ Key functions:
 - `start_metrics_http_server(...)`
 - `stop_metrics_http_server()`
 
-The exported metrics now include strict tenant quota counters for reservation, finalize, abort, and reconcile outcomes, in addition to the existing request, route-CAS, replication, eviction, and process families.
+The exported metrics now include strict tenant quota counters for reservation, finalize, abort, and reconcile outcomes, in addition to the existing request, route-CAS, replication, eviction, and process families. Sparse operational counters such as tenant quota, tenant-local eviction, preferred-segment skip, rebalance, and segment lifecycle are exported with zero-valued baseline series so dashboards show an explicit zero rate during steady state instead of `No data`.
 
 ## Full Example
 
