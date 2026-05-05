@@ -38,7 +38,7 @@ pub struct PlacementPlanner {
 impl PlacementPlanner {
     pub fn new(metadata: Arc<dyn MetadataBackend>) -> Self {
         Self {
-            metadata,
+            metadata: crate::observability::observe_metadata_backend(metadata),
             scope_label_key: DEFAULT_SCOPE_LABEL.to_string(),
             required_labels: BTreeMap::new(),
         }

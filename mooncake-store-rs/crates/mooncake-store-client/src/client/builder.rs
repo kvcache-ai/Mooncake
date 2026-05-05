@@ -82,12 +82,12 @@ fn validate_reachable_runtime(
             );
             Ok(false)
         }
-        crate::control_plane::ControlPlaneReachability::Unknown(error) => Err(StoreError::Conflict(
-            format!(
+        crate::control_plane::ControlPlaneReachability::Unknown(error) => {
+            Err(StoreError::Conflict(format!(
                 "startup guard cannot validate existing runtime {}: {error}",
                 remote.runtime
-            ),
-        )),
+            )))
+        }
     }
 }
 
@@ -143,7 +143,7 @@ pub struct StoreClientBuilder {
 impl StoreClientBuilder {
     pub fn new(metadata: Arc<dyn MetadataBackend>, stable_id: impl Into<String>) -> Self {
         Self {
-            metadata,
+            metadata: crate::observability::observe_metadata_backend(metadata),
             stable_id: ClientStableId::new(stable_id),
             compatibility: CompatibilityDescriptor::default(),
             endpoints: ClientEndpointSet::default(),
@@ -336,10 +336,9 @@ impl StoreClientBuilder {
         } else {
             self.initial_state
         };
-        let startup_activation_pending =
-            self.activate_on_local_memory_registration
-                && self.initial_state == ClientLifecycleState::Active
-                && published_initial_state != self.initial_state;
+        let startup_activation_pending = self.activate_on_local_memory_registration
+            && self.initial_state == ClientLifecycleState::Active
+            && published_initial_state != self.initial_state;
 
         let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
         let effective_tenant_policy =
@@ -376,11 +375,7 @@ impl StoreClientBuilder {
             endpoints: endpoints.clone(),
             expires_at_ms,
         };
-        validate_startup_conflicts(
-            self.metadata.as_ref(),
-            control_client.as_ref(),
-            &template,
-        )?;
+        validate_startup_conflicts(self.metadata.as_ref(), control_client.as_ref(), &template)?;
         let runtime = self.metadata.allocate_client_lease(&template)?;
         let provisional_lease = ClientLease {
             runtime: runtime.clone(),
@@ -423,8 +418,8 @@ impl StoreClientBuilder {
             transfer_stall_timeout: self.transfer_stall_timeout,
             request_timeout_override: self.request_timeout_override,
         });
-        let migration_adapter = Arc::new(LocalMigrationAdapter::new(
-            LocalMigrationExecutionContext {
+        let migration_adapter =
+            Arc::new(LocalMigrationAdapter::new(LocalMigrationExecutionContext {
                 executor_stable_id: runtime.stable_id.clone(),
                 base_lease: provisional_lease.clone(),
                 metadata: self.metadata.clone(),
@@ -437,8 +432,7 @@ impl StoreClientBuilder {
                 transfer_stall_timeout: self.transfer_stall_timeout,
                 request_timeout_override: self.request_timeout_override,
                 executions: Arc::new(Mutex::new(BTreeMap::new())),
-            },
-        ));
+            }));
         let control_plane = ControlPlaneHandle::spawn_with_migration(
             &control_bind_host(&endpoints.rpc_address),
             local_authority.clone(),
@@ -581,7 +575,10 @@ fn route_policy_from_tenant_spec(spec: &TenantPolicySpec) -> Option<RoutePolicy>
     })
 }
 
-fn bootstrap_default_route_policy(metadata: &dyn MetadataBackend, local: &RoutePolicy) -> Result<()> {
+fn bootstrap_default_route_policy(
+    metadata: &dyn MetadataBackend,
+    local: &RoutePolicy,
+) -> Result<()> {
     let domain = RoutePolicyDomain::Default;
     match metadata.get_route_policy(&domain)? {
         Some(_) => Ok(()),
@@ -611,9 +608,9 @@ fn resolve_effective_route_policy(
     if let Some(policy) = route_policy_from_tenant_spec(&tenant_spec) {
         return Ok(policy);
     }
-    if let Some(tenant_policy) = metadata.get_route_policy(&RoutePolicyDomain::Tenant(
-        default_tenant.to_string(),
-    ))? {
+    if let Some(tenant_policy) =
+        metadata.get_route_policy(&RoutePolicyDomain::Tenant(default_tenant.to_string()))?
+    {
         return Ok(tenant_policy);
     }
     metadata
@@ -642,11 +639,9 @@ fn resolved_namespace_quota(spec: &TenantPolicySpec) -> Option<NamespaceQuota> {
 }
 
 fn resolved_execution_fairness(spec: &TenantPolicySpec) -> Option<ExecutionFairness> {
-    spec.fairness
-        .as_ref()
-        .map(|fairness| ExecutionFairness {
-            max_remote_batch_items_per_tenant: fairness.max_remote_batch_items_per_tenant,
-        })
+    spec.fairness.as_ref().map(|fairness| ExecutionFairness {
+        max_remote_batch_items_per_tenant: fairness.max_remote_batch_items_per_tenant,
+    })
 }
 
 fn resolved_bandwidth_shaping(spec: &TenantPolicySpec) -> Option<BandwidthShaping> {
@@ -675,9 +670,7 @@ fn prewarm_live_client_cache(
         }
         Err(StoreError::Unsupported(_)) => {
             registry::record_runtime_leases(std::slice::from_ref(local_lease));
-            live_client_cache
-                .lock()
-                .store(vec![local_lease.clone()]);
+            live_client_cache.lock().store(vec![local_lease.clone()]);
             Ok(())
         }
         Err(error) => Err(error),

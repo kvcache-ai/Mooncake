@@ -49,6 +49,10 @@ pub(crate) const EVICTION_TOTAL: &str = "mooncake_store_eviction_total";
 pub(crate) const EVICTION_DURATION: &str = "mooncake_store_eviction_duration_seconds";
 pub(crate) const TRANSPORT_OPERATION_TOTAL: &str = "mooncake_store_transport_operation_total";
 pub(crate) const TRANSPORT_BYTES_TOTAL: &str = "mooncake_store_transport_bytes_total";
+pub(crate) const METADATA_OPERATION_TOTAL: &str = "mooncake_store_metadata_operation_total";
+pub(crate) const METADATA_OPERATION_INFLIGHT: &str = "mooncake_store_metadata_operation_inflight";
+pub(crate) const METADATA_OPERATION_DURATION: &str =
+    "mooncake_store_metadata_operation_duration_seconds";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OperationMetricSnapshot {
@@ -94,6 +98,9 @@ pub struct MetricsSnapshot {
     pub eviction_duration: Vec<HistogramSample<ResultKey>>,
     pub transport_operations: Vec<CounterSample<TransportOperationKey>>,
     pub transport_bytes: Vec<CounterSample<TransportBytesKey>>,
+    pub metadata_operations: Vec<CounterSample<MetadataOperationKey>>,
+    pub metadata_inflight: Vec<GaugeSample<MetadataInflightKey>>,
+    pub metadata_duration: Vec<HistogramSample<MetadataOperationKey>>,
     pub process: ProcessSnapshot,
 }
 
@@ -156,6 +163,19 @@ pub struct TransportOperationKey {
     pub direction: &'static str,
     pub peer_kind: &'static str,
     pub result: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct MetadataOperationKey {
+    pub backend: &'static str,
+    pub operation: &'static str,
+    pub result: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct MetadataInflightKey {
+    pub backend: &'static str,
+    pub operation: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -396,6 +416,9 @@ struct MetricsRegistry {
     eviction_duration: HistogramFamily<ResultKey>,
     transport_operations: CounterFamily<TransportOperationKey>,
     transport_bytes: CounterFamily<TransportBytesKey>,
+    metadata_operations: CounterFamily<MetadataOperationKey>,
+    metadata_inflight: GaugeFamily<MetadataInflightKey>,
+    metadata_duration: HistogramFamily<MetadataOperationKey>,
 }
 
 #[derive(Clone, Default)]
@@ -526,6 +549,9 @@ impl MetricsRegistry {
             eviction_duration: self.eviction_duration.snapshot(),
             transport_operations: self.transport_operations.snapshot(),
             transport_bytes: self.transport_bytes.snapshot(),
+            metadata_operations: self.metadata_operations.snapshot(),
+            metadata_inflight: self.metadata_inflight.snapshot(),
+            metadata_duration: self.metadata_duration.snapshot(),
             process,
         }
     }
@@ -840,6 +866,47 @@ pub(crate) fn record_transport_operation(
         },
         1,
     );
+}
+
+pub(crate) fn increment_metadata_inflight_with_registry(
+    registry: &SharedMetricsRegistry,
+    backend: &'static str,
+    operation: &'static str,
+) {
+    registry
+        .lock()
+        .metadata_inflight
+        .add(MetadataInflightKey { backend, operation }, 1.0);
+}
+
+pub(crate) fn decrement_metadata_inflight_with_registry(
+    registry: &SharedMetricsRegistry,
+    backend: &'static str,
+    operation: &'static str,
+) {
+    registry
+        .lock()
+        .metadata_inflight
+        .add(MetadataInflightKey { backend, operation }, -1.0);
+}
+
+pub(crate) fn record_metadata_operation_with_registry(
+    registry: &SharedMetricsRegistry,
+    backend: &'static str,
+    operation: &'static str,
+    result: &'static str,
+    duration: Duration,
+) {
+    let mut registry = registry.lock();
+    let key = MetadataOperationKey {
+        backend,
+        operation,
+        result,
+    };
+    registry.metadata_operations.add(key.clone(), 1);
+    registry
+        .metadata_duration
+        .observe(key, duration.as_secs_f64());
 }
 
 pub(crate) fn record_membership_refresh(result: &'static str, duration: Duration) {

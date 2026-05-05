@@ -15,6 +15,16 @@ use crate::route::{
 pub trait MetadataBackend: Send + Sync {
     fn route_namespace(&self) -> String;
 
+    /// Low-cardinality backend label for Store-RS metadata metrics.
+    fn backend_kind(&self) -> &'static str {
+        "unknown"
+    }
+
+    #[doc(hidden)]
+    fn metrics_observed(&self) -> bool {
+        false
+    }
+
     /// Republishes a client lease at an already-assigned `(stable_id, epoch)`.
     ///
     /// This path is for heartbeat refresh, lifecycle-state updates, and low-level

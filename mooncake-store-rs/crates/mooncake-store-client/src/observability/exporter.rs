@@ -1,11 +1,12 @@
 use super::registry::{
-    ActionResultKey, CounterSample, GaugeSample, HistogramSample, MetricsSnapshot, PhaseKey,
-    PhaseResultKey, PreferredSegmentSkipKey, ReplicaDistributionKey, RequestBytesKey,
-    RequestInflightKey, RequestKey, ResultKey, RuntimeKey, RuntimeStatusKey, TenantKey,
-    TransportBytesKey, TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, EVICTION_DURATION,
-    EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES, HEARTBEAT_LAST_SUCCESS_MS,
-    MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL, OBJECT_ROUTES,
-    PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL, REBALANCE_ROUTES_TOTAL,
+    ActionResultKey, CounterSample, GaugeSample, HistogramSample, MetadataInflightKey,
+    MetadataOperationKey, MetricsSnapshot, PhaseKey, PhaseResultKey, PreferredSegmentSkipKey,
+    ReplicaDistributionKey, RequestBytesKey, RequestInflightKey, RequestKey, ResultKey, RuntimeKey,
+    RuntimeStatusKey, TenantKey, TransportBytesKey, TransportOperationKey,
+    CHECKSUM_VALIDATION_TOTAL, EVICTION_DURATION, EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES,
+    HEARTBEAT_LAST_SUCCESS_MS, MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL,
+    METADATA_OPERATION_DURATION, METADATA_OPERATION_INFLIGHT, METADATA_OPERATION_TOTAL,
+    OBJECT_ROUTES, PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL, REBALANCE_ROUTES_TOTAL,
     REPLICATION_PUBLISH_DURATION, REPLICATION_PUBLISH_TOTAL, REPLICA_DISTRIBUTION, REQUEST_BYTES,
     REQUEST_DURATION, REQUEST_DURATION_BUCKETS, REQUEST_INFLIGHT, REQUEST_TOTAL, ROUTE_CAS_TOTAL,
     RUNTIME_LEASE_EXPIRES_AT_MS, RUNTIME_STATUS, SEGMENT_CAPACITY_BYTES, SEGMENT_LIFECYCLE_TOTAL,
@@ -19,10 +20,59 @@ pub(crate) fn render_prometheus_metrics(snapshot: &MetricsSnapshot) -> String {
     render_legacy_operation_metrics(&mut output, snapshot);
     render_request_metrics(&mut output, snapshot);
     render_cluster_state_metrics(&mut output, snapshot);
+    render_metadata_metrics(&mut output, snapshot);
     render_consistency_metrics(&mut output, snapshot);
     render_recovery_metrics(&mut output, snapshot);
     render_process_metrics(&mut output, snapshot);
     output
+}
+
+fn render_metadata_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
+    counter_family(
+        output,
+        METADATA_OPERATION_TOTAL,
+        "Metadata backend operation outcomes by backend, operation, and result.",
+    );
+    for CounterSample { key, value } in &snapshot.metadata_operations {
+        let MetadataOperationKey {
+            backend,
+            operation,
+            result,
+        } = key;
+        output.push_str(&format!(
+            "{}{{backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
+            METADATA_OPERATION_TOTAL,
+            escape(backend),
+            escape(operation),
+            escape(result),
+            value
+        ));
+    }
+
+    gauge_family(
+        output,
+        METADATA_OPERATION_INFLIGHT,
+        "Inflight metadata backend operations by backend and operation.",
+    );
+    for GaugeSample { key, value } in &snapshot.metadata_inflight {
+        let MetadataInflightKey { backend, operation } = key;
+        output.push_str(&format!(
+            "{}{{backend=\"{}\",operation=\"{}\"}} {}\n",
+            METADATA_OPERATION_INFLIGHT,
+            escape(backend),
+            escape(operation),
+            value
+        ));
+    }
+
+    histogram_family(
+        output,
+        METADATA_OPERATION_DURATION,
+        "Metadata backend operation duration in seconds.",
+    );
+    for sample in &snapshot.metadata_duration {
+        render_metadata_histogram(output, METADATA_OPERATION_DURATION, sample);
+    }
 }
 
 fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
@@ -579,6 +629,44 @@ fn render_result_histogram(output: &mut String, metric: &str, sample: &Histogram
     ));
     output.push_str(&format!(
         "{metric}_count{{result=\"{}\"}} {}\n",
+        escape(sample.key.result),
+        sample.count
+    ));
+}
+
+fn render_metadata_histogram(
+    output: &mut String,
+    metric: &str,
+    sample: &HistogramSample<MetadataOperationKey>,
+) {
+    for (le, value) in REQUEST_DURATION_BUCKETS.iter().zip(sample.buckets.iter()) {
+        output.push_str(&format!(
+            "{metric}_bucket{{backend=\"{}\",operation=\"{}\",result=\"{}\",le=\"{}\"}} {}\n",
+            escape(sample.key.backend),
+            escape(sample.key.operation),
+            escape(sample.key.result),
+            format_bucket(*le),
+            value
+        ));
+    }
+    output.push_str(&format!(
+        "{metric}_bucket{{backend=\"{}\",operation=\"{}\",result=\"{}\",le=\"+Inf\"}} {}\n",
+        escape(sample.key.backend),
+        escape(sample.key.operation),
+        escape(sample.key.result),
+        sample.count
+    ));
+    output.push_str(&format!(
+        "{metric}_sum{{backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
+        escape(sample.key.backend),
+        escape(sample.key.operation),
+        escape(sample.key.result),
+        sample.sum
+    ));
+    output.push_str(&format!(
+        "{metric}_count{{backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
+        escape(sample.key.backend),
+        escape(sample.key.operation),
         escape(sample.key.result),
         sample.count
     ));
