@@ -12,6 +12,7 @@ use mooncake_store_core::{
 };
 
 use super::registry;
+use super::ProfilingSpan;
 
 pub(crate) fn observe_metadata_backend(
     metadata: Arc<dyn MetadataBackend>,
@@ -41,10 +42,12 @@ struct ObservedMetadataBackend {
 
 impl ObservedMetadataBackend {
     fn observe<T>(&self, operation: &'static str, call: impl FnOnce() -> Result<T>) -> Result<T> {
+        let profiling_span = ProfilingSpan::start_metadata(self.backend, operation);
         let _inflight =
             MetadataInflightGuard::enter(self.backend, operation, self.registry.clone());
         let start = Instant::now();
         let result = call();
+        profiling_span.finish(metadata_result_label(&result), 0);
         registry::record_metadata_operation_with_registry(
             &self.registry,
             self.backend,

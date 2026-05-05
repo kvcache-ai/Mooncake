@@ -667,6 +667,14 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRACE_FILTER` | standalone client, Python wrapper setup fallback, e2e, and applications | `tracing_subscriber` filter string; `--trace-filter` overrides it for the standalone client |
 | `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |
 | `MC_STORE_RS_TRACE_SPAN_EVENTS` | standalone client, Python real mode, e2e, and applications | tracing span lifecycle events; unset suppresses synthetic span close lines, `close` enables operation close timing logs |
+| `MC_STORE_RS_OTLP_ENDPOINT` | standalone client, Python real mode, bench, and applications | OTLP HTTP endpoint for Jaeger profiling; `http://host:4318` is normalized to `/v1/traces` |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | standalone client, Python real mode, bench, and applications | standard OTLP traces endpoint; used as-is and takes precedence over `MC_STORE_RS_OTLP_ENDPOINT` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | standalone client, Python real mode, bench, and applications | standard base OTLP endpoint; normalized to `/v1/traces` |
+| `MC_STORE_RS_OTLP_TRACE` | standalone client, Python real mode, bench, and applications | initial Jaeger profiling switch; unset keeps profiling off until `/tracing` enables it |
+| `MC_STORE_RS_OTLP_SERVICE_NAME` / `OTEL_SERVICE_NAME` | standalone client, Python real mode, bench, and applications | Jaeger service name; default `mooncake-store-rs` |
+| `MC_STORE_RS_OTLP_SERVICE_INSTANCE_ID` | standalone client, Python real mode, bench, and applications | Jaeger service instance id; defaults to `HOSTNAME` when present |
+| `MC_STORE_RS_OTLP_TIMEOUT_MS` | standalone client, Python real mode, bench, and applications | OTLP export timeout; default `3000` |
+| `MC_STORE_RS_OTLP_SAMPLE_RATIO` | standalone client, Python real mode, bench, and applications | OTLP trace sampling ratio from `0.0` to `1.0`; default `1.0`, lower it for high-throughput profiling |
 | `MC_BENCH_TRACE_FILE` | `mooncake-store-bench` | append bench tracing logs to this file; bench otherwise logs to `stderr` and does not use `MC_STORE_RS_TRACE_FILE` for its own output |
 | `MC_BENCH_INTERFACES` | `mooncake-store-bench` | combined write/read interface selector; accepts `<write>,<read>`, `<write>:<read>`, or `write=<...>,read=<...>`; when set it overrides non-CLI interface defaults |
 | `MC_BENCH_WRITE_INTERFACE` | `mooncake-store-bench` | measured write-side bench API; `put`, `batch_put`, or `batch_put_from`; default `batch_put_from` |
@@ -718,6 +726,18 @@ The metrics HTTP server exposes:
 
 - `GET /metrics`
 - `GET /healthz`
+- `GET /tracing`
+- `POST /tracing/on`
+- `POST /tracing/off`
+- `POST /tracing?enabled=on&endpoint=http%3A%2F%2Fjaeger.observability.svc.cluster.local%3A4318&sample_ratio=0.05`
+- `POST /tracing/flush`
+
+`/tracing` returns JSON status for the OTLP profiler. Enabling requires an
+endpoint from either environment variables or the request query. The endpoint is
+locked after the exporter is initialized, because changing Jaeger backends while
+batch processors are running would make trace ownership ambiguous.
+The same lock applies to `service_name`, `service_instance_id`, and
+`sample_ratio`; set them before enabling export.
 
 Exporter families:
 
