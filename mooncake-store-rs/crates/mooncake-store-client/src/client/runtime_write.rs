@@ -197,6 +197,11 @@ impl StoreClient {
                     Ok(())
                 })();
                 tracker.finish(&result, 0);
+                registry::record_transport_operation(
+                    "write",
+                    "storage",
+                    if result.is_ok() { "ok" } else { "error" },
+                );
                 if result.is_ok() {
                     registry::record_transport_bytes("write", "storage", remote_bytes);
                 }
@@ -695,6 +700,12 @@ impl StoreClient {
                 .map(|entry| entry.value.len())
                 .sum::<usize>() as u64,
         );
+        let has_remote_targets = prepared.iter().any(|entry| {
+            entry
+                .targets
+                .iter()
+                .any(|target| target.storage_runtime != self.lease.runtime)
+        });
         let write_result = {
             let mut refreshed = false;
             loop {
@@ -1028,6 +1039,13 @@ impl StoreClient {
             }
         };
         write_tracker.finish(&write_result, 0);
+        if has_remote_targets {
+            registry::record_transport_operation(
+                "write",
+                "storage",
+                if write_result.is_ok() { "ok" } else { "error" },
+            );
+        }
         match write_result {
             Ok(routes) => break (routes, prepared),
             Err(error) => {
