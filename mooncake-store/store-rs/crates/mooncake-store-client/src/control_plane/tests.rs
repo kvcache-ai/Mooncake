@@ -1755,6 +1755,12 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .contains("mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"client\"} 32"));
         assert!(metrics
             .contains("mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"client\"} 16"));
+        assert!(metrics.contains(
+            "mooncake_store_transport_operation_total{direction=\"read\",peer_kind=\"client\",result=\"ok\"} 1"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"client\",result=\"ok\"} 1"
+        ));
         assert!(metrics.contains("mooncake_store_checksum_validation_total{result=\"ok\"} 2"));
         assert!(metrics.contains(
             "mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"} 1"

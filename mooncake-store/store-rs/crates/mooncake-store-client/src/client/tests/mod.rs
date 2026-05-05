@@ -2739,6 +2739,13 @@ fn observability_metrics_render_remote_datapaths() {
     assert!(metrics.contains("operation=\"get_remote_direct\",status=\"ok\""));
     assert!(metrics
         .contains("mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"}"));
+    assert!(metrics.contains("mooncake_store_replication_publish_total{result=\"ok\"}"));
+    assert!(metrics.contains(
+        "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"storage\",result=\"ok\"}"
+    ));
+    assert!(metrics.contains(
+        "mooncake_store_transport_operation_total{direction=\"read\",peer_kind=\"storage\",result=\"ok\"}"
+    ));
     assert!(metrics.contains(
         "mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"storage\"}"
     ));

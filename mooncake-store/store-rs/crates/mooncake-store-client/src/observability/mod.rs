@@ -741,6 +741,21 @@ mod tests {
     }
 
     #[test]
+    fn consistency_and_transport_counters_are_rendered() {
+        let _guard = metrics_test_lock().lock();
+        registry::reset_metrics();
+
+        registry::record_replication_publish("error", std::time::Duration::from_millis(7));
+        registry::record_transport_operation("write", "storage", "error");
+
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains("mooncake_store_replication_publish_total{result=\"error\"} 1"));
+        assert!(metrics.contains(
+            "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"storage\",result=\"error\"} 1"
+        ));
+    }
+
+    #[test]
     fn process_metrics_are_rendered_with_request_snapshot() {
         let _guard = metrics_test_lock().lock();
         let registry = registry::new_metrics_registry();

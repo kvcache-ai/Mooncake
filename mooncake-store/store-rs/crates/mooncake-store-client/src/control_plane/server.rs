@@ -400,6 +400,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     "control",
                     report.bytes,
                 );
+                registry::record_transport_operation("read", "client", "ok");
                 registry::record_transport_bytes("read", "client", report.bytes);
                 registry::record_checksum_validations("ok", report.accepted as u64);
                 pb::BatchReportRouteHitsReply {
@@ -407,10 +408,13 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     error: None,
                 }
             }
-            Err(error) => pb::BatchReportRouteHitsReply {
-                accepted: 0,
-                error: Some(pb_error(error)),
-            },
+            Err(error) => {
+                registry::record_transport_operation("read", "client", "error");
+                pb::BatchReportRouteHitsReply {
+                    accepted: 0,
+                    error: Some(pb_error(error)),
+                }
+            }
         };
         Ok(Response::new(reply))
     }
@@ -433,16 +437,20 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     "control",
                     report.bytes,
                 );
+                registry::record_transport_operation("write", "client", "ok");
                 registry::record_transport_bytes("write", "client", report.bytes);
                 pb::BatchTrackReplicaRoutesReply {
                     accepted: report.accepted as u64,
                     error: None,
                 }
             }
-            Err(error) => pb::BatchTrackReplicaRoutesReply {
-                accepted: 0,
-                error: Some(pb_error(error)),
-            },
+            Err(error) => {
+                registry::record_transport_operation("write", "client", "error");
+                pb::BatchTrackReplicaRoutesReply {
+                    accepted: 0,
+                    error: Some(pb_error(error)),
+                }
+            }
         };
         Ok(Response::new(reply))
     }

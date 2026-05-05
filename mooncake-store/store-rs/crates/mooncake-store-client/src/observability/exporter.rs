@@ -2,15 +2,16 @@ use super::registry::{
     ActionResultKey, CounterSample, GaugeSample, HistogramSample, MetricsSnapshot, PhaseKey,
     PhaseResultKey, PreferredSegmentSkipKey, ReplicaDistributionKey, RequestBytesKey,
     RequestInflightKey, RequestKey, ResultKey, RuntimeKey, RuntimeStatusKey, TenantKey,
-    TransportBytesKey, CHECKSUM_VALIDATION_TOTAL, EVICTION_DURATION, EVICTION_TOTAL,
-    HEARTBEAT_CONSECUTIVE_FAILURES, HEARTBEAT_LAST_SUCCESS_MS, MEMBERSHIP_REFRESH_DURATION,
-    MEMBERSHIP_REFRESH_TOTAL, OBJECT_ROUTES, PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL,
-    REBALANCE_ROUTES_TOTAL, REPLICATION_PUBLISH_DURATION, REPLICA_DISTRIBUTION, REQUEST_BYTES,
+    TransportBytesKey, TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, EVICTION_DURATION,
+    EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES, HEARTBEAT_LAST_SUCCESS_MS,
+    MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL, OBJECT_ROUTES,
+    PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL, REBALANCE_ROUTES_TOTAL,
+    REPLICATION_PUBLISH_DURATION, REPLICATION_PUBLISH_TOTAL, REPLICA_DISTRIBUTION, REQUEST_BYTES,
     REQUEST_DURATION, REQUEST_DURATION_BUCKETS, REQUEST_INFLIGHT, REQUEST_TOTAL, ROUTE_CAS_TOTAL,
     RUNTIME_LEASE_EXPIRES_AT_MS, RUNTIME_STATUS, SEGMENT_CAPACITY_BYTES, SEGMENT_LIFECYCLE_TOTAL,
     SEGMENT_USED_BYTES, TENANT_LOCAL_EVICTION_TOTAL, TENANT_QUOTA_ABORT_TOTAL,
     TENANT_QUOTA_FINALIZE_TOTAL, TENANT_QUOTA_RECONCILE_TOTAL, TENANT_QUOTA_RESERVATION_TOTAL,
-    TRANSPORT_BYTES_TOTAL,
+    TRANSPORT_BYTES_TOTAL, TRANSPORT_OPERATION_TOTAL,
 };
 
 pub(crate) fn render_prometheus_metrics(snapshot: &MetricsSnapshot) -> String {
@@ -296,6 +297,13 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     counter_family(output, ROUTE_CAS_TOTAL, "Route CAS outcomes.");
     for_result_counter(output, ROUTE_CAS_TOTAL, &snapshot.route_cas);
 
+    counter_family(output, REPLICATION_PUBLISH_TOTAL, "Route publish outcomes.");
+    for_result_counter(
+        output,
+        REPLICATION_PUBLISH_TOTAL,
+        &snapshot.replication_publish,
+    );
+
     histogram_family(
         output,
         REPLICATION_PUBLISH_DURATION,
@@ -438,6 +446,27 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     );
     for sample in &snapshot.eviction_duration {
         render_result_histogram(output, EVICTION_DURATION, sample);
+    }
+
+    counter_family(
+        output,
+        TRANSPORT_OPERATION_TOTAL,
+        "Transport operation outcomes by peer kind.",
+    );
+    for CounterSample { key, value } in &snapshot.transport_operations {
+        let TransportOperationKey {
+            direction,
+            peer_kind,
+            result,
+        } = key;
+        output.push_str(&format!(
+            "{}{{direction=\"{}\",peer_kind=\"{}\",result=\"{}\"}} {}\n",
+            TRANSPORT_OPERATION_TOTAL,
+            escape(direction),
+            escape(peer_kind),
+            escape(result),
+            value
+        ));
     }
 
     counter_family(

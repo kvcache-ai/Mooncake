@@ -31,6 +31,7 @@ pub(crate) const MEMBERSHIP_REFRESH_TOTAL: &str = "mooncake_store_membership_ref
 pub(crate) const MEMBERSHIP_REFRESH_DURATION: &str =
     "mooncake_store_membership_refresh_duration_seconds";
 pub(crate) const ROUTE_CAS_TOTAL: &str = "mooncake_store_route_cas_total";
+pub(crate) const REPLICATION_PUBLISH_TOTAL: &str = "mooncake_store_replication_publish_total";
 pub(crate) const REPLICATION_PUBLISH_DURATION: &str =
     "mooncake_store_replication_publish_duration_seconds";
 pub(crate) const CHECKSUM_VALIDATION_TOTAL: &str = "mooncake_store_checksum_validation_total";
@@ -46,6 +47,7 @@ pub(crate) const REBALANCE_BYTES_TOTAL: &str = "mooncake_store_rebalance_bytes_t
 pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecycle_total";
 pub(crate) const EVICTION_TOTAL: &str = "mooncake_store_eviction_total";
 pub(crate) const EVICTION_DURATION: &str = "mooncake_store_eviction_duration_seconds";
+pub(crate) const TRANSPORT_OPERATION_TOTAL: &str = "mooncake_store_transport_operation_total";
 pub(crate) const TRANSPORT_BYTES_TOTAL: &str = "mooncake_store_transport_bytes_total";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -76,6 +78,7 @@ pub struct MetricsSnapshot {
     pub membership_refresh: Vec<CounterSample<ResultKey>>,
     pub membership_refresh_duration: Vec<HistogramSample<ResultKey>>,
     pub route_cas: Vec<CounterSample<ResultKey>>,
+    pub replication_publish: Vec<CounterSample<ResultKey>>,
     pub replication_publish_duration: Vec<HistogramSample<ResultKey>>,
     pub checksum_validation: Vec<CounterSample<ResultKey>>,
     pub tenant_quota_reservation: Vec<CounterSample<ResultKey>>,
@@ -89,6 +92,7 @@ pub struct MetricsSnapshot {
     pub segment_lifecycle: Vec<CounterSample<ActionResultKey>>,
     pub eviction: Vec<CounterSample<ResultKey>>,
     pub eviction_duration: Vec<HistogramSample<ResultKey>>,
+    pub transport_operations: Vec<CounterSample<TransportOperationKey>>,
     pub transport_bytes: Vec<CounterSample<TransportBytesKey>>,
     pub process: ProcessSnapshot,
 }
@@ -145,6 +149,13 @@ pub struct ActionResultKey {
 pub struct TransportBytesKey {
     pub direction: &'static str,
     pub peer_kind: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TransportOperationKey {
+    pub direction: &'static str,
+    pub peer_kind: &'static str,
+    pub result: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -352,6 +363,7 @@ struct MetricsRegistry {
     membership_refresh: CounterFamily<ResultKey>,
     membership_refresh_duration: HistogramFamily<ResultKey>,
     route_cas: CounterFamily<ResultKey>,
+    replication_publish: CounterFamily<ResultKey>,
     replication_publish_duration: HistogramFamily<ResultKey>,
     checksum_validation: CounterFamily<ResultKey>,
     tenant_quota_reservation: CounterFamily<ResultKey>,
@@ -365,6 +377,7 @@ struct MetricsRegistry {
     segment_lifecycle: CounterFamily<ActionResultKey>,
     eviction: CounterFamily<ResultKey>,
     eviction_duration: HistogramFamily<ResultKey>,
+    transport_operations: CounterFamily<TransportOperationKey>,
     transport_bytes: CounterFamily<TransportBytesKey>,
 }
 
@@ -462,6 +475,7 @@ impl MetricsRegistry {
             membership_refresh: self.membership_refresh.snapshot(),
             membership_refresh_duration: self.membership_refresh_duration.snapshot(),
             route_cas: self.route_cas.snapshot(),
+            replication_publish: self.replication_publish.snapshot(),
             replication_publish_duration: self.replication_publish_duration.snapshot(),
             checksum_validation: self.checksum_validation.snapshot(),
             tenant_quota_reservation: self.tenant_quota_reservation.snapshot(),
@@ -475,6 +489,7 @@ impl MetricsRegistry {
             segment_lifecycle: self.segment_lifecycle.snapshot(),
             eviction: self.eviction.snapshot(),
             eviction_duration: self.eviction_duration.snapshot(),
+            transport_operations: self.transport_operations.snapshot(),
             transport_bytes: self.transport_bytes.snapshot(),
             process,
         }
@@ -623,10 +638,12 @@ pub(crate) fn record_route_cas(result: &'static str) {
 }
 
 pub(crate) fn record_replication_publish(result: &'static str, duration: Duration) {
-    global_metrics_registry()
-        .lock()
+    let mut registry = global_metrics_registry().lock();
+    let key = ResultKey { result };
+    registry.replication_publish.add(key.clone(), 1);
+    registry
         .replication_publish_duration
-        .observe(ResultKey { result }, duration.as_secs_f64());
+        .observe(key, duration.as_secs_f64());
 }
 
 pub(crate) fn record_checksum_validation(result: &'static str) {
@@ -715,6 +732,21 @@ pub(crate) fn record_transport_bytes(direction: &'static str, peer_kind: &'stati
             peer_kind,
         },
         bytes,
+    );
+}
+
+pub(crate) fn record_transport_operation(
+    direction: &'static str,
+    peer_kind: &'static str,
+    result: &'static str,
+) {
+    global_metrics_registry().lock().transport_operations.add(
+        TransportOperationKey {
+            direction,
+            peer_kind,
+            result,
+        },
+        1,
     );
 }
 

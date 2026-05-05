@@ -177,6 +177,17 @@ What it provides:
 - same-epoch lease reclaim after a lease TTL gap when no higher live epoch exists, so heartbeat repair and predecessor drain pinning do not fail with stale-epoch rejection
 - `with_soft_pin`
 
+## Observability
+
+The client Prometheus exporter reports both request-level and internal operation-level store
+health. Remote data-plane transfers now expose explicit transport operation outcomes through
+`mooncake_store_transport_operation_total{direction,peer_kind,result}` in addition to successful
+byte volume through `mooncake_store_transport_bytes_total{direction,peer_kind}`.
+
+Route publication also exposes `mooncake_store_replication_publish_total{result}` alongside the
+existing publish latency histogram. Operators can therefore distinguish publish failures from slow
+successful publishes without inferring result counts from histogram internals.
+
 ## Allocation and Segment Management
 
 ### Local allocation

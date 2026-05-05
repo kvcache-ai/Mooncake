@@ -3171,6 +3171,11 @@ impl StoreClient {
             "executed remote batch get chunk"
         );
         tracker.finish(&result, bytes_out);
+        registry::record_transport_operation(
+            "read",
+            "storage",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         if result.is_ok() {
             registry::record_transport_bytes("read", "storage", bytes_out);
         }
@@ -3288,6 +3293,11 @@ impl StoreClient {
             "executed direct remote batch get chunk into registered buffers"
         );
         tracker.finish(&result, bytes_out);
+        registry::record_transport_operation(
+            "read",
+            "storage",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         if result.is_ok() {
             registry::record_transport_bytes("read", "storage", bytes_out);
         }
@@ -3423,6 +3433,11 @@ impl StoreClient {
             "executed remote direct get fallback"
         );
         tracker.finish(&result, length as u64);
+        registry::record_transport_operation(
+            "read",
+            "storage",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         if result.is_ok() {
             registry::record_transport_bytes("read", "storage", length as u64);
         }
