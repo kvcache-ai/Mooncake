@@ -931,6 +931,25 @@ fn sample_lease(address: &str) -> ClientLease {
     }
 }
 
+fn prometheus_sample_value(metrics: &str, sample: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix(sample)?.strip_prefix(' ')?;
+            value.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+}
+
+fn assert_metric_delta_at_least(before: &str, after: &str, sample: &str, expected: u64) {
+    let previous = prometheus_sample_value(before, sample);
+    let current = prometheus_sample_value(after, sample);
+    assert!(
+        current >= previous.saturating_add(expected),
+        "expected {sample} to increase by at least {expected}, before={previous}, after={current}"
+    );
+}
+
 #[test]
 fn control_plane_client_round_trips_routes_and_allocator_calls() {
     let _guard = metrics_test_lock().lock();
@@ -1553,6 +1572,8 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
         .expect("runtime should start");
 
     runtime.block_on(async {
+        let metrics_before = render_prometheus_metrics();
+
         let get_reply = service
             .get_route(Request::new(pb::GetRouteRequest {
                 namespace: "ns-a".to_string(),
@@ -1747,26 +1768,54 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
         assert_eq!(eviction.reported.lock().len(), 3);
 
         let metrics = render_prometheus_metrics();
-        assert!(metrics.contains(
-            "mooncake_store_request_bytes_total{operation=\"storage_owner_report_route_hits\",direction=\"read\",scope=\"control\"} 32"
-        ));
-        assert!(metrics.contains(
-            "mooncake_store_request_bytes_total{operation=\"storage_owner_track_replica_routes\",direction=\"write\",scope=\"control\"} 16"
-        ));
-        assert!(metrics
-            .contains("mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"client\"} 32"));
-        assert!(metrics
-            .contains("mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"client\"} 16"));
-        assert!(metrics.contains(
-            "mooncake_store_transport_operation_total{direction=\"read\",peer_kind=\"client\",result=\"ok\"} 1"
-        ));
-        assert!(metrics.contains(
-            "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"client\",result=\"ok\"} 1"
-        ));
-        assert!(metrics.contains("mooncake_store_checksum_validation_total{result=\"ok\"} 2"));
-        assert!(metrics.contains(
-            "mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"} 1"
-        ));
+        assert_metric_delta_at_least(
+            &metrics_before,
+            &metrics,
+            "mooncake_store_request_bytes_total{operation=\"storage_owner_report_route_hits\",direction=\"read\",scope=\"control\"}",
+            32,
+        );
+        assert_metric_delta_at_least(
+            &metrics_before,
+            &metrics,
+            "mooncake_store_request_bytes_total{operation=\"storage_owner_track_replica_routes\",direction=\"write\",scope=\"control\"}",
+            16,
+        );
+        assert_metric_delta_at_least(
+            &metrics_before,
+            &metrics,
+            "mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"client\"}",
+            32,
+        );
+        assert_metric_delta_at_least(
+            &metrics_before,
+            &metrics,
+            "mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"client\"}",
+            16,
+        );
+        assert_metric_delta_at_least(
+            &metrics_before,
+            &metrics,
+            "mooncake_store_transport_operation_total{direction=\"read\",peer_kind=\"client\",result=\"ok\"}",
+            1,
+        );
+        assert_metric_delta_at_least(
+            &metrics_before,
+            &metrics,
+            "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"client\",result=\"ok\"}",
+            1,
+        );
+        assert_metric_delta_at_least(
+            &metrics_before,
+            &metrics,
+            "mooncake_store_checksum_validation_total{result=\"ok\"}",
+            2,
+        );
+        assert_metric_delta_at_least(
+            &metrics_before,
+            &metrics,
+            "mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"}",
+            1,
+        );
 
         let stream_reply = handle_control_stream_request(
             &service,

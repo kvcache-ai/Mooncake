@@ -8826,10 +8826,14 @@ fn helper_primitives_and_request_builders_cover_contracts() {
     assert_eq!(align_up_u64(64, 64), 64);
     assert!(now_ms() > 0);
 
-    record_success_metric("helper_metric", 12, 34);
-    let metrics = render_prometheus_metrics();
-    assert!(metrics.contains("operation=\"helper_metric\",status=\"ok\""));
-    assert!(metrics.contains("mooncake_store_operation_bytes_in_total"));
+    {
+        let _guard = metrics_test_lock().lock();
+        reset_metrics();
+        record_success_metric("helper_metric", 12, 34);
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains("operation=\"helper_metric\",status=\"ok\""));
+        assert!(metrics.contains("mooncake_store_operation_bytes_in_total"));
+    }
 
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     assert!(matches!(
