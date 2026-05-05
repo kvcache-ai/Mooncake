@@ -1,13 +1,13 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::env;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use mooncake_store_core::{Result, StoreError};
-use opentelemetry::global::BoxedSpan;
-use opentelemetry::trace::{Span as _, Status, Tracer};
-use opentelemetry::{global, KeyValue};
+use opentelemetry::trace::{Span as _, Status, TraceContextExt, Tracer};
+use opentelemetry::{global, Context, KeyValue};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use opentelemetry_sdk::Resource;
@@ -27,9 +27,33 @@ const SAMPLE_RATIO_ENV: &str = "MC_STORE_RS_OTLP_SAMPLE_RATIO";
 const DEFAULT_EXPORT_TIMEOUT: Duration = Duration::from_secs(3);
 
 static PROFILING_CONTROL: OnceLock<ProfilingControl> = OnceLock::new();
+static NEXT_PROFILING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static PROFILING_CONTEXT_STACK: RefCell<Vec<ProfilingFrame>> = const {
+        RefCell::new(Vec::new())
+    };
+}
 
 pub(crate) struct ProfilingSpan {
-    span: Option<BoxedSpan>,
+    context: Option<Context>,
+    stack_depth: Option<usize>,
+}
+
+#[derive(Clone)]
+struct ProfilingFrame {
+    context: Context,
+    request_id: u64,
+    root_operation: &'static str,
+    flow: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperationSemantics {
+    span_name: &'static str,
+    phase: &'static str,
+    flow: &'static str,
+    role: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,41 +90,53 @@ struct ProfilingControl {
 }
 
 impl ProfilingSpan {
-    pub(crate) fn start(name: &'static str) -> Self {
-        Self::start_named(|| Cow::Borrowed(name))
+    pub(crate) fn start(operation: &'static str) -> Self {
+        let semantics = operation_semantics(operation);
+        let mut span = Self::start_named(|| Cow::Borrowed(semantics.span_name), semantics);
+        span.set_str("mooncake.operation", operation);
+        span
     }
 
     pub(crate) fn start_metadata(backend: &'static str, operation: &'static str) -> Self {
-        let mut span = Self::start_named(|| Cow::Owned(format!("metadata.{operation}")));
+        let semantics = metadata_semantics();
+        let mut span = Self::start_named(|| Cow::Owned(format!("metadata.{operation}")), semantics);
         span.set_str("mooncake.metadata.backend", backend);
         span.set_str("mooncake.metadata.operation", operation);
         span
     }
 
     pub(crate) fn set_str(&mut self, key: &'static str, value: &str) {
-        if let Some(span) = &mut self.span {
-            span.set_attribute(KeyValue::new(key, value.to_string()));
+        if let Some(context) = &self.context {
+            context
+                .span()
+                .set_attribute(KeyValue::new(key, value.to_string()));
         }
     }
 
     pub(crate) fn set_u64(&mut self, key: &'static str, value: u64) {
-        if let Some(span) = &mut self.span {
-            span.set_attribute(KeyValue::new(key, clamp_u64_to_i64(value)));
+        if let Some(context) = &self.context {
+            context
+                .span()
+                .set_attribute(KeyValue::new(key, clamp_u64_to_i64(value)));
         }
     }
 
     pub(crate) fn finish(mut self, result: &'static str, bytes_out: u64) {
         self.set_str("mooncake.result", result);
         self.set_u64("mooncake.bytes_out", bytes_out);
-        if let Some(mut span) = self.span.take() {
+        if let Some(context) = self.context.take() {
             if result != "ok" {
-                span.set_status(Status::error(result.to_string()));
+                context.span().set_status(Status::error(result.to_string()));
             }
-            span.end();
+            context.span().end();
         }
+        self.pop_stack_frame();
     }
 
-    fn start_named(name: impl FnOnce() -> Cow<'static, str>) -> Self {
+    fn start_named(
+        name: impl FnOnce() -> Cow<'static, str>,
+        semantics: OperationSemantics,
+    ) -> Self {
         let control = profiling_control();
         if !control.enabled.load(Ordering::Relaxed) {
             return Self::disabled();
@@ -111,21 +147,75 @@ impl ProfilingSpan {
         }
 
         let tracer = global::tracer(DEFAULT_TRACER_NAME);
-        let mut span = tracer.start(name());
+        let parent = current_profiling_frame();
+        let request_id = parent
+            .as_ref()
+            .map(|frame| frame.request_id)
+            .unwrap_or_else(next_request_id);
+        let root_operation = parent
+            .as_ref()
+            .map(|frame| frame.root_operation)
+            .unwrap_or(semantics.span_name);
+        let flow = effective_flow(semantics.flow, parent.as_ref());
+        let mut span = if let Some(parent) = parent.as_ref() {
+            tracer.start_with_context(name(), &parent.context)
+        } else {
+            tracer.start(name())
+        };
         span.set_attribute(KeyValue::new("mooncake.component", "store-rs"));
-        Self { span: Some(span) }
+        span.set_attribute(KeyValue::new("mooncake.phase", semantics.phase));
+        span.set_attribute(KeyValue::new("mooncake.flow", flow));
+        span.set_attribute(KeyValue::new("mooncake.span_role", semantics.role));
+        span.set_attribute(KeyValue::new(
+            "mooncake.request_id",
+            clamp_u64_to_i64(request_id),
+        ));
+        span.set_attribute(KeyValue::new("mooncake.root_operation", root_operation));
+        let context = if let Some(parent) = parent.as_ref() {
+            parent.context.with_span(span)
+        } else {
+            Context::current_with_span(span)
+        };
+        let stack_depth = Some(push_profiling_frame(ProfilingFrame {
+            context: context.clone(),
+            request_id,
+            root_operation,
+            flow,
+        }));
+        Self {
+            context: Some(context),
+            stack_depth,
+        }
     }
 
     fn disabled() -> Self {
-        Self { span: None }
+        Self {
+            context: None,
+            stack_depth: None,
+        }
+    }
+
+    fn pop_stack_frame(&mut self) {
+        let Some(depth) = self.stack_depth.take() else {
+            return;
+        };
+        PROFILING_CONTEXT_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.len() >= depth {
+                stack.truncate(depth.saturating_sub(1));
+            } else {
+                stack.clear();
+            }
+        });
     }
 }
 
 impl Drop for ProfilingSpan {
     fn drop(&mut self) {
-        if let Some(mut span) = self.span.take() {
-            span.end();
+        if let Some(context) = self.context.take() {
+            context.span().end();
         }
+        self.pop_stack_frame();
     }
 }
 
@@ -446,6 +536,151 @@ fn sampler(sample_ratio: f64) -> Sampler {
     }
 }
 
+fn operation_semantics(operation: &'static str) -> OperationSemantics {
+    match operation {
+        "put" => api_semantics("store.put", "put"),
+        "put_from" => api_semantics("store.put_from", "put"),
+        "batch_put" => api_semantics("store.batch_put", "put"),
+        "batch_put_from" => api_semantics("store.batch_put_from", "put"),
+        "batch_put_from_multi_buffers" => {
+            api_semantics("store.batch_put_from_multi_buffers", "put")
+        }
+        "get" => api_semantics("store.get", "get"),
+        "get_into" => api_semantics("store.get_into", "get"),
+        "batch_get" => api_semantics("store.batch_get", "get"),
+        "batch_get_into" => api_semantics("store.batch_get_into", "get"),
+        "batch_get_into_multi_buffers" => {
+            api_semantics("store.batch_get_into_multi_buffers", "get")
+        }
+        "route_lookup_many" | "put_stage_load_route" | "batch_put_stage_load_routes" => {
+            stage_semantics("control.route_lookup", "control", infer_flow(operation))
+        }
+        "batch_put_stage_rank" => stage_semantics("control.placement_rank", "control", "put"),
+        "put_stage_reserve" | "batch_put_stage_reserve" => {
+            stage_semantics("control.allocate", "control", "put")
+        }
+        "put_stage_write" | "batch_put_stage_write" | "put_remote_batch_write" => {
+            stage_semantics("data.transfer_write", "data", "put")
+        }
+        "put_local_copy" => stage_semantics("data.local_write", "data", "put"),
+        "put_stage_route_cas" | "batch_put_stage_route_cas" => {
+            stage_semantics("control.route_publish", "control", "put")
+        }
+        "control_route_batch_get" => stage_semantics("control.route_lookup", "control", "get"),
+        "control_route_batch_cas" | "control_route_batch_replace" => {
+            stage_semantics("control.route_publish", "control", "put")
+        }
+        "control_allocator_batch_reserve_any" => {
+            stage_semantics("control.allocate", "control", "put")
+        }
+        "control_eviction_batch_track_replica_routes" => {
+            stage_semantics("control.replica_track", "control", "put")
+        }
+        "get_remote_batch_chunk" | "get_remote_batch_direct" | "get_remote_direct" => {
+            stage_semantics("data.transfer_read", "data", "get")
+        }
+        "remote_batch_get_fallback" | "remote_direct_get_fallback" => {
+            stage_semantics("data.transfer_read_fallback", "data", "get")
+        }
+        "get_local_copy" => stage_semantics("data.local_read", "data", "get"),
+        "register_local_memory" | "register_buffer" | "unregister_buffer" => {
+            stage_semantics("data.registration", "data", "maintenance")
+        }
+        "heartbeat" | "live_client_snapshot_refresh" | "tenant_policy_cache_refresh" => {
+            stage_semantics("control.membership_refresh", "control", "background")
+        }
+        "storage_owner_background_eviction" | "storage_owner_evict_one" => {
+            stage_semantics("data.eviction", "data", "background")
+        }
+        "storage_owner_rebuild_clock" => {
+            stage_semantics("data.eviction_rebuild", "data", "background")
+        }
+        _ if operation.starts_with("control_") => {
+            stage_semantics("control.rpc", "control", infer_flow(operation))
+        }
+        _ if operation.contains("metadata") => {
+            stage_semantics("metadata.operation", "metadata", "inherit")
+        }
+        _ if operation.contains("remote") || operation.contains("transfer") => {
+            stage_semantics("data.operation", "data", infer_flow(operation))
+        }
+        _ if operation.contains("route") || operation.contains("alloc") => {
+            stage_semantics("control.operation", "control", infer_flow(operation))
+        }
+        _ if operation.contains("background")
+            || operation.contains("evict")
+            || operation.contains("rebuild") =>
+        {
+            stage_semantics("background.operation", "background", "background")
+        }
+        _ => stage_semantics("store.operation", "api", infer_flow(operation)),
+    }
+}
+
+fn api_semantics(span_name: &'static str, flow: &'static str) -> OperationSemantics {
+    OperationSemantics {
+        span_name,
+        phase: "api",
+        flow,
+        role: "root",
+    }
+}
+
+fn stage_semantics(
+    span_name: &'static str,
+    phase: &'static str,
+    flow: &'static str,
+) -> OperationSemantics {
+    OperationSemantics {
+        span_name,
+        phase,
+        flow,
+        role: "stage",
+    }
+}
+
+fn metadata_semantics() -> OperationSemantics {
+    stage_semantics("metadata.operation", "metadata", "inherit")
+}
+
+fn infer_flow(operation: &str) -> &'static str {
+    if operation.contains("put") || operation.contains("write") || operation.contains("reserve") {
+        return "put";
+    }
+    if operation.contains("get") || operation.contains("read") || operation.contains("lookup") {
+        return "get";
+    }
+    if operation.contains("remove") || operation.contains("delete") || operation.contains("reclaim")
+    {
+        return "remove";
+    }
+    "unknown"
+}
+
+fn effective_flow(flow: &'static str, parent: Option<&ProfilingFrame>) -> &'static str {
+    match (flow, parent) {
+        ("inherit" | "unknown", Some(parent)) => parent.flow,
+        ("inherit", None) => "metadata",
+        _ => flow,
+    }
+}
+
+fn next_request_id() -> u64 {
+    NEXT_PROFILING_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn current_profiling_frame() -> Option<ProfilingFrame> {
+    PROFILING_CONTEXT_STACK.with(|stack| stack.borrow().last().cloned())
+}
+
+fn push_profiling_frame(frame: ProfilingFrame) -> usize {
+    PROFILING_CONTEXT_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        stack.push(frame);
+        stack.len()
+    })
+}
+
 fn env_value(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -553,5 +788,38 @@ mod tests {
     fn parse_update_query_rejects_invalid_sample_ratio() {
         let error = parse_update_query(Some("sample_ratio=2")).expect_err("ratio must fail");
         assert!(error.to_string().contains("expected 0.0..=1.0"));
+    }
+
+    #[test]
+    fn operation_semantics_make_put_get_waterfalls_readable() {
+        let put = operation_semantics("put");
+        assert_eq!(put.span_name, "store.put");
+        assert_eq!(put.phase, "api");
+        assert_eq!(put.flow, "put");
+        assert_eq!(put.role, "root");
+
+        let reserve = operation_semantics("batch_put_stage_reserve");
+        assert_eq!(reserve.span_name, "control.allocate");
+        assert_eq!(reserve.phase, "control");
+        assert_eq!(reserve.flow, "put");
+        assert_eq!(reserve.role, "stage");
+
+        let write = operation_semantics("batch_put_stage_write");
+        assert_eq!(write.span_name, "data.transfer_write");
+        assert_eq!(write.phase, "data");
+        assert_eq!(write.flow, "put");
+        assert_eq!(write.role, "stage");
+
+        let lookup = operation_semantics("route_lookup_many");
+        assert_eq!(lookup.span_name, "control.route_lookup");
+        assert_eq!(lookup.phase, "control");
+        assert_eq!(lookup.flow, "get");
+        assert_eq!(lookup.role, "stage");
+
+        let read = operation_semantics("get_remote_batch_chunk");
+        assert_eq!(read.span_name, "data.transfer_read");
+        assert_eq!(read.phase, "data");
+        assert_eq!(read.flow, "get");
+        assert_eq!(read.role, "stage");
     }
 }

@@ -727,10 +727,10 @@ The metrics HTTP server exposes:
 - `GET /metrics`
 - `GET /healthz`
 - `GET /tracing`
-- `POST /tracing/on`
-- `POST /tracing/off`
-- `POST /tracing?enabled=on&endpoint=http%3A%2F%2Fjaeger.observability.svc.cluster.local%3A4318&sample_ratio=0.05`
-- `POST /tracing/flush`
+- `GET /tracing/on`
+- `GET /tracing/off`
+- `GET /tracing?enabled=on&endpoint=http%3A%2F%2Fjaeger.observability.svc.cluster.local%3A4318&sample_ratio=0.05`
+- `GET /tracing/flush`
 
 `/tracing` returns JSON status for the OTLP profiler. Enabling requires an
 endpoint from either environment variables or the request query. The endpoint is
@@ -738,6 +738,17 @@ locked after the exporter is initialized, because changing Jaeger backends while
 batch processors are running would make trace ownership ambiguous.
 The same lock applies to `service_name`, `service_instance_id`, and
 `sample_ratio`; set them before enabling export.
+
+When OTLP profiling is enabled, Jaeger span names describe the performance
+surface instead of raw code hooks. API roots are named `store.*`; control-plane
+work is named `control.*`; data-plane work is named `data.*`; metadata backend
+calls are named `metadata.*`. Common span attributes include
+`mooncake.phase`, `mooncake.flow`, `mooncake.request_id`,
+`mooncake.item_count`, `mooncake.bytes_in`, `mooncake.bytes_out`,
+`mooncake.replica_count`, `mooncake.local_target_count`, and
+`mooncake.remote_target_count`. Use the Jaeger waterfall for one sampled
+request and the Prometheus operation histograms for the matching time-series
+view.
 
 Exporter families:
 

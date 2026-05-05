@@ -408,7 +408,11 @@ impl StoreClient {
                 value.len(),
             )?;
             let reserve_tracker =
-                OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
+                OperationTracker::new("put_stage_reserve")
+                    .attribute_str("mooncake.tenant", tenant)
+                    .attribute_u64("mooncake.item_count", 1)
+                    .attribute_u64("mooncake.replica_count", policy.replica_count as u64)
+                    .input_bytes(value.len() as u64);
             let reserve_result = self.reserve_replica_targets(&object_ref, value.len(), &policy);
             reserve_tracker.finish(&reserve_result, 0);
             let (targets, reservations) = match reserve_result {
@@ -421,8 +425,19 @@ impl StoreClient {
                     return Err(error);
                 }
             };
+            let remote_target_count = targets
+                .iter()
+                .filter(|target| target.storage_runtime != self.lease.runtime)
+                .count();
+            let local_target_count = targets.len().saturating_sub(remote_target_count);
             let write_tracker =
-                OperationTracker::new("put_stage_write").input_bytes(value.len() as u64);
+                OperationTracker::new("put_stage_write")
+                    .attribute_str("mooncake.tenant", tenant)
+                    .attribute_u64("mooncake.item_count", 1)
+                    .attribute_u64("mooncake.replica_count", targets.len() as u64)
+                    .attribute_u64("mooncake.local_target_count", local_target_count as u64)
+                    .attribute_u64("mooncake.remote_target_count", remote_target_count as u64)
+                    .input_bytes(value.len() as u64);
             let write_result =
                 self.write_reserved_replicas(&targets, &reservations, value, registered_source);
             write_tracker.finish(&write_result, value.len() as u64);
@@ -489,7 +504,9 @@ impl StoreClient {
                     .collect(),
             };
             mooncake_store_core::apply_route_identity(&mut route, object_id);
-            let cas_tracker = OperationTracker::new("put_stage_route_cas");
+            let cas_tracker = OperationTracker::new("put_stage_route_cas")
+                .attribute_str("mooncake.tenant", tenant)
+                .attribute_u64("mooncake.item_count", 1);
             let publish_started = Instant::now();
             let cas_result = self.route_directory.compare_and_swap_object_route(
                 &self.lease,
@@ -559,7 +576,9 @@ impl StoreClient {
             NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
             object.key,
         );
-        let load_tracker = OperationTracker::new("put_stage_load_route");
+        let load_tracker = OperationTracker::new("put_stage_load_route")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1);
         let current_result = self
             .route_directory
             .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(&object_id));
@@ -590,7 +609,9 @@ impl StoreClient {
             NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
             object.key,
         );
-        let load_tracker = OperationTracker::new("put_stage_load_route");
+        let load_tracker = OperationTracker::new("put_stage_load_route")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1);
         let current_result = self
             .route_directory
             .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(&object_id));
@@ -2082,7 +2103,8 @@ impl StoreClient {
     }
 
     fn resolve_objects(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<ResolvedObject>> {
-        let tracker = OperationTracker::new("route_lookup_many");
+        let tracker = OperationTracker::new("route_lookup_many")
+            .attribute_u64("mooncake.item_count", objects.len() as u64);
         let result = (|| {
             let scoped = objects
                 .iter()
@@ -3168,7 +3190,9 @@ impl StoreClient {
             .iter()
             .map(|index| resolved[*index].replica.length)
             .sum::<u64>();
-        let tracker = OperationTracker::new("get_remote_batch_chunk");
+        let tracker = OperationTracker::new("get_remote_batch_chunk")
+            .attribute_u64("mooncake.item_count", remote_indices.len() as u64)
+            .attribute_u64("mooncake.remote_target_count", remote_indices.len() as u64);
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
             let requests = {
                 let mut batch = Vec::with_capacity(remote_indices.len());
@@ -3311,7 +3335,9 @@ impl StoreClient {
             .iter()
             .map(|index| resolved[*index].replica.length)
             .sum::<u64>();
-        let tracker = OperationTracker::new("get_remote_batch_direct");
+        let tracker = OperationTracker::new("get_remote_batch_direct")
+            .attribute_u64("mooncake.item_count", remote_indices.len() as u64)
+            .attribute_u64("mooncake.remote_target_count", remote_indices.len() as u64);
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
             let requests = {
                 let mut batch = Vec::with_capacity(remote_indices.len());
@@ -3439,7 +3465,10 @@ impl StoreClient {
         length: usize,
         request_deadline: RequestDeadline,
     ) -> Result<()> {
-        let tracker = OperationTracker::new("get_remote_direct");
+        let tracker = OperationTracker::new("get_remote_direct")
+            .attribute_str("mooncake.tenant", &resolved.tenant)
+            .attribute_u64("mooncake.item_count", 1)
+            .attribute_u64("mooncake.remote_target_count", 1);
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
             let buffer_ptr = buffer.as_mut_ptr().cast::<c_void>();
             let buffer_len = buffer.len();
