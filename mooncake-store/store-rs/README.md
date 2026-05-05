@@ -995,13 +995,16 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 - `mooncake-store-bench` uses its own tracing init, writes to `stderr` by default, and falls back to `info` when neither `--trace-filter`, `MC_STORE_RS_TRACE_FILTER`, nor `RUST_LOG` is set
 - use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for bench logs; keep `MC_STORE_RS_TRACE_FILE` for standalone-client and Python real-client logging
 - bench disables tracing span-close events so hot-path `close time.busy=...` noise does not flood benchmark output
+- Jaeger profiling uses OTLP HTTP: set `MC_STORE_RS_OTLP_ENDPOINT=http://jaeger.observability.svc.cluster.local:4318`; keep `MC_STORE_RS_OTLP_TRACE` unset or `0` for a disabled startup
+- set `MC_STORE_RS_OTLP_SAMPLE_RATIO=0.05`, or pass `sample_ratio=0.05` before enabling, when profiling high-throughput bench traffic through memory-backed Jaeger
+- when `/metrics` is enabled, use `/tracing`, `/tracing/on`, `/tracing/off`, and `/tracing/flush` on that same HTTP server to inspect and dynamically switch OTLP profiling
 
 ### Metrics
 
 - `MC_STORE_RS_METRICS_ADDR=127.0.0.1:9090`
 - Python real clients auto-start the in-process `/metrics` endpoint after `setup(...)` when `MC_STORE_RS_METRICS_ADDR` is set
 - `render_prometheus_metrics()` returns a text snapshot
-- `start_metrics_http_server()` exposes `/metrics` and `/healthz`
+- `start_metrics_http_server()` exposes `/metrics`, `/stats`, `/healthz`, and `/tracing`
 - host-level CPU, disk, and network remain the responsibility of `node_exporter` / `cAdvisor`
 
 ## Documentation Index

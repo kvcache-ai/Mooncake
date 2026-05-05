@@ -1,6 +1,7 @@
 mod exporter;
 mod metadata;
 mod process;
+mod profiling;
 pub(crate) mod registry;
 
 use is_terminal::IsTerminal;
@@ -22,6 +23,7 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub(crate) use metadata::observe_metadata_backend;
+pub(crate) use profiling::ProfilingSpan;
 pub use registry::{MetricsSnapshot, OperationMetricSnapshot};
 
 static TRACING_STATE: OnceLock<()> = OnceLock::new();
@@ -56,6 +58,7 @@ pub struct OperationTracker {
     start: Instant,
     bytes_in: u64,
     registry: registry::SharedMetricsRegistry,
+    profiling_span: ProfilingSpan,
     _inflight: InflightGuard,
 }
 
@@ -68,6 +71,12 @@ impl OperationTracker {
             start: Instant::now(),
             bytes_in: 0,
             registry: registry::global_metrics_registry().clone(),
+            profiling_span: {
+                let mut span = ProfilingSpan::start(operation);
+                span.set_str("mooncake.operation", operation);
+                span.set_str("mooncake.scope", scope);
+                span
+            },
             _inflight: InflightGuard::enter(operation, scope),
         }
     }
@@ -81,6 +90,12 @@ impl OperationTracker {
             start: Instant::now(),
             bytes_in: 0,
             registry: registry.clone(),
+            profiling_span: {
+                let mut span = ProfilingSpan::start(operation);
+                span.set_str("mooncake.operation", operation);
+                span.set_str("mooncake.scope", scope);
+                span
+            },
             _inflight: InflightGuard::enter_with_registry(operation, scope, registry),
         }
     }
@@ -89,6 +104,7 @@ impl OperationTracker {
         if self.scope != scope {
             self._inflight =
                 InflightGuard::enter_with_registry(self.operation, scope, self.registry.clone());
+            self.profiling_span.set_str("mooncake.scope", scope);
         }
         self.scope = scope;
         self
@@ -96,15 +112,16 @@ impl OperationTracker {
 
     pub fn input_bytes(mut self, bytes_in: u64) -> Self {
         self.bytes_in = bytes_in;
+        self.profiling_span.set_u64("mooncake.bytes_in", bytes_in);
         self
     }
 
-    pub fn finish<T>(&self, result: &Result<T>, bytes_out: u64) {
+    pub fn finish<T>(self, result: &Result<T>, bytes_out: u64) {
         let result_label = result_label(result);
         self.finish_with_result(result_label, bytes_out);
     }
 
-    pub(crate) fn finish_with_result(&self, result: &'static str, bytes_out: u64) {
+    pub(crate) fn finish_with_result(self, result: &'static str, bytes_out: u64) {
         registry::record_request_with_registry(
             &self.registry,
             self.operation,
@@ -114,6 +131,7 @@ impl OperationTracker {
             bytes_out,
             self.start.elapsed(),
         );
+        self.profiling_span.finish(result, bytes_out);
     }
 }
 
@@ -488,6 +506,16 @@ fn handle_metrics_http_connection(
             render_stats_json_with_registry(registry),
         ),
         "/healthz" | "/livez" => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
+        path if path.starts_with("/tracing") || path.starts_with("/trace") => {
+            match profiling::handle_tracing_http_path(path) {
+                Ok(body) => ("200 OK", "application/json; charset=utf-8", body),
+                Err(error) => (
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    format!("{error}\n"),
+                ),
+            }
+        }
         _ => (
             "404 Not Found",
             "text/plain; charset=utf-8",
@@ -1115,6 +1143,17 @@ mod tests {
         let livez = http_get(&address, "/livez");
         assert!(livez.contains("HTTP/1.1 200 OK"));
         assert!(livez.ends_with("ok\n"));
+
+        let tracing_status = http_get(&address, "/tracing");
+        assert!(tracing_status.contains("HTTP/1.1 200 OK"));
+        assert!(tracing_status.contains("\"enabled\":"));
+
+        let tracing_off = http_get(&address, "/tracing/off");
+        assert!(tracing_off.contains("HTTP/1.1 200 OK"));
+        assert!(tracing_off.contains("\"enabled\":false"));
+
+        let tracing_bad = http_get(&address, "/tracing?enabled=maybe");
+        assert!(tracing_bad.contains("HTTP/1.1 400 Bad Request"));
 
         let missing = http_get(&address, "/missing");
         assert!(missing.contains("HTTP/1.1 404 Not Found"));

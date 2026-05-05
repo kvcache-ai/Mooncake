@@ -424,7 +424,15 @@ The same tracker framework also covers eviction-related work such as:
 
 ### Tracing
 
-Tracing is built on `tracing` + `tracing-subscriber` and can be enabled from code or by environment variables.
+Log-oriented tracing is built on `tracing` + `tracing-subscriber` and can be enabled from code or by environment variables.
+
+Jaeger profiling uses the same operation boundaries as the metrics registry:
+
+- `OperationTracker` creates one OTLP span per request or internal stage when profiling is enabled
+- the metadata backend wrapper creates child spans for Redis, etcd, or another `MetadataBackend`
+- disabled profiling is an atomic fast path and does not build spans or touch the exporter
+- `/tracing` on the metrics HTTP server can turn OTLP export on or off dynamically after an endpoint is configured
+- high-throughput profiling can set a sample ratio before exporter initialization to keep the collector from becoming the bottleneck
 
 ## Python Compatibility Architecture
 
