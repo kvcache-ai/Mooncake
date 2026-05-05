@@ -933,6 +933,8 @@ fn sample_lease(address: &str) -> ClientLease {
 
 #[test]
 fn control_plane_client_round_trips_routes_and_allocator_calls() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
     let eviction = Arc::new(TestEviction::default());
@@ -1824,6 +1826,8 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
 
 #[test]
 fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
     let eviction = Arc::new(TestEviction::default());
