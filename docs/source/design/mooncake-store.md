@@ -837,6 +837,7 @@ The HTTP metadata server can be configured using the following parameters:
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
 - MC_STORE_CLIENT_MIN_PORT: Minimum local port for client connections (default 12300). Must be in range 1024–32767 or 61000–65535; falls back to default on invalid input.
 - MC_STORE_CLIENT_MAX_PORT: Maximum local port for client connections (default 14300). Same range constraints; must be ≥ MC_STORE_CLIENT_MIN_PORT.
+- MC_STORE_TRANSFER_TIMEOUT: Timeout for transfer operations (default 60). Controls how long a client waits for a transfer to complete before considering it failed.
 - MC_STORE_USE_HUGEPAGE: Enables huge page support, disabled by default.
 - MC_STORE_HUGEPAGE_SIZE: Specifies the page size of the huge page to use, default 2M.
 - MC_MMAP_ARENA_POOL_SIZE: Size of the pre-allocated arena pool for mmap buffer allocations. Accepts human-readable sizes (e.g., `"8gb"`, `"20gb"`). Providing this variable explicitly enables the arena; when enabled via gflag without an env override, the default pool size is `8gb`. The arena is allocated once at first use and serves subsequent allocations via lock-free atomic bump pointer (~50ns per allocation vs ~1000ns for direct mmap).

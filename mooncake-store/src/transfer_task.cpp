@@ -9,6 +9,7 @@
 #include "gpu_staging_utils.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -330,8 +331,8 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
+    const int64_t timeout_milliseconds =
+        GetEnvOr<int64_t>("MC_STORE_TRANSFER_TIMEOUT", 60) * 1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
