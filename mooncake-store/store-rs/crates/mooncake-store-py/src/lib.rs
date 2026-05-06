@@ -1211,10 +1211,26 @@ impl PyMooncakeDistributedStore {
         keys: Vec<String>,
         tenant: Option<&str>,
     ) -> PyResult<Vec<Py<PyBytes>>> {
-        let dispatcher = self.real_dispatcher()?;
-        let values =
-            run_without_gil(move || dispatcher.batch_get_values(keys, tenant.map(str::to_string)))
-                .map_err(store_error_to_py)?;
+        let values = match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => run_without_gil(move || {
+                let mut values = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let (status, value) = dummy.get(&key, tenant)?;
+                    if status != 0 {
+                        return Err(StoreError::NotFound(format!(
+                            "dummy store batch_get failed for key={key}"
+                        )));
+                    }
+                    values.push(value);
+                }
+                Ok(values)
+            })
+            .map_err(store_error_to_py)?,
+            StoreBackend::Real(dispatcher) => run_without_gil(move || {
+                dispatcher.batch_get_values(keys, tenant.map(str::to_string))
+            })
+            .map_err(store_error_to_py)?,
+        };
         Ok(values
             .into_iter()
             .map(|value| PyBytes::new(py, &value).unbind())
@@ -2926,6 +2942,165 @@ mod tests {
         server.shutdown().expect("dummy server should stop");
     }
 
+    #[test]
+    fn setup_dummy_without_worker_scope_can_use_buffer_api_against_scoped_server() {
+        let _guard = env_test_lock().lock();
+        prepare_freethreaded_python();
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client("dummy-buffer-legacy-scope"),
+                "dummy-buffer-legacy-scope",
+            )
+            .expect("dummy dispatcher should spawn"),
+        );
+        dispatcher
+            .register_local_memory()
+            .expect("dummy local memory should register");
+        let server = start_dummy_store_server(
+            dispatcher,
+            &bind_addr(),
+            "tenant-a/dummy-buffer-legacy-scope",
+        )
+        .expect("dummy server should start");
+        let mut store = PyMooncakeDistributedStore::new();
+        store
+            .setup_dummy(0, 0, server.address(), None, None)
+            .expect("dummy store should connect without explicit worker scope");
+        for _ in 0..40 {
+            if store.health_check().expect("health check should succeed") == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(25));
+        }
+
+        let allocator = PyMooncakeHostMemAllocator::new(None, None);
+        let write_ptr = allocator
+            .alloc(64)
+            .expect("first legacy write buffer should allocate");
+        let write_ptr_two = allocator
+            .alloc(64)
+            .expect("second legacy write buffer should allocate");
+        let read_ptr = allocator
+            .alloc(64)
+            .expect("first legacy read buffer should allocate");
+        let read_ptr_two = allocator
+            .alloc(64)
+            .expect("second legacy read buffer should allocate");
+        unsafe {
+            slice::from_raw_parts_mut(write_ptr as *mut u8, 64)[..5].copy_from_slice(b"hello");
+            slice::from_raw_parts_mut(write_ptr_two as *mut u8, 64)[..5]
+                .copy_from_slice(b"world");
+        }
+
+        assert_eq!(
+            store
+                .register_buffer(write_ptr, 64)
+                .expect("first legacy write buffer should register"),
+            0
+        );
+        assert_eq!(
+            store
+                .register_buffer(write_ptr_two, 64)
+                .expect("second legacy write buffer should register"),
+            0
+        );
+        assert_eq!(
+            store
+                .register_buffer(read_ptr, 64)
+                .expect("first legacy read buffer should register"),
+            0
+        );
+        assert_eq!(
+            store
+                .register_buffer(read_ptr_two, 64)
+                .expect("second legacy read buffer should register"),
+            0
+        );
+
+        Python::with_gil(|py| {
+            let statuses = store
+                .batch_put_from(
+                    py,
+                    vec![
+                        ("legacy-a".to_string(), write_ptr, 5),
+                        ("legacy-b".to_string(), write_ptr_two, 5),
+                    ],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .expect("legacy dummy batch_put_from should succeed");
+            assert_eq!(
+                statuses
+                    .bind(py)
+                    .extract::<Vec<i32>>()
+                    .expect("legacy dummy batch_put_from should return status list"),
+                vec![0, 0]
+            );
+        });
+
+        let lengths = store
+            .batch_get_into(
+                vec![
+                    ("legacy-a".to_string(), read_ptr, 64),
+                    ("legacy-b".to_string(), read_ptr_two, 64),
+                ],
+                None,
+            )
+            .expect("legacy dummy batch_get_into should succeed");
+        assert_eq!(lengths, vec![5, 5]);
+        unsafe {
+            assert_eq!(slice::from_raw_parts(read_ptr as *const u8, 5), b"hello");
+            assert_eq!(slice::from_raw_parts(read_ptr_two as *const u8, 5), b"world");
+        }
+
+        assert_eq!(
+            store
+                .unregister_buffer(write_ptr, 64)
+                .expect("first legacy write buffer should unregister"),
+            0
+        );
+        assert_eq!(
+            store
+                .unregister_buffer(write_ptr_two, 64)
+                .expect("second legacy write buffer should unregister"),
+            0
+        );
+        assert_eq!(
+            store
+                .unregister_buffer(read_ptr, 64)
+                .expect("first legacy read buffer should unregister"),
+            0
+        );
+        assert_eq!(
+            store
+                .unregister_buffer(read_ptr_two, 64)
+                .expect("second legacy read buffer should unregister"),
+            0
+        );
+
+        store.close();
+        allocator
+            .free(write_ptr)
+            .expect("first legacy write buffer should free");
+        allocator
+            .free(write_ptr_two)
+            .expect("second legacy write buffer should free");
+        allocator
+            .free(read_ptr)
+            .expect("first legacy read buffer should free");
+        allocator
+            .free(read_ptr_two)
+            .expect("second legacy read buffer should free");
+        server.shutdown().expect("dummy server should stop");
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<String>,
@@ -4312,21 +4487,17 @@ mod tests {
             server.address()
         );
 
-        store
-            .put(
-                "alpha",
-                b"one".to_vec(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                true,
-                false,
-                false,
-            )
-            .expect("dummy put should succeed");
+        for (key, value) in [
+            ("alpha", b"one".to_vec()),
+            ("delta", b"four".to_vec()),
+            ("epsilon", b"five".to_vec()),
+        ] {
+            store
+                .put(
+                    key, value, None, None, None, None, None, None, true, false, false,
+                )
+                .expect("dummy put should succeed");
+        }
         store
             .batch_put(
                 vec![
@@ -4353,9 +4524,20 @@ mod tests {
                     .as_bytes(),
                 b"one"
             );
-            assert!(store
-                .batch_get(py, vec!["alpha".to_string()], None)
-                .is_err());
+            let batch = store
+                .batch_get(
+                    py,
+                    vec![
+                        "alpha".to_string(),
+                        "beta".to_string(),
+                        "delta".to_string(),
+                    ],
+                    None,
+                )
+                .expect("dummy batch_get should succeed");
+            assert_eq!(batch[0].bind(py).as_bytes(), b"one");
+            assert_eq!(batch[1].bind(py).as_bytes(), b"two");
+            assert_eq!(batch[2].bind(py).as_bytes(), b"four");
             assert!(store.query_route(py, "alpha", None).is_err());
         });
         assert!(store

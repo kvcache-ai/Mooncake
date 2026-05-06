@@ -616,6 +616,9 @@ class MooncakeDistributedStore:
             "batch_get", key_list, fallback_count=len(key_list), tenant=tenant
         )
 
+    def get_batch(self, keys: Sequence[str], *, tenant: str | None = None):
+        return self.batch_get(keys, tenant=tenant)
+
     def batch_get_buffer(self, keys: Sequence[str], *, tenant: str | None = None):
         key_list = list(keys)
         return self._invoke_cache(
