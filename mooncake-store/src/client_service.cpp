@@ -2646,8 +2646,13 @@ ErrorCode Client::BatchTransferReadRanges(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
     }
+#ifdef USE_ASCEND_HETEROGENEOUS
+    constexpr bool enable_task_grouping = false;
+#else
+    const bool enable_task_grouping = protocol_ == "rdma";
+#endif
     auto future = transfer_submitter_->submitBatchReadRanges(
-        dest_buffer, key_ranges, protocol_ == "rdma");
+        dest_buffer, key_ranges, enable_task_grouping);
     if (!future) {
         LOG(ERROR) << "Failed to submit batch read ranges";
         return ErrorCode::TRANSFER_FAIL;

@@ -327,7 +327,7 @@ Status UbTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = FAILED;
         else
             status.s = COMPLETED;
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         status.s = WAITING;
     }

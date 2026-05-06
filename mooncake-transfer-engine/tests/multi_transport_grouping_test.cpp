@@ -14,11 +14,85 @@
 
 #include <gtest/gtest.h>
 
+#include "multi_transport.h"
+#include "transfer_metadata.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
 
 namespace mooncake {
+
+namespace {
+
+class RecordingTransport : public Transport {
+   public:
+    explicit RecordingTransport(const char *name) : name_(name) {}
+
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest> &) override {
+        return Status::NotImplemented("unused");
+    }
+
+    Status submitTransferTask(
+        const std::vector<Transport::TransferTask *> &task_list) override {
+        submitted_group_sizes.clear();
+        submitted_group_sizes.reserve(task_list.size());
+        for (auto *task : task_list) {
+            submitted_group_sizes.push_back(
+                task->request_group.empty() ? 1 : task->request_group.size());
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
+            auto &batch_desc = Transport::toBatchDesc(task->batch_id);
+            batch_desc.finished_task_count.fetch_add(1,
+                                                     std::memory_order_release);
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus &) override {
+        return Status::NotImplemented("unused");
+    }
+
+    const char *getName() const override { return name_; }
+
+    std::vector<size_t> submitted_group_sizes;
+
+   private:
+    int registerLocalMemory(void *, size_t, const std::string &, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void *, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry> &,
+                                 const std::string &) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void *> &) override {
+        return 0;
+    }
+
+    const char *name_;
+};
+
+class TestableMultiTransport : public MultiTransport {
+   public:
+    TestableMultiTransport(std::shared_ptr<TransferMetadata> metadata,
+                           std::string &local_server_name)
+        : MultiTransport(metadata, local_server_name) {}
+
+    using MultiTransport::transport_map_;
+};
+
+std::shared_ptr<TransferMetadata> MakeMetadataWithSegment(
+    Transport::SegmentID segment_id, const std::string &protocol) {
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "remote" + std::to_string(segment_id);
+    desc->protocol = protocol;
+    metadata->addLocalSegment(segment_id, desc->name, std::move(desc));
+    return metadata;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Unit tests for TransferRequest::task_group_id field and grouping semantics
@@ -181,6 +255,63 @@ TEST_F(TaskGroupingTest, NonAdjacentSameGroupIdNotMerged) {
 // Grouping does not impose requirements on local buffer layout.
 // Each request within a group has its own independent source pointer;
 // the transport processes slices independently per-request.
+TEST_F(TaskGroupingTest, MultiTransportSubmitTransferCoalescesRdmaGroups) {
+    constexpr Transport::SegmentID kTargetSegmentId = 1;
+    auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "rdma");
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+    auto recording_transport = std::make_shared<RecordingTransport>("rdma");
+    multi_transport.transport_map_["rdma"] = recording_transport;
+
+    std::vector<Transport::TransferRequest> entries(4);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        entries[i].opcode = Transport::TransferRequest::READ;
+        entries[i].source = nullptr;
+        entries[i].target_id = kTargetSegmentId;
+        entries[i].target_offset = i * 4096;
+        entries[i].length = 4096;
+    }
+    entries[0].task_group_id = 10;
+    entries[1].task_group_id = 10;
+    entries[2].task_group_id = Transport::TransferRequest::kNoTaskGroup;
+    entries[3].task_group_id = 20;
+
+    auto batch_id = multi_transport.allocateBatchID(3);
+    auto status = multi_transport.submitTransfer(batch_id, entries);
+
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(recording_transport->submitted_group_sizes,
+              (std::vector<size_t>{2, 1, 1}));
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(TaskGroupingTest, MultiTransportSubmitTransferDoesNotCoalesceNonRdma) {
+    constexpr Transport::SegmentID kTargetSegmentId = 1;
+    auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "tcp");
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+    auto recording_transport = std::make_shared<RecordingTransport>("tcp");
+    multi_transport.transport_map_["tcp"] = recording_transport;
+
+    std::vector<Transport::TransferRequest> entries(2);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        entries[i].opcode = Transport::TransferRequest::READ;
+        entries[i].source = nullptr;
+        entries[i].target_id = kTargetSegmentId;
+        entries[i].target_offset = i * 4096;
+        entries[i].length = 4096;
+        entries[i].task_group_id = 10;
+    }
+
+    auto batch_id = multi_transport.allocateBatchID(2);
+    auto status = multi_transport.submitTransfer(batch_id, entries);
+
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(recording_transport->submitted_group_sizes,
+              (std::vector<size_t>{1, 1}));
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
 TEST_F(TaskGroupingTest, GroupedRequestsHaveIndependentLocalBuffers) {
     char buf_a[4096];
     char buf_b[4096];

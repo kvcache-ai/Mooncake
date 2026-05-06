@@ -1205,7 +1205,7 @@ Status BarexTransport::getTransferStatus(BatchID batch_id,
             } else {
                 status[task_id].s = TransferStatusEnum::COMPLETED;
             }
-            task.is_finished = true;
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
         } else {
             status[task_id].s = TransferStatusEnum::WAITING;
         }
@@ -1231,7 +1231,7 @@ Status BarexTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = TransferStatusEnum::FAILED;
         else
             status.s = TransferStatusEnum::COMPLETED;
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

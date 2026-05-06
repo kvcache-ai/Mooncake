@@ -465,13 +465,7 @@ Status RdmaTransport::submitTransferTask(
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
     uint64_t nr_slices;
-    const auto cleanup_posted_slices = [&]() {
-        for (auto &entry : slices_to_post) {
-            for (auto *slice : entry.second) {
-                getSliceCache().deallocate(slice);
-            }
-        }
-    };
+    const auto cleanup_posted_slices = [&]() { slices_to_post.clear(); };
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
@@ -615,7 +609,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
                 status[task_id].s = TransferStatusEnum::FAILED;
             else
                 status[task_id].s = TransferStatusEnum::COMPLETED;
-            task.is_finished = true;
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
         } else {
             status[task_id].s = TransferStatusEnum::WAITING;
         }
@@ -641,7 +635,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = TransferStatusEnum::FAILED;
         else
             status.s = TransferStatusEnum::COMPLETED;
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

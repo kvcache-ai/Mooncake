@@ -2865,14 +2865,6 @@ RealClient::get_into_ranges_internal(
         for (size_t j = 0; j < key_count; ++j) {
             auto metadata_it = metadata_cache.find(all_keys[i][j]);
             if (metadata_it == metadata_cache.end()) {
-                LOG(ERROR) << "get_into_ranges: metadata not found for key "
-                           << all_keys[i][j];
-                for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
-                    if (prepared.valid_fragments[i][j][k]) {
-                        prepared.results[i][j][k] =
-                            tl::unexpected(ErrorCode::INVALID_PARAMS);
-                    }
-                }
                 continue;
             }
             auto &metadata_result = metadata_it->second;

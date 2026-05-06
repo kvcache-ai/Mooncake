@@ -98,7 +98,7 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         }
     }
     if (transfer_status.s == COMPLETED) {
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     }
     status = transfer_status;
     return Status::OK();

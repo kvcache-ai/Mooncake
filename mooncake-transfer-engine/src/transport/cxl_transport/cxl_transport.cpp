@@ -302,7 +302,7 @@ Status CxlTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

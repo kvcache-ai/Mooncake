@@ -89,11 +89,6 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     {
         std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
-        if (!batch_desc.sealed.load(std::memory_order_acquire)) {
-            return Status::BatchBusy(
-                "BatchID cannot be freed until the batch is sealed");
-        }
-
         const size_t submitted_task_count = static_cast<size_t>(
             batch_desc.submitted_task_count.load(std::memory_order_acquire));
         const size_t finished_task_count = static_cast<size_t>(
@@ -101,14 +96,6 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
         if (finished_task_count < submitted_task_count) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all submitted tasks are done");
-        }
-
-        for (size_t task_id = 0; task_id < submitted_task_count; task_id++) {
-            if (!batch_desc.task_list[task_id].is_finished) {
-                return Status::BatchBusy(
-                    "BatchID cannot be freed until all submitted tasks are "
-                    "done");
-            }
         }
     }
 #ifdef CONFIG_USE_BATCH_DESC_SET
@@ -374,7 +361,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         } else {
             status.s = Transport::TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         if (globalConfig().slice_timeout > 0) {
             auto current_ts = getCurrentTimeInNano();

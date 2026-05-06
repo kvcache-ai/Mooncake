@@ -212,18 +212,17 @@ class Transport {
             }
 
             // --- Task complete ---
-            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
 
             batch_desc.finished_task_count.fetch_add(1,
                                                      std::memory_order_release);
 
-            // Wake ProgressiveGetHandle futex waiters (unconditional).
-            static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
-                          "futex on low-32 of uint64_t requires little-endian");
-            ::syscall(
-                SYS_futex,
-                reinterpret_cast<uint32_t *>(&batch_desc.finished_task_count),
-                FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+#ifdef __linux__
+            __atomic_fetch_add(&batch_desc.finished_task_futex_word, 1u,
+                               __ATOMIC_RELEASE);
+            ::syscall(SYS_futex, &batch_desc.finished_task_futex_word,
+                      FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+#endif
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             {
@@ -281,7 +280,7 @@ class Transport {
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
-        volatile bool is_finished = false;
+        bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
@@ -329,9 +328,10 @@ class Transport {
             false};  // Completion flag for wait predicate
         std::atomic<uint64_t> finished_transfer_bytes{0};
 
-        // Always present: per-task completion counter.
-        // Low 32 bits used as futex word by ProgressiveGetHandle.
         std::atomic<uint64_t> finished_task_count{0};
+#ifdef __linux__
+        alignas(4) uint32_t finished_task_futex_word = 0;
+#endif
 
         bool is_complete() const {
             return sealed.load(std::memory_order_acquire) &&
