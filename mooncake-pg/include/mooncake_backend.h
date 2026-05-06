@@ -30,7 +30,7 @@ class MooncakeBackend;
 // getBackendName, supportsCoalescing).
 class MooncakeP2PShim final : public ::c10d::Backend {
    public:
-    MooncakeP2PShim(MooncakeBackend* owner);
+    explicit MooncakeP2PShim(MooncakeBackend* owner);
 
     const std::string getBackendName() const override;
 
