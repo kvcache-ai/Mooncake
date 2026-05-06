@@ -672,9 +672,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(result.error());
             return tl::unexpected(result.error());
         }
-    } else if (local_buffer_size > 0) {
-        LOG(INFO) << "CXL protocol uses host staging buffers directly; skip "
-                     "registering local memory";
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
@@ -999,15 +996,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_ipc_server();
     stop_http_server();
 
-    auto client = std::atomic_exchange_explicit(
-        &client_, std::shared_ptr<Client>{}, std::memory_order_acq_rel);
-    if (!client) {
+    if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
-        auto unregister_result = client->unregisterLocalMemory(
+        auto unregister_result = client_->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
         if (!unregister_result) {
             LOG(WARNING)
@@ -1028,10 +1023,14 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     // Reset all resources
+    client_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
+    local_hostname = "";
+    device_name = "";
+    protocol = "";
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto shm_it = shm_contexts_.begin();
     while (shm_it != shm_contexts_.end()) {
@@ -3002,58 +3001,6 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
     return results;
 }
 
-int64_t RealClient::get_into_range(const std::string &key, void *buffer,
-                                   size_t dst_offset, size_t src_offset,
-                                   size_t size) {
-    return to_py_ret(
-        get_into_range_internal(key, buffer, dst_offset, src_offset, size));
-}
-
-std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
-    const std::vector<std::string> &keys) {
-    if (!client_) {
-        return std::vector<tl::expected<QueryResult, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    return client_->BatchQuery(keys);
-}
-
-tl::expected<int64_t, ErrorCode>
-RealClient::get_into_range_with_query_result_internal(
-    const std::string &key, const QueryResult &query_result, void *buffer,
-    size_t dst_offset, size_t src_offset, size_t size) {
-    if (!client_) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const auto &replica_list = query_result.replicas;
-    if (replica_list.empty()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const auto &res = client_->GetPreferredReplica(replica_list);
-    if (!res) return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    const auto &replica = res.value();
-    if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "get_into_range_with_query_result only supports memory";
-        return tl::unexpected(ErrorCode::INVALID_REPLICA);
-    }
-    uint64_t total_size = calculate_total_size(replica);
-    if (src_offset + size > total_size) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    std::vector<Slice> slices;
-    slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
-    auto get_result = client_->Get(key, query_result, slices, src_offset);
-    if (!get_result) return tl::unexpected(get_result.error());
-    return static_cast<int64_t>(size);
-}
-
-int64_t RealClient::get_into_range_with_query_result(
-    const std::string &key, const QueryResult &query_result, void *buffer,
-    size_t dst_offset, size_t src_offset, size_t size) {
-    return to_py_ret(get_into_range_with_query_result_internal(
-        key, query_result, buffer, dst_offset, src_offset, size));
-}
-
 std::string RealClient::get_hostname() const { return local_hostname; }
 
 std::vector<int> RealClient::batch_put_from(
@@ -3884,60 +3831,6 @@ RealClient::get_into_ranges_shm_helper(
         real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
         all_sizes, &prepared.required_buffer_sizes, &prepared.results,
         &prepared.valid_fragments);
-}
-
-std::vector<BatchQueryResultItem> RealClient::batch_query_dummy_helper(
-    const std::vector<std::string> &keys) {
-    if (!client_) {
-        return std::vector<BatchQueryResultItem>(
-            keys.size(),
-            BatchQueryResultItem{
-                static_cast<int>(ErrorCode::INVALID_PARAMS), {}, 0});
-    }
-    auto results = client_->BatchQuery(keys);
-    std::vector<BatchQueryResultItem> items;
-    items.reserve(results.size());
-    auto now = std::chrono::steady_clock::now();
-    for (const auto &r : results) {
-        if (r) {
-            auto lease_ttl_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    r->lease_timeout - now)
-                    .count();
-            if (lease_ttl_ms < 0) lease_ttl_ms = 0;
-            items.push_back({0, std::vector<Replica::Descriptor>(r->replicas),
-                             static_cast<uint64_t>(lease_ttl_ms)});
-        } else {
-            items.push_back({toInt(r.error()), {}, 0});
-        }
-    }
-    return items;
-}
-
-tl::expected<int64_t, ErrorCode>
-RealClient::get_into_range_with_query_result_dummy_helper(
-    const std::string &key, const BatchQueryResultItem &query_item,
-    uint64_t dummy_buffer, size_t dst_offset, size_t src_offset, size_t size,
-    const UUID &client_id) {
-    if (query_item.error_code != 0) {
-        return tl::unexpected(static_cast<ErrorCode>(query_item.error_code));
-    }
-    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
-    auto it = shm_contexts_.find(client_id);
-    if (it == shm_contexts_.end()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    void *real_buffer = nullptr;
-    if (!map_dummy_buffer_range_to_real(it->second, dummy_buffer, dst_offset,
-                                        size, real_buffer)) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto lease_timeout = std::chrono::steady_clock::now() +
-                         std::chrono::milliseconds(query_item.lease_ttl_ms);
-    std::vector<Replica::Descriptor> replicas = query_item.replicas;
-    QueryResult qr(std::move(replicas), lease_timeout);
-    return get_into_range_with_query_result_internal(key, qr, real_buffer, 0,
-                                                     src_offset, size);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>

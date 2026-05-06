@@ -135,12 +135,6 @@ struct ShmFdResponse {
     uint64_t shm_size;  // size of the shm region
 };
 
-struct BatchQueryResultItem {
-    int error_code;
-    std::vector<Replica::Descriptor> replicas;
-    uint64_t lease_ttl_ms;
-};
-
 class ClientRequester {
    public:
     ClientRequester();
@@ -250,32 +244,6 @@ class PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes) = 0;
 
-    /**
-     * Read a range [src_offset, src_offset+size) from key into
-     * (buffer + dst_offset). For zero-copy, buffer must be registered.
-     * @return bytes read on success, negative on error
-     */
-    virtual int64_t get_into_range(const std::string &key, void *buffer,
-                                   size_t dst_offset, size_t src_offset,
-                                   size_t size) = 0;
-
-    /**
-     * Batch query replica metadata for keys (one round-trip to master).
-     * Use with get_into_range_with_query_result to avoid per-call queries.
-     * @return Vector of QueryResult or ErrorCode per key
-     */
-    virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
-        const std::vector<std::string> &keys) = 0;
-
-    /**
-     * Read range using pre-fetched query result (skips master query).
-     * @param query_result From batch_query; must not be lease-expired
-     * @return bytes read on success, negative on error
-     */
-    virtual int64_t get_into_range_with_query_result(
-        const std::string &key, const QueryResult &query_result, void *buffer,
-        size_t dst_offset, size_t src_offset, size_t size) = 0;
-
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers,
@@ -382,14 +350,6 @@ class PyClient {
 
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
-
-    std::shared_ptr<mooncake::Client> get_client_shared() const {
-        return std::atomic_load_explicit(&client_, std::memory_order_acquire);
-    }
-
-    bool has_live_client() const {
-        return static_cast<bool>(get_client_shared());
-    }
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
