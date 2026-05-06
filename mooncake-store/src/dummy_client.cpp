@@ -989,15 +989,6 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     return results;
 }
 
-std::vector<int64_t> DummyClient::batch_get_buffer_ranges(
-    const std::vector<std::string>& keys, void* dest_buffer,
-    const std::vector<size_t>& dest_offsets,
-    const std::vector<size_t>& src_offsets, const std::vector<size_t>& sizes) {
-    LOG(ERROR) << "batch_get_buffer_ranges is not supported for dummy client";
-    return std::vector<int64_t>(
-        keys.size(), -static_cast<int64_t>(ErrorCode::INVALID_PARAMS));
-}
-
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
     uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);

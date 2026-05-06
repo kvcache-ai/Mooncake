@@ -110,12 +110,6 @@ class DummyClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
-    std::vector<int64_t> batch_get_buffer_ranges(
-        const std::vector<std::string> &keys, void *dest_buffer,
-        const std::vector<size_t> &dest_offsets,
-        const std::vector<size_t> &src_offsets,
-        const std::vector<size_t> &sizes) override;
-
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
                   const ReplicateConfig &config = ReplicateConfig{});

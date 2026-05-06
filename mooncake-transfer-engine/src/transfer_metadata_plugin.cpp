@@ -20,17 +20,9 @@
 #include <json/value.h>
 #include <net/if.h>
 #include <netdb.h>
-#include <netinet/tcp.h>
 #include <sys/socket.h>
 
-#include <cstring>
-#include <mutex>
 #include <random>
-#include <string_view>
-#include <type_traits>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
@@ -73,83 +65,6 @@ static bool parseJsonString(const std::string &json_str, Json::Value &value,
 }
 
 namespace mooncake {
-
-namespace {
-
-constexpr uint32_t kNotifyWireMagic = 0x4d434e54U;  // MCNT
-constexpr uint16_t kNotifyWireVersion = 1;
-
-template <typename T>
-void appendWireValue(std::string &out, const T &value) {
-    static_assert(std::is_trivially_copyable_v<T>);
-    size_t old_size = out.size();
-    out.resize(old_size + sizeof(T));
-    std::memcpy(out.data() + old_size, &value, sizeof(T));
-}
-
-template <typename T>
-bool readWireValue(std::string_view input, size_t &offset, T &value) {
-    static_assert(std::is_trivially_copyable_v<T>);
-    if (offset + sizeof(T) > input.size()) {
-        return false;
-    }
-    std::memcpy(&value, input.data() + offset, sizeof(T));
-    offset += sizeof(T);
-    return true;
-}
-
-bool readWireBytes(std::string_view input, size_t &offset, size_t length,
-                   std::string &value) {
-    if (offset + length > input.size()) {
-        return false;
-    }
-    value.assign(input.data() + offset, length);
-    offset += length;
-    return true;
-}
-
-bool encodeNotifyWirePayload(const TransferMetadata::NotifyDesc &desc,
-                             std::string &payload) {
-    payload.clear();
-    const uint32_t name_len = static_cast<uint32_t>(desc.name.size());
-    const uint32_t msg_len = static_cast<uint32_t>(desc.notify_msg.size());
-    appendWireValue(payload, kNotifyWireMagic);
-    appendWireValue(payload, kNotifyWireVersion);
-    appendWireValue(payload, static_cast<uint16_t>(0));
-    appendWireValue(payload, name_len);
-    appendWireValue(payload, msg_len);
-    payload.append(desc.name);
-    payload.append(desc.notify_msg);
-    return true;
-}
-
-bool decodeNotifyWirePayload(std::string_view payload,
-                             TransferMetadata::NotifyDesc &desc) {
-    size_t offset = 0;
-    uint32_t magic = 0;
-    uint16_t version = 0;
-    uint16_t reserved = 0;
-    uint32_t name_len = 0;
-    uint32_t msg_len = 0;
-    if (!readWireValue(payload, offset, magic) ||
-        !readWireValue(payload, offset, version) ||
-        !readWireValue(payload, offset, reserved) ||
-        !readWireValue(payload, offset, name_len) ||
-        !readWireValue(payload, offset, msg_len)) {
-        return false;
-    }
-    if (magic != kNotifyWireMagic || version != kNotifyWireVersion) {
-        return false;
-    }
-    if (!readWireBytes(payload, offset, name_len, desc.name) ||
-        !readWireBytes(payload, offset, msg_len, desc.notify_msg)) {
-        return false;
-    }
-    return offset == payload.size();
-}
-
-}  // namespace
-
 #ifdef USE_REDIS
 struct RedisStoragePlugin : public MetadataStoragePlugin {
     RedisStoragePlugin(const std::string &metadata_uri)
@@ -699,11 +614,6 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
 }
 
 struct SocketHandShakePlugin : public HandShakePlugin {
-    struct NotifyConnection {
-        std::mutex mu;
-        int fd = -1;
-    };
-
     SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {
         auto &config = globalConfig();
         listen_backlog_ = config.handshake_listen_backlog;
@@ -720,14 +630,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     virtual ~SocketHandShakePlugin() {
         if (listener_running_) {
             listener_running_ = false;
-            closeListen();
-        }
-        shutdownAcceptedConnections();
-        shutdownNotifyClientConnections();
-        if (listener_.joinable()) {
             listener_.join();
         }
-        joinConnectionWorkers();
+        closeListen();
     }
 
     virtual void registerOnConnectionCallBack(OnReceiveCallBack callback) {
@@ -738,7 +643,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         on_metadata_callback_ = callback;
     }
 
-    virtual void registerOnNotifyCallBack(OnReceiveNotifyCallBack callback) {
+    virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) {
         on_notify_callback_ = callback;
     }
 
@@ -838,15 +743,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                int on = 1;
-                if (setsockopt(conn_fd, IPPROTO_TCP, TCP_NODELAY, &on,
-                               sizeof(on))) {
-                    PLOG(ERROR)
-                        << "SocketHandShakePlugin: setsockopt(TCP_NODELAY)";
-                    close(conn_fd);
-                    continue;
-                }
-
                 struct timeval timeout;
                 timeout.tv_sec = 60;
                 timeout.tv_usec = 0;
@@ -857,11 +753,75 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     close(conn_fd);
                     continue;
                 }
-                registerAcceptedConnection(conn_fd);
-                std::lock_guard<std::mutex> guard(connection_workers_mu_);
-                connection_workers_.emplace_back(
-                    &SocketHandShakePlugin::handleConnection, this, conn_fd,
-                    getNetworkAddress((struct sockaddr *)&addr));
+
+                auto peer_hostname =
+                    getNetworkAddress((struct sockaddr *)&addr);
+
+                Json::Value local, peer;
+
+                auto [type, json_str] = readString(conn_fd);
+                std::string errs;
+                if (!parseJsonString(json_str, peer, &errs)) {
+                    LOG(ERROR)
+                        << "SocketHandShakePlugin: failed to receive "
+                           "handshake message, "
+                           "malformed json format: "
+                        << errs << ", json string length: " << json_str.size()
+                        << ", json string content: " << json_str;
+                    close(conn_fd);
+                    continue;
+                }
+
+                // old protocol equals Connection type
+                if (type == HandShakeRequestType::Connection ||
+                    type == HandShakeRequestType::OldProtocol) {
+                    if (on_connection_callback_)
+                        on_connection_callback_(peer, local);
+                } else if (type == HandShakeRequestType::Metadata) {
+                    if (on_metadata_callback_)
+                        on_metadata_callback_(peer, local);
+                } else if (type == HandShakeRequestType::Notify) {
+                    if (on_notify_callback_) on_notify_callback_(peer, local);
+                } else if (type == HandShakeRequestType::Probe) {
+                    if (on_probe_callback_) on_probe_callback_(peer, local);
+                } else {
+                    LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
+                                  "message type";
+                    close(conn_fd);
+                    continue;
+                }
+
+                int ret =
+                    writeString(conn_fd, type, Json::FastWriter{}.write(local));
+                if (ret) {
+                    LOG(ERROR) << "SocketHandShakePlugin: failed to send "
+                                  "message: "
+                                  "malformed json format, check tcp connection";
+                    close(conn_fd);
+                    continue;
+                }
+
+                ret = shutdown(conn_fd, SHUT_WR);
+                if (ret) {
+                    PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
+                                   "connection may be incomplete";
+                    close(conn_fd);
+                    continue;
+                }
+
+                // Wait for the client to close the connection
+                char byte;
+                ssize_t rc = read(conn_fd, &byte, sizeof(byte));
+                if (rc > 0) {
+                    LOG(ERROR) << "Unexpected socket read result: " << rc
+                               << ", byte: " << int(byte);
+                } else if (rc < 0) {
+                    PLOG(ERROR)
+                        << "Socket read failed while waiting client to close";
+                }
+                // else rc == 0, client close the connection, safe to close.
+
+                close(conn_fd);
             }
             return;
         });
@@ -870,10 +830,38 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
-                           const TransferMetadata::NotifyDesc &local,
-                           TransferMetadata::NotifyDesc &peer) {
-        auto connection = getNotifyConnection(ip_or_host_name, rpc_port);
-        return doSendNotify(connection, ip_or_host_name, rpc_port, local, peer);
+                           const Json::Value &local, Json::Value &peer) {
+        struct addrinfo hints;
+        struct addrinfo *result, *rp;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        char service[16];
+        sprintf(service, "%u", rpc_port);
+        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
+            PLOG(ERROR)
+                << "SocketHandShakePlugin: failed to get IP address of peer "
+                   "server "
+                << ip_or_host_name << ":" << rpc_port
+                << ", check DNS and /etc/hosts, or use IPv4 address instead";
+            return ERR_DNS;
+        }
+
+        int ret = 0;
+        for (rp = result; rp; rp = rp->ai_next) {
+            ret = doSendNotify(rp, local, peer);
+            if (ret == 0) {
+                freeaddrinfo(result);
+                return 0;
+            }
+            if (ret == ERR_MALFORMED_JSON) {
+                return ret;
+            }
+        }
+
+        freeaddrinfo(result);
+        return ret;
     }
 
     virtual int sendProbe(std::string ip_or_host_name, uint16_t rpc_port,
@@ -955,11 +943,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
         if (setsockopt(conn_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-        if (setsockopt(conn_fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on))) {
-            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(TCP_NODELAY)";
             close(conn_fd);
             return ERR_SOCKET;
         }
@@ -1059,51 +1042,45 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doSendNotify(const std::shared_ptr<NotifyConnection> &connection,
-                     const std::string &ip_or_host_name, uint16_t rpc_port,
-                     const TransferMetadata::NotifyDesc &local_notify,
-                     TransferMetadata::NotifyDesc &peer_notify) {
-        std::lock_guard<std::mutex> guard(connection->mu);
-        if (connection->fd < 0) {
-            int ret = connectNotifyConnection(ip_or_host_name, rpc_port,
-                                              connection->fd);
-            if (ret) {
-                return ret;
-            }
-        }
-
-        std::string request_payload;
-        if (!encodeNotifyWirePayload(local_notify, request_payload)) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to encode notify";
-            return ERR_MALFORMED_JSON;
-        }
-        int ret = writeString(connection->fd, HandShakeRequestType::Notify,
-                              request_payload);
+    int doSendNotify(struct addrinfo *addr, const Json::Value &local_notify,
+                     Json::Value &peer_notify) {
+        int conn_fd = -1;
+        int ret = doConnect(addr, conn_fd);
         if (ret) {
-            closeNotifyConnection(*connection);
-            LOG(ERROR)
-                << "SocketHandShakePlugin: failed to send metadata message: "
-                   "malformed json format, check tcp connection";
             return ret;
         }
 
-        auto [type, json_str] = readString(connection->fd);
+        ret = writeString(conn_fd, HandShakeRequestType::Notify,
+                          Json::FastWriter{}.write(local_notify));
+        if (ret) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: failed to send metadata message: "
+                   "malformed json format, check tcp connection";
+            close(conn_fd);
+            return ret;
+        }
+
+        auto [type, json_str] = readString(conn_fd);
         if (type != HandShakeRequestType::Notify) {
-            closeNotifyConnection(*connection);
             LOG(ERROR)
                 << "SocketHandShakePlugin: unexpected handshake message type";
+            close(conn_fd);
             return ERR_SOCKET;
         }
 
         // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
         //           << json_str;
 
-        if (!decodeNotifyWirePayload(json_str, peer_notify)) {
-            closeNotifyConnection(*connection);
-            LOG(ERROR)
-                << "SocketHandShakePlugin: failed to decode notify reply";
+        std::string errs;
+        if (!parseJsonString(json_str, peer_notify, &errs)) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
+                          "message, malformed json format: "
+                       << errs;
+            close(conn_fd);
             return ERR_MALFORMED_JSON;
         }
+
+        close(conn_fd);
         return 0;
     }
 
@@ -1144,207 +1121,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         close(conn_fd);
         return 0;
-    }
-
-    std::shared_ptr<NotifyConnection> getNotifyConnection(
-        const std::string &ip_or_host_name, uint16_t rpc_port) {
-        const std::string key =
-            ip_or_host_name + ":" + std::to_string(rpc_port);
-        std::lock_guard<std::mutex> guard(notify_connections_mu_);
-        auto &entry = notify_connections_[key];
-        if (!entry) {
-            entry = std::make_shared<NotifyConnection>();
-        }
-        return entry;
-    }
-
-    int connectNotifyConnection(const std::string &ip_or_host_name,
-                                uint16_t rpc_port, int &conn_fd) {
-        struct addrinfo hints;
-        struct addrinfo *result, *rp;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
-            PLOG(ERROR)
-                << "SocketHandShakePlugin: failed to get IP address of peer "
-                   "server "
-                << ip_or_host_name << ":" << rpc_port
-                << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
-        }
-        int ret = ERR_SOCKET;
-        for (rp = result; rp; rp = rp->ai_next) {
-            ret = doConnect(rp, conn_fd);
-            if (ret == 0) {
-                break;
-            }
-        }
-        freeaddrinfo(result);
-        return ret;
-    }
-
-    void closeNotifyConnection(NotifyConnection &connection) {
-        if (connection.fd >= 0) {
-            close(connection.fd);
-            connection.fd = -1;
-        }
-    }
-
-    void shutdownNotifyClientConnections() {
-        std::lock_guard<std::mutex> guard(notify_connections_mu_);
-        for (auto &entry : notify_connections_) {
-            auto &connection = *entry.second;
-            std::lock_guard<std::mutex> connection_guard(connection.mu);
-            if (connection.fd >= 0) {
-                shutdown(connection.fd, SHUT_RDWR);
-                close(connection.fd);
-                connection.fd = -1;
-            }
-        }
-        notify_connections_.clear();
-    }
-
-    void registerAcceptedConnection(int conn_fd) {
-        std::lock_guard<std::mutex> guard(active_connections_mu_);
-        active_connections_.insert(conn_fd);
-    }
-
-    void unregisterAcceptedConnection(int conn_fd) {
-        std::lock_guard<std::mutex> guard(active_connections_mu_);
-        active_connections_.erase(conn_fd);
-    }
-
-    void shutdownAcceptedConnections() {
-        std::lock_guard<std::mutex> guard(active_connections_mu_);
-        for (int conn_fd : active_connections_) {
-            shutdown(conn_fd, SHUT_RDWR);
-        }
-    }
-
-    void joinConnectionWorkers() {
-        std::lock_guard<std::mutex> guard(connection_workers_mu_);
-        for (auto &worker : connection_workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-        connection_workers_.clear();
-    }
-
-    void handleConnection(int conn_fd, const std::string &peer_hostname) {
-        while (true) {
-            Json::Value local, peer;
-            TransferMetadata::NotifyDesc local_notify;
-            TransferMetadata::NotifyDesc peer_notify;
-            auto [type, json_str] = readString(conn_fd);
-            if (json_str.empty()) {
-                break;
-            }
-
-            if (type == HandShakeRequestType::Notify) {
-                if (!decodeNotifyWirePayload(json_str, peer_notify)) {
-                    LOG(ERROR)
-                        << "SocketHandShakePlugin: failed to decode notify "
-                           "message from "
-                        << peer_hostname
-                        << ", payload length: " << json_str.size();
-                    break;
-                }
-            } else {
-                std::string errs;
-                if (!parseJsonString(json_str, peer, &errs)) {
-                    LOG(ERROR)
-                        << "SocketHandShakePlugin: failed to receive handshake "
-                           "message from "
-                        << peer_hostname << ", malformed json format: " << errs
-                        << ", json string length: " << json_str.size()
-                        << ", json string content: " << json_str;
-                    break;
-                }
-            }
-
-            bool keep_connection = false;
-            if (type == HandShakeRequestType::Connection ||
-                type == HandShakeRequestType::OldProtocol) {
-                if (on_connection_callback_) {
-                    on_connection_callback_(peer, local);
-                }
-            } else if (type == HandShakeRequestType::Metadata) {
-                if (on_metadata_callback_) {
-                    on_metadata_callback_(peer, local);
-                }
-            } else if (type == HandShakeRequestType::Notify) {
-                keep_connection = true;
-                if (on_notify_callback_) {
-                    on_notify_callback_(peer_notify, local_notify);
-                }
-            } else if (type == HandShakeRequestType::Probe) {
-                if (on_probe_callback_) {
-                    on_probe_callback_(peer, local);
-                }
-            } else {
-                LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
-                              "message type";
-                break;
-            }
-
-            std::string response_payload;
-            if (type == HandShakeRequestType::Notify) {
-                if (!encodeNotifyWirePayload(local_notify, response_payload)) {
-                    LOG(ERROR) << "SocketHandShakePlugin: failed to encode "
-                                  "notify reply";
-                    break;
-                }
-            } else {
-                response_payload = Json::FastWriter{}.write(local);
-            }
-            int ret = (type == HandShakeRequestType::Notify)
-                          ? writeString(conn_fd, type, response_payload)
-                          : writeString(conn_fd, type, response_payload);
-            if (ret) {
-                LOG(ERROR) << "SocketHandShakePlugin: failed to send message: "
-                              "malformed json format, check tcp connection";
-                break;
-            }
-
-            if (keep_connection) {
-                struct timeval timeout;
-                timeout.tv_sec = 3600;
-                timeout.tv_usec = 0;
-                if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                               sizeof(timeout))) {
-                    PLOG(ERROR)
-                        << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
-                    break;
-                }
-                continue;
-            }
-
-            ret = shutdown(conn_fd, SHUT_WR);
-            if (ret) {
-                PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
-                               "connection may be incomplete";
-                break;
-            }
-
-            char byte;
-            ssize_t rc = read(conn_fd, &byte, sizeof(byte));
-            if (rc > 0) {
-                LOG(ERROR) << "Unexpected socket read result: " << rc
-                           << ", byte: " << int(byte);
-            } else if (rc < 0 && errno != EWOULDBLOCK && errno != EINTR) {
-                PLOG(ERROR)
-                    << "Socket read failed while waiting client to close";
-            }
-            break;
-        }
-
-        unregisterAcceptedConnection(conn_fd);
-        close(conn_fd);
     }
 
     int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
@@ -1393,17 +1169,10 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::thread listener_;
     int listen_fd_;
     int listen_backlog_;
-    std::mutex notify_connections_mu_;
-    std::unordered_map<std::string, std::shared_ptr<NotifyConnection>>
-        notify_connections_;
-    std::mutex active_connections_mu_;
-    std::unordered_set<int> active_connections_;
-    std::mutex connection_workers_mu_;
-    std::vector<std::thread> connection_workers_;
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
-    OnReceiveNotifyCallBack on_notify_callback_;
+    OnReceiveCallBack on_notify_callback_;
     OnReceiveCallBack on_probe_callback_;
 };
 

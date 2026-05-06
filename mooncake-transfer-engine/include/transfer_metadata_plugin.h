@@ -42,8 +42,6 @@ struct HandShakePlugin {
     // second param represents local attributes.
     using OnReceiveCallBack =
         std::function<int(const Json::Value &, Json::Value &)>;
-    using OnReceiveNotifyCallBack = std::function<int(
-        const TransferMetadata::NotifyDesc &, TransferMetadata::NotifyDesc &)>;
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) = 0;
 
@@ -52,10 +50,10 @@ struct HandShakePlugin {
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) = 0;
     virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
-                           const TransferMetadata::NotifyDesc &local,
-                           TransferMetadata::NotifyDesc &peer) = 0;
+                           const Json::Value &local, Json::Value &peer) = 0;
     virtual int sendProbe(std::string ip_or_host_name, uint16_t rpc_port,
                           const Json::Value &local, Json::Value &peer) = 0;
+
     // Exchange metadata with remote peer.
     virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
                                  const Json::Value &local_metadata,
@@ -68,7 +66,7 @@ struct HandShakePlugin {
     virtual void registerOnMetadataCallBack(OnReceiveCallBack callback) = 0;
 
     // Register callback function for receiving metadata exchange request.
-    virtual void registerOnNotifyCallBack(OnReceiveNotifyCallBack callback) = 0;
+    virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) = 0;
 
     // Register callback function for receiving liveness probe request.
     virtual void registerOnProbeCallBack(OnReceiveCallBack callback) = 0;

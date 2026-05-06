@@ -58,20 +58,12 @@ class Transport {
     struct TransferRequest {
         enum OpCode { READ, WRITE };
 
-        /// Sentinel value indicating a request does not belong to any group.
-        static constexpr uint64_t kNoTaskGroup = 0;
-
         OpCode opcode;
         void *source;
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
-
-        /// Optional task group identifier. Adjacent requests that share the
-        /// same non-default task_group_id and resolve to the same Transport are
-        /// coalesced into a single logical task inside submitTransfer().
-        uint64_t task_group_id = kNoTaskGroup;
     };
 
     enum TransferStatusEnum {
@@ -311,10 +303,6 @@ class Transport {
 #else
         const TransferRequest *request = nullptr;
 #endif
-        // Grouped logical tasks may carry multiple adjacent requests that
-        // should be submitted as one transport task.
-        std::vector<TransferRequest> request_group;
-
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {

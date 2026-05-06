@@ -287,12 +287,6 @@ class PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node) = 0;
 
-    virtual std::vector<int64_t> batch_get_buffer_ranges(
-        const std::vector<std::string> &keys, void *dest_buffer,
-        const std::vector<size_t> &dest_offsets,
-        const std::vector<size_t> &src_offsets,
-        const std::vector<size_t> &sizes) = 0;
-
     virtual int put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config = ReplicateConfig{}) = 0;
 

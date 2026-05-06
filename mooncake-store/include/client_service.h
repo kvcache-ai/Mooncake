@@ -174,12 +174,6 @@ class Client {
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
 
-    ErrorCode BatchTransferReadRanges(
-        void* dest_buffer,
-        const std::vector<
-            std::pair<Replica::Descriptor,
-                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
-            key_ranges);
     ErrorCode BatchTransferReadBuffers(
         const std::vector<AllocatedBuffer::Descriptor>& src_buffers,
         const std::vector<void*>& dest_buffers,

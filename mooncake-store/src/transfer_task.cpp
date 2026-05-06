@@ -617,13 +617,11 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         const void* src;
 
         if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local
-            // buffer)
+            // READ: from handle (remote buffer) to slice (local buffer)
             dest = slice.ptr;
             src = reinterpret_cast<const void*>(base_address + offset);
         } else {
-            // WRITE: from slice (local buffer) to handle (remote
-            // buffer)
+            // WRITE: from slice (local buffer) to handle (remote buffer)
             dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
@@ -643,10 +641,9 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests, size_t batch_task_count) {
+    std::vector<TransferRequest>& requests) {
     // Allocate batch ID
-    const size_t batch_size =
-        batch_task_count == 0 ? requests.size() : batch_task_count;
+    const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
@@ -765,118 +762,6 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
         updateTransferMetrics(slices, TransferRequest::READ);
     }
 
-    return future;
-}
-
-namespace {
-
-using ScatterRange = std::tuple<size_t, size_t, size_t>;
-using ScatterKeyRanges =
-    std::vector<std::pair<Replica::Descriptor, std::vector<ScatterRange>>>;
-
-struct ScatterReadBuildResult {
-    std::vector<TransferRequest> flat_requests;
-    std::vector<std::vector<TransferRequest>> logical_groups;
-};
-
-std::optional<ScatterReadBuildResult> buildScatterReadRequests(
-    TransferEngine& engine, void* dest_buffer,
-    const ScatterKeyRanges& key_ranges, bool enable_task_grouping,
-    const char* log_context) {
-    ScatterReadBuildResult result;
-    size_t total_ranges = 0;
-    for (const auto& [_, ranges] : key_ranges) {
-        total_ranges += ranges.size();
-    }
-    result.flat_requests.reserve(total_ranges);
-    if (enable_task_grouping) {
-        result.logical_groups.reserve(key_ranges.size());
-    }
-
-    uint64_t next_task_group_id = 0;
-    char* dest_base = static_cast<char*>(dest_buffer);
-
-    for (const auto& [replica, ranges] : key_ranges) {
-        if (!replica.is_memory_replica()) {
-            LOG(ERROR) << log_context << ": disk replicas not supported";
-            return std::nullopt;
-        }
-        const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
-        if (handle.transport_endpoint_.empty()) {
-            LOG(ERROR) << log_context << ": empty transport endpoint";
-            return std::nullopt;
-        }
-
-        SegmentHandle seg = engine.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << log_context << ": failed to open segment for "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
-        }
-
-        uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-        std::vector<TransferRequest> group_requests;
-        if (enable_task_grouping) {
-            group_requests.reserve(ranges.size());
-        }
-        const uint64_t task_group_id = enable_task_grouping
-                                           ? next_task_group_id++
-                                           : TransferRequest::kNoTaskGroup;
-
-        for (const auto& [dest_offset, src_offset, size] : ranges) {
-            if (size == 0) {
-                continue;
-            }
-            TransferRequest request;
-            request.opcode = TransferRequest::READ;
-            request.source = dest_base + dest_offset;
-            request.target_id = seg;
-            request.target_offset = base_address + src_offset;
-            request.length = size;
-            request.task_group_id = task_group_id;
-            result.flat_requests.emplace_back(request);
-            if (enable_task_grouping) {
-                group_requests.emplace_back(request);
-            }
-        }
-
-        if (enable_task_grouping && !group_requests.empty()) {
-            result.logical_groups.emplace_back(std::move(group_requests));
-        }
-    }
-
-    return result;
-}
-}  // namespace
-
-std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
-    void* dest_buffer,
-    const std::vector<std::pair<
-        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
-        key_ranges,
-    bool enable_task_grouping) {
-    auto build_result =
-        buildScatterReadRequests(engine_, dest_buffer, key_ranges,
-                                 enable_task_grouping, "submitBatchReadRanges");
-    if (!build_result) {
-        return std::nullopt;
-    }
-
-    auto& requests = build_result->flat_requests;
-    if (requests.empty()) {
-        return TransferFuture(std::make_shared<EmptyOperationState>());
-    }
-
-    const size_t grouped_task_count = build_result->logical_groups.size();
-    auto future =
-        submitTransfer(requests, enable_task_grouping ? grouped_task_count : 0);
-    if (future && transfer_metric_) {
-        size_t total_bytes = 0;
-        for (const auto& request : requests) {
-            total_bytes += request.length;
-        }
-        transfer_metric_->total_read_bytes.inc(total_bytes);
-    }
     return future;
 }
 

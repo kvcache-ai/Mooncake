@@ -180,6 +180,7 @@ class TransferMetadata {
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
     int getNotifies(std::vector<NotifyDesc> &notifies);
+
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 
     using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
@@ -206,7 +207,8 @@ class TransferMetadata {
         Json::Value &segmentJSON, const std::string &segment_name);
     int receivePeerMetadata(const Json::Value &peer_json,
                             Json::Value &local_json);
-    int receivePeerNotify(const NotifyDesc &peer_desc, NotifyDesc &local_desc);
+    int receivePeerNotify(const Json::Value &peer_json,
+                          Json::Value &local_json);
     int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
     std::string getFullMetadataKey(const std::string &segment_name) const;
 
