@@ -271,7 +271,12 @@ class RegisteredAllocator:
 
     def alloc(self, size: int) -> int:
         pointer = int(self._allocator.alloc(size))
-        self._store.register_buffer(pointer, size)
+        status = int(self._store.register_buffer(pointer, size))
+        if status != 0:
+            self._allocator.free(pointer)
+            raise RuntimeError(
+                f"register_buffer failed pointer={pointer:#x} size={size} status={status}"
+            )
         self._registered.append((pointer, size))
         return pointer
 

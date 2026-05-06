@@ -90,6 +90,7 @@ Use `setup_dummy(...)` when Python should behave like the upstream dummy compati
 - `keyspace` remains the metadata/data-plane namespace knob for the real runtime that the standalone daemon was started with
 - `worker_scope` isolates dummy compat-local state such as hot-cache SHM, registered-region side channels, and worker-local dispatcher state
 - when `worker_scope` is omitted, the Python layer derives it from `keyspace` when present; otherwise it allocates a unique per-setup worker scope
+- a daemon started with an explicit `keyspace` or `worker_scope` also exposes a legacy `worker-1` side-channel alias so omitted-scope dummy buffer clients can still register SHM regions
 
 This mode:
 
@@ -102,6 +103,12 @@ This mode:
 Dummy mode is intentionally narrower than real mode. It exists to preserve compatibility for callers that expect the old dummy client / standalone server split.
 
 The standalone server behind dummy mode still uses the same Rust runtime internally, so route publication, reclaim, eviction, tracing, and metrics stay aligned with the real path.
+
+Compatibility note:
+
+- legacy Python alias names such as `put_batch(...)` and `get_batch(...)` remain available
+- dummy mode also supports high-level `batch_put(...)` and `batch_get(...)` compatibility calls for legacy black-box tests
+- registered-buffer and multi-buffer batch APIs are still the preferred throughput path for dummy-mode validation
 
 ## Local Hot Cache
 

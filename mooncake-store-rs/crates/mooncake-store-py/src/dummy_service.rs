@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use crate::shm::{
     recv_hot_cache_fd_request, recv_shm_register_request, send_hot_cache_fd_response,
     DummyClientId, ShmRegisterRequest,
 };
+use crate::DEFAULT_COMPAT_WORKER_SCOPE;
 
 pub mod pb {
     tonic::include_proto!("mooncake.store.dummy");
@@ -25,13 +26,13 @@ pub mod pb {
 
 pub struct DummyStoreServerHandle {
     address: String,
-    socket_path: PathBuf,
-    hot_cache_socket_path: Option<PathBuf>,
+    socket_paths: Vec<PathBuf>,
+    hot_cache_socket_paths: Vec<PathBuf>,
     shutdown_flag: Arc<AtomicBool>,
     grpc_shutdown: Option<oneshot::Sender<()>>,
     grpc_thread: Option<JoinHandle<()>>,
-    shm_thread: Option<JoinHandle<()>>,
-    hot_cache_thread: Option<JoinHandle<()>>,
+    shm_threads: Vec<JoinHandle<()>>,
+    hot_cache_threads: Vec<JoinHandle<()>>,
 }
 
 impl DummyStoreServerHandle {
@@ -40,7 +41,7 @@ impl DummyStoreServerHandle {
     }
 
     pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+        &self.socket_paths[0]
     }
 
     pub fn shutdown(mut self) -> Result<(), StoreError> {
@@ -48,23 +49,27 @@ impl DummyStoreServerHandle {
         if let Some(tx) = self.grpc_shutdown.take() {
             let _ = tx.send(());
         }
-        let _ = UnixStream::connect(&self.socket_path);
-        if let Some(path) = self.hot_cache_socket_path.as_ref() {
+        for path in &self.socket_paths {
             let _ = UnixStream::connect(path);
         }
-        if let Some(thread) = self.shm_thread.take() {
+        for path in &self.hot_cache_socket_paths {
+            let _ = UnixStream::connect(path);
+        }
+        for thread in self.shm_threads.drain(..) {
             let _ = thread.join();
         }
-        if let Some(thread) = self.hot_cache_thread.take() {
+        for thread in self.hot_cache_threads.drain(..) {
             let _ = thread.join();
         }
         if let Some(thread) = self.grpc_thread.take() {
             let _ = thread.join();
         }
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
+        for path in &self.socket_paths {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
         }
-        if let Some(path) = self.hot_cache_socket_path.as_ref() {
+        for path in &self.hot_cache_socket_paths {
             if path.exists() {
                 let _ = std::fs::remove_file(path);
             }
@@ -79,28 +84,99 @@ impl Drop for DummyStoreServerHandle {
         if let Some(tx) = self.grpc_shutdown.take() {
             let _ = tx.send(());
         }
-        let _ = UnixStream::connect(&self.socket_path);
-        if let Some(path) = self.hot_cache_socket_path.as_ref() {
+        for path in &self.socket_paths {
             let _ = UnixStream::connect(path);
         }
-        if let Some(thread) = self.shm_thread.take() {
+        for path in &self.hot_cache_socket_paths {
+            let _ = UnixStream::connect(path);
+        }
+        for thread in self.shm_threads.drain(..) {
             let _ = thread.join();
         }
-        if let Some(thread) = self.hot_cache_thread.take() {
+        for thread in self.hot_cache_threads.drain(..) {
             let _ = thread.join();
         }
         if let Some(thread) = self.grpc_thread.take() {
             let _ = thread.join();
         }
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
+        for path in &self.socket_paths {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
         }
-        if let Some(path) = self.hot_cache_socket_path.as_ref() {
+        for path in &self.hot_cache_socket_paths {
             if path.exists() {
                 let _ = std::fs::remove_file(path);
             }
         }
     }
+}
+
+fn spawn_shm_listener_thread(
+    listener: UnixListener,
+    context: Arc<DummyStoreContext>,
+    shutdown_flag: Arc<AtomicBool>,
+    thread_name: String,
+) -> Result<JoinHandle<()>, StoreError> {
+    thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            while !shutdown_flag.load(Ordering::SeqCst) {
+                match recv_shm_register_request(&listener) {
+                    Ok((request, fd)) => {
+                        if let Err(error) = context.register_region(request, fd) {
+                            tracing::warn!(error = %error, "dummy shm registration failed");
+                        }
+                    }
+                    Err(error) => {
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        tracing::warn!(error = %error, "dummy shm accept loop failed");
+                    }
+                }
+            }
+        })
+        .map_err(|error| StoreError::Transport(format!("failed to spawn shm thread: {error}")))
+}
+
+fn spawn_hot_cache_listener_thread(
+    listener: UnixListener,
+    context: Arc<DummyStoreContext>,
+    shutdown_flag: Arc<AtomicBool>,
+    thread_name: String,
+) -> Result<JoinHandle<()>, StoreError> {
+    thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            while !shutdown_flag.load(Ordering::SeqCst) {
+                match recv_hot_cache_fd_request(&listener) {
+                    Ok((stream, _request)) => match context.client.hot_cache_fd() {
+                        Ok(Some((fd, size))) => {
+                            if let Err(error) = send_hot_cache_fd_response(&stream, &fd, size) {
+                                tracing::warn!(
+                                    error = %error,
+                                    "dummy hot cache fd reply failed"
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(error = %error, "dummy hot cache fd lookup failed");
+                        }
+                    },
+                    Err(error) => {
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        tracing::warn!(error = %error, "dummy hot cache accept loop failed");
+                    }
+                }
+            }
+        })
+        .map_err(|error| {
+            StoreError::Transport(format!("failed to spawn hot cache thread: {error}"))
+        })
 }
 
 pub fn start_dummy_store_server(
@@ -109,76 +185,48 @@ pub fn start_dummy_store_server(
     worker_scope: &str,
 ) -> Result<DummyStoreServerHandle, StoreError> {
     let client = Arc::new(client.fork_with_scope(worker_scope.to_string())?);
-    let socket_path = dummy_ipc_socket_path(bind_addr, worker_scope);
-    let hot_cache_socket_path = client
-        .hot_cache_fd()?
-        .map(|_| hot_cache_ipc_socket_path(bind_addr, worker_scope));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let context = Arc::new(DummyStoreContext { client });
 
-    let shm_listener = bind_shm_listener(&socket_path)?;
-    let shm_shutdown = shutdown_flag.clone();
-    let shm_context = context.clone();
-    let shm_thread = thread::Builder::new()
-        .name("mooncake-store-dummy-shm".to_string())
-        .spawn(move || {
-            while !shm_shutdown.load(Ordering::SeqCst) {
-                match recv_shm_register_request(&shm_listener) {
-                    Ok((request, fd)) => {
-                        if let Err(error) = shm_context.register_region(request, fd) {
-                            tracing::warn!(error = %error, "dummy shm registration failed");
-                        }
-                    }
-                    Err(error) => {
-                        if shm_shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        tracing::warn!(error = %error, "dummy shm accept loop failed");
-                    }
-                }
-            }
-        })
-        .map_err(|error| StoreError::Transport(format!("failed to spawn shm thread: {error}")))?;
-
-    let hot_cache_thread = if let Some(path) = hot_cache_socket_path.as_ref() {
+    let mut socket_paths = vec![dummy_ipc_socket_path(bind_addr, worker_scope)];
+    if worker_scope != DEFAULT_COMPAT_WORKER_SCOPE {
+        let legacy_path = dummy_ipc_socket_path(bind_addr, DEFAULT_COMPAT_WORKER_SCOPE);
+        if legacy_path != socket_paths[0] {
+            socket_paths.push(legacy_path);
+        }
+    }
+    let mut shm_threads = Vec::with_capacity(socket_paths.len());
+    for (index, path) in socket_paths.iter().enumerate() {
         let listener = bind_shm_listener(path)?;
-        let hot_cache_shutdown = shutdown_flag.clone();
-        let hot_cache_context = context.clone();
-        Some(
-            thread::Builder::new()
-                .name("mooncake-store-dummy-hot-cache".to_string())
-                .spawn(move || {
-                    while !hot_cache_shutdown.load(Ordering::SeqCst) {
-                        match recv_hot_cache_fd_request(&listener) {
-                            Ok((stream, _request)) => match hot_cache_context.client.hot_cache_fd() {
-                                Ok(Some((fd, size))) => {
-                                    if let Err(error) =
-                                        send_hot_cache_fd_response(&stream, &fd, size)
-                                    {
-                                        tracing::warn!(error = %error, "dummy hot cache fd reply failed");
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!(error = %error, "dummy hot cache fd lookup failed");
-                                }
-                            },
-                            Err(error) => {
-                                if hot_cache_shutdown.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                                tracing::warn!(error = %error, "dummy hot cache accept loop failed");
-                            }
-                        }
-                    }
-                })
-                .map_err(|error| {
-                    StoreError::Transport(format!("failed to spawn hot cache thread: {error}"))
-                })?,
-        )
-    } else {
-        None
-    };
+        shm_threads.push(spawn_shm_listener_thread(
+            listener,
+            context.clone(),
+            shutdown_flag.clone(),
+            format!("mooncake-store-dummy-shm-{index}"),
+        )?);
+    }
+
+    let mut hot_cache_socket_paths = Vec::new();
+    let mut hot_cache_threads = Vec::new();
+    if context.client.hot_cache_fd()?.is_some() {
+        hot_cache_socket_paths.push(hot_cache_ipc_socket_path(bind_addr, worker_scope));
+        if worker_scope != DEFAULT_COMPAT_WORKER_SCOPE {
+            let legacy_path =
+                hot_cache_ipc_socket_path(bind_addr, DEFAULT_COMPAT_WORKER_SCOPE);
+            if legacy_path != hot_cache_socket_paths[0] {
+                hot_cache_socket_paths.push(legacy_path);
+            }
+        }
+        for (index, path) in hot_cache_socket_paths.iter().enumerate() {
+            let listener = bind_shm_listener(path)?;
+            hot_cache_threads.push(spawn_hot_cache_listener_thread(
+                listener,
+                context.clone(),
+                shutdown_flag.clone(),
+                format!("mooncake-store-dummy-hot-cache-{index}"),
+            )?);
+        }
+    }
 
     let grpc_context = context.clone();
     let address: SocketAddr = bind_addr
@@ -211,13 +259,13 @@ pub fn start_dummy_store_server(
 
     Ok(DummyStoreServerHandle {
         address: bind_addr.to_string(),
-        socket_path,
-        hot_cache_socket_path,
+        socket_paths,
+        hot_cache_socket_paths,
         shutdown_flag,
         grpc_shutdown: Some(shutdown_tx),
         grpc_thread: Some(grpc_thread),
-        shm_thread: Some(shm_thread),
-        hot_cache_thread,
+        shm_threads,
+        hot_cache_threads,
     })
 }
 
