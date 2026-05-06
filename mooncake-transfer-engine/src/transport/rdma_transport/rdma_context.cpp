@@ -259,8 +259,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // the exact allocation boundaries.
         CUdeviceptr allocBase;
         size_t allocSize;
-        result = cuMemGetAddressRange(&allocBase, &allocSize,
-                                      (CUdeviceptr)addr);
+        result =
+            cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
