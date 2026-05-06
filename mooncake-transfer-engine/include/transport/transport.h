@@ -20,9 +20,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __linux__
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <climits>
 #include <cstddef>
