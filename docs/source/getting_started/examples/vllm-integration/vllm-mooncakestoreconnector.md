@@ -16,7 +16,7 @@ This document describes how to deploy vLLM's `MooncakeStoreConnector`. `Mooncake
 
 Before you begin, make sure that:
 
-* [vLLM](https://github.com/vllm-project/vllm) is installed, [Mooncake](https://github.com/kvcache-ai/Mooncake) is installed. Refer to the [vLLM official repository]((https://github.com/vllm-project/vllm)) and [Mooncake official repository](https://github.com/kvcache-ai/Mooncake) for more installation instructions and building from source.
+* [vLLM](https://github.com/vllm-project/vllm) is installed, [Mooncake](https://github.com/kvcache-ai/Mooncake) is installed. Refer to the [vLLM official repository](https://github.com/vllm-project/vllm) and [Mooncake official repository](https://github.com/kvcache-ai/Mooncake) for more installation instructions and building from source.
 
 
 
