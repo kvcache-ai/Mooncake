@@ -480,6 +480,16 @@ class Client {
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
+
+    std::unordered_set<std::string> GetLocalEndpoints() const {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        std::unordered_set<std::string> endpoints;
+        for (const auto& [segment_id, segment] : mounted_segments_) {
+            endpoints.insert(segment.te_endpoint);
+        }
+        return endpoints;
+    }
+
     /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise

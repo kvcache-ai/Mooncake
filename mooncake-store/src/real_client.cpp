@@ -258,13 +258,29 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// Select the best replica from a list: prefer MEMORY, then LOCAL_DISK, then
-// DISK.  Master may return replicas in any order, so we always scan.
+// Select the best replica from a list: prefer local MEMORY, then any
+// MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
+// order, so we always scan.
 inline const Replica::Descriptor *SelectBestReplica(
-    const std::vector<Replica::Descriptor> &replicas) {
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints) {
+    const Replica::Descriptor *first_memory = nullptr;
+    for (const auto &r : replicas) {
+        if (r.status != ReplicaStatus::COMPLETE) continue;
+        if (r.is_memory_replica()) {
+            if (local_endpoints.count(
+                    r.get_memory_descriptor()
+                        .buffer_descriptor.transport_endpoint_)) {
+                return &r;  // local MEMORY — best case
+            }
+            if (!first_memory) first_memory = &r;
+        }
+    }
+    if (first_memory) return first_memory;
+
     const Replica::Descriptor *best = nullptr;
     for (const auto &r : replicas) {
-        if (r.is_memory_replica()) return &r;
+        if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_local_disk_replica()) {
             best = &r;  // LOCAL_DISK always overrides DISK
         } else if (r.is_disk_replica() && !best) {
@@ -1969,10 +1985,12 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Select best replica: prefer MEMORY, then LOCAL_DISK, then DISK.
+    // Select best replica: prefer local MEMORY, then any MEMORY,
+    // then LOCAL_DISK, then DISK.
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
     // MEMORY / DISK are handled via client_->Get below.
-    const auto *best_replica = SelectBestReplica(replica_list);
+    auto local_endpoints = client_->GetLocalEndpoints();
+    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
@@ -2260,6 +2278,7 @@ RealClient::batch_get_buffer_internal(
     std::vector<DiskKeyOp> disk_ops;
     valid_ops.reserve(keys.size());
 
+    auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto &key = keys[i];
 
@@ -2278,9 +2297,10 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
-        // Select best replica: prefer MEMORY, then LOCAL_DISK, then DISK.
+        // Select best replica: prefer local MEMORY, then any MEMORY,
+        // then LOCAL_DISK, then DISK.
         const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas);
+            SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             continue;
@@ -2528,8 +2548,10 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Select best replica: prefer MEMORY, then LOCAL_DISK, then DISK.
-    const auto *best_replica = SelectBestReplica(replica_list);
+    // Select best replica: prefer local MEMORY, then any MEMORY,
+    // then LOCAL_DISK, then DISK.
+    auto local_endpoints = client_->GetLocalEndpoints();
+    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -3726,6 +3748,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
+    auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
 
@@ -3749,9 +3772,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             continue;
         }
 
-        // Select best replica: prefer MEMORY, then LOCAL_DISK, then DISK.
+        // Select best replica: prefer local MEMORY, then any MEMORY,
+        // then LOCAL_DISK, then DISK.
         const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas);
+            SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -4204,6 +4228,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     std::vector<ValidKeyInfo> valid_operations;
     std::unordered_map<std::string, DiskKeyInfo> valid_local_disk_ops;
     valid_operations.reserve(num_keys);
+    auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
         // Handle query failures
@@ -4227,7 +4252,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         // LOCAL_DISK, then DISK. Master may return multiple replicas in any
         // order, so always scan rather than blindly taking replicas[0].
         const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas);
+            SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
@@ -4359,8 +4384,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                     user_slices.push_back(Slice{op.buffers[j], op.sizes[j]});
                     slice_total += op.sizes[j];
                 }
-                if (slice_total != op.total_size) {
-                    LOG(ERROR) << "Slice size mismatch for key " << key
+                if (slice_total < op.total_size) {
+                    LOG(ERROR) << "Slice size too small for key " << key
                                << ": slices=" << slice_total
                                << ", total=" << op.total_size;
                     results[op.original_index] =
