@@ -19,6 +19,12 @@ class MasterMetricManager {
     MasterMetricManager(MasterMetricManager&&) = delete;
     MasterMetricManager& operator=(MasterMetricManager&&) = delete;
 
+    struct StorageRatios {
+        double total;
+        double ram;
+        double cxl;
+    };
+
     // Memory Storage Metrics(global & segment)
     void inc_allocated_mem_size(const std::string& segment, int64_t val = 1);
     void dec_allocated_mem_size(const std::string& segment, int64_t val = 1);
@@ -26,7 +32,7 @@ class MasterMetricManager {
     void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_mem_capacity();
-    std::vector<double> get_global_used_ratio(void);
+    StorageRatios get_global_used_ratio(void);
 
     // DRAM Storage Metrics(global & segment)
     void inc_allocated_dram_size(const std::string& segment, int64_t val = 1);
@@ -75,7 +81,7 @@ class MasterMetricManager {
     void dec_total_mem_capacity(int64_t val = 1);
     int64_t get_allocated_mem_size();
     int64_t get_total_mem_capacity();
-    std::vector<double> get_segment_used_ratio(const std::string& segment);
+    StorageRatios get_segment_used_ratio(const std::string& segment);
     void reset_segment_allocated_mem_size(const std::string& segment);
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);

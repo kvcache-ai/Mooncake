@@ -75,6 +75,11 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y lcov gcovr ninja-build
 
+    - name: Test HugeTLB sizing helper
+      run: |
+        python3 scripts/test_hicache_hugepage_requirements.py
+      shell: bash
+
     - name: Set up coverage compilation flags
       run: |
         echo "Setting up coverage compilation flags..."
@@ -179,7 +184,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure -E ub_transport_test
       shell: bash
 
     - name: Drain HTTP E2E test

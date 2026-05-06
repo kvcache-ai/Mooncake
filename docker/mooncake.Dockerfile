@@ -116,6 +116,7 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
+COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
 RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]

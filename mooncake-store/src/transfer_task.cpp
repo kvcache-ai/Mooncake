@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <vector>
+#include "gpu_staging_utils.h"
 #include "replica.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -194,13 +195,35 @@ void MemcpyWorkerPool::workerThread() {
         // Execute the task if we have one
         if (task.state) {
             try {
+                bool ok = true;
                 for (const auto& op : task.operations) {
-                    std::memcpy(op.dest, op.src, op.size);
+                    int src_dev = -1, dst_dev = -1;
+                    bool src_on_gpu =
+                        gpu_staging::IsDevicePointer(op.src, &src_dev);
+                    bool dst_on_gpu =
+                        gpu_staging::IsDevicePointer(op.dest, &dst_dev);
+
+                    if (!src_on_gpu && !dst_on_gpu) {
+                        std::memcpy(op.dest, op.src, op.size);
+                    } else {
+                        int dev = src_on_gpu ? src_dev : dst_dev;
+                        gpu_staging::SetDevice(dev);
+                        if (!gpu_staging::CopyAuto(op.dest, op.src, op.size)) {
+                            LOG(ERROR)
+                                << "GPU memcpy failed: src_dev=" << src_dev
+                                << " dst_dev=" << dst_dev
+                                << " size=" << op.size;
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
 
-                VLOG(2) << "Memcpy task completed successfully with "
-                        << task.operations.size() << " operations";
-                task.state->set_completed(ErrorCode::OK);
+                VLOG(2) << "Memcpy task completed with "
+                        << task.operations.size() << " operations"
+                        << (ok ? "" : " (with GPU copy failure)");
+                task.state->set_completed(ok ? ErrorCode::OK
+                                             : ErrorCode::TRANSFER_FAIL);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
@@ -545,7 +568,19 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     }
 #ifdef ENABLE_MULTI_PROTOCOL
     if (level_protocols_.size() > 1) {
-        std::string proto = level_protocols_[replicas[0].get_storage_level()];
+        // Verify all replicas in the batch have the same storage level
+        auto first_level = replicas[0].get_storage_level();
+        for (size_t i = 1; i < replicas.size(); ++i) {
+            if (replicas[i].get_storage_level() != first_level) {
+                LOG(ERROR) << "submit_batch: mixed storage levels in batch "
+                           << "(first=" << static_cast<int>(first_level)
+                           << ", replica[" << i << "]="
+                           << static_cast<int>(replicas[i].get_storage_level())
+                           << ")";
+                return std::nullopt;
+            }
+        }
+        std::string proto = level_protocols_[first_level];
         future = mp_submitTransfer(requests, proto);
     } else
 #endif
@@ -876,49 +911,16 @@ TransferStrategy TransferSubmitter::selectStrategy(
     return TransferStrategy::TRANSFER_ENGINE;
 }
 
-namespace {
-// Helper function to extract IP address from endpoint string (ip:port
-// format) Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats
-std::string extractIpAddress(const std::string& endpoint) {
-    if (endpoint.empty()) {
-        return "";
-    }
-
-    // Handle IPv6 format: [ipv6]:port
-    if (endpoint[0] == '[') {
-        size_t closing_bracket = endpoint.find(']');
-        if (closing_bracket == std::string::npos) {
-            LOG(WARNING) << "Invalid IPv6 endpoint format: " << endpoint;
-            // Return empty to disable local memcpy optimization
-            return "";
-        }
-        return endpoint.substr(1, closing_bracket - 1);  // Extract IPv6 address
-    }
-
-    // Handle IPv4 or hostname:port format
-    // Find the last colon (to handle IPv6 addresses without brackets)
-    size_t colon_pos = endpoint.rfind(':');
-    if (colon_pos != std::string::npos) {
-        return endpoint.substr(0, colon_pos);
-    }
-
-    // No colon found, return the whole string (might be just IP or
-    // hostname)
-    return endpoint;
-}
-}  // namespace
-
 bool TransferSubmitter::isLocalTransfer(
     const AllocatedBuffer::Descriptor& handle) const {
     std::string local_ep = engine_.getLocalIpAndPort();
-    std::string local_ip = extractIpAddress(local_ep);
 
     if (!local_ep.empty()) {
-        std::string handle_ip = extractIpAddress(handle.transport_endpoint_);
-        return !handle.transport_endpoint_.empty() && handle_ip == local_ip;
+        return !handle.transport_endpoint_.empty() &&
+               handle.transport_endpoint_ == local_ep;
     }
 
-    // Without a local IP we cannot prove locality; disable memcpy.
+    // Without a local endpoint we cannot prove locality; disable memcpy.
     return false;
 }
 

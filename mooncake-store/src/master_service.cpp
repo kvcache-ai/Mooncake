@@ -2278,21 +2278,21 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
-        std::vector<double> used_ratios =
+        auto used_ratios =
             MasterMetricManager::instance().get_global_used_ratio();
-        if (used_ratios[0] > eviction_high_watermark_ratio_ ||
+        if (used_ratios.total > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
-            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratios[0]
+            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratios.total
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_eviction=" << need_eviction_
                       << " eviction_ratio=" << eviction_ratio_;
             double evict_ratio_target =
-                std::max(eviction_ratio_, used_ratios[0] -
+                std::max(eviction_ratio_, used_ratios.total -
                                               eviction_high_watermark_ratio_ +
                                               eviction_ratio_);
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
-                         used_ratios[0] - eviction_high_watermark_ratio_);
+                         used_ratios.total - eviction_high_watermark_ratio_);
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;

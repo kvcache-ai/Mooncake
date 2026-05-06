@@ -77,3 +77,23 @@ target_link_libraries(tent_fault_proxy_test PRIVATE gtest gtest_main
 target_include_directories(tent_fault_proxy_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_fault_proxy_test COMMAND tent_fault_proxy_test)
+
+add_executable(tent_rail_monitor_test rail_monitor_test.cpp)
+target_link_libraries(tent_rail_monitor_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+target_include_directories(tent_rail_monitor_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
+
+# End-to-end failover test: drives real TransferEngineImpl with
+# FaultProxyTransport-wrapped fakes to exercise resubmitTransferTask.
+add_executable(tent_engine_failover_e2e_test engine_failover_e2e_test.cpp)
+target_link_libraries(tent_engine_failover_e2e_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_engine_failover_e2e_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_engine_failover_e2e_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_engine_failover_e2e_test
+         COMMAND tent_engine_failover_e2e_test)

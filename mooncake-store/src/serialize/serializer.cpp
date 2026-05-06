@@ -742,14 +742,16 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                                "data, expected array"));
     }
 
-    // Verify array size is correct (should have 5 elements: id, status,
-    // replica_type, storage_level, payload)
-    if (obj.via.array.size != 5) {
+    // 4-element: [id, status, replica_type, payload]
+    // 5-element: [id, status, replica_type, storage_level, payload]
+    // storage_level was added later; default to RAM when absent.
+    const auto arr_size = obj.via.array.size;
+    if (arr_size != 4 && arr_size != 5) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize_msgpack Replica invalid array size: "
-                        "expected 5, got {}",
-                        obj.via.array.size)));
+                        "expected 4 or 5, got {}",
+                        arr_size)));
     }
 
     auto *array_items = obj.via.array.ptr;
@@ -763,8 +765,12 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
     // 3. Deserialize replica_type
     auto replica_type_code = array_items[2].as<int8_t>();
 
-    // 4. Deserialize storage_level
-    auto storage_level = static_cast<StorageLevel>(array_items[3].as<int8_t>());
+    // 4. Deserialize storage_level (absent in 4-element format → RAM)
+    StorageLevel storage_level = StorageLevel::RAM;
+    const size_t payload_index = (arr_size == 5) ? 4 : 3;
+    if (arr_size == 5) {
+        storage_level = static_cast<StorageLevel>(array_items[3].as<int8_t>());
+    }
 
     // 5. Parse payload by type
     std::shared_ptr<Replica> replica;
@@ -772,24 +778,25 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
         case static_cast<int8_t>(ReplicaType::MEMORY): {
             // MEMORY: payload is AllocatedBuffer
             auto buffer_result = Serializer<AllocatedBuffer>::deserialize(
-                array_items[4], segment_view);
+                array_items[payload_index], segment_view);
             if (!buffer_result) {
                 return tl::unexpected(buffer_result.error());
             }
-            // storage_level is read from the format for forward compatibility.
-            // The Replica constructor derives it from the buffer's allocator,
-            // which is already set to the correct level during deserialization.
-            DCHECK_EQ(
-                static_cast<int8_t>(storage_level),
-                static_cast<int8_t>(buffer_result.value()->getStorageLevel()))
-                << "storage_level mismatch between serialized data and "
-                   "allocator";
+            // When storage_level is present in the serialized data, verify it
+            // matches the allocator to catch data corruption early.
+            if (arr_size == 5) {
+                DCHECK_EQ(static_cast<int8_t>(storage_level),
+                          static_cast<int8_t>(
+                              buffer_result.value()->getStorageLevel()))
+                    << "storage_level mismatch between serialized data and "
+                       "allocator";
+            }
             replica = std::make_shared<Replica>(
                 std::move(buffer_result.value()), status);
             break;
         }
         case static_cast<int8_t>(ReplicaType::DISK): {
-            const auto &payload = array_items[4];
+            const auto &payload = array_items[payload_index];
             if (payload.type != msgpack::type::ARRAY ||
                 payload.via.array.size != 2) {
                 return tl::unexpected(
@@ -806,7 +813,7 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             break;
         }
         case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
-            const auto &payload = array_items[4];
+            const auto &payload = array_items[payload_index];
             if (payload.type != msgpack::type::ARRAY ||
                 payload.via.array.size != 3) {
                 return tl::unexpected(
@@ -895,7 +902,12 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
                                "state: not a msgpack array"));
     }
 
-    if (obj.via.array.size < 9) {
+    // 8-element: [id, name, base, size, te_endpoint, status, has_allocator,
+    // allocator] 9-element: [id, name, base, size, te_endpoint, protocol,
+    // status, has_allocator, allocator] protocol was added later; default to
+    // empty string when absent.
+    const auto seg_arr_size = obj.via.array.size;
+    if (seg_arr_size != 8 && seg_arr_size != 9) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize MountedSegment invalid array size"));
@@ -922,17 +934,23 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
         mounted_segment.segment.size =
             static_cast<size_t>(array[3].as<uint64_t>());
         mounted_segment.segment.te_endpoint = array[4].as<std::string>();
-        mounted_segment.segment.protocol = array[5].as<std::string>();
+
+        // protocol absent in 8-element format → default to empty string
+        const size_t status_index = (seg_arr_size == 9) ? 6 : 5;
+        if (seg_arr_size == 9) {
+            mounted_segment.segment.protocol = array[5].as<std::string>();
+        }
 
         // Deserialize SegmentStatus
         mounted_segment.status =
-            static_cast<SegmentStatus>(array[6].as<int16_t>());
+            static_cast<SegmentStatus>(array[status_index].as<int16_t>());
 
         // Deserialize BufferAllocator
-        bool has_buffer_allocator = array[7].as<bool>();
+        bool has_buffer_allocator = array[status_index + 1].as<bool>();
         if (has_buffer_allocator) {
             auto allocatorResult =
-                Serializer<OffsetBufferAllocator>::deserialize(array[8]);
+                Serializer<OffsetBufferAllocator>::deserialize(
+                    array[status_index + 2]);
             if (allocatorResult) {
                 mounted_segment.buf_allocator =
                     std::move(allocatorResult.value());
@@ -987,7 +1005,12 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
                                "serialized state: not a msgpack array"));
     }
 
-    if (obj.via.array.size != 7) {
+    // 6-element: [segment_name, base, total_size, cur_size, transport_endpoint,
+    // offset_allocator] 7-element: [segment_name, base, total_size, cur_size,
+    // transport_endpoint, storage_level, offset_allocator] storage_level was
+    // added later; default to RAM when absent.
+    const auto alloc_arr_size = obj.via.array.size;
+    if (alloc_arr_size != 6 && alloc_arr_size != 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize OffsetBufferAllocator invalid array size"));
@@ -1002,11 +1025,18 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
         auto total_size = static_cast<size_t>(array[2].as<uint64_t>());
         auto cur_size = static_cast<size_t>(array[3].as<uint64_t>());
         std::string transport_endpoint = array[4].as<std::string>();
-        auto storage_level = static_cast<StorageLevel>(array[5].as<int8_t>());
+
+        // storage_level absent in 6-element format → default to RAM
+        StorageLevel storage_level = StorageLevel::RAM;
+        const size_t allocator_index = (alloc_arr_size == 7) ? 6 : 5;
+        if (alloc_arr_size == 7) {
+            storage_level = static_cast<StorageLevel>(array[5].as<int8_t>());
+        }
 
         // Deserialize offset_allocator
-        auto offset_allocator_result = Serializer<
-            mooncake::offset_allocator::OffsetAllocator>::deserialize(array[6]);
+        auto offset_allocator_result =
+            Serializer<mooncake::offset_allocator::OffsetAllocator>::
+                deserialize(array[allocator_index]);
         if (!offset_allocator_result) {
             return tl::unexpected(offset_allocator_result.error());
         }

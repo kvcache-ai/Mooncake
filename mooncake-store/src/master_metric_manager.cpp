@@ -524,7 +524,8 @@ int64_t MasterMetricManager::get_total_mem_capacity() {
     return mem_total_capacity_.value();
 }
 
-std::vector<double> MasterMetricManager::get_global_used_ratio(void) {
+MasterMetricManager::StorageRatios MasterMetricManager::get_global_used_ratio(
+    void) {
     double allocated = mem_allocated_size_.value();
     double capacity = mem_total_capacity_.value();
     double ram_allocated = dram_allocated_size_.value();
@@ -658,7 +659,7 @@ int64_t MasterMetricManager::get_segment_total_cxl_capacity(
     return cxl_total_capacity_per_segment_.value({segment});
 }
 
-std::vector<double> MasterMetricManager::get_segment_used_ratio(
+MasterMetricManager::StorageRatios MasterMetricManager::get_segment_used_ratio(
     const std::string& segment) {
     double allocated = get_segment_allocated_mem_size(segment);
     double capacity = get_segment_total_mem_capacity(segment);

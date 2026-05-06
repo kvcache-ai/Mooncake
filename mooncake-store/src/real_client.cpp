@@ -684,7 +684,7 @@ tl::expected<void, ErrorCode> RealClient::mp_setup_internal(
                 if (end != env && *end == '\0')
                     cxl_dev_size = static_cast<size_t>(val);
             } else {
-                LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
+                LOG(ERROR) << "MC_CXL_DEV_SIZE not set";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
 
@@ -943,11 +943,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // Auto port binding with retry on metadata registration failure
         const int kMaxRetries =
             GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        const int rawMinPort = GetEnvOr<int>("MC_STORE_CLIENT_MIN_PORT", 12300);
+        const int rawMaxPort = GetEnvOr<int>("MC_STORE_CLIENT_MAX_PORT", 14300);
+        constexpr int kDefaultMinPort = 12300;
+        constexpr int kDefaultMaxPort = 14300;
+        auto [minPort, maxPort] = ValidatePortRange(
+            rawMinPort, rawMaxPort, kDefaultMinPort, kDefaultMaxPort);
         bool success = false;
 
         for (int retry = 0; retry < kMaxRetries; ++retry) {
             // Create port binder to hold a port
-            port_binder_ = std::make_unique<AutoPortBinder>();
+            port_binder_ = std::make_unique<AutoPortBinder>(minPort, maxPort);
             int port = port_binder_->getPort();
             if (port < 0) {
                 LOG(WARNING) << "Failed to bind available port, retry "
@@ -1020,7 +1026,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (end != env && *end == '\0')
                 cxl_dev_size = static_cast<size_t>(val);
         } else {
-            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
+            LOG(ERROR) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
