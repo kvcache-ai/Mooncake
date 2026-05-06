@@ -312,6 +312,12 @@ const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
 // ---- MooncakeP2PShim implementation ----
 
+MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner,
+                                 c10::DeviceType deviceType)
+    : Backend(owner->getRank(), owner->getSize()),
+      owner_(owner),
+      deviceType_(deviceType) {}
+
 const std::string MooncakeP2PShim::getBackendName() const {
     return "mooncake";
 }

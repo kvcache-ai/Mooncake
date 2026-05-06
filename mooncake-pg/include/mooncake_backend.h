@@ -16,6 +16,10 @@
 
 namespace mooncake {
 
+// Forward declaration – MooncakeP2PShim holds a non-owning pointer to
+// MooncakeBackend, which is defined below.
+class MooncakeBackend;
+
 // Lightweight Backend shim that delegates P2P send/recv back to the owning
 // MooncakeBackend.  PyTorch's P2P dispatch (batch_isend_irecv, isend, irecv)
 // requires getBackend() to return a registered c10d::Backend instance.
@@ -26,10 +30,7 @@ namespace mooncake {
 // getBackendName, supportsCoalescing).
 class MooncakeP2PShim final : public ::c10d::Backend {
    public:
-    MooncakeP2PShim(MooncakeBackend* owner, c10::DeviceType deviceType)
-        : Backend(owner->getRank(), owner->getSize()),
-          owner_(owner),
-          deviceType_(deviceType) {}
+    MooncakeP2PShim(MooncakeBackend* owner, c10::DeviceType deviceType);
 
     const std::string getBackendName() const override;
 
