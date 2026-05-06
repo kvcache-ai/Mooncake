@@ -16,6 +16,44 @@
 
 namespace mooncake {
 
+// Forward declaration – MooncakeP2PShim holds a non-owning pointer to
+// MooncakeBackend, which is defined below.
+class MooncakeBackend;
+
+// Lightweight Backend shim that delegates P2P send/recv back to the owning
+// MooncakeBackend.  PyTorch's P2P dispatch (batch_isend_irecv, isend, irecv)
+// requires getBackend() to return a registered c10d::Backend instance.
+// Since MooncakeBackend inherits from ProcessGroup (not Backend), we register
+// this shim in the ProcessGroup's deviceTypeToBackend_ map so that the P2P
+// path can find it.  The shim holds a non-owning pointer to its owner and
+// delegates only the operations that the P2P dispatch path calls (send, recv,
+// getBackendName, supportsCoalescing).
+class MooncakeP2PShim final : public ::c10d::Backend {
+   public:
+    explicit MooncakeP2PShim(MooncakeBackend* owner);
+
+    const std::string getBackendName() const override;
+
+    bool supportsCoalescing() const override { return false; }
+
+    c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors,
+                                        int dstRank, int tag) override;
+
+    c10::intrusive_ptr<c10d::Work> recv(std::vector<at::Tensor>& tensors,
+                                        int srcRank, int tag) override;
+
+    c10::intrusive_ptr<c10d::Work> recvAnysource(
+        std::vector<at::Tensor>& tensors, int tag) override;
+
+    c10::intrusive_ptr<c10d::Work> barrier(
+        const c10d::BarrierOptions& opts) override;
+
+   private:
+    // Non-owning: the shim is stored in ProcessGroup's backend maps which are
+    // cleared on destruction, and MooncakeBackend always outlives the shim.
+    MooncakeBackend* owner_;
+};
+
 class MooncakeBackend final : public ::c10d::ProcessGroup {
    public:
     struct MooncakeBackendOptions final : torch::CustomClassHolder {
