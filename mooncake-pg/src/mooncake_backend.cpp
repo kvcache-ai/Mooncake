@@ -314,10 +314,10 @@ const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 // ---- MooncakeP2PShim implementation ----
 
 MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner)
-    : Backend(owner->getRank(), owner->getSize()),
-      owner_(owner) {}
+    : Backend(owner->getRank(), owner->getSize()), owner_(owner) {}
 
-const std::string MooncakeP2PShim::getBackendName() const {
+const std::string
+MooncakeP2PShim::getBackendName() const {
     return "mooncake";
 }
 
