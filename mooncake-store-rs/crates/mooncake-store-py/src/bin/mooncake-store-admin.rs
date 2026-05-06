@@ -15,6 +15,7 @@ use _store_rs::admin::{
     AdminHttpServerHandle, AdminService, ErrorResponse, PolicyPatchInput, RouteMigrationMode,
     RouteMigrationTaskListResponse, RouteMigrationTaskState, RouteMigrationTaskStatusResponse,
     RouteMigrationTaskSubmitRequest, TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
+    TracingClusterResponse, TracingUpdateRequest,
 };
 use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::MetadataKeyspace;
@@ -60,6 +61,10 @@ enum Command {
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
+    },
+    Tracing {
+        #[command(subcommand)]
+        command: TracingCommand,
     },
 }
 
@@ -159,6 +164,32 @@ enum MigrateTaskCommand {
         #[arg(long, env = "MC_STORE_ADMIN_TASK_ID")]
         task_id: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TracingCommand {
+    Status,
+    On(TracingOnArgs),
+    Off(TracingFanoutArgs),
+    Flush(TracingFanoutArgs),
+}
+
+#[derive(ClapArgs, Clone, Debug, Default)]
+struct TracingFanoutArgs {
+    #[arg(long, env = "MC_STORE_ADMIN_TRACING_TIMEOUT_MS")]
+    timeout_ms: Option<u64>,
+    #[arg(long, env = "MC_STORE_ADMIN_TRACING_MAX_TARGETS")]
+    max_targets: Option<usize>,
+}
+
+#[derive(ClapArgs, Clone, Debug, Default)]
+struct TracingOnArgs {
+    #[arg(long, env = "MC_STORE_ADMIN_TRACING_ENDPOINT")]
+    endpoint: Option<String>,
+    #[arg(long, env = "MC_STORE_ADMIN_TRACING_SAMPLE_RATIO")]
+    sample_ratio: Option<f64>,
+    #[command(flatten)]
+    fanout: TracingFanoutArgs,
 }
 
 #[derive(ClapArgs, Clone, Debug)]
@@ -314,6 +345,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let service = AdminService::from_config(&args.metadata_url, args.keyspace.clone())?;
             run_quota_command(&service, &args, command)
         }
+        Command::Tracing { command } => run_tracing_command(&args, command),
     }
 }
 
@@ -357,6 +389,41 @@ fn run_migrate_command(args: &Args, command: &MigrateCommand) -> Result<(), Box<
         ),
         MigrateCommand::Task { command } => run_migrate_task_command(args, command),
     }
+}
+
+fn run_tracing_command(args: &Args, command: &TracingCommand) -> Result<(), Box<dyn Error>> {
+    let response = match command {
+        TracingCommand::Status => admin_http_get_json(args, "/v1/tracing")?,
+        TracingCommand::On(on_args) => admin_http_post_json(
+            args,
+            "/v1/tracing/on",
+            &TracingUpdateRequest {
+                endpoint: on_args.endpoint.clone(),
+                sample_ratio: on_args.sample_ratio,
+                timeout_ms: on_args.fanout.timeout_ms,
+                max_targets: on_args.fanout.max_targets,
+            },
+        )?,
+        TracingCommand::Off(fanout) => admin_http_post_json(
+            args,
+            "/v1/tracing/off",
+            &TracingUpdateRequest {
+                timeout_ms: fanout.timeout_ms,
+                max_targets: fanout.max_targets,
+                ..TracingUpdateRequest::default()
+            },
+        )?,
+        TracingCommand::Flush(fanout) => admin_http_post_json(
+            args,
+            "/v1/tracing/flush",
+            &TracingUpdateRequest {
+                timeout_ms: fanout.timeout_ms,
+                max_targets: fanout.max_targets,
+                ..TracingUpdateRequest::default()
+            },
+        )?,
+    };
+    print_tracing_cluster(args, &response)
 }
 
 fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<dyn Error>> {
@@ -629,7 +696,7 @@ fn admin_base_url(args: &Args) -> Result<Url, Box<dyn Error>> {
     let raw = args
         .admin_url
         .as_ref()
-        .ok_or("--admin-url is required for migrate commands because route migration tasks live in the long-lived admin server")?;
+        .ok_or("--admin-url is required for admin-server-backed commands")?;
     let url = Url::parse(raw)?;
     match url.scheme() {
         "http" => {}
@@ -1013,6 +1080,32 @@ fn quota_reconcile(
         println!("    key: {}", action.key);
         println!("    action: {}", action.action);
         println!("    reason: {}", action.reason);
+    }
+    Ok(())
+}
+
+fn print_tracing_cluster(
+    args: &Args,
+    response: &TracingClusterResponse,
+) -> Result<(), Box<dyn Error>> {
+    println!("tracing fanout:");
+    println!("  admin_url: {}", admin_base_url(args)?);
+    println!("  metadata_url: {}", redact_redis_url(&args.metadata_url));
+    println!("  keyspace: {}", current_keyspace(args).prefix());
+    println!("  action: {:?}", response.action);
+    println!("  total: {}", response.total);
+    println!("  ok: {}", response.ok);
+    println!("  failed: {}", response.failed);
+    for node in &response.nodes {
+        println!("  - runtime: {}", node.runtime);
+        println!("    metrics_url: {}", node.metrics_url);
+        println!("    ok: {}", node.ok);
+        if let Some(error) = node.error.as_deref() {
+            println!("    error: {error}");
+        }
+        if let Some(status) = node.status.as_ref() {
+            println!("    status: {}", serde_json::to_string(status)?);
+        }
     }
     Ok(())
 }
@@ -1515,6 +1608,38 @@ mod tests {
                     } => {
                         assert_eq!(reservation_id, "reservation-env");
                         assert!(dry_run);
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn tracing_args_read_env_when_cli_omits_flags() {
+        with_env_vars(
+            [
+                ("MC_STORE_RS_METADATA_URL", Some("redis://127.0.0.1:6380/4")),
+                ("MC_STORE_ADMIN_URL", Some("http://127.0.0.1:39000")),
+                (
+                    "MC_STORE_ADMIN_TRACING_ENDPOINT",
+                    Some("http://jaeger:4317"),
+                ),
+                ("MC_STORE_ADMIN_TRACING_SAMPLE_RATIO", Some("0.25")),
+                ("MC_STORE_ADMIN_TRACING_TIMEOUT_MS", Some("1500")),
+                ("MC_STORE_ADMIN_TRACING_MAX_TARGETS", Some("16")),
+            ],
+            || {
+                let args = Args::parse_from(["mooncake-store-admin", "tracing", "on"]);
+                assert_eq!(args.admin_url.as_deref(), Some("http://127.0.0.1:39000"));
+                match args.command {
+                    Command::Tracing {
+                        command: TracingCommand::On(on_args),
+                    } => {
+                        assert_eq!(on_args.endpoint.as_deref(), Some("http://jaeger:4317"));
+                        assert_eq!(on_args.sample_ratio, Some(0.25));
+                        assert_eq!(on_args.fanout.timeout_ms, Some(1500));
+                        assert_eq!(on_args.fanout.max_targets, Some(16));
                     }
                     other => panic!("unexpected command: {other:?}"),
                 }

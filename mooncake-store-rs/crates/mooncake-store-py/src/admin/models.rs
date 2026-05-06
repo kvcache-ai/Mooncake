@@ -3,6 +3,7 @@ use mooncake_store_core::{
     TenantPolicySpec, TenantQuotaReservation, TenantQuotaReservationState, TenantQuotaState,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TenantQuotaReconcileAction {
@@ -123,6 +124,42 @@ pub struct AdminMaintenanceReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracingUpdateRequest {
+    pub endpoint: Option<String>,
+    pub sample_ratio: Option<f64>,
+    pub timeout_ms: Option<u64>,
+    pub max_targets: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TracingAction {
+    Status,
+    On,
+    Off,
+    Flush,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TracingNodeResponse {
+    pub runtime: ClientRuntimeId,
+    pub metrics_url: String,
+    pub ok: bool,
+    pub status: Option<Value>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TracingClusterResponse {
+    pub action: TracingAction,
+    pub total: usize,
+    pub ok: usize,
+    pub failed: usize,
+    pub nodes: Vec<TracingNodeResponse>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

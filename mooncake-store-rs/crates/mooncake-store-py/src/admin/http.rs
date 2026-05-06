@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::models::{
     ErrorResponse, PutTenantPolicyRequest, RouteMigrationMode, RouteMigrationTaskSubmitRequest,
-    TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
+    TenantQuotaAbortRequest, TenantQuotaReconcileRequest, TracingAction, TracingUpdateRequest,
 };
 use super::service::AdminService;
 
@@ -153,6 +153,21 @@ fn route_request(service: &AdminService, request: HttpRequest) -> String {
                 Err(error) => http_store_error(error),
             }
         }
+        ("GET", "/v1/tracing") => {
+            match service.update_tracing(TracingAction::Status, TracingUpdateRequest::default()) {
+                Ok(report) => http_json_response("200 OK", &report),
+                Err(error) => http_store_error(error),
+            }
+        }
+        ("POST", "/v1/tracing/on") => {
+            update_tracing_request(service, &request.body, TracingAction::On)
+        }
+        ("POST", "/v1/tracing/off") => {
+            update_tracing_request(service, &request.body, TracingAction::Off)
+        }
+        ("POST", "/v1/tracing/flush") => {
+            update_tracing_request(service, &request.body, TracingAction::Flush)
+        }
         ("GET", "/v1/route-migrations") => {
             http_json_response("200 OK", &service.list_route_migration_tasks())
         }
@@ -163,6 +178,26 @@ fn route_request(service: &AdminService, request: HttpRequest) -> String {
             submit_route_migration_request(service, &request.body, RouteMigrationMode::Move)
         }
         _ => route_scoped_request(service, request, path_only.as_str()),
+    }
+}
+
+fn update_tracing_request(service: &AdminService, body: &[u8], action: TracingAction) -> String {
+    let request = if body.is_empty() {
+        TracingUpdateRequest::default()
+    } else {
+        match serde_json::from_slice::<TracingUpdateRequest>(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return http_error_response(
+                    "400 Bad Request",
+                    &format!("invalid JSON body: {error}"),
+                )
+            }
+        }
+    };
+    match service.update_tracing(action, request) {
+        Ok(report) => http_json_response("200 OK", &report),
+        Err(error) => http_store_error(error),
     }
 }
 
@@ -966,6 +1001,43 @@ mod tests {
         assert!(response.contains("HTTP/1.1 501 Not Implemented"));
         assert!(response.contains("supports redis://, rediss://, and etcd:// metadata only"));
 
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_serves_tracing_status_fanout() {
+        let service = test_service();
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!("GET /v1/tracing HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"),
+        );
+
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"action\":\"status\""));
+        assert!(response.contains("\"total\":0"));
+        server.shutdown().expect("server shutdown");
+    }
+
+    #[test]
+    fn admin_http_server_rejects_bad_tracing_payloads() {
+        let service = test_service();
+        let mut server =
+            AdminHttpServerHandle::start("127.0.0.1:0", service).expect("server start");
+        let address = server.address().to_string();
+
+        let response = http_request(
+            &address,
+            &format!(
+                "POST /v1/tracing/on HTTP/1.1\r\nHost: {address}\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{{"
+            ),
+        );
+
+        assert!(response.contains("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("invalid JSON body"));
         server.shutdown().expect("server shutdown");
     }
 

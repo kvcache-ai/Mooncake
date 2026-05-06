@@ -11,7 +11,8 @@ pub use models::{
     RouteMigrationTaskListResponse, RouteMigrationTaskState, RouteMigrationTaskStatusResponse,
     RouteMigrationTaskSubmitRequest, RoutePolicyResponse, TenantQuotaAbortRequest,
     TenantQuotaAbortResponse, TenantQuotaReconcileAction, TenantQuotaReconcileReport,
-    TenantQuotaReconcileRequest,
+    TenantQuotaReconcileRequest, TracingAction, TracingClusterResponse, TracingNodeResponse,
+    TracingUpdateRequest,
 };
 pub use service::{
     default_domain_name, default_namespace, default_object_set_name, format_policy_scope,

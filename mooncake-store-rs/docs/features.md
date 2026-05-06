@@ -190,6 +190,17 @@ Route publication also exposes `mooncake_store_replication_publish_total{result}
 existing publish latency histogram. Operators can therefore distinguish publish failures from slow
 successful publishes without inferring result counts from histogram internals.
 
+Jaeger tracing can be controlled dynamically through the store metrics HTTP endpoint and through
+the admin server fanout layer. The per-node metrics endpoint still owns the actual tracing switch,
+while `mooncake-store-admin tracing ...` provides the cluster-level operator entry point. Admin
+discovers live store nodes from metadata leases, derives the host from existing endpoint data, and
+uses the store-published `metrics_port` label for the metrics HTTP port.
+
+The lease extension is intentionally label-based. Older metadata readers ignore the extra label,
+and newer admin servers fall back to the default metrics port for leases written before the label
+existed. When tracing is disabled, request-path tracing work remains guarded by the runtime tracing
+filter and dynamic exporter state rather than adding metadata calls to put/get hot paths.
+
 ## Allocation and Segment Management
 
 ### Local allocation
