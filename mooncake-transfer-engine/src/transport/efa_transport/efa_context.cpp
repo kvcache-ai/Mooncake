@@ -89,9 +89,29 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
         ;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
-    // Get fabric info
+    // Get fabric info.
+    //
+    // Request libfabric API 1.18+ so the EFA provider's
+    // efa_rdm_get_use_device_rdma() takes the "new API" branch and keys
+    // the default for FI_EFA_USE_DEVICE_RDMA on hardware capability
+    // (hw_support) instead of vendor_part_id.  Under the older 1.14
+    // request, the provider's legacy branch hardcoded
+    //   default_val = (vendor_part_id == 0xefa0 || 0xefa1) ? false : true
+    // which silently disabled device RDMA on Nitro v4 EFA (p5/p5e, part
+    // id 0xefa1) while leaving it enabled on Nitro v5+ (p5en and newer).
+    // With device RDMA disabled, fi_write falls back to libfabric's
+    // emulated RDMA data path, and libfabric 2.4.0 has a thread-safety
+    // regression there between fi_av_insert and concurrent fi_cq_read
+    // that segfaults Mooncake once the handshake wave finishes and the
+    // first real transfers start.  Bumping the requested API to 1.18
+    // restores the same default path we already got on newer hardware,
+    // and applications that still want emulated RDMA can opt out with
+    // FI_EFA_USE_DEVICE_RDMA=0.
+    //
+    // 1.18 is from March 2023 (EFA installer 1.26+ ships 1.18 or later);
+    // all Mooncake deployments today run libfabric >> 1.18.
     int ret =
-        fi_getinfo(FI_VERSION(1, 14), nullptr, nullptr, 0, hints_, &fi_info_);
+        fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, hints_, &fi_info_);
     if (ret) {
         LOG(ERROR) << "fi_getinfo failed for device " << device_name_ << ": "
                    << fi_strerror(-ret);
