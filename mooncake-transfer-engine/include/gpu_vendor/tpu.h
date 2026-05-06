@@ -136,7 +136,7 @@ struct AdapterApi {
     MemGetHandleForAddressRangeFn mem_get_handle_for_address_range = nullptr;
 };
 
-inline thread_local int &lastError() {
+inline int &lastError() {
     static thread_local int error = cudaSuccess;
     return error;
 }
