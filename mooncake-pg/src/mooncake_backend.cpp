@@ -301,6 +301,7 @@ MooncakeBackend::MooncakeBackend(
     auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
     auto shim = c10::make_intrusive<MooncakeP2PShim>(this, deviceType);
     setBackend(deviceType, BackendType::CUSTOM, shim);
+    setDefaultBackend(BackendType::CUSTOM);
 
     // Increment backend index
     ++backendIndex_;
