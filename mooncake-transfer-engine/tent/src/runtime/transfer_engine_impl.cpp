@@ -1398,7 +1398,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
     size_t success_tasks = 0;
+    size_t failed_tasks = 0;
     size_t total_tasks = 0;
+    TransferStatusEnum worst_failure = PENDING;
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto& task = batch->task_list[task_id];
         if (task.derived) continue;  // This task is performed by other tasks
@@ -1409,7 +1411,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                 success_tasks++;
                 overall_status.transferred_bytes += task.request.length;
             } else {
-                overall_status.s = task.status;
+                failed_tasks++;
+                worst_failure = task.status;
             }
             continue;
         }
@@ -1419,7 +1422,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         } else {
             if (task.type == UNSPEC) {
                 task.status = FAILED;
-                overall_status.s = FAILED;
+                failed_tasks++;
+                worst_failure = FAILED;
                 continue;
             }
             auto& transport = transport_list_[task.type];
@@ -1436,7 +1440,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
 
         // Attempt failover before status aggregation so that a
         // successfully resubmitted task appears as PENDING and does not
-        // overwrite a permanent FAILED from another task in the batch.
+        // latch the batch to a terminal state while retries are in-flight.
         if (task_status.s == FAILED &&
             resubmitTransferTask(batch, task_id).ok()) {
             task.status = PENDING;
@@ -1447,14 +1451,23 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             success_tasks++;
             overall_status.transferred_bytes += task_status.transferred_bytes;
         } else if (task_status.s != PENDING) {
-            overall_status.s = task_status.s;
+            failed_tasks++;
+            worst_failure = task_status.s;
         }
 
         // Record metrics when task transitions to terminal state
         recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
                                     task_status.s);
     }
-    if (success_tasks == total_tasks) overall_status.s = COMPLETED;
+    // Determine overall status: COMPLETED only when all succeed; FAILED only
+    // when all tasks are terminal (no in-flight work) and at least one failed;
+    // otherwise PENDING (some tasks still running).
+    if (success_tasks == total_tasks) {
+        overall_status.s = COMPLETED;
+    } else if (success_tasks + failed_tasks == total_tasks) {
+        overall_status.s = worst_failure;
+    }
+    // else: some tasks still PENDING → overall_status.s stays PENDING
     CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
     return Status::OK();
 }
