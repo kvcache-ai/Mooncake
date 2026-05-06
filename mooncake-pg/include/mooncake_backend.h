@@ -30,7 +30,7 @@ class MooncakeBackend;
 // getBackendName, supportsCoalescing).
 class MooncakeP2PShim final : public ::c10d::Backend {
    public:
-    MooncakeP2PShim(MooncakeBackend* owner, c10::DeviceType deviceType);
+    MooncakeP2PShim(MooncakeBackend* owner);
 
     const std::string getBackendName() const override;
 
@@ -52,7 +52,6 @@ class MooncakeP2PShim final : public ::c10d::Backend {
     // Non-owning: the shim is stored in ProcessGroup's backend maps which are
     // cleared on destruction, and MooncakeBackend always outlives the shim.
     MooncakeBackend* owner_;
-    c10::DeviceType deviceType_;
 };
 
 class MooncakeBackend final : public ::c10d::ProcessGroup {

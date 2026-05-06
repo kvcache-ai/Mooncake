@@ -299,7 +299,7 @@ MooncakeBackend::MooncakeBackend(
     // (batch_isend_irecv → _get_backend → getBackend) can find a registered
     // Backend for this ProcessGroup.  The shim delegates send/recv back to us.
     auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
-    auto shim = c10::make_intrusive<MooncakeP2PShim>(this, deviceType);
+    auto shim = c10::make_intrusive<MooncakeP2PShim>(this);
     setBackend(deviceType, BackendType::CUSTOM, shim);
     setDefaultBackend(BackendType::CUSTOM);
 
@@ -313,11 +313,9 @@ const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
 // ---- MooncakeP2PShim implementation ----
 
-MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner,
-                                 c10::DeviceType deviceType)
+MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner)
     : Backend(owner->getRank(), owner->getSize()),
-      owner_(owner),
-      deviceType_(deviceType) {}
+      owner_(owner) {}
 
 const std::string MooncakeP2PShim::getBackendName() const {
     return "mooncake";
@@ -342,8 +340,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::recvAnysource(
 
 c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::barrier(
     const c10d::BarrierOptions& opts) {
-    std::vector<at::Tensor> dummy = {
-        at::empty({1}, at::dtype(at::kFloat).device(at::kCPU))};
     return owner_->barrier(opts);
 }
 
