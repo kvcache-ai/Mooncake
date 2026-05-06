@@ -99,7 +99,7 @@ MooncakeBackend::MooncakeBackend(
                    distBackendOpts.group_size),
       options_(std::move(options)),
       isCpu_(isCpu) {
-    auto store = distBackendOpts.store;
+    auto store = std::move(distBackendOpts.store);
     const int rank = distBackendOpts.group_rank;
     const int size = distBackendOpts.group_size;
     const auto& globalRanks = distBackendOpts.global_ranks_in_group;

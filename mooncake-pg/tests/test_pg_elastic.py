@@ -23,7 +23,7 @@ def _dynamic_world_size_worker(
 ) -> None:
     """Worker for testing that dist.get_world_size() reflects dynamic size after extend."""
     initial_world_size = ctx.world_size
-    device = ctx.init_group()
+    ctx.init_group()
     backend = ctx.get_backend()
 
     initial_ws = dist.get_world_size()

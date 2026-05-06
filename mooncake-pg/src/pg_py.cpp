@@ -58,7 +58,8 @@ int getNumSyncedRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     return mooncakeBackend->getNumSyncedRanks();
 }
 
-void extendGroupSizeTo(c10::intrusive_ptr<c10d::ProcessGroup> backend, int size) {
+void extendGroupSizeTo(c10::intrusive_ptr<c10d::ProcessGroup> backend,
+                       int size) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     mooncakeBackend->extendGroupSizeTo(size);
