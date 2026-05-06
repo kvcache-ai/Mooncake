@@ -465,7 +465,17 @@ Status RdmaTransport::submitTransferTask(
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
     uint64_t nr_slices;
-    const auto cleanup_posted_slices = [&]() { slices_to_post.clear(); };
+    const auto fail_unposted_slices = [&]() {
+        std::vector<Slice *> slices_to_fail;
+        for (auto &entry : slices_to_post) {
+            slices_to_fail.insert(slices_to_fail.end(), entry.second.begin(),
+                                  entry.second.end());
+        }
+        slices_to_post.clear();
+        for (auto *slice : slices_to_fail) {
+            slice->markFailed();
+        }
+    };
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
@@ -534,7 +544,7 @@ Status RdmaTransport::submitTransferTask(
                 }
                 if (!found_device) {
                     auto source_addr = slice->source_addr;
-                    cleanup_posted_slices();
+                    fail_unposted_slices();
                     LOG(ERROR) << "Memory region not registered by any active "
                                   "device(s): "
                                << source_addr;

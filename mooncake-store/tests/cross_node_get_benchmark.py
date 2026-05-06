@@ -29,7 +29,7 @@ import numpy as np
 
 os.environ["MC_STORE_MEMCPY"] = "0"
 
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
+from mooncake.store import MooncakeDistributedStore  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -137,10 +137,8 @@ def run_provider(args):
 
     log.info("All objects stored. Waiting for consumer (Ctrl-C to stop) ...")
 
-    # Write a sentinel key so consumer knows provider is ready
-    sentinel = np.zeros(8, dtype=np.uint8)
-    sentinel_ptr = sentinel.ctypes.data
-    # sentinel is tiny, use the already-registered buffer region
+    # Write a sentinel key so consumer knows provider is ready.
+    # The sentinel is tiny, so use the already-registered buffer region.
     buf[:8] = 0x42
     store.batch_put_from(["__bench_ready__"], [buf_ptr], [8])
 

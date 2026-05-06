@@ -14,7 +14,6 @@
 
 #include "multi_transport.h"
 #include <algorithm>
-#include <cstring>
 #include <sstream>
 #include <string>
 
@@ -207,7 +206,7 @@ Status MultiTransport::submitTransfer(
             const auto& req = entries[resolved[i].request_idx];
             Transport* tp = resolved[i].transport;
             if (req.task_group_id != TransferRequest::kNoTaskGroup &&
-                std::strcmp(tp->getName(), "rdma") == 0) {
+                tp->supportsGroupedScatter()) {
                 size_t group_start = i;
                 uint64_t gid = req.task_group_id;
                 while (i < resolved.size() &&

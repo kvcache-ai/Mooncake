@@ -26,7 +26,8 @@ namespace {
 
 class RecordingTransport : public Transport {
    public:
-    explicit RecordingTransport(const char *name) : name_(name) {}
+    RecordingTransport(const char *name, bool supports_grouped_scatter)
+        : name_(name), supports_grouped_scatter_(supports_grouped_scatter) {}
 
     Status submitTransfer(BatchID,
                           const std::vector<TransferRequest> &) override {
@@ -54,6 +55,10 @@ class RecordingTransport : public Transport {
 
     const char *getName() const override { return name_; }
 
+    bool supportsGroupedScatter() const override {
+        return supports_grouped_scatter_;
+    }
+
     std::vector<size_t> submitted_group_sizes;
 
    private:
@@ -71,6 +76,7 @@ class RecordingTransport : public Transport {
     }
 
     const char *name_;
+    bool supports_grouped_scatter_;
 };
 
 class TestableMultiTransport : public MultiTransport {
@@ -260,7 +266,8 @@ TEST_F(TaskGroupingTest, MultiTransportSubmitTransferCoalescesRdmaGroups) {
     auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "rdma");
     std::string local_server_name = "local";
     TestableMultiTransport multi_transport(metadata, local_server_name);
-    auto recording_transport = std::make_shared<RecordingTransport>("rdma");
+    auto recording_transport =
+        std::make_shared<RecordingTransport>("rdma", true);
     multi_transport.transport_map_["rdma"] = recording_transport;
 
     std::vector<Transport::TransferRequest> entries(4);
@@ -290,7 +297,8 @@ TEST_F(TaskGroupingTest, MultiTransportSubmitTransferDoesNotCoalesceNonRdma) {
     auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "tcp");
     std::string local_server_name = "local";
     TestableMultiTransport multi_transport(metadata, local_server_name);
-    auto recording_transport = std::make_shared<RecordingTransport>("tcp");
+    auto recording_transport =
+        std::make_shared<RecordingTransport>("tcp", false);
     multi_transport.transport_map_["tcp"] = recording_transport;
 
     std::vector<Transport::TransferRequest> entries(2);

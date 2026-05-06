@@ -59,6 +59,8 @@ class RdmaTransport : public Transport {
 
     const char *getName() const override { return "rdma"; }
 
+    bool supportsGroupedScatter() const override { return true; }
+
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,
                             bool update_metadata) override;

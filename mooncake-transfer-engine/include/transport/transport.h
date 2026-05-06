@@ -420,6 +420,8 @@ class Transport {
         const std::vector<void *> &addr_list) = 0;
 
     virtual const char *getName() const = 0;
+
+    virtual bool supportsGroupedScatter() const { return false; }
 };
 }  // namespace mooncake
 
