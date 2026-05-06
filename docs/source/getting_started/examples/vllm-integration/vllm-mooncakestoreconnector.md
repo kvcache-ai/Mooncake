@@ -86,7 +86,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     }'
 ```
 
-Decode Node：
+Decode Node:
 
 ```shell
 MOONCAKE_CONFIG_PATH=mooncake_config.json \
