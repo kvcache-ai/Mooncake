@@ -113,7 +113,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 
 Proxy：
 
-```sjell
+```shell
 python examples/disaggregated/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py --prefill http://192.168.0.2:8100 --decode http://192.168.0.3:8200
 ```
 
