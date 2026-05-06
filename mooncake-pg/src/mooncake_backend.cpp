@@ -316,10 +316,7 @@ const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner)
     : Backend(owner->getRank(), owner->getSize()), owner_(owner) {}
 
-const std::string
-MooncakeP2PShim::getBackendName() const {
-    return "mooncake";
-}
+const std::string MooncakeP2PShim::getBackendName() const { return "mooncake"; }
 
 c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::send(
     std::vector<at::Tensor>& tensors, int dstRank, int tag) {
