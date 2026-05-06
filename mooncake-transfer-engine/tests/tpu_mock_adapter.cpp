@@ -8,7 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ---- device-allocation registry ------------------------------------------
+// ---- memory type constants (match tpu.h) ----------------------------------
+
+#define MOCK_MEMORY_TYPE_HOST   1
+#define MOCK_MEMORY_TYPE_DEVICE 2
+#define MOCK_DMABUF_FD          42
 
 #define MAX_DEVICE_ALLOCS 64
 
@@ -94,11 +98,11 @@ int mc_tpu_adapter_pointer_get_attributes(mc_tpu_pointer_attributes_t *attr,
                                           const void *ptr) {
     size_t sz = 0;
     if (lookup_alloc(ptr, &sz)) {
-        attr->type = 2; /* cudaMemoryTypeDevice */
+        attr->type = MOCK_MEMORY_TYPE_DEVICE;
         attr->device = g_current_device;
         attr->size = sz;
     } else {
-        attr->type = 1; /* cudaMemoryTypeHost */
+        attr->type = MOCK_MEMORY_TYPE_HOST;
         attr->device = -1;
         attr->size = 0;
     }
@@ -161,7 +165,7 @@ int mc_tpu_adapter_mem_get_handle_for_address_range(void *handle,
     (void)handle_type;
     (void)flags;
     if (!handle) return 1;
-    *static_cast<int *>(handle) = 42; /* fake DMA-BUF fd */
+    *static_cast<int *>(handle) = MOCK_DMABUF_FD;
     return 0;
 }
 
