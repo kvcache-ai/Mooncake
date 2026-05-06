@@ -674,7 +674,7 @@ class Client {
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
-    std::mutex mounted_segments_mutex_;
+    mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
     // Configuration
