@@ -9,6 +9,8 @@ pub const DEFAULT_TENANT: &str = "default";
 pub const DEFAULT_DOMAIN: &str = "default";
 pub const DEFAULT_OBJECT_SET: &str = "default";
 pub const DEFAULT_QOS_TIER: &str = "default";
+pub const CONTROL_ADDR_LABEL: &str = "control_addr";
+pub const METRICS_PORT_LABEL: &str = "metrics_port";
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ClientStableId(pub String);

@@ -66,6 +66,32 @@ Operational model:
 - same-epoch lease reclaim after an expired lease key is allowed when that epoch is still the historical HWM and no higher live epoch exists, so heartbeat repair does not fail with `StaleEpoch` after a TTL gap
 - tenant quota reconcile is intentionally opt-in per tenant because the current metadata model has no bounded global tenant-work index for the admin plane to consume safely
 
+## Admin tracing fanout
+
+`mooncake-store-admin server` is the cluster-level entry point for dynamic Jaeger tracing control.
+Operators should send tracing commands to the admin HTTP server instead of addressing every
+store node manually:
+
+- `mooncake-store-admin tracing status --admin-url http://<admin-host>:<port>`
+- `mooncake-store-admin tracing on --admin-url http://<admin-host>:<port> [--endpoint <otlp-endpoint>] [--sample-ratio <0..1>]`
+- `mooncake-store-admin tracing off --admin-url http://<admin-host>:<port>`
+- `mooncake-store-admin tracing flush --admin-url http://<admin-host>:<port>`
+
+The admin server discovers store-node tracing endpoints from live client leases. Store runtimes
+publish only the system label `metrics_port=<port>` when the metrics HTTP endpoint is enabled.
+The host is derived from the existing lease endpoint data: `control_addr` first, then
+`endpoints.rpc_address`. This avoids duplicating another reachable-host field in metadata.
+
+Compatibility behavior:
+
+- `metrics_port` is stored inside `ClientEndpointSet.labels`, so the serialized lease schema does
+  not gain a new required field
+- newer admin servers use `metrics_port` when it exists and fall back to port `9300` for older
+  leases that predate the label
+- store startup removes any user-supplied `metrics_port` label and overwrites it with the actual
+  bound metrics port when metrics are enabled
+- store runtimes with metrics disabled do not publish `metrics_port`
+
 Server maintenance defaults:
 
 - `--cleanup-interval-ms 5000`
@@ -135,6 +161,10 @@ Policy and quota knobs:
 | `quota reservations --state` | `MC_STORE_ADMIN_RESERVATION_STATE` | none | reservation state filter |
 | `quota abort --reservation-id` | `MC_STORE_ADMIN_RESERVATION_ID` | required | quota reservation id |
 | `quota abort/reconcile --dry-run` | `MC_STORE_ADMIN_DRY_RUN` | `false` | inspect without changing metadata |
+| `tracing on --endpoint` | `MC_STORE_ADMIN_TRACING_ENDPOINT` | runtime default | OTLP endpoint passed to store tracing enablement |
+| `tracing on --sample-ratio` | `MC_STORE_ADMIN_TRACING_SAMPLE_RATIO` | runtime default | tracing sample ratio passed to store tracing enablement |
+| `tracing on/off/flush --timeout-ms` | `MC_STORE_ADMIN_TRACING_TIMEOUT_MS` | `2000` | per-node admin fanout timeout |
+| `tracing on/off/flush --max-targets` | `MC_STORE_ADMIN_TRACING_MAX_TARGETS` | `1024` | maximum store-node fanout count for one request |
 
 Boolean admin environment variables use falsey parsing: `0`, `false`, `no`,
 and `off` disable the flag; other non-empty values enable it.

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{
     atomic::{AtomicU8, Ordering},
     Arc,
@@ -23,6 +23,7 @@ use mooncake_store_client::{
 };
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
+    METRICS_PORT_LABEL,
 };
 use tracing::{debug, trace};
 
@@ -257,7 +258,7 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let heartbeat_interval =
         effective_heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_ms);
     let requested_initial_state = requested_initial_state(&args);
-    let runtime = build_runtime_args(&args, timeouts).build()?;
+    let runtime = build_runtime_args(&args, timeouts, metrics_addr.as_deref()).build()?;
 
     let stable_id = runtime.stable_id.clone();
     let epoch = runtime.epoch;
@@ -611,13 +612,22 @@ fn parse_falsey_env_bool(value: &str) -> bool {
     )
 }
 
-fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRuntimeArgs {
+fn build_runtime_args(
+    args: &RunArgs,
+    timeouts: CompatTimeoutConfig,
+    metrics_addr: Option<&str>,
+) -> CompatRuntimeArgs {
     // TE metadata defaults to the classic_te peer-handshake mode when
     // --transport-metadata-url is unset.
     let transport_metadata_url = args
         .transport_metadata_url
         .clone()
         .unwrap_or_else(|| "P2PHANDSHAKE".to_string());
+    let mut labels = args.labels.iter().cloned().collect::<BTreeMap<_, _>>();
+    labels.remove(METRICS_PORT_LABEL);
+    if let Some(port) = metrics_port_label(metrics_addr) {
+        labels.insert(METRICS_PORT_LABEL.to_string(), port);
+    }
     CompatRuntimeArgs {
         setup: CompatSetupArgs {
             local_hostname: args.local_hostname.clone(),
@@ -637,7 +647,7 @@ fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRu
             tenant: args.tenant.clone(),
             domain: args.domain.clone(),
             object_set: args.object_set.clone(),
-            labels: args.labels.iter().cloned().collect::<BTreeMap<_, _>>(),
+            labels,
             routed_writes: args.routed_writes,
             replica_count: args.replica_count,
             route_topk: args.route_topk,
@@ -651,6 +661,11 @@ fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRu
         initial_state: startup_initial_state(requested_initial_state(args)),
         route_control: args.route_control.into(),
     }
+}
+
+fn metrics_port_label(metrics_addr: Option<&str>) -> Option<String> {
+    let addr = metrics_addr?.parse::<SocketAddr>().ok()?;
+    Some(addr.port().to_string())
 }
 
 fn requested_initial_state(args: &RunArgs) -> ClientLifecycleState {
@@ -904,7 +919,7 @@ mod tests {
         record_heartbeat_health, stable_phase_spread_ms, start_metrics_http_server,
         stop_metrics_http_server, OperationTracker, RouteControlMode,
     };
-    use mooncake_store_core::{ClientEpoch, ClientLifecycleState};
+    use mooncake_store_core::{ClientEpoch, ClientLifecycleState, METRICS_PORT_LABEL};
 
     use _store_rs::runtime::CompatTimeoutConfig;
 
@@ -968,6 +983,45 @@ mod tests {
             route_control: RouteControlArg::EmbeddedWrh,
             drain_on_exit: false,
         }
+    }
+
+    #[test]
+    fn build_runtime_args_publishes_metrics_port_without_reachable_host() {
+        let mut args = sample_args();
+        args.labels.push(("pool".to_string(), "fast".to_string()));
+        args.labels
+            .push((METRICS_PORT_LABEL.to_string(), "bad-user-value".to_string()));
+
+        let runtime_args = build_runtime_args(&args, sample_timeouts(), Some("0.0.0.0:19300"));
+
+        assert_eq!(
+            runtime_args
+                .setup
+                .labels
+                .get(METRICS_PORT_LABEL)
+                .map(String::as_str),
+            Some("19300")
+        );
+        assert_eq!(
+            runtime_args.setup.labels.get("pool").map(String::as_str),
+            Some("fast")
+        );
+        assert!(!runtime_args
+            .setup
+            .labels
+            .values()
+            .any(|value| value.contains("0.0.0.0")));
+    }
+
+    #[test]
+    fn build_runtime_args_drops_stale_metrics_port_when_metrics_disabled() {
+        let mut args = sample_args();
+        args.labels
+            .push((METRICS_PORT_LABEL.to_string(), "19300".to_string()));
+
+        let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
+
+        assert!(!runtime_args.setup.labels.contains_key(METRICS_PORT_LABEL));
     }
 
     fn env_test_lock() -> &'static Mutex<()> {
@@ -1293,7 +1347,7 @@ mod tests {
                 assert!(!args.routed_writes);
                 assert!(!args.use_hugepage);
                 assert!(!args.drain_on_exit);
-                let runtime_args = build_runtime_args(&args, sample_timeouts());
+                let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
                 assert_eq!(runtime_args.setup.use_hugepage, Some(false));
 
                 let cli = parse_cli_from(["mooncake-store-client", "stats"])
@@ -1410,7 +1464,7 @@ mod tests {
         };
 
         validate_args(&args).expect("hot-upgrade args should validate");
-        let runtime_args = build_runtime_args(&args, sample_timeouts());
+        let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
         assert_eq!(runtime_args.setup.stable_id.as_deref(), Some("store-a"));
         assert_eq!(runtime_args.initial_state, ClientLifecycleState::Standby);
         assert_eq!(
@@ -1640,7 +1694,7 @@ mod tests {
         args.route_control = RouteControlArg::MetadataOnly;
         args.initial_state = InitialStateArg::Draining;
 
-        let runtime_args = build_runtime_args(&args, sample_timeouts());
+        let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
         assert_eq!(runtime_args.setup.local_hostname, "127.0.0.1");
         assert_eq!(
             runtime_args.setup.transport_metadata_url,
@@ -1678,7 +1732,7 @@ mod tests {
     #[test]
     fn active_startup_is_staged_as_standby_until_runtime_is_ready() {
         let args = sample_args();
-        let runtime_args = build_runtime_args(&args, sample_timeouts());
+        let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
         assert_eq!(requested_initial_state(&args), ClientLifecycleState::Active);
         assert_eq!(runtime_args.initial_state, ClientLifecycleState::Standby);
         assert!(should_activate_after_ready(

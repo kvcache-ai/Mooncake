@@ -756,6 +756,7 @@ mod tests {
     use crate::{
         scoped_logical_object_id, scoped_object_key, ClientEndpointSet, ClientEpoch, ClientLease,
         ClientLifecycleState, ClientRuntimeId, CompatibilityDescriptor, RouteControlMode,
+        METRICS_PORT_LABEL,
     };
 
     #[test]
@@ -923,6 +924,40 @@ mod tests {
         );
         assert_eq!(decoded.state, ClientLifecycleState::Active);
         assert_eq!(decoded.expires_at_ms, 42);
+    }
+
+    #[test]
+    fn client_lease_metrics_port_is_compatible_label_extension() {
+        let mut endpoints = ClientEndpointSet::default();
+        endpoints
+            .labels
+            .insert(METRICS_PORT_LABEL.to_string(), "19300".to_string());
+        let lease = ClientLease {
+            runtime: ClientRuntimeId::new("runtime-a", ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints,
+            expires_at_ms: 42,
+        };
+        let encoded = serde_json::to_value(&lease).expect("lease should serialize");
+
+        assert!(encoded.get(METRICS_PORT_LABEL).is_none());
+        assert_eq!(
+            encoded
+                .pointer(&format!("/endpoints/labels/{METRICS_PORT_LABEL}"))
+                .and_then(|value| value.as_str()),
+            Some("19300")
+        );
+        let decoded: ClientLease =
+            serde_json::from_value(encoded).expect("lease should deserialize");
+        assert_eq!(
+            decoded
+                .endpoints
+                .labels
+                .get(METRICS_PORT_LABEL)
+                .map(String::as_str),
+            Some("19300")
+        );
     }
 
     // --- Adversarial: TenantPolicyScope validation matrix ---------------

@@ -7,7 +7,7 @@ use std::time::Duration;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId, CompatibilityDescriptor,
     ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteVersion,
-    SegmentName, SegmentReservation, StoreError,
+    SegmentName, SegmentReservation, StoreError, CONTROL_ADDR_LABEL,
 };
 use parking_lot::Mutex;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
@@ -20,7 +20,6 @@ use tracing::{debug, trace, warn};
 
 use crate::observability::OperationTracker;
 
-const CONTROL_ADDR_LABEL: &str = "control_addr";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_CONTROL_REQUEST_TIMEOUT_MS";

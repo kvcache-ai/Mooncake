@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -19,7 +21,7 @@ use mooncake_store_core::{
     StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
     TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
     TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationState,
-    TenantRoutePolicy, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
+    TenantRoutePolicy, CONTROL_ADDR_LABEL, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET, METRICS_PORT_LABEL,
 };
 use parking_lot::Mutex;
 use url::Url;
@@ -33,6 +35,7 @@ use super::models::{
     RouteMigrationMode, RouteMigrationTaskListResponse, RouteMigrationTaskState,
     RouteMigrationTaskStatusResponse, RouteMigrationTaskSubmitRequest, RoutePolicyResponse,
     TenantQuotaAbortResponse, TenantQuotaReconcileAction, TenantQuotaReconcileReport,
+    TracingAction, TracingClusterResponse, TracingNodeResponse, TracingUpdateRequest,
 };
 
 pub type AdminResult<T> = mooncake_store_core::Result<T>;
@@ -45,6 +48,17 @@ const MIGRATION_MAX_RETRIES_ENV: &str = "MC_STORE_ADMIN_MIGRATION_MAX_RETRIES";
 const MIGRATION_RETRY_BASE_DELAY_MS_ENV: &str = "MC_STORE_ADMIN_MIGRATION_RETRY_BASE_DELAY_MS";
 const MIGRATION_RETRY_MAX_DELAY_MS_ENV: &str = "MC_STORE_ADMIN_MIGRATION_RETRY_MAX_DELAY_MS";
 const MIGRATION_POLL_INTERVAL_MS_ENV: &str = "MC_STORE_ADMIN_MIGRATION_POLL_INTERVAL_MS";
+const DEFAULT_STORE_METRICS_PORT: u16 = 9300;
+const DEFAULT_TRACING_FANOUT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_TRACING_MAX_TARGETS: usize = 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TracingTarget {
+    pub(crate) runtime: ClientRuntimeId,
+    pub(crate) metrics_url: String,
+    host: String,
+    port: u16,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MigrationQueueConfig {
@@ -1038,6 +1052,181 @@ fn admin_cleanup_report(report: &RedisMetadataCleanupReport) -> AdminCleanupRepo
     }
 }
 
+fn store_lease_can_host_tracing(lease: &ClientLease) -> bool {
+    lease.state.serves_reads()
+        && (lease.endpoints.labels.get("route").map(String::as_str) == Some("true")
+            || lease.endpoints.labels.get("storage").map(String::as_str) == Some("true"))
+}
+
+fn tracing_target_from_lease(lease: &ClientLease) -> Option<TracingTarget> {
+    let host = lease
+        .endpoints
+        .labels
+        .get(CONTROL_ADDR_LABEL)
+        .and_then(|value| endpoint_host(value))
+        .or_else(|| endpoint_host(&lease.endpoints.rpc_address))?;
+    let port = lease
+        .endpoints
+        .labels
+        .get(METRICS_PORT_LABEL)
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_STORE_METRICS_PORT);
+    let metrics_url = format!("http://{}", format_host_port(&host, port));
+    Some(TracingTarget {
+        runtime: lease.runtime.clone(),
+        metrics_url,
+        host,
+        port,
+    })
+}
+
+fn endpoint_host(address: &str) -> Option<String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return None;
+    }
+    let normalized = if address.contains("://") {
+        address.to_string()
+    } else {
+        format!("http://{address}")
+    };
+    Url::parse(&normalized)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn tracing_action_path(
+    action: TracingAction,
+    request: &TracingUpdateRequest,
+) -> AdminResult<String> {
+    match action {
+        TracingAction::Status => Ok("/tracing".to_string()),
+        TracingAction::Off => Ok("/tracing/off".to_string()),
+        TracingAction::Flush => Ok("/tracing/flush".to_string()),
+        TracingAction::On => {
+            if request.endpoint.is_none() && request.sample_ratio.is_none() {
+                return Ok("/tracing/on".to_string());
+            }
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query.append_pair("enabled", "on");
+            if let Some(endpoint) = request.endpoint.as_deref() {
+                query.append_pair("endpoint", endpoint);
+            }
+            if let Some(sample_ratio) = request.sample_ratio {
+                if !sample_ratio.is_finite() || !(0.0..=1.0).contains(&sample_ratio) {
+                    return Err(StoreError::Unsupported(format!(
+                        "tracing sample_ratio must be between 0.0 and 1.0, got {sample_ratio}"
+                    )));
+                }
+                query.append_pair("sample_ratio", &sample_ratio.to_string());
+            }
+            Ok(format!("/tracing?{}", query.finish()))
+        }
+    }
+}
+
+fn fetch_tracing_status(
+    target: &TracingTarget,
+    path: &str,
+    timeout: Duration,
+) -> AdminResult<serde_json::Value> {
+    let socket_addr = (target.host.as_str(), target.port)
+        .to_socket_addrs()
+        .map_err(|error| {
+            StoreError::Transport(format!(
+                "failed to resolve tracing target {}: {error}",
+                target.metrics_url
+            ))
+        })?
+        .next()
+        .ok_or_else(|| {
+            StoreError::Transport(format!(
+                "failed to resolve tracing target {}",
+                target.metrics_url
+            ))
+        })?;
+    let mut stream = TcpStream::connect_timeout(&socket_addr, timeout).map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to connect tracing target {}: {error}",
+            target.metrics_url
+        ))
+    })?;
+    stream.set_read_timeout(Some(timeout)).map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to set tracing read timeout for {}: {error}",
+            target.metrics_url
+        ))
+    })?;
+    stream.set_write_timeout(Some(timeout)).map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to set tracing write timeout for {}: {error}",
+            target.metrics_url
+        ))
+    })?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n\r\n",
+        format_host_port(&target.host, target.port)
+    );
+    stream.write_all(request.as_bytes()).map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to write tracing request to {}: {error}",
+            target.metrics_url
+        ))
+    })?;
+    stream.flush().map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to flush tracing request to {}: {error}",
+            target.metrics_url
+        ))
+    })?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to read tracing response from {}: {error}",
+            target.metrics_url
+        ))
+    })?;
+    let (headers, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
+        StoreError::Transport(format!(
+            "invalid tracing http response from {}",
+            target.metrics_url
+        ))
+    })?;
+    let status_line = headers.lines().next().ok_or_else(|| {
+        StoreError::Transport(format!(
+            "missing tracing http status from {}",
+            target.metrics_url
+        ))
+    })?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| {
+            StoreError::Transport(format!(
+                "invalid tracing http status from {}: {status_line}",
+                target.metrics_url
+            ))
+        })?;
+    if !(200..300).contains(&status_code) {
+        return Err(StoreError::Transport(format!(
+            "tracing request to {} failed: {status_line}: {}",
+            target.metrics_url,
+            body.trim()
+        )));
+    }
+    Ok(serde_json::from_str(body)
+        .unwrap_or_else(|_| serde_json::Value::String(body.trim().to_string())))
+}
+
 impl AdminService {
     fn maintenance_backend(&self) -> AdminResult<MaintenanceBackend> {
         if self.metadata_url.starts_with("redis://") || self.metadata_url.starts_with("rediss://") {
@@ -1127,6 +1316,69 @@ impl AdminService {
 
     pub fn redacted_metadata_url(&self) -> String {
         redact_redis_url(&self.metadata_url)
+    }
+
+    pub(crate) fn discover_tracing_targets(&self) -> AdminResult<Vec<TracingTarget>> {
+        let mut targets = self
+            .backend
+            .list_live_clients()?
+            .into_iter()
+            .filter(store_lease_can_host_tracing)
+            .filter_map(|lease| tracing_target_from_lease(&lease))
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.runtime.cmp(&right.runtime));
+        Ok(targets)
+    }
+
+    pub fn update_tracing(
+        &self,
+        action: TracingAction,
+        request: TracingUpdateRequest,
+    ) -> AdminResult<TracingClusterResponse> {
+        let targets = self.discover_tracing_targets()?;
+        let max_targets = request
+            .max_targets
+            .unwrap_or(DEFAULT_TRACING_MAX_TARGETS)
+            .max(1);
+        if targets.len() > max_targets {
+            return Err(StoreError::Unsupported(format!(
+                "tracing fanout target count {} exceeds max_targets {max_targets}",
+                targets.len()
+            )));
+        }
+        let timeout = request
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_TRACING_FANOUT_TIMEOUT)
+            .max(Duration::from_millis(1));
+        let path = tracing_action_path(action.clone(), &request)?;
+        let mut nodes = Vec::with_capacity(targets.len());
+        for target in targets {
+            nodes.push(match fetch_tracing_status(&target, &path, timeout) {
+                Ok(status) => TracingNodeResponse {
+                    runtime: target.runtime,
+                    metrics_url: target.metrics_url,
+                    ok: true,
+                    status: Some(status),
+                    error: None,
+                },
+                Err(error) => TracingNodeResponse {
+                    runtime: target.runtime,
+                    metrics_url: target.metrics_url,
+                    ok: false,
+                    status: None,
+                    error: Some(error.to_string()),
+                },
+            });
+        }
+        let ok = nodes.iter().filter(|node| node.ok).count();
+        Ok(TracingClusterResponse {
+            action,
+            total: nodes.len(),
+            ok,
+            failed: nodes.len().saturating_sub(ok),
+            nodes,
+        })
     }
 
     pub fn submit_route_migration_task(
@@ -1774,6 +2026,7 @@ pub fn redact_redis_url(url: &str) -> String {
 mod tests {
     use std::collections::VecDeque;
     use std::env;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
@@ -1795,7 +2048,7 @@ mod tests {
         TenantObjectAccountingState, TenantPolicy, TenantQuotaAbortOutcome,
         TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
         TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
-        TenantQuotaReservationState, TenantQuotaState,
+        TenantQuotaReservationState, TenantQuotaState, METRICS_PORT_LABEL,
     };
     use parking_lot::Mutex;
 
@@ -2408,6 +2661,136 @@ mod tests {
             },
             expires_at_ms: u64::MAX,
         }
+    }
+
+    #[test]
+    fn tracing_target_discovery_uses_control_host_and_metrics_port_label() {
+        let service = test_service();
+        let mut lease = live_lease("store-a", 1);
+        lease.endpoints.rpc_address = "192.0.2.10:17000".to_string();
+        lease.endpoints.labels.insert(
+            "control_addr".to_string(),
+            "http://10.1.2.3:19001".to_string(),
+        );
+        lease
+            .endpoints
+            .labels
+            .insert(METRICS_PORT_LABEL.to_string(), "19300".to_string());
+        service
+            .backend()
+            .upsert_client_lease(&lease)
+            .expect("lease should store");
+
+        let targets = service
+            .discover_tracing_targets()
+            .expect("tracing targets should discover");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].runtime, lease.runtime);
+        assert_eq!(targets[0].metrics_url, "http://10.1.2.3:19300");
+    }
+
+    #[test]
+    fn tracing_target_discovery_falls_back_to_rpc_host_and_default_metrics_port() {
+        let service = test_service();
+        let mut lease = live_lease("store-a", 1);
+        lease.endpoints.rpc_address = "10.9.8.7:17000".to_string();
+        lease.endpoints.labels.remove("control_addr");
+        lease.endpoints.labels.remove(METRICS_PORT_LABEL);
+        service
+            .backend()
+            .upsert_client_lease(&lease)
+            .expect("lease should store");
+
+        let targets = service
+            .discover_tracing_targets()
+            .expect("tracing targets should discover");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].metrics_url, "http://10.9.8.7:9300");
+    }
+
+    #[test]
+    fn tracing_target_discovery_ignores_non_store_client_leases() {
+        let service = test_service();
+        let mut lease = live_lease("bench-a", 1);
+        lease
+            .endpoints
+            .labels
+            .insert("route".to_string(), "false".to_string());
+        lease
+            .endpoints
+            .labels
+            .insert("storage".to_string(), "false".to_string());
+        lease
+            .endpoints
+            .labels
+            .insert(METRICS_PORT_LABEL.to_string(), "19300".to_string());
+        service
+            .backend()
+            .upsert_client_lease(&lease)
+            .expect("lease should store");
+
+        let targets = service
+            .discover_tracing_targets()
+            .expect("tracing targets should discover");
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn tracing_fanout_calls_discovered_metrics_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test tracing listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("test tracing listener should expose address")
+            .port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("test tracing server should accept request");
+            let mut request = [0; 512];
+            let read = stream
+                .read(&mut request)
+                .expect("test tracing server should read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /tracing/off HTTP/1.1"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"enabled\":false}",
+                )
+                .expect("test tracing server should reply");
+        });
+        let service = test_service();
+        let mut lease = live_lease("store-a", 1);
+        lease.endpoints.labels.insert(
+            "control_addr".to_string(),
+            "http://127.0.0.1:19001".to_string(),
+        );
+        lease
+            .endpoints
+            .labels
+            .insert(METRICS_PORT_LABEL.to_string(), port.to_string());
+        service
+            .backend()
+            .upsert_client_lease(&lease)
+            .expect("lease should store");
+
+        let response = service
+            .update_tracing(TracingAction::Off, TracingUpdateRequest::default())
+            .expect("tracing fanout should succeed");
+
+        server.join().expect("test tracing server should finish");
+        assert_eq!(response.total, 1);
+        assert_eq!(response.ok, 1);
+        assert_eq!(response.failed, 0);
+        assert_eq!(
+            response.nodes[0]
+                .status
+                .as_ref()
+                .and_then(|value| value.get("enabled")),
+            Some(&serde_json::Value::Bool(false))
+        );
     }
 
     fn wait_for_task_state(
