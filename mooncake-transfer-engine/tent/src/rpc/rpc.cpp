@@ -104,7 +104,8 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6) {
         try {
             if (port == 0)
                 port = kStartPort + SimpleRandom::Get().next(kPortRange);
-            server_ = new coro_rpc::coro_rpc_server(kRpcThreads, port);
+            server_ = new coro_rpc::coro_rpc_server(kRpcThreads, port,
+                                                    ipv6 ? "::" : "0.0.0.0");
             server_->register_handler<&CoroRpcAgent::process>(this);
             server_->async_start();
             const auto err = server_->get_errc();

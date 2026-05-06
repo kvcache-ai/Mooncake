@@ -10,6 +10,10 @@ The HTTP service serves multiple purposes:
 - **Data Inspection**: Examine stored objects and their replicas
 - **Health Checks**: Service availability and status verification
 
+The Python `mooncake.mooncake_store_service` module also provides a lightweight
+Store REST API for data operations and standalone segment mount/unmount
+workflows. Unless configured otherwise, it listens on port `8080`.
+
 ## HTTP Endpoints
 
 ### Metrics Endpoints
@@ -159,3 +163,100 @@ Basic health check endpoint for service availability verification.
 curl http://localhost:8080/health
 ```
 
+## Store REST API Endpoints
+
+The following endpoints are served by the Python store REST service, which wraps
+`MooncakeDistributedStore` with an aiohttp service. The HTTP handlers live in
+Python, while mount and unmount operations are delegated to the underlying store
+binding. Start the service with:
+
+```bash
+python -m mooncake.mooncake_store_service \
+  --config /path/to/mooncake_config.json \
+  --port 8080
+```
+
+If the wheel console scripts are installed, the equivalent command is:
+
+```bash
+mc_store_rest_server --config /path/to/mooncake_config.json --port 8080
+```
+
+### `/api/mount_shm`
+Mount a named shared memory object as one or more Mooncake store segments. If
+the requested size exceeds the maximum registration size, the service may split
+the region and return multiple segment ids.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "name": "mooncake_segment",
+  "size": 16777216,
+  "offset": 0,
+  "protocol": "tcp",
+  "location": ""
+}
+```
+
+**Fields**:
+- `name` (string, required): Named shared memory object name. A leading `/` is
+  accepted, but path separators are not.
+- `size` (integer, required): Number of bytes to mount.
+- `offset` (integer, optional): File offset in bytes. Defaults to `0`.
+- `protocol` (string, optional): Transfer protocol. Defaults to the service
+  configuration protocol.
+- `location` (string, optional): Device or locality hint. Defaults to an empty
+  string.
+
+**Success Response**:
+```json
+{
+  "status": "success",
+  "segment_ids": ["00000000-0000-0000-0000-000000000001"]
+}
+```
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/mount_shm \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "mooncake_segment",
+        "size": 16777216,
+        "offset": 0,
+        "protocol": "tcp",
+        "location": ""
+      }'
+```
+
+### `/api/unmount_shm`
+Unmount one or more segment ids previously returned by `/api/mount_shm`.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "segment_ids": ["00000000-0000-0000-0000-000000000001"]
+}
+```
+
+`segment_ids` may also be provided as a single string for one segment.
+
+**Success Response**:
+```json
+{
+  "status": "success"
+}
+```
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/unmount_shm \
+  -H "Content-Type: application/json" \
+  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000001"]}'
+```

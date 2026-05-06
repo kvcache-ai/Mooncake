@@ -112,6 +112,21 @@ class RdmaContext {
 
     int deleteEndpoint(const std::string &peer_nic_path);
 
+    // Drain the endpoint store's waiting list. Safe to call on any thread;
+    // intended to be invoked periodically from monitorWorker so reclaim is
+    // not gated on new endpoint insertions (which can stall under failure
+    // load while evictions/deletions continue). See issue #1845.
+    void reclaimEndpoints();
+
+    // Number of endpoints awaiting reclaim. For tests and operator
+    // observability.
+    size_t waitingListSize() const;
+
+    // Test-only: push a pre-constructed endpoint into the store's
+    // waiting_list_ so the reclaim path can be exercised without standing up
+    // a real RDMA QP.
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep);
+
     int disconnectAllEndpoints();
 
     // Get the total number of QPs across all endpoints in this context

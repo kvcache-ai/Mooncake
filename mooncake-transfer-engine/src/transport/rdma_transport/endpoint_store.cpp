@@ -81,6 +81,7 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     // remove endpoint but leaving it status unchanged
     // in case it is setting up connection or submitting slice
     if (iter != endpoint_map_.end()) {
+        waiting_list_len_++;
         waiting_list_.insert(iter->second);
         iter->second->set_active(false);
         endpoint_map_.erase(iter);
@@ -97,17 +98,20 @@ void FIFOEndpointStore::evictEndpoint() {
     fifo_list_.pop_front();
     fifo_map_.erase(victim);
     LOG(INFO) << victim << " evicted";
+    waiting_list_len_++;
     waiting_list_.insert(endpoint_map_[victim]);
     endpoint_map_.erase(victim);
     return;
 }
 
 void FIFOEndpointStore::reclaimEndpoint() {
+    if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
     for (auto &endpoint : waiting_list_)
         if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
     for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
+    waiting_list_len_ -= to_delete.size();
 }
 
 size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
@@ -133,6 +137,13 @@ size_t FIFOEndpointStore::getTotalQPNumber() {
         total_qps += kv.second->getQPNumber();
     }
     return total_qps;
+}
+
+void FIFOEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(ep);
+    waiting_list_len_++;
 }
 
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
@@ -261,6 +272,13 @@ int SIEVEEndpointStore::disconnectQPs() {
 }
 
 size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
+
+void SIEVEEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(ep);
+    waiting_list_len_++;
+}
 
 size_t SIEVEEndpointStore::getTotalQPNumber() {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);

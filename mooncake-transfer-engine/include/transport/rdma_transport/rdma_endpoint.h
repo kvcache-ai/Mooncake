@@ -143,7 +143,7 @@ class RdmaEndPoint {
                           std::vector<uint32_t> peer_qp_num_list,
                           std::string *reply_msg = nullptr);
 
-    int doSetupConnection(int qp_index, const std::string &peer_gid,
+    int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                           uint16_t peer_lid, uint32_t peer_qp_num,
                           std::string *reply_msg = nullptr);
 

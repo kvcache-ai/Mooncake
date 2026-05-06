@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       checkout_ref:
-        description: 'Git ref to checkout (PR head SHA for pull_request_target)'
+        description: 'Git ref to checkout (PR head SHA)'
         required: false
         type: string
 
@@ -49,7 +49,7 @@ jobs:
       if: steps.checkout_code.outcome == 'failure'
       shell: bash
       env:
-        ASCEND_GITHUB_MIRROR_URLS: ${{ vars.ASCEND_GITHUB_MIRROR_URLS }}
+        ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
         CHECKOUT_REF: ${{ inputs.checkout_ref || github.sha }}
       run: |
         set -euo pipefail
@@ -108,7 +108,7 @@ jobs:
     - name: Configure CMake
       shell: bash
       env:
-        ASCEND_GITHUB_MIRROR_URLS: ${{ vars.ASCEND_GITHUB_MIRROR_URLS }}
+        ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
       run: |
         source /usr/local/Ascend/cann-9.0.0/set_env.sh
         pwd

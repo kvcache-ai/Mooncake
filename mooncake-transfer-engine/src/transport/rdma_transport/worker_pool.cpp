@@ -493,6 +493,11 @@ void WorkerPool::monitorWorker() {
         auto current_ts = getCurrentTimeInNano();
         if (current_ts - last_reset_ts > 1000000000ll) {
             context_.set_active(true);
+            // Drain endpoint_store_->waiting_list_ even when no new
+            // insertions are happening. Without this, reclaim only runs
+            // from RdmaContext::endpoint() and the waiting list grows
+            // unboundedly under failure load. See issue #1845.
+            context_.reclaimEndpoints();
             last_reset_ts = current_ts;
         }
         struct epoll_event event;

@@ -1,5 +1,14 @@
 # Allocator Performance
 
+Mooncake Store uses two allocators at different layers:
+
+- **MmapArena** — backs the mmap buffer path used by SGLang HiCache for host KV cache memory. When explicitly enabled, it pre-allocates a hugepage-backed pool at startup and serves allocations via lock-free atomic bump pointer (~50ns per allocation). Configured via `MC_MMAP_ARENA_POOL_SIZE` (explicit opt-in) and `MC_DISABLE_MMAP_ARENA`.
+- **OffsetAllocator** — manages object-level allocation within Mooncake Store segments for KV cache entries. Evaluated below.
+
+These are complementary: MmapArena handles the backing memory, OffsetAllocator manages logical object placement within that memory.
+
+## OffsetAllocator
+
 We evaluated the performance of [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), the default memory allocator in Mooncake Store. This allocator is responsible for allocating memory from mounted segments to store the KV cache.
 
 In this context, the most important metric is **memory utilization**, defined as the ratio between the amount of memory that can be successfully allocated and the total available memory. A higher utilization means that more KV tensors can be cached, thereby accelerating LLM tasks. However, due to memory fragmentation, allocation may fail even when the allocated memory is well below the total available capacity.

@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include <string>
@@ -240,6 +243,32 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 }
 
 /**
+ * @brief Convert a boolean-like string to a bool
+ * @param str String representation ("1"/"true"/"yes"/"on" or
+ * "0"/"false"/"no"/"off")
+ * @return std::optional<bool> Parsed value, or std::nullopt if parsing fails
+ */
+[[nodiscard]] inline std::optional<bool> string_to_bool(std::string str) {
+    if (str.empty()) {
+        return std::nullopt;
+    }
+
+    str.erase(0, str.find_first_not_of(" \t\r\n"));
+    str.erase(str.find_last_not_of(" \t\r\n") + 1);
+    std::transform(str.begin(), str.end(), str.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    if (str == "1" || str == "true" || str == "yes" || str == "on") {
+        return true;
+    }
+    if (str == "0" || str == "false" || str == "no" || str == "off") {
+        return false;
+    }
+
+    return std::nullopt;
+}
+
+/**
  * @brief Split a string by delimiter into a vector of strings
  * @param str The string to split
  * @param delimiter The delimiter to split by (default is comma)
@@ -256,6 +285,7 @@ std::vector<std::string> splitString(const std::string& str,
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
+constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
 /**
  * @brief Allocates memory for the `BufferAllocator` class.
@@ -286,9 +316,6 @@ inline size_t align_up(size_t size, size_t alignment) {
     if (use_hp_env == nullptr) {
         return 0;
     }
-
-    constexpr size_t SZ_2MB = 2 * 1024 * 1024;
-    constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 
     size_t size = SZ_2MB;  // Default to 2MB
 
@@ -333,8 +360,33 @@ inline size_t align_up(size_t size, size_t alignment) {
     return size;
 }
 
-// Hugepage-backed allocation helpers (MAP_HUGETLB + MADV_HUGEPAGE)
+/**
+ * Allocate mmap-backed buffer memory for host KV / transfer buffers.
+ *
+ * When the global mmap arena is enabled, this function serves allocations
+ * from the arena and still honors the caller's requested alignment.
+ * Arena-owned allocations remain owned by the arena until process shutdown.
+ *
+ * When the arena is disabled or unavailable, this falls back to a direct
+ * mmap() allocation and returns a pointer aligned to at least the system page
+ * size (or the configured hugepage size when available).
+ *
+ * @param total_size Total buffer size in bytes.
+ * @param alignment Minimum alignment requested by the caller.
+ * @return Pointer to the allocation, or nullptr on failure.
+ */
 void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+
+/**
+ * Release memory previously returned by allocate_buffer_mmap_memory().
+ *
+ * Direct-mmap allocations are unmapped immediately. Arena-owned pointers are
+ * intentionally not unmapped individually; in that case this function is a
+ * no-op and the arena releases the backing pool during process teardown.
+ *
+ * @param ptr Pointer previously returned by allocate_buffer_mmap_memory().
+ * @param total_size Original allocation size in bytes.
+ */
 void free_buffer_mmap_memory(void* ptr, size_t total_size);
 
 /**

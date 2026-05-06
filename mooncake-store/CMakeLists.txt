@@ -37,5 +37,8 @@ add_subdirectory(src)
 
 if (BUILD_UNIT_TESTS)
     add_subdirectory(tests)
+endif()
+
+if (BUILD_BENCHMARK)
     add_subdirectory(benchmarks)
 endif()

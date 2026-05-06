@@ -16,6 +16,17 @@ add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest gtest_main )
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
+target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
+
+# Integration test for the monitorWorker reclaim tick (issue #1845).
+# Self-skips when no RDMA device is present, so safe to register with ctest.
+add_executable(endpoint_store_integration_test ${WORKSPACE}/endpoint_store_integration_test.cpp)
+target_link_libraries(endpoint_store_integration_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME endpoint_store_integration_test COMMAND endpoint_store_integration_test)
+set_tests_properties(endpoint_store_integration_test PROPERTIES LABELS "rdma")
+
 add_executable(rdma_transport_test2 ${WORKSPACE}/rdma_transport_test2.cpp)
 target_link_libraries(rdma_transport_test2 PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_transport_test2 COMMAND rdma_transport_test2)

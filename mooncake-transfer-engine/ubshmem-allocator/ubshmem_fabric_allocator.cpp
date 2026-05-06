@@ -3,9 +3,9 @@
 
 #include <iostream>
 
-extern "C" {
+namespace {
 
-bool mc_probe_ub_fabric_support(int device_id) {
+bool ProbeAllocatorBackend(int device_id) {
     aclError res = aclrtSetDevice(device_id);
     if (res != ACL_ERROR_NONE) {
         std::cerr << "Set device failed: " << device_id << ", result" << res;
@@ -19,25 +19,22 @@ bool mc_probe_ub_fabric_support(int device_id) {
     prop.memAttr = ACL_HBM_MEM_HUGE;
 
     aclrtDrvMemHandle handle;
-    // try to allocate 2M fabric mem
     size_t size = 2 * 1024 * 1024;
 
     res = aclrtMallocPhysical(&handle, size, &prop, 0);
     if (res == ACL_ERROR_NONE) {
-        aclrtFreePhysical(handle);  // success → clean up
+        aclrtFreePhysical(handle);
         return true;
-    } else {
-        return false;
     }
+    return false;
 }
 
-void *mc_ub_fabric_malloc(ssize_t size, int device) {
+void *AllocateFabricMemory(ssize_t size, int device) {
     size_t granularity = 0;
     aclrtPhysicalMemProp prop = {};
     aclrtDrvMemHandle handle;
     void *ptr = nullptr;
 
-    // Align size to 2M
     const size_t alignment = 2 * 1024 * 1024;
     size = (size + alignment - 1) & ~(alignment - 1);
 
@@ -54,7 +51,6 @@ void *mc_ub_fabric_malloc(ssize_t size, int device) {
         return nullptr;
     }
     uint64_t page_type = 1;
-    // now granularity is reserved to 0
     result =
         aclrtReserveMemAddress(&ptr, size, granularity, nullptr, page_type);
     if (result != ACL_ERROR_NONE) {
@@ -73,7 +69,8 @@ void *mc_ub_fabric_malloc(ssize_t size, int device) {
     return ptr;
 }
 
-void mc_ub_fabric_free(void *ptr, int device) {
+void FreeFabricMemory(void *ptr, int device) {
+    (void)device;
     aclrtDrvMemHandle handle;
     if (!ptr) {
         return;
@@ -83,10 +80,35 @@ void mc_ub_fabric_free(void *ptr, int device) {
         std::cerr << "aclrtMemRetainAllocationHandle failed: " << result
                   << "\n";
         return;
-    } else {
-        (void)aclrtUnmapMem(ptr);
-        (void)aclrtReleaseMemAddress(ptr);
     }
+    (void)aclrtUnmapMem(ptr);
+    (void)aclrtReleaseMemAddress(ptr);
     (void)aclrtFreePhysical(handle);
+}
+
+}  // namespace
+
+extern "C" {
+
+bool mc_probe_ub_fabric_support(int device_id) {
+    return ProbeAllocatorBackend(device_id);
+}
+
+int mc_allocator_probe(int device_id) {
+    return ProbeAllocatorBackend(device_id) ? 1 : 0;
+}
+
+void *mc_allocator_malloc(ssize_t size, int device) {
+    return AllocateFabricMemory(size, device);
+}
+
+void *mc_ub_fabric_malloc(ssize_t size, int device) {
+    return mc_allocator_malloc(size, device);
+}
+
+void mc_allocator_free(void *ptr, int device) { FreeFabricMemory(ptr, device); }
+
+void mc_ub_fabric_free(void *ptr, int device) {
+    mc_allocator_free(ptr, device);
 }
 }

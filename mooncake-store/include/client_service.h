@@ -296,6 +296,20 @@ class Client {
                                                  size_t size);
 
     /**
+     * @brief Mounts a memory segment and returns its generated Segment UUID.
+     *        Logic is identical to MountSegment, but returns the segment id.
+     */
+    tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
+
+    /**
+     * @brief Unmounts a segment by its UUID.
+     *        Logic is identical to UnmountSegment, but looks up by id.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentById(const UUID& segment_id);
+
+    /**
      * @brief Registers memory buffer with TransferEngine for data transfer
      * @param addr Memory address to register
      * @param length Size of the memory region
@@ -665,6 +679,13 @@ class Client {
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+
+    /**
+     * @brief Internal helper to unmount a segment by iterator.
+     *        Caller must hold mounted_segments_mutex_.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentImpl(
+        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
 
     // Configuration
     const std::string local_hostname_;

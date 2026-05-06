@@ -152,8 +152,6 @@ def init_mooncake_group(
         "rank": rank,
         "world_size": world_size,
     }
-    if device_type == "cuda":
-        kwargs["device_id"] = device
     if use_pg_options:
         resolved_active_value = (
             1 if is_extension else 0 if active_value is None else active_value
@@ -189,7 +187,7 @@ def init_mooncake_cpu_group(
 def get_mooncake_backend(group=None, device_type: str = "cpu"):
     if group is None:
         group = dist.group.WORLD
-    return group._get_backend(torch.device(device_type))
+    return group
 
 
 @dataclass(slots=True)

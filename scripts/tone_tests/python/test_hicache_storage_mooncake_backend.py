@@ -258,6 +258,9 @@ class TestMooncakeBackendMLAModel(
         server_args, env_vars = super()._get_additional_server_args_and_env()
         server_args["--hicache-mem-layout"] = "page_first"
         server_args["--tp-size"] = 2
+        # Keep arena coverage explicit in the self-hosted integration suite.
+        env_vars.pop("MC_DISABLE_MMAP_ARENA", None)
+        env_vars["MC_MMAP_ARENA_POOL_SIZE"] = "8gb"
         return server_args, env_vars
 
 
@@ -274,6 +277,10 @@ class TestMooncakeBackendAccuracy(
         server_args["--tp-size"] = 2
         server_args["--hicache-mem-layout"] = "page_first_direct"
         server_args["--hicache-io-backend"] = "direct"
+        # Explicitly cover the allocator-disabled fallback path as part of the
+        # self-hosted HiCache integration suite.
+        env_vars.pop("MC_MMAP_ARENA_POOL_SIZE", None)
+        env_vars["MC_DISABLE_MMAP_ARENA"] = "1"
         return server_args, env_vars
 
     def test_eval_accuracy(self):

@@ -16,6 +16,7 @@
 #define TENT_WORKERS_H
 
 #include <future>
+#include <memory>
 #include <queue>
 #include <thread>
 #include <unordered_set>
@@ -186,7 +187,10 @@ class Workers {
         std::condition_variable cv;
         volatile bool in_suspend = false;
 
-        std::unordered_map<std::string, RailMonitor> rails;
+        // Values are held via unique_ptr so that map rehashing does not
+        // invalidate pointers into RailMonitor stored on in-flight slices
+        // (see RdmaSlice::rail_monitor).
+        std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
         PerfMetricSummary perf;
         uint64_t padding[16];
     };
