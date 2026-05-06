@@ -295,6 +295,13 @@ MooncakeBackend::MooncakeBackend(
         connection_ctx_->waitUntilAllConnected();
     }
 
+    // Register a lightweight Backend shim so that PyTorch's P2P dispatch path
+    // (batch_isend_irecv → _get_backend → getBackend) can find a registered
+    // Backend for this ProcessGroup.  The shim delegates send/recv back to us.
+    auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
+    auto shim = c10::make_intrusive<MooncakeP2PShim>(this, deviceType);
+    setBackend(deviceType, BackendType::CUSTOM, shim);
+
     // Increment backend index
     ++backendIndex_;
 }
@@ -302,6 +309,36 @@ MooncakeBackend::MooncakeBackend(
 MooncakeBackend::~MooncakeBackend() { shutdown(); }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
+
+// ---- MooncakeP2PShim implementation ----
+
+const std::string MooncakeP2PShim::getBackendName() const {
+    return "mooncake";
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::send(
+    std::vector<at::Tensor>& tensors, int dstRank, int tag) {
+    return owner_->send(tensors, dstRank, tag);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::recv(
+    std::vector<at::Tensor>& tensors, int srcRank, int tag) {
+    return owner_->recv(tensors, srcRank, tag);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::recvAnysource(
+    std::vector<at::Tensor>& tensors, int tag) {
+    // MooncakeBackend doesn't implement recvAnysource; fall back to
+    // the base class which will raise a clear error.
+    return ::c10d::Backend::recvAnysource(tensors, tag);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::barrier(
+    const c10d::BarrierOptions& opts) {
+    std::vector<at::Tensor> dummy = {
+        at::empty({1}, at::dtype(at::kFloat).device(at::kCPU))};
+    return owner_->barrier(opts);
+}
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     std::vector<at::Tensor>& tensors, int dstRank, int tag) {
