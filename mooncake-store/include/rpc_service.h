@@ -165,6 +165,8 @@ class WrappedMasterService {
 
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
         const std::string& segment_name);
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
 

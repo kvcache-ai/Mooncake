@@ -178,6 +178,11 @@ struct RpcNameTraits<&WrappedMasterService::QuerySegmentStatus> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::QuerySegmentStatusById> {
+    static constexpr const char* value = "QuerySegmentStatusById";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetStorageConfig> {
     static constexpr const char* value = "GetStorageConfig";
 };
@@ -784,6 +789,17 @@ tl::expected<SegmentStatus, ErrorCode> MasterClient::QuerySegmentStatus(
     auto result =
         invoke_rpc<&WrappedMasterService::QuerySegmentStatus, SegmentStatus>(
             segment_name);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<SegmentStatus, ErrorCode> MasterClient::QuerySegmentStatusById(
+    const UUID& segment_id) {
+    ScopedVLogTimer timer(1, "MasterClient::QuerySegmentStatusById");
+    timer.LogRequest("segment_id=", segment_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::QuerySegmentStatusById,
+                             SegmentStatus>(segment_id);
     timer.LogResponseExpected(result);
     return result;
 }

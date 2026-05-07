@@ -2279,7 +2279,6 @@ void Client::StartGracefulUnmountTimer(const UUID& segment_id,
 
 void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
     // Query master to confirm the segment has been removed
-    std::string segment_name;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         auto it = gracefully_unmounting_segments_.find(segment_id);
@@ -2287,10 +2286,9 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
             // Already cleaned up (e.g. by destructor)
             return;
         }
-        segment_name = it->second.name;
     }
 
-    auto status = master_client_.QuerySegmentStatus(segment_name);
+    auto status = master_client_.QuerySegmentStatusById(segment_id);
     bool removed = false;
     if (!status) {
         if (status.error() == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -2345,7 +2343,7 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
         }
     } else {
         LOG(WARNING) << "Graceful unmount cleanup timeout for segment "
-                     << segment_name;
+                     << UuidToString(segment_id);
     }
 }
 

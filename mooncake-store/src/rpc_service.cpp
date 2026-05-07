@@ -1715,6 +1715,11 @@ tl::expected<SegmentStatus, ErrorCode> WrappedMasterService::QuerySegmentStatus(
     return master_service_.QuerySegmentStatus(segment_name);
 }
 
+tl::expected<SegmentStatus, ErrorCode>
+WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
+    return master_service_.QuerySegmentStatusById(segment_id);
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -1776,6 +1781,12 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::QuerySegmentStatus>(
+            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::QuerySegmentStatusById>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);

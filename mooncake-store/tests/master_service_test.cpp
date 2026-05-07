@@ -5264,6 +5264,34 @@ TEST_F(MasterServiceTest, GracefulUnmountSegment_TimerExpiresAndUnmounts) {
                                      : -1);
 }
 
+TEST_F(MasterServiceTest,
+       GracefulUnmountSegment_QueryStatusByIdWithReusedName) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto old_segment = MakeSegment("graceful_reused_name_segment");
+    auto new_segment = MakeSegment(old_segment.name, /*base=*/0x400000000);
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(old_segment, client_id).has_value());
+    ASSERT_TRUE(service_
+                    ->GracefulUnmountSegment(old_segment.id, client_id,
+                                             /*grace_period_ms=*/50)
+                    .has_value());
+    ASSERT_TRUE(service_->MountSegment(new_segment, client_id).has_value());
+
+    auto old_status = service_->QuerySegmentStatusById(old_segment.id);
+    ASSERT_TRUE(old_status.has_value());
+    EXPECT_EQ(old_status.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+
+    auto new_status = service_->QuerySegmentStatusById(new_segment.id);
+    ASSERT_TRUE(new_status.has_value());
+    EXPECT_EQ(new_status.value(), SegmentStatus::OK);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    EXPECT_FALSE(service_->QuerySegmentStatusById(old_segment.id).has_value());
+    ASSERT_TRUE(service_->QuerySegmentStatusById(new_segment.id).has_value());
+}
+
 TEST_F(MasterServiceTest, GracefulUnmountSegment_EarlierTimerPreemptsWait) {
     std::unique_ptr<MasterService> service_(new MasterService());
     auto long_segment = MakeSegment("graceful_long_timer_segment");

@@ -575,6 +575,17 @@ auto MasterService::QuerySegmentStatus(const std::string& segment_name)
     return status;
 }
 
+auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
+    -> tl::expected<SegmentStatus, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus status = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusById(segment_id, status);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return status;
+}
+
 auto MasterService::QueryIp(const UUID& client_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();

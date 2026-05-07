@@ -499,6 +499,12 @@ class MasterService {
         const std::string& segment_name);
 
     /**
+     * @brief Query current segment lifecycle state by segment id.
+     */
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
+
+    /**
      * @brief Query the status of a task
      * @return Task basic info
      */

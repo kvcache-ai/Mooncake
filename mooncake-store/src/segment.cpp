@@ -997,6 +997,17 @@ ErrorCode ScopedSegmentAccess::GetSegmentStatusByName(
     return ErrorCode::OK;
 }
 
+ErrorCode ScopedSegmentAccess::GetSegmentStatusById(
+    const UUID& segment_id, SegmentStatus& status) const {
+    auto mounted_segment_it =
+        segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted_segment_it == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    status = mounted_segment_it->second.status;
+    return ErrorCode::OK;
+}
+
 ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const std::string& segment_name, SegmentStatus status) {
     auto segment_id_it =

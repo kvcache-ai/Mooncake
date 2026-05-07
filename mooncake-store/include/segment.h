@@ -175,6 +175,12 @@ class ScopedSegmentAccess {
                                      SegmentStatus& status) const;
 
     /**
+     * @brief Query the lifecycle status of a segment by id.
+     */
+    ErrorCode GetSegmentStatusById(const UUID& segment_id,
+                                   SegmentStatus& status) const;
+
+    /**
      * @brief Update the lifecycle status of a segment by name.
      */
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
