@@ -1,3 +1,30 @@
+#include <algorithm>
+#include <cctype>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+static constexpr size_t kMaxTensorDimSelectionOutputBytes =
+    64ULL * 1024 * 1024 * 1024;
+static constexpr size_t kMaxTensorDimSelectionFragments = 1ULL * 1024 * 1024;
+static constexpr size_t kMaxTensorDimSelectionIndices =
+    kMaxTensorDimSelectionFragments;
+
+static bool range_exceeds(size_t offset, size_t length, size_t limit) {
+    return offset > limit || length > limit - offset;
+}
+
+static bool add_size_checked(size_t lhs, size_t rhs, size_t *result) {
+    if (lhs > std::numeric_limits<size_t>::max() - rhs) {
+        return false;
+    }
+    *result = lhs + rhs;
+    return true;
+}
+
 std::optional<ParsedTensorMetadata> get_tensor_metadata(
     const std::string &key,
     std::shared_ptr<BufferHandle> *buffer_handle_out = nullptr) {
@@ -22,6 +49,32 @@ std::optional<ParsedTensorMetadata> get_tensor_metadata(
                                buffer_handle->size());
 }
 
+std::optional<size_t> dtype_byte_size_from_name(const std::string &dtype_name,
+                                                const std::string &context) {
+    std::string normalized;
+    normalized.reserve(dtype_name.size());
+    for (char ch : dtype_name) {
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    const std::string torch_prefix = "torch.";
+    if (normalized.rfind(torch_prefix, 0) == 0) {
+        normalized = normalized.substr(torch_prefix.size());
+    }
+
+    static const std::unordered_map<std::string, size_t> kDtypeByteSizes = {
+        {"bool", 1},        {"uint8", 1},  {"int8", 1},    {"float8_e4m3fn", 1},
+        {"float8_e5m2", 1}, {"int16", 2},  {"uint16", 2},  {"float16", 2},
+        {"bfloat16", 2},    {"int32", 4},  {"uint32", 4},  {"float32", 4},
+        {"int64", 8},       {"uint64", 8}, {"float64", 8},
+    };
+    auto it = kDtypeByteSizes.find(normalized);
+    if (it == kDtypeByteSizes.end()) {
+        LOG(ERROR) << context << ": unsupported dtype " << dtype_name;
+        return std::nullopt;
+    }
+    return it->second;
+}
+
 std::optional<TensorIntoPlan> build_tensor_into_plan(
     const std::string &read_key, uintptr_t buffer_ptr, size_t size,
     const std::string &context,
@@ -34,8 +87,13 @@ std::optional<TensorIntoPlan> build_tensor_into_plan(
         return std::nullopt;
     }
 
-    const auto total_length =
-        resolved_metadata->data_offset + resolved_metadata->data_bytes;
+    size_t total_length = 0;
+    if (!add_size_checked(resolved_metadata->data_offset,
+                          resolved_metadata->data_bytes, &total_length)) {
+        LOG(ERROR) << context << ": tensor metadata length overflow for key "
+                   << read_key;
+        return std::nullopt;
+    }
     if (total_length > size) {
         LOG(ERROR) << context << ": buffer too small for key " << read_key;
         return std::nullopt;
@@ -45,7 +103,7 @@ std::optional<TensorIntoPlan> build_tensor_into_plan(
     if (!region.has_value()) {
         return std::nullopt;
     }
-    if (region->offset + total_length > region->size) {
+    if (range_exceeds(region->offset, total_length, region->size)) {
         LOG(ERROR) << context
                    << ": resolved destination range exceeds registered region";
         return std::nullopt;
@@ -166,7 +224,8 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
         return std::nullopt;
     }
     if (target_start < 0 || target_extent < 0 ||
-        target_start + target_extent > global_shape[split_dim]) {
+        target_start > global_shape[split_dim] ||
+        target_extent > global_shape[split_dim] - target_start) {
         LOG(ERROR) << context << ": invalid target shard range";
         return std::nullopt;
     }
@@ -190,7 +249,8 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
     }
     const size_t target_tensor_bytes = target_tensor_numel * *element_size;
     const size_t total_length = sizeof(TensorMetadata) + target_tensor_bytes;
-    if (total_length > size || region->offset + total_length > region->size) {
+    if (total_length > size ||
+        range_exceeds(region->offset, total_length, region->size)) {
         LOG(ERROR) << context << ": buffer too small for reconstructed tensor";
         return std::nullopt;
     }
@@ -1004,7 +1064,8 @@ std::vector<bool> execute_tensor_into_plan_transfers(
     all_src_offsets.reserve(plans.size());
     all_sizes.reserve(plans.size());
 
-    for (const auto &plan : plans) {
+    for (size_t i = 0; i < plans.size(); ++i) {
+        const auto &plan = plans[i];
         buffers.push_back(reinterpret_cast<void *>(plan.registered_buffer_ptr));
 
         std::unordered_map<std::string, size_t> key_to_index;
@@ -1012,6 +1073,20 @@ std::vector<bool> execute_tensor_into_plan_transfers(
         std::vector<std::vector<size_t>> dst_offsets;
         std::vector<std::vector<size_t>> src_offsets;
         std::vector<std::vector<size_t>> sizes;
+
+        if (plan.fragments.empty()) {
+            success[i] = true;
+            if (plan.materialized_metadata.has_value()) {
+                std::memcpy(reinterpret_cast<void *>(plan.user_buffer_ptr),
+                            &*plan.materialized_metadata,
+                            sizeof(TensorMetadata));
+            }
+            all_keys.push_back({});
+            all_dst_offsets.push_back({});
+            all_src_offsets.push_back({});
+            all_sizes.push_back({});
+            continue;
+        }
 
         for (const auto &fragment : plan.fragments) {
             if (fragment.read_key.empty() || fragment.size == 0) {
@@ -1035,6 +1110,13 @@ std::vector<bool> execute_tensor_into_plan_transfers(
         all_dst_offsets.push_back(std::move(dst_offsets));
         all_src_offsets.push_back(std::move(src_offsets));
         all_sizes.push_back(std::move(sizes));
+    }
+
+    const bool has_fragments = std::any_of(
+        all_sizes.begin(), all_sizes.end(),
+        [](const auto &per_plan_sizes) { return !per_plan_sizes.empty(); });
+    if (!has_fragments) {
+        return success;
     }
 
     std::vector<std::vector<std::vector<int64_t>>> range_results;
@@ -1094,6 +1176,475 @@ py::list execute_tensor_into_plans(const std::vector<TensorIntoPlan> &plans) {
             static_cast<int64_t>(plans[i].total_length));
     }
     return results;
+}
+
+struct TensorDimIndexSelection {
+    int64_t dim_size = 0;
+    bool identity = true;
+    std::vector<int64_t> indices;
+
+    size_t size() const {
+        return identity ? static_cast<size_t>(dim_size) : indices.size();
+    }
+
+    int64_t at(size_t position) const {
+        return identity ? static_cast<int64_t>(position) : indices[position];
+    }
+};
+
+std::optional<TensorDimIndexSelection> apply_tensor_dim_selection_ops(
+    int64_t dim_size, const py::object &selections,
+    const std::string &context) {
+    if (dim_size < 0) {
+        LOG(ERROR) << context << ": dimension size must be non-negative";
+        return std::nullopt;
+    }
+
+    TensorDimIndexSelection current;
+    current.dim_size = dim_size;
+    if (selections.is_none()) {
+        return current;
+    }
+
+    py::sequence selection_list;
+    try {
+        selection_list = py::reinterpret_borrow<py::sequence>(selections);
+    } catch (const std::exception &e) {
+        LOG(ERROR) << context
+                   << ": selections must be a sequence: " << e.what();
+        return std::nullopt;
+    }
+
+    for (const auto &selection_handle : selection_list) {
+        py::object selection =
+            py::reinterpret_borrow<py::object>(selection_handle);
+        std::string op;
+        py::object value;
+        try {
+            if (py::isinstance<py::dict>(selection)) {
+                auto dict = py::reinterpret_borrow<py::dict>(selection);
+                op = dict["op"].cast<std::string>();
+                value = py::reinterpret_borrow<py::object>(dict["value"]);
+            } else if (py::isinstance<py::tuple>(selection) ||
+                       py::isinstance<py::list>(selection)) {
+                auto tuple = py::reinterpret_borrow<py::sequence>(selection);
+                if (tuple.size() != 2) {
+                    LOG(ERROR)
+                        << context << ": selection tuple must have 2 items";
+                    return std::nullopt;
+                }
+                op = tuple[0].cast<std::string>();
+                value = py::reinterpret_borrow<py::object>(tuple[1]);
+            } else {
+                op = selection.attr("op").cast<std::string>();
+                value = selection.attr("value");
+            }
+        } catch (const std::exception &e) {
+            LOG(ERROR) << context << ": invalid selection op: " << e.what();
+            return std::nullopt;
+        }
+
+        if (op == "select_idxs") {
+            std::vector<int64_t> selected;
+            py::sequence index_list;
+            try {
+                index_list = py::reinterpret_borrow<py::sequence>(value);
+            } catch (const std::exception &e) {
+                LOG(ERROR) << context
+                           << ": select_idxs value must be a sequence: "
+                           << e.what();
+                return std::nullopt;
+            }
+            if (index_list.size() > kMaxTensorDimSelectionIndices) {
+                LOG(ERROR) << context << ": select index count exceeds "
+                           << kMaxTensorDimSelectionIndices;
+                return std::nullopt;
+            }
+            selected.reserve(index_list.size());
+            bool bool_mask = index_list.size() > 0;
+            for (const auto &index_handle : index_list) {
+                py::object index =
+                    py::reinterpret_borrow<py::object>(index_handle);
+                bool_mask = bool_mask && py::isinstance<py::bool_>(index);
+            }
+            if (bool_mask) {
+                if (index_list.size() != current.size()) {
+                    LOG(ERROR)
+                        << context
+                        << ": bool mask length must match current dimension";
+                    return std::nullopt;
+                }
+                for (size_t i = 0; i < index_list.size(); ++i) {
+                    if (py::reinterpret_borrow<py::object>(index_list[i])
+                            .cast<bool>()) {
+                        selected.push_back(current.at(i));
+                    }
+                }
+            } else {
+                for (const auto &index_handle : index_list) {
+                    int64_t index =
+                        py::reinterpret_borrow<py::object>(index_handle)
+                            .cast<int64_t>();
+                    if (index < 0) {
+                        index += static_cast<int64_t>(current.size());
+                    }
+                    if (index < 0 ||
+                        static_cast<size_t>(index) >= current.size()) {
+                        LOG(ERROR) << context << ": select index out of range";
+                        return std::nullopt;
+                    }
+                    selected.push_back(current.at(static_cast<size_t>(index)));
+                }
+            }
+            current.identity = false;
+            current.indices = std::move(selected);
+            continue;
+        }
+
+        if (op == "slice") {
+            py::sequence slice_args =
+                py::reinterpret_borrow<py::sequence>(value);
+            if (slice_args.size() != 3) {
+                LOG(ERROR) << context
+                           << ": slice value must be (start, end, step)";
+                return std::nullopt;
+            }
+            py::slice slice(slice_args[0], slice_args[1], slice_args[2]);
+            size_t start = 0;
+            size_t stop = 0;
+            size_t step = 0;
+            size_t slicelength = 0;
+            if (!slice.compute(current.size(), &start, &stop, &step,
+                               &slicelength)) {
+                LOG(ERROR) << context << ": invalid slice selection";
+                return std::nullopt;
+            }
+            if (slicelength > kMaxTensorDimSelectionIndices) {
+                LOG(ERROR) << context << ": slice selection count exceeds "
+                           << kMaxTensorDimSelectionIndices;
+                return std::nullopt;
+            }
+            std::vector<int64_t> sliced;
+            sliced.reserve(slicelength);
+            for (size_t i = 0, pos = start; i < slicelength; ++i, pos += step) {
+                sliced.push_back(current.at(pos));
+            }
+            current.identity = false;
+            current.indices = std::move(sliced);
+            continue;
+        }
+
+        if (op == "repeat") {
+            py::sequence repeat_args =
+                py::reinterpret_borrow<py::sequence>(value);
+            if (repeat_args.size() != 2) {
+                LOG(ERROR)
+                    << context
+                    << ": repeat value must be (repeat_times, interleave)";
+                return std::nullopt;
+            }
+            int64_t repeat_times = repeat_args[0].cast<int64_t>();
+            bool interleave = repeat_args[1].cast<bool>();
+            if (repeat_times < 0) {
+                LOG(ERROR) << context << ": repeat_times must be non-negative";
+                return std::nullopt;
+            }
+            if (current.size() != 0 &&
+                static_cast<size_t>(repeat_times) >
+                    std::numeric_limits<size_t>::max() / current.size()) {
+                LOG(ERROR) << context << ": repeat size overflow";
+                return std::nullopt;
+            }
+            size_t repeated_size =
+                current.size() * static_cast<size_t>(repeat_times);
+            if (repeated_size > kMaxTensorDimSelectionIndices) {
+                LOG(ERROR) << context << ": repeat selection count exceeds "
+                           << kMaxTensorDimSelectionIndices;
+                return std::nullopt;
+            }
+            std::vector<int64_t> repeated;
+            repeated.reserve(repeated_size);
+            if (interleave) {
+                for (size_t position = 0; position < current.size();
+                     ++position) {
+                    int64_t index = current.at(position);
+                    for (int64_t i = 0; i < repeat_times; ++i) {
+                        repeated.push_back(index);
+                    }
+                }
+            } else {
+                for (int64_t i = 0; i < repeat_times; ++i) {
+                    for (size_t position = 0; position < current.size();
+                         ++position) {
+                        repeated.push_back(current.at(position));
+                    }
+                }
+            }
+            current.identity = false;
+            current.indices = std::move(repeated);
+            continue;
+        }
+
+        if (op == "cat") {
+            py::sequence selection_groups;
+            try {
+                selection_groups = py::reinterpret_borrow<py::sequence>(value);
+            } catch (const std::exception &e) {
+                LOG(ERROR)
+                    << context
+                    << ": cat value must be a sequence of selection groups: "
+                    << e.what();
+                return std::nullopt;
+            }
+            std::vector<int64_t> concatenated;
+            for (const auto &group_handle : selection_groups) {
+                auto group_selection = apply_tensor_dim_selection_ops(
+                    static_cast<int64_t>(current.size()),
+                    py::reinterpret_borrow<py::object>(group_handle), context);
+                if (!group_selection.has_value()) {
+                    return std::nullopt;
+                }
+                size_t new_size = 0;
+                if (!add_size_checked(concatenated.size(),
+                                      group_selection->size(), &new_size)) {
+                    LOG(ERROR) << context << ": cat selection size overflow";
+                    return std::nullopt;
+                }
+                if (new_size > kMaxTensorDimSelectionIndices) {
+                    LOG(ERROR) << context << ": cat selection count exceeds "
+                               << kMaxTensorDimSelectionIndices;
+                    return std::nullopt;
+                }
+                concatenated.reserve(new_size);
+                for (size_t position = 0; position < group_selection->size();
+                     ++position) {
+                    concatenated.push_back(current.at(
+                        static_cast<size_t>(group_selection->at(position))));
+                }
+            }
+            current.identity = false;
+            current.indices = std::move(concatenated);
+            continue;
+        }
+
+        LOG(ERROR) << context << ": unsupported tensor dimension selection op "
+                   << op;
+        return std::nullopt;
+    }
+
+    return current;
+}
+
+bool multiply_size_checked(size_t lhs, size_t rhs, size_t *result) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        return false;
+    }
+    *result = lhs * rhs;
+    return true;
+}
+
+std::optional<TensorIntoPlan> build_tensor_dim_selection_into_plan(
+    const std::string &read_key, uintptr_t buffer_ptr, size_t size,
+    const std::vector<int64_t> &shape, const std::string &dtype, int64_t dim,
+    const py::object &selections, size_t data_offset,
+    const std::string &context) {
+    if (shape.empty()) {
+        LOG(ERROR) << context << ": shape must have at least one dimension";
+        return std::nullopt;
+    }
+    if (dim < 0) {
+        dim += static_cast<int64_t>(shape.size());
+    }
+    if (dim < 0 || static_cast<size_t>(dim) >= shape.size()) {
+        LOG(ERROR) << context << ": selection dim out of range";
+        return std::nullopt;
+    }
+    for (int64_t extent : shape) {
+        if (extent < 0) {
+            LOG(ERROR) << context << ": shape dimensions must be non-negative";
+            return std::nullopt;
+        }
+    }
+
+    auto selected_indices = apply_tensor_dim_selection_ops(
+        shape[static_cast<size_t>(dim)], selections, context);
+    if (!selected_indices.has_value()) {
+        return std::nullopt;
+    }
+    auto element_size = dtype_byte_size_from_name(dtype, context);
+    if (!element_size.has_value()) {
+        return std::nullopt;
+    }
+
+    size_t inner_elements = 1;
+    for (size_t i = static_cast<size_t>(dim) + 1; i < shape.size(); ++i) {
+        if (!multiply_size_checked(inner_elements,
+                                   static_cast<size_t>(shape[i]),
+                                   &inner_elements)) {
+            LOG(ERROR) << context << ": inner element count overflow";
+            return std::nullopt;
+        }
+    }
+    size_t inner_bytes = 0;
+    if (!multiply_size_checked(inner_elements, *element_size, &inner_bytes)) {
+        LOG(ERROR) << context << ": inner byte size overflow";
+        return std::nullopt;
+    }
+
+    size_t outer_count = 1;
+    for (size_t i = 0; i < static_cast<size_t>(dim); ++i) {
+        if (!multiply_size_checked(outer_count, static_cast<size_t>(shape[i]),
+                                   &outer_count)) {
+            LOG(ERROR) << context << ": outer element count overflow";
+            return std::nullopt;
+        }
+    }
+
+    size_t dim_span_bytes = 0;
+    if (!multiply_size_checked(
+            static_cast<size_t>(shape[static_cast<size_t>(dim)]), inner_bytes,
+            &dim_span_bytes)) {
+        LOG(ERROR) << context << ": dimension span byte size overflow";
+        return std::nullopt;
+    }
+    size_t selected_span_bytes = 0;
+    if (!multiply_size_checked(selected_indices->size(), inner_bytes,
+                               &selected_span_bytes)) {
+        LOG(ERROR) << context << ": selected span byte size overflow";
+        return std::nullopt;
+    }
+    size_t output_size = 0;
+    if (!multiply_size_checked(outer_count, selected_span_bytes,
+                               &output_size)) {
+        LOG(ERROR) << context << ": output byte size overflow";
+        return std::nullopt;
+    }
+    if (output_size > size) {
+        LOG(ERROR) << context << ": destination buffer too small";
+        return std::nullopt;
+    }
+    if (output_size > kMaxTensorDimSelectionOutputBytes) {
+        LOG(ERROR) << context << ": selected tensor output exceeds "
+                   << kMaxTensorDimSelectionOutputBytes << " bytes";
+        return std::nullopt;
+    }
+
+    TensorIntoPlan plan;
+    plan.total_length = output_size;
+    if (output_size == 0) {
+        return plan;
+    }
+
+    size_t fragment_count = 0;
+    if (!multiply_size_checked(outer_count, selected_indices->size(),
+                               &fragment_count)) {
+        LOG(ERROR) << context << ": fragment count overflow";
+        return std::nullopt;
+    }
+    if (inner_bytes != 0 && fragment_count > kMaxTensorDimSelectionFragments) {
+        LOG(ERROR) << context << ": selected tensor range count "
+                   << fragment_count << " exceeds "
+                   << kMaxTensorDimSelectionFragments;
+        return std::nullopt;
+    }
+
+    size_t total_src_span = 0;
+    if (!multiply_size_checked(outer_count, dim_span_bytes, &total_src_span)) {
+        LOG(ERROR) << context << ": source span overflow";
+        return std::nullopt;
+    }
+    if (range_exceeds(data_offset, total_src_span,
+                      std::numeric_limits<size_t>::max())) {
+        LOG(ERROR) << context << ": source offset overflow";
+        return std::nullopt;
+    }
+
+    auto region = resolve_registered_buffer_region(buffer_ptr, size, context);
+    if (!region.has_value()) {
+        return std::nullopt;
+    }
+    if (range_exceeds(region->offset, output_size, region->size)) {
+        LOG(ERROR) << context
+                   << ": resolved destination range exceeds registered region";
+        return std::nullopt;
+    }
+
+    plan.user_buffer_ptr = buffer_ptr;
+    plan.registered_buffer_ptr = reinterpret_cast<uintptr_t>(region->base);
+    plan.registered_buffer_size = region->size;
+
+    for (size_t outer = 0; outer < outer_count; ++outer) {
+        for (size_t selected_pos = 0; selected_pos < selected_indices->size();
+             ++selected_pos) {
+            const int64_t src_index = selected_indices->at(selected_pos);
+            if (src_index < 0 || src_index >= shape[static_cast<size_t>(dim)]) {
+                LOG(ERROR) << context << ": source index out of range";
+                return std::nullopt;
+            }
+            size_t dst_linear_index = 0;
+            size_t dst_index_base = 0;
+            if (!multiply_size_checked(outer, selected_indices->size(),
+                                       &dst_index_base) ||
+                !add_size_checked(dst_index_base, selected_pos,
+                                  &dst_linear_index)) {
+                LOG(ERROR) << context << ": destination index overflow";
+                return std::nullopt;
+            }
+            size_t dst_offset_delta = 0;
+            size_t dst_offset = 0;
+            if (!multiply_size_checked(dst_linear_index, inner_bytes,
+                                       &dst_offset_delta) ||
+                !add_size_checked(region->offset, dst_offset_delta,
+                                  &dst_offset)) {
+                LOG(ERROR) << context << ": destination offset overflow";
+                return std::nullopt;
+            }
+            size_t src_outer_offset = 0;
+            size_t src_index_offset = 0;
+            size_t src_offset = 0;
+            if (!multiply_size_checked(outer, dim_span_bytes,
+                                       &src_outer_offset) ||
+                !multiply_size_checked(static_cast<size_t>(src_index),
+                                       inner_bytes, &src_index_offset) ||
+                !add_size_checked(data_offset, src_outer_offset, &src_offset) ||
+                !add_size_checked(src_offset, src_index_offset, &src_offset)) {
+                LOG(ERROR) << context << ": source offset overflow";
+                return std::nullopt;
+            }
+            if (!plan.fragments.empty()) {
+                auto &previous = plan.fragments.back();
+                size_t previous_dst_end = 0;
+                size_t previous_src_end = 0;
+                if (!add_size_checked(previous.dst_offset, previous.size,
+                                      &previous_dst_end) ||
+                    !add_size_checked(previous.src_offset, previous.size,
+                                      &previous_src_end)) {
+                    LOG(ERROR) << context << ": fragment offset overflow";
+                    return std::nullopt;
+                }
+                if (previous.read_key == read_key &&
+                    previous_dst_end == dst_offset &&
+                    previous_src_end == src_offset) {
+                    if (!add_size_checked(previous.size, inner_bytes,
+                                          &previous.size)) {
+                        LOG(ERROR) << context << ": fragment size overflow";
+                        return std::nullopt;
+                    }
+                    continue;
+                }
+            }
+            if (inner_bytes == 0) {
+                continue;
+            }
+            plan.fragments.push_back(TensorIntoFragment{
+                .read_key = read_key,
+                .dst_offset = dst_offset,
+                .src_offset = src_offset,
+                .size = inner_bytes,
+            });
+        }
+    }
+    return plan;
 }
 
 std::optional<TensorIntoPlan> build_tensor_into_plan_for_target(

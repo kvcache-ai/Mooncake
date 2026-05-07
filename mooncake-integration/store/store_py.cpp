@@ -2,7 +2,9 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
+#include <cctype>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
@@ -799,72 +801,65 @@ class MooncakeStorePyWrapper {
     // Zero-copy put from pre-allocated buffer (layout: [TensorMetadata][data])
     int put_tensor_from(const std::string &key, uintptr_t buffer_ptr,
                         size_t size) {
-        if (buffer_ptr == 0) {
-            LOG(ERROR) << "Buffer pointer cannot be null";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        void *buffer = reinterpret_cast<void *>(buffer_ptr);
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (use_dummy_client_) {
-            LOG(ERROR) << "put_tensor_from is not supported for dummy client";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (size <= sizeof(TensorMetadata)) {
-            LOG(ERROR) << "Buffer size too small for tensor metadata";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        py::gil_scoped_release release_gil;
-        return store_->put_from(key, buffer, size, ReplicateConfig{});
+        return execute_single_tensor_write_from(
+            "put_tensor_from", key, buffer_ptr, size, ReplicateConfig{},
+            [this](const std::string &write_key, void *buffer,
+                   size_t write_size, const ReplicateConfig &config) {
+                py::gil_scoped_release release_gil;
+                return store_->put_from(write_key, buffer, write_size, config);
+            });
+    }
+
+    int pub_tensor_from(const std::string &key, uintptr_t buffer_ptr,
+                        size_t size,
+                        const ReplicateConfig &config = ReplicateConfig{}) {
+        return execute_single_tensor_write_from(
+            "pub_tensor_from", key, buffer_ptr, size, config,
+            [this](const std::string &write_key, void *buffer,
+                   size_t write_size, const ReplicateConfig &write_config) {
+                py::gil_scoped_release release_gil;
+                return store_->put_from(write_key, buffer, write_size,
+                                        write_config);
+            });
     }
 
     std::vector<int> batch_put_tensor_from(
         const std::vector<std::string> &keys,
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (use_dummy_client_) {
-            LOG(ERROR)
-                << "batch_put_tensor_from is not supported for dummy client";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (keys.empty()) {
-            return std::vector<int>();
-        }
-        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
-            LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
-                          "have the same length";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        for (size_t i = 0; i < sizes.size(); ++i) {
-            if (buffer_ptrs[i] == 0) {
-                LOG(ERROR) << "Buffer pointer at index " << i
-                           << " cannot be null";
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            if (sizes[i] <= sizeof(TensorMetadata)) {
-                LOG(ERROR) << "Buffer size at index " << i
-                           << " too small for tensor metadata";
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-        }
-        std::vector<void *> buffers;
-        buffers.reserve(buffer_ptrs.size());
-        for (uintptr_t ptr : buffer_ptrs) {
-            buffers.push_back(reinterpret_cast<void *>(ptr));
-        }
-        py::gil_scoped_release release_gil;
-        return store_->batch_put_from(keys, buffers, sizes, ReplicateConfig{});
+        return execute_batch_tensor_write_from(
+            "batch_put_tensor_from",
+            "Size mismatch: keys, buffer_ptrs, and sizes must have the same "
+            "length",
+            keys, buffer_ptrs, sizes, ReplicateConfig{},
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &buffers,
+                   const std::vector<size_t> &write_sizes,
+                   const ReplicateConfig &config) {
+                py::gil_scoped_release release_gil;
+                return store_->batch_put_from(write_keys, buffers, write_sizes,
+                                              config);
+            });
+    }
+
+    std::vector<int> batch_pub_tensor_from(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        return execute_batch_tensor_write_from(
+            "batch_pub_tensor_from",
+            "Size mismatch: keys, buffer_ptrs, and sizes must have the same "
+            "length",
+            keys, buffer_ptrs, sizes, config,
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &buffers,
+                   const std::vector<size_t> &write_sizes,
+                   const ReplicateConfig &write_config) {
+                py::gil_scoped_release release_gil;
+                return store_->batch_put_from(write_keys, buffers, write_sizes,
+                                              write_config);
+            });
     }
 
     int put_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
@@ -2024,11 +2019,24 @@ PYBIND11_MODULE(store, m) {
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
              "Put a tensor directly from a pre-allocated buffer. Buffer layout "
              "must be [TensorMetadata][tensor data], same as get_tensor_into.")
+        .def("pub_tensor_from", &MooncakeStorePyWrapper::pub_tensor_from,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             py::arg("config") = ReplicateConfig{},
+             "Publish a tensor directly from a pre-allocated buffer with "
+             "configurable replication settings. Buffer layout must be "
+             "[TensorMetadata][tensor data].")
         .def("batch_put_tensor_from",
              &MooncakeStorePyWrapper::batch_put_tensor_from, py::arg("keys"),
              py::arg("buffer_ptrs"), py::arg("sizes"),
              "Put tensors directly from pre-allocated buffers for multiple "
              "keys. Each buffer layout: [TensorMetadata][tensor data].")
+        .def("batch_pub_tensor_from",
+             &MooncakeStorePyWrapper::batch_pub_tensor_from, py::arg("keys"),
+             py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("config") = ReplicateConfig{},
+             "Publish tensors directly from pre-allocated buffers with "
+             "configurable replication settings. Each buffer layout: "
+             "[TensorMetadata][tensor data].")
         .def("put_tensor_with_tp_from",
              &MooncakeStorePyWrapper::put_tensor_with_tp_from, py::arg("key"),
              py::arg("buffer_ptr"), py::arg("size"), py::arg("tp_rank") = 0,
@@ -2086,6 +2094,30 @@ PYBIND11_MODULE(store, m) {
              py::arg("target") = py::none(),
              "Get a PyTorch tensor from the store directly into a "
              "pre-allocated buffer using a ReadTarget request.")
+        .def(
+            "get_tensor_dim_selection_into",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size,
+               const std::vector<int64_t> &shape, const std::string &dtype,
+               int64_t dim, const py::object &selections = py::none(),
+               size_t data_offset = 0) -> int64_t {
+                auto plan = self.build_tensor_dim_selection_into_plan(
+                    key, buffer_ptr, size, shape, dtype, dim, selections,
+                    data_offset, "get_tensor_dim_selection_into");
+                if (!plan.has_value()) {
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+                auto success = self.execute_tensor_into_plan_transfers({*plan});
+                if (success.empty() || !success[0]) {
+                    return to_py_ret(ErrorCode::TRANSFER_FAIL);
+                }
+                return static_cast<int64_t>(plan->total_length);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            py::arg("shape"), py::arg("dtype"), py::arg("dim"),
+            py::arg("selections") = py::none(), py::arg("data_offset") = 0,
+            "Materialize fixed-shape tensor dimension selections into a "
+            "registered buffer using Mooncake TensorIntoPlan and range reads.")
         .def("batch_get_tensor_with_parallelism_into",
              &MooncakeStorePyWrapper::batch_get_tensor_with_parallelism_into,
              py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),

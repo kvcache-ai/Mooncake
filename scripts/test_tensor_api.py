@@ -1,7 +1,6 @@
 import ctypes
 import os
 import sys
-import json
 import time
 import argparse
 import unittest
@@ -667,8 +666,10 @@ class TestMooncakeFunctional(MooncakeTestBase):
         retrieved_seed = self.store.get_tensor_into(seed_key, buf_put_ptr, total_buffer_size)
         self.assertIsNotNone(retrieved_seed)
         put_size = serialized_tensor_size(retrieved_seed)
-        rc = self.store.put_tensor_from(key, buf_put_ptr, put_size)
-        self.assertEqual(rc, 0, f"put_tensor_from failed with rc={rc}")
+        repconfig = ReplicateConfig()
+        repconfig.replica_num = 1
+        rc = self.store.pub_tensor_from(key, buf_put_ptr, put_size, repconfig)
+        self.assertEqual(rc, 0, f"pub_tensor_from failed with rc={rc}")
         self.assertTrue(self.store.is_exist(key), "Key not found after put")
 
         retrieved = self.store.get_tensor_into(key, buf_get_ptr, total_buffer_size)
@@ -699,8 +700,10 @@ class TestMooncakeFunctional(MooncakeTestBase):
         self.assertTrue(all(r == 0 for r in results), f"Batch put(seed) failed. Results: {results}")
         self.store.batch_get_tensor_into(seed_keys, put_ptrs, buffer_sizes)
         put_sizes = [serialized_tensor_size(tensors[j]) for j in range(batch_size)]
-        results = self.store.batch_put_tensor_from(keys, put_ptrs, put_sizes)
-        self.assertTrue(all(r == 0 for r in results), f"Batch put_tensor_from failed. Results: {results}")
+        repconfig = ReplicateConfig()
+        repconfig.replica_num = 1
+        results = self.store.batch_pub_tensor_from(keys, put_ptrs, put_sizes, repconfig)
+        self.assertTrue(all(r == 0 for r in results), f"Batch pub_tensor_from failed. Results: {results}")
 
         res = self.store.batch_get_tensor_into(keys, get_ptrs, buffer_sizes)
         self.assertEqual(len(res), len(tensors))

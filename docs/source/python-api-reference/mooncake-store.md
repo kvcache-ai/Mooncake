@@ -2311,6 +2311,47 @@ def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[
 
   - `List[torch.Tensor]`: List of retrieved tensors (or shards). Contains `None` for missing keys.
 
+#### get_tensor_dim_selection_into()
+
+Materialize selected slices from one fixed-shape tensor object into a registered output buffer. This API supports any tensor dimension through the `dim` argument. It is intended for DataProto-style remote batch reads where the common high-throughput path selects along dim 0.
+
+```python
+def get_tensor_dim_selection_into(
+    self,
+    key: str,
+    buffer_ptr: int,
+    size: int,
+    shape: List[int],
+    dtype: str,
+    dim: int,
+    selections: Optional[List[Tuple[str, Any]]] = None,
+    data_offset: int = 0,
+) -> int
+```
+
+**Parameters:**
+
+  - `key` (str): Object identifier for the stored tensor payload.
+  - `buffer_ptr` (int): Destination buffer pointer. The buffer must be registered before calling this API.
+  - `size` (int): Destination buffer byte capacity available for the selected tensor payload.
+  - `shape` (List[int]): Full logical shape of the stored fixed-shape tensor.
+  - `dtype` (str): Tensor dtype name, for example `int64`, `float32`, or `torch.bfloat16`.
+  - `dim` (int): Dimension to apply selections to. Negative dimensions are normalized like Python indexing.
+  - `selections` (List[Tuple[str, Any]], optional): Lazy selection operations on `dim`. Supported operations are `("select_idxs", indices_or_bool_mask)`, `("slice", (start, end, step))`, `("repeat", (times, interleave))`, and `("cat", selection_groups)`. `select_idxs` expects a sequence of integer indices or a boolean mask whose length exactly matches the current selected dimension. `cat` expects a sequence of selection groups and concatenates the independently selected views in order.
+  - `data_offset` (int): Source byte offset of the raw tensor payload within the stored object. Use `0` for raw tensor payload objects, or the tensor metadata data offset for `[TensorMetadata][tensor data]` objects. The caller-provided `shape`, `dtype`, and `data_offset` must describe the stored object layout.
+
+**Returns:**
+
+  - `int`: Number of raw tensor payload bytes materialized, or a negative error code.
+
+**Output layout:**
+
+The destination buffer receives only the selected raw tensor payload bytes. It does not include `TensorMetadata`. Empty outputs, such as `repeat(0)`, return `0` and do not write payload bytes.
+
+**Performance notes:**
+
+Selection along dim 0 is the intended high-throughput path for RL/DataProto batch operations because each selected row is usually a large contiguous range. Inner-dimension selections are supported, but they can create many small range reads. The implementation rejects requests that exceed internal output-size or fragment-count limits. Writes are not atomic with respect to the destination buffer: if a ranged transfer fails after some fragments complete, the destination buffer may contain partial data and should be discarded by the caller.
+
 #### put_tensor_from()
 
 Put a PyTorch tensor into the store directly from a pre-allocated buffer (zero-copy). The buffer must contain data in the same layout as produced by `get_tensor_into`: **\[TensorMetadata\]\[tensor data\]**. The buffer is only read during this call; no Python object references it.
@@ -2329,6 +2370,25 @@ def put_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
 
   - `int`: Status code (0 = success, non-zero = error code).
 
+#### pub_tensor_from()
+
+Publish a PyTorch tensor into the store directly from a pre-allocated buffer (zero-copy), with configurable replication settings. The buffer layout is **\[TensorMetadata\]\[tensor data\]**, same as `get_tensor_into`.
+
+```python
+def pub_tensor_from(self, key: str, buffer_ptr: int, size: int, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+
+  - `key` (str): Object identifier for the tensor.
+  - `buffer_ptr` (int): Buffer pointer containing serialized tensor metadata and payload.
+  - `size` (int): Actual serialized byte length of the tensor buffer.
+  - `config` (ReplicateConfig, optional): Replication configuration.
+
+**Returns:**
+
+  - `int`: Status code (0 = success, non-zero = error code).
+
 #### batch_put_tensor_from()
 
 Put a batch of PyTorch tensors into the store directly from pre-allocated buffers (zero-copy). Each buffer must contain data in the layout **\[TensorMetadata\]\[tensor data\]**, same as `get_tensor_into`.
@@ -2342,6 +2402,25 @@ def batch_put_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: 
   - `keys` (List[str]): List of object identifiers.
   - `buffer_ptrs` (List[int]): List of buffer pointers; buffers should be registered.
   - `sizes` (List[int]): List of **actual serialized byte lengths** for each buffer (metadata + tensor bytes), not buffer capacities.
+
+**Returns:**
+
+  - `List[int]`: List of status codes for each tensor operation (0 = success, non-zero = error code).
+
+#### batch_pub_tensor_from()
+
+Publish a batch of PyTorch tensors into the store directly from pre-allocated buffers (zero-copy), with configurable replication settings. Each buffer layout is **\[TensorMetadata\]\[tensor data\]**, same as `get_tensor_into`.
+
+```python
+def batch_pub_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int], config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+
+  - `keys` (List[str]): List of object identifiers.
+  - `buffer_ptrs` (List[int]): List of buffer pointers containing serialized tensor metadata and payload.
+  - `sizes` (List[int]): List of actual serialized byte lengths for each tensor buffer.
+  - `config` (ReplicateConfig, optional): Replication configuration.
 
 **Returns:**
 
