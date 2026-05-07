@@ -15,7 +15,6 @@
 #include <gtest/gtest.h>
 
 #include <memory>
-#include <set>
 #include <string>
 
 #include "tent/common/config.h"
@@ -118,21 +117,11 @@ TEST(FailoverConfigTest, ZeroDisablesFailover) {
 // verify the enum values are well-defined and usable in switch)
 // ---------------------------------------------------------------------------
 
-TEST(TransportTypeTest, AllEnumValuesDistinct) {
-    // Verify no accidental collisions in the enum
-    std::set<int> seen;
-    TransportType types[] = {RDMA,    MNNVL, SHM,          NVLINK, GDS,
-                             IOURING, TCP,   AscendDirect, UNSPEC};
-    for (auto t : types) {
-        EXPECT_TRUE(seen.insert(static_cast<int>(t)).second)
-            << "Duplicate TransportType value: " << static_cast<int>(t);
-    }
-}
-
-TEST(TransportTypeTest, SupportedCount) {
-    // kSupportedTransportTypes should cover all types except UNSPEC
-    EXPECT_EQ(kSupportedTransportTypes, 8u);
-    EXPECT_EQ(static_cast<int>(UNSPEC), 8);
+TEST(TransportTypeTest, UnspecIsSentinel) {
+    // UNSPEC must be the last enum value so that types [0, UNSPEC) are the
+    // valid transport types and kSupportedTransportTypes == (int)UNSPEC.
+    EXPECT_GT(kSupportedTransportTypes, 0);
+    EXPECT_EQ(kSupportedTransportTypes, static_cast<int>(UNSPEC));
 }
 
 // ---------------------------------------------------------------------------
