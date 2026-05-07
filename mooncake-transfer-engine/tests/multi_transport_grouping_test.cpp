@@ -26,8 +26,11 @@ namespace {
 
 class RecordingTransport : public Transport {
    public:
-    RecordingTransport(const char *name, bool supports_grouped_scatter)
-        : name_(name), supports_grouped_scatter_(supports_grouped_scatter) {}
+    RecordingTransport(const char *name, bool supports_grouped_scatter,
+                       Status submit_status = Status::OK())
+        : name_(name),
+          supports_grouped_scatter_(supports_grouped_scatter),
+          submit_status_(std::move(submit_status)) {}
 
     Status submitTransfer(BatchID,
                           const std::vector<TransferRequest> &) override {
@@ -38,15 +41,27 @@ class RecordingTransport : public Transport {
         const std::vector<Transport::TransferTask *> &task_list) override {
         submitted_group_sizes.clear();
         submitted_group_sizes.reserve(task_list.size());
+        submitted_tasks = task_list;
         for (auto *task : task_list) {
             submitted_group_sizes.push_back(
                 task->request_group.empty() ? 1 : task->request_group.size());
-            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
-            auto &batch_desc = Transport::toBatchDesc(task->batch_id);
-            batch_desc.finished_task_count.fetch_add(1,
-                                                     std::memory_order_release);
+            if (task->request_group.empty()) {
+                EXPECT_EQ(task->request, &task->owned_request);
+            } else {
+                EXPECT_EQ(task->request, &task->request_group[0]);
+            }
+            task->slice_count = 1;
+            if (submit_status_.ok()) {
+                task->success_slice_count = 1;
+                task->transferred_bytes = task->request_group.empty()
+                                              ? task->request->length
+                                              : task->request_group[0].length;
+            } else {
+                task->failed_slice_count = 1;
+            }
+            task->publish_completion();
         }
-        return Status::OK();
+        return submit_status_;
     }
 
     Status getTransferStatus(BatchID, size_t, TransferStatus &) override {
@@ -60,6 +75,7 @@ class RecordingTransport : public Transport {
     }
 
     std::vector<size_t> submitted_group_sizes;
+    std::vector<Transport::TransferTask *> submitted_tasks;
 
    private:
     int registerLocalMemory(void *, size_t, const std::string &, bool,
@@ -77,6 +93,7 @@ class RecordingTransport : public Transport {
 
     const char *name_;
     bool supports_grouped_scatter_;
+    Status submit_status_;
 };
 
 class TestableMultiTransport : public MultiTransport {
@@ -343,6 +360,62 @@ TEST_F(TaskGroupingTest, GroupedRequestsHaveIndependentLocalBuffers) {
     // Buffers are in completely different memory regions — this is valid.
     EXPECT_NE(req_a.source, req_b.source);
     EXPECT_EQ(req_a.task_group_id, req_b.task_group_id);
+}
+
+TEST_F(TaskGroupingTest, PartialBatchCompletesWhenSubmittedTasksComplete) {
+    constexpr Transport::SegmentID kTargetSegmentId = 1;
+    auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "rdma");
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+    auto recording_transport =
+        std::make_shared<RecordingTransport>("rdma", true);
+    multi_transport.transport_map_["rdma"] = recording_transport;
+
+    std::vector<Transport::TransferRequest> entries(2);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        entries[i].opcode = Transport::TransferRequest::READ;
+        entries[i].source = nullptr;
+        entries[i].target_id = kTargetSegmentId;
+        entries[i].target_offset = i * 4096;
+        entries[i].length = 4096;
+    }
+
+    auto batch_id = multi_transport.allocateBatchID(4);
+    auto submit_status = multi_transport.submitTransfer(batch_id, entries);
+    EXPECT_TRUE(submit_status.ok());
+
+    Transport::TransferStatus status{};
+    auto status_ret = multi_transport.getBatchTransferStatus(batch_id, status);
+    EXPECT_TRUE(status_ret.ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(TaskGroupingTest, SubmitFailureLeavesBatchFreeable) {
+    constexpr Transport::SegmentID kTargetSegmentId = 1;
+    auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "rdma");
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+    auto recording_transport = std::make_shared<RecordingTransport>(
+        "rdma", true, Status::InvalidArgument("injected submit failure"));
+    multi_transport.transport_map_["rdma"] = recording_transport;
+
+    std::vector<Transport::TransferRequest> entries(1);
+    entries[0].opcode = Transport::TransferRequest::READ;
+    entries[0].source = nullptr;
+    entries[0].target_id = kTargetSegmentId;
+    entries[0].target_offset = 0;
+    entries[0].length = 4096;
+
+    auto batch_id = multi_transport.allocateBatchID(1);
+    auto submit_status = multi_transport.submitTransfer(batch_id, entries);
+    EXPECT_FALSE(submit_status.ok());
+
+    Transport::TransferStatus status{};
+    auto status_ret = multi_transport.getBatchTransferStatus(batch_id, status);
+    EXPECT_TRUE(status_ret.ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 
 }  // namespace mooncake

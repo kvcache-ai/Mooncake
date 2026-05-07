@@ -14,8 +14,10 @@
 
 #include "multi_transport.h"
 #include <algorithm>
+#include <iterator>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 #include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -63,6 +65,30 @@
 #include <cassert>
 
 namespace mooncake {
+
+namespace {
+
+void markTasksWithoutSlicesFailed(
+    Transport::BatchID batch_id,
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>::iterator
+        begin,
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>::iterator
+        end) {
+    (void)batch_id;
+    for (auto it = begin; it != end; ++it) {
+        for (auto* task : it->second) {
+            if (__atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE) != 0) {
+                continue;
+            }
+            task->slice_count = 1;
+            task->failed_slice_count = 1;
+            task->publish_completion();
+        }
+    }
+}
+
+}  // namespace
+
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
     : metadata_(metadata), local_server_name_(local_server_name) {}
@@ -160,7 +186,6 @@ Status MultiTransport::submitTransfer(
                 batch_desc.sealed.store(true, std::memory_order_release);
             }
             batch_desc.is_finished.store(false, std::memory_order_release);
-            batch_desc.publish_completion_if_ready_locked();
         }
 
         std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
@@ -170,22 +195,29 @@ Status MultiTransport::submitTransfer(
         for (const auto& entry : resolved) {
             auto& task = batch_desc.task_list[task_id++];
             task.batch_id = batch_id;
-            const auto& request = entries[entry.request_idx];
-#ifdef USE_ASCEND_HETEROGENEOUS
-            task.request = const_cast<Transport::TransferRequest*>(&request);
-#else
-            task.request = &request;
-#endif
+            task.request_group.clear();
+            task.owned_request = entries[entry.request_idx];
+            task.request = &task.owned_request;
             submit_tasks[entry.transport].push_back(&task);
         }
 
         Status overall_status = Status::OK();
-        for (auto& entry : submit_tasks) {
-            auto status = entry.first->submitTransferTask(entry.second);
+        for (auto it = submit_tasks.begin(); it != submit_tasks.end(); ++it) {
+            auto status = it->first->submitTransferTask(it->second);
             if (!status.ok()) {
                 overall_status = status;
+                markTasksWithoutSlicesFailed(batch_id, it, submit_tasks.end());
+                break;
             }
         }
+        if (!overall_status.ok()) {
+            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+            batch_desc.has_failure.store(true, std::memory_order_release);
+            batch_desc.publish_completion_if_ready_locked();
+        }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        batch_desc.completion_cv.notify_all();
+#endif
         return overall_status;
     }
 
@@ -246,7 +278,6 @@ Status MultiTransport::submitTransfer(
             batch_desc.sealed.store(true, std::memory_order_release);
         }
         batch_desc.is_finished.store(false, std::memory_order_release);
-        batch_desc.publish_completion_if_ready_locked();
     }
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
@@ -255,30 +286,34 @@ Status MultiTransport::submitTransfer(
         auto& ltask = logical_tasks[lt];
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
-        const auto& first_req = entries[resolved[ltask.start].request_idx];
-#ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&first_req);
-#else
-        task.request = &first_req;
-#endif
-        if (ltask.count > 1) {
-            task.request_group.reserve(ltask.count);
-            for (size_t offset = 0; offset < ltask.count; ++offset) {
-                task.request_group.push_back(
-                    entries[resolved[ltask.start + offset].request_idx]);
-            }
+        task.request_group.clear();
+        task.request_group.reserve(ltask.count);
+        for (size_t offset = 0; offset < ltask.count; ++offset) {
+            task.request_group.push_back(
+                entries[resolved[ltask.start + offset].request_idx]);
         }
+        task.request = &task.request_group[0];
         ++task_id;
         submit_tasks[ltask.transport].push_back(&task);
     }
 
     Status overall_status = Status::OK();
-    for (auto& entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second);
+    for (auto it = submit_tasks.begin(); it != submit_tasks.end(); ++it) {
+        auto status = it->first->submitTransferTask(it->second);
         if (!status.ok()) {
             overall_status = status;
+            markTasksWithoutSlicesFailed(batch_id, it, submit_tasks.end());
+            break;
         }
     }
+    if (!overall_status.ok()) {
+        std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+        batch_desc.has_failure.store(true, std::memory_order_release);
+        batch_desc.publish_completion_if_ready_locked();
+    }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    batch_desc.completion_cv.notify_all();
+#endif
     return overall_status;
 }
 
@@ -287,6 +322,21 @@ Status MultiTransport::mp_submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::string& proto) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
+
+    struct ResolvedEntry {
+        size_t request_idx;
+        Transport* transport;
+    };
+    std::vector<ResolvedEntry> resolved;
+    resolved.reserve(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        Transport* transport = nullptr;
+        auto status = mp_selectTransport(entries[i], transport, proto);
+        if (!status.ok()) return status;
+        assert(transport);
+        resolved.push_back({i, transport});
+    }
+
     size_t task_id = 0;
     {
         std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
@@ -296,47 +346,50 @@ Status MultiTransport::mp_submitTransfer(
         }
         const size_t submitted_task_count = static_cast<size_t>(
             batch_desc.submitted_task_count.load(std::memory_order_acquire));
-        if (submitted_task_count + entries.size() > batch_desc.batch_size) {
+        if (submitted_task_count + resolved.size() > batch_desc.batch_size) {
             return Status::TooManyRequests(
                 "Exceed the limitation of batch capacity");
         }
 
         task_id = submitted_task_count;
-        batch_desc.task_list.resize(task_id + entries.size());
-        const size_t new_submitted_task_count = task_id + entries.size();
+        batch_desc.task_list.resize(task_id + resolved.size());
+        const size_t new_submitted_task_count = task_id + resolved.size();
         batch_desc.submitted_task_count.store(new_submitted_task_count,
                                               std::memory_order_release);
         if (new_submitted_task_count == batch_desc.batch_size) {
             batch_desc.sealed.store(true, std::memory_order_release);
         }
         batch_desc.is_finished.store(false, std::memory_order_release);
-        batch_desc.publish_completion_if_ready_locked();
     }
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
         submit_tasks;
-    for (auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = mp_selectTransport(request, transport, proto);
-        if (!status.ok()) return status;
-        assert(transport);
+    for (const auto& entry : resolved) {
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
-#ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&request);
-#else
-        task.request = &request;
-#endif
+        task.request_group.clear();
+        task.request_group.push_back(entries[entry.request_idx]);
+        task.request = &task.request_group[0];
         ++task_id;
-        submit_tasks[transport].push_back(&task);
+        submit_tasks[entry.transport].push_back(&task);
     }
     Status overall_status = Status::OK();
-    for (auto& entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second);
+    for (auto it = submit_tasks.begin(); it != submit_tasks.end(); ++it) {
+        auto status = it->first->submitTransferTask(it->second);
         if (!status.ok()) {
             overall_status = status;
+            markTasksWithoutSlicesFailed(batch_id, it, submit_tasks.end());
+            break;
         }
     }
+    if (!overall_status.ok()) {
+        std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+        batch_desc.has_failure.store(true, std::memory_order_release);
+        batch_desc.publish_completion_if_ready_locked();
+    }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    batch_desc.completion_cv.notify_all();
+#endif
     return overall_status;
 }
 #endif
@@ -360,7 +413,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         } else {
             status.s = Transport::TransferStatusEnum::COMPLETED;
         }
-        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        task.publish_completion();
     } else {
         if (globalConfig().slice_timeout > 0) {
             auto current_ts = getCurrentTimeInNano();
@@ -386,13 +439,14 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = static_cast<size_t>(
         batch_desc.submitted_task_count.load(std::memory_order_acquire));
-    const bool sealed = batch_desc.sealed.load(std::memory_order_acquire);
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) && sealed) {
-        status.s = Transport::TransferStatusEnum::COMPLETED;
+    if (batch_desc.is_finished.load(std::memory_order_acquire)) {
+        status.s = batch_desc.has_failure.load(std::memory_order_acquire)
+                       ? Transport::TransferStatusEnum::FAILED
+                       : Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
-            batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
+            batch_desc.finished_transfer_bytes.load(std::memory_order_acquire);
         return Status::OK();
     }
 
@@ -415,16 +469,18 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
             status.s = Transport::TransferStatusEnum::FAILED;
             batch_desc.has_failure.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+                batch_desc.publish_completion_if_ready_locked();
+            }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            batch_desc.completion_cv.notify_all();
+#endif
             return Status::OK();
         }
     }
 
-    if (!sealed) {
-        status.s = Transport::TransferStatusEnum::WAITING;
-        return Status::OK();
-    }
-
-    status.s = (success_count == task_count)
+    status.s = (success_count == task_count && task_count > 0)
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
@@ -432,8 +488,9 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
             std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
             batch_desc.publish_completion_if_ready_locked();
         }
-        batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
-                                                 std::memory_order_release);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        batch_desc.completion_cv.notify_all();
+#endif
     }
     return Status::OK();
 }

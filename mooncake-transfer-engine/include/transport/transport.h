@@ -20,12 +20,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __linux__
-#include <linux/futex.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
-
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -211,26 +205,7 @@ class Transport {
                 return;
             }
 
-            // --- Task complete ---
-            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
-
-            batch_desc.finished_task_count.fetch_add(1,
-                                                     std::memory_order_release);
-
-#ifdef __linux__
-            __atomic_fetch_add(&batch_desc.finished_task_futex_word, 1u,
-                               __ATOMIC_RELEASE);
-            ::syscall(SYS_futex, &batch_desc.finished_task_futex_word,
-                      FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
-#endif
-
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-            {
-                std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
-                batch_desc.publish_completion_if_ready_locked();
-            }
-            batch_desc.completion_cv.notify_all();
-#endif
+            task->publish_completion();
         }
     };
 
@@ -290,7 +265,7 @@ class Transport {
 
         volatile uint64_t completed_slice_count = 0;
 
-        // record the origin request
+        TransferRequest owned_request;
 #ifdef USE_ASCEND_HETEROGENEOUS
         // need to modify the request's source address, changing it from an NPU
         // address to a CPU address.
@@ -301,6 +276,27 @@ class Transport {
         // Grouped logical tasks may carry multiple adjacent requests that
         // should be submitted as one transport task.
         std::vector<TransferRequest> request_group;
+
+        void publish_completion() {
+            if (__atomic_exchange_n(&is_finished, true, __ATOMIC_ACQ_REL)) {
+                return;
+            }
+            auto &batch_desc = toBatchDesc(batch_id);
+            if (failed_slice_count > 0) {
+                batch_desc.has_failure.store(true, std::memory_order_release);
+            }
+            batch_desc.finished_transfer_bytes.fetch_add(
+                transferred_bytes, std::memory_order_release);
+            batch_desc.finished_task_count.fetch_add(1,
+                                                     std::memory_order_release);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            {
+                std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+                batch_desc.publish_completion_if_ready_locked();
+            }
+            batch_desc.completion_cv.notify_all();
+#endif
+        }
 
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
@@ -329,14 +325,13 @@ class Transport {
         std::atomic<uint64_t> finished_transfer_bytes{0};
 
         std::atomic<uint64_t> finished_task_count{0};
-#ifdef __linux__
-        alignas(4) uint32_t finished_task_futex_word = 0;
-#endif
 
         bool is_complete() const {
-            return sealed.load(std::memory_order_acquire) &&
+            const uint64_t submitted =
+                submitted_task_count.load(std::memory_order_acquire);
+            return submitted > 0 &&
                    finished_task_count.load(std::memory_order_acquire) ==
-                       submitted_task_count.load(std::memory_order_acquire);
+                       submitted;
         }
 
         void publish_completion_if_ready_locked() {

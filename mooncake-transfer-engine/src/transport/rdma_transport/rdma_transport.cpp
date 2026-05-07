@@ -544,6 +544,7 @@ Status RdmaTransport::submitTransferTask(
                 }
                 if (!found_device) {
                     auto source_addr = slice->source_addr;
+                    slice->markFailed();
                     fail_unposted_slices();
                     LOG(ERROR) << "Memory region not registered by any active "
                                   "device(s): "
@@ -558,6 +559,8 @@ Status RdmaTransport::submitTransferTask(
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
                     LOG(ERROR) << "Device " << device_id << " is not active";
+                    slice->markFailed();
+                    fail_unposted_slices();
                     return Status::InvalidArgument("Device " +
                                                    std::to_string(device_id) +
                                                    " is not active");
@@ -619,7 +622,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
                 status[task_id].s = TransferStatusEnum::FAILED;
             else
                 status[task_id].s = TransferStatusEnum::COMPLETED;
-            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+            task.publish_completion();
         } else {
             status[task_id].s = TransferStatusEnum::WAITING;
         }
@@ -645,7 +648,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = TransferStatusEnum::FAILED;
         else
             status.s = TransferStatusEnum::COMPLETED;
-        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        task.publish_completion();
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

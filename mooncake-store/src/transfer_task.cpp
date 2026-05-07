@@ -714,22 +714,12 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     return submitTransfer(requests);
 }
 
-namespace {
-
-using ScatterRange = std::tuple<size_t, size_t, size_t>;
-using ScatterKeyRanges =
-    std::vector<std::pair<Replica::Descriptor, std::vector<ScatterRange>>>;
-
-struct ScatterReadBuildResult {
-    std::vector<TransferRequest> flat_requests;
-    size_t logical_task_count = 0;
-};
-
-std::optional<ScatterReadBuildResult> buildScatterReadRequests(
-    TransferEngine& engine, void* dest_buffer,
-    const ScatterKeyRanges& key_ranges, bool enable_task_grouping,
-    const char* log_context) {
-    ScatterReadBuildResult result;
+std::optional<TransferSubmitter::ScatterReadBuildResult>
+TransferSubmitter::buildScatterReadRequests(
+    void* dest_buffer, const ScatterKeyRanges& key_ranges,
+    bool enable_task_grouping, const char* log_context,
+    const std::function<SegmentHandle(const std::string&)>& segment_resolver) {
+    TransferSubmitter::ScatterReadBuildResult result;
     size_t total_ranges = 0;
     for (const auto& [_, ranges] : key_ranges) {
         total_ranges += ranges.size();
@@ -750,7 +740,7 @@ std::optional<ScatterReadBuildResult> buildScatterReadRequests(
             return std::nullopt;
         }
 
-        SegmentHandle seg = engine.openSegment(handle.transport_endpoint_);
+        SegmentHandle seg = segment_resolver(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << log_context << ": failed to open segment for "
                        << handle.transport_endpoint_;
@@ -786,7 +776,6 @@ std::optional<ScatterReadBuildResult> buildScatterReadRequests(
 
     return result;
 }
-}  // namespace
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
@@ -844,9 +833,11 @@ std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
         Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
         key_ranges,
     bool enable_task_grouping) {
-    auto build_result =
-        buildScatterReadRequests(engine_, dest_buffer, key_ranges,
-                                 enable_task_grouping, "submitBatchReadRanges");
+    auto build_result = buildScatterReadRequests(
+        dest_buffer, key_ranges, enable_task_grouping, "submitBatchReadRanges",
+        [this](const std::string& endpoint) {
+            return engine_.openSegment(endpoint);
+        });
     if (!build_result) {
         return std::nullopt;
     }

@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "allocator.h"
+#include "replica.h"
 #include "types.h"
 
 namespace mooncake {
@@ -28,6 +30,40 @@ class TransferTaskTest : public ::testing::Test {
     void TearDown() override {
         // Cleanup glog
         google::ShutdownGoogleLogging();
+    }
+
+    using ScatterRangeForTest = std::tuple<size_t, size_t, size_t>;
+    using ScatterKeyRangesForTest = std::vector<std::pair<
+        Replica::Descriptor, std::vector<ScatterRangeForTest>>>;
+
+    std::optional<TransferSubmitter::ScatterReadBuildResult>
+    buildScatterReadRequestsForTest(void* dest_buffer,
+                                    const ScatterKeyRangesForTest& key_ranges,
+                                    bool enable_task_grouping) {
+        return TransferSubmitter::buildScatterReadRequests(
+            dest_buffer, key_ranges, enable_task_grouping,
+            "buildScatterReadRequestsForTest",
+            [](const std::string& endpoint) -> SegmentHandle {
+                return endpoint == "remote-a" ? 1 : 2;
+            });
+    }
+
+    Replica::Descriptor makeMemoryReplica(const std::string& endpoint,
+                                          uintptr_t base, size_t size) {
+        AllocatedBuffer::Descriptor buffer_desc{};
+        buffer_desc.size_ = size;
+        buffer_desc.buffer_address_ = base;
+        buffer_desc.protocol_ = "rdma";
+        buffer_desc.transport_endpoint_ = endpoint;
+
+        MemoryDescriptor memory_desc{};
+        memory_desc.buffer_descriptor = buffer_desc;
+
+        Replica::Descriptor replica{};
+        replica.id = 1;
+        replica.descriptor_variant = memory_desc;
+        replica.status = ReplicaStatus::COMPLETE;
+        return replica;
     }
 };
 
@@ -142,6 +178,55 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
             EXPECT_EQ(dest_buffers[i][j], 'A' + i);
         }
     }
+}
+
+TEST_F(TransferTaskTest, ScatterReadGroupingReducesLogicalTasks) {
+    char dest[4096];
+    auto replica = makeMemoryReplica("remote", 0x100000, sizeof(dest));
+    ScatterKeyRangesForTest key_ranges{
+        {replica,
+         {{0, 0, 256}, {512, 1024, 128}, {1024, 2048, 512}}},
+    };
+
+    auto ungrouped = buildScatterReadRequestsForTest(dest, key_ranges, false);
+    ASSERT_TRUE(ungrouped.has_value());
+    EXPECT_EQ(ungrouped->flat_requests.size(), 3u);
+    EXPECT_EQ(ungrouped->logical_task_count, 3u);
+    for (const auto& request : ungrouped->flat_requests) {
+        EXPECT_EQ(request.task_group_id,
+                  TransferRequest::kNoTaskGroup);
+    }
+
+    auto grouped = buildScatterReadRequestsForTest(dest, key_ranges, true);
+    ASSERT_TRUE(grouped.has_value());
+    EXPECT_EQ(grouped->flat_requests.size(), 3u);
+    EXPECT_EQ(grouped->logical_task_count, 1u);
+    for (const auto& request : grouped->flat_requests) {
+        EXPECT_NE(request.task_group_id,
+                  TransferRequest::kNoTaskGroup);
+        EXPECT_EQ(request.target_id, grouped->flat_requests[0].target_id);
+    }
+}
+
+TEST_F(TransferTaskTest, ScatterReadGroupingSeparatesReplicaGroups) {
+    char dest[4096];
+    auto replica_a = makeMemoryReplica("remote-a", 0x100000, sizeof(dest));
+    auto replica_b = makeMemoryReplica("remote-b", 0x200000, sizeof(dest));
+    ScatterKeyRangesForTest key_ranges{
+        {replica_a, {{0, 0, 256}, {256, 256, 256}}},
+        {replica_b, {{512, 0, 128}, {640, 128, 128}}},
+    };
+
+    auto grouped = buildScatterReadRequestsForTest(dest, key_ranges, true);
+    ASSERT_TRUE(grouped.has_value());
+    EXPECT_EQ(grouped->flat_requests.size(), 4u);
+    EXPECT_EQ(grouped->logical_task_count, 2u);
+    EXPECT_EQ(grouped->flat_requests[0].task_group_id,
+              grouped->flat_requests[1].task_group_id);
+    EXPECT_EQ(grouped->flat_requests[2].task_group_id,
+              grouped->flat_requests[3].task_group_id);
+    EXPECT_NE(grouped->flat_requests[0].task_group_id,
+              grouped->flat_requests[2].task_group_id);
 }
 
 // Test TransferStrategy enum and stream operator

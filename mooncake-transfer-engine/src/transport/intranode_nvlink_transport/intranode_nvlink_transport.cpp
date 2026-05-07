@@ -232,7 +232,7 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+        task.publish_completion();
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

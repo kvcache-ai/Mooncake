@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -367,6 +368,8 @@ class FilereadWorkerPool {
  * tracking.
  */
 class TransferSubmitter {
+    friend class TransferTaskTest;
+
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
@@ -479,8 +482,22 @@ class TransferSubmitter {
     void updateTransferMetrics(const std::vector<Slice>& slices,
                                TransferRequest::OpCode op);
 
+    struct ScatterReadBuildResult {
+        std::vector<TransferRequest> flat_requests;
+        size_t logical_task_count = 0;
+    };
+
+    using ScatterRange = std::tuple<size_t, size_t, size_t>;
+    using ScatterKeyRanges =
+        std::vector<std::pair<Replica::Descriptor, std::vector<ScatterRange>>>;
+
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests, size_t batch_task_count = 0);
+
+    static std::optional<ScatterReadBuildResult> buildScatterReadRequests(
+        void* dest_buffer, const ScatterKeyRanges& key_ranges,
+        bool enable_task_grouping, const char* log_context,
+        const std::function<SegmentHandle(const std::string&)>& segment_resolver);
 };
 
 }  // namespace mooncake
