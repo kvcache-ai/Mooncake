@@ -92,7 +92,7 @@ if(USE_MLU)
 endif()
 
 if(USE_TPU)
-  target_link_libraries(transfer_engine PUBLIC dl)
+  target_link_libraries(transfer_engine PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 if(USE_ASCEND)
