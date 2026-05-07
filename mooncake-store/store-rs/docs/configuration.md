@@ -222,6 +222,15 @@ Hugepage behavior:
 - if `hugepage_size_bytes` is set, hugepage mode is implicitly enabled
 - if both fields are `None`, the runtime falls back to `MC_STORE_USE_HUGEPAGE` and `MC_STORE_HUGEPAGE_SIZE`
 
+Compatibility entrypoints expose the same background eviction watermarks:
+
+| Surface | High watermark | Low watermark |
+|---------|----------------|---------------|
+| Standalone client | `--eviction-high-watermark-percent` / `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` | `--eviction-low-watermark-percent` / `MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT` |
+| Python `setup(...)` | `eviction_high_watermark_percent=` or `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` | `eviction_low_watermark_percent=` or `MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT` |
+| Python config dict | `eviction_high_watermark_percent` | `eviction_low_watermark_percent` |
+| `mooncake-store-bench` | `--eviction-high-watermark-percent` / `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` | `--eviction-low-watermark-percent` / `MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT` |
+
 Startup registration behavior:
 
 - `classic_te` + RDMA keeps startup storage-region planning NUMA-aware when `location` targets host memory and `numa_aware` remains enabled

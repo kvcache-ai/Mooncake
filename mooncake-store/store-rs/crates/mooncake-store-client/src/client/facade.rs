@@ -130,12 +130,14 @@ impl StoreClient {
         &self,
         keys: &[ObjectKey],
     ) -> Result<Vec<Option<ObjectRoute>>> {
-        Ok(self
+        let routes = self
             .route_directory
             .get_object_routes_bounded(&self.lease, keys)?
             .into_iter()
             .map(|route| route.filter(|route| route.state == RouteState::Active))
-            .collect())
+            .collect::<Vec<_>>();
+        self.report_route_hits_best_effort(routes.iter().filter_map(Option::as_ref));
+        Ok(routes)
     }
 
     fn shared_batch_replication_policy(
@@ -498,10 +500,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
-        Ok(self
+        let route = self
             .route_directory
             .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(object_id))?
-            .filter(|route| route.state == RouteState::Active))
+            .filter(|route| route.state == RouteState::Active);
+        self.report_route_hits_best_effort(route.iter());
+        Ok(route)
     }
 
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {

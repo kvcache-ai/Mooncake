@@ -14,6 +14,9 @@ This document explains the implemented capabilities by function rather than by c
 - `query_route`
 
 These APIs are the simplest entry points for applications that treat the store as an object service.
+Successful route queries and existence checks count as hot-object access. The client reports
+active route hits to the storage owners best-effort, so storage-owner CLOCK eviction sees
+prefix probes and metadata-style object checks before later reads arrive.
 
 With tenant quota policy configured, single-object `put` uses metadata-backed reserve/finalize/abort semantics and `remove` applies the matching refund when the delete becomes authoritative. This gives create, overwrite, and delete a tenant-root quota state that survives concurrent writers better than the older best-effort namespace scan.
 

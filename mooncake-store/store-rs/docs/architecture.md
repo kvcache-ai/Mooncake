@@ -201,6 +201,11 @@ This lets each storage owner update its local eviction clock from the published 
 
 For reads, the client first resolves the object route, then groups reads by remote segment and submits transfer requests through TE/TENT.
 When the selected replica is local, the client still resolves the same `ReplicaRoute::offset` target coordinate that remote TE reads use, then maps that coordinate back to the local storage registration.
+Successful route lookup APIs are also access signals: `query_route`, `get_size`, `is_exist`,
+and `batch_is_exist` report active route hits to the storage owners best-effort, using the same
+local/CLOCK and control-plane hit-report path as completed reads. This keeps prefix-probe
+workloads from letting recently observed replicas age out before the caller issues the matching
+restore read, without adding metadata-backend traffic to the request path.
 
 ```mermaid
 sequenceDiagram
@@ -214,6 +219,7 @@ sequenceDiagram
     App->>Client: get / batch_get
     Client->>Route: lookup route
     Route-->>Client: ObjectRoute
+    Client->>Evict: report active route hit
     Client->>TE: open segment and submit read batch
     TE-->>Peer: fetch bytes
     TE-->>Client: completion status

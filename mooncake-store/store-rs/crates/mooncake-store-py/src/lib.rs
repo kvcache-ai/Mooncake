@@ -134,8 +134,10 @@ impl PyMooncakeDistributedStore {
         expires_at_ms = None,
         use_hugepage = None,
         hugepage_size = None,
+        eviction_high_watermark_percent = None,
+        eviction_low_watermark_percent = None,
         route_control = "embedded_wrh"
-    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, route_control='embedded_wrh')")]
+    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, eviction_high_watermark_percent=None, eviction_low_watermark_percent=None, route_control='embedded_wrh')")]
     #[allow(clippy::too_many_arguments)]
     fn setup(
         &mut self,
@@ -162,6 +164,8 @@ impl PyMooncakeDistributedStore {
         expires_at_ms: Option<u64>,
         use_hugepage: Option<bool>,
         hugepage_size: Option<usize>,
+        eviction_high_watermark_percent: Option<u8>,
+        eviction_low_watermark_percent: Option<u8>,
         route_control: &str,
     ) -> PyResult<i32> {
         let initial_state = parse_initial_state_arg(initial_state)?;
@@ -175,6 +179,8 @@ impl PyMooncakeDistributedStore {
                 transport_metadata_url,
                 global_segment_size,
                 local_buffer_size,
+                eviction_high_watermark_percent,
+                eviction_low_watermark_percent,
                 protocol: protocol.to_string(),
                 _rdma_devices: rdma_devices.to_string(),
                 transport_rpc_port,

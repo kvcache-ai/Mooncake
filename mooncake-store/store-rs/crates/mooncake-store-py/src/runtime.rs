@@ -67,6 +67,17 @@ impl CompatRuntimeArgs {
             .scratch_bytes(plan.scratch_bytes)
             .location("cpu:0")
             .numa_aware(true);
+        if plan.eviction_high_watermark_percent.is_some()
+            || plan.eviction_low_watermark_percent.is_some()
+        {
+            let high_percent = plan
+                .eviction_high_watermark_percent
+                .unwrap_or(local_memory.eviction_high_watermark_percent);
+            let low_percent = plan
+                .eviction_low_watermark_percent
+                .unwrap_or(local_memory.eviction_low_watermark_percent);
+            local_memory = local_memory.eviction_watermarks(high_percent, low_percent);
+        }
         if let Some(use_hugepage) = plan.use_hugepage {
             local_memory = local_memory.use_hugepage(use_hugepage);
         }
@@ -225,6 +236,8 @@ mod tests {
                 transport_metadata_url: None,
                 global_segment_size: 1024,
                 local_buffer_size: 1024,
+                eviction_high_watermark_percent: None,
+                eviction_low_watermark_percent: None,
                 protocol: protocol.to_string(),
                 _rdma_devices: String::new(),
                 transport_rpc_port: None,

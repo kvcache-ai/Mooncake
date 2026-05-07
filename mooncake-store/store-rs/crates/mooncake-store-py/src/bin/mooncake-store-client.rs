@@ -96,6 +96,10 @@ struct RunArgs {
     storage_bytes: usize,
     #[arg(long, default_value_t = 4 * 1024 * 1024, env = "MC_STORE_RS_SCRATCH_BYTES")]
     scratch_bytes: usize,
+    #[arg(long, env = "MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT")]
+    eviction_high_watermark_percent: Option<u8>,
+    #[arg(long, env = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT")]
+    eviction_low_watermark_percent: Option<u8>,
     #[arg(long, default_value = "tcp", env = "MOONCAKE_PROTOCOL")]
     protocol: String,
     #[arg(long, default_value = "", env = "MC_STORE_RS_RDMA_DEVICES")]
@@ -284,6 +288,8 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
         segment = %segment_name,
         storage_bytes = args.storage_bytes,
         scratch_bytes = args.scratch_bytes,
+        eviction_high_watermark_percent = ?args.eviction_high_watermark_percent,
+        eviction_low_watermark_percent = ?args.eviction_low_watermark_percent,
         lease_ttl_ms = args.lease_ttl_ms,
         heartbeat_interval_ms = heartbeat_interval,
         request_timeout_ms = timeouts.request_timeout.as_millis(),
@@ -583,6 +589,8 @@ fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRu
             transport_metadata_url: args.transport_metadata_url.clone(),
             global_segment_size: args.storage_bytes,
             local_buffer_size: args.scratch_bytes,
+            eviction_high_watermark_percent: args.eviction_high_watermark_percent,
+            eviction_low_watermark_percent: args.eviction_low_watermark_percent,
             protocol: args.protocol.clone(),
             _rdma_devices: args.rdma_devices.clone(),
             transport_rpc_port: args.transport_rpc_port,
@@ -891,6 +899,8 @@ mod tests {
             transport_metadata_url: None,
             storage_bytes: 1024,
             scratch_bytes: 512,
+            eviction_high_watermark_percent: None,
+            eviction_low_watermark_percent: None,
             protocol: "tcp".to_string(),
             rdma_devices: String::new(),
             transport_rpc_port: None,

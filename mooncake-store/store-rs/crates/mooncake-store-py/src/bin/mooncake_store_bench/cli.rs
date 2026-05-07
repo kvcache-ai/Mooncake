@@ -34,6 +34,10 @@ pub struct GlobalArgs {
     pub storage_bytes: usize,
     #[arg(long, default_value_t = 16 * 1024 * 1024, env = "MC_STORE_RS_SCRATCH_BYTES")]
     pub scratch_bytes: usize,
+    #[arg(long, env = "MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT")]
+    pub eviction_high_watermark_percent: Option<u8>,
+    #[arg(long, env = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT")]
+    pub eviction_low_watermark_percent: Option<u8>,
     #[arg(long, default_value = "bench", env = "MC_STORE_RS_TENANT")]
     pub tenant: String,
     #[arg(long, env = "MC_STORE_RS_TRACE_FILTER")]
