@@ -350,9 +350,7 @@ const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner)
     : Backend(owner->getRank(), owner->getSize()), owner_(owner) {}
 
-const std::string MooncakeP2PShim::getBackendName() const {
-    return "mooncake";
-}
+const std::string MooncakeP2PShim::getBackendName() const { return "mooncake"; }
 
 c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::send(
     std::vector<at::Tensor>& tensors, int dstRank, int tag) {
@@ -366,6 +364,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::recv(
 
 c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::recvAnysource(
     std::vector<at::Tensor>& tensors, int tag) {
+    // MooncakeBackend doesn't implement recvAnysource; fall back to
+    // the base class which will raise a clear error.
     return ::c10d::Backend::recvAnysource(tensors, tag);
 }
 

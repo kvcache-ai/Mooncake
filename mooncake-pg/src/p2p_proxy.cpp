@@ -226,8 +226,16 @@ void P2PProxy::ReleaseResources() {
     TORCH_CHECK(!resource_abandoned_,
                 "Should not release abandoned resources.");
 
-    SetCudaDeviceIfNeeded(is_cpu_, cuda_device_index_,
-                          "P2PProxy ReleaseResources cudaSetDevice failed");
+    // During process teardown the CUDA driver may already be shut down.
+    // In that case there is nothing useful we can clean up — the OS will
+    // reclaim GPU resources — so just return instead of crashing.
+    if (!is_cpu_) {
+        const cudaError_t set_device_error =
+            cudaSetDevice(cuda_device_index_);
+        if (set_device_error != cudaSuccess) {
+            return;
+        }
+    }
 
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         auto& send_lane = send_peer_lanes_[i];
