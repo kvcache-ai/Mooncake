@@ -2439,26 +2439,79 @@ impl StoreClient {
             let mut cursor = 0usize;
             while cursor < fairness_slice.len() {
                 let capped_end = fairness_slice.len().min(cursor + shaping_chunk_limit);
+                let owner = resolved[fairness_slice[cursor]].replica.owner.clone();
+                let mut owner_end = cursor + 1;
+                while owner_end < capped_end
+                    && resolved[fairness_slice[owner_end]].replica.owner == owner
+                {
+                    owner_end += 1;
+                }
+                if let Err(error) = self.ensure_remote_runtime_read_ready(
+                    &owner,
+                    &resolved[fairness_slice[cursor]].replica.segment_name.0,
+                ) {
+                    let mut readable_runtimes = self.readable_runtime_set(false)?;
+                    readable_runtimes.remove(&owner);
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        storage_owner = %owner,
+                        items = owner_end - cursor,
+                        error = %error,
+                        "remote batch get owner preflight failed; trying per-object failover"
+                    );
+                    for index in &fairness_slice[cursor..owner_end] {
+                        self.try_advance_resolved_replica(&mut resolved[*index], &readable_runtimes);
+                        let buffer = &mut *buffers[*index];
+                        self.read_single_object_with_failover(
+                            transport,
+                            &mut resolved[*index],
+                            buffer,
+                            &mut checked_remote_runtimes,
+                            request_deadline,
+                            "remote_batch_get_owner_preflight_fallback",
+                        )?;
+                        remote_direct_fallbacks += 1;
+                    }
+                    cursor = owner_end;
+                    continue;
+                }
                 let mut direct_end = cursor;
-                while direct_end < capped_end
+                while direct_end < owner_end
                     && remote_registered_buffers[fairness_slice[direct_end]]
                 {
                     direct_end += 1;
                 }
                 if direct_end > cursor {
                     let direct_chunk = &fairness_slice[cursor..direct_end];
-                    self.execute_remote_batch_get_direct_chunk(
+                    match self.execute_remote_batch_get_direct_chunk(
                         transport,
                         resolved,
                         &buffer_ptrs,
                         direct_chunk,
                         request_deadline,
-                    )?;
-                    remote_registered_batch_chunks += 1;
+                    ) {
+                        Ok(()) => {
+                            remote_registered_batch_chunks += 1;
+                        }
+                        Err(_) => {
+                            for index in direct_chunk {
+                                let buffer = &mut *buffers[*index];
+                                self.read_single_object_with_failover(
+                                    transport,
+                                    &mut resolved[*index],
+                                    buffer,
+                                    &mut checked_remote_runtimes,
+                                    request_deadline,
+                                    "remote_batch_get_direct_fallback",
+                                )?;
+                                remote_direct_fallbacks += 1;
+                            }
+                        }
+                    }
                     cursor = direct_end;
                     continue;
                 }
-                let planning_window = &fairness_slice[cursor..capped_end];
+                let planning_window = &fairness_slice[cursor..owner_end];
                 match self.plan_remote_get_chunk(planning_window, &lengths, 0)? {
                     Some((next, scratch)) => {
                         match self.execute_remote_batch_get_chunk(
@@ -3112,6 +3165,70 @@ impl StoreClient {
         Ok(requests)
     }
 
+    fn ensure_remote_runtime_read_ready(
+        &self,
+        runtime: &ClientRuntimeId,
+        target: &str,
+    ) -> Result<()> {
+        if *runtime == self.lease.runtime {
+            return Ok(());
+        }
+        if self.runtime_is_suspect(runtime) {
+            return Err(StoreError::Transport(format!(
+                "remote runtime {runtime} is suspect before reading {target}"
+            )));
+        }
+        if self
+            .remote_runtime_probe_cache
+            .lock()
+            .is_recently_reachable(runtime)
+        {
+            return Ok(());
+        }
+        if !self
+            .remote_runtime_probe_cache
+            .lock()
+            .should_probe(runtime)
+        {
+            return Ok(());
+        }
+
+        let lease = self.lookup_runtime_lease_once(runtime, false)?;
+        match self
+            .control_client
+            .probe_reachability_with_timeout(&lease, DEFAULT_REMOTE_RUNTIME_PROBE_TIMEOUT)
+        {
+            crate::control_plane::ControlPlaneReachability::Reachable => {
+                self.remote_runtime_probe_cache.lock().mark_reachable(
+                    runtime.clone(),
+                    DEFAULT_REMOTE_RUNTIME_PROBE_REACHABLE_TTL,
+                    DEFAULT_REMOTE_RUNTIME_PROBE_RETRY_INTERVAL,
+                );
+                Ok(())
+            }
+            crate::control_plane::ControlPlaneReachability::Unreachable => {
+                self.mark_runtime_suspect(runtime, "remote_runtime_control_unreachable");
+                Err(StoreError::Transport(format!(
+                    "remote runtime {runtime} is unreachable before reading {target}"
+                )))
+            }
+            crate::control_plane::ControlPlaneReachability::Unknown(error) => {
+                self.remote_runtime_probe_cache.lock().mark_probe_deferred(
+                    runtime.clone(),
+                    DEFAULT_REMOTE_RUNTIME_PROBE_RETRY_INTERVAL,
+                );
+                debug!(
+                    runtime = %self.lease.runtime,
+                    remote_runtime = %runtime,
+                    target,
+                    error = %error,
+                    "remote read control probe inconclusive; falling back to transport"
+                );
+                Ok(())
+            }
+        }
+    }
+
     fn ensure_remote_runtime_reachable(
         &self,
         runtime: &ClientRuntimeId,
@@ -3134,10 +3251,6 @@ impl StoreClient {
         }
     }
 
-    fn ensure_remote_replica_reachable(&self, replica: &ReplicaRoute) -> Result<()> {
-        self.ensure_remote_runtime_reachable(&replica.owner, &replica.segment_name.0)
-    }
-
     fn ensure_remote_replica_reachable_once(
         &self,
         replica: &ReplicaRoute,
@@ -3146,10 +3259,16 @@ impl StoreClient {
         if replica.owner == self.lease.runtime {
             return Ok(());
         }
+        if self.runtime_is_suspect(&replica.owner) {
+            return Err(StoreError::Transport(format!(
+                "remote runtime {} is suspect before opening {}",
+                replica.owner, replica.segment_name.0
+            )));
+        }
         if !checked_runtimes.insert(replica.owner.clone()) {
             return Ok(());
         }
-        self.ensure_remote_replica_reachable(replica)
+        self.ensure_remote_runtime_read_ready(&replica.owner, &replica.segment_name.0)
     }
 
     fn execute_remote_batch_get_chunk(

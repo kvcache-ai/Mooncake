@@ -4279,6 +4279,126 @@ fn batch_get_fails_over_within_same_request_after_primary_transport_failure() {
 }
 
 #[test]
+fn batch_get_submits_remote_reads_by_storage_owner() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("batch-owner-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("batch-owner-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("batch-owner-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("batch-owner-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "batch-owner-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "batch-owner-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "batch-owner-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "batch-owner-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    writer
+        .put_with_policy(
+            "batch-owner-key-a",
+            b"owner-a",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_a.runtime_id().storage_key()]),
+        )
+        .expect("store-a routed put should succeed");
+    writer
+        .put_with_policy(
+            "batch-owner-key-b",
+            b"owner-b",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_b.runtime_id().storage_key()]),
+        )
+        .expect("store-b routed put should succeed");
+
+    {
+        let mut state = store_a_transport.state.lock();
+        state.submitted_batch_sizes.clear();
+        state.submitted_request_opcodes.clear();
+    }
+    let values = reader
+        .batch_get(&[
+            ObjectRef::new("batch-owner-key-a"),
+            ObjectRef::new("batch-owner-key-b"),
+        ])
+        .expect("batch get should succeed");
+    assert_eq!(values, vec![b"owner-a".to_vec(), b"owner-b".to_vec()]);
+
+    let read_batch_sizes = {
+        let state = store_a_transport.state.lock();
+        state
+            .submitted_batch_sizes
+            .iter()
+            .zip(state.submitted_request_opcodes.iter())
+            .filter_map(|(size, opcodes)| {
+                opcodes
+                    .iter()
+                    .all(|opcode| *opcode == Opcode::Read)
+                    .then_some(*size)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        read_batch_sizes,
+        vec![1, 1],
+        "remote reads for different storage owners must not share one TE batch"
+    );
+}
+
+#[test]
 fn route_lookup_many_stays_ok_when_live_replica_survives_and_snapshot_converges() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();

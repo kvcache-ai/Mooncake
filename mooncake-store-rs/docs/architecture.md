@@ -210,6 +210,15 @@ local/CLOCK and control-plane hit-report path as completed reads. This keeps pre
 workloads from letting recently observed replicas age out before the caller issues the matching
 restore read, without adding metadata-backend traffic to the request path.
 
+Remote batch reads are isolated by storage owner before they enter TE/TENT. A failed or killed
+storage owner therefore only affects the keys assigned to that owner instead of stalling a mixed
+batch that also contains healthy owners. Before a remote owner batch is submitted, the client
+checks the shared suspect-runtime cache and uses a short, rate-limited control-plane probe against
+the cached peer endpoint. This probe never refreshes metadata; Redis and etcd stay outside the
+steady-state read hot path. Inconclusive probes fall through to the transport path, while confirmed
+unreachable owners are quarantined locally and handled through the normal replica failover or
+cache-miss policy.
+
 ```mermaid
 sequenceDiagram
     participant App

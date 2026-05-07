@@ -1,5 +1,6 @@
 pub(crate) type SharedLiveClientCache = Arc<Mutex<LiveClientCache>>;
 pub(crate) type SharedSuspectRuntimeCache = Arc<Mutex<SuspectRuntimeCache>>;
+pub(crate) type SharedRemoteRuntimeProbeCache = Arc<Mutex<RemoteRuntimeProbeCache>>;
 
 #[derive(Default)]
 pub(crate) struct LiveClientCache {
@@ -77,12 +78,74 @@ pub(crate) struct SuspectRuntimeCache {
     suspects: BTreeMap<ClientRuntimeId, SuspectRuntimeEntry>,
 }
 
+#[derive(Default)]
+pub(crate) struct RemoteRuntimeProbeCache {
+    entries: BTreeMap<ClientRuntimeId, RemoteRuntimeProbeEntry>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RemoteRuntimeProbeEntry {
+    reachable_until: Option<Instant>,
+    retry_after: Instant,
+}
+
 #[derive(Clone)]
 pub(crate) struct SuspectRuntimeEntry {
     quarantine_until: Instant,
     observed_expires_at_ms: Option<u64>,
     observed_state: Option<ClientLifecycleState>,
     observed_control_address: Option<String>,
+}
+
+impl RemoteRuntimeProbeCache {
+    pub(crate) fn is_recently_reachable(&mut self, runtime: &ClientRuntimeId) -> bool {
+        let now = Instant::now();
+        self.prune(now);
+        self.entries
+            .get(runtime)
+            .and_then(|entry| entry.reachable_until)
+            .is_some_and(|until| now < until)
+    }
+
+    pub(crate) fn should_probe(&mut self, runtime: &ClientRuntimeId) -> bool {
+        let now = Instant::now();
+        self.prune(now);
+        self.entries
+            .get(runtime)
+            .is_none_or(|entry| now >= entry.retry_after)
+    }
+
+    pub(crate) fn mark_reachable(
+        &mut self,
+        runtime: ClientRuntimeId,
+        reachable_for: Duration,
+        retry_after: Duration,
+    ) {
+        let now = Instant::now();
+        self.entries.insert(
+            runtime,
+            RemoteRuntimeProbeEntry {
+                reachable_until: Some(now + reachable_for),
+                retry_after: now + retry_after,
+            },
+        );
+    }
+
+    pub(crate) fn mark_probe_deferred(&mut self, runtime: ClientRuntimeId, retry_after: Duration) {
+        self.entries.insert(
+            runtime,
+            RemoteRuntimeProbeEntry {
+                reachable_until: None,
+                retry_after: Instant::now() + retry_after,
+            },
+        );
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| {
+            entry.reachable_until.is_some_and(|until| now < until) || now < entry.retry_after
+        });
+    }
 }
 
 impl SuspectRuntimeCache {
@@ -199,6 +262,18 @@ pub(crate) fn shared_suspect_runtime_cache(namespace: &str) -> SharedSuspectRunt
     guard
         .entry(namespace.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(SuspectRuntimeCache::default())))
+        .clone()
+}
+
+pub(crate) fn shared_remote_runtime_probe_cache(namespace: &str) -> SharedRemoteRuntimeProbeCache {
+    static REMOTE_RUNTIME_PROBE_CACHES: OnceLock<
+        Mutex<BTreeMap<String, SharedRemoteRuntimeProbeCache>>,
+    > = OnceLock::new();
+    let caches = REMOTE_RUNTIME_PROBE_CACHES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut guard = caches.lock();
+    guard
+        .entry(namespace.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(RemoteRuntimeProbeCache::default())))
         .clone()
 }
 
