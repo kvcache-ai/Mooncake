@@ -349,6 +349,13 @@ MooncakeBackend::MooncakeBackend(
     // without calling extendGroupSizeTo(). Inactive slots are masked by
     // meta_->activeRanks / meta_->activeRanksTensor.
     meta_->size = max_size;
+    // activeSize tracks the visible group size (returned by getSize() /
+    // dist.get_world_size()). It starts at the actual member count and grows
+    // when extendGroupSizeTo() or recoverRanks() expands the group.
+    // For extension ranks, activeSize equals world_size (= max_world_size);
+    // the local-only behavior before joinGroup() is ensured by activeRanks
+    // masking, not by a smaller activeSize.
+    meta_->activeSize = size;
     meta_->taskCount = 0;
     if (isCpu) {
         meta_->activeRanks = new bool[kMaxNumRanks];
@@ -1078,6 +1085,15 @@ void MooncakeBackend::waitForExtensionState() {
         meta_->activeRanks[i] = state.activeRanks[i];
     }
     syncActiveRanksTensor();
+
+    // activeSize: count the number of active ranks (contiguous from 0)
+    int newActiveSize = 0;
+    for (int i = 0; i < meta_->size; ++i) {
+        if (meta_->activeRanks[i]) {
+            newActiveSize = i + 1;
+        }
+    }
+    meta_->activeSize = newActiveSize;
 }
 
 int MooncakeBackend::getNumSyncedRanks() {
@@ -1100,6 +1116,7 @@ int MooncakeBackend::getNumSyncedRanks() {
 
 void MooncakeBackend::extendGroupSizeTo(int newSize) {
     const int oldSize = meta_->size;
+    const int oldActiveSize = meta_->activeSize;
     if (newSize == oldSize) return;
 
     TORCH_CHECK(newSize >= 0 && static_cast<size_t>(newSize) < kMaxNumRanks,
@@ -1110,6 +1127,7 @@ void MooncakeBackend::extendGroupSizeTo(int newSize) {
               << ": Group size extend to " << newSize;
 
     meta_->size = newSize;
+    meta_->activeSize = newSize;
     meta_->taskCount = 0;
 
     // Initialize new rank's metadata
@@ -1190,6 +1208,13 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
                     "Rank out of range");
         TORCH_CHECK(meta_->peerConnected[rank]);
         meta_->activeRanks[rank] = true;
+    }
+
+    // Expand activeSize if any recovered rank is beyond the current boundary.
+    for (const int rank : ranks) {
+        if (rank >= meta_->activeSize) {
+            meta_->activeSize = rank + 1;
+        }
     }
 
     syncActiveRanksTensor();

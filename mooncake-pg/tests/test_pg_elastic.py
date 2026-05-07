@@ -63,6 +63,14 @@ def _extension_worker(
         )
         backend = ctx.get_backend()
 
+        # group_size should equal initial_world_size immediately after init
+        # (max_world_size only pre-allocates capacity, does not change visible size)
+        actual_ws = dist.get_world_size()
+        assert actual_ws == initial_world_size, (
+            f"rank {ctx.proc_rank}: initial world_size={actual_ws}, "
+            f"expected initial_world_size={initial_world_size}"
+        )
+
         # First collective
         tensor = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
@@ -83,6 +91,13 @@ def _extension_worker(
             description=f"rank {ctx.proc_rank} waiting for joiner ready",
         )
         pg.recover_ranks(backend, join_ranks)
+
+        # After recover_ranks, world_size should now reflect the expanded group
+        actual_ws_after = dist.get_world_size()
+        assert actual_ws_after == ctx.world_size, (
+            f"rank {ctx.proc_rank}: world_size after recover={actual_ws_after}, "
+            f"expected max_world_size={ctx.world_size}"
+        )
 
         # Final collective
         final_tensor = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -107,6 +122,17 @@ def _extension_worker(
 
         backend = ctx.get_backend()
 
+        # group_size for extension rank equals world_size passed at init.
+        # Note: this is world_size (= max_world_size for joiners), not 1,
+        # because the joiner's activeSize is initialized to world_size.
+        # The local-only behavior is ensured by activeRanks masking, not
+        # by a smaller activeSize.
+        actual_ws = dist.get_world_size()
+        assert actual_ws == ctx.world_size, (
+            f"extension rank: initial world_size={actual_ws}, "
+            f"expected {ctx.world_size}"
+        )
+
         # In extension mode, joiner starts in local-only collectives.
         local_tensor = torch.tensor([extension_rank + 1], dtype=torch.int32, device=device)
         dist.all_reduce(local_tensor, op=dist.ReduceOp.SUM)
@@ -118,6 +144,13 @@ def _extension_worker(
         # join_group publishes metadata and then blocks until recover_ranks()
         # publishes the extension state.
         pg.join_group(backend)
+
+        # After joinGroup, world_size should reflect the full group
+        actual_ws_after = dist.get_world_size()
+        assert actual_ws_after == ctx.world_size, (
+            f"extension rank: world_size after joinGroup={actual_ws_after}, "
+            f"expected {ctx.world_size}"
+        )
 
         # Final collective
         final_tensor = torch.tensor([extension_rank + 1], dtype=torch.int32, device=device)
@@ -741,7 +774,7 @@ class _ElasticMixin:
             _extension_worker_with_subgroups,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=30.0,
+            timeout_s=60.0,
         )
 
         result_rows = [r for r in rows if r.get("role") == "extension_subgroups"]

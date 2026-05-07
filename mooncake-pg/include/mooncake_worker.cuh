@@ -31,7 +31,8 @@ struct SegmentInfo {
 
 struct TransferGroupMeta {
     int rank;
-    int size;
+    int size;        // capacity: number of slots allocated (incl. inactive)
+    int activeSize;  // visible group size: number of ranks that participate
     int taskCount;
     bool* activeRanks;
     bool* activeRanksDevice;
