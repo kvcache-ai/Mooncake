@@ -173,11 +173,6 @@ struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::QuerySegmentStatus> {
-    static constexpr const char* value = "QuerySegmentStatus";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::QuerySegmentStatusById> {
     static constexpr const char* value = "QuerySegmentStatusById";
 };
@@ -777,18 +772,6 @@ tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     timer.LogRequest("action=get_fsdir");
 
     auto result = invoke_rpc<&WrappedMasterService::GetFsdir, std::string>();
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<SegmentStatus, ErrorCode> MasterClient::QuerySegmentStatus(
-    const std::string& segment_name) {
-    ScopedVLogTimer timer(1, "MasterClient::QuerySegmentStatus");
-    timer.LogRequest("segment_name=", segment_name);
-
-    auto result =
-        invoke_rpc<&WrappedMasterService::QuerySegmentStatus, SegmentStatus>(
-            segment_name);
     timer.LogResponseExpected(result);
     return result;
 }

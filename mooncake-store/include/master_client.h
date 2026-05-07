@@ -326,9 +326,6 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
 
-    [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
-        const std::string& segment_name);
-
     [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
 
