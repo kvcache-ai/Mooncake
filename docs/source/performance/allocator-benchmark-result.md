@@ -198,7 +198,8 @@ avg alloc time: 142.508508 ns/op
 
 ### Paired KV/Indexer Allocation Benchmark (DSA)
 
-In the DSA scenario, Mooncake Store stores both KV cache objects and indexer objects. We evaluated OffsetAllocator under a paired allocation workload with two production-like object sizes.
+In the DSA scenario, Mooncake Store stores both KV cache objects and indexer objects.
+We evaluated OffsetAllocator under a paired allocation workload using object sizes from GLM-5.1.
 
 **OffsetAllocator**
 
