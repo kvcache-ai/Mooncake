@@ -252,13 +252,19 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
         cuCtxSetCurrent(cuCtx);
 
+        // Use cuMemGetAddressRange to get the true allocation base and
+        // size — addr may sit at an offset within a larger cudaMalloc
+        // block (e.g. PyTorch caching allocator packs multiple tensors
+        // into one allocation).  cuMemGetHandleForAddressRange requires
+        // the exact allocation boundaries.
+        CUdeviceptr allocBase;
         size_t allocSize;
-        result = cuPointerGetAttribute(
-            &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
+        result =
+            cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
-            LOG(ERROR) << "Failed to call cuPointerGetAttribute for "
+            LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
             cuDevicePrimaryCtxRelease(cuDev);
             return ERR_CONTEXT;
@@ -266,7 +272,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 
         int dmabuf_fd;
         result = cuMemGetHandleForAddressRange(
-            &dmabuf_fd, (CUdeviceptr)addr, allocSize,
+            &dmabuf_fd, allocBase, allocSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
@@ -277,7 +283,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
             return ERR_CONTEXT;
         }
         mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
+        uint64_t dmabuf_offset = (uintptr_t)addr - allocBase;
+        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, dmabuf_offset, length,
                                       (uintptr_t)addr, dmabuf_fd, access);
         cuDevicePrimaryCtxRelease(cuDev);
     }

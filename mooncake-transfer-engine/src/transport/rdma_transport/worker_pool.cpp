@@ -288,22 +288,32 @@ void WorkerPool::performPollCq(int thread_id) {
                 qp_depth_set[slice->rdma.qp_depth] = 1;
             // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
             if (wc[i].status != IBV_WC_SUCCESS) {
-                bool show_work_request_flushed_error = globalConfig().trace;
-                // After detect an error, subsequent work requests will result
-                // in work_request_flushed_error, we hide this by default
-                if (wc[i].status != IBV_WC_WR_FLUSH_ERR ||
-                    show_work_request_flushed_error)
-                    LOG(ERROR)
-                        << "Worker: Process failed for slice (opcode: "
-                        << slice->opcode
-                        << ", source_addr: " << slice->source_addr
-                        << ", length: " << slice->length
-                        << ", dest_addr: " << (void *)slice->rdma.dest_addr
-                        << ", local_nic: " << context_.deviceName()
-                        << ", peer_nic: " << slice->peer_nic_path
-                        << ", dest_rkey: " << slice->rdma.dest_rkey
-                        << ", retry_cnt: " << slice->rdma.retry_cnt
-                        << "): " << ibv_wc_status_str(wc[i].status);
+                // Flush errors are generated when QPs transition to ERR
+                // state (e.g., during two-phase endpoint destruction via
+                // beginDestroy). They are not real network errors, so we
+                // directly mark the slice as failed without retry, without
+                // counting toward the RNIC error threshold, and without
+                // triggering endpoint deletion.
+                if (wc[i].status == IBV_WC_WR_FLUSH_ERR) {
+                    if (globalConfig().trace)
+                        LOG(INFO)
+                            << "Worker: WR flush error (peer_nic: "
+                            << slice->peer_nic_path << "), marking failed";
+                    slice->markFailed();
+                    processed_slice_count++;
+                    continue;
+                }
+
+                LOG(ERROR) << "Worker: Process failed for slice (opcode: "
+                           << slice->opcode
+                           << ", source_addr: " << slice->source_addr
+                           << ", length: " << slice->length
+                           << ", dest_addr: " << (void *)slice->rdma.dest_addr
+                           << ", local_nic: " << context_.deviceName()
+                           << ", peer_nic: " << slice->peer_nic_path
+                           << ", dest_rkey: " << slice->rdma.dest_rkey
+                           << ", retry_cnt: " << slice->rdma.retry_cnt
+                           << "): " << ibv_wc_status_str(wc[i].status);
                 failed_nr_polls++;
                 if (context_.active() && failed_nr_polls > 32 &&
                     !success_nr_polls) {
@@ -320,8 +330,6 @@ void WorkerPool::performPollCq(int thread_id) {
                     collective_slice_queue_[thread_id][slice->peer_nic_path]
                         .push_back(slice);
                     redispatch_counter_++;
-                    // std::vector<RdmaTransport::Slice *> slice_list { slice };
-                    // redispatch(slice_list, thread_id);
                 }
             } else {
                 slice->markSuccess();

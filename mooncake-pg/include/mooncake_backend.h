@@ -11,19 +11,18 @@
 #include <sys/types.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <transfer_engine.h>
 
 namespace mooncake {
 
-class MooncakeBackend final : public ::c10d::Backend {
+class MooncakeBackend final : public ::c10d::ProcessGroup {
    public:
-    struct MooncakeBackendOptions final : ::c10d::Backend::Options {
+    struct MooncakeBackendOptions final : torch::CustomClassHolder {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
-            : Options{"mooncake"}, activeRanks_{activeRanks} {}
+            : activeRanks_{activeRanks} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
-            : Options{"mooncake"},
-              activeRanks_{activeRanks},
-              isExtension_{isExtension} {}
+            : activeRanks_{activeRanks}, isExtension_{isExtension} {}
 
         ~MooncakeBackendOptions() override = default;
 
@@ -50,20 +49,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
-    /**
-     * @brief Return the stored Mooncake-specific backend options.
-     *
-     * PyTorch can use this to read Mooncake-specific options from an existing
-     * process group. This is used, for example, create sub-groups that inherit
-     * settings from the parent group.
-     *
-     * @return The stored backend options, or null when the backend was created
-     * without explicit Mooncake options.
-     */
-    c10::intrusive_ptr<::c10d::Backend::Options> getBackendOptions() override {
-        return c10::static_intrusive_pointer_cast<::c10d::Backend::Options>(
-            options_);
-    }
+    int getSize() const override { return meta_ ? meta_->size : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.

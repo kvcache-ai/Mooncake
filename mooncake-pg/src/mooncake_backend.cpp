@@ -95,7 +95,8 @@ class MooncakeP2PWork : public ::c10d::Work {
 MooncakeBackend::MooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
-    : Backend(distBackendOpts.group_rank, distBackendOpts.group_size),
+    : ProcessGroup(distBackendOpts.store, distBackendOpts.group_rank,
+                   distBackendOpts.group_size),
       options_(std::move(options)),
       isCpu_(isCpu) {
     auto store = std::move(distBackendOpts.store);
@@ -311,7 +312,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     auto tensor = tensors.back();
 
     TORCH_CHECK(meta_->store, "P2P send requires a valid Store.");
-    TORCH_CHECK(dstRank >= 0 && dstRank < size_,
+    TORCH_CHECK(dstRank >= 0 && dstRank < meta_->size,
                 "P2P send: dstRank out of range.");
 
     auto contiguous = tensor.contiguous();
@@ -343,7 +344,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     auto tensor = tensors.back();
 
     TORCH_CHECK(meta_->store, "P2P recv requires a valid Store.");
-    TORCH_CHECK(srcRank >= 0 && srcRank < size_,
+    TORCH_CHECK(srcRank >= 0 && srcRank < meta_->size,
                 "P2P recv: srcRank out of range.");
 
     auto target = tensor.is_contiguous() ? tensor : tensor.contiguous();
