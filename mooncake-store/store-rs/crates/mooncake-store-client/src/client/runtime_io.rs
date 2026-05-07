@@ -426,8 +426,8 @@ impl StoreClient {
             let write_result =
                 self.write_reserved_replicas(&targets, &reservations, value, registered_source);
             write_tracker.finish(&write_result, value.len() as u64);
-            let offsets = match write_result {
-                Ok(offsets) => offsets,
+            match write_result {
+                Ok(()) => {}
                 Err(error) => {
                     self.best_effort_release_reserved_allocations(
                         &targets,
@@ -474,12 +474,10 @@ impl StoreClient {
                 compatibility: self.lease.compatibility.clone(),
                 replicas: targets
                     .iter()
-                    .zip(offsets.iter())
                     .enumerate()
-                    .map(|(priority, (target, offset))| ReplicaRoute {
+                    .map(|(priority, target)| ReplicaRoute {
                         owner: target.storage_runtime.clone(),
                         segment_name: target.segment_name.clone(),
-                        offset: *offset,
                         segment_offset: reservations[priority].offset_bytes,
                         length: value.len() as u64,
                         checksum: Some(checksum),
@@ -988,9 +986,8 @@ impl StoreClient {
             Self::explicit_migration_object_ref(object_id, current.qos_tier.as_deref());
         let (targets, reservations) =
             self.reserve_explicit_migration_targets(&object_ref, payload.len(), plan)?;
-        let offsets =
-            match self.write_reserved_replicas(&targets, &reservations, &payload, None) {
-            Ok(offsets) => offsets,
+        match self.write_reserved_replicas(&targets, &reservations, &payload, None) {
+            Ok(()) => {}
             Err(error) => {
                 self.best_effort_release_reserved_allocations(
                     &targets,
@@ -1000,17 +997,15 @@ impl StoreClient {
                 self.note_remote_write_failure(&targets, &error, "explicit_migration_write_failed");
                 return Err(error);
             }
-        };
+        }
 
         let checksum = payload_checksum(&payload);
         let explicit_targets = targets
             .iter()
-            .zip(offsets.iter())
             .enumerate()
-            .map(|(priority, (target, offset))| ReplicaRoute {
+            .map(|(priority, target)| ReplicaRoute {
                 owner: target.storage_runtime.clone(),
                 segment_name: target.segment_name.clone(),
-                offset: *offset,
                 segment_offset: reservations[priority].offset_bytes,
                 length: payload.len() as u64,
                 checksum: Some(checksum),
@@ -2334,6 +2329,7 @@ impl StoreClient {
             .filter_map(|(local, length)| (*local).then_some(*length as u64))
             .sum::<u64>();
         let mut local_segment_infos = BTreeMap::new();
+        let mut local_target_chunks = BTreeMap::new();
         for (entry, local) in resolved.iter().zip(local_paths.iter()) {
             if !*local || local_segment_infos.contains_key(&entry.replica.segment_name) {
                 continue;
@@ -2343,6 +2339,10 @@ impl StoreClient {
                 state.open_segment_with_info(transport, &entry.replica.segment_name.0)?
             };
             local_segment_infos.insert(entry.replica.segment_name.clone(), info);
+            local_target_chunks.insert(
+                entry.replica.segment_name.clone(),
+                self.replica_target_chunks(&entry.replica)?,
+            );
         }
 
         {
@@ -2362,10 +2362,20 @@ impl StoreClient {
                         entry.replica.segment_name.0
                     ))
                 })?;
+                let target_chunks = local_target_chunks.get(&entry.replica.segment_name).ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "local segment target chunks for {} are missing",
+                        entry.replica.segment_name.0
+                    ))
+                })?;
                 memory.copy_storage_target_to(
                     &entry.replica.segment_name,
                     target_info,
-                    entry.replica.offset,
+                    Self::replica_storage_target_offset(
+                        target_info,
+                        target_chunks,
+                        &entry.replica,
+                    )?,
                     buffer.as_mut_ptr(),
                     entry.replica.length as usize,
                     transport.max_registration_bytes(),
@@ -2945,26 +2955,79 @@ impl StoreClient {
         Ok(target_offset)
     }
 
-    fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
-        if Self::segment_info_covers_target(info, replica.offset, replica.length) {
-            return Ok(replica.offset);
+    fn replica_storage_target_offset(
+        info: &SegmentInfo,
+        target_chunks: &[SegmentTargetChunk],
+        replica: &ReplicaRoute,
+    ) -> Result<u64> {
+        let resolved = Self::storage_target_offset(
+            target_chunks,
+            &replica.segment_name,
+            replica.segment_offset,
+            replica.length,
+        );
+        if let Ok(target_offset) = resolved {
+            if Self::segment_info_covers_target(info, target_offset, replica.length) {
+                return Ok(target_offset);
+            }
+            return Err(StoreError::Transport(format!(
+                "segment offset {} length {} maps outside segment {} transport buffers (target_offset={} num_buffers={})",
+                replica.segment_offset,
+                replica.length,
+                replica.segment_name.0,
+                target_offset,
+                info.buffers.len()
+            )));
         }
         warn!(
             segment = %replica.segment_name.0,
-            target_offset = replica.offset,
             segment_offset = replica.segment_offset,
             length = replica.length,
             num_buffers = info.buffers.len(),
             buffers = ?info.buffers.iter().map(|buffer| (buffer.base, buffer.length)).collect::<Vec<_>>(),
-            "replica target offset is outside segment; route metadata is not readable"
+            "replica segment offset is outside segment storage target map"
         );
-        Err(StoreError::Transport(format!(
-            "replica target offset {} length {} is outside segment {} (num_buffers={})",
-            replica.offset,
-            replica.length,
-            replica.segment_name.0,
-            info.buffers.len()
-        )))
+        resolved
+    }
+
+    fn replica_target_chunks(&self, replica: &ReplicaRoute) -> Result<Vec<SegmentTargetChunk>> {
+        {
+            let state = self.state.lock();
+            if let Some(target_chunks) =
+                state.cached_segment_target_chunks(&replica.owner, &replica.segment_name)
+            {
+                return Ok(target_chunks);
+            }
+        }
+
+        let segment = {
+            let local = self.allocator.lock().announcement(&replica.segment_name);
+            match local {
+                Some(segment) if segment.owner == replica.owner => segment,
+                _ => self
+                    .metadata
+                    .get_segment(&replica.owner, &replica.segment_name)?
+                    .ok_or_else(|| {
+                        StoreError::NotFound(format!(
+                            "segment {} for runtime {} not found",
+                            replica.segment_name.0, replica.owner
+                        ))
+                    })?,
+            }
+        };
+        if segment.target_chunks.is_empty() {
+            return Err(StoreError::Transport(format!(
+                "segment {} for runtime {} exposes no storage target chunks",
+                replica.segment_name.0, replica.owner
+            )));
+        }
+        let target_chunks = segment.target_chunks;
+        self.state.lock().cache_segment_target_chunks(
+            &replica.owner,
+            &replica.segment_name,
+            &target_chunks,
+        );
+        Ok(target_chunks)
     }
 
     fn target_buffer_transfer_requests(
@@ -3104,6 +3167,18 @@ impl StoreClient {
             .sum::<u64>();
         let tracker = OperationTracker::new("get_remote_batch_chunk");
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
+            let target_chunks = remote_indices
+                .iter()
+                .map(|index| {
+                    self.replica_target_chunks(&resolved[*index].replica)
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let requests = {
                 let mut state = self.state.lock();
                 let mut batch = Vec::with_capacity(remote_indices.len());
@@ -3117,8 +3192,12 @@ impl StoreClient {
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
                             )
                         })?;
-                    let target_offset = Self::remote_replica_target_offset(&info, &entry.replica)
-                        .map_err(|error| {
+                    let target_offset = Self::replica_storage_target_offset(
+                        &info,
+                        &target_chunks[position],
+                        &entry.replica,
+                    )
+                    .map_err(|error| {
                             (
                                 error.clone(),
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
@@ -3237,10 +3316,22 @@ impl StoreClient {
             .sum::<u64>();
         let tracker = OperationTracker::new("get_remote_batch_direct");
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
+            let target_chunks = remote_indices
+                .iter()
+                .map(|index| {
+                    self.replica_target_chunks(&resolved[*index].replica)
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let requests = {
                 let mut state = self.state.lock();
                 let mut batch = Vec::with_capacity(remote_indices.len());
-                for index in remote_indices {
+                for (position, index) in remote_indices.iter().enumerate() {
                     let entry = &resolved[*index];
                     let (segment, info) = state
                         .open_segment_with_info(transport, &entry.replica.segment_name.0)
@@ -3250,8 +3341,12 @@ impl StoreClient {
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
                             )
                         })?;
-                    let target_offset = Self::remote_replica_target_offset(&info, &entry.replica)
-                        .map_err(|error| {
+                    let target_offset = Self::replica_storage_target_offset(
+                        &info,
+                        &target_chunks[position],
+                        &entry.replica,
+                    )
+                    .map_err(|error| {
                             (
                                 error.clone(),
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
@@ -3373,6 +3468,13 @@ impl StoreClient {
                 }
             }
             let requests = {
+                let target_chunks =
+                    self.replica_target_chunks(&resolved.replica).map_err(|error| {
+                        (
+                            error.clone(),
+                            Self::remote_read_failure_marks_runtime_suspect(&error),
+                        )
+                    })?;
                 let mut state = self.state.lock();
                 let (segment, info) = state
                     .open_segment_with_info(transport, &resolved.replica.segment_name.0)
@@ -3383,14 +3485,15 @@ impl StoreClient {
                         )
                     })?;
                 let target_offset =
-                    Self::remote_replica_target_offset(&info, &resolved.replica).map_err(
+                    Self::replica_storage_target_offset(&info, &target_chunks, &resolved.replica)
+                        .map_err(
                         |error| {
                             (
                                 error.clone(),
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
                             )
                         },
-                    )?;
+                        )?;
                 Self::target_buffer_transfer_requests(
                     Opcode::Read,
                     segment,
@@ -3528,13 +3631,14 @@ impl StoreClient {
             let mut state = self.state.lock();
             state.open_segment_with_info(transport, &replica.segment_name.0)?
         };
+        let target_chunks = self.replica_target_chunks(replica)?;
         {
             let state = self.state.lock();
             let memory = state.memory_ref()?;
             memory.copy_storage_target_to(
                 &replica.segment_name,
                 &target_info,
-                replica.offset,
+                Self::replica_storage_target_offset(&target_info, &target_chunks, replica)?,
                 buffer.as_mut_ptr(),
                 length,
                 transport.max_registration_bytes(),
@@ -3759,21 +3863,15 @@ mod runtime_io_tests {
     }
 
     // -----------------------------------------------------------------------
-    // remote_replica_target_offset tests — read-path offset resolution accepts
-    // only the published transport target coordinate in ReplicaRoute::offset.
-    // segment_offset is allocator bookkeeping and must never repair a bad route.
+    // replica_storage_target_offset tests — segment_offset is the durable
+    // storage coordinate. The TE target coordinate is derived from the current
+    // segment buffer map at every read boundary.
     // -----------------------------------------------------------------------
 
-    fn make_replica(
-        segment_name: &str,
-        offset: u64,
-        segment_offset: u64,
-        length: u64,
-    ) -> ReplicaRoute {
+    fn make_replica(segment_name: &str, segment_offset: u64, length: u64) -> ReplicaRoute {
         ReplicaRoute {
             owner: ClientRuntimeId::new("test-runtime", ClientEpoch(0)),
             segment_name: SegmentName::new(segment_name),
-            offset,
             segment_offset,
             length,
             checksum: None,
@@ -3782,82 +3880,108 @@ mod runtime_io_tests {
         }
     }
 
-    #[test]
-    fn remote_replica_target_offset_returns_published_target_offset() {
-        let info = memory_segment(&[(1000, 128)]);
-        let replica = make_replica("seg", 1024, 24, 32);
+    fn target_chunks(chunks: &[(u64, u64, u64)]) -> Vec<SegmentTargetChunk> {
+        chunks
+            .iter()
+            .map(|(logical_offset, target_offset, length_bytes)| SegmentTargetChunk {
+                logical_offset: *logical_offset,
+                target_offset: *target_offset,
+                length_bytes: *length_bytes,
+            })
+            .collect()
+    }
 
-        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+    #[test]
+    fn replica_storage_target_offset_maps_segment_offset() {
+        let info = memory_segment(&[(1000, 128)]);
+        let chunks = target_chunks(&[(0, 1000, 128)]);
+        let replica = make_replica("seg", 24, 32);
+
+        let result = StoreClient::replica_storage_target_offset(&info, &chunks, &replica);
         assert_eq!(
-            result.expect("published target offset should be readable"),
+            result.expect("segment offset should map to target offset"),
             1024,
-            "read path must return ReplicaRoute::offset directly"
+            "read path must derive the TE target coordinate from segment_offset"
         );
     }
 
     #[test]
-    fn remote_replica_target_offset_rejects_uncovered_published_target() {
+    fn replica_storage_target_offset_rejects_uncovered_segment_offset() {
         let info = memory_segment(&[(1000, 128)]);
-        let replica = make_replica("seg", 9999, 24, 32);
+        let chunks = target_chunks(&[(0, 1000, 128)]);
+        let replica = make_replica("seg", 120, 32);
 
-        let result = StoreClient::remote_replica_target_offset(&info, &replica);
-        let error = result.expect_err("bad published target offset must fail");
+        let result = StoreClient::replica_storage_target_offset(&info, &chunks, &replica);
+        let error = result.expect_err("bad segment offset must fail");
         let message = error.to_string();
         assert!(
-            message.contains("replica target offset"),
-            "error must name the route target coordinate, got: {message}"
-        );
-        assert!(
-            !message.contains("segment offset"),
-            "read path must not expose the removed allocator-offset fallback, got: {message}"
+            message.contains("[120, 152)") || message.contains("segment offset"),
+            "error must name the durable storage range, got: {message}"
         );
     }
 
     #[test]
-    fn remote_replica_target_offset_ignores_segment_offset_when_target_is_valid() {
+    fn replica_storage_target_offset_uses_segment_offset() {
         let info = memory_segment(&[(1000, 128)]);
-        let replica = make_replica("seg", 1024, u64::MAX, 16);
+        let chunks = target_chunks(&[(0, 1000, 128)]);
+        let replica = make_replica("seg", 64, 16);
 
-        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        let result = StoreClient::replica_storage_target_offset(&info, &chunks, &replica);
         assert_eq!(
-            result.expect("valid published target must not consult segment_offset"),
-            1024
+            result.expect("segment offset must control read placement"),
+            1064
         );
     }
 
     #[test]
-    fn remote_replica_target_offset_fast_path_with_multi_buffer() {
+    fn replica_storage_target_offset_maps_multi_buffer_span() {
         let info = memory_segment(&[(1000, 64), (1064, 64)]);
-        let replica = make_replica("seg", 1080, 80, 32);
+        let chunks = target_chunks(&[(0, 1000, 64), (64, 1064, 64)]);
+        let replica = make_replica("seg", 80, 32);
 
-        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        let result = StoreClient::replica_storage_target_offset(&info, &chunks, &replica);
         assert_eq!(
-            result.expect("published target should work across contiguous buffers"),
+            result.expect("segment offset should work across contiguous buffers"),
             1080,
-            "read path should accept target offset spanning contiguous buffers"
+            "read path should accept logical ranges spanning contiguous buffers"
         );
     }
 
     #[test]
-    fn remote_replica_target_offset_fast_path_rejects_gap_crossing() {
-        // offset is within first buffer, but length crosses the gap
+    fn replica_storage_target_offset_rejects_gap_crossing() {
+        // segment_offset is within the first logical buffer, but length crosses the gap
         let info = memory_segment(&[(1000, 64), (2000, 64)]);
-        let replica = make_replica("seg", 1060, 60, 16);
+        let chunks = target_chunks(&[(0, 1000, 64), (64, 2000, 64)]);
+        let replica = make_replica("seg", 60, 16);
 
-        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        let result = StoreClient::replica_storage_target_offset(&info, &chunks, &replica);
         assert!(
             result.is_err(),
-            "published target transfer that crosses a buffer gap must be rejected"
+            "logical transfer that crosses a buffer gap must be rejected"
         );
     }
 
     #[test]
-    fn remote_replica_target_offset_rejects_empty_segment_info() {
+    fn replica_storage_target_offset_rejects_empty_segment_info() {
         let info = memory_segment(&[]);
-        let replica = make_replica("seg-empty", 0, 0, 1);
+        let chunks = target_chunks(&[(0, 1000, 64)]);
+        let replica = make_replica("seg-empty", 0, 1);
 
-        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        let result = StoreClient::replica_storage_target_offset(&info, &chunks, &replica);
         assert!(result.is_err(), "empty segment info cannot satisfy a read");
+    }
+
+    #[test]
+    fn replica_storage_target_offset_uses_published_storage_chunks_not_scratch_buffers() {
+        let info = memory_segment(&[(1000, 64), (2000, 128)]);
+        let chunks = target_chunks(&[(0, 2000, 128)]);
+        let replica = make_replica("seg", 24, 32);
+
+        let result = StoreClient::replica_storage_target_offset(&info, &chunks, &replica);
+        assert_eq!(
+            result.expect("published storage target chunk should map the read"),
+            2024
+        );
     }
 
     // -----------------------------------------------------------------------

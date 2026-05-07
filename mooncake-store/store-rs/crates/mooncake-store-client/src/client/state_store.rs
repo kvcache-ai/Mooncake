@@ -39,6 +39,8 @@ impl StoreState {
     fn invalidate_remote_segment(&mut self, segment_name: &str) {
         self.remote_segments.remove(segment_name);
         self.remote_segment_infos.remove(segment_name);
+        self.segment_target_chunks
+            .retain(|(_, segment), _| segment.0 != segment_name);
     }
 
     fn reopen_segment(
@@ -47,10 +49,32 @@ impl StoreState {
         segment_name: &str,
     ) -> Result<u64> {
         self.remote_segment_infos.remove(segment_name);
+        self.segment_target_chunks
+            .retain(|(_, segment), _| segment.0 != segment_name);
         if let Some(handle) = self.remote_segments.remove(segment_name) {
             let _ = transport.close_segment(handle);
         }
         self.open_segment(transport, segment_name)
+    }
+
+    fn cached_segment_target_chunks(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+    ) -> Option<Vec<SegmentTargetChunk>> {
+        self.segment_target_chunks
+            .get(&(owner.clone(), segment_name.clone()))
+            .cloned()
+    }
+
+    fn cache_segment_target_chunks(
+        &mut self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        target_chunks: &[SegmentTargetChunk],
+    ) {
+        self.segment_target_chunks
+            .insert((owner.clone(), segment_name.clone()), target_chunks.to_vec());
     }
 
     fn open_segment_with_info(
@@ -337,7 +361,7 @@ mod state_store_tests {
     #[test]
     fn cache_stale_detects_outside_segment_error() {
         let error = StoreError::Transport(
-            "replica target offset 53686206464 length 1540096 is outside segment \
+            "segment offset 53686206464 length 1540096 is outside segment \
              sm-16--487fdbe0-ext-1 (num_buffers=1)"
                 .to_string(),
         );
@@ -400,7 +424,6 @@ mod state_store_tests {
             replicas: vec![ReplicaRoute {
                 owner: runtime.clone(),
                 segment_name: SegmentName("seg-0".to_string()),
-                offset: 0,
                 segment_offset: 0,
                 length: 1024,
                 checksum: None,

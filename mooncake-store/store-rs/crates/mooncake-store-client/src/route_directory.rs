@@ -1833,10 +1833,9 @@ fn canonical_route_key(route: &ObjectRoute) -> String {
 fn append_replica_key(key: &mut String, replica: &ReplicaRoute) {
     let _ = write!(
         key,
-        "{}|{}|{}|{}|{}|{}|{}|{};",
+        "{}|{}|{}|{}|{}|{}|{};",
         replica.owner,
         replica.segment_name.0,
-        replica.offset,
         replica.segment_offset,
         replica.length,
         replica.checksum.unwrap_or_default(),
@@ -1985,7 +1984,6 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: owner.clone(),
                 segment_name: SegmentName::new("seg-a"),
-                offset: 64,
                 segment_offset: 64,
                 length: 32,
                 checksum: None,
@@ -2154,7 +2152,6 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: owner_a.clone(),
                 segment_name: SegmentName::new("seg-a"),
-                offset: 64,
                 segment_offset: 64,
                 length: 32,
                 checksum: None,
@@ -2175,7 +2172,6 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: owner_b.clone(),
                 segment_name: SegmentName::new("seg-b"),
-                offset: 128,
                 segment_offset: 128,
                 length: 32,
                 checksum: None,
