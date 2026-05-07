@@ -397,7 +397,7 @@ parse_test_exit_code() {
     fi
 
     echo "===== Parsing test results ====="
-    if [ "$test_exit_code" -eq 0 ]; then
+    if [ "$test_exit_code" = "0" ]; then
         save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
         echo "✓ Test PASSED"
         return 0
