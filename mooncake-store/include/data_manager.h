@@ -1,11 +1,18 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
-#include <vector>
 #include <string>
 #include <string_view>
-#include <memory>
-#include <optional>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
 #include "client_buffer.hpp"
@@ -58,6 +65,20 @@ class DataManager {
     friend class DataManagerTest;
 
    public:
+    using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+
+    struct PreWriteResult {
+        RemoteBufferDesc remote_buffer;
+        uint64_t deadline_ms = 0;
+        UUID pending_write_token{0, 0};
+    };
+
+    struct PinKeyResult {
+        RemoteBufferDesc remote_buffer;
+        uint64_t deadline_ms = 0;
+        UUID pin_token{0, 0};
+    };
+
     /**
      * @brief Constructor
      * @param tiered_backend Unique pointer to TieredBackend instance (takes
@@ -70,14 +91,9 @@ class DataManager {
                 size_t lock_shard_count = 1024,
                 const LocalTransferConfig& local_transfer_config = {});
 
-    void Stop() {
-        if (async_memcpy_executor_) {
-            async_memcpy_executor_->Shutdown();
-        }
-        if (tiered_backend_) {
-            tiered_backend_->Stop();
-        }
-    }
+    ~DataManager();
+
+    void Stop();
 
     /**
      * @brief Cleanup: delegates to TieredBackend::Destroy().
@@ -187,6 +203,19 @@ class DataManager {
         std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
 
+    tl::expected<PreWriteResult, ErrorCode> PreWrite(
+        std::string_view key, size_t size_bytes,
+        std::optional<UUID> tier_id = std::nullopt);
+
+    tl::expected<void, ErrorCode> WriteCommit(
+        std::string_view key, const UUID& pending_write_token);
+
+    tl::expected<PinKeyResult, ErrorCode> PinKey(
+        std::string_view key, std::optional<UUID> tier_id = std::nullopt);
+
+    tl::expected<void, ErrorCode> UnPinKey(std::string_view key,
+                                           const UUID& pin_token);
+
     // ================================================================
     // Utilities
     // ================================================================
@@ -213,6 +242,34 @@ class DataManager {
                std::optional<UUID> tier_id = std::nullopt) const;
 
    private:
+    struct KeyCtx {
+        std::string_view key;
+        std::string key_string;
+        size_t hash = 0;
+        size_t pending_write_shard_idx = 0;
+        size_t pinned_key_shard_idx = 0;
+    };
+
+    KeyCtx BuildKeyCtx(std::string_view key) const;
+    PendingWriteShard& GetPendingWriteShard(const KeyCtx& ctx);
+    PinnedKeyShard& GetPinnedKeyShard(const KeyCtx& ctx);
+
+    tl::expected<PreWriteResult, ErrorCode> PreWriteInternal(
+        const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id);
+    tl::expected<void, ErrorCode> WriteCommitInternal(const KeyCtx& ctx,
+                                                      const UUID& pending_write_token);
+    tl::expected<PinKeyResult, ErrorCode> PinKeyInternal(
+        const KeyCtx& ctx, std::optional<UUID> tier_id);
+    tl::expected<void, ErrorCode> UnPinKeyInternal(const KeyCtx& ctx,
+                                                   const UUID& pin_token);
+
+    tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandleInternal(
+        const KeyCtx& ctx, const UUID& pending_write_token);
+    tl::expected<AllocationHandle, ErrorCode> LookupPinnedKeyHandleInternal(
+        const KeyCtx& ctx, const UUID& pin_token);
+    void AbortPendingWriteInternal(const KeyCtx& ctx,
+                                   const UUID& pending_write_token);
+
     std::shared_mutex& GetKeyLock(std::string_view key) {
         size_t hash = std::hash<std::string_view>{}(key);
         return lock_shards_[hash % lock_shard_count_];
@@ -361,6 +418,68 @@ class DataManager {
     // Wait for all tasks to reach a terminal state, then free the batch.
     void CancelBatchTETask(Transport::BatchID batch_id, size_t num_tasks);
 
+    using OrderedDeadlineList = std::list<std::pair<std::string, TimePoint>>;
+    using OrderedDeadlineListIt = OrderedDeadlineList::iterator;
+
+    struct PendingWriteRecord {
+        UUID pending_write_token{0, 0};
+        TimePoint deadline{};
+        AllocationHandle handle;
+        OrderedDeadlineListIt list_it;
+    };
+
+    struct PinnedKeyRecord {
+        UUID pin_token{0, 0};
+        TimePoint deadline{};
+        AllocationHandle handle;
+        uint32_t ref_count = 1;
+        OrderedDeadlineListIt list_it;
+    };
+
+    struct PendingWriteShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<std::string, PendingWriteRecord> by_key;
+        OrderedDeadlineList ordered_list;
+    };
+
+    struct PinnedKeyShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<std::string, PinnedKeyRecord> by_key;
+        OrderedDeadlineList ordered_list;
+    };
+
+    size_t HashKey(std::string_view key) const;
+    PendingWriteShard& GetPendingWriteShard(std::string_view key);
+    PinnedKeyShard& GetPinnedKeyShard(std::string_view key);
+    const std::chrono::milliseconds& lease_duration() const {
+        return lease_duration_;
+    }
+    uint64_t TimePointToDeadlineMs(TimePoint deadline) const;
+    TimePoint DeadlineMsToTimePoint(uint64_t deadline_ms) const;
+    bool IsExpired(TimePoint deadline) const;
+    RemoteBufferDesc BuildRemoteBufferDesc(const AllocationHandle& handle) const;
+    void LeaseScannerMain();
+    void ShutdownLeaseScanner();
+    size_t ScanExpiredPendingWrites(PendingWriteShard& shard, TimePoint now);
+    size_t ScanExpiredPinnedKeys(PinnedKeyShard& shard, TimePoint now);
+    bool ErasePendingWriteLocked(PendingWriteShard& shard,
+                                 const std::string& key);
+    bool ErasePinnedKeyLocked(PinnedKeyShard& shard, const std::string& key);
+    bool RemoveExpiredPendingWriteLocked(PendingWriteShard& shard,
+                                         const std::string& key,
+                                         TimePoint now);
+    bool RemoveExpiredPinnedKeyLocked(PinnedKeyShard& shard,
+                                      const std::string& key, TimePoint now);
+    void TouchOrderedDeadlineNode(OrderedDeadlineList& ordered_list,
+                                  OrderedDeadlineListIt it,
+                                  const std::string& key, TimePoint deadline);
+
+    tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandle(
+        std::string_view key, const UUID& pending_write_token);
+    tl::expected<AllocationHandle, ErrorCode> LookupPinnedKeyHandle(
+        std::string_view key, const UUID& pin_token);
+    void AbortPendingWrite(std::string_view key, const UUID& pending_write_token);
+
    private:
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
@@ -370,6 +489,8 @@ class DataManager {
     // (default: 1024)
     size_t lock_shard_count_;
     std::vector<std::shared_mutex> lock_shards_;
+    std::vector<PendingWriteShard> pending_write_shards_;
+    std::vector<PinnedKeyShard> pinned_key_shards_;
 
     // Callback for rectifying stale read routes
     std::function<void(std::string_view, std::optional<UUID>)>
@@ -377,6 +498,12 @@ class DataManager {
 
     LocalTransferConfig local_transfer_config_;
     std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
+    std::chrono::milliseconds lease_duration_;
+    std::chrono::milliseconds lease_scan_interval_;
+    std::atomic<bool> lease_scanner_stop_requested_{false};
+    std::condition_variable lease_scanner_cv_;
+    std::mutex lease_scanner_mutex_;
+    std::thread lease_scanner_thread_;
 };
 
 }  // namespace mooncake
