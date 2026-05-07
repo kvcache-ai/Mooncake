@@ -11,7 +11,7 @@ This document lists common errors that may occur when using Mooncake Store and p
 
 ## Metadata and Out-of-Band Communication
 1. At startup, a `TransferMetadata` object is constructed according to the incoming `metadata_server` parameter. During program execution, this object is used to communicate with the etcd server to maintain internal data required for connection.
-2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method. 
+2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method.
 
 Errors in this part usually indicate that the error occurred within the `mooncake-transfer-engine/src/transfer_metadata.cpp` file.
 
@@ -166,6 +166,31 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
      **Workaround:** restart the process periodically if fd usage climbs without bound.
 
    * **`asio::socket::close()` runs under `pool_mutex_`.** `close()` cancels outstanding async operations and posts completion handlers to the io_context. Handlers such as `returnConnection()` also acquire `pool_mutex_`, so the current code is one scheduling step away from a circular wait. No deadlock has been observed in practice, but if the transfer engine hangs with all worker threads stuck waiting on `pool_mutex_`, this is the first place to look.
+
+## Memory Allocator
+
+Mooncake Store's mmap arena is opt-in for mmap buffer allocations. Setting `MC_MMAP_ARENA_POOL_SIZE` explicitly enables it and pre-allocates a hugepage-backed pool; if it is enabled via gflag instead, the default pool size is `8gb`. If the arena cannot allocate hugepages, it falls back to regular pages automatically.
+
+If you encounter memory allocation issues related to the arena:
+
+- **HugeTLB pool is too small for the launch:** Run `python3 scripts/check_hicache_hugepage_requirements.py ...` from a source checkout, or `mooncake-hicache-sizing ...` inside the Docker image, using your `--hicache-size`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`, and `MC_MMAP_ARENA_POOL_SIZE` values. If it reports `insufficient_for_baseline`, increase `vm.nr_hugepages`, reduce `--hicache-size`, or shrink `MOONCAKE_GLOBAL_SEGMENT_SIZE`.
+- **Arena pool too large for available hugepages:** Reduce the pool size with `MC_MMAP_ARENA_POOL_SIZE="8gb"` to fit within your hugepage budget, or leave `MC_MMAP_ARENA_POOL_SIZE` unset to stay on the baseline direct-`mmap()` path.
+- **Arena only partially fits:** If the helper reports `baseline_fits_arena_may_fallback`, the baseline should start but some arena allocations may spill onto regular pages. Either increase `vm.nr_hugepages` or reduce `MC_MMAP_ARENA_POOL_SIZE`.
+- **Need to disable the arena entirely:** Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) before the first Mooncake mmap-buffer allocation to fall back to per-call `mmap()`.
+- **Arena init failed once and the process stayed on the baseline path:** Arena initialization is lazy and one-shot per process. After a failed first attempt, Mooncake keeps using direct `mmap()` until the process restarts. Fix the env / hugepage budget, then restart the process before retrying.
+- **Arena OOM during serving:** The arena logs a warning and falls back to direct `mmap()` for that allocation. If this happens frequently, increase `MC_MMAP_ARENA_POOL_SIZE`.
+- **Direct hugepage mmap fails immediately:** Verify the host really has hugepages reserved with `grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo`. When `MC_STORE_USE_HUGEPAGE=1` is set, direct `mmap()` allocations depend on the OS HugeTLB pool.
+
+To provision `2 MiB` hugepages on Linux:
+
+```bash
+sudo sysctl -w vm.nr_hugepages=49152
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+printf 'vm.nr_hugepages=49152\n' | sudo tee /etc/sysctl.d/90-mooncake-hugepages.conf
+sudo sysctl --system
+```
+
+`49152` pages equals `96 GiB`; for `512 GiB` use `262144` pages.
 
 ## SGLang Common Questions
 

@@ -40,8 +40,8 @@ class Environ {
         return enable_dest_device_affinity_;
     }
     bool GetUseIpv6() const { return use_ipv6_; }
-    int GetMinPrcPort() const { return min_prc_port_; }
-    int GetMaxPrcPort() const { return max_prc_port_; }
+    int GetMinRpcPort() const { return min_rpc_port_; }
+    int GetMaxRpcPort() const { return max_rpc_port_; }
     int GetEnableParallelRegMr() const { return enable_parallel_reg_mr_; }
     std::string GetEndpointStoreType() const { return endpoint_store_type_; }
     bool GetForceTcp() const { return force_tcp_; }
@@ -90,8 +90,8 @@ class Environ {
     int fragment_ratio_;
     bool enable_dest_device_affinity_;
     bool use_ipv6_;
-    int min_prc_port_;
-    int max_prc_port_;
+    int min_rpc_port_;
+    int max_rpc_port_;
     int enable_parallel_reg_mr_;
     std::string endpoint_store_type_;
     bool force_tcp_;
