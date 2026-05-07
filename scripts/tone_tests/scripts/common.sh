@@ -391,6 +391,10 @@ parse_test_exit_code() {
     local test_case_name=$1
     local test_exit_code=$2
 
+    if ! [[ "$test_exit_code" =~ ^[0-9]+$ ]]; then
+        test_exit_code=1
+    fi
+
     echo "===== Parsing test results ====="
     if [ "$test_exit_code" -eq 0 ]; then
         save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
