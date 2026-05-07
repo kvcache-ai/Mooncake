@@ -70,10 +70,10 @@ namespace {
 
 void markTasksWithoutSlicesFailed(
     Transport::BatchID batch_id,
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>::iterator
-        begin,
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>::iterator
-        end) {
+    std::unordered_map<Transport*,
+                       std::vector<Transport::TransferTask*>>::iterator begin,
+    std::unordered_map<Transport*,
+                       std::vector<Transport::TransferTask*>>::iterator end) {
     (void)batch_id;
     for (auto it = begin; it != end; ++it) {
         for (auto* task : it->second) {

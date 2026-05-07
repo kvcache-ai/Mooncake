@@ -497,7 +497,8 @@ class TransferSubmitter {
     static std::optional<ScatterReadBuildResult> buildScatterReadRequests(
         void* dest_buffer, const ScatterKeyRanges& key_ranges,
         bool enable_task_grouping, const char* log_context,
-        const std::function<SegmentHandle(const std::string&)>& segment_resolver);
+        const std::function<SegmentHandle(const std::string&)>&
+            segment_resolver);
 };
 
 }  // namespace mooncake

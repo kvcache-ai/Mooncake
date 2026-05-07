@@ -329,9 +329,8 @@ class Transport {
         bool is_complete() const {
             const uint64_t submitted =
                 submitted_task_count.load(std::memory_order_acquire);
-            return submitted > 0 &&
-                   finished_task_count.load(std::memory_order_acquire) ==
-                       submitted;
+            return submitted > 0 && finished_task_count.load(
+                                        std::memory_order_acquire) == submitted;
         }
 
         void publish_completion_if_ready_locked() {

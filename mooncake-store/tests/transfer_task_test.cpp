@@ -33,8 +33,8 @@ class TransferTaskTest : public ::testing::Test {
     }
 
     using ScatterRangeForTest = std::tuple<size_t, size_t, size_t>;
-    using ScatterKeyRangesForTest = std::vector<std::pair<
-        Replica::Descriptor, std::vector<ScatterRangeForTest>>>;
+    using ScatterKeyRangesForTest = std::vector<
+        std::pair<Replica::Descriptor, std::vector<ScatterRangeForTest>>>;
 
     std::optional<TransferSubmitter::ScatterReadBuildResult>
     buildScatterReadRequestsForTest(void* dest_buffer,
@@ -184,8 +184,7 @@ TEST_F(TransferTaskTest, ScatterReadGroupingReducesLogicalTasks) {
     char dest[4096];
     auto replica = makeMemoryReplica("remote", 0x100000, sizeof(dest));
     ScatterKeyRangesForTest key_ranges{
-        {replica,
-         {{0, 0, 256}, {512, 1024, 128}, {1024, 2048, 512}}},
+        {replica, {{0, 0, 256}, {512, 1024, 128}, {1024, 2048, 512}}},
     };
 
     auto ungrouped = buildScatterReadRequestsForTest(dest, key_ranges, false);
@@ -193,8 +192,7 @@ TEST_F(TransferTaskTest, ScatterReadGroupingReducesLogicalTasks) {
     EXPECT_EQ(ungrouped->flat_requests.size(), 3u);
     EXPECT_EQ(ungrouped->logical_task_count, 3u);
     for (const auto& request : ungrouped->flat_requests) {
-        EXPECT_EQ(request.task_group_id,
-                  TransferRequest::kNoTaskGroup);
+        EXPECT_EQ(request.task_group_id, TransferRequest::kNoTaskGroup);
     }
 
     auto grouped = buildScatterReadRequestsForTest(dest, key_ranges, true);
@@ -202,8 +200,7 @@ TEST_F(TransferTaskTest, ScatterReadGroupingReducesLogicalTasks) {
     EXPECT_EQ(grouped->flat_requests.size(), 3u);
     EXPECT_EQ(grouped->logical_task_count, 1u);
     for (const auto& request : grouped->flat_requests) {
-        EXPECT_NE(request.task_group_id,
-                  TransferRequest::kNoTaskGroup);
+        EXPECT_NE(request.task_group_id, TransferRequest::kNoTaskGroup);
         EXPECT_EQ(request.target_id, grouped->flat_requests[0].target_id);
     }
 }
