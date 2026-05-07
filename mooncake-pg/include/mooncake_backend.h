@@ -241,6 +241,14 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     bool connectionPollerRegistered_{false};
 };
 
+struct ExtensionState {
+    std::vector<bool> activeRanks;
+    std::vector<uint32_t> p2pEpochs;
+    int taskCount = -1;
+};
+std::vector<uint8_t> serialize(const ExtensionState& state);
+ExtensionState deserialize(const std::vector<uint8_t>& buffer);
+
 }  // namespace mooncake
 
 #endif  // MOONCAKE_BACKEND_H

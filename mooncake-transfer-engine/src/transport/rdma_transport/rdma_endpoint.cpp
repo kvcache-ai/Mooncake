@@ -37,7 +37,13 @@ RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
       cq_outstanding_(nullptr) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
-    if (!qp_list_.empty()) deconstruct();
+    if (!qp_list_.empty()) {
+        // In normal flow, beginDestroy()+finishDestroy() should have been
+        // called already via endpoint_store. This is a fallback for abnormal
+        // shutdown (e.g., process exit).
+        RWSpinlock::WriteGuard guard(lock_);
+        deconstructLocked();
+    }
 }
 
 int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
@@ -91,7 +97,8 @@ int RdmaEndPoint::reconstruct() {
     auto max_inline_bytes = max_inline_bytes_;
 
     // Deconstruct and reconstruct to get fresh QPs (same as delete+create)
-    int ret = deconstruct();
+    // Use deconstructLocked because callers already hold lock_
+    int ret = deconstructLocked();
     if (ret) {
         LOG(ERROR) << "Failed to deconstruct endpoint: " << ret;
         return ret;
@@ -113,13 +120,15 @@ int RdmaEndPoint::reconstruct() {
 }
 
 int RdmaEndPoint::deconstruct() {
+    RWSpinlock::WriteGuard guard(lock_);
+    return deconstructLocked();
+}
+
+int RdmaEndPoint::deconstructLocked() {
+    // Adjust cq_outstanding_ before destroying QPs, so the counter is
+    // always corrected even if ibv_destroy_qp fails and we return early.
+    bool displayed = false;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (ibv_destroy_qp(qp_list_[i])) {
-            PLOG(ERROR) << "Failed to destroy QP";
-            return ERR_ENDPOINT;
-        }
-        // After destroying QP, the wr_depth_list_ won't change
-        bool displayed = false;
         if (wr_depth_list_[i] != 0) {
             if (!displayed) {
                 LOG(WARNING) << "Outstanding work requests found, CQ will not "
@@ -130,13 +139,111 @@ int RdmaEndPoint::deconstruct() {
             wr_depth_list_[i] = 0;
         }
     }
+
+    int result = 0;
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        if (!qp_list_[i]) continue;  // already destroyed in a previous call
+        if (ibv_destroy_qp(qp_list_[i])) {
+            PLOG(ERROR) << "Failed to destroy QP[" << i << "]";
+            result = ERR_ENDPOINT;
+        } else {
+            qp_list_[i] = nullptr;
+        }
+    }
+
+    if (result) return result;
+
     qp_list_.clear();
     peer_qp_num_list_.clear();
     delete[] wr_depth_list_;
+    wr_depth_list_ = nullptr;
     return 0;
 }
 
 int RdmaEndPoint::destroyQP() { return deconstruct(); }
+
+void RdmaEndPoint::beginDestroy() {
+    RWSpinlock::WriteGuard guard(lock_);
+    auto current_status = status_.load(std::memory_order_relaxed);
+    if (current_status == DESTROYING || current_status == DESTROYED) return;
+
+    active_ = false;
+    inactive_time_ = getCurrentTimeInNano();
+    status_.store(DESTROYING, std::memory_order_release);
+
+    // Transition QPs to ERR state so hardware flushes all inflight WRs to CQ.
+    // This allows performPollCq to drain them naturally.
+    ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_ERR;
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE)) {
+            PLOG(WARNING) << "Failed to modify QP to ERR during beginDestroy";
+        }
+    }
+}
+
+bool RdmaEndPoint::finishDestroy() {
+    RWSpinlock::WriteGuard guard(lock_);
+    auto current_status = status_.load(std::memory_order_relaxed);
+
+    // Gate 1: already done.
+    if (current_status == DESTROYED) return true;
+
+    // Gate 2: non-two-phase path (status != DESTROYING). The endpoint
+    // reached waiting_list_ without going through beginDestroy(). This is
+    // the contract expected by EndpointStore::testOnlyInsertWaiting() and
+    // serves as a safety net for any future non-two-phase path. Mirror the
+    // pre-two-phase predicate (!hasOutstandingSlice == !active_): only
+    // inactive endpoints are eligible for reclaim; active ones must stay.
+    if (current_status != DESTROYING) {
+        if (active_) return false;
+        // Endpoints that never reached construct() own no RDMA resources
+        // and have wr_depth_list_ uninitialized; deconstructLocked() would
+        // delete[] a wild pointer. Drop them directly.
+        if (qp_list_.empty()) {
+            status_.store(DESTROYED, std::memory_order_relaxed);
+            return true;
+        }
+        LOG(WARNING) << "finishDestroy called in unexpected state: "
+                     << current_status
+                     << ", forcing destruction to avoid waiting_list_ leak";
+        // Fall through to the unified destroy path.
+    } else {
+        // Gate 3: two-phase path. Wait for inflight WRs to drain via CQ
+        // polling. If ibv_modify_qp-to-ERR failed in beginDestroy, WRs may
+        // never be flushed; enforce a timeout to avoid leaking forever.
+        bool has_outstanding = false;
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            if (wr_depth_list_[i] != 0) {
+                has_outstanding = true;
+                break;
+            }
+        }
+        if (has_outstanding) {
+            double elapsed = (getCurrentTimeInNano() - inactive_time_) / 1e9;
+            if (elapsed < kFinishDestroyTimeoutSec) return false;
+            LOG(WARNING) << "finishDestroy timed out after " << elapsed
+                         << "s with outstanding WRs, forcing destruction";
+        }
+    }
+
+    // Unified destroy: tear down QPs (deconstructLocked handles
+    // cq_outstanding_ adjustment internally) and bound retries to avoid
+    // log flooding when ibv_destroy_qp fails permanently.
+    int ret = deconstructLocked();
+    if (ret) {
+        finish_destroy_retries_++;
+        LOG(ERROR) << "Failed to finish destroying endpoint (attempt "
+                   << finish_destroy_retries_ << "/" << kFinishDestroyMaxRetries
+                   << "): " << ret;
+        if (finish_destroy_retries_ < kFinishDestroyMaxRetries) return false;
+        LOG(ERROR) << "Giving up after " << finish_destroy_retries_
+                   << " retries (possible resource leak)";
+    }
+    status_.store(DESTROYED, std::memory_order_relaxed);
+    return true;
+}
 
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
@@ -459,22 +566,24 @@ const std::string RdmaEndPoint::toString() const {
     if (status == CONNECTED)
         return "EndPoint: local " + context_.nicPath() + ", peer " +
                peer_nic_path_;
+    else if (status == DESTROYING)
+        return "EndPoint: local " + context_.nicPath() + ", peer " +
+               peer_nic_path_ + " (destroying)";
+    else if (status == DESTROYED)
+        return "EndPoint: local " + context_.nicPath() + " (destroyed)";
     else
         return "EndPoint: local " + context_.nicPath() + " (unconnected)";
-}
-
-bool RdmaEndPoint::hasOutstandingSlice() const {
-    if (active_) return true;
-    for (size_t i = 0; i < qp_list_.size(); i++)
-        if (wr_depth_list_[i] != 0) return true;
-    return false;
 }
 
 int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_) return 0;
+    if (!active_ || status_.load(std::memory_order_relaxed) != CONNECTED) {
+        for (auto &slice : slice_list) failed_slice_list.push_back(slice);
+        slice_list.clear();
+        return 0;
+    }
 
     const size_t num_qp = qp_list_.size();
     if (slice_list.empty()) return 0;
