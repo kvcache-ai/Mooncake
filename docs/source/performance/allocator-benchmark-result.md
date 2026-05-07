@@ -36,9 +36,8 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 
 **OffsetAllocator (After Optimization)**
 
-
 | Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
-| ---------- | -------------- | -------------- | --------- |
+|------------|----------------|----------------|-----------|
 | 32         | 1              | 1              | 544       |
 | 128        | 1              | 1              | 417       |
 | 512        | 1              | 1              | 174       |
@@ -51,12 +50,10 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 | 8388608    | 1              | 1              | 99        |
 | 33554432   | 1              | 1              | 98        |
 
-
 **OffsetAllocator (Before Optimization)**
 
-
 | Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
-| ---------- | -------------- | -------------- | --------- |
+|------------|----------------|----------------|-----------|
 | 32         | 1              | 1              | 539       |
 | 128        | 1              | 1              | 419       |
 | 512        | 1              | 1              | 217       |
@@ -69,14 +66,12 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 | 8388608    | 1              | 1              | 98        |
 | 33554432   | 1              | 1              | 98        |
 
-
 ### Uniform size, size equals power of 2 +/- 17
 
 **OffsetAllocator (After Optimization)**
 
-
 | Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
-| ---------- | -------------- | -------------- | --------- |
+|------------|----------------|----------------|-----------|
 | 15         | 1              | 1              | 568       |
 | 111        | 0.991071       | 0.991071       | 441       |
 | 495        | 0.966797       | 0.966797       | 178       |
@@ -100,12 +95,10 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 | 8388625    | 0.886721       | 0.886721       | 100       |
 | 33554449   | 0.875          | 0.875          | 100       |
 
-
 **OffsetAllocator (Before Optimization)**
 
-
 | Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
-| ---------- | -------------- | -------------- | --------- |
+|------------|----------------|----------------|-----------|
 | 15         | 1              | 1              | 566       |
 | 111        | 0.669866       | 0.710845       | 703       |
 | 495        | 0.665779       | 0.676874       | 238       |
@@ -129,14 +122,12 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 | 8388625    | 0.60547        | 0.665131       | 121       |
 | 33554449   | 0.546875       | 0.660917       | 120       |
 
-
 ### Uniform size, size equals power of 2 multiply 0.9 or 1.1
 
 **OffsetAllocator (After Optimization)**
 
-
 | Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
-| ---------- | -------------- | -------------- | --------- |
+|------------|----------------|----------------|-----------|
 | 28         | 1              | 1              | 543       |
 | 115        | 0.958333       | 0.958333       | 418       |
 | 460        | 0.958332       | 0.958332       | 189       |
@@ -160,12 +151,10 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 | 9227468    | 0.975391       | 0.975391       | 99        |
 | 36909875   | 0.9625         | 0.9625         | 100       |
 
-
 **OffsetAllocator (Before Optimization)**
 
-
 | Alloc Size | Min Util Ratio | Avg Util Ratio | Time (ns) |
-| ---------- | -------------- | -------------- | --------- |
+|------------|----------------|----------------|-----------|
 | 28         | 1              | 1              | 539       |
 | 115        | 0.669299       | 0.709245       | 701       |
 | 460        | 0.665825       | 0.677532       | 255       |
@@ -189,7 +178,6 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 | 9227468    | 0.597266       | 0.666037       | 118       |
 | 36909875   | 0.55           | 0.669564       | 121       |
 
-
 ### Random Size
 
 **OffsetAllocator (After Optimization)**
@@ -198,6 +186,14 @@ To address this, we introduced targeted optimizations for uniform-size workloads
 util ratio (min / p99 / p90 / p50 / max / avg):
 0.544250 / 0.713338 / 0.779739 / 0.847867 / 0.952591 / 0.841576
 avg alloc time: 145.575738 ns/op
+```
+
+**OffsetAllocator (Before Optimization)**
+
+```
+util ratio (min / p99 / p90 / p50 / max / avg):
+0.569255 / 0.712076 / 0.781224 / 0.855046 / 0.976057 / 0.848873
+avg alloc time: 142.508508 ns/op
 ```
 
 **OffsetAllocator (Before Optimization)**
