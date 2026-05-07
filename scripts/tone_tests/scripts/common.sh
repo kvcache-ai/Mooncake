@@ -392,6 +392,7 @@ parse_test_exit_code() {
     local test_exit_code=$2
 
     if ! [[ "$test_exit_code" =~ ^[0-9]+$ ]]; then
+        echo "Warning: Invalid exit code '$test_exit_code', treating as failure" >&2
         test_exit_code=1
     fi
 
