@@ -8299,6 +8299,49 @@ fn storage_owner_clock_evicts_cold_local_replicas_before_hot_ones() {
 }
 
 #[test]
+fn query_route_marks_local_replica_hot_for_eviction() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("query-hot-local-segment"));
+    let client = StoreClientBuilder::new(metadata, "query-hot-local")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    client
+        .put("query-hot", b"0123456789abcdef")
+        .expect("hot put should succeed");
+    client
+        .put("query-cold", b"fedcba9876543210")
+        .expect("cold put should succeed");
+    assert!(client
+        .query_route("query-hot")
+        .expect("query route should succeed")
+        .is_some());
+
+    client
+        .put("query-fresh", b"abcdefghijklmnop")
+        .expect("fresh put should trigger eviction and succeed");
+    assert!(client
+        .query_route("query-hot")
+        .expect("hot route query should succeed")
+        .is_some());
+    assert!(client
+        .query_route("query-fresh")
+        .expect("fresh route query should succeed")
+        .is_some());
+    assert!(client
+        .query_route("query-cold")
+        .expect("cold route query should succeed")
+        .is_none());
+}
+
+#[test]
 fn remote_hit_reports_drive_storage_owner_clock_eviction() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let storage_transport = Arc::new(TestTransport::new("clock-remote-storage-segment"));
@@ -8369,6 +8412,77 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
             .expect("fresh object should be readable"),
         fresh
     );
+}
+
+#[test]
+fn batch_is_exist_marks_remote_replicas_hot_for_eviction() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("exists-hot-remote-storage-segment"));
+    let router_transport = Arc::new(storage_transport.peer("exists-hot-remote-router-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "exists-hot-remote-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let router = StoreClientBuilder::new(metadata.clone(), "exists-hot-remote-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+
+    wait_for_membership_convergence(&[&storage, &router]);
+
+    let hot = b"0123456789abcdef";
+    let cold = b"fedcba9876543210";
+    let fresh = b"abcdefghijklmnop";
+
+    router
+        .put("remote-exists-hot", hot)
+        .expect("hot put should succeed");
+    router
+        .put("remote-exists-cold", cold)
+        .expect("cold put should succeed");
+    assert_eq!(
+        router
+            .batch_is_exist(&[ObjectRef::new("remote-exists-hot")])
+            .expect("batch_is_exist should succeed"),
+        vec![true]
+    );
+
+    let fresh_route = router
+        .put("remote-exists-fresh", fresh)
+        .expect("fresh put should trigger remote eviction and succeed");
+    assert_eq!(fresh_route.replicas[0].owner, storage.runtime_id().clone());
+    assert_eq!(
+        router
+            .get("remote-exists-hot")
+            .expect("hot object should remain readable"),
+        hot
+    );
+    assert!(matches!(
+        router.get("remote-exists-cold"),
+        Err(StoreError::NotFound(_))
+    ));
 }
 
 #[test]

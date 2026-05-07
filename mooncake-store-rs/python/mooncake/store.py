@@ -842,6 +842,12 @@ class MooncakeDistributedStore:
             expires_at_ms=_coerce_optional_int(config.get("expires_at_ms")),
             use_hugepage=_coerce_optional_bool(config.get("use_hugepage")),
             hugepage_size=_normalize_hugepage_size(config.get("hugepage_size")),
+            eviction_high_watermark_percent=_coerce_optional_int(
+                config.get("eviction_high_watermark_percent")
+            ),
+            eviction_low_watermark_percent=_coerce_optional_int(
+                config.get("eviction_low_watermark_percent")
+            ),
             route_control=str(config.get("route_control", "embedded_wrh")),
         )
         _start_metrics_server_from_env()
@@ -996,6 +1002,14 @@ _SETUP_ENV_DEFAULTS = {
     "transport_backend": ("MC_STORE_RS_TRANSPORT_BACKEND", _coerce_optional_str),
     "local_segment_name": ("MC_STORE_RS_LOCAL_SEGMENT_NAME", _coerce_optional_str),
     "expires_at_ms": ("MC_STORE_RS_EXPIRES_AT_MS", _coerce_optional_int),
+    "eviction_high_watermark_percent": (
+        "MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT",
+        _coerce_optional_int,
+    ),
+    "eviction_low_watermark_percent": (
+        "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT",
+        _coerce_optional_int,
+    ),
     "route_control": ("MC_STORE_RS_ROUTE_CONTROL", _coerce_optional_str),
 }
 

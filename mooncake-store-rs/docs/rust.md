@@ -168,6 +168,12 @@ The Rust client supports both object-oriented and buffer-oriented paths.
 - `batch_put`, `batch_get`, `batch_remove`
 - `is_exist`, `batch_is_exist`, `get_size`
 
+`query_route`, `get_size`, `is_exist`, and `batch_is_exist` are treated as access
+signals when they find active routes. They report route hits to the storage owners
+best-effort through the same CLOCK hit-report path used by reads, so applications that
+probe keys before restore do not lose hot pages to background eviction between the probe
+and the later read.
+
 ### Registered-buffer APIs
 
 - `register_buffer`

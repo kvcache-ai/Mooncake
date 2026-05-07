@@ -2607,6 +2607,42 @@ impl StoreClient {
                     .insert(key);
             }
         }
+        self.report_grouped_route_hits_best_effort(local_hits, remote_hits, true);
+    }
+
+    fn report_route_hits_best_effort<'a>(
+        &self,
+        routes: impl IntoIterator<Item = &'a ObjectRoute>,
+    ) {
+        let mut local_hits = BTreeSet::new();
+        let mut remote_hits = BTreeMap::<ClientRuntimeId, BTreeSet<ObjectKey>>::new();
+        for route in routes {
+            if route.state != RouteState::Active {
+                continue;
+            }
+            for replica in &route.replicas {
+                if replica.owner == self.lease.runtime {
+                    local_hits.insert(route.key.clone());
+                } else {
+                    remote_hits
+                        .entry(replica.owner.clone())
+                        .or_default()
+                        .insert(route.key.clone());
+                }
+            }
+        }
+        self.report_grouped_route_hits_best_effort(local_hits, remote_hits, false);
+    }
+
+    fn report_grouped_route_hits_best_effort(
+        &self,
+        local_hits: BTreeSet<ObjectKey>,
+        remote_hits: BTreeMap<ClientRuntimeId, BTreeSet<ObjectKey>>,
+        force_membership_refresh_on_miss: bool,
+    ) {
+        if local_hits.is_empty() && remote_hits.is_empty() {
+            return;
+        }
         if !local_hits.is_empty() {
             let local_hits = local_hits.into_iter().collect::<Vec<_>>();
             let _ = self.storage_owner.report_route_hits(&local_hits);
@@ -2614,7 +2650,12 @@ impl StoreClient {
         if remote_hits.is_empty() {
             return;
         }
-        let leases = match self.lookup_runtime_leases(remote_hits.keys().cloned()) {
+        let leases = if force_membership_refresh_on_miss {
+            self.lookup_runtime_leases(remote_hits.keys().cloned())
+        } else {
+            self.lookup_cached_runtime_leases_best_effort(remote_hits.keys().cloned())
+        };
+        let leases = match leases {
             Ok(leases) => leases,
             Err(error) => {
                 debug!(

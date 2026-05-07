@@ -73,6 +73,13 @@ This mode:
 - supports routed writes, replication policy, segment lifecycle, metrics, and tracing
 - is the normal path for Python clients that should behave like store-rs nodes
 
+`setup(...)` accepts `eviction_high_watermark_percent=` and
+`eviction_low_watermark_percent=` for storage-role runtimes. The same values can come from
+`MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` and
+`MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT`. They feed the Rust `LocalMemoryConfig` directly;
+the high watermark must be in `1..=100`, and the low watermark must be lower than the high
+watermark.
+
 ### Dummy mode
 
 Use `setup_dummy(...)` when Python should behave like the upstream dummy compatibility client.
