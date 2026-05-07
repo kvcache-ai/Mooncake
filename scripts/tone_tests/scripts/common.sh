@@ -397,15 +397,18 @@ parse_test_exit_code() {
     fi
 
     echo "===== Parsing test results ====="
-    if [ "$test_exit_code" = "0" ]; then
-        save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
-        echo "✓ Test PASSED"
-        return 0
-    else
-        save_test_result "$test_case_name" "Fail" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
-        echo "✗ Test FAILED"
-        return 1
-    fi
+    case "$test_exit_code" in
+        0)
+            save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
+            echo "✓ Test PASSED"
+            return 0
+            ;;
+        *)
+            save_test_result "$test_case_name" "Fail" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
+            echo "✗ Test FAILED"
+            return 1
+            ;;
+    esac
 }
 
 run_test_case_with_parse() {
@@ -418,7 +421,6 @@ run_test_case_with_parse() {
     fi
 
     parse_test_exit_code "$test_case_name" "$exit_code"
-    return $?
 }
 
 parse_model_results() {
