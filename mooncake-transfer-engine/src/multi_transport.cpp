@@ -124,17 +124,11 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
         }
     }
 #ifdef CONFIG_USE_BATCH_DESC_SET
-    bool present = false;
-    {
-        RWSpinlock::ReadGuard guard(batch_desc_lock_);
-        present = batch_desc_set_.find(batch_id) != batch_desc_set_.end();
-    }
-    if (present) {
-        RWSpinlock::WriteGuard guard(batch_desc_lock_);
-        batch_desc_set_.erase(batch_id);
-    }
-#endif
+    RWSpinlock::WriteGuard guard(batch_desc_lock_);
+    batch_desc_set_.erase(batch_id);
+#else
     delete &batch_desc;
+#endif
     return Status::OK();
 }
 

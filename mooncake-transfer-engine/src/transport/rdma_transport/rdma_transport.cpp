@@ -513,6 +513,8 @@ Status RdmaTransport::submitTransferTask(
                 slice->status = Slice::PENDING;
                 slice->ts = 0;
                 task.slice_list.push_back(slice);
+                task.total_bytes += slice->length;
+                __sync_fetch_and_add(&task.slice_count, 1);
 
                 int buffer_id = -1, device_id = -1,
                     retry_cnt = request.advise_retry_cnt;
@@ -568,8 +570,6 @@ Status RdmaTransport::submitTransferTask(
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
 
                 if (local_nr_slices >= kSubmitWatermark) {
                     for (auto &entry : slices_to_post) {
