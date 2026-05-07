@@ -64,6 +64,32 @@ else
     echo "Skipping test: MOONCAKE_STORAGE_ROOT_DIR environment variable is not set"
 fi
 
+if [ -n "$TEST_LOCAL_DISK_GET" ]; then
+    TEST_ROOT_DIR="/tmp/mooncake_test_local_disk_get"
+    mkdir -p $TEST_ROOT_DIR
+    echo "Running LOCAL_DISK store.get e2e test..."
+    # enable_offload + root_fs_dir lets the client init FileStorage and
+    # produce LOCAL_DISK replicas during eviction. The bucket-flush
+    # thresholds are lowered via env vars so a small workload actually
+    # flushes (defaults are 500 keys / 256 MB which never fire here).
+    mooncake_master \
+        --default_kv_lease_ttl=500 \
+        --root_fs_dir=$TEST_ROOT_DIR \
+        --enable_offload=true &
+    MASTER_PID=$!
+    sleep 1
+    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+        DEFAULT_KV_LEASE_TTL=500 \
+        MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_ROOT_DIR \
+        MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT=10 \
+        MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
+        python test_local_disk_get.py
+    kill $MASTER_PID || true
+    rm -rf $TEST_ROOT_DIR
+else
+    echo "Skipping test: TEST_LOCAL_DISK_GET environment variable is not set"
+fi
+
 echo "Running CXL protocol test (test_distributed_object_store_cxl.py)..."
 killall mooncake_master || true
 sleep 2

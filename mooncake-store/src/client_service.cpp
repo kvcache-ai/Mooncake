@@ -2655,9 +2655,22 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
         total_size = mem_desc.buffer_descriptor.size_;
-    } else {
+    } else if (replica_descriptor.is_disk_replica()) {
         auto& disk_desc = replica_descriptor.get_disk_descriptor();
         total_size = disk_desc.object_size;
+    } else if (replica_descriptor.is_local_disk_replica()) {
+        // LOCAL_DISK reads do not flow through the local TransferSubmitter:
+        // the bytes live on a peer client's SSD, reachable only via that
+        // client's offload RPC server. The caller (RealClient's
+        // get_buffer_internal / batch_get_into) routes such reads through
+        // the offload-RPC path before reaching here; if we get here, the
+        // routing is wrong.
+        LOG(ERROR) << "TransferRead does not support LOCAL_DISK replicas; "
+                   << "caller must route via the offload RPC path";
+        return ErrorCode::INVALID_REPLICA;
+    } else {
+        LOG(ERROR) << "TransferRead: unknown replica descriptor type";
+        return ErrorCode::INVALID_REPLICA;
     }
 
     size_t slices_size = CalculateSliceSize(slices);

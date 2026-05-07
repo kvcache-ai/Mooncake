@@ -2339,7 +2339,28 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    const auto &replica = res.value();
+    Replica::Descriptor replica = res.value();
+    // GetPreferredReplica's fallback returns replica_list[0] without
+    // checking ReplicaStatus. The lower-level Client::Get re-selects via
+    // FindFirstCompleteReplica which *does* filter by COMPLETE — so when
+    // replica_list[0] is PROCESSING (e.g., DISK during the async
+    // PutEnd(DISK) window after a put), the two layers disagree: the
+    // outer get_buffer_internal allocates and dispatches based on the
+    // PROCESSING replica, while the inner Client::Get tries to read from
+    // a different (COMPLETE) replica. The mismatch surfaces as either a
+    // crash (pre any TransferRead fix) or silently wrong/empty data.
+    //
+    // Defend by re-selecting via the same helper Client::Get uses, so
+    // both layers agree on the COMPLETE replica.
+    if (replica.status != ReplicaStatus::COMPLETE) {
+        if (client_->FindFirstCompleteReplica(replica_list, replica) !=
+            ErrorCode::OK) {
+            LOG(ERROR) << "No COMPLETE replica for key: " << key
+                       << " (preferred replica is in status "
+                       << static_cast<int>(replica.status) << ")";
+            return nullptr;
+        }
+    }
     uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
@@ -2359,8 +2380,40 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     std::vector<Slice> slices;
     allocateSlices(slices, replica, buffer_handle.ptr());
 
-    // Get the object data
-    auto get_result = client_->Get(key, query_result.value(), slices);
+    // LOCAL_DISK replicas live on a peer client's SSD and are reachable
+    // only through that client's offload RPC server, not via the local
+    // TransferSubmitter that client_->Get uses. Route to the same offload
+    // path that batch_get_into already uses for LOCAL_DISK-only keys.
+    if (replica.is_local_disk_replica()) {
+        if (slices.size() != 1) {
+            LOG(ERROR) << "Expected single staging slice for LOCAL_DISK read; "
+                       << "got " << slices.size() << " for key: " << key;
+            return nullptr;
+        }
+        const auto &ld_desc = replica.get_local_disk_descriptor();
+        std::unordered_map<std::string, Slice> single_obj;
+        single_obj.emplace(key, slices[0]);
+        auto offload_result = batch_get_into_offload_object_internal(
+            ld_desc.transport_endpoint, single_obj);
+        if (!offload_result) {
+            LOG(ERROR) << "LOCAL_DISK offload-RPC read failed for key: " << key
+                       << " with error: " << toString(offload_result.error());
+            return nullptr;
+        }
+        return std::make_shared<BufferHandle>(std::move(buffer_handle));
+    }
+
+    // MEMORY / DISK path goes through the TransferSubmitter as before.
+    // Pass a single-replica QueryResult so Client::Get internal
+    // FindFirstCompleteReplica picks the same replica we already
+    // allocated slices for; otherwise the two layers can disagree (we
+    // size for one descriptor and read into a different one) and the
+    // caller silently gets wrong or empty bytes.
+    std::vector<Replica::Descriptor> chosen_only;
+    chosen_only.push_back(replica);
+    QueryResult chosen_qr(std::move(chosen_only),
+                          query_result.value().lease_timeout);
+    auto get_result = client_->Get(key, chosen_qr, slices);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
