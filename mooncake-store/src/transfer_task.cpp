@@ -782,10 +782,16 @@ TransferSubmitter::buildScatterReadRequests(
         }
 
         uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-        const uint64_t task_group_id = enable_task_grouping
-                                           ? next_task_group_id++
-                                           : TransferRequest::kNoTaskGroup;
         size_t non_empty_range_count = 0;
+        for (const auto& range : ranges) {
+            if (std::get<2>(range) > 0) {
+                ++non_empty_range_count;
+            }
+        }
+        const uint64_t task_group_id =
+            enable_task_grouping && non_empty_range_count > 1
+                ? next_task_group_id++
+                : TransferRequest::kNoTaskGroup;
 
         for (const auto& [dest_offset, src_offset, size] : ranges) {
             if (size == 0) {
@@ -799,12 +805,13 @@ TransferSubmitter::buildScatterReadRequests(
             request.length = size;
             request.task_group_id = task_group_id;
             result.flat_requests.emplace_back(request);
-            ++non_empty_range_count;
         }
 
         if (non_empty_range_count > 0) {
             result.logical_task_count +=
-                enable_task_grouping ? 1 : non_empty_range_count;
+                task_group_id == TransferRequest::kNoTaskGroup
+                    ? non_empty_range_count
+                    : 1;
         }
     }
 

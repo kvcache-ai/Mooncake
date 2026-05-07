@@ -215,6 +215,21 @@ TEST_F(TransferTaskTest, ScatterReadGroupingReducesLogicalTasks) {
     }
 }
 
+TEST_F(TransferTaskTest, ScatterReadGroupingKeepsSingleRangeUngrouped) {
+    char dest[4096];
+    auto replica = makeMemoryReplica("remote", 0x100000, sizeof(dest));
+    ScatterKeyRangesForTest key_ranges{
+        {replica, {{0, 0, 256}}},
+    };
+
+    auto grouped = buildScatterReadRequestsForTest(dest, key_ranges, true);
+    ASSERT_TRUE(grouped.has_value());
+    ASSERT_EQ(grouped->flat_requests.size(), 1u);
+    EXPECT_EQ(grouped->logical_task_count, 1u);
+    EXPECT_EQ(grouped->flat_requests[0].task_group_id,
+              TransferRequest::kNoTaskGroup);
+}
+
 TEST_F(TransferTaskTest, ScatterReadGroupingSeparatesReplicaGroups) {
     char dest[4096];
     auto replica_a = makeMemoryReplica("remote-a", 0x100000, sizeof(dest));

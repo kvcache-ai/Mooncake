@@ -257,6 +257,7 @@ class Transport {
         bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
+        bool is_submitted = false;
 
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;
@@ -286,9 +287,7 @@ class Transport {
                 __atomic_load_n(&transferred_bytes, __ATOMIC_ACQUIRE);
 
             auto &batch_desc = toBatchDesc(batch_id);
-#ifdef USE_EVENT_DRIVEN_COMPLETION
             std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
-#endif
             if (final_failed_slice_count > 0) {
                 batch_desc.has_failure.store(true, std::memory_order_release);
             }
@@ -296,8 +295,8 @@ class Transport {
                 final_transferred_bytes, std::memory_order_release);
             batch_desc.finished_task_count.fetch_add(1,
                                                      std::memory_order_release);
-#ifdef USE_EVENT_DRIVEN_COMPLETION
             batch_desc.publish_completion_if_ready_locked();
+#ifdef USE_EVENT_DRIVEN_COMPLETION
             batch_desc.completion_cv.notify_all();
 #endif
         }
@@ -320,6 +319,7 @@ class Transport {
         // Mutable batch lifecycle state for incremental append-style submit.
         mutable std::mutex lifecycle_mutex;
         std::atomic<uint64_t> submitted_task_count{0};
+        std::atomic<uint64_t> active_submit_count{0};
         std::atomic<bool> sealed{false};
 
         // Track batch progress and notifies waiters

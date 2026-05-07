@@ -397,7 +397,7 @@ TEST_F(TaskGroupingTest, PartialBatchCompletesWhenSubmittedTasksComplete) {
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 
-TEST_F(TaskGroupingTest, ZeroSliceTaskCompletesAndIsFreeable) {
+TEST_F(TaskGroupingTest, ZeroLengthTaskCompletesAndIsFreeable) {
     constexpr Transport::SegmentID kTargetSegmentId = 1;
     auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "rdma");
     std::string local_server_name = "local";
@@ -411,7 +411,7 @@ TEST_F(TaskGroupingTest, ZeroSliceTaskCompletesAndIsFreeable) {
     entries[0].source = nullptr;
     entries[0].target_id = kTargetSegmentId;
     entries[0].target_offset = 0;
-    entries[0].length = 4096;
+    entries[0].length = 0;
 
     auto batch_id = multi_transport.allocateBatchID(1);
     auto submit_status = multi_transport.submitTransfer(batch_id, entries);
@@ -424,7 +424,34 @@ TEST_F(TaskGroupingTest, ZeroSliceTaskCompletesAndIsFreeable) {
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 
-TEST_F(TaskGroupingTest, EmptyBatchCompletesAndIsFreeable) {
+TEST_F(TaskGroupingTest, EmptyBatchStatusDoesNotSealFreshBatch) {
+    constexpr Transport::SegmentID kTargetSegmentId = 1;
+    auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "rdma");
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+
+    auto batch_id = multi_transport.allocateBatchID(1);
+
+    Transport::TransferStatus status{};
+    auto status_ret = multi_transport.getBatchTransferStatus(batch_id, status);
+    EXPECT_TRUE(status_ret.ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::WAITING);
+
+    auto recording_transport =
+        std::make_shared<RecordingTransport>("rdma", true);
+    multi_transport.transport_map_["rdma"] = recording_transport;
+    std::vector<Transport::TransferRequest> entries(1);
+    entries[0].opcode = Transport::TransferRequest::READ;
+    entries[0].source = reinterpret_cast<void *>(0x1000);
+    entries[0].target_id = kTargetSegmentId;
+    entries[0].target_offset = 0;
+    entries[0].length = 1024;
+    auto submit_status = multi_transport.submitTransfer(batch_id, entries);
+    EXPECT_TRUE(submit_status.ok());
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(TaskGroupingTest, ZeroCapacityBatchCompletesOnAllocate) {
     auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
     std::string local_server_name = "local";
     TestableMultiTransport multi_transport(metadata, local_server_name);
@@ -438,20 +465,45 @@ TEST_F(TaskGroupingTest, EmptyBatchCompletesAndIsFreeable) {
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 
-TEST_F(TaskGroupingTest, EmptySubmitCompletesAndIsFreeable) {
+TEST_F(TaskGroupingTest, EmptySubmitOnZeroCapacityBatchIsIdempotent) {
     auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
     std::string local_server_name = "local";
     TestableMultiTransport multi_transport(metadata, local_server_name);
 
     auto batch_id = multi_transport.allocateBatchID(0);
     std::vector<Transport::TransferRequest> entries;
-    auto submit_status = multi_transport.submitTransfer(batch_id, entries);
-    EXPECT_TRUE(submit_status.ok());
+    EXPECT_TRUE(multi_transport.submitTransfer(batch_id, entries).ok());
+    EXPECT_TRUE(multi_transport.submitTransfer(batch_id, entries).ok());
 
     Transport::TransferStatus status{};
     auto status_ret = multi_transport.getBatchTransferStatus(batch_id, status);
     EXPECT_TRUE(status_ret.ok());
     EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(TaskGroupingTest, EmptySubmitDoesNotSealNonzeroCapacityBatch) {
+    constexpr Transport::SegmentID kTargetSegmentId = 1;
+    auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "rdma");
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+
+    auto batch_id = multi_transport.allocateBatchID(1);
+    std::vector<Transport::TransferRequest> empty_entries;
+    auto empty_status = multi_transport.submitTransfer(batch_id, empty_entries);
+    EXPECT_FALSE(empty_status.ok());
+
+    auto recording_transport =
+        std::make_shared<RecordingTransport>("rdma", true);
+    multi_transport.transport_map_["rdma"] = recording_transport;
+    std::vector<Transport::TransferRequest> entries(1);
+    entries[0].opcode = Transport::TransferRequest::READ;
+    entries[0].source = nullptr;
+    entries[0].target_id = kTargetSegmentId;
+    entries[0].target_offset = 0;
+    entries[0].length = 1024;
+    auto submit_status = multi_transport.submitTransfer(batch_id, entries);
+    EXPECT_TRUE(submit_status.ok());
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 
