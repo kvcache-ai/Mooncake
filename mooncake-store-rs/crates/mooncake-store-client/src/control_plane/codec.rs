@@ -157,7 +157,6 @@ pub(super) fn pb_replica_route(replica: &ReplicaRoute) -> pb::ReplicaRoute {
     pb::ReplicaRoute {
         owner: Some(pb_runtime_id(&replica.owner)),
         segment_name: replica.segment_name.0.clone(),
-        offset: replica.offset,
         segment_offset: replica.segment_offset,
         length: replica.length,
         checksum: replica.checksum,
@@ -184,7 +183,6 @@ pub(super) fn try_replica_route(replica: pb::ReplicaRoute) -> Result<ReplicaRout
     Ok(ReplicaRoute {
         owner,
         segment_name: SegmentName::new(replica.segment_name),
-        offset: replica.offset,
         segment_offset: replica.segment_offset,
         length: replica.length,
         checksum: replica.checksum,

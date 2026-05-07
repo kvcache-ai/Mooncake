@@ -1530,7 +1530,6 @@ fn route_to_py(py: Python<'_>, route: &ObjectRoute) -> PyResult<Py<PyAny>> {
         let entry = PyDict::new(py);
         entry.set_item("owner", replica.owner.storage_key())?;
         entry.set_item("segment_name", replica.segment_name.0.clone())?;
-        entry.set_item("offset", replica.offset)?;
         entry.set_item("segment_offset", replica.segment_offset)?;
         entry.set_item("length", replica.length)?;
         entry.set_item("priority", replica.priority)?;
@@ -3109,7 +3108,6 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("owner", ClientEpoch(2)),
                 segment_name: SegmentName::new("segment-z"),
-                offset: 64,
                 segment_offset: 64,
                 length: 5,
                 checksum: Some(3),

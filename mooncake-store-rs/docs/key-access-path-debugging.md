@@ -212,7 +212,6 @@ Example output:
     {
       "owner": "storage-node-a:1",
       "segment_name": "storage-node-a-segment",
-      "offset": 140733193388032,
       "segment_offset": 1048576,
       "length": 4096,
       "priority": 0,
@@ -230,9 +229,10 @@ Field meanings:
 - `replicas[*].owner` is the **storage owner / replica owner**, not the route
   authority owner.
 - `replicas[*].segment_name` is the storage segment containing the object.
-- `replicas[*].segment_offset` is the offset inside that segment.
-- `replicas[*].offset` is the transport-visible absolute address recorded for
-  the replica.
+- `replicas[*].segment_offset` is the durable offset inside that segment; reads
+  derive the live transport target offset from this value and the segment's
+  published storage target chunks, then verify the range against the current TE
+  segment buffers.
 - `replicas[*].length` is the object length in bytes.
 - `replicas[*].priority` is the replica priority; lower priority is preferred.
 - `replicas[*].tier` is the storage tier.
