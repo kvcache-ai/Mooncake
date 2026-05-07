@@ -1024,6 +1024,14 @@ impl ControlPlaneClient {
     }
 
     pub(crate) fn probe_reachability(&self, lease: &ClientLease) -> ControlPlaneReachability {
+        self.probe_reachability_with_timeout(lease, CONNECT_TIMEOUT)
+    }
+
+    pub(crate) fn probe_reachability_with_timeout(
+        &self,
+        lease: &ClientLease,
+        timeout: Duration,
+    ) -> ControlPlaneReachability {
         let address = match control_address(lease) {
             Ok(address) => address,
             Err(error) => return ControlPlaneReachability::Unknown(error),
@@ -1031,7 +1039,7 @@ impl ControlPlaneClient {
 
         let uri = normalize_control_uri(&address);
         let endpoint = match Endpoint::from_shared(uri.clone()) {
-            Ok(endpoint) => endpoint.connect_timeout(CONNECT_TIMEOUT).tcp_nodelay(true),
+            Ok(endpoint) => endpoint.connect_timeout(timeout).tcp_nodelay(true),
             Err(error) => {
                 return ControlPlaneReachability::Unknown(StoreError::Transport(format!(
                     "invalid control plane uri {uri}: {error}"
@@ -1039,9 +1047,13 @@ impl ControlPlaneClient {
             }
         };
 
-        match self.with_runtime(|runtime| runtime.block_on(endpoint.connect())) {
-            Ok(_) => ControlPlaneReachability::Reachable,
-            Err(_) => ControlPlaneReachability::Unreachable,
+        let timeout = timeout.max(Duration::from_millis(1));
+        let result = self.with_runtime(|runtime| {
+            runtime.block_on(async move { tokio::time::timeout(timeout, endpoint.connect()).await })
+        });
+        match result {
+            Ok(Ok(_)) => ControlPlaneReachability::Reachable,
+            Ok(Err(_)) | Err(_) => ControlPlaneReachability::Unreachable,
         }
     }
 

@@ -363,6 +363,7 @@ impl StoreClientBuilder {
         let route_namespace = self.metadata.route_namespace();
         let live_client_cache = shared_live_client_cache(&route_namespace);
         let suspect_runtime_cache = shared_suspect_runtime_cache(&route_namespace);
+        let remote_runtime_probe_cache = shared_remote_runtime_probe_cache(&route_namespace);
         let control_client = Arc::new(ControlPlaneClient::new()?);
 
         let template = ClientLease {
@@ -504,6 +505,7 @@ impl StoreClientBuilder {
             lease_ttl_ms,
             live_client_cache,
             suspect_runtime_cache,
+            remote_runtime_probe_cache,
             membership_sync,
             _async_eviction: async_eviction,
             default_tenant: self.default_tenant,
