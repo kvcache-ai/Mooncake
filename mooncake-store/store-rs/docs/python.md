@@ -62,7 +62,7 @@ Isolation knobs:
 - `keyspace` isolates metadata-backed routing, policy lookup, and object visibility
 - `tenant`, `domain`, and `object_set` select the default namespace scope applied to Python compatibility read/write operations
 - `worker_scope` isolates compat-local worker state such as the dispatcher executor and local hot-cache domain
-- when `worker_scope` is omitted, the Python layer derives it from `keyspace` when present; otherwise it allocates a unique per-setup worker scope
+- when `worker_scope` is omitted, the Python layer derives it from `keyspace` when present; otherwise dummy mode falls back to the legacy `worker-1` scope so omitted-scope clients keep matching standalone daemon side-channel aliases
 
 This mode:
 
@@ -91,11 +91,13 @@ Use `setup_dummy(...)` when Python should behave like the upstream dummy compati
 - `worker_scope` isolates dummy compat-local state such as hot-cache SHM, registered-region side channels, and worker-local dispatcher state
 - when `worker_scope` is omitted, the Python layer derives it from `keyspace` when present; otherwise it allocates a unique per-setup worker scope
 - a daemon started with an explicit `keyspace` or `worker_scope` also exposes a legacy `worker-1` side-channel alias so omitted-scope dummy buffer clients can still register SHM regions
+- a daemon started with a wildcard `client_server_address` such as `0.0.0.0:16590` or `[::]:16590` also exposes dummy shm and hot-cache side-channel aliases for its advertised hostname plus loopback forms, so clients may connect through a concrete host address without breaking buffer registration
 
 This mode:
 
 - connects to a standalone `mooncake-store-client` process over gRPC
 - registers shm regions by passing file descriptors over a Unix socket
+- only reports dummy `register_buffer(...)` success after the standalone daemon has installed the shared region in its dispatcher, so callers can issue `batch_put_from(...)` or `batch_get_into(...)` immediately without adding an extra sleep/retry fence
 - derives short hashed Unix socket filenames for dummy shm and hot-cache side channels so long worker scopes stay below AF_UNIX path limits
 - keeps the Python process out of the distributed control plane
 - is the compatibility path used by the HiCache dummy flow
@@ -622,7 +624,7 @@ ptr = allocator.alloc(4096)
 store.register_buffer(ptr, 4096)
 ```
 
-`setup_dummy(...)` only needs `client_server_address` for the remote endpoint. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and data-plane endpoint on behalf of the dummy client. Use `keyspace` to align with the intended metadata namespace and `worker_scope` when you need an explicit compat worker boundary for dummy-side cache and shm isolation. When callers omit `keyspace`, the Python wrapper now also falls back to `MC_STORE_RS_KEYSPACE` before deriving the dummy worker scope, so upstream SGLang dummy mode can share the same scoped side-channel namespace as a `mooncake-store-client --keyspace ... --client-server-address ...` gateway.
+`setup_dummy(...)` only needs `client_server_address` for the remote endpoint. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and data-plane endpoint on behalf of the dummy client. Use `keyspace` to align with the intended metadata namespace and `worker_scope` when you need an explicit compat worker boundary for dummy-side cache and shm isolation. When callers omit `keyspace`, the Python wrapper now also falls back to `MC_STORE_RS_KEYSPACE` before deriving the dummy worker scope, so upstream SGLang dummy mode can share the same scoped side-channel namespace as a `mooncake-store-client --keyspace ... --client-server-address ...` gateway. A standalone daemon that binds `client_server_address` on a wildcard host also publishes side-channel aliases for its advertised host address, `127.0.0.1`, `::1`, and `localhost`, so dummy buffer clients do not need the daemon to bind the exact same host string they dial.
 
 ## Host Allocator and Hugepages
 
@@ -1006,7 +1008,8 @@ python -m sglang.launch_server \
 ```
 
   Use this when SGLang should behave like the upstream dummy client. The standalone `mooncake-store-client` process owns the real runtime and exposes a dummy-compatible gRPC endpoint through `client_server_address`.
-  Because upstream SGLang still does not forward `worker_scope`, the standalone `mooncake-store-client --client-server-address` path now defaults its dummy side-channel scope to `worker-1` when `keyspace` is absent. That matches the first omitted-scope `setup_dummy(...)` client in the serving process, so the default SGLang gateway topology can register shared-memory buffers without requiring a patched SGLang fork.
+  Because upstream SGLang still does not forward `worker_scope`, the standalone `mooncake-store-client --client-server-address` path now defaults its dummy side-channel scope to `worker-1` when `keyspace` is absent. That matches omitted-scope `setup_dummy(...)` clients in the serving process, so the default SGLang gateway topology can register shared-memory buffers without requiring a patched SGLang fork.
+  The standalone gateway may still bind `client_server_address` on `0.0.0.0` while dummy clients dial a concrete service IP. The dummy side channels now publish matching aliases for that concrete host string, so this wildcard-bind topology keeps working for registered-buffer and hot-cache paths.
 
 Port role summary:
 

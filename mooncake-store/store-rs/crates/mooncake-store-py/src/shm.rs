@@ -340,24 +340,29 @@ pub fn send_shm_register_request(
     Ok(())
 }
 
-pub fn recv_shm_register_request(listener: &UnixListener) -> Result<(ShmRegisterRequest, OwnedFd)> {
+pub fn send_shm_register_reply(stream: &UnixStream, status: i32) -> Result<()> {
+    let mut stream = stream;
+    stream.write_all(&status.to_ne_bytes()).map_err(|error| {
+        StoreError::Transport(format!("failed to ack shm registration: {error}"))
+    })?;
+    Ok(())
+}
+
+pub fn recv_shm_register_request(
+    listener: &UnixListener,
+) -> Result<(UnixStream, ShmRegisterRequest, OwnedFd)> {
     let (stream, _) = listener.accept().map_err(|error| {
         StoreError::Transport(format!("failed to accept shm registration: {error}"))
     })?;
     let (request, fd) = recv_fd::<ShmRegisterRequest>(stream.as_raw_fd())?;
     if request.magic != SHM_REGISTER_MAGIC {
-        let _ = (&stream).write_all(&(-1i32).to_ne_bytes());
+        let _ = send_shm_register_reply(&stream, -1);
         return Err(StoreError::Transport(format!(
             "invalid shm registration magic: {}",
             request.magic
         )));
     }
-    (&stream)
-        .write_all(&(0i32).to_ne_bytes())
-        .map_err(|error| {
-            StoreError::Transport(format!("failed to ack shm registration: {error}"))
-        })?;
-    Ok((request, fd))
+    Ok((stream, request, fd))
 }
 
 pub fn recv_hot_cache_fd_request(
@@ -592,6 +597,7 @@ fn recv_fd<T>(sock: RawFd) -> Result<(T, OwnedFd)> {
 mod tests {
     use std::sync::OnceLock;
     use std::thread;
+    use std::time::Duration;
 
     use parking_lot::Mutex;
 
@@ -653,14 +659,19 @@ mod tests {
             registration.region_id,
             registration.requested_len,
         );
-        let worker = thread::spawn(move || recv_shm_register_request(&listener));
+        let worker = thread::spawn(move || {
+            let (stream, request, fd) =
+                recv_shm_register_request(&listener).expect("listener should decode request");
+            send_shm_register_reply(&stream, 0).expect("listener should ack request");
+            Ok::<_, StoreError>((request, fd))
+        });
 
         send_shm_register_request(&socket_path, &request, &registration.fd)
             .expect("registration request should be accepted");
         let (received, fd) = worker
             .join()
             .expect("listener worker should join")
-            .expect("listener should decode request");
+            .expect("listener should return request");
         let mapped = map_registered_region(fd, registration.registered_len)
             .expect("received file descriptor should map");
         mapped
@@ -773,6 +784,37 @@ mod tests {
             .expect("listener worker should join")
             .expect_err("server should reject invalid magic");
         assert!(matches!(server_error, StoreError::Transport(_)));
+
+        free_shared_region(ptr).expect("shared region cleanup should succeed");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn shm_registration_reply_waits_for_server_installation() {
+        let _guard = test_lock().lock();
+        let ptr = allocate_shared_region(1024).expect("shared alloc should succeed");
+        let registration =
+            shared_region_for_registration(ptr, 1024).expect("registration should resolve");
+        let socket_path = unique_socket_path("delayed-ack");
+        let listener = bind_shm_listener(&socket_path).expect("listener bind should succeed");
+        let request = ShmRegisterRequest::new(DummyClientId::new(), registration.region_id, 1024);
+        let worker = thread::spawn(move || {
+            let (stream, _request, _fd) =
+                recv_shm_register_request(&listener).expect("listener should decode request");
+            thread::sleep(Duration::from_millis(100));
+            send_shm_register_reply(&stream, 0).expect("listener should ack request");
+        });
+
+        let started = std::time::Instant::now();
+        send_shm_register_request(&socket_path, &request, &registration.fd)
+            .expect("registration request should be accepted");
+        let elapsed = started.elapsed();
+        worker.join().expect("listener worker should join");
+        assert!(
+            elapsed >= Duration::from_millis(75),
+            "client should wait for server-side registration before returning, observed {:?}",
+            elapsed
+        );
 
         free_shared_region(ptr).expect("shared region cleanup should succeed");
         let _ = std::fs::remove_file(socket_path);

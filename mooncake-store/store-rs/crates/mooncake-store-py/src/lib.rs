@@ -51,7 +51,7 @@ fn finalize_real_dispatcher_setup(
 
 pub const DEFAULT_COMPAT_WORKER_SCOPE: &str = "worker-1";
 
-fn resolve_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
+fn resolve_real_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
     if let Some(scope) = worker_scope
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
@@ -70,6 +70,22 @@ fn resolve_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> S
         return DEFAULT_COMPAT_WORKER_SCOPE.to_string();
     }
     format!("worker-{id}")
+}
+
+fn resolve_dummy_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
+    if let Some(scope) = worker_scope
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+    {
+        return scope.to_string();
+    }
+    if let Some(keyspace) = keyspace
+        .map(str::trim)
+        .filter(|keyspace| !keyspace.is_empty())
+    {
+        return keyspace.to_string();
+    }
+    DEFAULT_COMPAT_WORKER_SCOPE.to_string()
 }
 
 impl StoreBackend {
@@ -174,7 +190,7 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<i32> {
         let initial_state = parse_initial_state_arg(initial_state)?;
         let route_control = parse_route_control_arg(route_control)?;
-        let worker_scope = resolve_worker_scope(keyspace.as_deref(), worker_scope.as_deref());
+        let worker_scope = resolve_real_worker_scope(keyspace.as_deref(), worker_scope.as_deref());
         let compat_scope = keyspace.clone().unwrap_or_else(|| "default".to_string());
         let runtime = CompatRuntimeArgs {
             setup: config::CompatSetupArgs {
@@ -237,7 +253,7 @@ impl PyMooncakeDistributedStore {
         worker_scope: Option<String>,
     ) -> PyResult<i32> {
         let _ = (mem_pool_size, local_buffer_size);
-        let worker_scope = resolve_worker_scope(keyspace.as_deref(), worker_scope.as_deref());
+        let worker_scope = resolve_dummy_worker_scope(keyspace.as_deref(), worker_scope.as_deref());
         let session =
             DummySession::connect(server_address, worker_scope).map_err(store_error_to_py)?;
         self.replace_backend(StoreBackend::Dummy(session));
@@ -1813,6 +1829,8 @@ mod tests {
 
     struct TestTransport {
         local_segment: String,
+        rpc_host: String,
+        rpc_port: u16,
         state: Arc<Mutex<TestTransportState>>,
     }
 
@@ -1834,8 +1852,14 @@ mod tests {
 
     impl TestTransport {
         fn new(local_segment: &str) -> Self {
+            Self::new_with_rpc_address(local_segment, "127.0.0.1", 0)
+        }
+
+        fn new_with_rpc_address(local_segment: &str, rpc_host: &str, rpc_port: u16) -> Self {
             Self {
                 local_segment: local_segment.to_string(),
+                rpc_host: rpc_host.to_string(),
+                rpc_port,
                 state: Arc::new(Mutex::new(TestTransportState {
                     next_handle: 1,
                     next_batch: 1,
@@ -1855,7 +1879,7 @@ mod tests {
         }
 
         fn rpc_server_address(&self) -> mooncake_store_core::Result<(String, u16)> {
-            Ok(("127.0.0.1".to_string(), 0))
+            Ok((self.rpc_host.clone(), self.rpc_port))
         }
 
         fn open_segment(&self, segment_name: &str) -> mooncake_store_core::Result<u64> {
@@ -2887,6 +2911,14 @@ mod tests {
         address
     }
 
+    fn wildcard_bind_addr(address: &str) -> String {
+        let port = address
+            .rsplit_once(':')
+            .expect("address should contain port")
+            .1;
+        format!("0.0.0.0:{port}")
+    }
+
     fn build_dummy_store(name: &str) -> (PyMooncakeDistributedStore, DummyStoreServerHandle) {
         let dispatcher = Arc::new(
             StoreDispatcher::spawn(build_client(name), format!("dummy-dispatcher-{name}"))
@@ -2988,8 +3020,7 @@ mod tests {
             .expect("second legacy read buffer should allocate");
         unsafe {
             slice::from_raw_parts_mut(write_ptr as *mut u8, 64)[..5].copy_from_slice(b"hello");
-            slice::from_raw_parts_mut(write_ptr_two as *mut u8, 64)[..5]
-                .copy_from_slice(b"world");
+            slice::from_raw_parts_mut(write_ptr_two as *mut u8, 64)[..5].copy_from_slice(b"world");
         }
 
         assert_eq!(
@@ -3057,7 +3088,10 @@ mod tests {
         assert_eq!(lengths, vec![5, 5]);
         unsafe {
             assert_eq!(slice::from_raw_parts(read_ptr as *const u8, 5), b"hello");
-            assert_eq!(slice::from_raw_parts(read_ptr_two as *const u8, 5), b"world");
+            assert_eq!(
+                slice::from_raw_parts(read_ptr_two as *const u8, 5),
+                b"world"
+            );
         }
 
         assert_eq!(
@@ -3098,6 +3132,123 @@ mod tests {
         allocator
             .free(read_ptr_two)
             .expect("second legacy read buffer should free");
+        server.shutdown().expect("dummy server should stop");
+    }
+
+    #[test]
+    fn setup_dummy_buffer_api_accepts_wildcard_bind_with_concrete_client_address() {
+        let _guard = env_test_lock().lock();
+        prepare_freethreaded_python();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new_with_rpc_address(
+            "dummy-buffer-wildcard-bind-segment",
+            "127.0.0.1",
+            17300,
+        ));
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client_with_metadata_and_transport(
+                    "dummy-buffer-wildcard-bind",
+                    metadata,
+                    transport,
+                    ClientLifecycleState::Active,
+                ),
+                "dummy-buffer-wildcard-bind",
+            )
+            .expect("dummy dispatcher should spawn"),
+        );
+        dispatcher
+            .register_local_memory()
+            .expect("dummy local memory should register");
+        let client_addr = bind_addr();
+        let server = start_dummy_store_server(
+            dispatcher,
+            &wildcard_bind_addr(&client_addr),
+            DEFAULT_COMPAT_WORKER_SCOPE,
+        )
+        .expect("dummy server should start");
+        let mut store = PyMooncakeDistributedStore::new();
+        store
+            .setup_dummy(0, 0, &client_addr, None, None)
+            .expect("dummy store should connect through concrete client address");
+        for _ in 0..40 {
+            if store.health_check().expect("health check should succeed") == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(25));
+        }
+
+        let allocator = PyMooncakeHostMemAllocator::new(None, None);
+        let write_ptr = allocator
+            .alloc(64)
+            .expect("dummy write buffer should allocate");
+        let read_ptr = allocator
+            .alloc(64)
+            .expect("dummy read buffer should allocate");
+        unsafe {
+            slice::from_raw_parts_mut(write_ptr as *mut u8, 64)[..5].copy_from_slice(b"hello");
+        }
+
+        assert_eq!(
+            store
+                .register_buffer(write_ptr, 64)
+                .expect("dummy write buffer should register"),
+            0
+        );
+        assert_eq!(
+            store
+                .register_buffer(read_ptr, 64)
+                .expect("dummy read buffer should register"),
+            0
+        );
+
+        Python::with_gil(|py| {
+            let statuses = store
+                .batch_put_from(
+                    py,
+                    vec![("wildcard".to_string(), write_ptr, 5)],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .expect("wildcard dummy batch_put_from should succeed");
+            assert_eq!(
+                statuses
+                    .bind(py)
+                    .extract::<Vec<i32>>()
+                    .expect("wildcard dummy batch_put_from should return status list"),
+                vec![0]
+            );
+        });
+
+        let lengths = store
+            .batch_get_into(vec![("wildcard".to_string(), read_ptr, 64)], None)
+            .expect("wildcard dummy batch_get_into should succeed");
+        assert_eq!(lengths, vec![5]);
+        unsafe {
+            assert_eq!(slice::from_raw_parts(read_ptr as *const u8, 5), b"hello");
+        }
+
+        assert_eq!(
+            store
+                .unregister_buffer(write_ptr, 64)
+                .expect("dummy write buffer should unregister"),
+            0
+        );
+        assert_eq!(
+            store
+                .unregister_buffer(read_ptr, 64)
+                .expect("dummy read buffer should unregister"),
+            0
+        );
+
+        store.close();
         server.shutdown().expect("dummy server should stop");
     }
 
@@ -4527,11 +4678,7 @@ mod tests {
             let batch = store
                 .batch_get(
                     py,
-                    vec![
-                        "alpha".to_string(),
-                        "beta".to_string(),
-                        "delta".to_string(),
-                    ],
+                    vec!["alpha".to_string(), "beta".to_string(), "delta".to_string()],
                     None,
                 )
                 .expect("dummy batch_get should succeed");

@@ -54,7 +54,7 @@ Current defaulting behavior:
 
 - if `worker_scope` is set explicitly, that value is used
 - otherwise Python derives `worker_scope` from `keyspace` when `keyspace` is present
-- otherwise Python allocates a unique per-setup worker scope so separate setups do not silently share compat-local state
+- otherwise real-mode Python setups allocate a unique per-setup worker scope so separate setups do not silently share compat-local state; dummy-mode setups without an explicit scope fall back to the legacy `worker-1` compat scope so they stay compatible with standalone daemon side-channel aliases
 
 This means two Python setups can intentionally share metadata namespace through the same `keyspace` while still keeping their compat-local caches and worker state isolated by different `worker_scope` values.
 
