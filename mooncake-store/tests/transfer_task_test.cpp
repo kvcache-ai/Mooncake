@@ -180,6 +180,16 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
     }
 }
 
+TEST_F(TransferTaskTest, EmptyScatterReadBuildHasNoTasks) {
+    char dest[1];
+    ScatterKeyRangesForTest key_ranges;
+
+    auto grouped = buildScatterReadRequestsForTest(dest, key_ranges, true);
+    ASSERT_TRUE(grouped.has_value());
+    EXPECT_TRUE(grouped->flat_requests.empty());
+    EXPECT_EQ(grouped->logical_task_count, 0u);
+}
+
 TEST_F(TransferTaskTest, ScatterReadGroupingReducesLogicalTasks) {
     char dest[4096];
     auto replica = makeMemoryReplica("remote", 0x100000, sizeof(dest));

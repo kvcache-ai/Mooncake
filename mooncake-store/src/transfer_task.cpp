@@ -642,6 +642,11 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     std::vector<TransferRequest>& requests, size_t batch_task_count) {
+    if (requests.empty()) {
+        auto state = std::make_shared<EmptyOperationState>();
+        return TransferFuture(state);
+    }
+
     const size_t batch_size =
         batch_task_count == 0 ? requests.size() : batch_task_count;
     BatchID batch_id = engine_.allocateBatchID(batch_size);

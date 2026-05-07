@@ -474,10 +474,13 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         }
     }
 
-    status.s = (success_count == task_count && task_count > 0)
+    status.s = (success_count == task_count)
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
+        if (task_count == 0) {
+            batch_desc.sealed.store(true, std::memory_order_release);
+        }
         {
             std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
             batch_desc.publish_completion_if_ready_locked();

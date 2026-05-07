@@ -391,6 +391,37 @@ TEST_F(TaskGroupingTest, PartialBatchCompletesWhenSubmittedTasksComplete) {
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 
+TEST_F(TaskGroupingTest, EmptyBatchCompletesAndIsFreeable) {
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+
+    auto batch_id = multi_transport.allocateBatchID(0);
+
+    Transport::TransferStatus status{};
+    auto status_ret = multi_transport.getBatchTransferStatus(batch_id, status);
+    EXPECT_TRUE(status_ret.ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(TaskGroupingTest, EmptySubmitCompletesAndIsFreeable) {
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+
+    auto batch_id = multi_transport.allocateBatchID(0);
+    std::vector<Transport::TransferRequest> entries;
+    auto submit_status = multi_transport.submitTransfer(batch_id, entries);
+    EXPECT_TRUE(submit_status.ok());
+
+    Transport::TransferStatus status{};
+    auto status_ret = multi_transport.getBatchTransferStatus(batch_id, status);
+    EXPECT_TRUE(status_ret.ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
 TEST_F(TaskGroupingTest, SubmitFailureLeavesBatchFreeable) {
     constexpr Transport::SegmentID kTargetSegmentId = 1;
     auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "rdma");
