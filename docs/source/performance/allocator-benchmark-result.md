@@ -195,3 +195,15 @@ util ratio (min / p99 / p90 / p50 / max / avg):
 0.569255 / 0.712076 / 0.781224 / 0.855046 / 0.976057 / 0.848873
 avg alloc time: 142.508508 ns/op
 ```
+
+### Paired KV/Indexer Allocation Benchmark (DSA)
+
+In the DSA scenario, Mooncake Store stores both KV cache objects and indexer objects. We evaluated OffsetAllocator under a paired allocation workload with two production-like object sizes.
+
+**OffsetAllocator**
+
+```
+util ratio (min / p99 / p90 / p50 / max / avg):
+0.948299 / 0.948765 / 0.949311 / 0.949884 / 0.952491 / 0.950091
+avg alloc time: 232.420141 ns/op
+```
