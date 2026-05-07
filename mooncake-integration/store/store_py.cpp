@@ -362,11 +362,7 @@ class MooncakeStorePyWrapper {
                 size, protocol, location, segment_ids, &allocated_size);
         }
         result["ret"] = ret;
-        py::list ids;
-        for (const auto &id : segment_ids) {
-            ids.append(id);
-        }
-        result["segment_ids"] = ids;
+        result["segment_ids"] = py::cast(segment_ids);
         result["allocated_size"] = allocated_size;
         return result;
     }

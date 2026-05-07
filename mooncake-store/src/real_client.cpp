@@ -1011,18 +1011,14 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         }
     }
 
-    std::vector<AllocatedSegmentRecord> allocated_records_to_free;
+    std::unordered_map<std::string, AllocatedSegmentRecord> records_to_free;
     {
         std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
-        allocated_records_to_free.reserve(allocated_segment_records_.size());
-        for (auto &entry : allocated_segment_records_) {
-            allocated_records_to_free.push_back(entry.second);
-        }
-        allocated_segment_records_.clear();
+        records_to_free.swap(allocated_segment_records_);
     }
-    for (auto &record : allocated_records_to_free) {
-        if (record.base) {
-            free_memory(record.protocol, record.base);
+    for (const auto &entry : records_to_free) {
+        if (entry.second.base) {
+            free_memory(entry.second.protocol, entry.second.base);
         }
     }
 
