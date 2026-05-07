@@ -15,7 +15,7 @@ use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use dispatcher::StoreDispatcher;
+use dispatcher::{CompatNamespaceScope, StoreDispatcher};
 use dummy_client::DummySession;
 use mooncake_store_client::{
     init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
@@ -24,7 +24,7 @@ use mooncake_store_client::{
     RouteControlMode,
 };
 use mooncake_store_core::{
-    ClientLifecycleState, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
+    ClientLifecycleState, NamespaceScope, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
 };
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -121,6 +121,8 @@ impl PyMooncakeDistributedStore {
         stable_id = None,
         initial_state = "active",
         tenant = "default",
+        domain = None,
+        object_set = None,
         labels = None,
         routed_writes = false,
         replica_count = 1,
@@ -137,7 +139,7 @@ impl PyMooncakeDistributedStore {
         eviction_high_watermark_percent = None,
         eviction_low_watermark_percent = None,
         route_control = "embedded_wrh"
-    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, eviction_high_watermark_percent=None, eviction_low_watermark_percent=None, route_control='embedded_wrh')")]
+    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', domain=None, object_set=None, labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, eviction_high_watermark_percent=None, eviction_low_watermark_percent=None, route_control='embedded_wrh')")]
     #[allow(clippy::too_many_arguments)]
     fn setup(
         &mut self,
@@ -151,6 +153,8 @@ impl PyMooncakeDistributedStore {
         stable_id: Option<String>,
         initial_state: &str,
         tenant: &str,
+        domain: Option<String>,
+        object_set: Option<String>,
         labels: Option<BTreeMap<String, String>>,
         routed_writes: bool,
         replica_count: usize,
@@ -187,6 +191,8 @@ impl PyMooncakeDistributedStore {
                 transport_backend,
                 stable_id,
                 tenant: tenant.to_string(),
+                domain: domain.clone(),
+                object_set: object_set.clone(),
                 labels: labels.unwrap_or_default(),
                 routed_writes,
                 replica_count,
@@ -206,11 +212,13 @@ impl PyMooncakeDistributedStore {
         let _ = master_server;
         let stable_id = runtime.stable_id.clone();
         let lease_ttl_ms = runtime.lease_ttl_ms;
-        let dispatcher = StoreDispatcher::spawn_with_timeout_config_and_scope(
+        let default_scope = CompatNamespaceScope::new(tenant.to_string(), domain, object_set);
+        let dispatcher = StoreDispatcher::spawn_with_timeout_config_and_namespace_scope(
             runtime.client,
             format!("mooncake-py-dispatcher-{stable_id}-{worker_scope}"),
             CompatTimeoutConfig::from_env(),
             compat_scope,
+            default_scope,
         )
         .map_err(store_error_to_py)?;
         finalize_real_dispatcher_setup(&dispatcher, initial_state, lease_ttl_ms)
@@ -291,14 +299,21 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_key = key.clone();
                 let cache_tenant = tenant.clone();
+                let scope = dispatcher.object_scope(tenant);
                 run_without_gil(move || {
-                    dispatcher.run(move |client| match (tenant.as_deref(), policy.as_ref()) {
-                        (Some(tenant), Some(policy)) => {
-                            client.put_in_tenant_with_policy(tenant, &key, &value, policy)
+                    dispatcher.run(move |client| {
+                        let mut request =
+                            PutRequest::new(&key, &value).tenant(scope.tenant.as_str());
+                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                            request = request.domain(scope.domain.as_str());
                         }
-                        (None, Some(policy)) => client.put_with_policy(&key, &value, policy),
-                        (Some(tenant), None) => client.put_in_tenant(tenant, &key, &value),
-                        (None, None) => client.put(&key, &value),
+                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                            request = request.object_set(scope.object_set.as_str());
+                        }
+                        if let Some(policy) = policy {
+                            request = request.replication(policy);
+                        }
+                        client.batch_put(&[request]).map(|_| ())
                     })
                 })
                 .map_err(store_error_to_py)?;
@@ -346,10 +361,19 @@ impl PyMooncakeDistributedStore {
             StoreBackend::Real(dispatcher) => {
                 let key = key.to_string();
                 let tenant = tenant.map(str::to_string);
+                let scope = dispatcher.object_scope(tenant);
                 run_without_gil(move || {
-                    dispatcher.run(move |client| match tenant.as_deref() {
-                        Some(tenant) => client.is_exist_in_tenant(tenant, &key),
-                        None => client.is_exist(&key),
+                    dispatcher.run(move |client| {
+                        let mut object = ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
+                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                            object = object.domain(scope.domain.as_str());
+                        }
+                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                            object = object.object_set(scope.object_set.as_str());
+                        }
+                        client
+                            .batch_is_exist(&[object])
+                            .map(|items| items.first().copied().unwrap_or(false))
                     })
                 })
                 .map_err(store_error_to_py)
@@ -367,14 +391,19 @@ impl PyMooncakeDistributedStore {
             StoreBackend::Real(dispatcher) => {
                 let item_count = keys.len();
                 let tenant = tenant.map(str::to_string);
+                let scope = dispatcher.object_scope(tenant);
                 run_without_gil(move || {
                     dispatcher.run(move |client| {
                         let objects = keys
                             .iter()
                             .map(|key| {
-                                let mut object = ObjectRef::new(key.as_str());
-                                if let Some(tenant) = tenant.as_deref() {
-                                    object = object.tenant(tenant);
+                                let mut object =
+                                    ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
+                                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                    object = object.domain(scope.domain.as_str());
+                                }
+                                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                                    object = object.object_set(scope.object_set.as_str());
                                 }
                                 object
                             })
@@ -419,13 +448,28 @@ impl PyMooncakeDistributedStore {
             StoreBackend::Real(dispatcher) => {
                 let key = key.to_string();
                 let tenant = tenant.map(str::to_string);
+                let scope = dispatcher.object_scope(tenant);
                 run_without_gil(move || {
-                    dispatcher.run(move |client| match tenant.as_deref() {
-                        Some(tenant) => client.get_size_in_tenant(tenant, &key),
-                        None => client.get_size(&key),
+                    dispatcher.run(move |client| {
+                        let mut object = ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
+                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                            object = object.domain(scope.domain.as_str());
+                        }
+                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                            object = object.object_set(scope.object_set.as_str());
+                        }
+                        client
+                            .batch_get(&[object])
+                            .map(|values| values.first().map(Vec::len).unwrap_or_default())
                     })
                 })
-                .map_err(store_error_to_py)
+                .or_else(|error| {
+                    if should_soft_miss_error(&error) {
+                        Ok(0)
+                    } else {
+                        Err(store_error_to_py(error))
+                    }
+                })
             }
         }
     }
@@ -512,20 +556,22 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_key = key.clone();
                 let cache_tenant = tenant.clone();
+                let scope = dispatcher.object_scope(tenant);
                 run_without_gil(move || {
                     dispatcher.run(move |client| {
                         let buffer = buffer_ptr as *const c_void;
-                        match (tenant.as_deref(), policy.as_ref()) {
-                            (Some(tenant), Some(policy)) => client
-                                .put_from_in_tenant_with_policy(tenant, &key, buffer, size, policy),
-                            (None, Some(policy)) => {
-                                client.put_from_with_policy(&key, buffer, size, policy)
-                            }
-                            (Some(tenant), None) => {
-                                client.put_from_in_tenant(tenant, &key, buffer, size)
-                            }
-                            (None, None) => client.put_from(&key, buffer, size),
+                        let mut request =
+                            PutFromRequest::new(&key, buffer, size).tenant(scope.tenant.as_str());
+                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                            request = request.domain(scope.domain.as_str());
                         }
+                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                            request = request.object_set(scope.object_set.as_str());
+                        }
+                        if let Some(policy) = policy {
+                            request = request.replication(policy);
+                        }
+                        client.batch_put_from(&[request]).map(|_| ())
                     })
                 })
                 .map_err(store_error_to_py)?;
@@ -621,14 +667,19 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
+                let scope = dispatcher.object_scope(tenant);
                 run_without_gil(move || {
                     dispatcher.run(move |client| {
                         let requests = items
                             .iter()
                             .map(|(key, value)| {
-                                let mut request = PutRequest::new(key, value);
-                                if let Some(tenant) = tenant.as_deref() {
-                                    request = request.tenant(tenant);
+                                let mut request =
+                                    PutRequest::new(key, value).tenant(scope.tenant.as_str());
+                                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                    request = request.domain(scope.domain.as_str());
+                                }
+                                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                                    request = request.object_set(scope.object_set.as_str());
                                 }
                                 if let Some(policy) = policy.clone() {
                                     request = request.replication(policy);
@@ -702,6 +753,7 @@ impl PyMooncakeDistributedStore {
                     .map(|(key, _, _)| key.clone())
                     .collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
+                let scope = dispatcher.object_scope(tenant);
                 let statuses = run_without_gil(move || {
                     dispatcher.run(move |client| {
                         let total_bytes = items.iter().map(|(_, _, size)| *size).sum::<usize>();
@@ -712,9 +764,13 @@ impl PyMooncakeDistributedStore {
                                     key,
                                     (*buffer_ptr as *mut c_void).cast_const(),
                                     *size,
-                                );
-                                if let Some(tenant) = tenant.as_deref() {
-                                    request = request.tenant(tenant);
+                                )
+                                .tenant(scope.tenant.as_str());
+                                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                    request = request.domain(scope.domain.as_str());
+                                }
+                                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                                    request = request.object_set(scope.object_set.as_str());
                                 }
                                 if let Some(policy) = policy.clone() {
                                     request = request.replication(policy);
@@ -742,33 +798,22 @@ impl PyMooncakeDistributedStore {
                                     .iter()
                                     .map(|(key, buffer_ptr, size)| {
                                         let item_started = Instant::now();
-                                        let result = match (tenant.as_deref(), policy.as_ref()) {
-                                            (Some(tenant), Some(policy)) => client
-                                                .put_from_in_tenant_with_policy(
-                                                    tenant,
-                                                    key,
-                                                    (*buffer_ptr as *const c_void).cast(),
-                                                    *size,
-                                                    policy,
-                                                ),
-                                            (Some(tenant), None) => client.put_from_in_tenant(
-                                                tenant,
-                                                key,
-                                                (*buffer_ptr as *const c_void).cast(),
-                                                *size,
-                                            ),
-                                            (None, Some(policy)) => client.put_from_with_policy(
-                                                key,
-                                                (*buffer_ptr as *const c_void).cast(),
-                                                *size,
-                                                policy,
-                                            ),
-                                            (None, None) => client.put_from(
-                                                key,
-                                                (*buffer_ptr as *const c_void).cast(),
-                                                *size,
-                                            ),
-                                        };
+                                        let mut request = PutFromRequest::new(
+                                            key,
+                                            (*buffer_ptr as *const c_void).cast(),
+                                            *size,
+                                        )
+                                        .tenant(scope.tenant.as_str());
+                                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                            request = request.domain(scope.domain.as_str());
+                                        }
+                                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                                            request = request.object_set(scope.object_set.as_str());
+                                        }
+                                        if let Some(policy) = policy.clone() {
+                                            request = request.replication(policy);
+                                        }
+                                        let result = client.batch_put_from(&[request]);
                                         match result {
                                             Ok(_) | Err(StoreError::Conflict(_)) => 0,
                                             Err(error) => {
@@ -924,6 +969,7 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = items.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
                 let cache_tenant = tenant.clone();
+                let scope = dispatcher.object_scope(tenant);
                 run_without_gil(move || {
                     dispatcher.run(move |client| {
                         let borrowed = items
@@ -940,9 +986,13 @@ impl PyMooncakeDistributedStore {
                             .zip(borrowed.iter())
                             .map(|((key, _), slices)| {
                                 let mut request =
-                                    MultiBufferPutRequest::new(key, slices.as_slice());
-                                if let Some(tenant) = tenant.as_deref() {
-                                    request = request.tenant(tenant);
+                                    MultiBufferPutRequest::new(key, slices.as_slice())
+                                        .tenant(scope.tenant.as_str());
+                                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                    request = request.domain(scope.domain.as_str());
+                                }
+                                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                                    request = request.object_set(scope.object_set.as_str());
                                 }
                                 if let Some(policy) = policy.clone() {
                                     request = request.replication(policy);
@@ -1048,6 +1098,7 @@ impl PyMooncakeDistributedStore {
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = keys.clone();
                 let cache_tenant = tenant.clone();
+                let scope = dispatcher.object_scope(tenant);
                 run_without_gil(move || {
                     dispatcher.run(move |client| {
                         let borrowed = all_buffer_ptrs
@@ -1068,9 +1119,13 @@ impl PyMooncakeDistributedStore {
                             .zip(borrowed.iter())
                             .map(|(key, buffers)| {
                                 let mut request =
-                                    MultiBufferPutRequest::new(key, buffers.as_slice());
-                                if let Some(tenant) = tenant.as_deref() {
-                                    request = request.tenant(tenant);
+                                    MultiBufferPutRequest::new(key, buffers.as_slice())
+                                        .tenant(scope.tenant.as_str());
+                                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                    request = request.domain(scope.domain.as_str());
+                                }
+                                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                                    request = request.object_set(scope.object_set.as_str());
                                 }
                                 if let Some(policy) = policy.clone() {
                                     request = request.replication(policy);
@@ -1095,10 +1150,17 @@ impl PyMooncakeDistributedStore {
         let tenant = tenant.map(str::to_string);
         let cache_key = key.clone();
         let cache_tenant = tenant.clone();
+        let scope = dispatcher.object_scope(tenant);
         run_without_gil(move || {
-            dispatcher.run(move |client| match tenant.as_deref() {
-                Some(tenant) => client.remove_in_tenant(tenant, &key, force),
-                None => client.remove(&key, force),
+            dispatcher.run(move |client| {
+                let mut object = ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
+                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                    object = object.domain(scope.domain.as_str());
+                }
+                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                    object = object.object_set(scope.object_set.as_str());
+                }
+                client.batch_remove(&[object], force).map(|_| ())
             })
         })
         .map_err(store_error_to_py)?;
@@ -1118,14 +1180,18 @@ impl PyMooncakeDistributedStore {
         let tenant = tenant.map(str::to_string);
         let cache_keys = keys.clone();
         let cache_tenant = tenant.clone();
+        let scope = dispatcher.object_scope(tenant);
         run_without_gil(move || {
             dispatcher.run(move |client| {
                 let objects = keys
                     .iter()
                     .map(|key| {
-                        let mut object = ObjectRef::new(key.as_str());
-                        if let Some(tenant) = tenant.as_deref() {
-                            object = object.tenant(tenant);
+                        let mut object = ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
+                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                            object = object.domain(scope.domain.as_str());
+                        }
+                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                            object = object.object_set(scope.object_set.as_str());
                         }
                         object
                     })
@@ -1341,10 +1407,15 @@ impl PyMooncakeDistributedStore {
         let key = key.to_string();
         let tenant = tenant.map(str::to_string);
         let dispatcher = self.real_dispatcher()?;
+        let scope = dispatcher.object_scope(tenant);
         let route = run_without_gil(move || {
-            dispatcher.run(move |client| match tenant.as_deref() {
-                Some(tenant) => client.query_route_in_tenant(tenant, &key),
-                None => client.query_route(&key),
+            dispatcher.run(move |client| {
+                let scope = NamespaceScope::with_defaults(
+                    Some(scope.tenant.as_str()),
+                    Some(scope.domain.as_str()),
+                    Some(scope.object_set.as_str()),
+                );
+                client.query_route_in_scope(&scope, &key)
             })
         })
         .map_err(store_error_to_py)?;
@@ -1718,7 +1789,7 @@ mod tests {
         stop_metrics_server, store_error_to_py, DummySession, PyMooncakeDistributedStore,
         PyMooncakeHostMemAllocator, StoreBackend,
     };
-    use crate::dispatcher::StoreDispatcher;
+    use crate::dispatcher::{CompatNamespaceScope, StoreDispatcher};
     use crate::dummy_service::pb;
     use crate::dummy_service::{start_dummy_store_server, DummyStoreServerHandle};
     use crate::runtime::CompatTimeoutConfig;
@@ -2734,11 +2805,28 @@ mod tests {
         compat_scope: &str,
         metadata: Arc<dyn MetadataBackend>,
     ) -> PyMooncakeDistributedStore {
-        let dispatcher = StoreDispatcher::spawn_with_timeout_config_and_scope(
-            build_client_with_metadata(name, metadata),
+        build_real_store_with_default_scope(name, compat_scope, metadata, None, None)
+    }
+
+    fn build_real_store_with_default_scope(
+        name: &str,
+        compat_scope: &str,
+        metadata: Arc<dyn MetadataBackend>,
+        domain: Option<&str>,
+        object_set: Option<&str>,
+    ) -> PyMooncakeDistributedStore {
+        let client = build_client_with_metadata(name, metadata);
+        let default_scope = CompatNamespaceScope::new(
+            client.default_tenant().to_string(),
+            domain.map(str::to_string),
+            object_set.map(str::to_string),
+        );
+        let dispatcher = StoreDispatcher::spawn_with_timeout_config_and_namespace_scope(
+            client,
             format!("dispatcher-{name}"),
             CompatTimeoutConfig::from_env(),
             compat_scope,
+            default_scope,
         )
         .expect("dispatcher should spawn");
         dispatcher
@@ -3232,6 +3320,123 @@ mod tests {
         allocator
             .free(ptr)
             .expect("allocator should free shared memory");
+    }
+
+    #[test]
+    fn real_store_default_namespace_scope_isolates_python_compat_api() {
+        init_python();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let object_set = "CHECKPOINT=oss://example-bucket/example-path/checkpoint-500/";
+        let store_a = build_real_store_with_default_scope(
+            "py-default-scope-a",
+            "default",
+            metadata.clone(),
+            Some("sglang-chat"),
+            Some(object_set),
+        );
+        let store_b = build_real_store_with_default_scope(
+            "py-default-scope-b",
+            "default",
+            metadata,
+            Some("sglang-chat"),
+            Some("checkpoint-501"),
+        );
+
+        store_a
+            .put(
+                "same-key",
+                b"version-a".to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("put under object_set A should succeed");
+        store_b
+            .put(
+                "same-key",
+                b"version-b".to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("put under object_set B should succeed");
+
+        Python::with_gil(|py| {
+            assert_eq!(
+                store_a
+                    .get(py, "same-key", None)
+                    .expect("get from object_set A should succeed")
+                    .as_bytes(),
+                b"version-a"
+            );
+            assert_eq!(
+                store_b
+                    .get(py, "same-key", None)
+                    .expect("get from object_set B should succeed")
+                    .as_bytes(),
+                b"version-b"
+            );
+            let route = store_a
+                .query_route(py, "same-key", None)
+                .expect("query_route should succeed")
+                .expect("route should exist");
+            assert_eq!(
+                route
+                    .bind(py)
+                    .get_item("key")
+                    .expect("route key should exist")
+                    .extract::<String>()
+                    .expect("route key should extract"),
+                "default::ns/sglang-chat/CHECKPOINT%3Doss%3A%2F%2Fexample-bucket%2Fexample-path%2Fcheckpoint-500%2F/same-key"
+            );
+        });
+
+        assert!(store_a
+            .is_exist("same-key", None)
+            .expect("is_exist should use default object_set"));
+        assert_eq!(
+            store_a
+                .batch_is_exist(vec!["same-key".to_string()], None)
+                .expect("batch_is_exist should use default object_set"),
+            vec![1]
+        );
+        assert_eq!(
+            store_a
+                .get_size("same-key", None)
+                .expect("get_size should use default object_set"),
+            b"version-a".len()
+        );
+
+        store_a
+            .remove("same-key", false, None)
+            .expect("remove should use default object_set");
+        assert!(
+            store_a
+                .get_size("same-key", None)
+                .expect("removed object should be absent")
+                == 0
+        );
+        Python::with_gil(|py| {
+            assert_eq!(
+                store_b
+                    .get(py, "same-key", None)
+                    .expect("other object_set should remain readable")
+                    .as_bytes(),
+                b"version-b"
+            );
+        });
     }
 
     #[test]

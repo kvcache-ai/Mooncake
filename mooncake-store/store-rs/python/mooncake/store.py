@@ -362,7 +362,9 @@ class MooncakeDistributedStore:
         self._worker = None
         self._lock = threading.RLock()
         self._registered_buffers: dict[int, int] = {}
-        self._tracked_keys: set[tuple[str | None, str]] = set()
+        self._tracked_keys: set[tuple[str | None, str | None, str | None, str]] = set()
+        self._default_domain: str | None = None
+        self._default_object_set: str | None = None
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -400,6 +402,10 @@ class MooncakeDistributedStore:
         kwargs = _apply_setup_env_defaults(kwargs)
         if "hugepage_size" in kwargs:
             kwargs["hugepage_size"] = _normalize_hugepage_size(kwargs["hugepage_size"])
+        self._default_domain = kwargs.get("domain") if _has_value(kwargs.get("domain")) else None
+        self._default_object_set = (
+            kwargs.get("object_set") if _has_value(kwargs.get("object_set")) else None
+        )
         if args:
             local_hostname, transport_rpc_port = (
                 _normalize_local_hostname_and_transport_port(
@@ -449,6 +455,8 @@ class MooncakeDistributedStore:
         finally:
             if self._worker is not None:
                 self._worker.close()
+            self._default_domain = None
+            self._default_object_set = None
 
     def register_buffer(self, buffer_ptr: int, size: int):
         result = self._invoke_cache("register_buffer", buffer_ptr, size)
@@ -729,18 +737,26 @@ class MooncakeDistributedStore:
         except Exception:
             pass
         removed = 0
-        for tenant, keys in self._group_tracked_keys().items():
-            statuses = self._invoke_cache(
-                "batch_remove",
-                keys,
-                fallback_count=len(keys),
-                force=force,
-                tenant=tenant,
-            )
-            for key, status in zip(keys, statuses):
-                if int(status) == 0:
-                    self._forget_keys([key], tenant=tenant)
-                    removed += 1
+        for (tenant, domain, object_set), keys in self._group_tracked_keys().items():
+            original_domain = self._default_domain
+            original_object_set = self._default_object_set
+            self._default_domain = domain
+            self._default_object_set = object_set
+            try:
+                statuses = self._invoke_cache(
+                    "batch_remove",
+                    keys,
+                    fallback_count=len(keys),
+                    force=force,
+                    tenant=tenant,
+                )
+                for key, status in zip(keys, statuses):
+                    if int(status) == 0:
+                        self._forget_keys([key], tenant=tenant)
+                        removed += 1
+            finally:
+                self._default_domain = original_domain
+                self._default_object_set = original_object_set
         return removed
 
     def start_metrics_server(self, bind_addr: str = "127.0.0.1:0") -> str:
@@ -765,12 +781,16 @@ class MooncakeDistributedStore:
     def _track_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
         with self._lock:
             for key in keys:
-                self._tracked_keys.add((tenant, str(key)))
+                self._tracked_keys.add(
+                    (tenant, self._default_domain, self._default_object_set, str(key))
+                )
 
     def _forget_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
         with self._lock:
             for key in keys:
-                self._tracked_keys.discard((tenant, str(key)))
+                self._tracked_keys.discard(
+                    (tenant, self._default_domain, self._default_object_set, str(key))
+                )
 
     def _track_successful_keys(
         self,
@@ -784,11 +804,11 @@ class MooncakeDistributedStore:
             tenant=tenant,
         )
 
-    def _group_tracked_keys(self) -> dict[str | None, list[str]]:
-        grouped: dict[str | None, list[str]] = {}
+    def _group_tracked_keys(self) -> dict[tuple[str | None, str | None, str | None], list[str]]:
+        grouped: dict[tuple[str | None, str | None, str | None], list[str]] = {}
         with self._lock:
-            for tenant, key in self._tracked_keys:
-                grouped.setdefault(tenant, []).append(key)
+            for tenant, domain, object_set, key in self._tracked_keys:
+                grouped.setdefault((tenant, domain, object_set), []).append(key)
         return grouped
 
     def _setup_from_config_dict(self, config: Mapping[str, object]):
@@ -814,6 +834,16 @@ class MooncakeDistributedStore:
             _coerce_optional_str(config.get("initial_state", config.get("state")))
             or "active"
         )
+        self._default_domain = (
+            _coerce_optional_str(config.get("domain"))
+            if _has_value(config.get("domain"))
+            else None
+        )
+        self._default_object_set = (
+            _coerce_optional_str(config.get("object_set"))
+            if _has_value(config.get("object_set"))
+            else None
+        )
         _init_tracing_from_env()
         result = self._invoke(
             "setup",
@@ -827,6 +857,8 @@ class MooncakeDistributedStore:
             stable_id=_coerce_optional_str(config.get("stable_id")),
             initial_state=initial_state,
             tenant=str(config.get("tenant", "default")),
+            domain=self._default_domain,
+            object_set=self._default_object_set,
             labels=_coerce_mapping(config.get("labels")),
             routed_writes=_coerce_bool(config.get("routed_writes"), False),
             replica_count=_coerce_int(config.get("replica_count"), 1),
@@ -987,6 +1019,8 @@ _SETUP_ENV_DEFAULTS = {
     "stable_id": ("MC_STORE_RS_STABLE_ID", _coerce_optional_str),
     "initial_state": ("MC_STORE_RS_INITIAL_STATE", _coerce_optional_str),
     "tenant": ("MC_STORE_RS_TENANT", str),
+    "domain": ("MC_STORE_RS_DOMAIN", str),
+    "object_set": ("MC_STORE_RS_OBJECT_SET", str),
     "routed_writes": (
         "MC_STORE_RS_ROUTED_WRITES",
         lambda value: _coerce_bool(value, False),

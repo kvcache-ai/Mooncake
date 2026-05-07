@@ -448,6 +448,8 @@ no arguments still renders help.
 | `--stable-id` | `MC_STORE_RS_STABLE_ID` | generated | persistent runtime identity |
 | `--initial-state` | `MC_STORE_RS_INITIAL_STATE` | `active` | startup lifecycle state |
 | `--tenant` | `MC_STORE_RS_TENANT` | `default` | default tenant scope |
+| `--domain` | `MC_STORE_RS_DOMAIN` | `default` | default domain scope for scoped object identity |
+| `--object-set` | `MC_STORE_RS_OBJECT_SET` | `default` | default object-set scope for scoped object identity |
 | `--label key=value` | `MC_STORE_RS_LABELS` | none | comma-separated runtime labels such as `pool=a,storage=true` |
 | `--routed-writes` | `MC_STORE_RS_ROUTED_WRITES` | `false` | enable routed writer mode; env accepts falsey values such as `0`, `false`, `no`, or `off`, and treats other non-empty values as true |
 | `--replica-count` | `MC_STORE_RS_REPLICA_COUNT` | `1` | default routed-writer replica count |
@@ -478,13 +480,15 @@ same falsey-value parsing as the standalone runtime boolean flags.
 
 Important Python-only compatibility knobs:
 
-`tenant` remains a normal default scope selector. `route_topk` and `route_control` are kept for compatibility, but admin-managed tenant policy in metadata is the preferred place to author tenant-scoped routing policy.
+`tenant`, `domain`, and `object_set` form the default namespace scope used by Python compatibility read/write operations when a request does not provide a more specific scope. `route_topk` and `route_control` are kept for compatibility, but admin-managed tenant policy in metadata is the preferred place to author tenant-scoped routing policy.
 
 
 | Parameter | Meaning |
 |-----------|---------|
 | `stable_id` | persistent client identity |
 | `tenant` | default tenant scope |
+| `domain` | default domain scope; falls back to `default` when omitted or empty |
+| `object_set` | default object-set scope; falls back to `default` when omitted or empty |
 | `labels` | lease labels such as `pool` and `storage` |
 | `routed_writes` | enable routed placement from Python |
 | `replica_count` | default replica count when routed writes are enabled |
@@ -573,7 +577,7 @@ Behavior notes:
 - values larger than `block_size` bypass the cache instead of being partially cached
 - successful read misses populate the cache from the fetched value
 - successful local writes and deletes invalidate the matching local cache entry on that daemon
-- Python compatibility runtimes partition local entries by effective metadata keyspace, so different keyspaces do not reuse the same cached value even inside one process
+- Python compatibility runtimes partition local entries by effective namespace scope, including `tenant`, `domain`, and `object_set`, so different object sets do not reuse the same cached value even inside one process
 - shm mode shares payload bytes with dummy clients connected to the same `mooncake-store-client`, while LRU metadata, generations, and pins remain private to the daemon
 - cache entries are daemon-local only and are never published to Redis or etcd
 - metadata keyspace remains the authoritative read/write isolation boundary; cache partitioning does not make objects visible across keyspaces
@@ -616,6 +620,8 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_STABLE_ID` | standalone client and Python wrapper setup fallback | stable client id used when SGLang cannot pass `stable_id` |
 | `MC_STORE_RS_INITIAL_STATE` | standalone client and Python wrapper setup fallback | initial lifecycle state, for example `active`, `standby`, `draining`, or `offline` |
 | `MC_STORE_RS_TENANT` | standalone client, Python wrapper setup fallback, and bench | default tenant used when SGLang cannot pass `tenant` |
+| `MC_STORE_RS_DOMAIN` | standalone client and Python wrapper setup fallback | default domain used when SGLang cannot pass `domain` |
+| `MC_STORE_RS_OBJECT_SET` | standalone client and Python wrapper setup fallback | default object set used when SGLang cannot pass `object_set`; treated as an opaque namespace component |
 | `MC_STORE_RS_LABELS` | standalone client and Python wrapper setup fallback | standalone labels as comma-separated `key=value` pairs; Python also accepts a JSON object |
 | `MC_STORE_RS_ROUTED_WRITES` | standalone client and Python wrapper setup fallback | enable routed writer mode when set to `1`, `true`, `yes`, or `on`; standalone also treats `0`, `false`, `no`, or `off` as false |
 | `MC_STORE_RS_REPLICA_COUNT` | standalone client, Python wrapper setup fallback, and bench | default routed-writer replica count |
