@@ -207,10 +207,10 @@ Status MultiTransport::submitTransfer(
             std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
             batch_desc.has_failure.store(true, std::memory_order_release);
             batch_desc.publish_completion_if_ready_locked();
-        }
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-        batch_desc.completion_cv.notify_all();
+            batch_desc.completion_cv.notify_all();
 #endif
+        }
         return overall_status;
     }
 
@@ -303,10 +303,10 @@ Status MultiTransport::submitTransfer(
         std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
         batch_desc.has_failure.store(true, std::memory_order_release);
         batch_desc.publish_completion_if_ready_locked();
-    }
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    batch_desc.completion_cv.notify_all();
+        batch_desc.completion_cv.notify_all();
 #endif
+    }
     return overall_status;
 }
 
@@ -379,10 +379,10 @@ Status MultiTransport::mp_submitTransfer(
         std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
         batch_desc.has_failure.store(true, std::memory_order_release);
         batch_desc.publish_completion_if_ready_locked();
-    }
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    batch_desc.completion_cv.notify_all();
+        batch_desc.completion_cv.notify_all();
 #endif
+    }
     return overall_status;
 }
 #endif
@@ -468,10 +468,10 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
             {
                 std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
                 batch_desc.publish_completion_if_ready_locked();
-            }
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-            batch_desc.completion_cv.notify_all();
+                batch_desc.completion_cv.notify_all();
 #endif
+            }
             return Status::OK();
         }
     }
@@ -486,10 +486,10 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         {
             std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
             batch_desc.publish_completion_if_ready_locked();
-        }
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-        batch_desc.completion_cv.notify_all();
+            batch_desc.completion_cv.notify_all();
 #endif
+        }
     }
     return Status::OK();
 }

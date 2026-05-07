@@ -280,19 +280,24 @@ class Transport {
             if (__atomic_exchange_n(&is_finished, true, __ATOMIC_ACQ_REL)) {
                 return;
             }
+            const uint64_t final_failed_slice_count =
+                __atomic_load_n(&failed_slice_count, __ATOMIC_ACQUIRE);
+            const uint64_t final_transferred_bytes =
+                __atomic_load_n(&transferred_bytes, __ATOMIC_ACQUIRE);
+
             auto &batch_desc = toBatchDesc(batch_id);
-            if (failed_slice_count > 0) {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+#endif
+            if (final_failed_slice_count > 0) {
                 batch_desc.has_failure.store(true, std::memory_order_release);
             }
             batch_desc.finished_transfer_bytes.fetch_add(
-                transferred_bytes, std::memory_order_release);
+                final_transferred_bytes, std::memory_order_release);
             batch_desc.finished_task_count.fetch_add(1,
                                                      std::memory_order_release);
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-            {
-                std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
-                batch_desc.publish_completion_if_ready_locked();
-            }
+            batch_desc.publish_completion_if_ready_locked();
             batch_desc.completion_cv.notify_all();
 #endif
         }
