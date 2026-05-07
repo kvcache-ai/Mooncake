@@ -41,13 +41,17 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
 
 Status Transport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
-    const size_t task_count = batch_desc.task_list.size();
-    for (size_t task_id = 0; task_id < task_count; task_id++) {
-        if (!__atomic_load_n(&batch_desc.task_list[task_id].is_finished,
-                             __ATOMIC_ACQUIRE)) {
-            LOG(ERROR) << "BatchID cannot be freed until all tasks are done";
-            return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+    {
+        std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+        const size_t task_count = batch_desc.task_list.size();
+        for (size_t task_id = 0; task_id < task_count; task_id++) {
+            if (!__atomic_load_n(&batch_desc.task_list[task_id].is_finished,
+                                 __ATOMIC_ACQUIRE)) {
+                LOG(ERROR)
+                    << "BatchID cannot be freed until all tasks are done";
+                return Status::BatchBusy(
+                    "BatchID cannot be freed until all tasks are done");
+            }
         }
     }
     delete &batch_desc;

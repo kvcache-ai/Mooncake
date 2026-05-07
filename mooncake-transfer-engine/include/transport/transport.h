@@ -278,6 +278,8 @@ class Transport {
         std::vector<TransferRequest> request_group;
 
         void publish_completion() {
+            auto &batch_desc = toBatchDesc(batch_id);
+            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
             if (__atomic_exchange_n(&is_finished, true, __ATOMIC_ACQ_REL)) {
                 return;
             }
@@ -286,8 +288,6 @@ class Transport {
             const uint64_t final_transferred_bytes =
                 __atomic_load_n(&transferred_bytes, __ATOMIC_ACQUIRE);
 
-            auto &batch_desc = toBatchDesc(batch_id);
-            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
             if (final_failed_slice_count > 0) {
                 batch_desc.has_failure.store(true, std::memory_order_release);
             }
