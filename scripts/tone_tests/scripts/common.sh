@@ -411,13 +411,13 @@ parse_test_exit_code() {
 run_test_case_with_parse() {
     local test_case_name=$1
     local run_test_func=$2
-    local exit_code=0
+    local test_exit_code=0
 
     if ! "$run_test_func"; then
-        exit_code=1
+        test_exit_code=1
     fi
 
-    parse_test_exit_code "$test_case_name" "$exit_code"
+    parse_test_exit_code "$test_case_name" "$test_exit_code"
 }
 
 parse_model_results() {
