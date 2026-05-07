@@ -13,7 +13,7 @@ use mooncake_store_client::{
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
-    StoreError,
+    NamespaceScope, ObjectKey, StoreError, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
@@ -28,6 +28,102 @@ type RegionKey = (u64, u64, u64);
 type RegionMap = BTreeMap<RegionKey, OwnedMappedRegion>;
 type TrackedKey = (String, String);
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompatNamespaceScope {
+    pub(crate) tenant: String,
+    pub(crate) domain: String,
+    pub(crate) object_set: String,
+}
+
+impl CompatNamespaceScope {
+    pub fn new(
+        tenant: impl Into<String>,
+        domain: Option<impl Into<String>>,
+        object_set: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            tenant: tenant.into(),
+            domain: domain
+                .map(Into::into)
+                .unwrap_or_else(|| DEFAULT_DOMAIN.to_string()),
+            object_set: object_set
+                .map(Into::into)
+                .unwrap_or_else(|| DEFAULT_OBJECT_SET.to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompatObjectScope {
+    pub(crate) tenant: String,
+    pub(crate) domain: String,
+    pub(crate) object_set: String,
+}
+
+impl CompatObjectScope {
+    fn from_defaults(default_scope: &CompatNamespaceScope, tenant: Option<String>) -> Self {
+        Self {
+            tenant: tenant.unwrap_or_else(|| default_scope.tenant.clone()),
+            domain: default_scope.domain.clone(),
+            object_set: default_scope.object_set.clone(),
+        }
+    }
+
+    pub(crate) fn cache_namespace(&self) -> String {
+        ObjectKey::from_scope(
+            &NamespaceScope::with_defaults(
+                Some(self.tenant.as_str()),
+                Some(self.domain.as_str()),
+                Some(self.object_set.as_str()),
+            ),
+            "",
+        )
+        .0
+    }
+}
+
+fn apply_scope_to_object_ref<'a>(
+    mut object: ObjectRef<'a>,
+    scope: &'a CompatObjectScope,
+) -> ObjectRef<'a> {
+    object = object.tenant(scope.tenant.as_str());
+    if scope.domain != DEFAULT_DOMAIN {
+        object = object.domain(scope.domain.as_str());
+    }
+    if scope.object_set != DEFAULT_OBJECT_SET {
+        object = object.object_set(scope.object_set.as_str());
+    }
+    object
+}
+
+fn apply_scope_to_get_request<'a>(
+    mut request: GetRequest<'a>,
+    scope: &'a CompatObjectScope,
+) -> GetRequest<'a> {
+    request = request.tenant(scope.tenant.as_str());
+    if scope.domain != DEFAULT_DOMAIN {
+        request = request.domain(scope.domain.as_str());
+    }
+    if scope.object_set != DEFAULT_OBJECT_SET {
+        request = request.object_set(scope.object_set.as_str());
+    }
+    request
+}
+
+fn apply_scope_to_multi_buffer_get_request<'a>(
+    mut request: MultiBufferGetRequest<'a>,
+    scope: &'a CompatObjectScope,
+) -> MultiBufferGetRequest<'a> {
+    request = request.tenant(scope.tenant.as_str());
+    if scope.domain != DEFAULT_DOMAIN {
+        request = request.domain(scope.domain.as_str());
+    }
+    if scope.object_set != DEFAULT_OBJECT_SET {
+        request = request.object_set(scope.object_set.as_str());
+    }
+    request
+}
 
 pub(crate) struct DispatcherState {
     tracked_keys: BTreeSet<TrackedKey>,
@@ -74,6 +170,7 @@ pub struct StoreDispatcher {
     hot_cache: Option<Arc<LocalHotCache>>,
     #[cfg_attr(not(test), allow(dead_code))]
     compat_scope: String,
+    default_scope: CompatNamespaceScope,
 }
 
 impl StoreDispatcher {
@@ -116,7 +213,29 @@ impl StoreDispatcher {
         timeouts: CompatTimeoutConfig,
         compat_scope: impl Into<String>,
     ) -> Result<Self, StoreError> {
-        Self::new_with_shared_client(Arc::new(client), timeouts, compat_scope.into())
+        let tenant = client.default_tenant().to_string();
+        Self::spawn_with_timeout_config_and_namespace_scope(
+            client,
+            _thread_name,
+            timeouts,
+            compat_scope,
+            CompatNamespaceScope::new(tenant, None::<String>, None::<String>),
+        )
+    }
+
+    pub fn spawn_with_timeout_config_and_namespace_scope(
+        client: StoreClient,
+        _thread_name: impl Into<String>,
+        timeouts: CompatTimeoutConfig,
+        compat_scope: impl Into<String>,
+        default_scope: CompatNamespaceScope,
+    ) -> Result<Self, StoreError> {
+        Self::new_with_shared_client(
+            Arc::new(client),
+            timeouts,
+            compat_scope.into(),
+            default_scope,
+        )
     }
 
     pub(crate) fn fork_with_scope(
@@ -133,6 +252,7 @@ impl StoreDispatcher {
                 dummy_rpc_timeout: self.request_timeout,
             },
             compat_scope.into(),
+            self.default_scope.clone(),
         )
     }
 
@@ -140,6 +260,7 @@ impl StoreDispatcher {
         client: Arc<StoreClient>,
         timeouts: CompatTimeoutConfig,
         compat_scope: String,
+        default_scope: CompatNamespaceScope,
     ) -> Result<Self, StoreError> {
         let startup_timeout =
             timeouts.registration_timeout_for_bytes(client.local_memory_registration_bytes());
@@ -169,6 +290,7 @@ impl StoreDispatcher {
             heartbeat_health: Arc::new(Mutex::new(HeartbeatHealthState::default())),
             hot_cache,
             compat_scope,
+            default_scope,
         })
     }
 
@@ -484,7 +606,8 @@ impl StoreDispatcher {
 
     pub fn get_value(&self, key: String, tenant: Option<String>) -> Result<Vec<u8>, StoreError> {
         let hot_cache = self.hot_cache.clone();
-        self.run(move |client| execute_get_value(client, hot_cache.as_ref(), tenant, key))
+        let scope = self.object_scope(tenant);
+        self.run(move |client| execute_get_value(client, hot_cache.as_ref(), scope, key))
     }
 
     pub fn batch_get_values(
@@ -493,7 +616,8 @@ impl StoreDispatcher {
         tenant: Option<String>,
     ) -> Result<Vec<Vec<u8>>, StoreError> {
         let hot_cache = self.hot_cache.clone();
-        self.run(move |client| execute_batch_get_values(client, hot_cache.as_ref(), tenant, keys))
+        let scope = self.object_scope(tenant);
+        self.run(move |client| execute_batch_get_values(client, hot_cache.as_ref(), scope, keys))
     }
 
     pub fn get_into_buffer(
@@ -504,8 +628,9 @@ impl StoreDispatcher {
         size: usize,
     ) -> Result<usize, StoreError> {
         let hot_cache = self.hot_cache.clone();
+        let scope = self.object_scope(tenant);
         self.run(move |client| {
-            execute_get_into_value(client, hot_cache.as_ref(), tenant, key, buffer_ptr, size)
+            execute_get_into_value(client, hot_cache.as_ref(), scope, key, buffer_ptr, size)
         })
     }
 
@@ -515,8 +640,9 @@ impl StoreDispatcher {
         tenant: Option<String>,
     ) -> Result<Vec<i64>, StoreError> {
         let hot_cache = self.hot_cache.clone();
+        let scope = self.object_scope(tenant);
         self.run(move |client| {
-            execute_batch_get_values_into(client, hot_cache.as_ref(), tenant, items)
+            execute_batch_get_values_into(client, hot_cache.as_ref(), scope, items)
         })
     }
 
@@ -528,11 +654,12 @@ impl StoreDispatcher {
         tenant: Option<String>,
     ) -> Result<Vec<i64>, StoreError> {
         let hot_cache = self.hot_cache.clone();
+        let scope = self.object_scope(tenant);
         self.run(move |client| {
             execute_batch_get_values_into_multi(
                 client,
                 hot_cache.as_ref(),
-                tenant,
+                scope,
                 keys,
                 all_buffer_ptrs,
                 all_sizes,
@@ -544,26 +671,28 @@ impl StoreDispatcher {
         let Some(cache) = self.hot_cache.as_ref() else {
             return;
         };
-        let tenant = normalized_tenant(self.client.as_ref(), tenant.as_deref().unwrap_or_default());
-        cache.invalidate(&HotCacheKey::new(tenant, key));
+        let scope = self.object_scope(tenant);
+        cache.invalidate(&HotCacheKey::new(scope.cache_namespace(), key));
     }
 
     pub fn invalidate_keys(&self, keys: Vec<String>, tenant: Option<String>) {
         let Some(cache) = self.hot_cache.as_ref() else {
             return;
         };
-        let tenant = normalized_tenant(self.client.as_ref(), tenant.as_deref().unwrap_or_default());
+        let scope = self.object_scope(tenant);
+        let cache_tenant = scope.cache_namespace();
         cache.invalidate_many(
             keys.into_iter()
-                .map(|key| HotCacheKey::new(tenant.clone(), key)),
+                .map(|key| HotCacheKey::new(cache_tenant.clone(), key)),
         );
     }
 
     #[cfg(test)]
     pub(crate) fn hot_cache_contains(&self, tenant: &str, key: &str) -> bool {
+        let scope = self.object_scope(Some(tenant.to_string()));
         self.hot_cache
             .as_ref()
-            .is_some_and(|cache| cache.contains(&HotCacheKey::new(tenant, key)))
+            .is_some_and(|cache| cache.contains(&HotCacheKey::new(scope.cache_namespace(), key)))
     }
 
     #[cfg(test)]
@@ -722,6 +851,10 @@ impl StoreDispatcher {
         Ok(())
     }
 
+    pub(crate) fn object_scope(&self, tenant: Option<String>) -> CompatObjectScope {
+        CompatObjectScope::from_defaults(&self.default_scope, tenant)
+    }
+
     fn prepare_state_update(
         &self,
         next_state: ClientLifecycleState,
@@ -757,6 +890,20 @@ impl StoreDispatcher {
             executor: self.executor.clone(),
             heartbeat_health: self.heartbeat_health.clone(),
         }
+    }
+}
+
+fn expect_exactly_one<T>(mut items: Vec<T>, operation: &str) -> Result<T, StoreError> {
+    match items.len() {
+        1 => Ok(items
+            .pop()
+            .expect("single-item vector should contain one element")),
+        0 => Err(StoreError::InvalidState(format!(
+            "expected exactly one {operation} result, got 0"
+        ))),
+        len => Err(StoreError::InvalidState(format!(
+            "expected exactly one {operation} result, got {len}"
+        ))),
     }
 }
 
@@ -891,7 +1038,13 @@ fn execute_get(
     hot_cache: Option<&Arc<LocalHotCache>>,
     request: pb::GetRequest,
 ) -> pb::GetReply {
-    match execute_get_value(client, hot_cache, Some(request.tenant), request.key) {
+    let tenant = normalized_tenant(client, &request.tenant);
+    let scope = CompatObjectScope {
+        tenant,
+        domain: DEFAULT_DOMAIN.to_string(),
+        object_set: DEFAULT_OBJECT_SET.to_string(),
+    };
+    match execute_get_value(client, hot_cache, scope, request.key) {
         Ok(value) => pb::GetReply { status: 0, value },
         Err(_) => pb::GetReply {
             status: -1,
@@ -903,17 +1056,17 @@ fn execute_get(
 fn execute_get_value(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    tenant_hint: Option<String>,
+    scope: CompatObjectScope,
     key: String,
 ) -> Result<Vec<u8>, StoreError> {
-    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
-    let cache_key = HotCacheKey::new(tenant.clone(), key.clone());
+    let cache_key = HotCacheKey::new(scope.cache_namespace(), key.clone());
     if let Some(cache) = hot_cache {
         if let Some(value) = cache.get(&cache_key) {
             return Ok(value);
         }
     }
-    let value = client.get_in_tenant(&tenant, &key)?;
+    let object = apply_scope_to_object_ref(ObjectRef::new(key.as_str()), &scope);
+    let value = expect_exactly_one(client.batch_get(&[object])?, "batch_get")?;
     insert_hot_cache(hot_cache, cache_key, &value);
     Ok(value)
 }
@@ -921,29 +1074,32 @@ fn execute_get_value(
 fn execute_batch_get_values(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    tenant_hint: Option<String>,
+    scope: CompatObjectScope,
     keys: Vec<String>,
 ) -> Result<Vec<Vec<u8>>, StoreError> {
-    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
+    let cache_tenant = scope.cache_namespace();
     let mut results = vec![Vec::new(); keys.len()];
     let mut misses = Vec::new();
     let mut objects = Vec::new();
     for (index, key) in keys.iter().enumerate() {
-        let cache_key = HotCacheKey::new(tenant.clone(), key.clone());
+        let cache_key = HotCacheKey::new(cache_tenant.clone(), key.clone());
         if let Some(cache) = hot_cache {
             if let Some(value) = cache.get(&cache_key) {
                 results[index] = value;
                 continue;
             }
         }
-        objects.push(ObjectRef::new(key.as_str()).tenant(tenant.as_str()));
+        objects.push(apply_scope_to_object_ref(
+            ObjectRef::new(key.as_str()),
+            &scope,
+        ));
         misses.push((index, key.clone()));
     }
     if !objects.is_empty() {
         for ((index, key), value) in misses.into_iter().zip(client.batch_get(&objects)?) {
             insert_hot_cache(
                 hot_cache,
-                HotCacheKey::new(tenant.clone(), key.clone()),
+                HotCacheKey::new(cache_tenant.clone(), key.clone()),
                 &value,
             );
             results[index] = value;
@@ -955,20 +1111,23 @@ fn execute_batch_get_values(
 fn execute_get_into_value(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    tenant_hint: Option<String>,
+    scope: CompatObjectScope,
     key: String,
     buffer_ptr: usize,
     size: usize,
 ) -> Result<usize, StoreError> {
-    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
     let target = unsafe { std::slice::from_raw_parts_mut(buffer_ptr as *mut u8, size) };
-    let cache_key = HotCacheKey::new(tenant.clone(), key.clone());
+    let cache_key = HotCacheKey::new(scope.cache_namespace(), key.clone());
     if let Some(cache) = hot_cache {
         if let Some(hit) = cache.copy_into(&cache_key, target)? {
             return Ok(hit);
         }
     }
-    let copied = client.get_into_in_tenant(&tenant, &key, target)?;
+    let mut request = apply_scope_to_get_request(GetRequest::new(key.as_str(), target), &scope);
+    let copied = expect_exactly_one(
+        client.batch_get_into(std::slice::from_mut(&mut request))?,
+        "batch_get_into",
+    )?;
     insert_hot_cache(hot_cache, cache_key, &target[..copied]);
     Ok(copied)
 }
@@ -976,12 +1135,12 @@ fn execute_get_into_value(
 fn execute_get_into_multi_value(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    tenant: &str,
+    scope: &CompatObjectScope,
     key: String,
     buffer_ptrs: Vec<usize>,
     sizes: Vec<usize>,
 ) -> Result<usize, StoreError> {
-    let cache_key = HotCacheKey::new(tenant.to_string(), key.clone());
+    let cache_key = HotCacheKey::new(scope.cache_namespace(), key.clone());
     let mut buffers = buffer_ptrs
         .iter()
         .zip(sizes.iter())
@@ -999,8 +1158,10 @@ fn execute_get_into_multi_value(
         .map(|buffer| (buffer.as_ptr() as usize, buffer.len()))
         .collect::<Vec<_>>();
     let copied = {
-        let mut request = MultiBufferGetRequest::new(key.as_str(), buffers.as_mut_slice());
-        request = request.tenant(tenant);
+        let request = apply_scope_to_multi_buffer_get_request(
+            MultiBufferGetRequest::new(key.as_str(), buffers.as_mut_slice()),
+            scope,
+        );
         let mut requests = vec![request];
         client
             .batch_get_into_multi_buffers(requests.as_mut_slice())?
@@ -1279,15 +1440,15 @@ fn execute_batch_get_into_multi_buffers(
 fn execute_batch_get_values_into(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    tenant_hint: Option<String>,
+    scope: CompatObjectScope,
     items: Vec<(String, usize, usize)>,
 ) -> Result<Vec<i64>, StoreError> {
-    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
+    let cache_tenant = scope.cache_namespace();
     let mut lengths = vec![-1; items.len()];
     let mut misses = Vec::new();
     for (index, (key, buffer_ptr, size)) in items.iter().enumerate() {
         let target = unsafe { std::slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size) };
-        let cache_key = HotCacheKey::new(tenant.clone(), key.clone());
+        let cache_key = HotCacheKey::new(cache_tenant.clone(), key.clone());
         if let Some(cache) = hot_cache {
             if let Some(hit) = cache.copy_into(&cache_key, target)? {
                 lengths[index] = hit as i64;
@@ -1309,7 +1470,7 @@ fn execute_batch_get_values_into(
         .iter()
         .zip(buffers.iter_mut())
         .map(|((_, key, _, _), buffer)| {
-            GetRequest::new(key.as_str(), buffer).tenant(tenant.as_str())
+            apply_scope_to_get_request(GetRequest::new(key.as_str(), buffer), &scope)
         })
         .collect::<Vec<_>>();
     let sizes = client.batch_get_into(requests.as_mut_slice())?;
@@ -1317,7 +1478,7 @@ fn execute_batch_get_values_into(
     {
         insert_hot_cache(
             hot_cache,
-            HotCacheKey::new(tenant.clone(), key),
+            HotCacheKey::new(cache_tenant.clone(), key),
             &buffer[..copied],
         );
         lengths[index] = copied as i64;
@@ -1328,18 +1489,17 @@ fn execute_batch_get_values_into(
 fn execute_batch_get_values_into_multi(
     client: &StoreClient,
     hot_cache: Option<&Arc<LocalHotCache>>,
-    tenant_hint: Option<String>,
+    scope: CompatObjectScope,
     keys: Vec<String>,
     all_buffer_ptrs: Vec<Vec<usize>>,
     all_sizes: Vec<Vec<usize>>,
 ) -> Result<Vec<i64>, StoreError> {
-    let tenant = normalized_tenant(client, tenant_hint.as_deref().unwrap_or_default());
     let mut lengths = Vec::with_capacity(keys.len());
     for ((key, buffer_ptrs), sizes) in keys.into_iter().zip(all_buffer_ptrs).zip(all_sizes) {
         lengths.push(execute_get_into_multi_value(
             client,
             hot_cache,
-            &tenant,
+            &scope,
             key,
             buffer_ptrs,
             sizes,

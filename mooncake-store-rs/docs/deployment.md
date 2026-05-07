@@ -262,14 +262,14 @@ python -m sglang.launch_server \
 
   Current upstream SGLang only forwards the legacy Mooncake fields from `--hicache-storage-backend-extra-config`: `local_hostname`, `metadata_server`, `global_segment_size`, `protocol`, `device_name`, `master_server_address`, `check_server`, `standalone_storage`, and `client_server_address`.
 
-  Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. The Python compatibility layer therefore treats environment variables as setup fallbacks when SGLang does not pass the new fields. Explicit Python `setup(...)` arguments still win over environment values.
+  Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `domain`, `object_set`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. The Python compatibility layer therefore treats environment variables as setup fallbacks when SGLang does not pass the new fields. Explicit Python `setup(...)` arguments still win over environment values.
 
 Use these environment variables for SGLang real mode:
 
 These are compatibility bridges because current upstream SGLang does not forward the full Store-RS setup surface. Prefer admin-managed tenant policy in metadata whenever the integration path allows it.
 
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`; default `classic_te`
-- `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
+- `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_DOMAIN`, `MC_STORE_RS_OBJECT_SET`, `MC_STORE_RS_LABELS`
 - `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
 - `MC_STORE_RS_TRANSPORT_METADATA_URL` (`redis://...` by default, or `P2PHANDSHAKE` with `classic_te`), `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
@@ -279,7 +279,7 @@ These are compatibility bridges because current upstream SGLang does not forward
 - `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC client capacity; default `2`
 - `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS=<n>` to tune embedded control-plane gRPC server capacity; default `4`
 
-`MC_STORE_RS_LABELS` accepts either a JSON object or comma-separated `key=value` pairs, for example `MC_STORE_RS_LABELS='storage=false,pool=rw'`.
+`MC_STORE_RS_OBJECT_SET` is treated as an opaque namespace component. For model-serving deployments it can carry the active weight-version boundary, and compatibility reads/writes, including KVCache keys, will use that object set until the process is restarted or a future runtime hot-update API changes it. `MC_STORE_RS_LABELS` accepts either a JSON object or comma-separated `key=value` pairs, for example `MC_STORE_RS_LABELS='storage=false,pool=rw'`.
 
 - dummy-mode SGLang through a standalone routed gateway
 

@@ -244,6 +244,8 @@ mod tests {
                 transport_backend: None,
                 stable_id: Some("py-runtime".to_string()),
                 tenant: "default".to_string(),
+                domain: None,
+                object_set: None,
                 labels: BTreeMap::new(),
                 routed_writes: false,
                 replica_count: 1,

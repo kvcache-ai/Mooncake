@@ -760,6 +760,8 @@ fn build_runtime(
         transport_backend: Some(transport_backend_name(&global.transport_backend).to_string()),
         stable_id: Some(spec.stable_id),
         tenant: global.tenant.clone(),
+        domain: None,
+        object_set: None,
         labels,
         routed_writes: spec.routed_writes,
         replica_count: global.replica_count,

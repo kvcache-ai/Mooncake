@@ -29,6 +29,8 @@ Current scope model:
 
 Object identity is deterministic across that scope model: the default namespace keeps the legacy route key shape `tenant::logical_key`, while non-default `domain` / `object_set` scopes use a full-scope route key so the same tenant can store the same logical key in different scopes without collision.
 
+Python compatibility clients can now select a default namespace scope at setup time with `tenant`, `domain`, and `object_set`, or through `MC_STORE_RS_TENANT`, `MC_STORE_RS_DOMAIN`, and `MC_STORE_RS_OBJECT_SET` when an integration layer such as SGLang cannot forward those fields directly. The compatibility API applies that default scope to both read and write paths unless the caller supplies an explicit tenant override. Treat `object_set` as an opaque namespace component; URI-like values such as checkpoint paths are percent-encoded in route keys rather than parsed or inferred from object key patterns.
+
 In Phase 1 strict quota rollout, mutable quota state is still tenant-root metadata. Nested selectors remain useful for object-accounting lookups and for future policy expansion.
 
 ## Recommended Control-Plane Model
@@ -160,12 +162,15 @@ store.setup(
     protocol="tcp",
     device_name="",
     master_server_address="",
+    tenant="tenant-a",
+    domain="sglang-chat",
+    object_set="deepseek-r1__2026-04-19-build-44",
     keyspace="tenant-a-prod",
     worker_scope="py-worker-a",
 )
 ```
 
-Use real mode when Python should participate directly in the same distributed runtime as Rust clients.
+Use real mode when Python should participate directly in the same distributed runtime as Rust clients. If the caller cannot pass `domain` / `object_set`, set `MC_STORE_RS_DOMAIN` and `MC_STORE_RS_OBJECT_SET` before startup so compatibility reads, writes, route queries, removes, size checks, and local hot-cache keys all use the same default namespace scope.
 
 Python dummy-mode example:
 

@@ -10,7 +10,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use _store_rs::dispatcher::StoreDispatcher;
+use _store_rs::dispatcher::{CompatNamespaceScope, StoreDispatcher};
 use _store_rs::dummy_service::start_dummy_store_server;
 use _store_rs::runtime::{
     CompatRuntimeArgs, CompatSetupArgs, CompatTimeoutCliOverrides, CompatTimeoutConfig,
@@ -128,6 +128,18 @@ struct RunArgs {
         help = "Default tenant scope for startup policy lookup and request defaults"
     )]
     tenant: String,
+    #[arg(
+        long,
+        env = "MC_STORE_RS_DOMAIN",
+        help = "Default domain scope for compatibility read/write requests"
+    )]
+    domain: Option<String>,
+    #[arg(
+        long = "object-set",
+        env = "MC_STORE_RS_OBJECT_SET",
+        help = "Default object-set scope for compatibility read/write requests"
+    )]
+    object_set: Option<String>,
     #[arg(long = "label", value_parser = parse_label, value_delimiter = ',', env = "MC_STORE_RS_LABELS", help = "Runtime identity and placement labels; use admin-managed tenant policy for tenant-scoped routing/resource policy")]
     labels: Vec<(String, String)>,
     #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_RS_ROUTED_WRITES")]
@@ -244,11 +256,22 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let epoch = runtime.epoch;
     let startup_state = runtime.initial_state;
     let segment_name = runtime.segment_name.clone();
-    let client = Arc::new(StoreDispatcher::spawn_with_timeout_config(
-        runtime.client,
-        format!("mooncake-store-dispatcher-{stable_id}"),
-        timeouts,
-    )?);
+    let default_scope = CompatNamespaceScope::new(
+        args.tenant.clone(),
+        args.domain.clone(),
+        args.object_set.clone(),
+    );
+    let client = Arc::new(
+        StoreDispatcher::spawn_with_timeout_config_and_namespace_scope(
+            runtime.client,
+            format!("mooncake-store-dispatcher-{stable_id}"),
+            timeouts,
+            args.keyspace
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            default_scope,
+        )?,
+    );
     client.register_local_memory()?;
     let dummy_server = match args.client_server_address.as_deref() {
         Some(address) => {
@@ -599,6 +622,8 @@ fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRu
                 .map(|backend| backend.as_str().to_string()),
             stable_id: args.stable_id.clone(),
             tenant: args.tenant.clone(),
+            domain: args.domain.clone(),
+            object_set: args.object_set.clone(),
             labels: args.labels.iter().cloned().collect::<BTreeMap<_, _>>(),
             routed_writes: args.routed_writes,
             replica_count: args.replica_count,
@@ -908,6 +933,8 @@ mod tests {
             stable_id: Some("sample".to_string()),
             initial_state: InitialStateArg::Active,
             tenant: "default".to_string(),
+            domain: None,
+            object_set: None,
             labels: vec![],
             routed_writes: false,
             replica_count: 1,
@@ -1117,6 +1144,8 @@ mod tests {
                 ("MC_STORE_RS_STABLE_ID", Some("env-node")),
                 ("MC_STORE_RS_INITIAL_STATE", Some("standby")),
                 ("MC_STORE_RS_TENANT", Some("tenant-env")),
+                ("MC_STORE_RS_DOMAIN", Some("domain-env")),
+                ("MC_STORE_RS_OBJECT_SET", Some("object-set-env")),
                 ("MC_STORE_RS_LABELS", Some("pool=env,storage=true")),
                 ("MC_STORE_RS_ROUTED_WRITES", Some("1")),
                 ("MC_STORE_RS_REPLICA_COUNT", Some("3")),
@@ -1158,6 +1187,8 @@ mod tests {
                 assert_eq!(args.stable_id.as_deref(), Some("env-node"));
                 assert_eq!(args.initial_state, InitialStateArg::Standby);
                 assert_eq!(args.tenant, "tenant-env");
+                assert_eq!(args.domain.as_deref(), Some("domain-env"));
+                assert_eq!(args.object_set.as_deref(), Some("object-set-env"));
                 assert_eq!(
                     args.labels,
                     vec![

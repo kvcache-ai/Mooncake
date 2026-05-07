@@ -353,8 +353,16 @@ impl LocalHotCache {
     }
 
     pub(crate) fn invalidate_many(&self, keys: impl IntoIterator<Item = HotCacheKey>) {
+        let mut inner = self.inner.lock();
         for key in keys {
-            self.invalidate(&key);
+            let Some(block_id) = inner.key_to_block.remove(&key) else {
+                continue;
+            };
+            let block = &mut inner.blocks[block_id];
+            block.generation = block.generation.saturating_add(1);
+            if block.pins == 0 {
+                block.len = 0;
+            }
         }
     }
 

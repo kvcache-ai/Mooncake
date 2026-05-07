@@ -60,6 +60,7 @@ For tenant-scoped routing and resource policy, prefer `mooncake-store-admin poli
 Isolation knobs:
 
 - `keyspace` isolates metadata-backed routing, policy lookup, and object visibility
+- `tenant`, `domain`, and `object_set` select the default namespace scope applied to Python compatibility read/write operations
 - `worker_scope` isolates compat-local worker state such as the dispatcher executor and local hot-cache domain
 - when `worker_scope` is omitted, the Python layer derives it from `keyspace` when present; otherwise it allocates a unique per-setup worker scope
 
@@ -414,6 +415,8 @@ store.setup(
     "",
     stable_id="py-store-a",
     tenant="default",
+    domain="sglang-chat",
+    object_set="deepseek-r1__2026-04-19-build-44",
     labels={"pool": "pool-a", "storage": "true"},
     transport_backend="classic_te",
     transport_rpc_port=17111,
@@ -422,6 +425,8 @@ store.setup(
 store.put("hello", b"world")
 assert store.get("hello") == b"world"
 ```
+
+When `domain` and `object_set` are omitted from `setup(...)`, the Python wrapper also accepts `MC_STORE_RS_DOMAIN` and `MC_STORE_RS_OBJECT_SET` as startup fallbacks. The selected default scope is applied consistently to real-mode compatibility reads, writes, route queries, removes, existence checks, size checks, batch operations, registered-buffer operations, and local hot-cache keys.
 
 ## Routed Writes
 

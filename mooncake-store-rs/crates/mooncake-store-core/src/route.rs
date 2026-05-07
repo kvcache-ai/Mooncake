@@ -806,6 +806,16 @@ mod tests {
     }
 
     #[test]
+    fn object_set_uri_like_checkpoint_is_percent_encoded() {
+        let object_set = "CHECKPOINT=oss://example-bucket/example-path/checkpoint-500/";
+        let scope = NamespaceScope::new("tenant-a", "domain-a", object_set);
+        assert_eq!(
+            ObjectKey::from_scope(&scope, "weights/model.safetensors").0,
+            "tenant-a::ns/domain-a/CHECKPOINT%3Doss%3A%2F%2Fexample-bucket%2Fexample-path%2Fcheckpoint-500%2F/weights%2Fmodel.safetensors"
+        );
+    }
+
+    #[test]
     fn route_version_next_saturates_at_max_value() {
         assert_eq!(RouteVersion(9).next(), RouteVersion(10));
         assert_eq!(RouteVersion(u64::MAX).next(), RouteVersion(u64::MAX));
