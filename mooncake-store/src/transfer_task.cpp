@@ -255,18 +255,21 @@ bool TransferEngineOperationState::is_completed() {
         return true;
     }
 
-    if (status.s == TransferStatusEnum::COMPLETED ||
-        status.s == TransferStatusEnum::FAILED ||
+    if (status.s == TransferStatusEnum::COMPLETED) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_.has_value()) {
+            set_result_internal(ErrorCode::OK);
+        }
+        return true;
+    }
+
+    if (status.s == TransferStatusEnum::FAILED ||
         status.s == TransferStatusEnum::CANCELED ||
         status.s == TransferStatusEnum::INVALID ||
         status.s == TransferStatusEnum::TIMEOUT) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!result_.has_value()) {
-            set_result_internal(status.s == TransferStatusEnum::COMPLETED
-                                    ? ErrorCode::OK
-                                    : ErrorCode::TRANSFER_FAIL);
-        }
-        return true;
+        check_task_status();
+        return result_.has_value();
     }
 
     std::lock_guard<std::mutex> lock(mutex_);

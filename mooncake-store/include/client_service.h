@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include <chrono>

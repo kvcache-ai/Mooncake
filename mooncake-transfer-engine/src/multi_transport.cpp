@@ -79,8 +79,8 @@ void markTasksWithoutSlicesFailed(
             if (__atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE) != 0) {
                 continue;
             }
-            task->slice_count = 1;
-            task->failed_slice_count = 1;
+            __atomic_store_n(&task->failed_slice_count, 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&task->slice_count, 1, __ATOMIC_RELEASE);
             task->publish_completion();
         }
     }
