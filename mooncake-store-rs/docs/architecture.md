@@ -133,6 +133,10 @@ membership snapshot, and retries placement when the request is not pinned to a h
 segment. This keeps transient storage-owner transport failures from escaping into Python backup
 threads as fatal exceptions.
 
+Segment-announcement metadata faults such as missing or non-contiguous published storage target
+chunks are treated as stale segment state first. The client invalidates cached segment state and
+may retry the write, but it does not quarantine the touched storage runtimes on that signal alone.
+
 Remote transfer planning splits each request at both local registration limits and the storage
 target chunks published in the target segment announcement. The route still records one logical
 replica, but the transport only receives slices that fit inside one registered storage target

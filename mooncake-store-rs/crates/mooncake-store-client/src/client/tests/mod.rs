@@ -5173,6 +5173,55 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
 }
 
 #[test]
+fn stale_segment_metadata_write_failure_does_not_quarantine_runtime() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("stale-write-store-segment"));
+    let writer_transport = Arc::new(store_transport.peer("stale-write-writer-segment"));
+
+    let store = StoreClientBuilder::new(metadata.clone(), "stale-write-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "stale-write-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let writer = StoreClientBuilder::new(metadata, "stale-write-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "stale-write-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    writer.note_remote_write_failure(
+        &[ReplicaWriteTarget {
+            storage_runtime: store.runtime_id().clone(),
+            segment_name: SegmentName::new("stale-write-store-segment"),
+            target_chunks: Vec::new(),
+        }],
+        &StoreError::Transport(
+            "segment stale-write-store-segment has no published storage target chunks".to_string(),
+        ),
+        "stale_segment_test",
+    );
+
+    assert!(
+        !writer
+            .suspect_runtime_cache
+            .lock()
+            .contains(store.runtime_id()),
+        "stale segment metadata must refresh cached placement state before quarantining a runtime"
+    );
+}
+
+#[test]
 fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("put-failed-a-segment"));

@@ -1938,6 +1938,14 @@ impl StoreClient {
                 }
             }
         }
+        if remote_segment_cache_stale(error) {
+            let _ = refresh_live_client_cache(
+                self.metadata.as_ref(),
+                &self.live_client_cache,
+                "live_client_snapshot_remote_write_failure",
+            );
+            return;
+        }
         for runtime in failed_runtimes {
             eprintln!(
                 "[mooncake-store] marking remote write target suspect runtime={} context={} error={}",

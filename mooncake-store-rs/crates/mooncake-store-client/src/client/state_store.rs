@@ -381,6 +381,28 @@ mod state_store_tests {
     }
 
     #[test]
+    fn cache_stale_detects_missing_target_chunks_error() {
+        let error =
+            StoreError::Transport("segment remote-a has no published storage target chunks".to_string());
+        assert!(
+            remote_segment_cache_stale(&error),
+            "missing target chunk errors should trigger cache refresh"
+        );
+    }
+
+    #[test]
+    fn cache_stale_detects_unpublished_chunk_crossing_error() {
+        let error = StoreError::InvalidState(
+            "storage range [0, 64) crosses an unpublished target chunk for segment remote-a"
+                .to_string(),
+        );
+        assert!(
+            remote_segment_cache_stale(&error),
+            "unpublished target chunk crossings should trigger cache refresh"
+        );
+    }
+
+    #[test]
     fn cache_stale_rejects_allocator_error() {
         let error = StoreError::Allocator("out of memory".to_string());
         assert!(
@@ -1007,7 +1029,12 @@ fn remote_segment_cache_stale(error: &StoreError) -> bool {
         StoreError::Transport(message)
         | StoreError::NotFound(message)
         | StoreError::InvalidState(message) => {
-            message.contains("segment handle") || message.contains("is outside segment")
+            message.contains("segment handle")
+                || message.contains("is outside segment")
+                || message.contains("has no published storage target chunks")
+                || message.contains("crosses an unpublished target chunk")
+                || message.contains("target chunks are not contiguous")
+                || message.contains("target chunk has zero length")
         }
         _ => false,
     }
