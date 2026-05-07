@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::collections::BTreeSet;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use mooncake_store_client::MooncakeCompatibilityFacade;
 use mooncake_store_core::StoreError;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
@@ -16,7 +18,7 @@ use crate::dispatcher::StoreDispatcher;
 use crate::shm::{
     bind_shm_listener, dummy_ipc_socket_path, hot_cache_ipc_socket_path, map_registered_region,
     recv_hot_cache_fd_request, recv_shm_register_request, send_hot_cache_fd_response,
-    DummyClientId, ShmRegisterRequest,
+    send_shm_register_reply, DummyClientId, ShmRegisterRequest,
 };
 use crate::DEFAULT_COMPAT_WORKER_SCOPE;
 
@@ -123,9 +125,16 @@ fn spawn_shm_listener_thread(
         .spawn(move || {
             while !shutdown_flag.load(Ordering::SeqCst) {
                 match recv_shm_register_request(&listener) {
-                    Ok((request, fd)) => {
-                        if let Err(error) = context.register_region(request, fd) {
-                            tracing::warn!(error = %error, "dummy shm registration failed");
+                    Ok((stream, request, fd)) => {
+                        let status = match context.register_region(request, fd) {
+                            Ok(()) => 0,
+                            Err(error) => {
+                                tracing::warn!(error = %error, "dummy shm registration failed");
+                                -1
+                            }
+                        };
+                        if let Err(error) = send_shm_register_reply(&stream, status) {
+                            tracing::warn!(error = %error, "dummy shm registration reply failed");
                         }
                     }
                     Err(error) => {
@@ -179,6 +188,76 @@ fn spawn_hot_cache_listener_thread(
         })
 }
 
+fn socket_addr_aliases(bind_addr: &str, advertised_host: Option<&str>) -> Vec<String> {
+    let mut aliases = BTreeSet::new();
+    aliases.insert(bind_addr.to_string());
+
+    let Ok(socket_addr) = bind_addr.parse::<SocketAddr>() else {
+        return aliases.into_iter().collect();
+    };
+    let port = socket_addr.port();
+
+    if let Some(host) = advertised_host_alias(advertised_host, port) {
+        aliases.insert(host);
+    }
+
+    match socket_addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            aliases.insert(format!("127.0.0.1:{port}"));
+            aliases.insert(format!("localhost:{port}"));
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            aliases.insert(format!("[::1]:{port}"));
+            aliases.insert(format!("localhost:{port}"));
+        }
+        _ => {}
+    }
+
+    aliases.into_iter().collect()
+}
+
+fn advertised_host_alias(advertised_host: Option<&str>, port: u16) -> Option<String> {
+    let host = advertised_host
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(extract_host_for_socket_alias)?;
+    Some(format!("{host}:{port}"))
+}
+
+fn extract_host_for_socket_alias(address: &str) -> String {
+    if let Ok(socket_addr) = address.parse::<SocketAddr>() {
+        return match socket_addr.ip() {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+    }
+    if let Some((host, port)) = address.rsplit_once(':') {
+        if !host.is_empty() && port.parse::<u16>().is_ok() {
+            return host.to_string();
+        }
+    }
+    address.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_host_for_socket_alias;
+
+    #[test]
+    fn extract_host_for_socket_alias_handles_rpc_addresses() {
+        assert_eq!(
+            extract_host_for_socket_alias("11.167.208.79:17300"),
+            "11.167.208.79"
+        );
+        assert_eq!(extract_host_for_socket_alias("[::1]:17300"), "[::1]");
+        assert_eq!(
+            extract_host_for_socket_alias("dummy-host.internal:17300"),
+            "dummy-host.internal"
+        );
+        assert_eq!(extract_host_for_socket_alias("localhost"), "localhost");
+    }
+}
+
 pub fn start_dummy_store_server(
     client: Arc<StoreDispatcher>,
     bind_addr: &str,
@@ -187,14 +266,24 @@ pub fn start_dummy_store_server(
     let client = Arc::new(client.fork_with_scope(worker_scope.to_string())?);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let context = Arc::new(DummyStoreContext { client });
+    let advertised_host = context.client.run(|client| client.get_hostname()).ok();
+    let socket_addr_aliases = socket_addr_aliases(bind_addr, advertised_host.as_deref());
 
-    let mut socket_paths = vec![dummy_ipc_socket_path(bind_addr, worker_scope)];
+    let mut socket_paths = socket_addr_aliases
+        .iter()
+        .map(|addr| dummy_ipc_socket_path(addr, worker_scope))
+        .collect::<Vec<_>>();
     if worker_scope != DEFAULT_COMPAT_WORKER_SCOPE {
-        let legacy_path = dummy_ipc_socket_path(bind_addr, DEFAULT_COMPAT_WORKER_SCOPE);
-        if legacy_path != socket_paths[0] {
+        let legacy_paths = socket_addr_aliases
+            .iter()
+            .map(|addr| dummy_ipc_socket_path(addr, DEFAULT_COMPAT_WORKER_SCOPE))
+            .collect::<Vec<_>>();
+        for legacy_path in legacy_paths {
             socket_paths.push(legacy_path);
         }
     }
+    socket_paths.sort();
+    socket_paths.dedup();
     let mut shm_threads = Vec::with_capacity(socket_paths.len());
     for (index, path) in socket_paths.iter().enumerate() {
         let listener = bind_shm_listener(path)?;
@@ -209,14 +298,21 @@ pub fn start_dummy_store_server(
     let mut hot_cache_socket_paths = Vec::new();
     let mut hot_cache_threads = Vec::new();
     if context.client.hot_cache_fd()?.is_some() {
-        hot_cache_socket_paths.push(hot_cache_ipc_socket_path(bind_addr, worker_scope));
+        hot_cache_socket_paths.extend(
+            socket_addr_aliases
+                .iter()
+                .map(|addr| hot_cache_ipc_socket_path(addr, worker_scope)),
+        );
         if worker_scope != DEFAULT_COMPAT_WORKER_SCOPE {
-            let legacy_path =
-                hot_cache_ipc_socket_path(bind_addr, DEFAULT_COMPAT_WORKER_SCOPE);
-            if legacy_path != hot_cache_socket_paths[0] {
+            for legacy_path in socket_addr_aliases
+                .iter()
+                .map(|addr| hot_cache_ipc_socket_path(addr, DEFAULT_COMPAT_WORKER_SCOPE))
+            {
                 hot_cache_socket_paths.push(legacy_path);
             }
         }
+        hot_cache_socket_paths.sort();
+        hot_cache_socket_paths.dedup();
         for (index, path) in hot_cache_socket_paths.iter().enumerate() {
             let listener = bind_shm_listener(path)?;
             hot_cache_threads.push(spawn_hot_cache_listener_thread(
