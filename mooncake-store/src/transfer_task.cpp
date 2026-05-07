@@ -238,12 +238,38 @@ void MemcpyWorkerPool::workerThread() {
 // ============================================================================
 
 bool TransferEngineOperationState::is_completed() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (result_.has_value()) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (result_.has_value()) {
+            return true;
+        }
+    }
+
+    TransferStatus status;
+    Status s = engine_.getBatchTransferStatus(batch_id_, status);
+    if (!s.ok()) {
+        LOG(ERROR) << "Failed to get batch transfer status for batch "
+                   << batch_id_ << " with error " << s.message();
+        std::lock_guard<std::mutex> lock(mutex_);
+        set_result_internal(ErrorCode::TRANSFER_FAIL);
         return true;
     }
 
-    check_task_status();
+    if (status.s == TransferStatusEnum::COMPLETED ||
+        status.s == TransferStatusEnum::FAILED ||
+        status.s == TransferStatusEnum::CANCELED ||
+        status.s == TransferStatusEnum::INVALID ||
+        status.s == TransferStatusEnum::TIMEOUT) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_.has_value()) {
+            set_result_internal(status.s == TransferStatusEnum::COMPLETED
+                                    ? ErrorCode::OK
+                                    : ErrorCode::TRANSFER_FAIL);
+        }
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
     return result_.has_value();
 }
 

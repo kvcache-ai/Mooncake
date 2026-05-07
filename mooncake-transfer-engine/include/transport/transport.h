@@ -20,7 +20,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>

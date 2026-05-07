@@ -14,7 +14,6 @@
 
 #include "multi_transport.h"
 #include <algorithm>
-#include <iterator>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -400,8 +399,11 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
-    assert(task.slice_count);
-    if (success_slice_count + failed_slice_count == task.slice_count) {
+    const uint64_t slice_count = task.slice_count;
+    if (slice_count == 0) {
+        status.s = Transport::TransferStatusEnum::COMPLETED;
+        task.publish_completion();
+    } else if (success_slice_count + failed_slice_count == slice_count) {
         if (failed_slice_count) {
             status.s = Transport::TransferStatusEnum::FAILED;
         } else {
