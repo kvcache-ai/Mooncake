@@ -400,9 +400,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 store_->deleteKey(
                     getBufferStoreKey(backendIndex_, pollingRank));
                 store_->deleteKey(
-                    getExtensionTaskCountStoreKey(backendIndex_, pollingRank));
-                store_->deleteKey(getExtensionActiveRanksStoreKey(backendIndex_,
-                                                                  pollingRank));
+                    getExtensionStateStoreKey(backendIndex_, pollingRank));
             } catch (const std::exception& e) {
                 LOG(WARNING) << "Rank " << rank_
                              << " got an exception when deleteKey for peer "
@@ -414,7 +412,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 &warmup_recv_region_[pollingRank]) = 0;
 
             // Reset P2PProxy states
-            p2p_proxy_->ResetPeerState(pollingRank);
+            p2p_proxy_->resetPeerState(pollingRank);
 
             // Back to WAITING_STORE to reconnect it.
             peerState.state = PeerConnectionState::WAITING_STORE;

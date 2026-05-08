@@ -33,59 +33,138 @@ TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
 
-namespace {
+std::vector<uint8_t> serialize(const ExtensionState& state) {
+    uint32_t rankCount = static_cast<uint32_t>(state.activeRanks.size());
 
-std::vector<uint8_t> serializeActiveRanks(const bool* activeRanks, int size) {
-    std::vector<uint8_t> bytes(size);
-    for (int i = 0; i < size; ++i) {
-        bytes[i] = activeRanks[i] ? 1 : 0;
+    // Calculate bytes needed for the bitmap: 1 bit per rank, rounded up to
+    // nearest byte
+    size_t bitmapSize = (rankCount + 7) / 8;
+
+    // Total size = count field + bitmap + p2pEpochs[] + taskCount
+    size_t totalSize = sizeof(uint32_t) + bitmapSize +
+                       sizeof(uint32_t) * rankCount + sizeof(int32_t);
+
+    std::vector<uint8_t> buffer(totalSize, 0);
+    uint8_t* ptr = buffer.data();
+
+    // 1. Store the number of ranks
+    std::memcpy(ptr, &rankCount, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+
+    // 2. Store activeRanks as a bitset
+    for (size_t i = 0; i < rankCount; ++i) {
+        if (state.activeRanks[i]) {
+            // Set the i-th bit to 1 if the rank is active
+            ptr[i / 8] |= (1 << (i % 8));
+        }
     }
-    return bytes;
+    ptr += bitmapSize;
+
+    // 3. Store per-peer p2pEpochs
+    for (size_t i = 0; i < rankCount; ++i) {
+        std::memcpy(ptr + i * sizeof(uint32_t), &state.p2pEpochs[i],
+                    sizeof(uint32_t));
+    }
+    ptr += sizeof(uint32_t) * rankCount;
+
+    // 4. Store taskCount
+    int32_t taskCount = static_cast<int32_t>(state.taskCount);
+    std::memcpy(ptr, &taskCount, sizeof(int32_t));
+
+    return buffer;
 }
 
-void deserializeActiveRanks(const std::vector<uint8_t>& bytes,
-                            bool* activeRanks, int size) {
-    TORCH_CHECK(static_cast<int>(bytes.size()) == size,
-                "Unexpected active-ranks snapshot size.");
-    for (int i = 0; i < size; ++i) {
-        activeRanks[i] = (bytes[i] != 0);
-    }
-}
+ExtensionState deserialize(const std::vector<uint8_t>& buffer) {
+    ExtensionState state;
+    if (buffer.size() < sizeof(uint32_t)) return state;
 
-}  // namespace
+    const uint8_t* ptr = buffer.data();
+
+    // 1. Read the number of ranks
+    uint32_t rankCount = 0;
+    std::memcpy(&rankCount, ptr, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+
+    // Calculate expected total size and verify buffer is sufficient before
+    // proceeding with further reads.
+    size_t bitmapSize = (rankCount + 7) / 8;
+    size_t expectedSize = sizeof(uint32_t) + bitmapSize +
+                          sizeof(uint32_t) * rankCount + sizeof(int32_t);
+    if (buffer.size() < expectedSize) return state;
+
+    // 2. Read the bitmap and reconstruct the activeRanks vector
+    state.activeRanks.resize(rankCount);
+    for (size_t i = 0; i < rankCount; ++i) {
+        // Check if the i-th bit is set
+        bool isActive = ptr[i / 8] & (1 << (i % 8));
+        state.activeRanks[i] = isActive;
+    }
+    ptr += bitmapSize;
+
+    // 3. Read per-peer p2pEpochs
+    state.p2pEpochs.resize(rankCount);
+    for (size_t i = 0; i < rankCount; ++i) {
+        std::memcpy(&state.p2pEpochs[i], ptr, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+    }
+
+    // 4. Read taskCount
+    int32_t taskCount = 0;
+    std::memcpy(&taskCount, ptr, sizeof(int32_t));
+    state.taskCount = static_cast<int>(taskCount);
+
+    return state;
+}
 
 // Async Work implementation for P2P operations processed by worker threads.
 class MooncakeP2PWork : public ::c10d::Work {
    public:
-    explicit MooncakeP2PWork(std::shared_ptr<std::atomic<bool>> completed)
-        : Work(-1, c10d::OpType::UNKNOWN), completed_(completed) {}
+    explicit MooncakeP2PWork(
+        std::shared_ptr<std::atomic<P2PProxy::OpStatus>> status)
+        : Work(-1, c10d::OpType::UNKNOWN), status_(status) {}
 
     bool isCompleted() override {
-        return completed_->load(std::memory_order_acquire);
+        return status_->load(std::memory_order_acquire) !=
+               P2PProxy::OpStatus::kPending;
+    }
+
+    bool isSuccess() const override {
+        return status_->load(std::memory_order_acquire) ==
+               P2PProxy::OpStatus::kSuccess;
     }
 
     bool wait(std::chrono::milliseconds timeout) override {
-        if (completed_->load(std::memory_order_acquire)) {
-            return true;
-        }
-
         BackoffWaiterConfig cfg{};
         cfg.max_sleep = std::chrono::microseconds(10);
         BackoffWaiter waiter(cfg);
 
+        bool done = false;
         if (timeout.count() > 0) {
-            return waiter.wait_for(timeout, [this] {
-                return completed_->load(std::memory_order_acquire);
+            done = waiter.wait_for(timeout, [this] {
+                return status_->load(std::memory_order_acquire) !=
+                       P2PProxy::OpStatus::kPending;
             });
+        } else {
+            waiter.wait([this] {
+                return status_->load(std::memory_order_acquire) !=
+                       P2PProxy::OpStatus::kPending;
+            });
+            done = true;
         }
 
-        waiter.wait(
-            [this] { return completed_->load(std::memory_order_acquire); });
+        if (!done) {
+            return false;
+        }
+
+        if (status_->load(std::memory_order_acquire) ==
+            P2PProxy::OpStatus::kFailed) {
+            TORCH_CHECK(false, "Mooncake P2P operation failed.");
+        }
         return true;
     }
 
    private:
-    std::shared_ptr<std::atomic<bool>> completed_;
+    std::shared_ptr<std::atomic<P2PProxy::OpStatus>> status_;
 };
 
 /**
@@ -196,13 +275,14 @@ MooncakeBackend::MooncakeBackend(
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
-    auto& dev_worker_mgr = P2PDeviceWorkerManager::GetInstance();
+    auto& dev_worker_mgr = P2PDeviceWorkerManager::getInstance();
     int cuda_device_index = isCpu_ ? -1 : at::cuda::current_device();
 
     if (isCpu_)
-        p2p_device_worker_ = dev_worker_mgr.GetCPUWorker();
+        p2p_device_worker_ = dev_worker_mgr.getCPUWorker(engine_);
     else
-        p2p_device_worker_ = dev_worker_mgr.GetCUDAWorker(cuda_device_index);
+        p2p_device_worker_ =
+            dev_worker_mgr.getCUDAWorker(cuda_device_index, engine_);
 
     auto& worker_mgr = MooncakeWorkerManager::GetInstance();
     if (isCpu_)
@@ -220,7 +300,6 @@ MooncakeBackend::MooncakeBackend(
                      .rank = rank_,
                      .size = size_,
                      .cuda_device_index = cuda_device_index,
-                     .location = location,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
@@ -241,10 +320,8 @@ MooncakeBackend::MooncakeBackend(
         (uint64_t)connection_ctx_->warmup_send_region();
     rank_info.warmup_buffer[1] =
         (uint64_t)connection_ctx_->warmup_recv_region();
-    rank_info.p2p_send_buffer = (uint64_t)p2p_proxy_->send_buffer();
-    rank_info.p2p_recv_buffer = (uint64_t)p2p_proxy_->recv_buffer();
-    rank_info.p2p_ctrl_send = (uint64_t)p2p_proxy_->ctrl_send_region();
-    rank_info.p2p_ctrl_recv = (uint64_t)p2p_proxy_->ctrl_recv_region();
+    rank_info.p2p_credit_region = (uint64_t)p2p_proxy_->credit_region();
+    rank_info.p2p_ack_region = (uint64_t)p2p_proxy_->ack_region();
 
     // Sync metadata
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
@@ -283,7 +360,7 @@ MooncakeBackend::MooncakeBackend(
     meta_->store = store;
     meta_->backendIndex = backendIndex_;
     meta_->bufferBaseIndex = backendIndex_ * 10;
-    p2p_proxy_->BindMeta(meta_);
+    p2p_proxy_->bindMeta(meta_);
 
     connection_ctx_->bootstrapLocalPeer(localServerName_, rank_info);
     if (options_ && options_->isExtension_) {
@@ -295,6 +372,14 @@ MooncakeBackend::MooncakeBackend(
         connection_ctx_->waitUntilAllConnected();
     }
 
+    // Register a lightweight Backend shim so that PyTorch's P2P dispatch path
+    // (batch_isend_irecv → _get_backend → getBackend) can find a registered
+    // Backend for this ProcessGroup.  The shim delegates send/recv back to us.
+    auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
+    auto shim = c10::make_intrusive<MooncakeP2PShim>(this);
+    setBackend(deviceType, BackendType::CUSTOM, shim);
+    setDefaultBackend(BackendType::CUSTOM);
+
     // Increment backend index
     ++backendIndex_;
 }
@@ -302,6 +387,35 @@ MooncakeBackend::MooncakeBackend(
 MooncakeBackend::~MooncakeBackend() { shutdown(); }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
+
+// ---- MooncakeP2PShim implementation ----
+
+MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner)
+    : Backend(owner->getRank(), owner->getSize()), owner_(owner) {}
+
+const std::string MooncakeP2PShim::getBackendName() const { return "mooncake"; }
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::send(
+    std::vector<at::Tensor>& tensors, int dstRank, int tag) {
+    return owner_->send(tensors, dstRank, tag);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::recv(
+    std::vector<at::Tensor>& tensors, int srcRank, int tag) {
+    return owner_->recv(tensors, srcRank, tag);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::recvAnysource(
+    std::vector<at::Tensor>& tensors, int tag) {
+    // MooncakeBackend doesn't implement recvAnysource; fall back to
+    // the base class which will raise a clear error.
+    return ::c10d::Backend::recvAnysource(tensors, tag);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::barrier(
+    const c10d::BarrierOptions& opts) {
+    return owner_->barrier(opts);
+}
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     std::vector<at::Tensor>& tensors, int dstRank, int tag) {
@@ -316,7 +430,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
                 "P2P send: dstRank out of range.");
 
     auto contiguous = tensor.contiguous();
-    auto completed = std::make_shared<std::atomic<bool>>(false);
+    auto status = std::make_shared<std::atomic<P2PProxy::OpStatus>>(
+        P2PProxy::OpStatus::kPending);
     cudaStream_t stream = nullptr;
     if (!isCpu_) {
         auto current_stream =
@@ -325,14 +440,14 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     }
 
     TORCH_CHECK(p2p_proxy_, "P2P send proxy is not initialized.");
-    p2p_proxy_->EnqueueSend(P2PProxy::SendOp{
+    p2p_proxy_->enqueueSend(P2PProxy::SendOp{
         .tensor_ = std::move(contiguous),
         .peer_rank_ = dstRank,
         .cuda_stream_ = stream,
-        .completed_ = completed,
+        .status_ = status,
     });
 
-    return c10::make_intrusive<MooncakeP2PWork>(completed);
+    return c10::make_intrusive<MooncakeP2PWork>(status);
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
@@ -348,7 +463,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
                 "P2P recv: srcRank out of range.");
 
     auto target = tensor.is_contiguous() ? tensor : tensor.contiguous();
-    auto completed = std::make_shared<std::atomic<bool>>(false);
+    auto status = std::make_shared<std::atomic<P2PProxy::OpStatus>>(
+        P2PProxy::OpStatus::kPending);
     cudaStream_t stream = nullptr;
     if (!isCpu_) {
         auto current_stream =
@@ -357,15 +473,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     }
 
     TORCH_CHECK(p2p_proxy_, "P2P recv proxy is not initialized.");
-    p2p_proxy_->EnqueueRecv(P2PProxy::RecvOp{
+    p2p_proxy_->enqueueRecv(P2PProxy::RecvOp{
         .tensor_ = target,
         .original_tensor_ = tensor,
         .peer_rank_ = srcRank,
         .cuda_stream_ = stream,
-        .completed_ = completed,
+        .status_ = status,
     });
 
-    return c10::make_intrusive<MooncakeP2PWork>(completed);
+    return c10::make_intrusive<MooncakeP2PWork>(status);
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
@@ -806,7 +922,7 @@ void MooncakeBackend::shutdown() {
 
     // Phase 1: Drain P2P tasks
     p2p_device_worker_->removeProxy(p2p_proxy_);
-    has_hung_operation |= !p2p_proxy_->DrainTasks();
+    has_hung_operation |= !p2p_proxy_->drainTasks();
 
     // Phase 2: Drain collective tasks for this backend
     has_hung_operation |= !worker_->drainTasks(meta_.get());
@@ -826,7 +942,7 @@ void MooncakeBackend::shutdown() {
 
     // Phase 5: Release resources if no hung operations
     if (has_hung_operation) {
-        p2p_proxy_->AbandonResources();
+        p2p_proxy_->abandonResources();
         connection_ctx_->abandonResources();
     }
 
@@ -897,24 +1013,33 @@ void MooncakeBackend::setLocalOnlyActiveRanks() {
 void MooncakeBackend::waitForExtensionState() {
     TORCH_CHECK(meta_->store, "Recovery join requires a valid Store.");
 
-    auto task_count_key = ConnectionContext::getExtensionTaskCountStoreKey(
-        meta_->backendIndex, rank_);
-    auto active_ranks_key = ConnectionContext::getExtensionActiveRanksStoreKey(
+    auto state_key = ConnectionContext::getExtensionStateStoreKey(
         meta_->backendIndex, rank_);
 
     BackoffWaiter waiter(
         BackoffWaiterConfig::constantSleep(std::chrono::milliseconds(50)));
 
-    waiter.wait([&] {
-        return meta_->store->check({task_count_key, active_ranks_key});
-    });
+    waiter.wait([&] { return meta_->store->check({state_key}); });
 
-    auto task_count_data = meta_->store->get(task_count_key);
-    std::string task_count(task_count_data.begin(), task_count_data.end());
-    meta_->taskCount = std::stoi(task_count);
+    auto state_data = meta_->store->get(state_key);
+    auto state = deserialize(state_data);
 
-    auto active_ranks = meta_->store->get(active_ranks_key);
-    deserializeActiveRanks(active_ranks, meta_->activeRanks, meta_->size);
+    // taskCount
+    meta_->taskCount = state.taskCount;
+
+    // p2pEpochs
+    TORCH_CHECK(static_cast<size_t>(meta_->size) == state.p2pEpochs.size(),
+                "Invalid p2pEpochs size");
+    for (int i = 0; i < meta_->size; ++i) {
+        p2p_proxy_->setEpoch(i, state.p2pEpochs[i]);
+    }
+
+    // activeRanks
+    TORCH_CHECK(static_cast<size_t>(meta_->size) == state.activeRanks.size(),
+                "Invalid activeRanks");
+    for (int i = 0; i < meta_->size; ++i) {
+        meta_->activeRanks[i] = state.activeRanks[i];
+    }
     syncActiveRanksTensor();
 }
 
@@ -961,6 +1086,7 @@ void MooncakeBackend::extendGroupSizeTo(int newSize) {
     tensor.slice(0, oldSize, newSize).fill_(1);
 
     connection_ctx_->extendGroupSizeTo(newSize);
+    p2p_proxy_->extendGroupSizeTo(newSize);
     // After extendGroupSizeTo, we don't `waitUntilNewRanksConnected` here
     // but do it in the first task. This enables client code to overlap
     // execution between `extendGroupSizeTo` and the first communication call.
@@ -1022,15 +1148,20 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
     }
 
     syncActiveRanksTensor();
-    auto active_ranks_snapshot =
-        serializeActiveRanks(meta_->activeRanks, meta_->size);
+    std::vector<uint32_t> epochs(meta_->size);
+    for (int i = 0; i < meta_->size; ++i) {
+        epochs[i] = p2p_proxy_->getEpoch(i);
+    }
+    ExtensionState state{
+        .activeRanks =
+            std::vector(meta_->activeRanks, meta_->activeRanks + meta_->size),
+        .p2pEpochs = std::move(epochs),
+        .taskCount = meta_->taskCount};
+    auto state_data = serialize(state);
     for (const int rank : ranks) {
-        meta_->store->set(ConnectionContext::getExtensionTaskCountStoreKey(
-                              meta_->backendIndex, rank),
-                          std::to_string(meta_->taskCount));
-        meta_->store->set(ConnectionContext::getExtensionActiveRanksStoreKey(
-                              meta_->backendIndex, rank),
-                          active_ranks_snapshot);
+        auto key = ConnectionContext::getExtensionStateStoreKey(
+            meta_->backendIndex, rank);
+        meta_->store->set(key, state_data);
     }
 }
 

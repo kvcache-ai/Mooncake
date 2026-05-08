@@ -410,6 +410,9 @@ class Client {
         bool enable_offloading,
         std::unordered_map<std::string, int64_t>& offloading_objects);
 
+    tl::expected<void, ErrorCode> ReportSsdCapacity(
+        int64_t ssd_total_capacity_bytes);
+
     /**
      * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
@@ -494,6 +497,17 @@ class Client {
 
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
+    }
+
+    /**
+     * @brief Get the endpoint address for segment operations.
+     * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
+     *         For other modes, returns the logical local hostname used for
+     * segment registration.
+     */
+    [[nodiscard]] std::string GetSegmentEndpoint() {
+        return (metadata_connstring_ == P2PHANDSHAKE) ? GetTransportEndpoint()
+                                                      : local_hostname_;
     }
 
     // Return sorted NUMA node IDs that have at least one RDMA NIC.

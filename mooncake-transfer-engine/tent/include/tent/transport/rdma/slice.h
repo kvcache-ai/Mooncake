@@ -40,6 +40,13 @@ struct RdmaSliceList {
     int num_slices = 0;
 };
 
+// Forward declarations
+class RdmaEndPoint;
+struct RdmaTask;
+
+using RdmaSliceStorage = Slab<RdmaSlice>;
+using RdmaTaskStorage = Slab<RdmaTask>;
+
 struct RdmaTask {
     int num_slices;
     Request request;
@@ -48,6 +55,16 @@ struct RdmaTask {
     volatile int success_slices;
     volatile int resolved_slices;
     volatile TransferStatusEnum first_error = PENDING;
+
+    // Reference counting for UAF protection
+    std::atomic<int> ref_count{0};
+
+    void ref() { ref_count.fetch_add(1, std::memory_order_relaxed); }
+    void deref() {
+        if (ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            RdmaTaskStorage::Get().deallocate(this);
+        }
+    }
 };
 
 class RdmaEndPoint;
@@ -81,8 +98,6 @@ struct RdmaSlice {
     RailMonitor* rail_monitor = nullptr;
 };
 
-using RdmaSliceStorage = Slab<RdmaSlice>;
-
 static inline void updateSliceStatus(RdmaSlice* slice,
                                      TransferStatusEnum status) {
     if (status == PENDING) return;
@@ -102,6 +117,7 @@ static inline void updateSliceStatus(RdmaSlice* slice,
         if (final_st == PENDING) final_st = FAILED;
         __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
     }
+    task->deref();
 }
 
 }  // namespace tent

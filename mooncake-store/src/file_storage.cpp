@@ -246,6 +246,17 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             return mount_file_storage_result;
         }
     }
+    // Report configured SSD capacity to Master so it can populate
+    // file_total_capacity_ (the denominator in "SSD Storage: X / Y").
+    // Called once at init; old Masters that lack this RPC will log an error
+    // but FileStorage continues normally.
+    if (config_.total_size_limit > 0) {
+        auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);
+        if (!cap_result) {
+            LOG(WARNING) << "ReportSsdCapacity failed (old Master?): "
+                         << cap_result.error();
+        }
+    }
 
     auto scan_meta_result = storage_backend_->ScanMeta(
         [this](const std::vector<std::string>& keys,
@@ -581,7 +592,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
     auto error_code = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), config_.local_buffer_size,
-        kWildcardLocation, false, false);
+        kWildcardLocation, false, true);
     if (!error_code) {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;

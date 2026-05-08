@@ -1445,7 +1445,7 @@ def mount_segment(
 ```
 
 **Parameters:**
-- `path` (str): File path to map and mount.
+- `path` (str): File or shared-memory path to map and mount.
 - `size` (int): Number of bytes to mount.
 - `offset` (int, optional): File offset in bytes. Defaults to `0`.
 - `protocol` (str, optional): Transfer protocol. Defaults to `"tcp"`.
@@ -1498,6 +1498,73 @@ def unmount_segment(self, segment_ids: List[str]) -> int
 ret = store.unmount_segment(segment_ids)
 if ret != 0:
     print("Unmount failed:", ret)
+```
+
+---
+
+#### allocate_and_mount_segment()
+Allocate memory inside the store process and mount it as one or more Mooncake
+store segments.
+
+```python
+def allocate_and_mount_segment(
+    self,
+    size: int,
+    protocol: str = "tcp",
+    location: str = "",
+) -> dict
+```
+
+**Parameters:**
+- `size` (int): Number of bytes requested. The allocated size may be rounded up
+  for alignment.
+- `protocol` (str, optional): Transfer protocol. Defaults to `"tcp"`.
+- `location` (str, optional): Device or locality hint. Defaults to an empty
+  string.
+
+**Returns:**
+- `dict`: A result dictionary with:
+  - `ret` (int): Status code (0 = success, non-zero = error code)
+  - `segment_ids` (List[str]): Segment ids created by the mount operation
+  - `allocated_size` (int): Actual allocated size in bytes
+
+**Example:**
+```python
+result = store.allocate_and_mount_segment(
+    16 * 1024 * 1024,
+    protocol="tcp",
+    location="",
+)
+
+if result["ret"] == 0:
+    segment_ids = list(result["segment_ids"])
+    allocated_size = result["allocated_size"]
+```
+
+The corresponding HTTP endpoints are `/api/mount` and `/api/unmount`.
+
+---
+
+#### unmount_and_free_segment()
+Unmount one or more internally allocated segments by segment id and free their
+local memory.
+
+```python
+def unmount_and_free_segment(self, segment_ids: List[str]) -> int
+```
+
+**Parameters:**
+- `segment_ids` (List[str]): Segment ids returned by
+  `allocate_and_mount_segment()`.
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+ret = store.unmount_and_free_segment(segment_ids)
+if ret != 0:
+    print("Unmount and free failed:", ret)
 ```
 
 ---
