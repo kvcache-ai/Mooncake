@@ -185,7 +185,7 @@ MooncakeBackend::MooncakeBackend(
                              ? options_->maxWorldSize_
                              : size;
 
-    TORCH_CHECK(max_size >= 0 && static_cast<size_t>(max_size) < kMaxNumRanks,
+    TORCH_CHECK(max_size >= 0 && static_cast<size_t>(max_size) <= kMaxNumRanks,
                 "max_world_size out of range");
     TORCH_CHECK(max_size >= size,
                 "max_world_size must be >= process group size");
@@ -1211,9 +1211,10 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
     }
 
     // Expand activeSize if any recovered rank is beyond the current boundary.
-    for (const int rank : ranks) {
-        if (rank >= meta_->activeSize) {
-            meta_->activeSize = rank + 1;
+    if (!ranks.empty()) {
+        const int max_rank = *std::max_element(ranks.begin(), ranks.end());
+        if (max_rank >= meta_->activeSize) {
+            meta_->activeSize = max_rank + 1;
         }
     }
 

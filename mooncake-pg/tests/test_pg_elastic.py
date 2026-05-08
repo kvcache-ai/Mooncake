@@ -403,7 +403,6 @@ def _run_allgather_reduce_scatter(
     rank: this rank's logical rank (0-indexed).
     Each rank contributes value (rank + 1).
     """
-    elem_size = 4  # int32
 
     # --- _allgather_base ---
     # input: scalar (rank+1); output: flat buffer of active_world_size elements
