@@ -12,21 +12,25 @@ class CapacityPriorityIterator : public ClientIterator {
                                  boost::hash<UUID>>& client_metas) {
         if (client_metas.empty()) return;
 
-        clients_.reserve(client_metas.size());
-        for (auto& client : client_metas) {
+        std::vector<std::pair<size_t, std::shared_ptr<ClientMeta>>>
+            client_with_caps;
+        client_with_caps.reserve(client_metas.size());
+        for (const auto& client : client_metas) {
             if (auto p2p_meta =
                     std::static_pointer_cast<P2PClientMeta>(client.second)) {
-                clients_.emplace_back(p2p_meta);
+                client_with_caps.emplace_back(p2p_meta->GetAvailableCapacity(),
+                                              p2p_meta);
             }
         }
 
-        std::sort(clients_.begin(), clients_.end(),
-                  [](const auto& a, const auto& b) {
-                      return std::static_pointer_cast<P2PClientMeta>(a)
-                                 ->GetAvailableCapacity() >
-                             std::static_pointer_cast<P2PClientMeta>(b)
-                                 ->GetAvailableCapacity();
-                  });
+        std::sort(
+            client_with_caps.begin(), client_with_caps.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        clients_.reserve(client_with_caps.size());
+        for (auto& [cap, client] : client_with_caps) {
+            clients_.emplace_back(std::move(client));
+        }
     }
 };
 
