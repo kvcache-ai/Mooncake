@@ -51,6 +51,18 @@ using gpu_staging::SetDevice;
     return slice_size;
 }
 
+ClientTransferStatsDelta ClientTransferStats::compute_delta(
+    const ClientTransferStats& last) const {
+    return {get_from_memory_count - last.get_from_memory_count,
+            get_from_disk_count - last.get_from_disk_count,
+            get_from_memory_bytes - last.get_from_memory_bytes,
+            get_from_disk_bytes - last.get_from_disk_bytes,
+            put_to_memory_count - last.put_to_memory_count,
+            put_to_disk_count - last.put_to_disk_count,
+            put_to_memory_bytes - last.put_to_memory_bytes,
+            put_to_disk_bytes - last.put_to_disk_bytes};
+}
+
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
@@ -781,10 +793,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     // Track which storage tier this Get reads from
     if (metrics_) {
-        uint64_t total_bytes = 0;
-        for (const auto& s : slices) {
-            total_bytes += s.size;
-        }
+        uint64_t total_bytes = CalculateSliceSize(slices);
         if (replica.is_memory_replica()) {
             metrics_->transfer_metric.get_from_memory_count.inc();
             metrics_->transfer_metric.get_from_memory_bytes.inc(total_bytes);
@@ -1075,10 +1084,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Track which storage tier this Get reads from
         if (metrics_) {
-            uint64_t total_bytes = 0;
-            for (const auto& s : slices_it->second) {
-                total_bytes += s.size;
-            }
+            uint64_t total_bytes = CalculateSliceSize(slices_it->second);
             if (replica.is_memory_replica()) {
                 metrics_->transfer_metric.get_from_memory_count.inc();
                 metrics_->transfer_metric.get_from_memory_bytes.inc(total_bytes);
@@ -1244,8 +1250,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             if (replica.is_disk_replica()) {
                 // Track Put to disk tier
                 if (metrics_) {
-                    uint64_t total_bytes = 0;
-                    for (const auto& s : slices) total_bytes += s.size;
+                    uint64_t total_bytes = CalculateSliceSize(slices);
                     metrics_->transfer_metric.put_to_disk_count.inc();
                     metrics_->transfer_metric.put_to_disk_bytes.inc(total_bytes);
                 }
@@ -1264,8 +1269,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             if (r.is_memory_replica()) { has_memory_replica = true; break; }
         }
         if (has_memory_replica) {
-            uint64_t total_bytes = 0;
-            for (const auto& s : slices) total_bytes += s.size;
+            uint64_t total_bytes = CalculateSliceSize(slices);
             metrics_->transfer_metric.put_to_memory_count.inc();
             metrics_->transfer_metric.put_to_memory_bytes.inc(total_bytes);
         }
@@ -1619,8 +1623,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                 if (replica.is_disk_replica()) {
                     // Track Put to disk tier
                     if (metrics_) {
-                        uint64_t total_bytes = 0;
-                        for (const auto& s : op.slices) total_bytes += s.size;
+                        uint64_t total_bytes = CalculateSliceSize(op.slices);
                         metrics_->transfer_metric.put_to_disk_count.inc();
                         metrics_->transfer_metric.put_to_disk_bytes.inc(total_bytes);
                     }
@@ -1638,8 +1641,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             if (replica.is_memory_replica()) {
                 // Track Put to memory tier (once per key)
                 if (!memory_counted && metrics_) {
-                    uint64_t total_bytes = 0;
-                    for (const auto& s : op.slices) total_bytes += s.size;
+                    uint64_t total_bytes = CalculateSliceSize(op.slices);
                     metrics_->transfer_metric.put_to_memory_count.inc();
                     metrics_->transfer_metric.put_to_memory_bytes.inc(total_bytes);
                     memory_counted = true;
@@ -2906,32 +2908,8 @@ void Client::StorageHeartbeatThreadMain() {
         ClientTransferStatsDelta delta;
         ClientTransferStats snap{};
         if (metrics_) {
-            auto& tm = metrics_->transfer_metric;
-            snap = ClientTransferStats{
-                tm.get_from_memory_count.value(),
-                tm.get_from_disk_count.value(),
-                tm.get_from_memory_bytes.value(),
-                tm.get_from_disk_bytes.value(),
-                tm.put_to_memory_count.value(),
-                tm.put_to_disk_count.value(),
-                tm.put_to_memory_bytes.value(),
-                tm.put_to_disk_bytes.value()};
-            delta.get_from_memory_count =
-                snap.get_from_memory_count - last_stats_snapshot_.get_from_memory_count;
-            delta.get_from_disk_count =
-                snap.get_from_disk_count - last_stats_snapshot_.get_from_disk_count;
-            delta.get_from_memory_bytes =
-                snap.get_from_memory_bytes - last_stats_snapshot_.get_from_memory_bytes;
-            delta.get_from_disk_bytes =
-                snap.get_from_disk_bytes - last_stats_snapshot_.get_from_disk_bytes;
-            delta.put_to_memory_count =
-                snap.put_to_memory_count - last_stats_snapshot_.put_to_memory_count;
-            delta.put_to_disk_count =
-                snap.put_to_disk_count - last_stats_snapshot_.put_to_disk_count;
-            delta.put_to_memory_bytes =
-                snap.put_to_memory_bytes - last_stats_snapshot_.put_to_memory_bytes;
-            delta.put_to_disk_bytes =
-                snap.put_to_disk_bytes - last_stats_snapshot_.put_to_disk_bytes;
+            snap = GetClientStats();
+            delta = snap.compute_delta(last_stats_snapshot_);
         }
 
         // Ping master with stats delta

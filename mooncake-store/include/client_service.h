@@ -59,6 +59,8 @@ class QueryResult {
  * @brief Client-side transfer statistics by storage tier (DRAM vs SSD).
  * These are local counters tracked on each client — no RPC needed.
  */
+struct ClientTransferStatsDelta;
+
 struct ClientTransferStats {
     int64_t get_from_memory_count = 0;
     int64_t get_from_disk_count = 0;
@@ -68,6 +70,8 @@ struct ClientTransferStats {
     int64_t put_to_disk_count = 0;
     int64_t put_to_memory_bytes = 0;
     int64_t put_to_disk_bytes = 0;
+
+    ClientTransferStatsDelta compute_delta(const ClientTransferStats& last) const;
 };
 
 /**

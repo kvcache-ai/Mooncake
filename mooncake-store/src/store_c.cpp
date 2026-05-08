@@ -394,7 +394,7 @@ int mooncake_store_calc_cache_stats(mooncake_store_t store, char *buf_out,
             get(CS::SSD_HIT_RATE), get(CS::OVERALL_HIT_RATE),
             get(CS::VALID_GET_RATE));
 
-        if (len < 0) return -1;
+        if (len < 0 || static_cast<size_t>(len) >= sizeof(tmp)) return -1;
         size_t copy_len =
             static_cast<size_t>(len) < buf_len - 1 ? len : buf_len - 1;
         memcpy(buf_out, tmp, copy_len);
