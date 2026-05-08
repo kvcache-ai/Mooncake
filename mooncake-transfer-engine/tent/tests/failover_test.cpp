@@ -226,8 +226,8 @@ TEST(BatchStatusAggregationTest, PendingTaskPreventsEarlyBatchFailure) {
         size_t length{1024};
     };
 
-    auto aggregateStatus = [](const std::vector<MockTask>& tasks)
-        -> TransferStatusEnum {
+    auto aggregateStatus =
+        [](const std::vector<MockTask>& tasks) -> TransferStatusEnum {
         size_t success_tasks = 0;
         size_t failed_tasks = 0;
         size_t total_tasks = 0;
