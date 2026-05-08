@@ -744,22 +744,28 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     auto& context = it->second;
     context.client_buffer_allocator.reset();
 
+    bool had_error = false;
     for (auto& shm : context.mapped_shms) {
-        if (shm.shm_buffer) {
+        if (!shm.shm_buffer) continue;
+        if (shm.shm_size > 0) {
             auto rc = client_service_->unregisterLocalMemory(shm.shm_buffer,
                                                              shm.shm_size);
             if (!rc) {
-                LOG(ERROR) << "Failed to unregister memory";
-                munmap(shm.shm_buffer, shm.shm_size);
-                context.mapped_shms.clear();
-                shm_contexts_.erase(it);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                LOG(WARNING)
+                    << "Failed to unregister memory for " << shm.shm_name
+                    << ", error=" << toString(rc.error())
+                    << ", proceeding with cleanup";
+                had_error = true;
             }
-            munmap(shm.shm_buffer, shm.shm_size);
+        }
+        if (munmap(shm.shm_buffer, shm.shm_size) != 0) {
+            LOG(WARNING) << "munmap failed for " << shm.shm_name << ": "
+                         << strerror(errno);
         }
     }
     context.mapped_shms.clear();
     shm_contexts_.erase(it);
+    if (had_error) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     return {};
 }
 
