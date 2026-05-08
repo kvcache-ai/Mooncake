@@ -55,16 +55,21 @@ class RecordingTransport : public Transport {
             if (!create_slices_) {
                 continue;
             }
+            auto *slice = getSliceCache().allocate();
+            slice->source_addr = task->request->source;
+            slice->length = task->request->length;
+            slice->opcode = task->request->opcode;
+            slice->task = task;
+            slice->target_id = task->request->target_id;
+            slice->status = Slice::PENDING;
+            slice->ts = 0;
+            task->slice_list.push_back(slice);
             task->slice_count = 1;
             if (submit_status_.ok()) {
-                task->success_slice_count = 1;
-                task->transferred_bytes = task->request_group.empty()
-                                              ? task->request->length
-                                              : task->request_group[0].length;
+                slice->markSuccess();
             } else {
-                task->failed_slice_count = 1;
+                slice->markFailed();
             }
-            task->publish_completion();
         }
         return submit_status_;
     }
