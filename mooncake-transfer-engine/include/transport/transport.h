@@ -172,29 +172,26 @@ class Transport {
         };
 
        public:
-        void markSuccess() {
-            status = Slice::SUCCESS;
-            __atomic_fetch_add(&task->transferred_bytes, length,
-                               __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+        void markSuccess() { check_batch_completion(false); }
 
-            check_batch_completion(false);
-        }
-
-        void markFailed() {
-            status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
-
-            check_batch_completion(true);
-        }
+        void markFailed() { check_batch_completion(true); }
 
         volatile int64_t ts;
 
        private:
         inline void check_batch_completion(bool is_failed) {
             auto &batch_desc = toBatchDesc(task->batch_id);
+            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+            status = is_failed ? Slice::FAILED : Slice::SUCCESS;
             if (is_failed) {
+                __atomic_fetch_add(&task->failed_slice_count, 1,
+                                   __ATOMIC_RELAXED);
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
+            } else {
+                __atomic_fetch_add(&task->transferred_bytes, length,
+                                   __ATOMIC_RELAXED);
+                __atomic_fetch_add(&task->success_slice_count, 1,
+                                   __ATOMIC_RELAXED);
             }
 
             uint64_t prev_completed = __atomic_fetch_add(
@@ -204,7 +201,7 @@ class Transport {
                 return;
             }
 
-            task->publish_completion();
+            task->publish_completion_locked();
         }
     };
 
@@ -277,11 +274,10 @@ class Transport {
         // should be submitted as one transport task.
         std::vector<TransferRequest> request_group;
 
-        void publish_completion() {
+        bool publish_completion_locked() {
             auto &batch_desc = toBatchDesc(batch_id);
-            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
             if (__atomic_exchange_n(&is_finished, true, __ATOMIC_ACQ_REL)) {
-                return;
+                return false;
             }
             const uint64_t final_failed_slice_count =
                 __atomic_load_n(&failed_slice_count, __ATOMIC_ACQUIRE);
@@ -296,8 +292,17 @@ class Transport {
             batch_desc.finished_task_count.fetch_add(1,
                                                      std::memory_order_release);
             batch_desc.publish_completion_if_ready_locked();
+            return true;
+        }
+
+        void publish_completion() {
+            auto &batch_desc = toBatchDesc(batch_id);
+            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+            const bool should_notify = publish_completion_locked();
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-            batch_desc.completion_cv.notify_all();
+            if (should_notify) {
+                batch_desc.completion_cv.notify_all();
+            }
 #endif
         }
 

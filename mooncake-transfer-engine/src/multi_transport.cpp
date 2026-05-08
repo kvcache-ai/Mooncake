@@ -116,22 +116,7 @@ class BatchLifecycle {
     }
 
     bool publishTaskCompletionLocked(Transport::TransferTask& task) {
-        if (__atomic_exchange_n(&task.is_finished, true, __ATOMIC_ACQ_REL)) {
-            return false;
-        }
-        const uint64_t final_failed_slice_count =
-            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
-        const uint64_t final_transferred_bytes =
-            __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE);
-
-        if (final_failed_slice_count > 0) {
-            batch_desc_.has_failure.store(true, std::memory_order_release);
-        }
-        batch_desc_.finished_transfer_bytes.fetch_add(
-            final_transferred_bytes, std::memory_order_release);
-        batch_desc_.finished_task_count.fetch_add(1, std::memory_order_release);
-        batch_desc_.publish_completion_if_ready_locked();
-        return true;
+        return task.publish_completion_locked();
     }
 
     void markTransportSubmitted(
