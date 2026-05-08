@@ -109,6 +109,7 @@ static inline void updateSliceStatus(RdmaSlice* slice,
         if (final_st == PENDING) final_st = FAILED;
         __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
     }
+    task->deref();
 }
 
 }  // namespace tent

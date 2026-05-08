@@ -294,7 +294,7 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
     if (!rdma_batch)
         return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
     for (auto* task : rdma_batch->task_list) {
-        task->deref();
+        task->deref();  // Release batch's reference to the task
     }
     rdma_batch->task_list.clear();
     for (auto slice : rdma_batch->slice_chain) {
@@ -347,6 +347,7 @@ Status RdmaTransport::submitTransferTasks(
         task->status_word = PENDING;
         task->transferred_bytes = 0;
         task->ref_count = 0;
+        task->ref();  // Batch holds a reference to the task
 
         const double merge_ratio = 0.25;
         uint64_t base_block = default_block_size;
