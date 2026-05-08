@@ -112,6 +112,8 @@ class RdmaEndPoint {
     void beginDestroyNoLock();  // Internal version without locking
     bool finishDestroy();
 
+    const std::string &peerNicPath() const { return peer_nic_path_; }
+
    private:
     int disconnectUnlocked();
 
