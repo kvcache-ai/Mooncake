@@ -254,10 +254,13 @@ RemoteBufferDesc DataManager::BuildRemoteBufferDesc(
     const auto& loc_data = handle->loc.data;
     RemoteBufferDesc remote_buffer;
     remote_buffer.segment_endpoint = local_transfer_config_.te_endpoint;
-    remote_buffer.addr =
-        reinterpret_cast<uintptr_t>(loc_data.buffer ? loc_data.buffer->data()
-                                                    : nullptr);
-    remote_buffer.size = loc_data.buffer ? loc_data.buffer->size() : 0;
+    remote_buffer.addr = 0;
+    remote_buffer.size = 0;
+    if (loc_data.buffer) {
+        remote_buffer.addr =
+            reinterpret_cast<uintptr_t>(loc_data.buffer->data());
+        remote_buffer.size = loc_data.buffer->size();
+    }
     return remote_buffer;
 }
 

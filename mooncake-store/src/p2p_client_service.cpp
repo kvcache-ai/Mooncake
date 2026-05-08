@@ -255,8 +255,8 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
             config.local_memcpy_async_worker_num;
     }
 
-    data_manager_ = DataManager(std::move(tiered_backend), transfer_engine_,
-                                config.lock_shard_count, local_transfer_config);
+    data_manager_.emplace(std::move(tiered_backend), transfer_engine_,
+                          config.lock_shard_count, local_transfer_config);
     // Set rectify callback on DataManager to remove stale replicas from master
     data_manager_->SetRectifyCallback([this](std::string_view key,
                                              std::optional<UUID> tier_id) {
