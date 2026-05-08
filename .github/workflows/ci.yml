@@ -465,7 +465,7 @@ jobs:
         MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
-        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+        python mooncake-pg/tests/test_pg_collectives.py
       shell: bash
 
     - name: Test Safetensor Functions
