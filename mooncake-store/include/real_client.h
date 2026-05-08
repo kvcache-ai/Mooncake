@@ -22,7 +22,60 @@
 #include <ylt/coro_io/coro_io.hpp>
 #include <async_simple/coro/Lazy.h>
 
+#include <queue>
+#include <condition_variable>
+
 namespace mooncake {
+
+/**
+ * @brief Async context for concurrent batch_get operations.
+ * Uses a completion queue model: submit() enqueues work,
+ * wait_any() blocks until any one completes.
+ * Internally uses a completion thread that polls TransferFuture::isReady().
+ */
+class AsyncGetContext {
+   public:
+    using Token = uint64_t;
+    static constexpr Token INVALID_TOKEN = static_cast<Token>(-1);
+
+    explicit AsyncGetContext(class RealClient *client, size_t max_concurrency);
+    ~AsyncGetContext();
+
+    AsyncGetContext(const AsyncGetContext &) = delete;
+    AsyncGetContext &operator=(const AsyncGetContext &) = delete;
+
+    Token submit(const std::vector<std::string> &keys,
+                 const std::vector<void *> &buffers,
+                 const std::vector<size_t> &sizes);
+
+    std::pair<Token, std::vector<int64_t>> wait_any();
+
+    size_t in_flight() const;
+
+   private:
+    struct Slot {
+        Token token;
+        BatchGetState state;
+    };
+
+    void completion_thread_func();
+
+    RealClient *client_;
+    size_t max_concurrency_;
+    std::atomic<uint64_t> next_token_{0};
+
+    std::mutex slots_mu_;
+    std::vector<Slot> active_slots_;
+
+    std::mutex cq_mu_;
+    std::condition_variable cq_cv_;
+    std::queue<std::pair<Token, std::vector<int64_t>>> completed_;
+
+    std::atomic<size_t> in_flight_count_{0};
+
+    std::thread completion_thread_;
+    std::atomic<bool> running_{true};
+};
 
 class RealClient;
 
@@ -146,6 +199,15 @@ class RealClient : public PyClient {
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
+
+    std::unique_ptr<AsyncGetContext> create_async_context(
+        size_t max_concurrency);
+
+    BatchGetState batch_get_submit(const std::vector<std::string> &keys,
+                                   const std::vector<void *> &buffers,
+                                   const std::vector<size_t> &sizes);
+
+    std::vector<int64_t> batch_get_complete(BatchGetState &state);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple

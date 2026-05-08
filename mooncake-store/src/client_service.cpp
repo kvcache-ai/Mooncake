@@ -3163,4 +3163,152 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     return local_hostname_ == replica_transfer_endpoint;
 }
 
+// ============================================================================
+// Two-phase async BatchGet: Submit + Complete
+// Only supports memory replicas. SSD offload replicas are marked as errors.
+// ============================================================================
+
+BatchGetState Client::BatchGetSubmit(
+    const std::vector<std::string>& object_keys,
+    const std::vector<QueryResult>& query_results,
+    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    BatchGetState state;
+    state.submit_time = std::chrono::steady_clock::now();
+    state.object_keys = object_keys;
+    state.lease_timeouts.reserve(object_keys.size());
+    for (const auto& qr : query_results) {
+        state.lease_timeouts.push_back(qr.lease_timeout);
+    }
+    state.slices = slices;
+    state.results.resize(object_keys.size());
+
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            state.results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return state;
+    }
+
+    if (query_results.size() != object_keys.size()) {
+        LOG(ERROR) << "Query results size mismatch";
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            state.results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return state;
+    }
+
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        const auto& key = object_keys[i];
+        const auto& query_result = query_results[i];
+
+        auto slices_it = slices.find(key);
+        if (slices_it == slices.end()) {
+            LOG(ERROR) << "Slices not found for key: " << key;
+            state.results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        Replica::Descriptor replica;
+        ErrorCode err =
+            FindFirstCompleteReplica(query_result.replicas, replica);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << key;
+            }
+            state.results[i] = tl::unexpected(err);
+            continue;
+        }
+
+        // Only support memory replicas in async path
+        if (!replica.is_memory_replica()) {
+            LOG(WARNING) << "BatchGetSubmit: non-memory replica for key=" << key
+                         << ", marking as unsupported";
+            state.results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        bool cache_used = false;
+        if (hot_cache_ && replica.is_memory_replica()) {
+            cache_used = RedirectToHotCache(key, replica);
+            if (cache_used) {
+                state.total_cache_hits++;
+            }
+        }
+
+        auto future = transfer_submitter_->submit(replica, slices_it->second,
+                                                  TransferRequest::READ);
+        if (!future) {
+            if (hot_cache_ && cache_used) {
+                hot_cache_->ReleaseHotKey(key);
+            }
+            LOG(ERROR) << "Failed to submit transfer for key: " << key;
+            state.results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            continue;
+        }
+
+        VLOG(1) << "BatchGetSubmit: submitted key=" << key
+                << " strategy=" << static_cast<int>(future->strategy());
+
+        state.pending_transfers.emplace_back(i, key, std::move(*future),
+                                             replica, cache_used);
+    }
+
+    return state;
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGetComplete(
+    BatchGetState& state) {
+    // Wait for all pending transfers
+    for (auto& pt : state.pending_transfers) {
+        ErrorCode result = pt.future.get();
+
+        if (hot_cache_ && pt.cache_used) {
+            hot_cache_->ReleaseHotKey(pt.key);
+        }
+
+        if (result != ErrorCode::OK) {
+            LOG(ERROR) << "Transfer failed for key: " << pt.key
+                       << " error: " << static_cast<int>(result);
+            state.results[pt.index] = tl::unexpected(result);
+        } else {
+            VLOG(1) << "Transfer completed for key: " << pt.key;
+            state.results[pt.index] = {};
+
+            if (hot_cache_) {
+                auto slices_it = state.slices.find(pt.key);
+                if (slices_it != state.slices.end() &&
+                    ShouldAdmitToHotCache(pt.key, pt.cache_used)) {
+                    ProcessSlicesAsync(pt.key, slices_it->second, pt.replica);
+                }
+            }
+        }
+    }
+
+    // Lease expiry check
+    std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+    for (size_t i = 0; i < state.object_keys.size(); ++i) {
+        if (state.results[i].has_value() && now >= state.lease_timeouts[i]) {
+            LOG(WARNING) << "lease_expired key=" << state.object_keys[i];
+            state.results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+    }
+
+    // Metrics
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  now - state.submit_time)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_get_latency_us.observe(us);
+    }
+
+    if (hot_cache_) {
+        VLOG(1) << "BatchGetComplete: num_keys=" << state.object_keys.size()
+                << " cache_hits=" << state.total_cache_hits;
+    }
+
+    return std::move(state.results);
+}
+
 }  // namespace mooncake

@@ -4815,4 +4815,247 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             co_return result->result();
         }());
 }
+
+// ============================================================================
+// Two-phase batch_get: RealClient wrappers
+// ============================================================================
+
+BatchGetState RealClient::batch_get_submit(const std::vector<std::string> &keys,
+                                           const std::vector<void *> &buffers,
+                                           const std::vector<size_t> &sizes) {
+    BatchGetState state;
+
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        state.results.resize(keys.size(),
+                             tl::unexpected(ErrorCode::INVALID_PARAMS));
+        return state;
+    }
+
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Input vector sizes mismatch";
+        state.results.resize(keys.size(),
+                             tl::unexpected(ErrorCode::INVALID_PARAMS));
+        return state;
+    }
+
+    const size_t num_keys = keys.size();
+    if (num_keys == 0) return state;
+
+    const auto query_results = client_->BatchQuery(keys);
+
+    std::vector<std::string> batch_keys;
+    std::vector<QueryResult> batch_query_results;
+    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    std::vector<size_t> batch_to_orig;
+    std::vector<tl::expected<int64_t, ErrorCode>> pre_results(num_keys);
+
+    for (size_t i = 0; i < num_keys; ++i) {
+        const auto &key = keys[i];
+
+        if (!query_results[i]) {
+            pre_results[i] = tl::unexpected(query_results[i].error());
+            continue;
+        }
+
+        auto qr = query_results[i].value();
+        if (qr.replicas.empty()) {
+            pre_results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+
+        const auto &replica = qr.replicas[0];
+        if (!replica.is_memory_replica()) {
+            pre_results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        uint64_t total_size = calculate_total_size(replica);
+        if (sizes[i] < total_size) {
+            pre_results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        std::vector<Slice> key_slices;
+        allocateSlices(key_slices, replica, buffers[i]);
+
+        batch_keys.push_back(key);
+        batch_query_results.push_back(std::move(qr));
+        batch_slices[key] = std::move(key_slices);
+        batch_to_orig.push_back(i);
+        pre_results[i] = static_cast<int64_t>(total_size);
+    }
+
+    if (batch_keys.empty()) {
+        state.results.resize(num_keys);
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (!pre_results[i])
+                state.results[i] = tl::unexpected(pre_results[i].error());
+        }
+        return state;
+    }
+
+    state =
+        client_->BatchGetSubmit(batch_keys, batch_query_results, batch_slices);
+
+    // Re-index from batch keys to original keys
+    auto batch_results = std::move(state.results);
+    state.results.resize(num_keys);
+    state.object_keys = keys;
+
+    auto batch_leases = std::move(state.lease_timeouts);
+    state.lease_timeouts.resize(num_keys);
+
+    for (size_t i = 0; i < num_keys; ++i) {
+        auto it = std::find(batch_to_orig.begin(), batch_to_orig.end(), i);
+        if (it != batch_to_orig.end()) {
+            size_t batch_idx = std::distance(batch_to_orig.begin(), it);
+            state.results[i] = batch_results[batch_idx];
+            state.lease_timeouts[i] = batch_leases[batch_idx];
+        } else {
+            state.results[i] = tl::unexpected(pre_results[i].error());
+        }
+    }
+
+    for (auto &pt : state.pending_transfers) {
+        pt.index = batch_to_orig[pt.index];
+    }
+
+    return state;
+}
+
+std::vector<int64_t> RealClient::batch_get_complete(BatchGetState &state) {
+    auto results = client_->BatchGetComplete(state);
+    std::vector<int64_t> int_results(results.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        int_results[i] = results[i].has_value() ? 0 : -1;
+    }
+    return int_results;
+}
+
+std::unique_ptr<AsyncGetContext> RealClient::create_async_context(
+    size_t max_concurrency) {
+    return std::make_unique<AsyncGetContext>(this, max_concurrency);
+}
+
+// ============================================================================
+// AsyncGetContext implementation
+// ============================================================================
+
+AsyncGetContext::AsyncGetContext(RealClient *client, size_t max_concurrency)
+    : client_(client), max_concurrency_(max_concurrency) {
+    completion_thread_ =
+        std::thread(&AsyncGetContext::completion_thread_func, this);
+}
+
+AsyncGetContext::~AsyncGetContext() {
+    running_.store(false);
+    cq_cv_.notify_all();
+    if (completion_thread_.joinable()) {
+        completion_thread_.join();
+    }
+
+    // Drain active slots: wait for all in-flight RDMA transfers to complete
+    // before destroying state. Otherwise freeBatchID may fail (BatchBusy)
+    // leaking batch_desc, and RDMA hardware may DMA into freed buffers.
+    for (auto &slot : active_slots_) {
+        for (auto &pt : slot.state.pending_transfers) {
+            pt.future.wait();
+        }
+    }
+}
+
+AsyncGetContext::Token AsyncGetContext::submit(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes) {
+    // Atomically reserve a slot (CAS to prevent exceeding max_concurrency)
+    size_t current = in_flight_count_.load();
+    while (true) {
+        if (current >= max_concurrency_) {
+            return INVALID_TOKEN;
+        }
+        if (in_flight_count_.compare_exchange_weak(current, current + 1)) {
+            break;
+        }
+    }
+
+    auto state = client_->batch_get_submit(keys, buffers, sizes);
+
+    Token token = next_token_++;
+
+    if (state.pending_transfers.empty()) {
+        // All keys failed in submit phase. No transfers to wait for.
+        // Enqueue results directly so wait_any() returns the errors.
+        auto results = client_->batch_get_complete(state);
+        {
+            std::lock_guard<std::mutex> lk(cq_mu_);
+            completed_.push({token, std::move(results)});
+        }
+        cq_cv_.notify_one();
+    } else {
+        std::lock_guard<std::mutex> lk(slots_mu_);
+        active_slots_.push_back(Slot{token, std::move(state)});
+    }
+
+    return token;
+}
+
+std::pair<AsyncGetContext::Token, std::vector<int64_t>>
+AsyncGetContext::wait_any() {
+    std::unique_lock<std::mutex> lk(cq_mu_);
+    cq_cv_.wait(lk, [this] { return !completed_.empty() || !running_; });
+
+    if (completed_.empty()) {
+        return {INVALID_TOKEN, {}};
+    }
+
+    auto result = std::move(completed_.front());
+    completed_.pop();
+    in_flight_count_--;
+    return result;
+}
+
+size_t AsyncGetContext::in_flight() const { return in_flight_count_.load(); }
+
+void AsyncGetContext::completion_thread_func() {
+    while (running_.load()) {
+        // Phase 1: Under lock, find ready slots and move them out
+        std::vector<Slot> ready_slots;
+        {
+            std::lock_guard<std::mutex> lk(slots_mu_);
+            for (auto it = active_slots_.begin(); it != active_slots_.end();) {
+                bool all_ready = true;
+                for (auto &pt : it->state.pending_transfers) {
+                    if (!pt.future.isReady()) {
+                        all_ready = false;
+                        break;
+                    }
+                }
+
+                if (all_ready) {
+                    ready_slots.push_back(
+                        Slot{it->token, std::move(it->state)});
+                    it = active_slots_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }  // slots_mu_ released
+
+        // Phase 2: Without lock, complete transfers and enqueue results
+        for (auto &slot : ready_slots) {
+            auto results = client_->batch_get_complete(slot.state);
+            {
+                std::lock_guard<std::mutex> cq_lk(cq_mu_);
+                completed_.push({slot.token, std::move(results)});
+            }
+            cq_cv_.notify_one();
+        }
+
+        if (ready_slots.empty()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+}
+
 }  // namespace mooncake
