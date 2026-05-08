@@ -201,7 +201,12 @@ class Transport {
                 return;
             }
 
-            task->publish_completion_locked();
+            const bool should_notify = task->publish_completion_locked();
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            if (should_notify) {
+                batch_desc.completion_cv.notify_all();
+            }
+#endif
         }
     };
 
