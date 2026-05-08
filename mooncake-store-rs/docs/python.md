@@ -419,8 +419,8 @@ mooncake-store-admin \
 
 Notes:
 
-- client leases expire automatically; segment registration keys do not
-- the cleanup is explicit by design, so temporary lease misses do not trigger automatic deletion
+- client leases expire automatically; segment metadata is stored under the owning runtime namespace
+- cleanup consumes the lease-expiry work index and removes segment metadata for that exact dead owner after re-checking liveness
 - tenant-scoped routing, quota, fairness, shaping, and placement defaults should be authored through admin-managed metadata policy
 - Python `setup(...)`, standalone client flags, and related env vars remain compatibility/bootstrap fallbacks when metadata does not provide the relevant section
 - `--keyspace <prefix>` scopes both policy operations and stale-segment cleanup to one metadata namespace

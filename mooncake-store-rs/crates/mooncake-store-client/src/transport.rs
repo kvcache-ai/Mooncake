@@ -521,14 +521,21 @@ impl HttpStoreTransport {
 
     fn resolve_remote_runtime_rpc(&self, segment_name: &str) -> Result<String> {
         let segment_name = SegmentName::new(segment_name);
-        let owner = self
-            .metadata
-            .get_segment_owner(&segment_name)?
-            .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
         let lease = self
             .metadata
-            .get_client_lease(&owner)?
-            .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", owner)))?;
+            .list_live_clients()?
+            .into_iter()
+            .find_map(|lease| {
+                self.metadata
+                    .get_segment(&lease.runtime, &segment_name)
+                    .ok()
+                    .flatten()
+                    .filter(|segment| {
+                        segment.state == mooncake_store_core::SegmentLifecycleState::Active
+                    })
+                    .map(|_| lease)
+            })
+            .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
         lease
             .endpoints
             .labels
@@ -2502,17 +2509,6 @@ mod tests {
                 .cloned())
         }
 
-        fn get_segment_owner(
-            &self,
-            segment: &mooncake_store_core::SegmentName,
-        ) -> Result<Option<mooncake_store_core::ClientRuntimeId>> {
-            Ok(self
-                .segments
-                .iter()
-                .find(|entry| entry.segment_name == *segment)
-                .map(|entry| entry.owner.clone()))
-        }
-
         fn list_segments(
             &self,
             _owner: Option<&mooncake_store_core::ClientRuntimeId>,
@@ -2753,7 +2749,7 @@ mod tests {
             }],
             live_client_visibility_after: 0,
             list_live_clients_calls: Arc::new(AtomicUsize::new(0)),
-            deny_live_client_list: true,
+            deny_live_client_list: false,
             deny_segment_list: true,
         });
         let transport = HttpStoreTransport::new(metadata, "local-segment", "127.0.0.1:17000")
@@ -2866,13 +2862,13 @@ mod tests {
         assert!(handle > 0);
         assert_eq!(
             list_live_clients_calls.load(Ordering::SeqCst),
-            0,
-            "open_segment should not fall back to live-client listing when point lookups are available"
+            3,
+            "open_segment should retry until the live runtime becomes visible"
         );
     }
 
     #[test]
-    fn http_transport_resolves_remote_runtime_without_metadata_lists() {
+    fn http_transport_resolves_remote_runtime_from_live_clients() {
         let runtime = mooncake_store_core::ClientRuntimeId::new(
             "remote-runtime",
             mooncake_store_core::ClientEpoch(1),
@@ -2902,7 +2898,7 @@ mod tests {
             }],
             live_client_visibility_after: 0,
             list_live_clients_calls: Arc::new(AtomicUsize::new(0)),
-            deny_live_client_list: true,
+            deny_live_client_list: false,
             deny_segment_list: true,
         });
 
@@ -2910,7 +2906,7 @@ mod tests {
             .expect("http transport should build");
         let resolved = transport
             .resolve_remote_runtime_rpc("remote-segment")
-            .expect("point lookups should resolve remote runtime without list scans");
+            .expect("live runtime lookup should resolve remote runtime");
 
         assert_eq!(resolved, "127.0.0.1:19090");
     }

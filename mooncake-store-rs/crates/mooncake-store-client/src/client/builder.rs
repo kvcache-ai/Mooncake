@@ -33,38 +33,31 @@ fn validate_segment_owner_conflict(
     local: &ClientLease,
     segment: &SegmentName,
 ) -> Result<()> {
-    let Some(owner) = metadata.get_segment_owner(segment)? else {
-        return Ok(());
-    };
-    if owner == local.runtime {
-        return Ok(());
+    for remote in metadata.list_live_clients()? {
+        if remote.runtime == local.runtime || remote.state != ClientLifecycleState::Active {
+            continue;
+        }
+        let lease_names_segment = remote
+            .endpoints
+            .segment_name
+            .as_ref()
+            .is_some_and(|name| name == segment);
+        let metadata_names_segment = metadata
+            .get_segment(&remote.runtime, segment)?
+            .filter(|announcement| announcement.state == SegmentLifecycleState::Active)
+            .is_some();
+        if !lease_names_segment && !metadata_names_segment {
+            continue;
+        }
+        if !validate_reachable_runtime(control_client, local, &remote)? {
+            continue;
+        }
+        return Err(StoreError::Conflict(format!(
+            "segment {} is already owned by live runtime {}",
+            segment.0, remote.runtime
+        )));
     }
-    let Some(remote) = metadata.get_client_lease(&owner)? else {
-        debug!(
-            local_runtime = %local.runtime,
-            remote_runtime = %owner,
-            segment = %segment.0,
-            "startup guard ignored stale segment-owner index without live lease"
-        );
-        return Ok(());
-    };
-    if remote.state != ClientLifecycleState::Active {
-        debug!(
-            local_runtime = %local.runtime,
-            remote_runtime = %remote.runtime,
-            remote_state = ?remote.state,
-            segment = %segment.0,
-            "startup guard ignored segment-owner lease that is no longer writable"
-        );
-        return Ok(());
-    }
-    if !validate_reachable_runtime(control_client, local, &remote)? {
-        return Ok(());
-    }
-    Err(StoreError::Conflict(format!(
-        "segment {} is already owned by live runtime {}",
-        segment.0, remote.runtime
-    )))
+    Ok(())
 }
 
 fn validate_reachable_runtime(

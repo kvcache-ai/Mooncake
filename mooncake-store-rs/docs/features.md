@@ -178,7 +178,7 @@ What it provides:
 - continuous stateless cleanup through `mooncake-store-admin server`
 - optional tenant-quota reservation reconcile in that same admin server for an explicit tenant list
 - backend-native lease-expiry indexing for recoverable maintenance scheduling (`ZSET` in Redis, `by-runtime` + `by-time` keys in etcd)
-- owner-scoped cleanup through backend-native owner metadata instead of a hidden global segment scan in the steady-state worker
+- owner-scoped cleanup through segment metadata stored under the owning client runtime namespace
 - same-epoch lease reclaim after a lease TTL gap when no higher live epoch exists, so heartbeat repair and predecessor drain pinning do not fail with stale-epoch rejection
 - `with_soft_pin`
 

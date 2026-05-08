@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
+import pathlib
+import sys
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 
@@ -40,6 +43,28 @@ __all__ = sorted(
         "__version__",
     }
 )
+
+
+def _install_store_rs_module_alias() -> None:
+    name = f"{__name__}.store"
+    existing = sys.modules.get(name)
+    if (
+        existing is not None
+        and pathlib.Path(getattr(existing, "__file__", "")).suffix == ".py"
+    ):
+        return
+
+    store_py = pathlib.Path(__file__).with_name("store.py")
+    spec = importlib.util.spec_from_file_location(name, store_py)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {name} from {store_py}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+
+
+_install_store_rs_module_alias()
 
 
 def __getattr__(name: str):

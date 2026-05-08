@@ -1913,13 +1913,6 @@ mod tests {
             self.inner.get_segment(owner, segment)
         }
 
-        fn get_segment_owner(
-            &self,
-            segment: &mooncake_store_core::SegmentName,
-        ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-            self.inner.get_segment_owner(segment)
-        }
-
         fn list_segments(
             &self,
             owner: Option<&ClientRuntimeId>,

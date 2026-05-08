@@ -114,20 +114,6 @@ pub trait MetadataBackend: Send + Sync {
             .find(|entry| entry.segment_name == *segment))
     }
 
-    /// Looks up the owner runtime for a segment name.
-    ///
-    /// # Performance
-    /// The default implementation scans `list_segments()` in memory and is
-    /// intended for tests or small datasets. Production backends should provide
-    /// an indexed implementation.
-    fn get_segment_owner(&self, segment: &SegmentName) -> Result<Option<ClientRuntimeId>> {
-        Ok(self
-            .list_segments(None)?
-            .into_iter()
-            .find(|entry| entry.segment_name == *segment)
-            .map(|entry| entry.owner))
-    }
-
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>>;
 
     fn update_segment_state(

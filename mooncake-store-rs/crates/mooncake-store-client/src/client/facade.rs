@@ -132,12 +132,8 @@ impl StoreClient {
     ) -> Result<Vec<Option<ObjectRoute>>> {
         let routes = self
             .route_directory
-            .get_object_routes_bounded(&self.lease, keys)?
-            .into_iter()
-            .map(|route| route.filter(|route| route.state == RouteState::Active))
-            .collect::<Vec<_>>();
-        self.report_route_hits_best_effort(routes.iter().filter_map(Option::as_ref));
-        Ok(routes)
+            .get_object_routes_bounded(&self.lease, keys)?;
+        self.filter_routes_to_readable(routes)
     }
 
     fn shared_batch_replication_policy(
@@ -607,15 +603,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn get_size_in_tenant(&self, tenant: &str, key: &str) -> Result<usize> {
+        let Some(route) = self.query_route_in_tenant(tenant, key)? else {
+            return Ok(0);
+        };
         Ok(self
-            .query_route_in_tenant(tenant, key)?
-            .and_then(|route| {
-                route
-                    .replicas
-                    .iter()
-                    .min_by_key(|replica| replica.priority)
-                    .map(|replica| replica.length as usize)
-            })
+            .select_readable_replica_with_refresh(&route)?
+            .map(|replica| replica.length as usize)
             .unwrap_or(0))
     }
 
@@ -624,7 +617,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn is_exist_in_tenant(&self, tenant: &str, key: &str) -> Result<bool> {
-        Ok(self.query_route_in_tenant(tenant, key)?.is_some())
+        let Some(route) = self.query_route_in_tenant(tenant, key)? else {
+            return Ok(false);
+        };
+        Ok(self.select_readable_replica_with_refresh(&route)?.is_some())
     }
 
     fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {

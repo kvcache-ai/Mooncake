@@ -57,9 +57,9 @@ Operational model:
 
 - Redis lease keys still use TTL as the liveness signal
 - etcd lease keys do not expire automatically; admin re-checks the stored `expires_at_ms` field when due work arrives
-- segment keys still do **not** use TTL in either backend
+- segment keys still do **not** use TTL in either backend, but they are stored under the owning client runtime namespace
 - lease publish and heartbeat refresh now also update a backend-native expiry work index under the same metadata keyspace: Redis uses one sorted set, etcd uses `by-runtime` + lexicographically ordered `by-time` keys
-- the admin maintenance loop consumes due entries from that work index, re-checks lease liveness, and only then removes dead-owner segment metadata through owner-scoped segment metadata instead of a hidden global scan in the steady-state worker
+- the admin maintenance loop consumes due entries from that work index, re-checks lease liveness, and only then removes that owner's segment metadata through the owner-scoped segment namespace
 - same-epoch lease reclaim after an expired lease key is allowed when that epoch is still the historical HWM and no higher live epoch exists, so heartbeat repair does not fail with `StaleEpoch` after a TTL gap
 - tenant quota reconcile is intentionally opt-in per tenant because the current metadata model has no bounded global tenant-work index for the admin plane to consume safely
 
@@ -215,6 +215,7 @@ Storage-role normalization:
 
 - `storage=true` requires `storage_bytes > 0`
 - if `storage_bytes=0` and the storage label is missing, the runtime normalizes it to `storage=false`
+- a scratch-only client may still enable `routed_writes`; placement will choose live `storage=true` runtimes and will not use stale segment metadata as a candidate source
 
 Hugepage behavior:
 
@@ -271,6 +272,7 @@ Reconnect behavior:
 - `classic_te` recreates its transport runtime before republishing local buffers
 - `tent` also recreates its transport runtime before re-registering the local buffers it still owns
 - peer restarts that invalidate a cached remote segment handle are repaired on demand: the read path drops the stale handle, reopens by segment name, and only quarantines that runtime if the fresh reopen still fails
+- segment metadata lookup starts from live clients. A leftover segment record whose owner lease is gone is ignored for allocation, preferred-segment resolution, and HTTP remote-runtime resolution.
 - remote read batches are split by storage owner and guarded by a short, rate-limited peer control-plane probe from the cached membership snapshot; the probe does not refresh metadata and only quarantines the owner when the cached peer endpoint is confirmed unreachable
 - routed writes apply the same stale-handle refresh once before escalating to outer soft-pin retry or failover, so a restarted live peer does not poison the cached remote-segment state
 - if Redis restarts from an empty dataset, surviving storage clients republish both lease state and segment metadata during recovery

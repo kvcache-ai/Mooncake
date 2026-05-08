@@ -35,9 +35,8 @@ use crate::{
 };
 
 /// A fixture composed of several Active `StoreClient` instances sharing the
-/// same `InMemoryMetadataBackend` and `TestTransport` hub.  Each client has a
-/// distinct segment so the metadata-backend's segment-owner index keeps them
-/// separate.
+/// same `InMemoryMetadataBackend` and `TestTransport` hub. Each client has a
+/// distinct owner-scoped segment.
 #[allow(dead_code)]
 pub(super) struct IsolationCluster {
     pub metadata: Arc<InMemoryMetadataBackend>,

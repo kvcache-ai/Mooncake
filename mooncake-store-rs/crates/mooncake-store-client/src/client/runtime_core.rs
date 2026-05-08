@@ -1149,32 +1149,31 @@ impl StoreClient {
     }
 
     fn lookup_preferred_segment(&self, segment_name: &SegmentName) -> Result<SegmentAnnouncement> {
-        let owner = self
-            .metadata
-            .get_segment_owner(segment_name)?
-            .ok_or_else(|| {
-                StoreError::NotFound(format!("preferred segment {} not found", segment_name.0))
-            })?;
-        let segment = self
-            .metadata
-            .get_segment(&owner, segment_name)?
-            .ok_or_else(|| {
-                StoreError::NotFound(format!("preferred segment {} not found", segment_name.0))
-            })?;
-        if segment.state != SegmentLifecycleState::Active {
-            return Err(StoreError::NotFound(format!(
-                "preferred segment {} not found or not active",
-                segment_name.0
-            )));
-        }
-        if !self.has_active_compatible_runtime(&segment.owner, false)?
-            && !self.has_active_compatible_runtime(&segment.owner, true)?
+        let live_clients = self.available_compatible_live_clients(false)?;
+        for lease in live_clients
+            .iter()
+            .filter(|lease| lease.state == ClientLifecycleState::Active)
         {
-            return Err(StoreError::InvalidState(format!(
-                "preferred segment {} belongs to an unavailable client",
-                segment_name.0
-            )));
+            if let Some(segment) = self.metadata.get_segment(&lease.runtime, segment_name)? {
+                if segment.state == SegmentLifecycleState::Active {
+                    return Ok(segment);
+                }
+            }
         }
-        Ok(segment)
+        let live_clients = self.available_compatible_live_clients(true)?;
+        for lease in live_clients
+            .iter()
+            .filter(|lease| lease.state == ClientLifecycleState::Active)
+        {
+            if let Some(segment) = self.metadata.get_segment(&lease.runtime, segment_name)? {
+                if segment.state == SegmentLifecycleState::Active {
+                    return Ok(segment);
+                }
+            }
+        }
+        Err(StoreError::NotFound(format!(
+            "preferred segment {} not found on a live storage client",
+            segment_name.0
+        )))
     }
 }

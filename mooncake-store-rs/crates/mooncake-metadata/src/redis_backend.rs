@@ -1162,11 +1162,18 @@ impl RedisMetadataBackend {
         owner_storage_key: &str,
     ) -> Result<RedisSegmentCleanupStats> {
         let owner_index = self.keyspace.segment_index_for_owner_key(owner_storage_key);
-        let global_index = self.keyspace.segment_index(None);
         let mut connection = self.connection("redis cleanup stale segments")?;
-        let keys: Vec<String> = connection
+        let mut keys: Vec<String> = connection
             .smembers(&owner_index)
             .map_err(|error| metadata_error("redis smembers owner segment index", error))?;
+        if keys.is_empty() {
+            if let Some(owner) = ClientRuntimeId::from_storage_key(owner_storage_key) {
+                keys = scan_keys(
+                    &mut connection,
+                    &self.keyspace.segment_pattern(Some(&owner)),
+                )?;
+            }
+        }
         if keys.is_empty() {
             let _ = connection.del::<_, usize>(owner_index.as_str());
             return Ok(RedisSegmentCleanupStats::default());
@@ -1176,7 +1183,7 @@ impl RedisMetadataBackend {
             inspected_segment_keys: keys.len(),
             ..RedisSegmentCleanupStats::default()
         };
-        let mut stale_global_entries = Vec::new();
+        let mut stale_owner_entries = Vec::new();
 
         for key in &keys {
             let owner: Option<String> = redis::cmd("HGET")
@@ -1189,7 +1196,7 @@ impl RedisMetadataBackend {
                     connection
                         .del::<_, ()>(key.as_str())
                         .map_err(|error| metadata_error("redis del stale segment", error))?;
-                    stale_global_entries.push(key.clone());
+                    stale_owner_entries.push(key.clone());
                     stats.removed_segment_keys += 1;
                 }
                 Some(_) => {
@@ -1201,18 +1208,15 @@ impl RedisMetadataBackend {
                     stats.stale_missing_segment_index_entries += 1;
                 }
                 None => {
-                    stale_global_entries.push(key.clone());
+                    stale_owner_entries.push(key.clone());
                     stats.stale_missing_segment_index_entries += 1;
                 }
             }
         }
 
-        if !stale_global_entries.is_empty() {
-            stats.removed_segment_index_entries = connection
-                .srem(&global_index, stale_global_entries.clone())
-                .map_err(|error| metadata_error("redis srem stale segment index", error))?;
+        if !stale_owner_entries.is_empty() {
             stats.removed_owner_segment_index_entries = connection
-                .srem(owner_index.as_str(), stale_global_entries)
+                .srem(owner_index.as_str(), stale_owner_entries)
                 .map_err(|error| metadata_error("redis srem stale owner segment index", error))?;
         }
 
@@ -1273,9 +1277,6 @@ impl RedisMetadataBackend {
             )
             .map_err(|error| metadata_error("redis hset segment state", error))?;
         connection
-            .sadd::<_, _, ()>(self.keyspace.segment_index(None), key.as_str())
-            .map_err(|error| metadata_error("redis sadd segment index", error))?;
-        connection
             .sadd::<_, _, ()>(
                 self.keyspace.segment_index(Some(&state.announcement.owner)),
                 key,
@@ -1285,54 +1286,32 @@ impl RedisMetadataBackend {
 
     pub fn cleanup_stale_segments(&self) -> Result<RedisMetadataCleanupReport> {
         let live_clients = self.list_live_clients()?;
-        let live_runtime_keys = live_clients
-            .iter()
-            .map(|lease| lease.runtime.storage_key())
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut connection = self.connection("redis cleanup stale segments")?;
-        let global_index = self.keyspace.segment_index(None);
-        let mut keys: Vec<String> = connection
-            .smembers(&global_index)
-            .map_err(|error| metadata_error("redis smembers segment index", error))?;
-        if keys.is_empty() {
-            keys = scan_keys(&mut connection, &self.keyspace.segment_pattern(None))?;
-        }
-
-        let mut stats = RedisSegmentCleanupStats {
-            inspected_segment_keys: keys.len(),
-            ..RedisSegmentCleanupStats::default()
-        };
-        let mut stale_owners = std::collections::BTreeSet::<String>::new();
-
-        for key in keys {
-            let owner: Option<String> = redis::cmd("HGET")
-                .arg(key.as_str())
-                .arg("owner")
-                .query(&mut connection)
-                .map_err(|error| metadata_error("redis hget segment owner", error))?;
-            let Some(owner) = owner else {
-                let removed: usize = connection
-                    .srem(&global_index, key.as_str())
-                    .map_err(|error| metadata_error("redis srem dangling segment index", error))?;
-                stats.removed_segment_index_entries += removed;
-                stats.stale_missing_segment_index_entries += 1;
+        let due_lease_keys = self.list_due_client_lease_expiries(now_ms(), 4096)?;
+        let mut stats = RedisSegmentCleanupStats::default();
+        for lease_key in due_lease_keys {
+            let Some((stable_id, epoch)) = self.keyspace.parse_client_key(&lease_key) else {
+                let _ = self.remove_client_lease_expiry_entry(&lease_key);
+                stats.stale_missing_segment_index_entries =
+                    stats.stale_missing_segment_index_entries.saturating_add(1);
                 continue;
             };
-            if live_runtime_keys.contains(&owner) {
+            let owner = ClientRuntimeId::new(stable_id, ClientEpoch(epoch));
+            if matches!(
+                self.client_lease_liveness(&owner)?,
+                ClientLeaseLiveness::Live(_)
+            ) {
                 continue;
             }
-            stale_owners.insert(owner);
-        }
-
-        for owner_storage_key in stale_owners {
             let owner_stats =
-                self.cleanup_stale_segments_for_owner_storage_key(&owner_storage_key)?;
+                self.cleanup_stale_segments_for_owner_storage_key(&owner.storage_key())?;
+            stats.inspected_segment_keys += owner_stats.inspected_segment_keys;
             stats.removed_segment_keys += owner_stats.removed_segment_keys;
             stats.removed_segment_index_entries += owner_stats.removed_segment_index_entries;
             stats.removed_owner_segment_index_entries +=
                 owner_stats.removed_owner_segment_index_entries;
             stats.stale_missing_segment_index_entries +=
                 owner_stats.stale_missing_segment_index_entries;
+            let _ = self.remove_client_lease_expiry_entry(&lease_key);
         }
 
         Ok(RedisMetadataCleanupReport {
@@ -1805,21 +1784,6 @@ impl MetadataBackend for RedisMetadataBackend {
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
         self.query_idempotent_write("redis publish segment", |connection| {
             let key = self.keyspace.segment(&segment.owner, &segment.segment_name);
-            let owner_key = self.keyspace.segment_owner(&segment.segment_name);
-            let existing_owner: Option<String> = connection.get(&owner_key)?;
-            if let Some(existing_owner) = existing_owner.as_ref() {
-                let Some(runtime) = ClientRuntimeId::from_storage_key(existing_owner) else {
-                    return Err(store_error_to_redis_error(StoreError::Metadata(format!(
-                        "invalid runtime storage key in segment owner index: {existing_owner}"
-                    ))));
-                };
-                if runtime != segment.owner {
-                    return Err(store_error_to_redis_error(StoreError::Conflict(format!(
-                        "segment {} is already owned by live runtime {}",
-                        segment.segment_name.0, runtime
-                    ))));
-                }
-            }
             let current_payload: Option<String> = redis::cmd("HGET")
                 .arg(&key)
                 .arg("state_json")
@@ -1830,18 +1794,7 @@ impl MetadataBackend for RedisMetadataBackend {
                 None => StoredSegmentState::new(segment.clone()),
             };
             state.merge_announcement(segment);
-            redis::cmd("WATCH")
-                .arg(&key)
-                .arg(&owner_key)
-                .query::<()>(connection)?;
-            let watched_owner: Option<String> = connection.get(&owner_key)?;
-            if watched_owner != existing_owner {
-                redis::cmd("UNWATCH").query::<()>(connection)?;
-                return Err(redis::RedisError::from((
-                    redis::ErrorKind::BusyLoadingError,
-                    "segment owner changed during publish",
-                )));
-            }
+            redis::cmd("WATCH").arg(&key).query::<()>(connection)?;
             let watched_payload: Option<String> = redis::cmd("HGET")
                 .arg(&key)
                 .arg("state_json")
@@ -1875,31 +1828,18 @@ impl MetadataBackend for RedisMetadataBackend {
                         .map_err(|error| store_error_to_redis_error(json_error(error)))?,
                 );
             pipe.cmd("SADD")
-                .arg(self.keyspace.segment_index(None))
-                .arg(key.as_str());
-            pipe.cmd("SADD")
                 .arg(self.keyspace.segment_index(Some(&segment.owner)))
                 .arg(key.as_str());
-            pipe.cmd("SET")
-                .arg(&owner_key)
-                .arg(segment.owner.storage_key());
             pipe.query::<()>(connection)
         })
     }
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
         let key = self.keyspace.segment(owner, segment);
-        let owner_key = self.keyspace.segment_owner(segment);
         self.query_idempotent_write("redis unpublish segment", |connection| {
-            let indexed_owner: Option<String> = connection.get(&owner_key)?;
             let mut pipe = redis::pipe();
             pipe.atomic();
             pipe.del(&key).ignore();
-            if indexed_owner.as_deref() == Some(owner.storage_key().as_str()) {
-                pipe.del(&owner_key).ignore();
-            }
-            pipe.srem(self.keyspace.segment_index(None), key.as_str())
-                .ignore();
             pipe.srem(self.keyspace.segment_index(Some(owner)), key.as_str())
                 .ignore();
             pipe.query::<()>(connection)
@@ -1928,22 +1868,14 @@ impl MetadataBackend for RedisMetadataBackend {
             .transpose()
     }
 
-    fn get_segment_owner(&self, segment: &SegmentName) -> Result<Option<ClientRuntimeId>> {
-        let key = self.keyspace.segment_owner(segment);
-        let owner: Option<String> =
-            self.query_readonly("redis get segment owner", |connection| connection.get(&key))?;
-        let Some(owner) = owner else {
-            return Ok(None);
-        };
-        let Some(runtime) = ClientRuntimeId::from_storage_key(&owner) else {
-            return Err(StoreError::Metadata(format!(
-                "invalid runtime storage key in segment owner index: {owner}"
-            )));
-        };
-        Ok(Some(runtime))
-    }
-
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
+        if owner.is_none() {
+            let mut segments = Vec::new();
+            for lease in self.list_live_clients()? {
+                segments.extend(self.list_segments(Some(&lease.runtime))?);
+            }
+            return Ok(segments);
+        }
         let index = self.keyspace.segment_index(owner);
         let keys = self.query_readonly("redis list segments", |connection| {
             let mut keys: Vec<String> = connection.smembers(&index)?;
@@ -3636,7 +3568,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_backend_rejects_stale_segment_owner_index_on_publish() {
+    fn redis_backend_allows_republish_after_previous_owner_unpublished() {
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -3666,15 +3598,6 @@ mod tests {
             .unpublish_segment(&owner_a, &segment_name)
             .expect("first owner should unpublish");
 
-        let mut connection = redis::Client::open(server.url())
-            .expect("redis client should open")
-            .get_connection()
-            .expect("redis connection should open");
-        let owner_key = keyspace.segment_owner(&segment_name);
-        connection
-            .set::<_, _, ()>(&owner_key, owner_a.storage_key())
-            .expect("stale owner index should write");
-
         let segment_b = SegmentAnnouncement {
             owner: owner_b,
             segment_name,
@@ -3685,14 +3608,9 @@ mod tests {
             alignment_bytes: 16,
             tags: vec![],
         };
-        let error = backend
+        backend
             .publish_segment(&segment_b)
-            .expect_err("stale owner index should still block publish today");
-        assert!(matches!(
-            error,
-            StoreError::Metadata(message)
-                if message.contains("already owned by live runtime")
-        ));
+            .expect("segment should publish under the new owner");
     }
 
     #[test]
@@ -4201,12 +4119,15 @@ mod tests {
         backend
             .publish_segment(&dead_segment)
             .expect("dead segment publish should succeed");
+        backend
+            .refresh_client_lease_expiry(&dead_runtime, super::now_ms().saturating_sub(1))
+            .expect("dead owner expiry should be indexed");
 
         let report = backend
             .cleanup_stale_segments()
             .expect("stale segment cleanup should succeed");
         assert_eq!(report.live_clients, 1);
-        assert!(report.inspected_segment_keys >= 2);
+        assert_eq!(report.inspected_segment_keys, 1);
         assert_eq!(report.removed_segment_keys, 1);
 
         let segments = backend
@@ -4218,13 +4139,6 @@ mod tests {
         let mut connection = client
             .get_connection()
             .expect("redis connection should succeed");
-        let global_index: Vec<String> = connection
-            .smembers(keyspace.segment_index(None))
-            .expect("global segment index should load");
-        assert_eq!(
-            global_index,
-            vec![keyspace.segment(&live_segment.owner, &live_segment.segment_name)]
-        );
         let dead_owner_index: Vec<String> = connection
             .smembers(keyspace.segment_index(Some(&dead_runtime)))
             .expect("dead owner index should load");
@@ -4277,7 +4191,7 @@ mod tests {
         assert_eq!(report.removed_segment_keys, 1);
 
         let remaining = backend
-            .list_segments(None)
+            .list_segments(Some(&other_runtime))
             .expect("segment listing after owner cleanup should succeed");
         assert_eq!(remaining, vec![other_segment.clone()]);
 

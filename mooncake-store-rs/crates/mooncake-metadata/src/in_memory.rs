@@ -30,8 +30,6 @@ struct InMemoryState {
     tenant_object_accounting: BTreeMap<ObjectKey, TenantObjectAccounting>,
     tenant_quota_reservations: BTreeMap<String, TenantQuotaReservation>,
     segments: BTreeMap<String, StoredSegmentState>,
-    segment_owners: BTreeMap<SegmentName, ClientRuntimeId>,
-    lease_segment_owners: BTreeMap<SegmentName, ClientRuntimeId>,
 }
 
 pub struct InMemoryMetadataBackend {
@@ -192,15 +190,6 @@ impl MetadataBackend for InMemoryMetadataBackend {
             } else if state.stable_runtimes.get(&stable_id) == Some(&storage_key) {
                 state.stable_runtimes.remove(&stable_id);
             }
-            if let Some(segment_name) = lease.endpoints.segment_name.as_ref() {
-                if lease.state.serves_reads() {
-                    state
-                        .lease_segment_owners
-                        .insert(segment_name.clone(), lease.runtime.clone());
-                } else if state.lease_segment_owners.get(segment_name) == Some(&lease.runtime) {
-                    state.lease_segment_owners.remove(segment_name);
-                }
-            }
             return Ok(());
         }
 
@@ -222,15 +211,6 @@ impl MetadataBackend for InMemoryMetadataBackend {
             state
                 .stable_runtimes
                 .insert(stable_id.clone(), storage_key.clone());
-        }
-        if let Some(segment_name) = lease.endpoints.segment_name.as_ref() {
-            if lease.state.serves_reads() {
-                state
-                    .lease_segment_owners
-                    .insert(segment_name.clone(), lease.runtime.clone());
-            } else if state.lease_segment_owners.get(segment_name) == Some(&lease.runtime) {
-                state.lease_segment_owners.remove(segment_name);
-            }
         }
         state.clients.insert(storage_key, lease.clone());
         state
@@ -273,27 +253,14 @@ impl MetadataBackend for InMemoryMetadataBackend {
         next: ClientLifecycleState,
     ) -> Result<()> {
         let mut state = self.state.write();
-        let (segment_name, serves_reads_now) = {
+        {
             let Some(lease) = state.clients.get_mut(&runtime.storage_key()) else {
                 return Err(StoreError::NotFound(runtime.storage_key()));
             };
             lease.state = next;
-            (
-                lease.endpoints.segment_name.clone(),
-                lease.state.serves_reads(),
-            )
-        };
+        }
         if next != ClientLifecycleState::Active {
             state.stable_runtimes.remove(&runtime.stable_id);
-        }
-        if let Some(segment_name) = segment_name.as_ref() {
-            if serves_reads_now {
-                state
-                    .lease_segment_owners
-                    .insert(segment_name.clone(), runtime.clone());
-            } else if state.lease_segment_owners.get(segment_name) == Some(runtime) {
-                state.lease_segment_owners.remove(segment_name);
-            }
         }
         Ok(())
     }
@@ -330,17 +297,6 @@ impl MetadataBackend for InMemoryMetadataBackend {
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
         let key = Self::segment_key(&segment.owner, &segment.segment_name);
         let mut state = self.state.write();
-        if let Some(existing_owner) = state.segment_owners.get(&segment.segment_name) {
-            if existing_owner != &segment.owner {
-                return Err(StoreError::Conflict(format!(
-                    "segment {} is already owned by live runtime {}",
-                    segment.segment_name.0, existing_owner
-                )));
-            }
-        }
-        state
-            .segment_owners
-            .insert(segment.segment_name.clone(), segment.owner.clone());
         match state.segments.get_mut(&key) {
             Some(current) => current.merge_announcement(segment),
             None => {
@@ -355,9 +311,6 @@ impl MetadataBackend for InMemoryMetadataBackend {
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
         let mut state = self.state.write();
         state.segments.remove(&Self::segment_key(owner, segment));
-        if state.segment_owners.get(segment) == Some(owner) {
-            state.segment_owners.remove(segment);
-        }
         Ok(())
     }
 
@@ -372,15 +325,6 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .segments
             .get(&Self::segment_key(owner, segment))
             .map(|segment| segment.announcement.clone()))
-    }
-
-    fn get_segment_owner(&self, segment: &SegmentName) -> Result<Option<ClientRuntimeId>> {
-        let state = self.state.read();
-        Ok(state
-            .lease_segment_owners
-            .get(segment)
-            .cloned()
-            .or_else(|| state.segment_owners.get(segment).cloned()))
     }
 
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
