@@ -190,6 +190,18 @@ Common variants:
 DIST_DIR=artifacts ./scripts/build/build-wheel.sh
 ```
 
+CI jobs that already downloaded native artifacts can skip the upstream CMake
+portion and reuse `MOONCAKE_UPSTREAM_BUILD_DIR` directly:
+
+```bash
+MOONCAKE_REUSE_NATIVE_ARTIFACTS=1 \
+MOONCAKE_SKIP_NATIVE_BUILD=1 \
+MOONCAKE_UPSTREAM_BUILD_DIR="$PWD/third_party/Mooncake/build-wheel-compat" \
+MOONCAKE_CLASSIC_SHIM_LIB_PATH="$PWD/dist/lib/libmooncake_classic_shim.so" \
+MOONCAKE_TENT_SHIM_LIB_PATH="$PWD/dist/lib/libmooncake_tent_shim.so" \
+./scripts/build/build-wheel.sh --interpreter python3.10
+```
+
 When the host OS is missing build dependencies, use the Ubuntu Docker wrapper
 instead. It reuses `scripts/build/build-wheel.sh` inside the container and
 produces the same `dist/wheels/` and `dist/bin/` outputs:

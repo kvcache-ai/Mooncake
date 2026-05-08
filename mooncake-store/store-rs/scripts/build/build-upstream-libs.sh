@@ -21,6 +21,18 @@ UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}
 UPSTREAM_BUILD_DIR=${MOONCAKE_UPSTREAM_BUILD_DIR:-"${UPSTREAM_DIR}/build-wheel-compat"}
 YALANTINGLIBS_PREFIX=${YALANTINGLIBS_PREFIX:-"${UPSTREAM_BUILD_DIR}/yalantinglibs-install"}
 BUILD_JOBS=${BUILD_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 8)}
+BUILD_WHEEL_NATIVE_ASSETS=${BUILD_WHEEL_NATIVE_ASSETS:-0}
+
+is_truthy() {
+  case "${1:-}" in
+    1 | true | TRUE | yes | YES | on | ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 ensure_yalantinglibs() {
   local source_dir="${UPSTREAM_DIR}/extern/yalantinglibs"
@@ -87,6 +99,13 @@ ensure_pybind11
 ensure_yalantinglibs
 export CPATH="${YALANTINGLIBS_PREFIX}/include${CPATH:+:${CPATH}}"
 
+BUILD_EXAMPLES=OFF
+BUILD_TARGETS=(transfer_engine tent_shared)
+if is_truthy "${BUILD_WHEEL_NATIVE_ASSETS}"; then
+  BUILD_EXAMPLES=ON
+  BUILD_TARGETS=(engine transfer_engine_bench tent_shared)
+fi
+
 # Create a minimal venv just for cmake's Python3_EXECUTABLE requirement
 VENV_DIR="${REPO_ROOT}/.venv-upstream-libs"
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
@@ -103,7 +122,7 @@ cmake \
   -DWITH_TE=ON \
   -DWITH_STORE=OFF \
   -DWITH_STORE_RUST=OFF \
-  -DBUILD_EXAMPLES=OFF \
+  -DBUILD_EXAMPLES="${BUILD_EXAMPLES}" \
   -DBUILD_UNIT_TESTS=OFF \
   -DUSE_TENT=ON \
   -DUSE_REDIS=ON \
@@ -112,9 +131,14 @@ cmake \
   -DBUILD_SHARED_LIBS=ON
 
 cmake --build "${UPSTREAM_BUILD_DIR}" \
-  --target transfer_engine tent_shared \
+  --target "${BUILD_TARGETS[@]}" \
   -j"${BUILD_JOBS}"
 
 echo "Upstream libraries built successfully:"
 echo "  libtransfer_engine.so: ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so"
 echo "  libtent_shared.so:     ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so"
+if is_truthy "${BUILD_WHEEL_NATIVE_ASSETS}"; then
+  echo "  engine*.so:            ${UPSTREAM_BUILD_DIR}/mooncake-integration/"
+  echo "  libasio.so:            ${UPSTREAM_BUILD_DIR}/mooncake-asio/libasio.so"
+  echo "  transfer_engine_bench: ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench"
+fi
