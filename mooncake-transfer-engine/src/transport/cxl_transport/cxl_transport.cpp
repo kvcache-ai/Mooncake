@@ -302,7 +302,7 @@ Status CxlTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        task.publish_completion();
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
@@ -326,6 +326,7 @@ Status CxlTransport::submitTransfer(
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
+        task.initialize(batch_id, request, true);
         uint64_t dest_cxl_offset = request.target_offset;
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();

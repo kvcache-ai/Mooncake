@@ -107,8 +107,7 @@ class CXLTransportTest : public ::testing::Test {
         int rc = engine->registerLocalMemory(base_addr + offset_1, len);
         ASSERT_EQ(rc, 0);
 
-        segment_id = engine->openSegment(FLAGS_local_server_name.c_str());
-        // bindToSocket(0);
+        segment_id = LOCAL_SEGMENT_ID;
         segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     }
 
@@ -128,7 +127,7 @@ TEST_F(CXLTransportTest, MultiWrite) {
     while (times--) {
         for (size_t offset = 0; offset < kDataLength; ++offset)
             *((char *)(addr) + offset) = 'a' + lrand48() % 26;
-        auto batch_id = xport->allocateBatchID(1);
+        auto batch_id = engine->allocateBatchID(1);
         Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
@@ -143,7 +142,7 @@ TEST_F(CXLTransportTest, MultiWrite) {
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            Status s = xport->getTransferStatus(batch_id, 0, status);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
             ASSERT_EQ(s, Status::OK());
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
@@ -153,7 +152,7 @@ TEST_F(CXLTransportTest, MultiWrite) {
             }
         }
 
-        s = xport->freeBatchID(batch_id);
+        s = engine->freeBatchID(batch_id);
         ASSERT_EQ(s, Status::OK());
     }
 }
@@ -163,7 +162,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
     while (times--) {
         for (size_t offset = 0; offset < kDataLength; ++offset)
             *((char *)(addr) + offset) = 'a' + lrand48() % 26;
-        auto batch_id = xport->allocateBatchID(1);
+        auto batch_id = engine->allocateBatchID(1);
         Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
@@ -178,7 +177,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            Status s = xport->getTransferStatus(batch_id, 0, status);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
             ASSERT_EQ(s, Status::OK());
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
@@ -188,7 +187,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
             }
         }
 
-        s = xport->freeBatchID(batch_id);
+        s = engine->freeBatchID(batch_id);
         ASSERT_EQ(s, Status::OK());
     }
 
@@ -196,7 +195,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
 
     times = 10;
     while (times--) {
-        auto batch_id = xport->allocateBatchID(1);
+        auto batch_id = engine->allocateBatchID(1);
         int ret = 0;
         void *src = allocateMemoryPool(kDataLength, 0, false);
 
@@ -214,7 +213,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            Status s = xport->getTransferStatus(batch_id, 0, status);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
             ASSERT_EQ(s, Status::OK());
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
@@ -223,7 +222,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
             }
         }
 
-        s = xport->freeBatchID(batch_id);
+        s = engine->freeBatchID(batch_id);
         ASSERT_EQ(s, Status::OK());
         ret = memcmp((uint8_t *)(src), (uint8_t *)(addr), kDataLength);
         ASSERT_EQ(ret, 0);

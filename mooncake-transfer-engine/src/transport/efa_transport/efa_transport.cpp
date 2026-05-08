@@ -783,7 +783,12 @@ Status EfaTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask*> task_list;
-    for (auto& task : batch_desc.task_list) task_list.push_back(&task);
+    task_list.reserve(entries.size());
+    for (const auto& entry : entries) {
+        auto& task = batch_desc.task_list[task_id++];
+        task.initialize(batch_id, entry, true);
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 
@@ -927,7 +932,7 @@ Status EfaTransport::getTransferStatus(BatchID batch_id,
                 status[task_id].s = TransferStatusEnum::FAILED;
             else
                 status[task_id].s = TransferStatusEnum::COMPLETED;
-            task.is_finished = true;
+            task.publish_completion();
         } else {
             status[task_id].s = TransferStatusEnum::WAITING;
         }
@@ -953,7 +958,7 @@ Status EfaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = TransferStatusEnum::FAILED;
         else
             status.s = TransferStatusEnum::COMPLETED;
-        task.is_finished = true;
+        task.publish_completion();
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

@@ -238,12 +238,41 @@ void MemcpyWorkerPool::workerThread() {
 // ============================================================================
 
 bool TransferEngineOperationState::is_completed() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (result_.has_value()) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (result_.has_value()) {
+            return true;
+        }
+    }
+
+    TransferStatus status;
+    Status s = engine_.getBatchTransferStatus(batch_id_, status);
+    if (!s.ok()) {
+        LOG(ERROR) << "Failed to get batch transfer status for batch "
+                   << batch_id_ << " with error " << s.message();
+        std::lock_guard<std::mutex> lock(mutex_);
+        set_result_internal(ErrorCode::TRANSFER_FAIL);
         return true;
     }
 
-    check_task_status();
+    if (status.s == TransferStatusEnum::COMPLETED) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_.has_value()) {
+            set_result_internal(ErrorCode::OK);
+        }
+        return true;
+    }
+
+    if (status.s == TransferStatusEnum::FAILED ||
+        status.s == TransferStatusEnum::CANCELED ||
+        status.s == TransferStatusEnum::INVALID ||
+        status.s == TransferStatusEnum::TIMEOUT) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        check_task_status();
+        return result_.has_value();
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
     return result_.has_value();
 }
 
@@ -350,7 +379,7 @@ void TransferEngineOperationState::wait_for_completion() {
         // avoid missed notifications. The predicate is re-checked under the
         // lock. Under the mutex, relaxed is sufficient; the mutex acquire
         // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+        std::unique_lock<std::mutex> lock(batch_desc.lifecycle_mutex);
         const int64_t elapsed_milliseconds =
             getCurrentTimeInMilli() - start_ts_;
         if (elapsed_milliseconds < timeout_milliseconds) {
@@ -363,7 +392,7 @@ void TransferEngineOperationState::wait_for_completion() {
                         std::memory_order_relaxed);
                 });
         }
-    }  // Explicitly release completion_mutex before acquiring mutex_
+    }  // Explicitly release lifecycle_mutex before acquiring mutex_
 
     // Once completion is observed, read failure flag.
     if (completed) {
@@ -641,9 +670,14 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
-    // Allocate batch ID
-    const size_t batch_size = requests.size();
+    std::vector<TransferRequest>& requests, size_t batch_task_count) {
+    if (requests.empty()) {
+        auto state = std::make_shared<EmptyOperationState>();
+        return TransferFuture(state);
+    }
+
+    const size_t batch_size =
+        batch_task_count == 0 ? requests.size() : batch_task_count;
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
@@ -714,6 +748,76 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     return submitTransfer(requests);
 }
 
+std::optional<TransferSubmitter::ScatterReadBuildResult>
+TransferSubmitter::buildScatterReadRequests(
+    void* dest_buffer, const ScatterKeyRanges& key_ranges,
+    bool enable_task_grouping, const char* log_context,
+    const std::function<SegmentHandle(const std::string&)>& segment_resolver) {
+    TransferSubmitter::ScatterReadBuildResult result;
+    size_t total_ranges = 0;
+    for (const auto& [_, ranges] : key_ranges) {
+        total_ranges += ranges.size();
+    }
+    result.flat_requests.reserve(total_ranges);
+
+    uint64_t next_task_group_id = TransferRequest::kNoTaskGroup + 1;
+    char* dest_base = static_cast<char*>(dest_buffer);
+
+    for (const auto& [replica, ranges] : key_ranges) {
+        if (!replica.is_memory_replica()) {
+            LOG(ERROR) << log_context << ": disk replicas not supported";
+            return std::nullopt;
+        }
+        const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+        if (handle.transport_endpoint_.empty()) {
+            LOG(ERROR) << log_context << ": empty transport endpoint";
+            return std::nullopt;
+        }
+
+        SegmentHandle seg = segment_resolver(handle.transport_endpoint_);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << log_context << ": failed to open segment for "
+                       << handle.transport_endpoint_;
+            return std::nullopt;
+        }
+
+        uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+        size_t non_empty_range_count = 0;
+        for (const auto& range : ranges) {
+            if (std::get<2>(range) > 0) {
+                ++non_empty_range_count;
+            }
+        }
+        const uint64_t task_group_id =
+            enable_task_grouping && non_empty_range_count > 1
+                ? next_task_group_id++
+                : TransferRequest::kNoTaskGroup;
+
+        for (const auto& [dest_offset, src_offset, size] : ranges) {
+            if (size == 0) {
+                continue;
+            }
+            TransferRequest request;
+            request.opcode = TransferRequest::READ;
+            request.source = dest_base + dest_offset;
+            request.target_id = seg;
+            request.target_offset = base_address + src_offset;
+            request.length = size;
+            request.task_group_id = task_group_id;
+            result.flat_requests.emplace_back(request);
+        }
+
+        if (non_empty_range_count > 0) {
+            result.logical_task_count +=
+                task_group_id == TransferRequest::kNoTaskGroup
+                    ? non_empty_range_count
+                    : 1;
+        }
+    }
+
+    return result;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     uint64_t src_offset) {
@@ -761,7 +865,38 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     if (future.has_value()) {
         updateTransferMetrics(slices, TransferRequest::READ);
     }
+    return future;
+}
 
+std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges,
+    bool enable_task_grouping) {
+    auto build_result = buildScatterReadRequests(
+        dest_buffer, key_ranges, enable_task_grouping, "submitBatchReadRanges",
+        [this](const std::string& endpoint) {
+            return engine_.openSegment(endpoint);
+        });
+    if (!build_result) {
+        return std::nullopt;
+    }
+
+    auto& requests = build_result->flat_requests;
+    if (requests.empty()) {
+        return TransferFuture(std::make_shared<EmptyOperationState>());
+    }
+
+    auto future = submitTransfer(
+        requests, enable_task_grouping ? build_result->logical_task_count : 0);
+    if (future && transfer_metric_) {
+        size_t total_bytes = 0;
+        for (const auto& request : requests) {
+            total_bytes += request.length;
+        }
+        transfer_metric_->total_read_bytes.inc(total_bytes);
+    }
     return future;
 }
 

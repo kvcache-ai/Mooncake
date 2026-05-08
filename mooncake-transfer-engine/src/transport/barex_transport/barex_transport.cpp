@@ -363,6 +363,7 @@ Status BarexTransport::submitTransfer(
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
+        task.initialize(batch_id, request, true);
         SegmentID target_id = request.target_id;
         auto peer_segment_desc = segment_desc_map[target_id];
         if (!peer_segment_desc) {
@@ -1205,7 +1206,7 @@ Status BarexTransport::getTransferStatus(BatchID batch_id,
             } else {
                 status[task_id].s = TransferStatusEnum::COMPLETED;
             }
-            task.is_finished = true;
+            task.publish_completion();
         } else {
             status[task_id].s = TransferStatusEnum::WAITING;
         }
@@ -1231,7 +1232,7 @@ Status BarexTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = TransferStatusEnum::FAILED;
         else
             status.s = TransferStatusEnum::COMPLETED;
-        task.is_finished = true;
+        task.publish_completion();
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

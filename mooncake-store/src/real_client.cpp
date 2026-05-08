@@ -2749,13 +2749,8 @@ RealClient::resolve_registered_buffer(void *buffer) const {
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
-RealClient::resolve_ranged_read_metadata(const std::string &key) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto query_result = client_->Query(key);
+RealClient::build_ranged_read_metadata_from_query_result(
+    const std::string &key, tl::expected<QueryResult, ErrorCode> query_result) {
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -2772,10 +2767,22 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const auto &res = client_->GetPreferredReplica(replica_list);
+    std::vector<Replica::Descriptor> complete_replicas;
+    complete_replicas.reserve(replica_list.size());
+    for (const auto &replica : replica_list) {
+        if (replica.status == ReplicaStatus::COMPLETE) {
+            complete_replicas.push_back(replica);
+        }
+    }
+    if (complete_replicas.empty()) {
+        LOG(ERROR) << "no_complete_replicas_found key=" << key;
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    const auto &res = client_->GetPreferredReplica(complete_replicas);
     if (!res) {
-        LOG(ERROR) << "Internal error: replica_list is empty";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(ERROR) << "Failed to select preferred replica for key: " << key;
+        return tl::unexpected(res.error());
     }
 
     auto query_value = std::move(query_result.value());
@@ -2783,6 +2790,95 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
     return RangedReadMetadata{.query_result = std::move(query_value),
                               .replica = std::move(replica),
                               .total_size = calculate_total_size(replica)};
+}
+
+tl::expected<RealClient::RangedReadMetadata, ErrorCode>
+RealClient::resolve_ranged_read_metadata(const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return build_ranged_read_metadata_from_query_result(key,
+                                                        client_->Query(key));
+}
+
+std::unordered_map<std::string,
+                   tl::expected<RealClient::RangedReadMetadata, ErrorCode>>
+RealClient::batch_resolve_ranged_read_metadata(
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<bool>>> &valid_fragments,
+    const std::vector<size_t> &buffer_capacities,
+    bool skip_zero_capacity_buffers) {
+    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
+        metadata_cache;
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return metadata_cache;
+    }
+
+    if (all_keys.size() != valid_fragments.size() ||
+        all_keys.size() != buffer_capacities.size()) {
+        LOG(ERROR) << "get_into_ranges: metadata input size mismatch";
+        return metadata_cache;
+    }
+
+    size_t key_count_hint = 0;
+    for (const auto &keys : all_keys) {
+        key_count_hint += keys.size();
+    }
+    metadata_cache.reserve(key_count_hint);
+
+    std::vector<std::string> unique_keys;
+    unique_keys.reserve(key_count_hint);
+    for (size_t i = 0; i < valid_fragments.size(); ++i) {
+        if (skip_zero_capacity_buffers && buffer_capacities[i] == 0 &&
+            !all_keys[i].empty()) {
+            continue;
+        }
+        if (all_keys[i].size() != valid_fragments[i].size()) {
+            LOG(ERROR) << "get_into_ranges: metadata key-group size mismatch";
+            continue;
+        }
+        for (size_t j = 0; j < valid_fragments[i].size(); ++j) {
+            bool has_valid_fragment = false;
+            for (bool valid_fragment : valid_fragments[i][j]) {
+                if (valid_fragment) {
+                    has_valid_fragment = true;
+                    break;
+                }
+            }
+            if (!has_valid_fragment) {
+                continue;
+            }
+            auto [_, inserted] = metadata_cache.emplace(
+                all_keys[i][j], tl::unexpected(ErrorCode::INVALID_PARAMS));
+            if (inserted) {
+                unique_keys.push_back(all_keys[i][j]);
+            }
+        }
+    }
+    if (unique_keys.empty()) {
+        return metadata_cache;
+    }
+
+    auto query_results = client_->BatchQuery(unique_keys);
+    if (query_results.size() != unique_keys.size()) {
+        LOG(ERROR) << "BatchQuery result size mismatch in get_into_ranges";
+        for (const auto &key : unique_keys) {
+            metadata_cache.erase(key);
+            metadata_cache.emplace(key, tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return metadata_cache;
+    }
+
+    for (size_t i = 0; i < unique_keys.size(); ++i) {
+        metadata_cache.erase(unique_keys[i]);
+        metadata_cache.emplace(
+            unique_keys[i], build_ranged_read_metadata_from_query_result(
+                                unique_keys[i], std::move(query_results[i])));
+    }
+    return metadata_cache;
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -2919,8 +3015,15 @@ RealClient::get_into_ranges_internal(
         }
     }
 
-    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
-        metadata_cache;
+    auto metadata_cache = batch_resolve_ranged_read_metadata(
+        all_keys, prepared.valid_fragments, resolved_buffer_capacities,
+        buffer_capacities == nullptr);
+
+    struct PendingFragment {
+        size_t key_index;
+        size_t fragment_index;
+        size_t size;
+    };
 
     for (size_t i = 0; i < buffer_count; ++i) {
         const size_t key_count = prepared.results[i].size();
@@ -2929,10 +3032,17 @@ RealClient::get_into_ranges_internal(
             continue;
         }
 
+        std::vector<std::pair<Replica::Descriptor,
+                              std::vector<std::tuple<size_t, size_t, size_t>>>>
+            key_ranges;
+        std::vector<std::vector<PendingFragment>> pending_fragments;
+        std::unordered_map<std::string, size_t> key_to_range_index;
+
         for (size_t j = 0; j < key_count; ++j) {
-            auto [metadata_it, inserted] = metadata_cache.try_emplace(
-                all_keys[i][j], resolve_ranged_read_metadata(all_keys[i][j]));
-            (void)inserted;
+            auto metadata_it = metadata_cache.find(all_keys[i][j]);
+            if (metadata_it == metadata_cache.end()) {
+                continue;
+            }
             auto &metadata_result = metadata_it->second;
 
             for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
@@ -2940,16 +3050,16 @@ RealClient::get_into_ranges_internal(
                     continue;
                 }
 
-                if (all_sizes[i][j][k] > 0 &&
-                    (all_dst_offsets[i][j][k] > buffer_size ||
-                     all_sizes[i][j][k] >
-                         buffer_size - all_dst_offsets[i][j][k])) {
+                const size_t dst_offset = all_dst_offsets[i][j][k];
+                const size_t src_offset = all_src_offsets[i][j][k];
+                const size_t size = all_sizes[i][j][k];
+                if (size > 0 && (dst_offset > buffer_size ||
+                                 size > buffer_size - dst_offset)) {
                     LOG(ERROR)
                         << "get_into_ranges: destination overflow, "
                            "buffer_index="
                         << i << " key_index=" << j << " fragment_index=" << k
-                        << " dst_offset=" << all_dst_offsets[i][j][k]
-                        << " size=" << all_sizes[i][j][k]
+                        << " dst_offset=" << dst_offset << " size=" << size
                         << " buffer_size=" << buffer_size;
                     continue;
                 }
@@ -2959,7 +3069,7 @@ RealClient::get_into_ranges_internal(
                              ErrorCode::OBJECT_NOT_FOUND ||
                          metadata_result.error() ==
                              ErrorCode::REPLICA_IS_NOT_READY) &&
-                        all_src_offsets[i][j][k] == 0) {
+                        src_offset == 0) {
                         VLOG(1)
                             << "Object not found for key: " << all_keys[i][j];
                     }
@@ -2968,10 +3078,61 @@ RealClient::get_into_ranges_internal(
                     continue;
                 }
 
-                prepared.results[i][j][k] = execute_ranged_read(
-                    all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
-                    all_src_offsets[i][j][k], all_sizes[i][j][k],
-                    metadata_result.value());
+                const auto &metadata = metadata_result.value();
+                if (size > metadata.total_size ||
+                    src_offset > metadata.total_size - size) {
+                    LOG(ERROR) << "Range overflow: src_offset=" << src_offset
+                               << " + size=" << size
+                               << " > total=" << metadata.total_size;
+                    continue;
+                }
+
+                if (size == 0) {
+                    prepared.results[i][j][k] = 0;
+                    continue;
+                }
+
+                if (!metadata.replica.is_memory_replica() ||
+                    (src_offset == 0 && size == metadata.total_size)) {
+                    prepared.results[i][j][k] = execute_ranged_read(
+                        all_keys[i][j], buffers[i], dst_offset, src_offset,
+                        size, metadata);
+                    continue;
+                }
+
+                auto [range_it, range_inserted] = key_to_range_index.emplace(
+                    all_keys[i][j], key_ranges.size());
+                if (range_inserted) {
+                    key_ranges.emplace_back(
+                        metadata.replica,
+                        std::vector<std::tuple<size_t, size_t, size_t>>{});
+                    pending_fragments.emplace_back();
+                }
+                const size_t range_index = range_it->second;
+                key_ranges[range_index].second.emplace_back(dst_offset,
+                                                            src_offset, size);
+                pending_fragments[range_index].push_back(
+                    PendingFragment{j, k, size});
+            }
+        }
+
+        if (key_ranges.empty()) {
+            continue;
+        }
+
+        ErrorCode err =
+            client_->BatchTransferReadRanges(buffers[i], key_ranges);
+        for (size_t group = 0; group < pending_fragments.size(); ++group) {
+            for (const auto &fragment : pending_fragments[group]) {
+                if (err == ErrorCode::OK) {
+                    prepared.results[i][fragment.key_index]
+                                    [fragment.fragment_index] =
+                        static_cast<int64_t>(fragment.size);
+                } else {
+                    prepared.results[i][fragment.key_index]
+                                    [fragment.fragment_index] =
+                        tl::unexpected(err);
+                }
             }
         }
     }

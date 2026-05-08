@@ -567,6 +567,7 @@ Status HipTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
+        task.initialize(batch_id, request, true);
 
         PendingTransfer pending;
         Status status = startAsyncTransfer(request, task, pending);
@@ -610,7 +611,7 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        task.publish_completion();
     } else {
         status.s = TransferStatusEnum::WAITING;
     }

@@ -98,7 +98,7 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         }
     }
     if (transfer_status.s == COMPLETED) {
-        task.is_finished = true;
+        task.publish_completion();
     }
     status = transfer_status;
     return Status::OK();
@@ -107,8 +107,9 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 // Dummy implement for solving build issues, WIP
 Status NVMeoFTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    /* TBD */
-    return Status::OK();
+    (void)task_list;
+    return Status::NotImplemented(
+        "NVMeoFTransport::submitTransferTask is not implemented");
 }
 
 Status NVMeoFTransport::submitTransfer(
@@ -134,6 +135,7 @@ Status NVMeoFTransport::submitTransfer(
     // getSegmentDescByID(LOCAL_SEGMENT_ID);
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
+        task.initialize(batch_id, request, true);
         auto target_id = request.target_id;
 
         if (!segment_desc_map.count(target_id)) {

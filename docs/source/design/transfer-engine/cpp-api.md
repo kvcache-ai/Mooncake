@@ -72,12 +72,16 @@ The `TransferRequest` structure is defined as follows:
 struct TransferRequest
 {
     enum OpCode { READ, WRITE };
+
+    static constexpr uint64_t kNoTaskGroup = 0;
+
     OpCode opcode;
     void *source;
     SegmentID target_id; // The ID of the target segment, which may correspond to local or remote DRAM/VRAM/NVMeof, with the specific routing logic hidden
     uint64_t target_offset;
     size_t length;
     int advise_retry_cnt = 0;
+    uint64_t task_group_id = kNoTaskGroup;
 };
 ```
 
@@ -87,6 +91,7 @@ struct TransferRequest
   - RAM space type, covering DRAM/VRAM. As mentioned earlier, there is only one segment under the same process (or `TransferEngine` instance), which contains various types of Buffers (DRAM/VRAM). In this case, the segment name passed to the `openSegment` interface is equivalent to the server hostname. `target_offset` is the virtual address of the target server.
   - NVMeOF space type, where each file corresponds to a segment. In this case, the segment name passed to the `openSegment` interface is equivalent to the unique identifier of the file. `target_offset` is the offset of the target file.
 - `length` represents the amount of data transferred. TransferEngine may further split this into multiple read/write requests internally.
+- `task_group_id` is an optional field (default: `kNoTaskGroup = 0`). For RDMA transfers, adjacent requests in the `entries` array that share the same non-default `task_group_id` and resolve to the same underlying transport are coalesced into one logical task. This affects `batch_size` accounting and status tracking: `batch_size` is measured in logical tasks, and `getTransferStatus` uses logical task indices. Ungrouped requests (with `task_group_id == kNoTaskGroup`) each remain a standalone logical task. Grouping is purely a task-aggregation optimization; it does not require the local `source` buffers of grouped requests to reside in the same registered memory region.
 
 #### TransferEngine::allocateBatchID
 
@@ -106,7 +111,7 @@ Status submitTransfer(BatchID batch_id,
                       const std::vector<TransferRequest> &entries);
 ```
 
-Submits new `TransferRequest` tasks to `batch_id`. The task is asynchronously submitted to the background thread pool. The total number of `entries` accumulated under the same `batch_id` should not exceed the `batch_size` defined at creation.
+Submits new `TransferRequest` tasks to `batch_id`. The task is asynchronously submitted to the background thread pool. The total number of **logical tasks** accumulated under the same `batch_id` should not exceed the `batch_size` defined at creation. For RDMA transfers, adjacent requests that share the same non-default group ID and resolve to the same transport are coalesced into a single logical task; ungrouped requests each count as one logical task.
 
 - `batch_id`: The `BatchID` it belongs to;
 - `entries`: Array of `TransferRequest`;

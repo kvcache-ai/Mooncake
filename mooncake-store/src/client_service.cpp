@@ -2649,6 +2649,29 @@ ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
 }
 
+ErrorCode Client::BatchTransferReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+#ifdef USE_ASCEND_HETEROGENEOUS
+    constexpr bool enable_task_grouping = false;
+#else
+    const bool enable_task_grouping = protocol_ == "rdma";
+#endif
+    auto future = transfer_submitter_->submitBatchReadRanges(
+        dest_buffer, key_ranges, enable_task_grouping);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit batch read ranges";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+    return future->get();
+}
+
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices) {
     size_t total_size = 0;

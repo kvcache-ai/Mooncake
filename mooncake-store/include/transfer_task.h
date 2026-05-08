@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -11,6 +12,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "transfer_engine.h"
@@ -367,6 +369,8 @@ class FilereadWorkerPool {
  * tracking.
  */
 class TransferSubmitter {
+    friend class TransferTaskTest;
+
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
@@ -407,6 +411,22 @@ class TransferSubmitter {
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, Slice>& batched_slices);
+
+    /**
+     * @brief Submit batch read of multiple non-contiguous ranges from
+     * multiple keys in a single transfer batch.
+     * @param dest_buffer Base pointer of destination buffer
+     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
+     * size), ...])
+     * @return TransferFuture or nullopt on failure
+     */
+    std::optional<TransferFuture> submitBatchReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges,
+        bool enable_task_grouping = false);
 
    private:
     TransferEngine& engine_;
@@ -463,8 +483,23 @@ class TransferSubmitter {
     void updateTransferMetrics(const std::vector<Slice>& slices,
                                TransferRequest::OpCode op);
 
+    struct ScatterReadBuildResult {
+        std::vector<TransferRequest> flat_requests;
+        size_t logical_task_count = 0;
+    };
+
+    using ScatterRange = std::tuple<size_t, size_t, size_t>;
+    using ScatterKeyRanges =
+        std::vector<std::pair<Replica::Descriptor, std::vector<ScatterRange>>>;
+
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests, size_t batch_task_count = 0);
+
+    static std::optional<ScatterReadBuildResult> buildScatterReadRequests(
+        void* dest_buffer, const ScatterKeyRanges& key_ranges,
+        bool enable_task_grouping, const char* log_context,
+        const std::function<SegmentHandle(const std::string&)>&
+            segment_resolver);
 };
 
 }  // namespace mooncake

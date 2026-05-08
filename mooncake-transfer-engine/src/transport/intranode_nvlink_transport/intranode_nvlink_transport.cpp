@@ -179,6 +179,7 @@ Status IntraNodeNvlinkTransport::submitTransfer(
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
+        task.initialize(batch_id, request, true);
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
@@ -232,7 +233,7 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        task.publish_completion();
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
