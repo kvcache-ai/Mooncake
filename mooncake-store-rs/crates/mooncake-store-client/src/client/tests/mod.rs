@@ -5307,6 +5307,19 @@ fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
             .expect("writer get should succeed"),
         b"put-failed-payload"
     );
+
+    let fallback_route = writer
+        .put_with_policy(
+            "put-failed-key-after-suspect",
+            b"put-after-suspect-payload",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([dead_runtime.storage_key()]),
+        )
+        .expect("put should treat suspect preferred owner as a hint and fall back");
+    assert_eq!(fallback_route.replicas.len(), 1);
+    assert_eq!(fallback_route.replicas[0].owner, live_runtime);
 }
 
 #[test]
