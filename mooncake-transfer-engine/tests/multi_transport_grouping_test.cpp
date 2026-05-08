@@ -102,6 +102,52 @@ class RecordingTransport : public Transport {
     bool create_slices_;
 };
 
+class EarlyCompletionTransport : public Transport {
+   public:
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest> &) override {
+        return Status::NotImplemented("unused");
+    }
+
+    Status submitTransferTask(
+        const std::vector<Transport::TransferTask *> &task_list) override {
+        for (auto *task : task_list) {
+            auto *slice = getSliceCache().allocate();
+            slice->source_addr = task->request->source;
+            slice->length = task->request->length;
+            slice->opcode = task->request->opcode;
+            slice->task = task;
+            slice->target_id = task->request->target_id;
+            slice->status = Slice::PENDING;
+            slice->ts = 0;
+            task->slice_list.push_back(slice);
+            task->slice_count = 1;
+            slice->markSuccess();
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus &) override {
+        return Status::NotImplemented("unused");
+    }
+
+    const char *getName() const override { return "early"; }
+
+   private:
+    int registerLocalMemory(void *, size_t, const std::string &, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void *, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry> &,
+                                 const std::string &) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void *> &) override {
+        return 0;
+    }
+};
+
 class TestableMultiTransport : public MultiTransport {
    public:
     TestableMultiTransport(std::shared_ptr<TransferMetadata> metadata,
@@ -504,6 +550,33 @@ TEST_F(TaskGroupingTest, EmptySubmitDoesNotSealNonzeroCapacityBatch) {
     entries[0].length = 1024;
     auto submit_status = multi_transport.submitTransfer(batch_id, entries);
     EXPECT_TRUE(submit_status.ok());
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(TaskGroupingTest, EarlySliceCompletionWaitsForTransportSubmission) {
+    constexpr Transport::SegmentID kTargetSegmentId = 1;
+    auto metadata = MakeMetadataWithSegment(kTargetSegmentId, "early");
+    std::string local_server_name = "local";
+    TestableMultiTransport multi_transport(metadata, local_server_name);
+    multi_transport.transport_map_["early"] =
+        std::make_shared<EarlyCompletionTransport>();
+
+    std::vector<Transport::TransferRequest> entries(1);
+    entries[0].opcode = Transport::TransferRequest::READ;
+    entries[0].source = nullptr;
+    entries[0].target_id = kTargetSegmentId;
+    entries[0].target_offset = 0;
+    entries[0].length = 4096;
+
+    auto batch_id = multi_transport.allocateBatchID(1);
+    auto submit_status = multi_transport.submitTransfer(batch_id, entries);
+    EXPECT_TRUE(submit_status.ok());
+
+    Transport::TransferStatus status{};
+    auto status_ret = multi_transport.getBatchTransferStatus(batch_id, status);
+    EXPECT_TRUE(status_ret.ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 4096u);
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 

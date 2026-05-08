@@ -200,7 +200,8 @@ class Transport {
             uint64_t prev_completed = __atomic_fetch_add(
                 &task->completed_slice_count, 1, __ATOMIC_RELAXED);
 
-            if (prev_completed + 1 != task->slice_count) {
+            if (prev_completed + 1 != task->slice_count ||
+                !task->is_submitted) {
                 return;
             }
 

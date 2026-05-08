@@ -122,9 +122,18 @@ class BatchLifecycle {
     void markTransportSubmitted(
         const std::vector<Transport::TransferTask*>& task_list) {
         std::lock_guard<std::mutex> lock(batch_desc_.lifecycle_mutex);
+        bool should_notify = false;
         for (auto* task : task_list) {
             task->is_submitted = true;
+            const uint64_t completed_slice_count =
+                __atomic_load_n(&task->completed_slice_count, __ATOMIC_ACQUIRE);
+            const uint64_t slice_count =
+                __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE);
+            if (slice_count > 0 && completed_slice_count == slice_count) {
+                should_notify |= publishTaskCompletionLocked(*task);
+            }
         }
+        notifyCompletionIfNeeded(should_notify);
     }
 
     void completeZeroLengthTasksWithoutSlices(
