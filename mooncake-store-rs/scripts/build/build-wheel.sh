@@ -42,6 +42,9 @@ Environment:
   YALANTINGLIBS_PREFIX       Install prefix for bundled yalantinglibs
   YALANTINGLIBS_PREBUILT_DIR Prebuilt yalantinglibs directory (if set, skip build and copy from here)
   PYBIND11_PREBUILT_DIR      Prebuilt pybind11 directory (if set, use instead of submodule)
+  MOONCAKE_REUSE_NATIVE_ARTIFACTS
+                             Reuse existing native assets in MOONCAKE_UPSTREAM_BUILD_DIR
+                             instead of configuring/building upstream CMake targets
   BUILD_JOBS                 Parallel jobs for CMake builds
 
 Examples:
@@ -81,6 +84,17 @@ require_command cargo
 require_command cmake
 require_command patchelf
 require_command "${PYTHON_BIN}"
+
+is_truthy() {
+  case "${1:-}" in
+    1 | true | TRUE | yes | YES | on | ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 AUDITWHEEL_EXCLUDES=(
   --exclude "libcurl.so*"
@@ -290,41 +304,82 @@ repair_runtime_wheel() {
   printf '%s\n' "${WHEEL_DIR}/$(basename "${repaired_wheel}")"
 }
 
-# 如果设置了 SKIP_SUBMODULE_UPDATE，跳过 submodule 更新（CI 环境中 checkout 已处理）
-if [[ -z "${SKIP_SUBMODULE_UPDATE:-}" ]]; then
-  git -C "${REPO_ROOT}" submodule update --init --recursive
+require_file() {
+  local path=$1
+
+  if [[ ! -f "${path}" ]]; then
+    echo "missing required native artifact: ${path}" >&2
+    exit 1
+  fi
+}
+
+require_glob() {
+  local pattern=$1
+
+  if ! compgen -G "${pattern}" >/dev/null; then
+    echo "missing required native artifact matching: ${pattern}" >&2
+    exit 1
+  fi
+}
+
+require_reusable_native_artifacts() {
+  require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so"
+  require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so"
+  require_file "${UPSTREAM_BUILD_DIR}/mooncake-asio/libasio.so"
+  require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench"
+  require_glob "${UPSTREAM_BUILD_DIR}/mooncake-integration/engine*.so"
+
+  if [[ -n "${MOONCAKE_CLASSIC_SHIM_LIB_PATH:-}" ]]; then
+    require_file "${MOONCAKE_CLASSIC_SHIM_LIB_PATH}"
+  fi
+  if [[ -n "${MOONCAKE_TENT_SHIM_LIB_PATH:-}" ]]; then
+    require_file "${MOONCAKE_TENT_SHIM_LIB_PATH}"
+  fi
+}
+
+if is_truthy "${MOONCAKE_REUSE_NATIVE_ARTIFACTS:-0}"; then
+  require_reusable_native_artifacts
+  export MOONCAKE_SKIP_NATIVE_BUILD="${MOONCAKE_SKIP_NATIVE_BUILD:-1}"
+  export MOONCAKE_CLASSIC_TE_LIB_PATH="${MOONCAKE_CLASSIC_TE_LIB_PATH:-${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so}"
+  export MOONCAKE_TENT_SHARED_LIB_PATH="${MOONCAKE_TENT_SHARED_LIB_PATH:-${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so}"
+  _timer_elapsed $_WHEEL_GLOBAL_START "setup (reused native artifacts)"
+else
+  # 如果设置了 SKIP_SUBMODULE_UPDATE，跳过 submodule 更新（CI 环境中 checkout 已处理）
+  if [[ -z "${SKIP_SUBMODULE_UPDATE:-}" ]]; then
+    git -C "${REPO_ROOT}" submodule update --init --recursive
+  fi
+  ensure_pybind11
+  ensure_yalantinglibs
+  export CPATH="${YALANTINGLIBS_PREFIX}/include${CPATH:+:${CPATH}}"
+  _timer_elapsed $_WHEEL_GLOBAL_START "setup (venv + deps + pybind11 + yalantinglibs)"
+
+  _CMAKE_CONF_START=$(_timer_start)
+  PATH="${VENV_BIN}:${PATH}" cmake \
+    -S "${UPSTREAM_DIR}" \
+    -B "${UPSTREAM_BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="${YALANTINGLIBS_PREFIX}" \
+    -Dyalantinglibs_DIR="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs" \
+    -DPython3_EXECUTABLE="${VENV_PYTHON}" \
+    -DWITH_TE=ON \
+    -DWITH_STORE=OFF \
+    -DWITH_STORE_RUST=OFF \
+    -DBUILD_EXAMPLES=ON \
+    -DBUILD_UNIT_TESTS=OFF \
+    -DUSE_TENT=ON \
+    -DUSE_REDIS=ON \
+    -DUSE_HTTP=ON \
+    -DUSE_ETCD=OFF \
+    -DBUILD_SHARED_LIBS=ON
+
+  _timer_elapsed $_CMAKE_CONF_START "cmake configure"
+
+  _CMAKE_BUILD_START=$(_timer_start)
+  PATH="${VENV_BIN}:${PATH}" cmake --build "${UPSTREAM_BUILD_DIR}" \
+    --target engine transfer_engine_bench tent_shared \
+    -j"${BUILD_JOBS}"
+  _timer_elapsed $_CMAKE_BUILD_START "cmake build (C++ libs)"
 fi
-ensure_pybind11
-ensure_yalantinglibs
-export CPATH="${YALANTINGLIBS_PREFIX}/include${CPATH:+:${CPATH}}"
-_timer_elapsed $_WHEEL_GLOBAL_START "setup (venv + deps + pybind11 + yalantinglibs)"
-
-_CMAKE_CONF_START=$(_timer_start)
-PATH="${VENV_BIN}:${PATH}" cmake \
-  -S "${UPSTREAM_DIR}" \
-  -B "${UPSTREAM_BUILD_DIR}" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="${YALANTINGLIBS_PREFIX}" \
-  -Dyalantinglibs_DIR="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs" \
-  -DPython3_EXECUTABLE="${VENV_PYTHON}" \
-  -DWITH_TE=ON \
-  -DWITH_STORE=OFF \
-  -DWITH_STORE_RUST=OFF \
-  -DBUILD_EXAMPLES=ON \
-  -DBUILD_UNIT_TESTS=OFF \
-  -DUSE_TENT=ON \
-  -DUSE_REDIS=ON \
-  -DUSE_HTTP=ON \
-  -DUSE_ETCD=OFF \
-  -DBUILD_SHARED_LIBS=ON
-
-_timer_elapsed $_CMAKE_CONF_START "cmake configure"
-
-_CMAKE_BUILD_START=$(_timer_start)
-PATH="${VENV_BIN}:${PATH}" cmake --build "${UPSTREAM_BUILD_DIR}" \
-  --target engine transfer_engine_bench tent_shared \
-  -j"${BUILD_JOBS}"
-_timer_elapsed $_CMAKE_BUILD_START "cmake build (C++ libs)"
 
 export MOONCAKE_UPSTREAM_DIR="${UPSTREAM_DIR}"
 export MOONCAKE_UPSTREAM_BUILD_DIR="${UPSTREAM_BUILD_DIR}"
@@ -377,6 +432,7 @@ import base64
 import csv
 import hashlib
 import json
+import os
 import pathlib
 import shutil
 import stat
@@ -398,6 +454,11 @@ build_time = sys.argv[10]
 upstream_py_dir = repo_root / "third_party" / "Mooncake" / "mooncake-wheel" / "mooncake"
 transport_shim_out_dirs = sorted(transport_build_dir.glob("mooncake-transport-sys-*/out"))
 
+
+def env_candidate(name):
+    value = os.environ.get(name)
+    return [pathlib.Path(value)] if value else []
+
 binary_assets = {
     "mooncake-store-client": store_client_path,
     "mooncake-store-admin": store_admin_path,
@@ -412,15 +473,19 @@ library_assets = {
     "engine.so": sorted((upstream_build_dir / "mooncake-integration").glob("engine*.so")),
     "libasio.so": [upstream_build_dir / "mooncake-asio" / "libasio.so"],
     "libtransfer_engine.so": [
+        *env_candidate("MOONCAKE_CLASSIC_TE_LIB_PATH"),
         upstream_build_dir / "mooncake-transfer-engine" / "src" / "libtransfer_engine.so"
     ],
     "libtent_shared.so": [
+        *env_candidate("MOONCAKE_TENT_SHARED_LIB_PATH"),
         upstream_build_dir / "mooncake-transfer-engine" / "tent" / "src" / "libtent_shared.so"
     ],
-    "libmooncake_classic_shim.so": [
+    "libmooncake_classic_shim.so": env_candidate("MOONCAKE_CLASSIC_SHIM_LIB_PATH")
+    + [
         shim_dir / "libmooncake_classic_shim.so" for shim_dir in transport_shim_out_dirs
     ],
-    "libmooncake_tent_shim.so": [
+    "libmooncake_tent_shim.so": env_candidate("MOONCAKE_TENT_SHIM_LIB_PATH")
+    + [
         shim_dir / "libmooncake_tent_shim.so" for shim_dir in transport_shim_out_dirs
     ],
 }
