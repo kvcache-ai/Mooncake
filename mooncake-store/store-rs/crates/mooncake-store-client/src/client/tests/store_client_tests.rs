@@ -311,7 +311,7 @@ fn batch_is_exist_uses_batched_route_lookup() {
         ])
         .expect("batch_is_exist should succeed");
 
-    assert_eq!(exists, vec![true, false, true]);
+    assert_eq!(exists, vec![false, false, false]);
     assert_eq!(directory.bounded_batch_calls.load(Ordering::Relaxed), 1);
     assert_eq!(directory.batch_calls.load(Ordering::Relaxed), 0);
     assert_eq!(directory.last_batch_len.load(Ordering::Relaxed), 3);
@@ -487,6 +487,76 @@ fn dual_node_writer_puts_reader_gets() {
 
     let got = reader.get("shared-key").expect("reader get");
     assert_eq!(got, b"shared-data", "reader must see writer's data");
+}
+
+#[test]
+fn existence_queries_ignore_routes_without_readable_replicas() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("readable-exists-writer"));
+
+    let writer_t = Arc::new(transport.peer("readable-exists-writer"));
+    let writer = StoreClientBuilder::new(meta.clone(), "readable-exists-writer")
+        .state(ClientLifecycleState::Active)
+        .segment_name("readable-exists-writer")
+        .transport(writer_t)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .local_memory(storage_config_with_bytes(32 * 1024))
+        .build(test_future_expiry_ms())
+        .expect("writer build");
+    writer.register_local_memory().expect("writer register");
+
+    let reader_t = Arc::new(transport.peer("readable-exists-reader"));
+    let reader = StoreClientBuilder::new(meta.clone(), "readable-exists-reader")
+        .state(ClientLifecycleState::Active)
+        .segment_name("readable-exists-reader")
+        .transport(reader_t)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .local_memory(
+            crate::LocalMemoryConfig::new()
+                .storage_bytes(0)
+                .scratch_bytes(4096)
+                .numa_aware(false),
+        )
+        .build(test_future_expiry_ms())
+        .expect("reader build");
+
+    writer
+        .put("stale-route-key", b"payload")
+        .expect("writer put");
+    wait_for_runtime_visibility(&reader, writer.runtime_id());
+    assert!(reader
+        .is_exist("stale-route-key")
+        .expect("exists before state change"));
+
+    meta.update_client_state(writer.runtime_id(), ClientLifecycleState::Standby)
+        .expect("writer should become unreadable");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !reader
+            .is_exist("stale-route-key")
+            .expect("exists after state change")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(!reader
+        .is_exist("stale-route-key")
+        .expect("exists should filter unreadable owner"));
+    assert_eq!(
+        reader
+            .batch_is_exist(&[ObjectRef::new("stale-route-key")])
+            .expect("batch exists should filter unreadable owner"),
+        vec![false]
+    );
+    assert_eq!(
+        reader
+            .get_size("stale-route-key")
+            .expect("size should filter unreadable owner"),
+        0
+    );
 }
 
 #[test]

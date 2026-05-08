@@ -531,20 +531,6 @@ impl MetadataBackend for RecoverableMetadataBackend {
         }))
     }
 
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        let hidden = self
-            .state
-            .lock()
-            .expect("recoverable metadata state lock should succeed")
-            .hidden_segments
-            .clone();
-        let owner = self.inner.get_segment_owner(segment)?;
-        Ok(owner.filter(|owner| !hidden.contains(&Self::segment_key(owner, segment))))
-    }
-
     fn list_segments(
         &self,
         owner: Option<&ClientRuntimeId>,
@@ -833,13 +819,6 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
-    }
-
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -1362,13 +1341,6 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.get_segment(owner, segment)
     }
 
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        self.inner.get_segment_owner(segment)
-    }
-
     fn list_segments(
         &self,
         owner: Option<&ClientRuntimeId>,
@@ -1624,13 +1596,6 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
-    }
-
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -1893,13 +1858,6 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
-    }
-
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(

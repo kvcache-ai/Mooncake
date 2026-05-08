@@ -172,12 +172,6 @@ impl MetadataBackend for ObservedMetadataBackend {
         self.observe("get_segment", || self.inner.get_segment(owner, segment))
     }
 
-    fn get_segment_owner(&self, segment: &SegmentName) -> Result<Option<ClientRuntimeId>> {
-        self.observe("get_segment_owner", || {
-            self.inner.get_segment_owner(segment)
-        })
-    }
-
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
         self.observe("list_segments", || self.inner.list_segments(owner))
     }

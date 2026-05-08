@@ -305,32 +305,38 @@ impl EtcdMetadataBackend {
 
     pub fn cleanup_stale_segments(&self) -> Result<RedisMetadataCleanupReport> {
         let live_clients = self.list_live_clients()?;
-        let live_runtime_keys = live_clients
-            .iter()
-            .map(|lease| lease.runtime.storage_key())
-            .collect::<std::collections::BTreeSet<_>>();
-        let segments = self.list_segments(None)?;
-        let mut stale_owners = std::collections::BTreeSet::<ClientRuntimeId>::new();
-        for segment in &segments {
-            if !live_runtime_keys.contains(&segment.owner.storage_key()) {
-                stale_owners.insert(segment.owner.clone());
-            }
-        }
+        let due_lease_keys = self.list_due_client_lease_expiries(now_ms(), 4096)?;
         let mut removed_segment_keys = 0usize;
+        let mut inspected_segment_keys = 0usize;
         self.block_on(async {
             let mut client = self.client().await?;
-            for owner in stale_owners {
+            for lease_key in &due_lease_keys {
+                let Some((stable_id, epoch)) = self.config.keyspace.parse_client_key(lease_key)
+                else {
+                    let _ = self.remove_client_lease_expiry_entry(lease_key);
+                    continue;
+                };
+                let owner = ClientRuntimeId::new(stable_id, ClientEpoch(epoch));
+                if matches!(
+                    self.client_lease_liveness(&owner)?,
+                    ClientLeaseLiveness::Live(_)
+                ) {
+                    continue;
+                }
                 let stats = self
                     .cleanup_stale_segments_for_owner_runtime(&mut client, &owner)
                     .await?;
+                inspected_segment_keys =
+                    inspected_segment_keys.saturating_add(stats.inspected_segment_keys);
                 removed_segment_keys =
                     removed_segment_keys.saturating_add(stats.removed_segment_keys);
+                let _ = self.remove_client_lease_expiry_entry(lease_key);
             }
             Ok(())
         })?;
         Ok(RedisMetadataCleanupReport {
             live_clients: live_clients.len(),
-            inspected_segment_keys: segments.len(),
+            inspected_segment_keys,
             removed_segment_keys,
             removed_segment_index_entries: 0,
             removed_owner_segment_index_entries: 0,
@@ -841,30 +847,9 @@ impl MetadataBackend for EtcdMetadataBackend {
             .config
             .keyspace
             .segment(&segment.owner, &segment.segment_name);
-        let owner_key = self.config.keyspace.segment_owner(&segment.segment_name);
         self.block_on(async {
             let mut client = self.client().await?;
             loop {
-                let owner_response = client
-                    .get(owner_key.clone(), None)
-                    .await
-                    .map_err(etcd_error("etcd get segment owner index"))?;
-                if let Some(kv) = owner_response.kvs().first() {
-                    let owner_storage_key = std::str::from_utf8(kv.value()).map_err(|error| {
-                        StoreError::Metadata(format!("invalid segment owner index payload: {error}"))
-                    })?;
-                    let Some(owner) = ClientRuntimeId::from_storage_key(owner_storage_key) else {
-                        return Err(StoreError::Metadata(format!(
-                            "invalid runtime storage key in segment owner index: {owner_storage_key}"
-                        )));
-                    };
-                    if owner != segment.owner {
-                        return Err(StoreError::Conflict(format!(
-                            "segment {} is already owned by live runtime {}",
-                            segment.segment_name.0, owner
-                        )));
-                    }
-                }
                 let current = client
                     .get(key.clone(), None)
                     .await
@@ -879,22 +864,16 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .unwrap_or_else(|| StoredSegmentState::new(segment.clone()));
                 state.merge_announcement(segment);
                 let payload = serde_json::to_string(&state).map_err(json_error)?;
-                let owner_compare = if let Some(kv) = owner_response.kvs().first() {
-                    Compare::mod_revision(owner_key.clone(), CompareOp::Equal, kv.mod_revision())
-                } else {
-                    Compare::version(owner_key.clone(), CompareOp::Equal, 0)
-                };
                 let segment_compare = if let Some(kv) = current.kvs().first() {
                     Compare::mod_revision(key.clone(), CompareOp::Equal, kv.mod_revision())
                 } else {
                     Compare::version(key.clone(), CompareOp::Equal, 0)
                 };
-                let txn = Txn::new()
-                    .when([owner_compare, segment_compare])
-                    .and_then([
-                        TxnOp::put(key.clone(), payload, None),
-                        TxnOp::put(owner_key.clone(), segment.owner.storage_key(), None),
-                    ]);
+                let txn = Txn::new().when([segment_compare]).and_then([TxnOp::put(
+                    key.clone(),
+                    payload,
+                    None,
+                )]);
                 let response = client
                     .txn(txn)
                     .await
@@ -908,7 +887,6 @@ impl MetadataBackend for EtcdMetadataBackend {
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
         let key = self.config.keyspace.segment(owner, segment);
-        let owner_key = self.config.keyspace.segment_owner(segment);
         self.block_on(async {
             let mut client = self.client().await?;
             loop {
@@ -919,34 +897,12 @@ impl MetadataBackend for EtcdMetadataBackend {
                 let Some(segment_kv) = segment_response.kvs().first() else {
                     return Ok(());
                 };
-                let owner_response = client
-                    .get(owner_key.clone(), None)
-                    .await
-                    .map_err(etcd_error("etcd get segment owner index before delete"))?;
-                let mut compares = vec![Compare::mod_revision(
+                let compares = vec![Compare::mod_revision(
                     key.clone(),
                     CompareOp::Equal,
                     segment_kv.mod_revision(),
                 )];
-                let mut ops = vec![TxnOp::delete(key.clone(), None)];
-                if let Some(owner_kv) = owner_response.kvs().first() {
-                    let owner_storage_key = std::str::from_utf8(owner_kv.value()).map_err(|error| {
-                        StoreError::Metadata(format!("invalid segment owner index payload: {error}"))
-                    })?;
-                    let Some(index_owner) = ClientRuntimeId::from_storage_key(owner_storage_key) else {
-                        return Err(StoreError::Metadata(format!(
-                            "invalid runtime storage key in segment owner index: {owner_storage_key}"
-                        )));
-                    };
-                    compares.push(Compare::mod_revision(
-                        owner_key.clone(),
-                        CompareOp::Equal,
-                        owner_kv.mod_revision(),
-                    ));
-                    if index_owner == *owner {
-                        ops.push(TxnOp::delete(owner_key.clone(), None));
-                    }
-                }
+                let ops = vec![TxnOp::delete(key.clone(), None)];
                 let txn = Txn::new().when(compares).and_then(ops);
                 let response = client
                     .txn(txn)
@@ -983,30 +939,14 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
-    fn get_segment_owner(&self, segment: &SegmentName) -> Result<Option<ClientRuntimeId>> {
-        let key = self.config.keyspace.segment_owner(segment);
-        self.block_on(async {
-            let mut client = self.client().await?;
-            let response = client
-                .get(key, None)
-                .await
-                .map_err(etcd_error("etcd get segment owner"))?;
-            let Some(kv) = response.kvs().first() else {
-                return Ok(None);
-            };
-            let owner_storage_key = std::str::from_utf8(kv.value()).map_err(|error| {
-                StoreError::Metadata(format!("invalid segment owner index: {error}"))
-            })?;
-            let Some(owner) = ClientRuntimeId::from_storage_key(owner_storage_key) else {
-                return Err(StoreError::Metadata(format!(
-                    "invalid runtime storage key in segment owner index: {owner_storage_key}"
-                )));
-            };
-            Ok(Some(owner))
-        })
-    }
-
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
+        if owner.is_none() {
+            let mut segments = Vec::new();
+            for lease in self.list_live_clients()? {
+                segments.extend(self.list_segments(Some(&lease.runtime))?);
+            }
+            return Ok(segments);
+        }
         let prefix = self.config.keyspace.segment_prefix(owner);
         self.block_on(async {
             let mut client = self.client().await?;
@@ -2981,14 +2921,14 @@ mod tests {
         assert_eq!(report.removed_segment_keys, 1);
         assert_eq!(
             backend
-                .list_segments(None)
+                .list_segments(Some(&live_runtime))
                 .expect("segment listing should succeed"),
             vec![live_segment]
         );
     }
 
     #[test]
-    fn etcd_backend_rejects_stale_segment_owner_index_on_publish() {
+    fn etcd_backend_allows_republish_after_previous_owner_unpublished() {
         let Some(server) = EtcdTestServer::start() else {
             return;
         };
@@ -3018,18 +2958,6 @@ mod tests {
             .unpublish_segment(&owner_a, &segment_name)
             .expect("first owner should unpublish");
 
-        let owner_key = keyspace.segment_owner(&segment_name);
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-        runtime.block_on(async {
-            let mut client = etcd_client::Client::connect([server.endpoint().to_string()], None)
-                .await
-                .expect("etcd client should connect");
-            client
-                .put(owner_key, owner_a.storage_key(), None)
-                .await
-                .expect("stale owner index should write");
-        });
-
         let segment_b = SegmentAnnouncement {
             owner: owner_b,
             segment_name,
@@ -3040,10 +2968,9 @@ mod tests {
             alignment_bytes: 16,
             tags: vec![],
         };
-        let error = backend
+        backend
             .publish_segment(&segment_b)
-            .expect_err("stale owner index should still block publish today");
-        assert!(matches!(error, StoreError::Conflict(_)));
+            .expect("segment should publish under the new owner");
     }
 
     #[test]

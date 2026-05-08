@@ -146,17 +146,21 @@ impl MetadataKeyspace {
 
     pub fn segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> String {
         format!(
-            "{}/segments/{}:{}",
+            "{}/client-resources/{}/segments/{}",
             self.slot_tag,
             owner.storage_key(),
-            segment.0
+            encode_key_component(&segment.0)
         )
     }
 
     pub fn segment_prefix(&self, owner: Option<&ClientRuntimeId>) -> String {
         match owner {
-            Some(owner) => format!("{}/segments/{}:", self.slot_tag, owner.storage_key()),
-            None => format!("{}/segments/", self.slot_tag),
+            Some(owner) => format!(
+                "{}/client-resources/{}/segments/",
+                self.slot_tag,
+                owner.storage_key()
+            ),
+            None => format!("{}/client-resources/", self.slot_tag),
         }
     }
 
@@ -166,20 +170,19 @@ impl MetadataKeyspace {
 
     pub fn segment_index(&self, owner: Option<&ClientRuntimeId>) -> String {
         match owner {
-            Some(owner) => format!("{}/indexes/segments/{}", self.slot_tag, owner.storage_key()),
-            None => format!("{}/indexes/segments", self.slot_tag),
+            Some(owner) => format!(
+                "{}/client-resources/{}/indexes/segments",
+                self.slot_tag,
+                owner.storage_key()
+            ),
+            None => format!("{}/client-resources/indexes/segments", self.slot_tag),
         }
     }
 
     pub fn segment_index_for_owner_key(&self, owner_storage_key: &str) -> String {
-        format!("{}/indexes/segments/{}", self.slot_tag, owner_storage_key)
-    }
-
-    pub fn segment_owner(&self, segment: &SegmentName) -> String {
         format!(
-            "{}/indexes/segment-owners/{}",
-            self.slot_tag,
-            encode_key_component(&segment.0)
+            "{}/client-resources/{}/indexes/segments",
+            self.slot_tag, owner_storage_key
         )
     }
 
@@ -564,22 +567,28 @@ mod tests {
         );
         assert_eq!(
             keyspace.segment(&runtime, &segment),
-            "{tenant-a}/segments/writer:9:seg-1"
+            "{tenant-a}/client-resources/writer:9/segments/seg-1"
         );
         assert_eq!(
             keyspace.segment_prefix(Some(&runtime)),
-            "{tenant-a}/segments/writer:9:"
+            "{tenant-a}/client-resources/writer:9/segments/"
         );
-        assert_eq!(keyspace.segment_prefix(None), "{tenant-a}/segments/");
+        assert_eq!(
+            keyspace.segment_prefix(None),
+            "{tenant-a}/client-resources/"
+        );
         assert_eq!(
             keyspace.segment_pattern(Some(&runtime)),
-            "{tenant-a}/segments/writer:9:*"
+            "{tenant-a}/client-resources/writer:9/segments/*"
         );
         assert_eq!(
             keyspace.segment_index(Some(&runtime)),
-            "{tenant-a}/indexes/segments/writer:9"
+            "{tenant-a}/client-resources/writer:9/indexes/segments"
         );
-        assert_eq!(keyspace.segment_index(None), "{tenant-a}/indexes/segments");
+        assert_eq!(
+            keyspace.segment_index(None),
+            "{tenant-a}/client-resources/indexes/segments"
+        );
         assert_eq!(keyspace.object(&object), "{tenant-a}/objects/alpha");
         assert_eq!(keyspace.object_prefix(), "{tenant-a}/objects/");
         assert_eq!(keyspace.object_pattern(), "{tenant-a}/objects/*");
@@ -821,9 +830,9 @@ mod tests {
         let runtime = ClientRuntimeId::new("node-1", ClientEpoch(42));
         let segment = SegmentName::new("seg:special");
         let key = keyspace.segment(&runtime, &segment);
-        assert!(
-            key.contains("seg:special"),
-            "segment-name colons must survive into the key: got {key}"
+        assert_eq!(
+            key,
+            "{ns}/client-resources/node-1:42/segments/seg%3Aspecial"
         );
     }
 

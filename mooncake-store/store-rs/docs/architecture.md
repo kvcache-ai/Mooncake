@@ -119,6 +119,12 @@ The membership snapshot is runtime cache, not protocol configuration:
 - route policy is durable cluster configuration stored in metadata
 - request-level tenants affect scoped object keys, not the cluster-wide route-authority policy
 
+Segment metadata is scoped under its owning `ClientRuntimeId`. The client lease is the liveness
+truth; segment records are child resources that describe buffers owned by that live runtime. Write
+placement and preferred-segment resolution start from live compatible leases and then do exact
+`get_segment(owner, segment)` lookups for those owners. A stale segment record without a live
+client lease cannot make a runtime eligible for allocation.
+
 ## Write Path
 
 A write is split into route resolution, allocation, transfer, and route publication.
@@ -188,6 +194,10 @@ The current implementation supports:
 - multi-replica placement
 
 The default request policy prefers local storage when available. When local capacity is insufficient, the client allocates on remote storage nodes selected by the planner and the replication policy.
+Routed writes use the same live membership snapshot as route-authority selection, then resolve
+segment metadata under each live storage runtime. Scratch-only writers, including Python clients
+with `storage_bytes=0` and routed writes enabled, never become storage candidates just because
+old segment metadata remains in the backend.
 
 ### Remote storage-owner tracking
 
@@ -202,17 +212,20 @@ This lets each storage owner update its local eviction clock from the published 
 
 ## Read Path
 
-For reads, the client first resolves the object route, derives the selected replica's TE target
-coordinate from `segment_offset` and the selected segment's published storage target chunks, then
-groups remote reads by segment and submits transfer requests through TE/TENT. When the selected
-replica is local, the client uses the same derived target coordinate and maps it back to the local
-storage registration.
+For reads, the client first resolves the object route, filters replicas to currently readable
+owners, derives the selected replica's TE target coordinate from `segment_offset` and the selected
+segment's published storage target chunks, then groups remote reads by segment and submits
+transfer requests through TE/TENT. A local replica is readable only when the local storage segment
+is still registered; a remote replica is readable only when its owner is in the live membership
+snapshot. When the selected replica is local, the client uses the same derived target coordinate
+and maps it back to the local storage registration.
 
 Successful route lookup APIs are also access signals: `query_route`, `get_size`, `is_exist`,
-and `batch_is_exist` report active route hits to the storage owners best-effort, using the same
-local/CLOCK and control-plane hit-report path as completed reads. This keeps prefix-probe
-workloads from letting recently observed replicas age out before the caller issues the matching
-restore read, without adding metadata-backend traffic to the request path.
+and `batch_is_exist` report hits only to readable storage owners, using the same local/CLOCK and
+control-plane hit-report path as completed reads. `is_exist` and `batch_is_exist` return true only
+when at least one active route replica is currently readable. This keeps prefix-probe workloads
+from letting recently observed replicas age out before the caller issues the matching restore read,
+without adding metadata-backend traffic to the request path.
 
 Remote batch reads are isolated by storage owner before they enter TE/TENT. A failed or killed
 storage owner therefore only affects the keys assigned to that owner instead of stalling a mixed

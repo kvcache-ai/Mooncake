@@ -35,11 +35,63 @@ def _load_store_module():
     return module
 
 
+def _load_package_with_stale_native_store():
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    package_dir = repo_root / "python" / "mooncake"
+
+    for name in list(sys.modules):
+        if name == "mooncake" or name.startswith("mooncake."):
+            del sys.modules[name]
+
+    fake_build_info = types.ModuleType("mooncake._build_info")
+    fake_build_info.BUILD_INFO = {
+        "branch": "test",
+        "commit": "test",
+        "build_time": "test",
+    }
+    sys.modules["mooncake._build_info"] = fake_build_info
+
+    fake_runtime = types.ModuleType("mooncake._runtime")
+    fake_runtime.package_dir = lambda: package_dir
+    fake_runtime.preload_native_libraries = lambda root: None
+    sys.modules["mooncake._runtime"] = fake_runtime
+
+    fake_native = types.ModuleType("mooncake._store_rs")
+    sys.modules["mooncake._store_rs"] = fake_native
+
+    stale_store = types.ModuleType("mooncake.store")
+    stale_store.__file__ = "/tmp/store.cpython-312-x86_64-linux-gnu.so"
+    sys.modules["mooncake.store"] = stale_store
+
+    spec = importlib.util.spec_from_file_location(
+        "mooncake",
+        package_dir / "__init__.py",
+        submodule_search_locations=[str(package_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to create mooncake package spec")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["mooncake"] = module
+    spec.loader.exec_module(module)
+    return module, sys.modules["mooncake.store"]
+
+
 STORE_MODULE = _load_store_module()
 MooncakeDistributedStore = STORE_MODULE.MooncakeDistributedStore
 
 
 class StoreAliasTests(unittest.TestCase):
+    def test_package_prefers_store_rs_python_module_over_stale_native_store(
+        self,
+    ) -> None:
+        _, store_module = _load_package_with_stale_native_store()
+
+        self.assertEqual(pathlib.Path(store_module.__file__).name, "store.py")
+        self.assertEqual(
+            store_module.MooncakeDistributedStore.__name__,
+            "MooncakeDistributedStore",
+        )
+
     def test_put_batch_delegates_to_batch_put(self) -> None:
         store = object.__new__(MooncakeDistributedStore)
         calls: list[tuple[str, tuple, dict]] = []

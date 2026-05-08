@@ -402,7 +402,9 @@ class MooncakeDistributedStore:
         kwargs = _apply_setup_env_defaults(kwargs)
         if "hugepage_size" in kwargs:
             kwargs["hugepage_size"] = _normalize_hugepage_size(kwargs["hugepage_size"])
-        self._default_domain = kwargs.get("domain") if _has_value(kwargs.get("domain")) else None
+        self._default_domain = (
+            kwargs.get("domain") if _has_value(kwargs.get("domain")) else None
+        )
         self._default_object_set = (
             kwargs.get("object_set") if _has_value(kwargs.get("object_set")) else None
         )
@@ -807,7 +809,9 @@ class MooncakeDistributedStore:
             tenant=tenant,
         )
 
-    def _group_tracked_keys(self) -> dict[tuple[str | None, str | None, str | None], list[str]]:
+    def _group_tracked_keys(
+        self,
+    ) -> dict[tuple[str | None, str | None, str | None], list[str]]:
         grouped: dict[tuple[str | None, str | None, str | None], list[str]] = {}
         with self._lock:
             for tenant, domain, object_set, key in self._tracked_keys:

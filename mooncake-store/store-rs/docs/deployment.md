@@ -625,8 +625,7 @@ The local e2e now includes a focused strict tenant quota scenario that proves al
 The command removes:
 
 - stale segment hash keys owned by clients with no live lease
-- stale entries from the global segment index
-- stale entries from the per-owner segment index
+- stale entries from owner-scoped segment indexes
 
 ### Transport metadata
 
