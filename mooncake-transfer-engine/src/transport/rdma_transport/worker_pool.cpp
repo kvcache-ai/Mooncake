@@ -234,8 +234,7 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->active()) {
             if (endpoint->inactiveTime() > 1.0)
-                context_.deleteEndpoint(
-                    entry.first);  // enable for re-establishation
+                context_.deleteEndpointRef(endpoint.get());
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;

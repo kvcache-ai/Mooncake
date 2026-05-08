@@ -108,6 +108,7 @@ class RdmaEndPoint {
     // actually destroys QPs and frees resources. Returns true if destruction
     // is complete, false if outstanding WRs remain.
     void beginDestroy();
+    void beginDestroyNoLock();  // Internal version without locking
     bool finishDestroy();
 
    private:

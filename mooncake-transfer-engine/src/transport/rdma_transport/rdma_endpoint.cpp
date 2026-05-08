@@ -125,21 +125,11 @@ int RdmaEndPoint::deconstruct() {
 }
 
 int RdmaEndPoint::deconstructLocked() {
-    // Adjust cq_outstanding_ before destroying QPs, so the counter is
-    // always corrected even if ibv_destroy_qp fails and we return early.
-    bool displayed = false;
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (wr_depth_list_[i] != 0) {
-            if (!displayed) {
-                LOG(WARNING) << "Outstanding work requests found, CQ will not "
-                                "be generated";
-                displayed = true;
-            }
-            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-            wr_depth_list_[i] = 0;
-        }
-    }
-
+    // Note: We no longer manually adjust wr_depth_list_/cq_outstanding_ here.
+    // This function should only be called after all CQEs have been drained
+    // (via the two-phase beginDestroy/finishDestroy flow), so counters should
+    // already be zero. Manual adjustment would race with CQE processing in
+    // performPollCq() and cause double-counting.
     int result = 0;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (!qp_list_[i]) continue;  // already destroyed in a previous call
@@ -164,6 +154,10 @@ int RdmaEndPoint::destroyQP() { return deconstruct(); }
 
 void RdmaEndPoint::beginDestroy() {
     RWSpinlock::WriteGuard guard(lock_);
+    beginDestroyNoLock();
+}
+
+void RdmaEndPoint::beginDestroyNoLock() {
     auto current_status = status_.load(std::memory_order_relaxed);
     if (current_status == DESTROYING || current_status == DESTROYED) return;
 
@@ -223,14 +217,23 @@ bool RdmaEndPoint::finishDestroy() {
         if (has_outstanding) {
             double elapsed = (getCurrentTimeInNano() - inactive_time_) / 1e9;
             if (elapsed < kFinishDestroyTimeoutSec) return false;
+            // Log outstanding WRs for each QP before forcing destruction
+            for (size_t i = 0; i < qp_list_.size(); ++i) {
+                if (wr_depth_list_[i] != 0) {
+                    LOG(ERROR) << "finishDestroy timeout: QP[" << i
+                               << "] has " << wr_depth_list_[i]
+                               << " outstanding WRs (cq_outstanding leak expected)";
+                }
+            }
             LOG(WARNING) << "finishDestroy timed out after " << elapsed
                          << "s with outstanding WRs, forcing destruction";
         }
     }
 
-    // Unified destroy: tear down QPs (deconstructLocked handles
-    // cq_outstanding_ adjustment internally) and bound retries to avoid
-    // log flooding when ibv_destroy_qp fails permanently.
+    // Unified destroy: tear down QPs and bound retries to avoid log
+    // flooding when ibv_destroy_qp fails permanently.
+    // Note: If timed out with outstanding WRs, counters will leak (accept
+    // as this is an abnormal situation).
     int ret = deconstructLocked();
     if (ret) {
         finish_destroy_retries_++;
@@ -247,9 +250,9 @@ bool RdmaEndPoint::finishDestroy() {
 
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (connected()) {
-        LOG(WARNING) << "Previous connection will be discarded";
-        disconnectUnlocked();
+    if (connected() && peer_nic_path_ != peer_nic_path) {
+        LOG(WARNING) << "PeerNicPath of RdmaEndPoint has been assigned";
+        return;
     }
     peer_nic_path_ = peer_nic_path;
 }
@@ -368,8 +371,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
                         "re-establishing connection: "
                      << toString();
 
-        int ret = resetConnection("re-establishing connection (active)");
-        if (ret) return ret;
+        resetConnection("re-establishing connection (active)");
+        return ERR_ENDPOINT;
     }
 
     if (!peer_desc.reply_msg.empty()) {
@@ -437,8 +440,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         // Different peer (e.g., peer restarted)
         LOG(WARNING) << "Re-establish connection: " << toString();
 
-        int ret = resetConnection("re-establishing connection (passive)");
-        if (ret) return ret;
+        resetConnection("re-establishing connection (passive)");
+        return ERR_ENDPOINT;
     }
 
     // At this point, the state can only be UNCONNECTED or CONNECTING.
@@ -516,26 +519,19 @@ int RdmaEndPoint::disconnectUnlocked() {
 
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
+    attr.qp_state = IBV_QPS_ERR;
     int ret = 0;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (curr_ret) {
-            PLOG(ERROR) << "Failed to modify QP to RESET";
+            PLOG(ERROR) << "Failed to modify QP to ERR";
             ret = ERR_ENDPOINT;
         }
-        // After resetting QP, the wr_depth_list_ won't change
-        bool displayed = false;
-        if (wr_depth_list_[i] != 0) {
-            if (!displayed) {
-                LOG(WARNING) << "Outstanding work requests found, CQ will not "
-                                "be generated";
-                displayed = true;
-            }
-            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-            wr_depth_list_[i] = 0;
-        }
     }
+    // Note: We no longer manually adjust wr_depth_list_/cq_outstanding_ here.
+    // ERR state flushes all inflight WRs to CQ as FLUSH errors, which will be
+    // processed by performPollCq() and naturally decrement the counters.
+    // Manual adjustment would cause double-counting with CQE processing.
     peer_qp_num_list_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);
     return ret;
@@ -545,20 +541,16 @@ int RdmaEndPoint::resetConnection(const std::string &reason) {
     auto curr_status = status_.load(std::memory_order_acquire);
     if (curr_status != CONNECTING && curr_status != CONNECTED) return 0;
 
-#ifdef CONFIG_ERDMA
-    int ret = reconstruct();
-#else
-    int ret = disconnectUnlocked();
-#endif
+    active_ = false;
+    inactive_time_ = getCurrentTimeInNano();
+    status_.store(UNCONNECTED, std::memory_order_release);
+    LOG(INFO) << "Endpoint marked inactive: " << reason;
 
-    if (ret) {
-        LOG(ERROR) << "Failed to reset the endpoint (triggered by: " << reason
-                   << "): error=" << ret;
-    } else {
-        LOG(INFO) << "Successfully reset the endpoint (triggered by: " << reason
-                  << ").";
-    }
-    return ret;
+    // Delete from endpoint store so endpoint() won't return this endpoint.
+    // Uses deleteEndpointRef which calls beginDestroyNoLock() to avoid
+    // deadlocking when caller already holds lock_.
+    context_.deleteEndpointRef(this);
+    return 0;
 }
 
 const std::string RdmaEndPoint::toString() const {

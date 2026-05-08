@@ -94,6 +94,25 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
+int FIFOEndpointStore::deleteEndpointRef(RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    // Find and remove the endpoint by pointer comparison
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end(); ++iter) {
+        if (iter->second.get() == endpoint_ptr) {
+            waiting_list_len_++;
+            iter->second->beginDestroyNoLock();  // Caller may already hold lock_
+            waiting_list_.insert(iter->second);
+            std::string peer_nic_path = iter->first;
+            endpoint_map_.erase(iter);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            return 0;
+        }
+    }
+    return 0;
+}
+
 void FIFOEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) return;
     std::string victim = fifo_list_.front();
@@ -224,6 +243,29 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
         }
         fifo_list_.erase(fifo_iter);
         fifo_map_.erase(peer_nic_path);
+    }
+    return 0;
+}
+
+int SIEVEEndpointStore::deleteEndpointRef(RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    // Find and remove the endpoint by pointer comparison
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end(); ++iter) {
+        if (iter->second.first.get() == endpoint_ptr) {
+            waiting_list_len_++;
+            iter->second.first->beginDestroyNoLock();  // Caller may already hold lock_
+            waiting_list_.insert(iter->second.first);
+            std::string peer_nic_path = iter->first;
+            endpoint_map_.erase(iter);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            if (hand_.has_value() && hand_.value() == fifo_iter) {
+                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                                : hand_ = std::prev(fifo_iter);
+            }
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            return 0;
+        }
     }
     return 0;
 }

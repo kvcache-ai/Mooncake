@@ -111,6 +111,7 @@ class RdmaContext {
         const RdmaEndPoint *endpoint_ptr);
 
     int deleteEndpoint(const std::string &peer_nic_path);
+    int deleteEndpointRef(RdmaEndPoint *endpoint_ptr);
 
     // Drain the endpoint store's waiting list. Safe to call on any thread;
     // intended to be invoked periodically from monitorWorker so reclaim is

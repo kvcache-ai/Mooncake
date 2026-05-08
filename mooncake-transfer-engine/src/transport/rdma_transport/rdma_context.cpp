@@ -409,6 +409,10 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }
 
+int RdmaContext::deleteEndpointRef(RdmaEndPoint *endpoint_ptr) {
+    return endpoint_store_->deleteEndpointRef(endpoint_ptr);
+}
+
 void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
 
 size_t RdmaContext::waitingListSize() const {
