@@ -346,7 +346,6 @@ Status RdmaTransport::submitTransferTasks(
         task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;
-        task->ref_count = 0;
         task->ref();  // Batch holds a reference to the task
 
         const double merge_ratio = 0.25;
