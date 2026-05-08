@@ -130,8 +130,12 @@ int RdmaEndPoint::deconstructLocked() {
     // (via the two-phase beginDestroy/finishDestroy flow), so counters should
     // already be zero. Manual adjustment would race with CQE processing in
     // performPollCq() and cause double-counting.
+
+    // Save the size before clearing qp_list_
+    size_t num_qp = qp_list_.size();
+
     int result = 0;
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
+    for (size_t i = 0; i < num_qp; ++i) {
         if (!qp_list_[i]) continue;  // already destroyed in a previous call
         if (ibv_destroy_qp(qp_list_[i])) {
             PLOG(ERROR) << "Failed to destroy QP[" << i << "]";
@@ -145,8 +149,28 @@ int RdmaEndPoint::deconstructLocked() {
 
     qp_list_.clear();
     peer_qp_num_list_.clear();
-    delete[] wr_depth_list_;
-    wr_depth_list_ = nullptr;
+
+    // Check for outstanding WRs before deleting wr_depth_list_ to prevent UAF.
+    // Slices hold pointers to wr_depth_list_ entries (slice->rdma.qp_depth),
+    // and worker threads may still access them when processing CQEs.
+    // If there are outstanding WRs, leak the memory to prevent UAF.
+    bool has_outstanding = false;
+    if (wr_depth_list_) {
+        for (size_t i = 0; i < num_qp; ++i) {
+            if (wr_depth_list_[i] != 0) {
+                has_outstanding = true;
+                break;
+            }
+        }
+        // Only delete if no outstanding WRs (safe to free)
+        if (!has_outstanding) {
+            delete[] wr_depth_list_;
+            wr_depth_list_ = nullptr;
+        } else {
+            LOG(WARNING) << "Leaking wr_depth_list_ due to outstanding WRs to "
+                            "prevent UAF";
+        }
+    }
     return 0;
 }
 

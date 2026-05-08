@@ -38,9 +38,10 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpoint(
 std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpointByPtr(
     const RdmaEndPoint *endpoint_ptr) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
-    for (auto &kv : endpoint_map_) {
-        if (kv.second.get() == endpoint_ptr) return kv.second;
-    }
+    // O(1) lookup using peerNicPath() instead of O(N) iteration
+    auto iter = endpoint_map_.find(endpoint_ptr->peerNicPath());
+    if (iter != endpoint_map_.end() && iter->second.get() == endpoint_ptr)
+        return iter->second;
     for (auto &endpoint : waiting_list_)
         if (endpoint.get() == endpoint_ptr) return endpoint;
     return nullptr;
@@ -96,21 +97,18 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
 
 int FIFOEndpointStore::deleteEndpointRef(RdmaEndPoint *endpoint_ptr) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    // Find and remove the endpoint by pointer comparison
-    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
-         ++iter) {
-        if (iter->second.get() == endpoint_ptr) {
-            waiting_list_len_++;
-            iter->second
-                ->beginDestroyNoLock();  // Caller may already hold lock_
-            waiting_list_.insert(iter->second);
-            std::string peer_nic_path = iter->first;
-            endpoint_map_.erase(iter);
-            auto fifo_iter = fifo_map_[peer_nic_path];
-            fifo_list_.erase(fifo_iter);
-            fifo_map_.erase(peer_nic_path);
-            return 0;
-        }
+    // O(1) lookup using peerNicPath() instead of O(N) iteration
+    const std::string &peer_nic_path = endpoint_ptr->peerNicPath();
+    auto iter = endpoint_map_.find(peer_nic_path);
+    if (iter != endpoint_map_.end() && iter->second.get() == endpoint_ptr) {
+        waiting_list_len_++;
+        iter->second->beginDestroyNoLock();  // Caller may already hold lock_
+        waiting_list_.insert(iter->second);
+        endpoint_map_.erase(iter);
+        auto fifo_iter = fifo_map_[peer_nic_path];
+        fifo_list_.erase(fifo_iter);
+        fifo_map_.erase(peer_nic_path);
+        return 0;
     }
     return 0;
 }
@@ -190,9 +188,10 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpointByPtr(
     const RdmaEndPoint *endpoint_ptr) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
-    for (auto &kv : endpoint_map_) {
-        if (kv.second.first.get() == endpoint_ptr) return kv.second.first;
-    }
+    // O(1) lookup using peerNicPath() instead of O(N) iteration
+    auto iter = endpoint_map_.find(endpoint_ptr->peerNicPath());
+    if (iter != endpoint_map_.end() && iter->second.first.get() == endpoint_ptr)
+        return iter->second.first;
     for (auto &endpoint : waiting_list_)
         if (endpoint.get() == endpoint_ptr) return endpoint;
     return nullptr;
@@ -251,25 +250,24 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
 
 int SIEVEEndpointStore::deleteEndpointRef(RdmaEndPoint *endpoint_ptr) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    // Find and remove the endpoint by pointer comparison
-    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
-         ++iter) {
-        if (iter->second.first.get() == endpoint_ptr) {
-            waiting_list_len_++;
-            iter->second.first
-                ->beginDestroyNoLock();  // Caller may already hold lock_
-            waiting_list_.insert(iter->second.first);
-            std::string peer_nic_path = iter->first;
-            endpoint_map_.erase(iter);
-            auto fifo_iter = fifo_map_[peer_nic_path];
-            if (hand_.has_value() && hand_.value() == fifo_iter) {
-                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
-                                                : hand_ = std::prev(fifo_iter);
-            }
-            fifo_list_.erase(fifo_iter);
-            fifo_map_.erase(peer_nic_path);
-            return 0;
+    // O(1) lookup using peerNicPath() instead of O(N) iteration
+    const std::string &peer_nic_path = endpoint_ptr->peerNicPath();
+    auto iter = endpoint_map_.find(peer_nic_path);
+    if (iter != endpoint_map_.end() &&
+        iter->second.first.get() == endpoint_ptr) {
+        waiting_list_len_++;
+        iter->second.first
+            ->beginDestroyNoLock();  // Caller may already hold lock_
+        waiting_list_.insert(iter->second.first);
+        endpoint_map_.erase(iter);
+        auto fifo_iter = fifo_map_[peer_nic_path];
+        if (hand_.has_value() && hand_.value() == fifo_iter) {
+            fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                            : hand_ = std::prev(fifo_iter);
         }
+        fifo_list_.erase(fifo_iter);
+        fifo_map_.erase(peer_nic_path);
+        return 0;
     }
     return 0;
 }
