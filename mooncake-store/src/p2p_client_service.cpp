@@ -943,8 +943,8 @@ async_simple::coro::Lazy<void> P2PClientService::RunWriteWithRetry(
     std::unique_ptr<TaskHandle<void>> current_task, std::string current_route,
     std::vector<std::unique_ptr<WriteOp>> retry_op_list, std::string_view key) {
     size_t retry_cnt = 0;
+    tl::expected<void, ErrorCode> result;
     while (current_task) {
-        tl::expected<void, ErrorCode> result;
         try {
             result = co_await current_task->WaitAsync();
         } catch (const std::exception& e) {
@@ -984,10 +984,12 @@ async_simple::coro::Lazy<void> P2PClientService::RunWriteWithRetry(
             retry_cnt++;
         }
     }
-    LOG(ERROR) << "write failed with all retry list, key:" << key;
-    tl::expected<void, ErrorCode> exhausted =
-        tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    promise->setValue(std::move(exhausted));
+    if (result.has_value()) {
+        result = tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    LOG(ERROR) << "write failed with all retry list"
+               << ", key:" << key << ", error: " << result.error();
+    promise->setValue(std::move(result));
 }
 
 // ============================================================================
@@ -1435,16 +1437,20 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                     tl::expected<void, ErrorCode> ok;
                     promise->setValue(std::move(ok));
                     co_return;
-                } else if (result.error() != ErrorCode::OBJECT_NOT_FOUND) {
-                    LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                               << ", error: " << result.error();
                 } else {
+                    if (result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                        LOG(ERROR)
+                            << "Failed to get from remote, key: " << req->key
+                            << ", error: " << result.error();
+                    }
                     final_result = result.error();
                 }
             } catch (const std::exception& e) {
+                final_result = ErrorCode::INTERNAL_ERROR;
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
                            << ", exception: " << e.what();
             } catch (...) {
+                final_result = ErrorCode::INTERNAL_ERROR;
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
                            << ", unknown exception";
             }
