@@ -1401,6 +1401,13 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
     size_t failed_tasks = 0;
     size_t total_tasks = 0;
     TransferStatusEnum worst_failure = PENDING;
+    auto isWorse = [](TransferStatusEnum cur, TransferStatusEnum best) {
+        static const std::unordered_map<TransferStatusEnum, int> severity = {
+            {INITIAL, 0},  {PENDING, 0}, {COMPLETED, 0}, {INVALID, 1},
+            {CANCELED, 2}, {TIMEOUT, 3}, {FAILED, 4},
+        };
+        return severity.at(cur) > severity.at(best);
+    };
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto& task = batch->task_list[task_id];
         if (task.derived) continue;  // This task is performed by other tasks
@@ -1412,7 +1419,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                 overall_status.transferred_bytes += task.request.length;
             } else {
                 failed_tasks++;
-                worst_failure = task.status;
+                if (isWorse(task.status, worst_failure))
+                    worst_failure = task.status;
             }
             continue;
         }
@@ -1423,7 +1431,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             if (task.type == UNSPEC) {
                 task.status = FAILED;
                 failed_tasks++;
-                worst_failure = FAILED;
+                if (isWorse(FAILED, worst_failure)) worst_failure = FAILED;
                 continue;
             }
             auto& transport = transport_list_[task.type];
@@ -1452,7 +1460,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             overall_status.transferred_bytes += task_status.transferred_bytes;
         } else if (task_status.s != PENDING) {
             failed_tasks++;
-            worst_failure = task_status.s;
+            if (isWorse(task_status.s, worst_failure))
+                worst_failure = task_status.s;
         }
 
         // Record metrics when task transitions to terminal state
