@@ -244,6 +244,10 @@ class DataManager {
    private:
     void ClearLeaseRecords();
 
+    // Forward declarations for nested shard structs used by internal helpers.
+    struct PendingWriteShard;
+    struct PinnedKeyShard;
+
     struct KeyCtx {
         std::string_view key;
         std::string key_string;
