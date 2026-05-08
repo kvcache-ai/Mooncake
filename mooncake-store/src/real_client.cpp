@@ -737,8 +737,8 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO) << "client_id=" << client_id << ", shm already unmapped";
+        return {};
     }
 
     auto& context = it->second;
@@ -774,8 +774,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO) << "client_id=" << client_id << ", shm already unmapped";
+        return {};
     }
     auto& context = it->second;
 
