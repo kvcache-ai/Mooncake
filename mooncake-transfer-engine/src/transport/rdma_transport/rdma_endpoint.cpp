@@ -220,9 +220,10 @@ bool RdmaEndPoint::finishDestroy() {
             // Log outstanding WRs for each QP before forcing destruction
             for (size_t i = 0; i < qp_list_.size(); ++i) {
                 if (wr_depth_list_[i] != 0) {
-                    LOG(ERROR) << "finishDestroy timeout: QP[" << i
-                               << "] has " << wr_depth_list_[i]
-                               << " outstanding WRs (cq_outstanding leak expected)";
+                    LOG(ERROR)
+                        << "finishDestroy timeout: QP[" << i << "] has "
+                        << wr_depth_list_[i]
+                        << " outstanding WRs (cq_outstanding leak expected)";
                 }
             }
             LOG(WARNING) << "finishDestroy timed out after " << elapsed

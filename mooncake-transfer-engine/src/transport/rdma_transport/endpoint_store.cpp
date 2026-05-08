@@ -97,10 +97,12 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
 int FIFOEndpointStore::deleteEndpointRef(RdmaEndPoint *endpoint_ptr) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find and remove the endpoint by pointer comparison
-    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end(); ++iter) {
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
         if (iter->second.get() == endpoint_ptr) {
             waiting_list_len_++;
-            iter->second->beginDestroyNoLock();  // Caller may already hold lock_
+            iter->second
+                ->beginDestroyNoLock();  // Caller may already hold lock_
             waiting_list_.insert(iter->second);
             std::string peer_nic_path = iter->first;
             endpoint_map_.erase(iter);
@@ -250,10 +252,12 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
 int SIEVEEndpointStore::deleteEndpointRef(RdmaEndPoint *endpoint_ptr) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find and remove the endpoint by pointer comparison
-    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end(); ++iter) {
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
         if (iter->second.first.get() == endpoint_ptr) {
             waiting_list_len_++;
-            iter->second.first->beginDestroyNoLock();  // Caller may already hold lock_
+            iter->second.first
+                ->beginDestroyNoLock();  // Caller may already hold lock_
             waiting_list_.insert(iter->second.first);
             std::string peer_nic_path = iter->first;
             endpoint_map_.erase(iter);
