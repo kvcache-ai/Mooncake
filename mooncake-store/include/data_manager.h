@@ -242,6 +242,8 @@ class DataManager {
                std::optional<UUID> tier_id = std::nullopt) const;
 
    private:
+    void ClearLeaseRecords();
+
     struct KeyCtx {
         std::string_view key;
         std::string key_string;

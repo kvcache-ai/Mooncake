@@ -173,11 +173,25 @@ DataManager::~DataManager() { Stop(); }
 
 void DataManager::Stop() {
     ShutdownLeaseScanner();
+    ClearLeaseRecords();
     if (async_memcpy_executor_) {
         async_memcpy_executor_->Shutdown();
     }
     if (tiered_backend_) {
         tiered_backend_->Stop();
+    }
+}
+
+void DataManager::ClearLeaseRecords() {
+    for (auto& shard : pending_write_shards_) {
+        std::unique_lock lock(shard.mutex);
+        shard.by_key.clear();
+        shard.ordered_list.clear();
+    }
+    for (auto& shard : pinned_key_shards_) {
+        std::unique_lock lock(shard.mutex);
+        shard.by_key.clear();
+        shard.ordered_list.clear();
     }
 }
 
