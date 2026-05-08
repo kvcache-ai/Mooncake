@@ -74,6 +74,12 @@ This mode:
 - supports routed writes, replication policy, segment lifecycle, metrics, and tracing
 - is the normal path for Python clients that should behave like store-rs nodes
 
+Registered-buffer batch restores are best-effort per item in the Python compatibility layer. If
+the fast batch restore path fails because one route is missing or one storage owner is unavailable,
+the dispatcher retries the missed entries one by one and returns a per-key status: positive byte
+counts for restored entries and negative soft-miss codes for the entries that still failed. A dead
+cache replica therefore does not turn healthy keys in the same HiCache batch into misses.
+
 `setup(...)` accepts `eviction_high_watermark_percent=` and
 `eviction_low_watermark_percent=` for storage-role runtimes. The same values can come from
 `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` and

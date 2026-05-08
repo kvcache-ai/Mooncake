@@ -1473,15 +1473,47 @@ fn execute_batch_get_values_into(
             apply_scope_to_get_request(GetRequest::new(key.as_str(), buffer), &scope)
         })
         .collect::<Vec<_>>();
-    let sizes = client.batch_get_into(requests.as_mut_slice())?;
-    for (((index, key, _, _), buffer), copied) in misses.into_iter().zip(buffers.iter()).zip(sizes)
-    {
-        insert_hot_cache(
-            hot_cache,
-            HotCacheKey::new(cache_tenant.clone(), key),
-            &buffer[..copied],
-        );
-        lengths[index] = copied as i64;
+    match client.batch_get_into(requests.as_mut_slice()) {
+        Ok(sizes) => {
+            for (((index, key, _, _), buffer), copied) in
+                misses.into_iter().zip(buffers.iter()).zip(sizes)
+            {
+                insert_hot_cache(
+                    hot_cache,
+                    HotCacheKey::new(cache_tenant.clone(), key),
+                    &buffer[..copied],
+                );
+                lengths[index] = copied as i64;
+            }
+        }
+        Err(batch_error) => {
+            warn!(
+                runtime = %client.runtime_id(),
+                items = misses.len(),
+                error = %batch_error,
+                "batch_get_into failed; falling back to per-key soft misses"
+            );
+            for ((index, key, _, _), target) in misses.into_iter().zip(buffers) {
+                let mut request =
+                    apply_scope_to_get_request(GetRequest::new(key.as_str(), target), &scope);
+                let result = client
+                    .batch_get_into(std::slice::from_mut(&mut request))
+                    .and_then(|sizes| expect_exactly_one(sizes, "batch_get_into"));
+                match result {
+                    Ok(copied) => {
+                        insert_hot_cache(
+                            hot_cache,
+                            HotCacheKey::new(cache_tenant.clone(), key),
+                            &target[..copied],
+                        );
+                        lengths[index] = copied as i64;
+                    }
+                    Err(error) => {
+                        lengths[index] = soft_get_status(&error);
+                    }
+                }
+            }
+        }
     }
     Ok(lengths)
 }
@@ -1496,16 +1528,26 @@ fn execute_batch_get_values_into_multi(
 ) -> Result<Vec<i64>, StoreError> {
     let mut lengths = Vec::with_capacity(keys.len());
     for ((key, buffer_ptrs), sizes) in keys.into_iter().zip(all_buffer_ptrs).zip(all_sizes) {
-        lengths.push(execute_get_into_multi_value(
-            client,
-            hot_cache,
-            &scope,
-            key,
-            buffer_ptrs,
-            sizes,
-        )? as i64);
+        let copied =
+            execute_get_into_multi_value(client, hot_cache, &scope, key, buffer_ptrs, sizes)
+                .map(|copied| copied as i64)
+                .unwrap_or_else(|error| soft_get_status(&error));
+        lengths.push(copied);
     }
     Ok(lengths)
+}
+
+fn soft_get_status(error: &StoreError) -> i64 {
+    match error {
+        StoreError::NotFound(_) => -1,
+        StoreError::InvalidState(_) => -2,
+        StoreError::Metadata(_) => -3,
+        StoreError::Transport(_) => -4,
+        StoreError::Conflict(_) | StoreError::QuotaExceeded { .. } => -5,
+        StoreError::StaleEpoch(_) => -6,
+        StoreError::Unsupported(_) => -7,
+        StoreError::Allocator(_) => -8,
+    }
 }
 
 fn execute_remove_all(

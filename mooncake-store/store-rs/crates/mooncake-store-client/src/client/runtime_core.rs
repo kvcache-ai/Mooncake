@@ -602,12 +602,14 @@ impl StoreClient {
                     .filter(|lease| lease.runtime.stable_id.0 == *selector)
                     .max_by_key(|lease| lease.runtime.epoch)
             };
-            let lease = matched.ok_or_else(|| {
-                StoreError::NotFound(format!(
-                    "preferred storage owner {} is not available",
-                    selector
-                ))
-            })?;
+            let Some(lease) = matched else {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    preferred_storage_owner = selector,
+                    "skipping unavailable preferred storage owner"
+                );
+                continue;
+            };
             if seen.insert(lease.runtime.clone()) {
                 resolved.push(lease.runtime.clone());
             }

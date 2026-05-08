@@ -158,6 +158,10 @@ Useful knobs:
 - `preferred_storage_owners(...)`
 - `with_soft_pin(...)`
 
+Preferred storage owners are placement hints. If a hinted owner is not in the compatible live
+snapshot or is locally quarantined as suspect, the writer skips it and continues with normal
+placement candidates instead of failing the cache write before fallback can run.
+
 ## Use Batch and Buffer-Oriented APIs
 
 The Rust client supports both object-oriented and buffer-oriented paths.

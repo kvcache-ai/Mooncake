@@ -3975,6 +3975,27 @@ mod tests {
                 .expect("missing batch_get_into should degrade to soft miss"),
             vec![-1]
         );
+        let mut missing_target = vec![0u8; 16];
+        let mut live_target = vec![0u8; 16];
+        let mixed_lengths = store
+            .batch_get_into(
+                vec![
+                    (
+                        "missing".to_string(),
+                        missing_target.as_mut_ptr() as usize,
+                        missing_target.len(),
+                    ),
+                    (
+                        "epsilon".to_string(),
+                        live_target.as_mut_ptr() as usize,
+                        live_target.len(),
+                    ),
+                ],
+                None,
+            )
+            .expect("mixed batch_get_into should isolate soft misses");
+        assert_eq!(mixed_lengths, vec![-1, source.len() as i64]);
+        assert_eq!(&live_target[..source.len()], source.as_slice());
         assert!(store
             .batch_get_into_raw(vec!["alpha".to_string()], vec![], vec![], None)
             .is_err());
