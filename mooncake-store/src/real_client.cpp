@@ -761,6 +761,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         if (munmap(shm.shm_buffer, shm.shm_size) != 0) {
             LOG(WARNING) << "munmap failed for " << shm.shm_name << ": "
                          << strerror(errno);
+            had_error = true;
         }
     }
     context.mapped_shms.clear();
