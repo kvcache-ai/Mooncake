@@ -28,6 +28,8 @@ enum ShmSegmentType : uint32_t {
     SHM_SEG_HOT_CACHE = 0,  // local hot cache backing memory
 };
 
+constexpr int32_t kInvalidPhysicalDeviceId = -1;
+
 // Return codes for health_check()
 enum HealthCheckStatus : int {
     HC_HEALTHY = 0,          // Fully connected, all links up
@@ -116,6 +118,7 @@ struct ShmRegisterRequest {
     uint64_t client_id_second;
     uint64_t dummy_base_addr;
     uint64_t shm_size;
+    int32_t device_id = kInvalidPhysicalDeviceId;
     bool is_local_buffer;
 };
 

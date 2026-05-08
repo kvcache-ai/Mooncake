@@ -9,6 +9,7 @@ set(MOONCAKE_STORE_SOURCES
     types.cpp
     master_client.cpp
     utils.cpp
+    mmap_arena.cpp
     master_metric_manager.cpp
     storage_backend.cpp
     thread_pool.cpp
@@ -143,25 +144,19 @@ add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
 if(STORE_USE_REDIS)
-    target_include_directories(mooncake_store PRIVATE
-        ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+  target_include_directories(mooncake_store
+                             PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
 endif()
-# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g., vendor-specific hardware)
-# to targets that don't need it (e.g., mooncake_master).
-# Targets that need transfer_engine should link it explicitly.
-target_link_libraries(mooncake_store
-    PUBLIC
-        cachelib_memory_allocator
-        ${ETCD_WRAPPER_LIB}
-        glog::glog
-        gflags::gflags
-        ${EXTRA_LIBS}
-        asio_shared
-    PRIVATE
-        transfer_engine
-)
+# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g.,
+# vendor-specific hardware) to targets that don't need it (e.g.,
+# mooncake_master). Targets that need transfer_engine should link it explicitly.
+target_link_libraries(
+  mooncake_store
+  PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
+         ${EXTRA_LIBS} asio_shared
+  PRIVATE transfer_engine)
 if(STORE_USE_ETCD)
-    add_dependencies(mooncake_store build_etcd_wrapper)
+  add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
 if(URING_LIB AND URING_INCLUDE)

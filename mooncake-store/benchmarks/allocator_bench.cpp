@@ -12,7 +12,7 @@ using namespace mooncake::offset_allocator;
 
 class OffsetAllocatorBenchHelper {
    public:
-    OffsetAllocatorBenchHelper(uint64_t baseAddress, uint32_t poolSize,
+    OffsetAllocatorBenchHelper(uint64_t baseAddress, size_t poolSize,
                                uint32_t maxAllocs)
         : pool_size_(poolSize),
           allocated_size_(0),
@@ -160,13 +160,11 @@ void random_size_allocation_benchmark() {
         static_cast<double>(benchmark_num);
 
     std::sort(util_ratios.begin(), util_ratios.end());
-
     const double min_util = util_ratios.front();
     const double max_util = util_ratios.back();
     const double p50 = util_ratios[util_ratios.size() * 0.50];
     const double p90 = util_ratios[util_ratios.size() * 0.10];
     const double p99 = util_ratios[util_ratios.size() * 0.01];
-
     const double mean_util =
         std::accumulate(util_ratios.begin(), util_ratios.end(), 0.0) /
         util_ratios.size();
@@ -178,8 +176,85 @@ void random_size_allocation_benchmark() {
     std::cout << "avg alloc time: " << avg_time_ns << " ns/op" << std::endl;
 }
 
+template <typename BenchHelper>
+void paired_kv_indexer_allocation_benchmark() {
+    std::cout << std::endl
+              << "=== Paired KV/Indexer Allocation Benchmark (DSA) ==="
+              << std::endl;
+
+    const uint32_t kvcache_size = 3274752;                 // 3,274,752 B
+    const uint32_t indexer_size = 643u * 1024;             // 643 KB
+    const size_t pool_size = 600ull * 1024 * 1024 * 1024;  // 600 GB
+    const int max_per_round = 128;
+    const int warmup_rounds = 5000;
+    const int num_rounds = 500000;
+
+    size_t max_allocs = pool_size / indexer_size + 1024;
+    BenchHelper bench_helper(0x1000, pool_size, max_allocs);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> per_round_dist(1, max_per_round);
+
+    // Warmup
+    for (int round = 0; round < warmup_rounds; round++) {
+        int per_round = per_round_dist(gen);
+        for (int i = 0; i < per_round; i++) {
+            bench_helper.allocate(kvcache_size);
+        }
+        for (int i = 0; i < per_round; i++) {
+            bench_helper.allocate(indexer_size);
+        }
+    }
+
+    std::vector<double> util_ratios;
+    util_ratios.reserve(static_cast<size_t>(num_rounds) * 2 * max_per_round);
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    for (int round = 0; round < num_rounds; round++) {
+        int per_round = per_round_dist(gen);
+        for (int i = 0; i < per_round; i++) {
+            bench_helper.allocate(kvcache_size);
+            util_ratios.push_back(bench_helper.get_allocated_ratio());
+        }
+        for (int i = 0; i < per_round; i++) {
+            bench_helper.allocate(indexer_size);
+            util_ratios.push_back(bench_helper.get_allocated_ratio());
+        }
+    }
+    auto end_time = std::chrono::high_resolution_clock::now();
+
+    const double avg_time_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end_time -
+                                                             start_time)
+            .count() /
+        static_cast<double>(util_ratios.size());
+
+    std::sort(util_ratios.begin(), util_ratios.end());
+    const double min_util = util_ratios.front();
+    const double max_util = util_ratios.back();
+    const double p50 = util_ratios[util_ratios.size() * 0.50];
+    const double p90 = util_ratios[util_ratios.size() * 0.10];
+    const double p99 = util_ratios[util_ratios.size() * 0.01];
+    const double mean_util =
+        std::accumulate(util_ratios.begin(), util_ratios.end(), 0.0) /
+        util_ratios.size();
+
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "kvcache size: " << kvcache_size
+              << " B, indexer size: " << indexer_size << " B" << std::endl;
+    std::cout << "pool size: " << (pool_size / (1024.0 * 1024 * 1024))
+              << " GB, warmup rounds: " << warmup_rounds
+              << ", benchmark rounds: " << num_rounds << std::endl;
+    std::cout << "util ratio (min / p99 / p90 / p50 / max / avg): " << min_util
+              << " / " << p99 << " / " << p90 << " / " << p50 << " / "
+              << max_util << " / " << mean_util << std::endl;
+    std::cout << "avg alloc time: " << avg_time_ns << " ns/op" << std::endl;
+}
+
 int main() {
     std::cout << "=== OffsetAllocator Benchmark ===" << std::endl;
     uniform_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
     random_size_allocation_benchmark<OffsetAllocatorBenchHelper>();
+    paired_kv_indexer_allocation_benchmark<OffsetAllocatorBenchHelper>();
 }

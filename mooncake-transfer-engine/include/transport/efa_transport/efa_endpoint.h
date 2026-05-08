@@ -124,6 +124,13 @@ class EfaEndPoint {
     RWSpinlock lock_;  // protects peer_nic_path_ and status_
     std::string peer_nic_path_;
     fi_addr_t peer_fi_addr_;  // slot in context_.av()
+    // Last peer EFA address successfully inserted into the AV.  Used to
+    // make passive handshakes idempotent: when both peers initiate a
+    // handshake concurrently (the common case under bilateral sglang PD
+    // traffic), the second passive handshake carries the same EFA
+    // address as the cached value, and we can skip the fi_av_remove/
+    // fi_av_insert churn entirely.
+    std::string cached_peer_addr_;
 };
 
 }  // namespace mooncake

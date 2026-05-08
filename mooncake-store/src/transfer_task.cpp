@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <vector>
+#include "gpu_staging_utils.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -193,13 +194,35 @@ void MemcpyWorkerPool::workerThread() {
         // Execute the task if we have one
         if (task.state) {
             try {
+                bool ok = true;
                 for (const auto& op : task.operations) {
-                    std::memcpy(op.dest, op.src, op.size);
+                    int src_dev = -1, dst_dev = -1;
+                    bool src_on_gpu =
+                        gpu_staging::IsDevicePointer(op.src, &src_dev);
+                    bool dst_on_gpu =
+                        gpu_staging::IsDevicePointer(op.dest, &dst_dev);
+
+                    if (!src_on_gpu && !dst_on_gpu) {
+                        std::memcpy(op.dest, op.src, op.size);
+                    } else {
+                        int dev = src_on_gpu ? src_dev : dst_dev;
+                        gpu_staging::SetDevice(dev);
+                        if (!gpu_staging::CopyAuto(op.dest, op.src, op.size)) {
+                            LOG(ERROR)
+                                << "GPU memcpy failed: src_dev=" << src_dev
+                                << " dst_dev=" << dst_dev
+                                << " size=" << op.size;
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
 
-                VLOG(2) << "Memcpy task completed successfully with "
-                        << task.operations.size() << " operations";
-                task.state->set_completed(ErrorCode::OK);
+                VLOG(2) << "Memcpy task completed with "
+                        << task.operations.size() << " operations"
+                        << (ok ? "" : " (with GPU copy failure)");
+                task.state->set_completed(ok ? ErrorCode::OK
+                                             : ErrorCode::TRANSFER_FAIL);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
@@ -810,7 +833,7 @@ std::string extractIpAddress(const std::string& endpoint) {
 bool TransferSubmitter::isSameProcessEndpoint(
     const std::string& handle_endpoint, const std::string& local_endpoint) {
     // Local memcpy requires that handle.buffer_address_ is a virtual address
-    // valid in THIS process. Same host is not enough — two processes on the
+    // valid in THIS process. Same host is not enough: two processes on the
     // same host share an IP but have distinct virtual address spaces, so a
     // memcpy on a peer process's address would segfault. Require the full
     // transport endpoint to match, which uniquely identifies the owning

@@ -72,8 +72,8 @@ Environ::Environ() {
     enable_dest_device_affinity_ =
         GetBool("MC_ENABLE_DEST_DEVICE_AFFINITY", false);
     use_ipv6_ = GetBool("MC_USE_IPV6", false);
-    min_prc_port_ = GetInt("MC_MIN_PRC_PORT", 15000);
-    max_prc_port_ = GetInt("MC_MAX_PRC_PORT", 17000);
+    min_rpc_port_ = GetInt("MC_MIN_RPC_PORT", GetInt("MC_MIN_PRC_PORT", 15000));
+    max_rpc_port_ = GetInt("MC_MAX_RPC_PORT", GetInt("MC_MAX_PRC_PORT", 17000));
     enable_parallel_reg_mr_ = GetInt("MC_ENABLE_PARALLEL_REG_MR", -1);
     endpoint_store_type_ = GetString("MC_ENDPOINT_STORE_TYPE", "SIEVE");
     force_tcp_ = GetBool("MC_FORCE_TCP", false);

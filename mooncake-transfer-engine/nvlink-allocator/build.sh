@@ -2,6 +2,8 @@
 
 set -e
 
+source "$(dirname "$(readlink -f "$0")")/../scripts/allocator_build_common.sh"
+
 # Check for flags
 USE_NVCC=false
 USE_HIPCC=false
@@ -25,27 +27,11 @@ fi
 # Get output directory from command line argument, default to current directory
 OUTPUT_DIR=${1:-.}
 
-# Get include directories from second argument (if provided)
-INCLUDE_LIST=""
-if [ $# -ge 2 ]; then
-    INCLUDE_LIST=${2}
-fi
-
-# Add include directory for cuda_alike.h (relative to build.sh location)
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-INCLUDE_LIST="${INCLUDE_LIST:+${INCLUDE_LIST} }${SCRIPT_DIR}/../include"
-
-# Process include directories into flags
-INCLUDE_FLAGS=""
-if [ -n "$INCLUDE_LIST" ]; then
-    INCLUDE_FLAGS=$(echo "$INCLUDE_LIST" | tr ' ' '\n' | sed 's/^/-I/' | paste -sd' ' -)
-fi
+prepare_allocator_build_env "$OUTPUT_DIR" "${2:-}"
 
 echo "Building nvlink allocator to: $OUTPUT_DIR"
-# Create output directory if it doesn't exist
-mkdir -p "$OUTPUT_DIR"
 
-CPP_FILE=$(dirname $(readlink -f $0))/nvlink_allocator.cpp  # get cpp file path, under same dir with this script
+CPP_FILE="${SCRIPT_DIR}/nvlink_allocator.cpp"
 
 # Choose build command based on flags
 if [ "$CI_BUILD" = true ]; then

@@ -31,6 +31,8 @@ This repository also hosts its technical report and the open-sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **May 7, 2026**: 🚀 vLLM officially features [Mooncake Store](https://vllm.ai/blog/mooncake-store) — a deep dive into how Mooncake's distributed KVCache engine supercharges vLLM inference with high-throughput, memory-efficient, cross-instance KV cache sharing!
+- **Apr 29, 2026**: SGLang introduces [RDMA-based P2P weight transfer for large-scale distributed RL](https://lmsys.org/blog/2026-04-29-p2p-update/) using Mooncake TransferEngine, achieving 7x faster weight updates for the 1T-parameter Kimi-K2 model (53s → 7.2s) with zero-copy RDMA transfer across thousands of GPUs.
 - **Mar 19, 2026**: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale) is [open sourced](https://github.com/torchspec-project/TorchSpec), using Mooncake to decouple inference and training via efficient hidden states management.
 - **Mar 5, 2026**: [LightX2V](https://github.com/ModelTC/LightX2V/pull/893) now supports disaggregated deployment based on Mooncake, enabling encoder/transformer service decoupling with Mooncake Transfer Engine for high-performance cross-device and cross-machine data transfer.
 - **Feb 25, 2026**: [SGLang](https://github.com/sgl-project/sglang) merged [Encoder Global Cache Manager](https://github.com/sgl-project/sglang/pull/16137), introducing a Mooncake-powered global multimodal embedding cache that enables cross-instance sharing of ViT embeddings to avoid redundant GPU computation.
@@ -220,8 +222,29 @@ docker build -f docker/mooncake.Dockerfile \
 The resulting image already has a virtual environment at `/opt/venv` with the freshly built wheel installed. Launch it with GPU/RDMA access as needed, for example:
 
 ```bash
-docker run --gpus all --network host -it mooncake:from-source /bin/bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+
+docker run --gpus all \
+  --network host \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --shm-size=128g \
+  -e MC_STORE_USE_HUGEPAGE=1 \
+  -e MC_STORE_HUGEPAGE_SIZE=2MB \
+  -e MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb \
+  -e MC_MMAP_ARENA_POOL_SIZE=56gb \
+  -it mooncake:from-source /bin/bash
 ```
+
+The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not allocator defaults. The arena is off by default. Setting `MC_MMAP_ARENA_POOL_SIZE=...` explicitly both enables and sizes the arena; if you enable it via gflag instead, the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) instead when you want the baseline direct-`mmap()` path. Like the arena size itself, this must be set before the first Mooncake mmap-buffer allocation in the process. Arena bring-up is a one-shot lazy init, so after a failed first attempt you need to restart the process to retry with corrected env / hugepage settings. Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is present, Mooncake instead preserves the strict hugepage contract for both arena and direct-`mmap()` host-buffer allocation instead of silently downgrading to regular pages.
 
 > [!NOTE]
 > Make sure you build the image from the repository root so that Git metadata and submodules are available inside the build context.

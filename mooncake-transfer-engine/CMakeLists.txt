@@ -73,5 +73,7 @@ endif()
 
 if (USE_TENT)
   add_subdirectory(tent)
-  add_subdirectory(benchmark)
+  if (BUILD_BENCHMARK)
+    add_subdirectory(benchmark)
+  endif()
 endif()

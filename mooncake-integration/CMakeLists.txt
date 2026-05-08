@@ -1,34 +1,39 @@
 file(GLOB SOURCES "*.cpp")
 include(${CMAKE_CURRENT_LIST_DIR}/../mooncake-common/SetupPython.cmake)
 execute_process(
-    COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print([s for s in sys.path if 'packages' in s][0])"
-    OUTPUT_VARIABLE PYTHON_SYS_PATH
-)
+  COMMAND ${PYTHON_EXECUTABLE} -c
+          "import sys; print([s for s in sys.path if 'packages' in s][0])"
+  OUTPUT_VARIABLE PYTHON_SYS_PATH)
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
 
 if("${PYTHON_SYS_PATH}" STREQUAL "")
-    message(FATAL_ERROR "Python path is empty! Please check the python env.")
+  message(FATAL_ERROR "Python path is empty! Please check the python env.")
 endif()
 
-if (WITH_STORE)
-    include_directories("../mooncake-store/include")
-    include_directories("../mooncake-store/include/cachelib_memory_allocator")
+if(WITH_STORE)
+  include_directories("../mooncake-store/include")
+  include_directories("../mooncake-store/include/cachelib_memory_allocator")
 
-    include_directories("../mooncake-store/include/cachelib_memory_allocator/include")
-    include_directories("../mooncake-store/include/cachelib_memory_allocator/fake_include")
+  include_directories(
+    "../mooncake-store/include/cachelib_memory_allocator/include")
+  include_directories(
+    "../mooncake-store/include/cachelib_memory_allocator/fake_include")
 endif()
 
 include_directories("/usr/include/jsoncpp")
 include_directories("./")
 include_directories("../mooncake-transfer-engine/include")
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(
+  Python3
+  COMPONENTS Interpreter Development
+  REQUIRED)
 
 execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
-    OUTPUT_VARIABLE PYTHON_EXT_SUFFIX
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+  OUTPUT_VARIABLE PYTHON_EXT_SUFFIX
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
@@ -37,179 +42,161 @@ message("${PYTHON_SYS_PATH}")
 
 set(PYTHON_PACKAGE_NAME "mooncake")
 
-if (WITH_TE)
-    pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-        transfer_engine/transfer_engine_py.cpp
-    )
-    set_target_properties(engine PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
-    )
+if(WITH_TE)
+  pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+                      transfer_engine/transfer_engine_py.cpp)
+  set_target_properties(engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 
-    # Propagate EFA compile definition to engine target
-    if(USE_EFA)
-        target_compile_definitions(engine PRIVATE USE_EFA)
-    endif()
+  # Propagate EFA compile definition to engine target
+  if(USE_EFA)
+    target_compile_definitions(engine PRIVATE USE_EFA)
+  endif()
 
-    target_link_libraries(engine PRIVATE
-        $<TARGET_OBJECTS:rpc_communicator>
-    )
+  target_link_libraries(engine PRIVATE $<TARGET_OBJECTS:rpc_communicator>)
 
-    target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
-    target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
-    if (USE_ASCEND_DIRECT)
-        target_link_libraries(engine PUBLIC
-            ascendcl
-            transfer_engine
-            glog::glog
-            gflags::gflags
-        )
-    else()
-        target_link_libraries(engine PUBLIC
-            transfer_engine
-            glog::glog
-            gflags::gflags
-        )
-    endif()
+  target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
+  target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
+  if(USE_ASCEND_DIRECT)
+    target_link_libraries(engine PUBLIC ascendcl transfer_engine glog::glog
+                                        gflags::gflags)
+  else()
+    target_link_libraries(engine PUBLIC transfer_engine glog::glog
+                                        gflags::gflags)
+  endif()
 
-    if (USE_CUDA)
-        find_package(CUDAToolkit REQUIRED)
-        target_link_libraries(engine PRIVATE CUDA::cudart)
-    endif()
+  if(USE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(engine PRIVATE CUDA::cudart)
+  endif()
 endif()
 
-
-set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
-set(UBSHMEM_ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so")
+set(ALLOCATOR_SO_PATH
+    "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so"
+)
+set(UBSHMEM_ALLOCATOR_SO_PATH
+    "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so"
+)
 
 if(USE_MNNVL)
-    message(STATUS "USE_MNNVL is enabled, nvlink_allocator.so will be installed in the Python package")
-    install(FILES
-        "${ALLOCATOR_SO_PATH}"
-        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
-    )
+  message(
+    STATUS
+      "USE_MNNVL is enabled, nvlink_allocator.so will be installed in the Python package"
+  )
+  install(FILES "${ALLOCATOR_SO_PATH}"
+          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
 if(USE_UBSHMEM)
-    message(STATUS "USE_UBSHMEM is enabled, ubshmem_fabric_allocator.so will be installed in the Python package")
-    install(FILES
-        "${UBSHMEM_ALLOCATOR_SO_PATH}"
-        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
-    )
+  message(
+    STATUS
+      "USE_UBSHMEM is enabled, ubshmem_fabric_allocator.so will be installed in the Python package"
+  )
+  install(FILES "${UBSHMEM_ALLOCATOR_SO_PATH}"
+          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
-if (WITH_STORE)
-    pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-        store/store_py.cpp
-        integration_utils.h
-    )
-    set_target_properties(store PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
-    )
-    if (USE_ASCEND_DIRECT)
-        target_link_libraries(store PUBLIC
-            ascendcl
-            transfer_engine
-            glog::glog
-            gflags::gflags
-            mooncake_store
-            cachelib_memory_allocator
-        )
-    else()
-        target_link_libraries(store PUBLIC
-            transfer_engine
-            glog::glog
-            gflags::gflags
-            mooncake_store
-            cachelib_memory_allocator
-        )
-    endif()
+if(WITH_STORE)
+  pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+                      store/store_py.cpp integration_utils.h)
+  set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
+  if(USE_ASCEND_DIRECT)
+    target_link_libraries(
+      store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags
+                   mooncake_store cachelib_memory_allocator)
+  else()
+    target_link_libraries(
+      store PUBLIC transfer_engine glog::glog gflags::gflags mooncake_store
+                   cachelib_memory_allocator)
+  endif()
 endif()
 
 message("${PYTHON_SYS_PATH}")
 
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/__init__.py
-    "# Auto-generated by CMake\n"
-)
+     "# Auto-generated by CMake\n")
 
-if (USE_MNNVL)
-    message(STATUS "allocator.py will be installed in the Python package")
-    install(FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/allocator.py"
-        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
-    )
+if(USE_MNNVL)
+  message(STATUS "allocator.py will be installed in the Python package")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/allocator.py"
+          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
-if (USE_UBSHMEM)
-    message(STATUS "allocator_ascend_npu.py will be installed in the Python package")
-    install(FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/allocator_ascend_npu.py"
-        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
-    )
+if(USE_UBSHMEM)
+  message(
+    STATUS "allocator_ascend_npu.py will be installed in the Python package")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/allocator_ascend_npu.py"
+          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()
+
+if(USE_MNNVL OR USE_UBSHMEM)
+  message(
+    STATUS "fabric_allocator_utils.py will be installed in the Python package")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/fabric_allocator_utils.py"
+          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
 if(USE_INTRA_NVLINK)
-    message(STATUS "USE_INTRA_NVLINK is enabled, IntraNode nvlink is now activated")
+  message(
+    STATUS "USE_INTRA_NVLINK is enabled, IntraNode nvlink is now activated")
 endif()
 
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
-#Install Python scripts from mooncake - wheel / mooncake / directory
-install(FILES
+# Install Python scripts from mooncake - wheel / mooncake / directory
+install(
+  FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_connector_v1.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/vllm_v1_proxy_server.py"
-    DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
-)
+  DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
-if (WITH_STORE)
-    install(FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
-        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
-    )
+if(WITH_STORE)
+  install(
+    FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
+    DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
-install(
-    DIRECTORY
-        ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/
-    DESTINATION
-        ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
-)
+install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
 install(
-    CODE "
+  CODE "
         execute_process(COMMAND chmod 767 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}\")
         execute_process(COMMAND chmod 766 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/__init__.py\")
-    "
-)
+    ")
 
-if (WITH_STORE)
-    install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+if(WITH_STORE)
+  install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
-if (WITH_TE)
-    install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
-    install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+if(WITH_TE)
+  install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+  install(TARGETS asio_shared
+          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
-if (WITH_EP)
-    install(
-        DIRECTORY "${EP_PG_STAGING_DIR}/"
-        DESTINATION "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}"
-        FILES_MATCHING PATTERN "*.so"
-    )
-    install(FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/ep.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ep_buffer.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
-        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
-    )
-    # ep.so / pg.so link against engine.so by that exact bare name.
-    # Create a engine.so -> engine<EXT_SUFFIX> symlink so they can find it.
-    install(CODE "
+if(WITH_EP)
+  install(
+    DIRECTORY "${EP_PG_STAGING_DIR}/"
+    DESTINATION "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}"
+    FILES_MATCHING
+    PATTERN "*.so")
+  install(
+    FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/ep.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ep_buffer.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
+    DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+  # ep.so / pg.so link against engine.so by that exact bare name. Create a
+  # engine.so -> engine<EXT_SUFFIX> symlink so they can find it.
+  install(
+    CODE "
         execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink
             \"engine${PYTHON_EXT_SUFFIX}\"
             \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/engine.so\"

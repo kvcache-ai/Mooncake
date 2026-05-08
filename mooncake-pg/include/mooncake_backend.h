@@ -11,19 +11,56 @@
 #include <sys/types.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <transfer_engine.h>
 
 namespace mooncake {
 
-class MooncakeBackend final : public ::c10d::Backend {
+// Forward declaration – MooncakeP2PShim holds a non-owning pointer to
+// MooncakeBackend, which is defined below.
+class MooncakeBackend;
+
+// Lightweight Backend shim that delegates P2P send/recv back to the owning
+// MooncakeBackend.  PyTorch's P2P dispatch (batch_isend_irecv, isend, irecv)
+// requires getBackend() to return a registered c10d::Backend instance.
+// Since MooncakeBackend inherits from ProcessGroup (not Backend), we register
+// this shim in the ProcessGroup's deviceTypeToBackend_ map so that the P2P
+// path can find it.  The shim holds a non-owning pointer to its owner and
+// delegates only the operations that the P2P dispatch path calls (send, recv,
+// getBackendName, supportsCoalescing).
+class MooncakeP2PShim final : public ::c10d::Backend {
    public:
-    struct MooncakeBackendOptions final : ::c10d::Backend::Options {
+    explicit MooncakeP2PShim(MooncakeBackend* owner);
+
+    const std::string getBackendName() const override;
+
+    bool supportsCoalescing() const override { return false; }
+
+    c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors,
+                                        int dstRank, int tag) override;
+
+    c10::intrusive_ptr<c10d::Work> recv(std::vector<at::Tensor>& tensors,
+                                        int srcRank, int tag) override;
+
+    c10::intrusive_ptr<c10d::Work> recvAnysource(
+        std::vector<at::Tensor>& tensors, int tag) override;
+
+    c10::intrusive_ptr<c10d::Work> barrier(
+        const c10d::BarrierOptions& opts) override;
+
+   private:
+    // Non-owning: the shim is stored in ProcessGroup's backend maps which are
+    // cleared on destruction, and MooncakeBackend always outlives the shim.
+    MooncakeBackend* owner_;
+};
+
+class MooncakeBackend final : public ::c10d::ProcessGroup {
+   public:
+    struct MooncakeBackendOptions final : torch::CustomClassHolder {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
-            : Options{"mooncake"}, activeRanks_{activeRanks} {}
+            : activeRanks_{activeRanks} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
-            : Options{"mooncake"},
-              activeRanks_{activeRanks},
-              isExtension_{isExtension} {}
+            : activeRanks_{activeRanks}, isExtension_{isExtension} {}
 
         ~MooncakeBackendOptions() override = default;
 
@@ -50,20 +87,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
-    /**
-     * @brief Return the stored Mooncake-specific backend options.
-     *
-     * PyTorch can use this to read Mooncake-specific options from an existing
-     * process group. This is used, for example, create sub-groups that inherit
-     * settings from the parent group.
-     *
-     * @return The stored backend options, or null when the backend was created
-     * without explicit Mooncake options.
-     */
-    c10::intrusive_ptr<::c10d::Backend::Options> getBackendOptions() override {
-        return c10::static_intrusive_pointer_cast<::c10d::Backend::Options>(
-            options_);
-    }
+    int getSize() const override { return meta_ ? meta_->size : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -207,6 +231,14 @@ class MooncakeBackend final : public ::c10d::Backend {
     std::shared_ptr<ConnectionContext> connection_ctx_;
     bool connectionPollerRegistered_{false};
 };
+
+struct ExtensionState {
+    std::vector<bool> activeRanks;
+    std::vector<uint32_t> p2pEpochs;
+    int taskCount = -1;
+};
+std::vector<uint8_t> serialize(const ExtensionState& state);
+ExtensionState deserialize(const std::vector<uint8_t>& buffer);
 
 }  // namespace mooncake
 

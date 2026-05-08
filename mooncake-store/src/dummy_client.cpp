@@ -299,8 +299,15 @@ int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
         return 0;
     }
     if (!globalConfig().ascend_use_fabric_mem) {
-        LOG(ERROR) << "Host mem is only supported in fabric mem mode.";
-        return -1;
+        // Host: memfd + mmap (ShmHelper); register with Real like non-agent GPU
+        // path.
+        if (shm->fd < 0) {
+            LOG(ERROR)
+                << "Host POSIX shared memory requires memfd-backed allocation "
+                   "(use ShmHelper::allocate / alloc_from_mem_pool)";
+            return -1;
+        }
+        return register_shm_via_ipc(shm, is_local);
     }
 
     // Fabric host mem shared by vmm
@@ -385,6 +392,8 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
     req.client_id_second = client_id_.second;
     req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm->base_addr);
     req.shm_size = shm->size;
+    req.device_id = globalConfig().ascend_agent_mode ? device_id_
+                                                     : kInvalidPhysicalDeviceId;
     req.is_local_buffer = is_local;
 
     if (ipc_send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
@@ -482,16 +491,16 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         }
         local_buffer_shm->registered = true;
         local_buffer_shm->is_local = true;
+
+        // Best-effort: request hot cache shm from real client
+        if (request_hot_cache_fd() != 0) {
+            LOG(INFO)
+                << "Hot cache shm not available (real client may not have it)";
+        }
     }
 
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
-
-    // Best-effort: request hot cache shm from real client
-    if (request_hot_cache_fd() != 0) {
-        LOG(INFO)
-            << "Hot cache shm not available (real client may not have it)";
-    }
     return 0;
 }
 
@@ -517,6 +526,12 @@ int DummyClient::tearDownAll() {
     }
     connected_.store(false);
     last_ping_healthy_.store(false);
+#if defined(USE_ASCEND_DIRECT)
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_.clear();
+    }
+#endif
     return 0;
 }
 
@@ -533,22 +548,103 @@ int64_t DummyClient::unregister_shm() {
         invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_));
 }
 
+#if defined(USE_ASCEND_DIRECT)
+int DummyClient::register_device_buffer_for_reconnect(void* buffer,
+                                                      size_t size) {
+    const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        auto it = registered_device_buffers_.find(buffer_addr);
+        if (it != registered_device_buffers_.end() && it->second != size) {
+            LOG(ERROR) << "Device buffer size mismatch for tracked buffer, "
+                       << "buffer=" << buffer << ", size=" << size
+                       << ", tracked_size=" << it->second;
+            return -1;
+        }
+    }
+
+    ShmHelper::ShmSegment shm{};
+    shm.base_addr = buffer;
+    shm.size = size;
+    if (register_ascend_shm(&shm, false) != 0) {
+        LOG(ERROR) << "Failed to register device buffer, buffer=" << buffer
+                   << ", size=" << size;
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_[buffer_addr] = size;
+    }
+    return 0;
+}
+
+int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
+    const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        if (registered_device_buffers_.find(buffer_addr) ==
+            registered_device_buffers_.end()) {
+            LOG(ERROR) << "Device buffer is not registered with RealClient";
+            return -1;
+        }
+    }
+
+    auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
+        buffer_addr, client_id_);
+    if (ret.has_value()) {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_.erase(buffer_addr);
+    }
+    return to_py_ret(ret);
+}
+
+std::vector<ShmHelper::ShmSegment> DummyClient::get_registered_device_buffers()
+    const {
+    std::vector<ShmHelper::ShmSegment> device_buffers;
+    std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+    device_buffers.reserve(registered_device_buffers_.size());
+    for (const auto& [buffer_addr, size] : registered_device_buffers_) {
+        ShmHelper::ShmSegment shm{};
+        shm.base_addr = reinterpret_cast<void*>(buffer_addr);
+        shm.size = size;
+        device_buffers.push_back(std::move(shm));
+    }
+    return device_buffers;
+}
+#endif
+
 // Dummy only register buffer within the shared memory region
 int DummyClient::register_buffer(void* buffer, size_t size) {
     if (buffer == nullptr) {
         LOG(ERROR) << "Invalid buffer pointer";
         return -1;
     }
+#if defined(USE_ASCEND_DIRECT)
     if (globalConfig().ascend_agent_mode) {
-        auto shm = std::make_shared<ShmHelper::ShmSegment>();
-        shm->base_addr = buffer;
-        shm->size = size;
-        if (register_ascend_shm(shm.get(), false) != 0) {
-            LOG(ERROR) << "Failed to implicitly register new ascend shm.";
+        aclrtPtrAttributes attributes{};
+        auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
+        if (acl_ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Failed to get pointer attributes, ret=" << acl_ret;
             return -1;
         }
-        return 0;
+        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            return register_device_buffer_for_reconnect(buffer, size);
+        }
+        if (globalConfig().ascend_use_fabric_mem) {
+            auto shm = std::make_shared<ShmHelper::ShmSegment>();
+            shm->base_addr = buffer;
+            shm->size = size;
+            if (register_ascend_shm(shm.get(), false) != 0) {
+                LOG(ERROR) << "Failed to register buffer, buffer=" << buffer
+                           << ", size=" << size;
+                return -1;
+            }
+            return 0;
+        }
+        // non-Fabric Host: same rules as shm
     }
+#endif
     // Find which shm this buffer belongs to
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) {
@@ -586,6 +682,17 @@ int DummyClient::unregister_buffer(void* buffer) {
         LOG(ERROR) << "Invalid buffer pointer";
         return -1;
     }
+
+#if defined(USE_ASCEND_DIRECT)
+    if (globalConfig().ascend_agent_mode) {
+        aclrtPtrAttributes attributes{};
+        auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
+        if (acl_ret == ACL_ERROR_NONE &&
+            attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            return unregister_device_buffer_for_reconnect(buffer);
+        }
+    }
+#endif
 
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) {
@@ -1141,23 +1248,39 @@ void DummyClient::ping_thread_main() {
                         if (globalConfig().ascend_agent_mode) {
                             if (register_ascend_shm(shm_ptr.get(),
                                                     shm_ptr->is_local) != 0) {
-                                LOG(WARNING) << "Failed to re-register VMM "
-                                                "during reconnection";
-                                all_registered = false;
-                                break;
-                            }
-                        } else {
-                            if (register_shm_via_ipc(shm_ptr.get(),
-                                                     shm_ptr->is_local) != 0) {
                                 LOG(WARNING)
-                                    << "Failed to re-register shared memory "
-                                       "during reconnection";
+                                    << "Failed to re-register Ascend shared "
+                                       "memory during reconnection";
                                 all_registered = false;
                                 break;
                             }
+                        } else if (register_shm_via_ipc(
+                                       shm_ptr.get(), shm_ptr->is_local) != 0) {
+                            LOG(WARNING)
+                                << "Failed to re-register shared memory "
+                                   "during reconnection";
+                            all_registered = false;
+                            break;
                         }
                     }
                 }
+
+#if defined(USE_ASCEND_DIRECT)
+                if (all_registered && globalConfig().ascend_agent_mode) {
+                    auto device_buffers = get_registered_device_buffers();
+                    for (const auto& device_buffer : device_buffers) {
+                        if (register_ascend_shm(&device_buffer, false) != 0) {
+                            LOG(WARNING)
+                                << "Failed to re-register device buffer "
+                                   "during reconnection, buffer="
+                                << device_buffer.base_addr
+                                << ", size=" << device_buffer.size;
+                            all_registered = false;
+                            break;
+                        }
+                    }
+                }
+#endif
 
                 if (all_registered) {
                     LOG(INFO)

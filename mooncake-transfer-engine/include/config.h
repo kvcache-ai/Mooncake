@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace mooncake {
 
@@ -91,6 +92,11 @@ void updateGlobalConfig(ibv_device_attr& device_attr);
 GlobalConfig& globalConfig();
 
 uint16_t getDefaultHandshakePort();
+
+// Validates a port range. Returns {default_min, default_max} on invalid input.
+// Rejects: min > max, well-known ports (0-1023), ephemeral ports (32768-60999).
+std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                      int default_min, int default_max);
 
 }  // namespace mooncake
 
