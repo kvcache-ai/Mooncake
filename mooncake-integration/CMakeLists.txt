@@ -98,7 +98,7 @@ endif()
 
 if(WITH_STORE)
   pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-                      store/store_py.cpp store/engram_py.cpp integration_utils.h)
+                      store/store_py.cpp store/engram_store_py.cpp integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
   if(USE_ASCEND_DIRECT)
     target_link_libraries(

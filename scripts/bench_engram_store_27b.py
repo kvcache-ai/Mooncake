@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Engram backend benchmark.
+EngramStore backend benchmark.
 
 Scenario:
   - 1 token per request (L=1)
@@ -13,10 +13,10 @@ Usage:
 
   export MOONCAKE_MASTER=127.0.0.1:50051
   export MOONCAKE_TE_META_DATA_SERVER=http://127.0.0.1:8080/metadata
-  python scripts/bench_engram_27b.py
+  python scripts/bench_engram_store_27b.py
 
 Optional:
-  export ENGRAM_ALLOW_POPULATE_FALLBACK=1
+  export ENGRAM_STORE_ALLOW_POPULATE_FALLBACK=1
 """
 
 import ctypes
@@ -48,12 +48,12 @@ NUM_ITER = 50
 TABLE_VOCAB_SIZES = [50000] * 8
 EMBEDDING_DIM = 16
 ALLOW_POPULATE_FALLBACK = (
-    os.environ.get("ENGRAM_ALLOW_POPULATE_FALLBACK", "0") == "1"
+    os.environ.get("ENGRAM_STORE_ALLOW_POPULATE_FALLBACK", "0") == "1"
 )
 
 
-def create_engram_config():
-    cfg = store.EngramConfig()
+def create_engram_store_config():
+    cfg = store.EngramStoreConfig()
     cfg.table_vocab_sizes = TABLE_VOCAB_SIZES
     cfg.embedding_dim = EMBEDDING_DIM
     return cfg
@@ -121,17 +121,17 @@ def populate_store_via_cxl_segment(store_obj, keys, embedding_buffers):
         raise
 
 
-def populate_store(engram, store_obj):
-    keys = engram.get_store_keys()
+def populate_store(engram_store, store_obj):
+    keys = engram_store.get_store_keys()
     embedding_buffers = []
-    for vocab_size in engram.get_table_vocab_sizes():
-        emb = np.random.randn(vocab_size, engram.get_embedding_dim()).astype(np.float32)
+    for vocab_size in engram_store.get_table_vocab_sizes():
+        emb = np.random.randn(vocab_size, engram_store.get_embedding_dim()).astype(np.float32)
         embedding_buffers.append(emb)
 
     t0 = time.perf_counter()
-    mode = "engram.populate"
+    mode = "engram_store.populate"
     try:
-        engram.populate(embedding_buffers)
+        engram_store.populate(embedding_buffers)
     except RuntimeError:
         if not ALLOW_POPULATE_FALLBACK:
             raise
@@ -158,30 +158,30 @@ def populate_store(engram, store_obj):
     return embedding_buffers, populate_ms, mode
 
 
-def make_row_ids(engram, batch_size, seq_len):
+def make_row_ids(engram_store, batch_size, seq_len):
     row_ids = []
     for b in range(batch_size):
         batch = []
         for l in range(seq_len):
             token_rows = []
-            for head, vocab_size in enumerate(engram.get_table_vocab_sizes()):
+            for head, vocab_size in enumerate(engram_store.get_table_vocab_sizes()):
                 token_rows.append((b * seq_len + l + head) % vocab_size)
             batch.append(token_rows)
         row_ids.append(batch)
     return row_ids
 
 
-def run_benchmark(engram, batch_size, num_warmup, num_iter):
+def run_benchmark(engram_store, batch_size, num_warmup, num_iter):
     seq_len = 1
-    row_ids = make_row_ids(engram, batch_size, seq_len)
+    row_ids = make_row_ids(engram_store, batch_size, seq_len)
 
     for _ in range(num_warmup):
-        engram.lookup(row_ids)
+        engram_store.lookup(row_ids)
 
     total_ms_list = []
     for _ in range(num_iter):
         t0 = time.perf_counter()
-        engram.lookup(row_ids)
+        engram_store.lookup(row_ids)
         t1 = time.perf_counter()
         total_ms_list.append((t1 - t0) * 1000)
 
@@ -194,8 +194,8 @@ def run_benchmark(engram, batch_size, num_warmup, num_iter):
     bytes_per_request = (
         batch_size
         * seq_len
-        * engram.get_num_heads()
-        * engram.get_embedding_dim()
+        * engram_store.get_num_heads()
+        * engram_store.get_embedding_dim()
         * 4
     )
     gbps = (bytes_per_request / 1e9) / (mean_total / 1000)
@@ -210,9 +210,9 @@ def run_benchmark(engram, batch_size, num_warmup, num_iter):
     }
 
 
-def validate_lookup_correctness(engram, embedding_buffers):
-    row_ids = make_row_ids(engram, batch_size=1, seq_len=1)
-    output = np.asarray(engram.lookup(row_ids))
+def validate_lookup_correctness(engram_store, embedding_buffers):
+    row_ids = make_row_ids(engram_store, batch_size=1, seq_len=1)
+    output = np.asarray(engram_store.lookup(row_ids))
 
     max_abs_err = 0.0
     for head_idx in range(output.shape[2]):
@@ -225,7 +225,7 @@ def validate_lookup_correctness(engram, embedding_buffers):
 
 def main():
     print("=" * 60)
-    print("Engram Backend Benchmark")
+    print("EngramStore Backend Benchmark")
     print("  Config: 1 token, Mooncake row-id lookup only")
     print("  Batch sizes: 1, 4, 16, 64, 128, 256")
     print(f"  Build dir: {build_dir}")
@@ -247,15 +247,15 @@ def main():
     if rc != 0:
         raise RuntimeError(f"Failed to setup Mooncake store, rc={rc}")
 
-    engram = None
+    engram_store = None
     try:
-        cfg = create_engram_config()
+        cfg = create_engram_store_config()
         layer_id = uuid.uuid4().int & 0x7FFFFFFF
-        engram = store.Engram(layer_id=layer_id, config=cfg, store=store_obj)
-        embedding_buffers, populate_ms, mode = populate_store(engram, store_obj)
+        engram_store = store.EngramStore(layer_id=layer_id, config=cfg, store=store_obj)
+        embedding_buffers, populate_ms, mode = populate_store(engram_store, store_obj)
         print(f"Populate mode: {mode}, took {populate_ms:.2f} ms")
 
-        max_abs_err = validate_lookup_correctness(engram, embedding_buffers)
+        max_abs_err = validate_lookup_correctness(engram_store, embedding_buffers)
         print(f"Max abs error: {max_abs_err:.6f}")
 
         print("\nResults:")
@@ -263,15 +263,15 @@ def main():
             f"{'Batch':>8} {'Mean(ms)':>10} {'P50(ms)':>10} {'P99(ms)':>10} {'Tok/s':>12} {'GB/s':>10}"
         )
         for batch_size in BATCH_SIZES:
-            result = run_benchmark(engram, batch_size, NUM_WARMUP, NUM_ITER)
+            result = run_benchmark(engram_store, batch_size, NUM_WARMUP, NUM_ITER)
             print(
                 f"{result['batch_size']:>8} {result['mean_total_ms']:>10.3f} {result['p50_ms']:>10.3f} "
                 f"{result['p99_ms']:>10.3f} {result['tokens_per_sec']:>12.1f} {result['gbps']:>10.3f}"
             )
     finally:
-        if engram is not None:
+        if engram_store is not None:
             try:
-                engram.remove_from_store(force=True)
+                engram_store.remove_from_store(force=True)
             except Exception as exc:
                 print(f"Warning: failed to clean up benchmark layer: {exc}")
         store_obj.close()

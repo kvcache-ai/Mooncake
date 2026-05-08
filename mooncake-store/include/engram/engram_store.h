@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "engram/engram_config.h"
+#include "engram/engram_store_config.h"
 
 namespace mooncake {
 
@@ -24,12 +24,12 @@ namespace engram {
  * It does not implement tokenizer compression, N-gram hashing, routing,
  * gating, convolution, or any other model-side Engram logic.
  */
-class Engram {
+class EngramStore {
    public:
-    Engram(int layer_id, const EngramConfig& config,
-           std::shared_ptr<PyClient> store = nullptr);
+    EngramStore(int layer_id, const EngramStoreConfig& config,
+                std::shared_ptr<PyClient> store = nullptr);
 
-    ~Engram() = default;
+    ~EngramStore() = default;
 
     /**
      * Lookup embedding rows for a batch of precomputed row IDs.
@@ -54,8 +54,8 @@ class Engram {
     int get_embedding_dim() const;
 
     /**
-     * Remove all head tables owned by this Engram layer from Mooncake Store.
-     * Missing keys are ignored. Returns the number of removed tables on
+     * Remove all head tables owned by this EngramStore layer from Mooncake
+     * Store. Missing keys are ignored. Returns the number of removed tables on
      * success, or a negative error code on failure.
      */
     int remove_from_store(bool force = false);

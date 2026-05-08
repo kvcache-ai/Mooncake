@@ -4,8 +4,8 @@
 
 #include <cstring>
 
-#include "engram/engram.h"
-#include "engram/engram_config.h"
+#include "engram/engram_store.h"
+#include "engram/engram_store_config.h"
 #include "pyclient.h"
 
 namespace py = pybind11;
@@ -72,7 +72,8 @@ std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
 
     if (!py::hasattr(store_obj, kPyClientCapsuleMethod)) {
         throw std::runtime_error(
-            "Engram store parameter must be a PyClient or store wrapper that "
+            "EngramStore store parameter must be a PyClient or store wrapper "
+            "that "
             "implements _get_pyclient_capsule()");
     }
 
@@ -80,8 +81,9 @@ std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
         py::object capsule = store_obj.attr(kPyClientCapsuleMethod)();
         return unwrap_pyclient_capsule(capsule);
     } catch (const py::error_already_set& e) {
-        throw std::runtime_error("Failed to unwrap store wrapper for Engram: " +
-                                 std::string(e.what()));
+        throw std::runtime_error(
+            "Failed to unwrap store wrapper for EngramStore: " +
+            std::string(e.what()));
     }
 }
 
@@ -112,7 +114,7 @@ py::array_t<float> require_embedding_buffer(py::handle buf,
 }
 
 py::array_t<float> lookup_to_numpy(
-    Engram& self,
+    EngramStore& self,
     const std::vector<std::vector<std::vector<int64_t>>>& row_ids) {
     if (row_ids.empty() || row_ids[0].empty()) {
         throw std::runtime_error("row_ids must not be empty");
@@ -128,13 +130,13 @@ py::array_t<float> lookup_to_numpy(
     int ret =
         self.lookup_rows(row_ids, out_buf.ptr, out_buf.size * sizeof(float));
     if (ret != 0) {
-        throw std::runtime_error("Engram lookup failed");
+        throw std::runtime_error("EngramStore lookup failed");
     }
     return output;
 }
 
 py::array_t<float> lookup_array_to_numpy(
-    Engram& self,
+    EngramStore& self,
     const py::array_t<int64_t, py::array::c_style | py::array::forcecast>&
         row_ids) {
     auto req = row_ids.request();
@@ -157,7 +159,7 @@ py::array_t<float> lookup_array_to_numpy(
         self.lookup_rows_contiguous(static_cast<const int64_t*>(req.ptr), B, L,
                                     out_buf.ptr, out_buf.size * sizeof(float));
     if (ret != 0) {
-        throw std::runtime_error("Engram lookup failed");
+        throw std::runtime_error("EngramStore lookup failed");
     }
     return output;
 }
@@ -167,20 +169,21 @@ py::array_t<float> lookup_array_to_numpy(
 namespace mooncake {
 namespace engram {
 
-void bind_engram(py::module& m) {
-    py::class_<EngramConfig>(m, "EngramConfig")
+void bind_engram_store(py::module& m) {
+    py::class_<EngramStoreConfig>(m, "EngramStoreConfig")
         .def(py::init<>())
-        .def_readwrite("table_vocab_sizes", &EngramConfig::table_vocab_sizes)
-        .def_readwrite("embedding_dim", &EngramConfig::embedding_dim);
+        .def_readwrite("table_vocab_sizes",
+                       &EngramStoreConfig::table_vocab_sizes)
+        .def_readwrite("embedding_dim", &EngramStoreConfig::embedding_dim);
 
-    py::class_<Engram>(m, "Engram")
-        .def("get_table_vocab_sizes", &Engram::get_table_vocab_sizes)
-        .def("get_store_keys", &Engram::get_store_keys)
-        .def("get_num_heads", &Engram::get_num_heads)
-        .def("get_embedding_dim", &Engram::get_embedding_dim)
+    py::class_<EngramStore>(m, "EngramStore")
+        .def("get_table_vocab_sizes", &EngramStore::get_table_vocab_sizes)
+        .def("get_store_keys", &EngramStore::get_store_keys)
+        .def("get_num_heads", &EngramStore::get_num_heads)
+        .def("get_embedding_dim", &EngramStore::get_embedding_dim)
         .def(
             "remove_from_store",
-            [](Engram& self, bool force) {
+            [](EngramStore& self, bool force) {
                 int ret = self.remove_from_store(force);
                 if (ret < 0) {
                     throw std::runtime_error("remove_from_store failed, rc=" +
@@ -189,19 +192,19 @@ void bind_engram(py::module& m) {
                 return ret;
             },
             py::arg("force") = false,
-            "Remove all Mooncake Store tables owned by this Engram layer. "
+            "Remove all Mooncake Store tables owned by this EngramStore layer. "
             "Returns the number of removed head tables; missing keys are "
             "ignored.")
-        .def(py::init([](int layer_id, const EngramConfig& cfg,
+        .def(py::init([](int layer_id, const EngramStoreConfig& cfg,
                          py::object store_obj) {
                  std::shared_ptr<PyClient> store = unwrap_store(store_obj);
-                 return new Engram(layer_id, cfg, store);
+                 return new EngramStore(layer_id, cfg, store);
              }),
              py::arg("layer_id"), py::arg("config"),
              py::arg("store") = py::none())
         .def(
             "lookup",
-            [](Engram& self, py::object row_ids_obj) {
+            [](EngramStore& self, py::object row_ids_obj) {
                 if (py::isinstance<py::array>(row_ids_obj)) {
                     auto row_ids_array = py::array_t<
                         int64_t, py::array::c_style |
@@ -218,7 +221,7 @@ void bind_engram(py::module& m) {
             "Lookup embeddings by precomputed row IDs. Returns [B, L, H, D].")
         .def(
             "populate",
-            [](Engram& self, py::list embedding_buffers) {
+            [](EngramStore& self, py::list embedding_buffers) {
                 const std::vector<int64_t> vocab_sizes =
                     self.get_table_vocab_sizes();
                 const int embed_dim = self.get_embedding_dim();

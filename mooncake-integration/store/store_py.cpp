@@ -17,14 +17,14 @@
 
 #include "integration_utils.h"
 
-// Forward declaration for Engram bindings
+// Forward declaration for EngramStore bindings
 namespace mooncake {
 namespace engram {
-void bind_engram(py::module &m);
+void bind_engram_store(py::module &m);
 }
 }  // namespace mooncake
-#include "engram/engram.h"
-#include "engram/engram_config.h"
+#include "engram/engram_store.h"
+#include "engram/engram_store_config.h"
 
 namespace py = pybind11;
 
@@ -1786,7 +1786,7 @@ PYBIND11_MODULE(store, m) {
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     // Helper function to extract PyClient shared_ptr from
-    // MooncakeStorePyWrapper This is used by Engram to get the underlying
+    // MooncakeStorePyWrapper This is used by EngramStore to get the underlying
     // PyClient We return it as a Python capsule to avoid type registration
     // issues
     m.def(
@@ -1796,7 +1796,7 @@ PYBIND11_MODULE(store, m) {
                 return py::none();
             }
             // Return as a capsule containing the shared_ptr
-            // The caller (engram_py.cpp) will extract it
+            // The caller (engram_store_py.cpp) will extract it
             // Use unique_ptr for RAII: if py::capsule throws, the pointer is
             // freed; otherwise release() transfers ownership to the capsule.
             auto ptr =
@@ -2749,8 +2749,8 @@ PYBIND11_MODULE(store, m) {
         "Bind the current thread and memory allocation preference to the "
         "specified NUMA node");
 
-    // Add Engram bindings
-    mooncake::engram::bind_engram(m);
+    // Add EngramStore bindings
+    mooncake::engram::bind_engram_store(m);
 }
 
 }  // namespace mooncake

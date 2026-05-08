@@ -1,6 +1,6 @@
-# Engram Backend
+# EngramStore Backend
 
-Mooncake provides Engram support as a storage backend for embedding tables.
+Mooncake provides EngramStore as the storage backend for Engram embedding tables.
 
 The scope is intentionally narrow:
 
@@ -14,8 +14,8 @@ or any other model-side Engram algorithm.
 
 ## Current Backend Boundary
 
-The current implementation is intentionally conservative. It keeps the Engram
-backend on top of the existing Store interfaces and does not depend on:
+The current implementation is intentionally conservative. It keeps EngramStore
+on top of the existing Store interfaces and does not depend on:
 
 - transfer scatter read
 - grouped transfer task
@@ -25,12 +25,12 @@ backend on top of the existing Store interfaces and does not depend on:
 - query cache
 - remote gather control-plane changes
 
-Those optimizations are deferred to follow-up PRs so that the Engram backend can
+Those optimizations are deferred to follow-up PRs so that the EngramStore backend can
 land first as a small, reviewable unit.
 
 ## Configuration
 
-`EngramConfig` contains the physical layout for one Engram layer:
+`EngramStoreConfig` contains the physical layout for one EngramStore layer:
 
 - `table_vocab_sizes`: per-head table sizes `[N_0, N_1, ..., N_{H-1}]`
 - `embedding_dim`: row width `D`
@@ -47,7 +47,7 @@ Each key stores a `float32` table with shape `[N_h, D]`.
 
 Python:
 
-- `Engram(layer_id, config, store=None)`
+- `EngramStore(layer_id, config, store=None)`
 - `populate(embedding_buffers)`
 - `lookup(row_ids)`
 - `remove_from_store(force=False)`
@@ -61,7 +61,7 @@ wrapper, or `None` for metadata-only construction.
 
 C++:
 
-- constructor `Engram(int layer_id, const EngramConfig&, std::shared_ptr<PyClient>)`
+- constructor `EngramStore(int layer_id, const EngramStoreConfig&, std::shared_ptr<PyClient>)`
 - `populate(...)`
 - `lookup_rows(...)`
 - `lookup_rows_contiguous(...)`
@@ -98,7 +98,7 @@ Populate follows the existing Store write path:
 5. upload all head tables with `batch_put_from(...)`
 6. unregister the staging buffers
 
-`populate(...)` is defined as a create-only operation for one Engram layer. To
+`populate(...)` is defined as a create-only operation for one EngramStore layer. To
 reuse a `layer_id`, first remove the old tables with `remove_from_store(...)`.
 
 If upload fails after some head tables have already been written, or if publish
@@ -132,13 +132,13 @@ The backend enforces these invariants:
 
 This backend is covered by:
 
-- correctness tests in `scripts/test_engram.py`
-- benchmark coverage in `scripts/bench_engram_27b.py`
+- correctness tests in `scripts/test_engram_store.py`
+- benchmark coverage in `scripts/bench_engram_store_27b.py`
 
-`scripts/test_engram.py` can run against an existing Mooncake deployment through
+`scripts/test_engram_store.py` can run against an existing Mooncake deployment through
 `MOONCAKE_CONFIG_PATH` / `MOONCAKE_MASTER`, or it can start a local
 `mooncake_master` instance automatically for a self-contained TCP test run.
 
-By default, the benchmark exercises `engram.populate(...)` directly. Its
+By default, the benchmark exercises `engram_store.populate(...)` directly. Its
 fallback populate paths are gated behind `ENGRAM_ALLOW_POPULATE_FALLBACK=1` so
 they do not silently mask regressions in the current implementation.

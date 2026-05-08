@@ -56,7 +56,7 @@ set(MOONCAKE_STORE_SOURCES
     standby_state_machine.cpp
     ha_metric_manager.cpp
     store_c.cpp
-    engram/engram.cpp
+    engram/engram_store.cpp
 )
 
 set(EXTRA_LIBS "")

@@ -1,4 +1,4 @@
-#include "engram/engram.h"
+#include "engram/engram_store.h"
 
 #include <cstring>
 #include <limits>
@@ -11,24 +11,24 @@
 namespace mooncake {
 namespace engram {
 
-Engram::Engram(int layer_id, const EngramConfig& config,
-               std::shared_ptr<PyClient> store)
+EngramStore::EngramStore(int layer_id, const EngramStoreConfig& config,
+                         std::shared_ptr<PyClient> store)
     : store_(std::move(store)),
       table_vocab_sizes_(config.table_vocab_sizes),
       embedding_dim_(config.embedding_dim) {
     if (table_vocab_sizes_.empty()) {
         throw std::invalid_argument(
-            "EngramConfig.table_vocab_sizes must not be empty");
+            "EngramStoreConfig.table_vocab_sizes must not be empty");
     }
     if (embedding_dim_ <= 0) {
         throw std::invalid_argument(
-            "EngramConfig.embedding_dim must be positive");
+            "EngramStoreConfig.embedding_dim must be positive");
     }
     for (int64_t vocab_size : table_vocab_sizes_) {
         if (vocab_size <= 0) {
             throw std::invalid_argument(
-                "EngramConfig.table_vocab_sizes must contain only positive "
-                "values");
+                "EngramStoreConfig.table_vocab_sizes must contain only "
+                "positive values");
         }
     }
 
@@ -40,8 +40,9 @@ Engram::Engram(int layer_id, const EngramConfig& config,
     }
 }
 
-int Engram::lookup_rows_flat(const int64_t* row_ids, int B, int L,
-                             void* output_buffer, size_t output_size) const {
+int EngramStore::lookup_rows_flat(const int64_t* row_ids, int B, int L,
+                                  void* output_buffer,
+                                  size_t output_size) const {
     if (store_ == nullptr || row_ids == nullptr || output_buffer == nullptr ||
         B <= 0 || L <= 0) {
         return -1;
@@ -141,13 +142,13 @@ int Engram::lookup_rows_flat(const int64_t* row_ids, int B, int L,
     return 0;
 }
 
-int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
-                                   void* output_buffer,
-                                   size_t output_size) const {
+int EngramStore::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
+                                        void* output_buffer,
+                                        size_t output_size) const {
     return lookup_rows_flat(row_ids, B, L, output_buffer, output_size);
 }
 
-int Engram::lookup_rows(
+int EngramStore::lookup_rows(
     const std::vector<std::vector<std::vector<int64_t>>>& row_ids,
     void* output_buffer, size_t output_size) const {
     if (store_ == nullptr || output_buffer == nullptr || row_ids.empty() ||
@@ -177,19 +178,21 @@ int Engram::lookup_rows(
                             output_size);
 }
 
-std::vector<int64_t> Engram::get_table_vocab_sizes() const {
+std::vector<int64_t> EngramStore::get_table_vocab_sizes() const {
     return table_vocab_sizes_;
 }
 
-std::vector<std::string> Engram::get_store_keys() const { return embed_keys_; }
+std::vector<std::string> EngramStore::get_store_keys() const {
+    return embed_keys_;
+}
 
-int Engram::get_num_heads() const {
+int EngramStore::get_num_heads() const {
     return static_cast<int>(table_vocab_sizes_.size());
 }
 
-int Engram::get_embedding_dim() const { return embedding_dim_; }
+int EngramStore::get_embedding_dim() const { return embedding_dim_; }
 
-int Engram::remove_from_store(bool force) {
+int EngramStore::remove_from_store(bool force) {
     if (store_ == nullptr) {
         return static_cast<int>(ErrorCode::INVALID_PARAMS);
     }
@@ -216,8 +219,8 @@ int Engram::remove_from_store(bool force) {
     return first_error != 0 ? first_error : removed;
 }
 
-int Engram::populate(const std::vector<void*>& embedding_buffers,
-                     const std::vector<size_t>& buffer_sizes) {
+int EngramStore::populate(const std::vector<void*>& embedding_buffers,
+                          const std::vector<size_t>& buffer_sizes) {
     if (store_ == nullptr) {
         return -1;
     }
@@ -236,20 +239,20 @@ int Engram::populate(const std::vector<void*>& embedding_buffers,
 
     std::vector<int> exists_results = store_->batchIsExist(embed_keys_);
     if (exists_results.size() != embed_keys_.size()) {
-        LOG(ERROR) << "Failed to preflight Engram populate key existence";
+        LOG(ERROR) << "Failed to preflight EngramStore populate key existence";
         return -1;
     }
     for (size_t i = 0; i < exists_results.size(); ++i) {
         const int exists = exists_results[i];
         if (exists < 0) {
-            LOG(ERROR) << "Failed to query Engram key '" << embed_keys_[i]
+            LOG(ERROR) << "Failed to query EngramStore key '" << embed_keys_[i]
                        << "' before populate, rc=" << exists;
             return -1;
         }
         if (exists != 0) {
-            LOG(ERROR) << "Engram populate requires empty destination key '"
-                       << embed_keys_[i]
-                       << "'. Remove the existing layer first.";
+            LOG(ERROR)
+                << "EngramStore populate requires empty destination key '"
+                << embed_keys_[i] << "'. Remove the existing layer first.";
             return -1;
         }
     }
@@ -299,13 +302,15 @@ int Engram::populate(const std::vector<void*>& embedding_buffers,
             int rc = store_->remove(embed_keys_[i], true);
             if (rc != 0 &&
                 rc != static_cast<int>(ErrorCode::OBJECT_NOT_FOUND)) {
-                LOG(ERROR) << "Failed to roll back partially populated Engram "
-                           << "key '" << embed_keys_[i] << "', rc=" << rc;
+                LOG(ERROR)
+                    << "Failed to roll back partially populated EngramStore "
+                    << "key '" << embed_keys_[i] << "', rc=" << rc;
             }
         }
         if (unregister_failed) {
-            LOG(ERROR) << "Rolling back Engram populate because buffer cleanup "
-                          "failed after publish";
+            LOG(ERROR)
+                << "Rolling back EngramStore populate because buffer cleanup "
+                   "failed after publish";
         }
         return -1;
     }
