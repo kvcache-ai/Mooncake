@@ -490,6 +490,7 @@ Status UBShmemTransport::submitTransfer(
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto &request = entries[i];
         auto &task = batch_desc.task_list[task_id + i];
+        task.initialize(batch_id, request, true);
         task.total_bytes = request.length;
 
         Slice *slice = getSliceCache().allocate();

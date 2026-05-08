@@ -237,6 +237,7 @@ Status AscendDirectTransport::submitTransfer(
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[cur_task_size];
         ++cur_task_size;
+        task.initialize(batch_id, request, true);
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
         InitializeSlice(request, current_engine_id, &task, slice);

@@ -135,6 +135,7 @@ Status NVMeoFTransport::submitTransfer(
     // getSegmentDescByID(LOCAL_SEGMENT_ID);
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
+        task.initialize(batch_id, request, true);
         auto target_id = request.target_id;
 
         if (!segment_desc_map.count(target_id)) {

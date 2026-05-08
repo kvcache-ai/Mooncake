@@ -363,6 +363,7 @@ Status BarexTransport::submitTransfer(
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
+        task.initialize(batch_id, request, true);
         SegmentID target_id = request.target_id;
         auto peer_segment_desc = segment_desc_map[target_id];
         if (!peer_segment_desc) {

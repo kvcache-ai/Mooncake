@@ -283,6 +283,16 @@ class Transport {
         // should be submitted as one transport task.
         std::vector<TransferRequest> request_group;
 
+        void initialize(BatchID new_batch_id,
+                        const TransferRequest &transfer_request,
+                        bool submitted) {
+            batch_id = new_batch_id;
+            owned_request = transfer_request;
+            request = &owned_request;
+            request_group.clear();
+            is_submitted = submitted;
+        }
+
         bool publish_completion_locked() {
             auto &batch_desc = toBatchDesc(batch_id);
             if (__atomic_exchange_n(&is_finished, true, __ATOMIC_ACQ_REL)) {

@@ -550,6 +550,7 @@ Status HipTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
+        task.initialize(batch_id, request, true);
 
         PendingTransfer pending;
         Status status = startAsyncTransfer(request, task, pending);

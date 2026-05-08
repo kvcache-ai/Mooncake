@@ -637,6 +637,7 @@ Status TcpTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
+        task.initialize(batch_id, request, true);
         task.total_bytes = request.length;
         Slice* slice = getSliceCache().allocate();
         slice->source_addr = (char*)request.source;
