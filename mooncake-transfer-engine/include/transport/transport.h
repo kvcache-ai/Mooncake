@@ -182,6 +182,9 @@ class Transport {
         inline void check_batch_completion(bool is_failed) {
             auto &batch_desc = toBatchDesc(task->batch_id);
             std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+            if (status != Slice::PENDING) {
+                return;
+            }
             status = is_failed ? Slice::FAILED : Slice::SUCCESS;
             if (is_failed) {
                 __atomic_fetch_add(&task->failed_slice_count, 1,
