@@ -412,6 +412,10 @@ class Replica {
                 descriptor_variant);
         }
 
+        bool is_completed() const noexcept {
+            return status == ReplicaStatus::COMPLETE;
+        }
+
         MemoryDescriptor& get_memory_descriptor() {
             if (auto* desc =
                     std::get_if<MemoryDescriptor>(&descriptor_variant)) {
