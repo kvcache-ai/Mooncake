@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass, replace
+import threading
+from dataclasses import dataclass, field, replace
 from math import prod
 from typing import Any, Optional, Sequence, Union
 from collections.abc import Mapping
@@ -286,6 +287,37 @@ class RemoteTensorBatchMaterializer:
             for region in allocated.values():
                 region.close()
 
+    def materialize_tensors(
+        self,
+        remote_batch: RemoteTensorBatch,
+        fields: Optional[Sequence[str]] = None,
+    ) -> dict[str, Any]:
+        """Fetch selected fields and return torch tensors backed by the materialized buffers."""
+        if torch is None:
+            raise ImportError("torch is required to materialize remote tensors")
+        requests = remote_batch.read_requests(fields)
+        allocated = {
+            request.name: self.buffer_allocator.allocate(_checked_output_nbytes(request))
+            for request in requests
+        }
+        tensors = {}
+        try:
+            for request in requests:
+                region = allocated[request.name]
+                self.materialize_request_into_region(request, region)
+                tensor = torch.frombuffer(
+                    region.buffer,
+                    dtype=_torch_dtype(request.ref.dtype),
+                    count=int(prod(request.output_shape())),
+                ).reshape(request.output_shape())
+                if request.device is not None:
+                    tensor = tensor.to(request.device)
+                tensors[request.name] = tensor
+            return tensors
+        finally:
+            for region in allocated.values():
+                region.close()
+
     def materialize_requests_into(
         self, requests: Sequence[TensorReadRequest], buffers: Mapping[str, Any]
     ) -> dict[str, int]:
@@ -311,9 +343,11 @@ class RemoteTensorBatchMaterializer:
             )
         if required_size == 0:
             return 0
-        register_ret = self.store.register_buffer(region.ptr, region.size)
-        if register_ret != 0:
-            raise RuntimeError(f"register_buffer failed with retcode {register_ret}")
+        should_unregister = not region.registered
+        if should_unregister:
+            register_ret = self.store.register_buffer(region.ptr, region.size)
+            if register_ret != 0:
+                raise RuntimeError(f"register_buffer failed with retcode {register_ret}")
         transfer_error: Optional[BaseException] = None
         try:
             ret = self.store.get_tensor_dim_selection_into(
@@ -335,14 +369,61 @@ class RemoteTensorBatchMaterializer:
             transfer_error = exc
             raise
         finally:
-            unregister_ret = self.store.unregister_buffer(region.ptr)
-            if unregister_ret != 0:
-                cleanup_error = RuntimeError(
-                    f"unregister_buffer failed with retcode {unregister_ret}"
-                )
-                if transfer_error is not None:
-                    raise cleanup_error from transfer_error
-                raise cleanup_error
+            if should_unregister:
+                unregister_ret = self.store.unregister_buffer(region.ptr)
+                if unregister_ret != 0:
+                    cleanup_error = RuntimeError(
+                        f"unregister_buffer failed with retcode {unregister_ret}"
+                    )
+                    if transfer_error is not None:
+                        raise cleanup_error from transfer_error
+                    raise cleanup_error
+
+
+@dataclass
+class ReusableRegisteredBufferAllocator:
+    """Keep allocated writable buffers registered with Mooncake until close()."""
+
+    store: Any
+    _regions: list["WritableBufferRegion"] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def allocate(self, size: int) -> "WritableBufferRegion":
+        with self._lock:
+            return self._add_region(size).view_region(size)
+
+    def close(self) -> None:
+        with self._lock:
+            errors = []
+            remaining = []
+            for region in self._regions:
+                ret = self.store.unregister_buffer(region.ptr)
+                if ret != 0:
+                    errors.append(ret)
+                    remaining.append(region)
+                    continue
+                region.registered = False
+                region.close()
+            self._regions = remaining
+            if errors:
+                raise RuntimeError(f"unregister_buffer failed with retcodes {errors}")
+
+    def __enter__(self) -> "ReusableRegisteredBufferAllocator":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+    def _add_region(self, size: int) -> "WritableBufferRegion":
+        buffer = bytearray(size)
+        region = writable_buffer_region(buffer, registered=True)
+        ret = self.store.register_buffer(region.ptr, region.size)
+        if ret != 0:
+            region.close()
+            raise RuntimeError(f"register_buffer failed with retcode {ret}")
+        self._regions.append(region)
+        return region
+
 
 
 @dataclass
@@ -354,13 +435,31 @@ class WritableBufferRegion:
     c_buffer: Any
     ptr: int
     size: int
+    registered: bool = False
+    owns_view: bool = True
     closed: bool = False
+
+    def view_region(self, size: int) -> "WritableBufferRegion":
+        if self.closed:
+            raise ValueError("buffer region is closed")
+        if size > self.size:
+            raise ValueError(f"buffer too small: need {size} bytes, got {self.size}")
+        return WritableBufferRegion(
+            buffer=self.buffer,
+            view=self.view,
+            c_buffer=self.c_buffer,
+            ptr=self.ptr,
+            size=size,
+            registered=self.registered,
+            owns_view=False,
+        )
 
     def close(self) -> None:
         if self.closed:
             return
         self.c_buffer = None
-        self.view.release()
+        if self.owns_view:
+            self.view.release()
         self.closed = True
 
     def __enter__(self) -> "WritableBufferRegion":
@@ -380,6 +479,19 @@ class BytearrayBufferAllocator:
 def normalize_dtype_name(dtype: Union[str, Any]) -> str:
     """Normalize a dtype object or name to the string accepted by Mooncake store APIs."""
     return str(dtype).removeprefix("torch.").lower()
+
+
+def _torch_dtype(dtype: Union[str, Any]) -> Any:
+    if torch is None:
+        raise ImportError("torch is required for dtype conversion")
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    dtype_name = normalize_dtype_name(dtype)
+    if dtype_name == "float8_e4m3fn":
+        return torch.float8_e4m3fn
+    if dtype_name == "float8_e5m2":
+        return torch.float8_e5m2
+    return getattr(torch, dtype_name)
 
 
 def dtype_byte_size(dtype: Union[str, Any]) -> int:
@@ -441,7 +553,7 @@ def _checked_output_nbytes(request: TensorReadRequest) -> int:
     return output_nbytes
 
 
-def writable_buffer_region(buffer: Any) -> WritableBufferRegion:
+def writable_buffer_region(buffer: Any, registered: bool = False) -> WritableBufferRegion:
     """Return a writable buffer region while keeping the Python buffer export alive."""
     view = memoryview(buffer)
     if view.readonly:
@@ -467,6 +579,7 @@ def writable_buffer_region(buffer: Any) -> WritableBufferRegion:
         c_buffer=c_buffer,
         ptr=ctypes.addressof(c_buffer),
         size=contiguous.nbytes,
+        registered=registered,
     )
 
 

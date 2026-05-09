@@ -8,6 +8,7 @@ import numpy as np
 
 from mooncake.remote_tensor_batch import (
     BytearrayBufferAllocator,
+    ReusableRegisteredBufferAllocator,
     RemoteTensorBatch,
     RemoteTensorBatchMaterializer,
     TensorDimSelection,
@@ -263,6 +264,24 @@ class TestRemoteTensorBatchHelpers(unittest.TestCase):
         self.assertEqual(len(buffer), tensor_nbytes((2, 2), "int64"))
         self.assertEqual(shape, (2, 2))
         self.assertEqual(dtype, "int64")
+
+    def test_reusable_allocator_allocates_distinct_active_regions(self):
+        store = FakeStore()
+        allocator = ReusableRegisteredBufferAllocator(store)
+
+        first = allocator.allocate(8)
+        second = allocator.allocate(4)
+
+        self.assertIsNot(second.buffer, first.buffer)
+        self.assertTrue(first.registered)
+        self.assertTrue(second.registered)
+        first.close()
+        second.close()
+        allocator.close()
+        self.assertEqual(store.calls[0][0], "register_buffer")
+        self.assertEqual(store.calls[1][0], "register_buffer")
+        self.assertEqual(store.calls[-2][0], "unregister_buffer")
+        self.assertEqual(store.calls[-1][0], "unregister_buffer")
 
     def test_zero_byte_materialization_skips_store_calls(self):
         store = FakeStore()

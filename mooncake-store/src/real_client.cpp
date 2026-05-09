@@ -14,9 +14,10 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
-#include <cctype>
 #include <limits>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "real_client.h"
@@ -2511,22 +2512,144 @@ std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
         });
 }
 
+namespace {
+
+constexpr size_t kInitialRegisterChunkSize = 64ULL * 1024 * 1024;
+constexpr size_t kMinRegisterChunkSize = 1ULL * 1024 * 1024;
+constexpr size_t kMaxRegisterChunkCount = 4096;
+
+}  // namespace
+
 tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     void *buffer, size_t size) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
+    if (!client_ || buffer == nullptr || size == 0) {
+        LOG(ERROR) << "Invalid register_buffer request";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    {
+        std::unique_lock<std::mutex> lock(registered_buffer_mutex_);
+        if (registered_buffers_.find(buffer) != registered_buffers_.end()) {
+            LOG(ERROR) << "Buffer is already registered";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        RegisteredBufferRegion registering_region;
+        registering_region.base = buffer;
+        registering_region.size = size;
+        registering_region.registering = true;
+        registered_buffers_[buffer] = std::move(registering_region);
+    }
+
+    auto finish_registration = [&](tl::expected<void, ErrorCode> status,
+                                   std::optional<RegisteredBufferRegion> region) {
+        std::unique_lock<std::mutex> lock(registered_buffer_mutex_);
+        if (!status) {
+            registered_buffers_.erase(buffer);
+            registered_buffer_cv_.notify_all();
+            return status;
+        }
+        auto it = registered_buffers_.find(buffer);
+        if (it == registered_buffers_.end() || !it->second.registering) {
+            registered_buffer_cv_.notify_all();
+            return tl::expected<void, ErrorCode>{
+                tl::unexpected(ErrorCode::INVALID_PARAMS)};
+        }
+        it->second = std::move(*region);
+        registered_buffer_cv_.notify_all();
+        return status;
+    };
+
     auto result = client_->RegisterLocalMemory(buffer, size, kWildcardLocation,
                                                false, true);
-    if (!result) {
-        return result;
+    if (result) {
+        return finish_registration(
+            {}, RegisteredBufferRegion{
+                    .base = buffer,
+                    .size = size,
+                    .offset = 0,
+                    .mode = RegisteredBufferMode::Whole,
+                    .chunk_size = size,
+                    .chunks = {},
+                });
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_[buffer] = size;
+
+    size_t chunk_size = std::min(kInitialRegisterChunkSize,
+                                 static_cast<size_t>(kMaxSliceSize));
+    if (chunk_size < kMinRegisterChunkSize) {
+        chunk_size = kMinRegisterChunkSize;
     }
-    return result;
+    if (size <= chunk_size) {
+        return finish_registration(tl::unexpected(result.error()), std::nullopt);
+    }
+
+    RegisteredBufferRegion region{
+        .base = buffer,
+        .size = size,
+        .offset = 0,
+        .mode = RegisteredBufferMode::Chunked,
+        .chunk_size = chunk_size,
+        .chunks = {},
+    };
+
+    auto try_register_chunks = [&](size_t candidate_chunk_size) {
+        const size_t chunk_count =
+            (size + candidate_chunk_size - 1) / candidate_chunk_size;
+        if (chunk_count > kMaxRegisterChunkCount) {
+            return tl::expected<void, ErrorCode>{
+                tl::unexpected(ErrorCode::INVALID_PARAMS)};
+        }
+        region.chunks.clear();
+        region.chunks.reserve(chunk_count);
+        region.chunk_size = candidate_chunk_size;
+        size_t offset = 0;
+        while (offset < size) {
+            const size_t current_size =
+                std::min(candidate_chunk_size, size - offset);
+            void *current_ptr = static_cast<char *>(buffer) + offset;
+            auto chunk_result = client_->RegisterLocalMemory(
+                current_ptr, current_size, kWildcardLocation, false, true);
+            if (!chunk_result) {
+                for (const auto &chunk : region.chunks) {
+                    auto unregister_result =
+                        client_->unregisterLocalMemory(chunk.ptr, true);
+                    if (!unregister_result) {
+                        LOG(WARNING) << "Failed to rollback registered chunk: "
+                                     << toString(unregister_result.error());
+                    }
+                }
+                region.chunks.clear();
+                return chunk_result;
+            }
+            region.chunks.push_back(RegisteredBufferChunk{current_ptr,
+                                                          current_size});
+            offset += current_size;
+        }
+        return tl::expected<void, ErrorCode>{};
+    };
+
+    auto chunk_result = try_register_chunks(chunk_size);
+    while (!chunk_result && chunk_size > kMinRegisterChunkSize) {
+        const size_t retry_chunk_size =
+            std::max(kMinRegisterChunkSize, chunk_size / 2);
+        if (retry_chunk_size == chunk_size) {
+            break;
+        }
+        LOG(WARNING) << "Chunked buffer registration failed with chunk_size="
+                     << chunk_size << ", retrying with chunk_size="
+                     << retry_chunk_size;
+        chunk_size = retry_chunk_size;
+        chunk_result = try_register_chunks(chunk_size);
+    }
+    if (!chunk_result) {
+        return finish_registration(tl::unexpected(chunk_result.error()),
+                                   std::nullopt);
+    }
+
+    LOG(WARNING) << "Whole buffer registration failed; using chunked "
+                    "registration, size="
+                 << size << ", chunk_size=" << region.chunk_size
+                 << ", chunks=" << region.chunks.size();
+    return finish_registration({}, std::move(region));
 }
 
 int RealClient::register_buffer(void *buffer, size_t size) {
@@ -2539,16 +2662,68 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto unregister_result = client_->unregisterLocalMemory(buffer, true);
-    if (!unregister_result) {
-        LOG(ERROR) << "Unregister buffer failed with error: "
-                   << toString(unregister_result.error());
-        return tl::unexpected(unregister_result.error());
-    }
+
+    RegisteredBufferRegion region;
     {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_.erase(buffer);
+        std::unique_lock<std::mutex> lock(registered_buffer_mutex_);
+        auto it = registered_buffers_.find(buffer);
+        if (it == registered_buffers_.end()) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (it->second.unregistering || it->second.registering) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        it->second.unregistering = true;
+        registered_buffer_cv_.wait(lock, [&]() {
+            auto current = registered_buffers_.find(buffer);
+            return current == registered_buffers_.end() ||
+                   current->second.active_operations == 0;
+        });
+        it = registered_buffers_.find(buffer);
+        if (it == registered_buffers_.end()) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        region = it->second;
     }
+
+    if (region.mode == RegisteredBufferMode::Whole) {
+        auto unregister_result = client_->unregisterLocalMemory(buffer, true);
+        if (!unregister_result) {
+            LOG(ERROR) << "Unregister buffer failed with error: "
+                       << toString(unregister_result.error());
+            std::unique_lock<std::mutex> lock(registered_buffer_mutex_);
+            auto it = registered_buffers_.find(buffer);
+            if (it != registered_buffers_.end()) {
+                it->second.unregistering = false;
+            }
+            return tl::unexpected(unregister_result.error());
+        }
+        std::unique_lock<std::mutex> lock(registered_buffer_mutex_);
+        registered_buffers_.erase(buffer);
+        return {};
+    }
+
+    ErrorCode first_error = ErrorCode::OK;
+    std::vector<RegisteredBufferChunk> remaining_chunks;
+    for (const auto &chunk : region.chunks) {
+        auto unregister_result = client_->unregisterLocalMemory(chunk.ptr, true);
+        if (!unregister_result) {
+            if (first_error == ErrorCode::OK) {
+                first_error = unregister_result.error();
+            }
+            remaining_chunks.push_back(chunk);
+        }
+    }
+    std::unique_lock<std::mutex> lock(registered_buffer_mutex_);
+    auto it = registered_buffers_.find(buffer);
+    if (first_error != ErrorCode::OK) {
+        if (it != registered_buffers_.end()) {
+            it->second.chunks = std::move(remaining_chunks);
+            it->second.unregistering = false;
+        }
+        return tl::unexpected(first_error);
+    }
+    registered_buffers_.erase(buffer);
     return {};
 }
 
@@ -2556,26 +2731,112 @@ int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
-std::optional<RealClient::RegisteredBufferRegion>
-RealClient::resolve_registered_buffer(void *buffer) const {
-    std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+RealClient::RegisteredBufferGuard::RegisteredBufferGuard(RealClient *client,
+                                                          void *base)
+    : client_(client), base_(base) {}
+
+RealClient::RegisteredBufferGuard::RegisteredBufferGuard(
+    RegisteredBufferGuard &&other) noexcept
+    : client_(other.client_), base_(other.base_), region_(std::move(other.region_)) {
+    other.client_ = nullptr;
+    other.base_ = nullptr;
+}
+
+RealClient::RegisteredBufferGuard &RealClient::RegisteredBufferGuard::operator=(
+    RegisteredBufferGuard &&other) noexcept {
+    if (this != &other) {
+        release();
+        client_ = other.client_;
+        base_ = other.base_;
+        region_ = std::move(other.region_);
+        other.client_ = nullptr;
+        other.base_ = nullptr;
+    }
+    return *this;
+}
+
+RealClient::RegisteredBufferGuard::~RegisteredBufferGuard() { release(); }
+
+void RealClient::RegisteredBufferGuard::release() {
+    if (client_ == nullptr || base_ == nullptr) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(client_->registered_buffer_mutex_);
+    auto it = client_->registered_buffers_.find(base_);
+    if (it != client_->registered_buffers_.end() &&
+        it->second.active_operations > 0) {
+        --it->second.active_operations;
+        if (it->second.active_operations == 0) {
+            client_->registered_buffer_cv_.notify_all();
+        }
+    }
+    client_ = nullptr;
+    base_ = nullptr;
+}
+
+std::optional<RealClient::RegisteredBufferGuard>
+RealClient::resolve_registered_buffer_guard(void *buffer) {
+    std::unique_lock<std::mutex> lock(registered_buffer_mutex_);
     const auto target = reinterpret_cast<uintptr_t>(buffer);
-    for (const auto &[registered_buffer, registered_size] :
-         registered_buffer_sizes_) {
+    for (auto &[registered_buffer, record] : registered_buffers_) {
+        if (record.registering) {
+            continue;
+        }
         const auto base = reinterpret_cast<uintptr_t>(registered_buffer);
         if (target < base) {
             continue;
         }
         const auto offset = target - base;
-        if (offset < registered_size) {
-            return RegisteredBufferRegion{
-                .base = registered_buffer,
-                .size = registered_size,
-                .offset = static_cast<size_t>(offset),
-            };
+        if (offset < record.size && !record.unregistering && !record.registering) {
+            ++record.active_operations;
+            RegisteredBufferGuard guard(this, registered_buffer);
+            guard.region_ = record;
+            guard.region_.offset = static_cast<size_t>(offset);
+            return guard;
         }
     }
     return std::nullopt;
+}
+
+static tl::expected<std::vector<Slice>, ErrorCode> build_registered_chunk_slices(
+    const RealClient::RegisteredBufferRegion &region, void *buffer,
+    size_t size) {
+    if (region.mode != RealClient::RegisteredBufferMode::Chunked) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<Slice> slices;
+    if (size == 0) {
+        return slices;
+    }
+
+    const auto base = reinterpret_cast<uintptr_t>(region.base);
+    const auto begin = reinterpret_cast<uintptr_t>(buffer);
+    if (begin < base || begin - base > region.size ||
+        size > region.size - (begin - base)) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    size_t remaining = size;
+    uintptr_t current = begin;
+    for (const auto &chunk : region.chunks) {
+        const auto chunk_begin = reinterpret_cast<uintptr_t>(chunk.ptr);
+        const auto chunk_end = chunk_begin + chunk.size;
+        if (current >= chunk_end) {
+            continue;
+        }
+        if (current < chunk_begin) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const size_t slice_size =
+            std::min(remaining, static_cast<size_t>(chunk_end - current));
+        slices.emplace_back(Slice{reinterpret_cast<void *>(current), slice_size});
+        remaining -= slice_size;
+        current += slice_size;
+        if (remaining == 0) {
+            return slices;
+        }
+    }
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
@@ -2725,6 +2986,8 @@ RealClient::get_into_ranges_internal(
         return std::move(prepared.results);
     }
 
+    std::vector<std::optional<RegisteredBufferGuard>> registered_guards(
+        buffer_count);
     std::vector<size_t> resolved_buffer_capacities;
     if (buffer_capacities != nullptr) {
         if (buffer_capacities->size() != buffer_count) {
@@ -2736,16 +2999,16 @@ RealClient::get_into_ranges_internal(
         resolved_buffer_capacities = *buffer_capacities;
     } else {
         resolved_buffer_capacities.resize(buffer_count, 0);
-        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         for (size_t i = 0; i < buffer_count; ++i) {
-            auto it = registered_buffer_sizes_.find(buffers[i]);
-            if (it == registered_buffer_sizes_.end()) {
+            registered_guards[i] = resolve_registered_buffer_guard(buffers[i]);
+            if (!registered_guards[i].has_value()) {
                 LOG(ERROR)
                     << "get_into_ranges: buffer is not registered at index "
                     << i;
                 continue;
             }
-            resolved_buffer_capacities[i] = it->second;
+            const auto &region = registered_guards[i]->region();
+            resolved_buffer_capacities[i] = region.size - region.offset;
         }
     }
 
@@ -2758,6 +3021,12 @@ RealClient::get_into_ranges_internal(
         if (buffer_size == 0 && key_count > 0 && buffer_capacities == nullptr) {
             continue;
         }
+        const RegisteredBufferRegion *registered_region =
+            registered_guards[i].has_value() ? &registered_guards[i]->region()
+                                             : nullptr;
+        const bool use_chunked_region =
+            registered_region != nullptr &&
+            registered_region->mode == RegisteredBufferMode::Chunked;
 
         for (size_t j = 0; j < key_count; ++j) {
             auto [metadata_it, inserted] = metadata_cache.try_emplace(
@@ -2795,6 +3064,29 @@ RealClient::get_into_ranges_internal(
                     }
                     prepared.results[i][j][k] =
                         tl::unexpected(metadata_result.error());
+                    continue;
+                }
+
+                if (use_chunked_region) {
+                    auto slices = build_registered_chunk_slices(
+                        *registered_region,
+                        static_cast<char *>(buffers[i]) + all_dst_offsets[i][j][k],
+                        all_sizes[i][j][k]);
+                    if (!slices) {
+                        prepared.results[i][j][k] =
+                            tl::unexpected(slices.error());
+                        continue;
+                    }
+                    auto get_result = client_->Get(
+                        all_keys[i][j], metadata_result.value().query_result,
+                        slices.value(), all_src_offsets[i][j][k]);
+                    if (!get_result) {
+                        prepared.results[i][j][k] =
+                            tl::unexpected(get_result.error());
+                    } else {
+                        prepared.results[i][j][k] =
+                            static_cast<int64_t>(all_sizes[i][j][k]);
+                    }
                     continue;
                 }
 
@@ -2917,6 +3209,8 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
+    std::vector<std::optional<RegisteredBufferGuard>> registered_guards;
+    registered_guards.reserve(keys.size());
 
     // Create slices from user buffers
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -2925,13 +3219,26 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         size_t size = sizes[i];
 
         std::vector<mooncake::Slice> slices;
-        uint64_t offset = 0;
-
-        while (offset < size) {
-            auto chunk_size = std::min(size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
+        auto registered_region = resolve_registered_buffer_guard(buffer);
+        const RegisteredBufferRegion *region =
+            registered_region.has_value() ? &registered_region->region() : nullptr;
+        registered_guards.push_back(std::move(registered_region));
+        if (region && region->mode == RegisteredBufferMode::Chunked) {
+            auto chunked_slices = build_registered_chunk_slices(
+                *region, buffer, size);
+            if (!chunked_slices) {
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    keys.size(), tl::unexpected(chunked_slices.error()));
+            }
+            slices = std::move(chunked_slices.value());
+        } else {
+            uint64_t offset = 0;
+            while (offset < size) {
+                auto chunk_size = std::min(size - offset, kMaxSliceSize);
+                void *chunk_ptr = static_cast<char *>(buffer) + offset;
+                slices.emplace_back(Slice{chunk_ptr, chunk_size});
+                offset += chunk_size;
+            }
         }
 
         all_slices[key] = std::move(slices);
@@ -2973,15 +3280,24 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
         return {};
     }
 
-    // Create slices directly from the user buffer
     std::vector<mooncake::Slice> slices;
-    uint64_t offset = 0;
-
-    while (offset < size) {
-        auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
-        slices.emplace_back(Slice{chunk_ptr, chunk_size});
-        offset += chunk_size;
+    auto registered_region = resolve_registered_buffer_guard(buffer);
+    if (registered_region &&
+        registered_region->region().mode == RegisteredBufferMode::Chunked) {
+        auto chunked_slices = build_registered_chunk_slices(
+            registered_region->region(), buffer, size);
+        if (!chunked_slices) {
+            return tl::unexpected(chunked_slices.error());
+        }
+        slices = std::move(chunked_slices.value());
+    } else {
+        uint64_t offset = 0;
+        while (offset < size) {
+            auto chunk_size = std::min(size - offset, kMaxSliceSize);
+            void *chunk_ptr = static_cast<char *>(buffer) + offset;
+            slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            offset += chunk_size;
+        }
     }
 
     auto put_result = client_->Put(key, slices, config);

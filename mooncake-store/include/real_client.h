@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
+#include <condition_variable>
 #include <csignal>
 #include <memory>
 #include <shared_mutex>
@@ -103,14 +104,52 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
+    enum class RegisteredBufferMode {
+        Whole,
+        Chunked,
+    };
+
+    struct RegisteredBufferChunk {
+        void *ptr{nullptr};
+        size_t size{0};
+    };
+
     struct RegisteredBufferRegion {
         void *base{nullptr};
         size_t size{0};
         size_t offset{0};
+        RegisteredBufferMode mode{RegisteredBufferMode::Whole};
+        size_t chunk_size{0};
+        std::vector<RegisteredBufferChunk> chunks;
+        size_t active_operations{0};
+        bool unregistering{false};
+        bool registering{false};
     };
 
-    std::optional<RegisteredBufferRegion> resolve_registered_buffer(
-        void *buffer) const;
+    class RegisteredBufferGuard {
+       public:
+        RegisteredBufferGuard() = default;
+        RegisteredBufferGuard(RealClient *client, void *base);
+        RegisteredBufferGuard(const RegisteredBufferGuard &) = delete;
+        RegisteredBufferGuard &operator=(const RegisteredBufferGuard &) = delete;
+        RegisteredBufferGuard(RegisteredBufferGuard &&other) noexcept;
+        RegisteredBufferGuard &operator=(RegisteredBufferGuard &&other) noexcept;
+        ~RegisteredBufferGuard();
+
+        const RegisteredBufferRegion &region() const { return region_; }
+
+       private:
+        friend class RealClient;
+
+        void release();
+
+        RealClient *client_{nullptr};
+        void *base_{nullptr};
+        RegisteredBufferRegion region_{};
+    };
+
+    std::optional<RegisteredBufferGuard> resolve_registered_buffer_guard(
+        void *buffer);
 
     /**
      * @brief Get object data directly into a pre-allocated buffer
@@ -772,8 +811,9 @@ class RealClient : public PyClient {
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 
-    mutable std::shared_mutex registered_buffer_mutex_;
-    std::unordered_map<void *, size_t> registered_buffer_sizes_;
+    mutable std::mutex registered_buffer_mutex_;
+    std::condition_variable registered_buffer_cv_;
+    std::unordered_map<void *, RegisteredBufferRegion> registered_buffers_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

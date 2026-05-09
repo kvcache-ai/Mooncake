@@ -1033,14 +1033,15 @@ class MooncakeStorePyWrapper {
             return std::nullopt;
         }
 
-        auto region = real_client->resolve_registered_buffer(
+        auto guard = real_client->resolve_registered_buffer_guard(
             reinterpret_cast<void *>(buffer_ptr));
-        if (!region.has_value()) {
+        if (!guard.has_value()) {
             LOG(ERROR) << context << ": buffer is not registered";
             return std::nullopt;
         }
 
-        if (region->offset + size > region->size) {
+        auto region = guard->region();
+        if (region.offset > region.size || size > region.size - region.offset) {
             LOG(ERROR) << context << ": buffer range exceeds registered region";
             return std::nullopt;
         }
