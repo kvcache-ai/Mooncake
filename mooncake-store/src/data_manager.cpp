@@ -856,6 +856,11 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
 
     if (!transfer_result) {
         timer.LogResponse("error_code=", transfer_result.error());
+        if (!unpin_result) {
+            LOG(ERROR) << "Also failed to unpin key " << kctx.key
+                       << " after transfer failure: "
+                       << toString(unpin_result.error());
+        }
         return tl::make_unexpected(transfer_result.error());
     }
     if (!unpin_result) {
