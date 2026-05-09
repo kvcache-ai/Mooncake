@@ -171,8 +171,10 @@ constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
 
 // Store client configuration defaults
-static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
-static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
+static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE =
+    facebook::cachelib::Slab::kSize;
+static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE =
+    facebook::cachelib::Slab::kSize;
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 
@@ -332,8 +334,7 @@ struct Slice {
 };
 
 const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;
-const static uint64_t kMaxSliceSize =
-    facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
+const static uint64_t kMaxSliceSize = facebook::cachelib::Slab::kSize - 16;
 
 /**
  * @brief Represents a contiguous memory region

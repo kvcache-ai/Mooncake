@@ -74,8 +74,8 @@ class RealClient : public PyClient {
 
     int setup_real(
         const std::string &local_hostname, const std::string &metadata_server,
-        size_t global_segment_size = 1024 * 1024 * 16,
-        size_t local_buffer_size = 1024 * 1024 * 16,
+        size_t global_segment_size = DEFAULT_GLOBAL_SEGMENT_SIZE,
+        size_t local_buffer_size = DEFAULT_LOCAL_BUFFER_SIZE,
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
@@ -92,7 +92,7 @@ class RealClient : public PyClient {
     };
 
     int initAll(const std::string &protocol, const std::string &device_name,
-                size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
+                size_t mount_segment_size = DEFAULT_GLOBAL_SEGMENT_SIZE);
 
     uint64_t alloc_from_mem_pool(size_t size) { return 0; };
 
@@ -492,8 +492,8 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> setup_internal(
         const std::string &local_hostname, const std::string &metadata_server,
-        size_t global_segment_size = 1024 * 1024 * 16,
-        size_t local_buffer_size = 1024 * 1024 * 16,
+        size_t global_segment_size = DEFAULT_GLOBAL_SEGMENT_SIZE,
+        size_t local_buffer_size = DEFAULT_LOCAL_BUFFER_SIZE,
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
@@ -507,7 +507,7 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
-        size_t mount_segment_size = 1024 * 1024 * 16);
+        size_t mount_segment_size = DEFAULT_GLOBAL_SEGMENT_SIZE);
 
     tl::expected<void, ErrorCode> unregister_buffer_internal(void *buffer);
 
