@@ -66,10 +66,6 @@ int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle) {
 // Direct ACL VMM allocation (always bypasses adxl MallocMem).
 // Used by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.
 void *allocate_vmm_memory_direct_impl(size_t total_size) {
-    if (total_size % kFabricMemPageSize != 0) {
-        LOG(ERROR) << "VMM memory size must be a multiple of 1GB";
-        return nullptr;
-    }
     aclrtDrvMemHandle handle = nullptr;
     if (allocate_physical_memory(total_size, handle) != 0) {
         return nullptr;
@@ -137,10 +133,6 @@ void *ascend_allocate_memory(size_t total_size, const std::string &protocol) {
     if (globalConfig().ascend_use_fabric_mem) {
         void *va = nullptr;
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
-        if (total_size % kFabricMemPageSize != 0) {
-            LOG(ERROR) << "Local buffer size must be a multiple of 1GB";
-            return nullptr;
-        }
         if (&adxl::AdxlEngine::MallocMem != nullptr) {
             // Try to use adxl_engine's MallocMem
             auto status = adxl::AdxlEngine::MallocMem(adxl::MemType::MEM_HOST,

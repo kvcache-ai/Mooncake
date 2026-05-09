@@ -315,6 +315,20 @@ class Client {
                                                  size_t size);
 
     /**
+     * @brief Mounts a memory segment and returns its generated Segment UUID.
+     *        Logic is identical to MountSegment, but returns the segment id.
+     */
+    tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
+
+    /**
+     * @brief Unmounts a segment by its UUID.
+     *        Logic is identical to UnmountSegment, but looks up by id.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentById(const UUID& segment_id);
+
+    /**
      * @brief Registers memory buffer with TransferEngine for data transfer
      * @param addr Memory address to register
      * @param length Size of the memory region
@@ -406,6 +420,9 @@ class Client {
     tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
         bool enable_offloading,
         std::unordered_map<std::string, int64_t>& offloading_objects);
+
+    tl::expected<void, ErrorCode> ReportSsdCapacity(
+        int64_t ssd_total_capacity_bytes);
 
     /**
      * @brief Performs a batched read of multiple objects using a
@@ -511,6 +528,17 @@ class Client {
 
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
+    }
+
+    /**
+     * @brief Get the endpoint address for segment operations.
+     * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
+     *         For other modes, returns the logical local hostname used for
+     * segment registration.
+     */
+    [[nodiscard]] std::string GetSegmentEndpoint() {
+        return (metadata_connstring_ == P2PHANDSHAKE) ? GetTransportEndpoint()
+                                                      : local_hostname_;
     }
 
     // Return sorted NUMA node IDs that have at least one RDMA NIC.
@@ -704,6 +732,13 @@ class Client {
     // Mutex to protect mounted_segments_
     std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+
+    /**
+     * @brief Internal helper to unmount a segment by iterator.
+     *        Caller must hold mounted_segments_mutex_.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentImpl(
+        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
 
     // Configuration
     const std::string local_hostname_;

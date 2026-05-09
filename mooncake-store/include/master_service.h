@@ -439,6 +439,10 @@ class MasterService {
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
 
+    auto ReportSsdCapacity(const UUID& client_id,
+                           int64_t ssd_total_capacity_bytes)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Notifies the master that offloading of specified objects has
      * succeeded.
@@ -1167,6 +1171,14 @@ class MasterService {
     const bool enable_ha_;
 
     const bool enable_offload_;
+
+    // Offload-on-evict: defer disk offload to eviction time
+    // (config: offload_on_evict)
+    bool offload_on_evict_{false};
+    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
+    // exceeded (config: offload_force_evict, only effective when
+    // offload_on_evict_=true)
+    bool offload_force_evict_{false};
 
     const std::string ha_backend_type_;
 

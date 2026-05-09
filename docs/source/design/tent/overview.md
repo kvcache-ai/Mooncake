@@ -88,3 +88,11 @@ cpp-api
 
 metrics
 :::
+
+## TENT Failover
+
+:::{toctree}
+:maxdepth: 1
+
+failover
+:::

@@ -25,6 +25,9 @@ rm -f mooncake-wheel/mooncake/*.so
 
 echo "Creating directory structure..."
 
+# Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
+cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric_allocator_utils.py
+
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
@@ -170,11 +173,8 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
-if command -v python${PYTHON_VERSION} &>/dev/null; then
+if command -v pip &>/dev/null; then
     python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
-elif command -v pip &>/dev/null; then
-    pip install --upgrade pip
-    pip install build setuptools wheel auditwheel
 elif command -v uv &>/dev/null; then
     uv pip install --upgrade pip
     uv pip install build setuptools wheel auditwheel

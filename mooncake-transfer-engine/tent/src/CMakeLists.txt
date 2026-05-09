@@ -23,6 +23,18 @@ else()
   message(STATUS "CUDA: Disabled")
 endif()
 
+# ROCm / HIP
+if(USE_HIP)
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
+  find_package(HIP REQUIRED)
+  message(STATUS "ROCm/HIP: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_HIP __HIP_PLATFORM_AMD__)
+  target_include_directories(tent_interface INTERFACE ${HIP_INCLUDE_DIRS})
+  target_link_libraries(tent_interface INTERFACE hip::host)
+else()
+  message(STATUS "ROCm/HIP: Disabled")
+endif()
+
 # GDS
 find_library(CUFILE_LIB cufile PATHS /usr/local/cuda/lib64)
 find_path(CUFILE_INCLUDE cufile.h PATHS /usr/local/cuda/include)
@@ -65,6 +77,14 @@ else()
   message(STATUS "Uring: Disabled")
 endif()
 
+if(USE_SUNRISE)
+  target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
+  target_include_directories(tent_interface INTERFACE /usr/local/tangrt/include)
+  target_link_directories(tent_interface INTERFACE
+                          /usr/local/tangrt/lib/linux-x86_64)
+  target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
+endif()
+
 set(YALANTING_TARGET yalantinglibs::yalantinglibs)
 if(NOT TARGET ${YALANTING_TARGET})
   if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -81,7 +101,14 @@ add_subdirectory(runtime)
 add_subdirectory(platform)
 add_subdirectory(transport)
 add_subdirectory(metrics)
-add_subdirectory(python)
+if(NOT TARGET pybind11::module)
+  find_package(pybind11 QUIET)
+endif()
+if(TARGET pybind11::module)
+  add_subdirectory(python)
+else()
+  message(STATUS "pybind11 not found, skipping Tent Python bindings")
+endif()
 
 file(GLOB TENT_ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
@@ -100,7 +127,9 @@ foreach(
   metastore_etcd
   tent_platform_all
   platform_cuda
+  platform_rocm
   platform_ascend
+  platform_sunrise
   tent_xport_gds
   tent_xport_uring
   tent_xport_bufio
@@ -110,13 +139,13 @@ foreach(
   tent_xport_shm
   tent_xport_tcp
   tent_xport_ascend_direct
+  tent_xport_sunrise_link
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})
   endif()
 endforeach()
 target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
-
 install(
   TARGETS tent_shared
   ARCHIVE DESTINATION lib

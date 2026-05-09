@@ -19,6 +19,8 @@
 #include "rpc_types.h"
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_io/coro_io.hpp>
+#include <async_simple/coro/Lazy.h>
 
 namespace mooncake {
 
@@ -100,6 +102,15 @@ class RealClient : public PyClient {
     int register_buffer(void *buffer, size_t size);
 
     int unregister_buffer(void *buffer);
+
+    struct RegisteredBufferRegion {
+        void *base{nullptr};
+        size_t size{0};
+        size_t offset{0};
+    };
+
+    std::optional<RegisteredBufferRegion> resolve_registered_buffer(
+        void *buffer) const;
 
     /**
      * @brief Get object data directly into a pre-allocated buffer
@@ -406,10 +417,11 @@ class RealClient : public PyClient {
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config, const UUID &client_id);
 
-    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_dummy_helper(
-        const std::vector<std::string> &keys,
-        const std::vector<uint64_t> &buffers, const std::vector<size_t> &sizes,
-        int32_t device_id, const UUID &client_id);
+    async_simple::coro::Lazy<std::vector<tl::expected<int64_t, ErrorCode>>>
+    batch_get_into_dummy_helper(const std::vector<std::string> &keys,
+                                const std::vector<uint64_t> &buffers,
+                                const std::vector<size_t> &sizes,
+                                int32_t device_id, const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string> &keys,
@@ -453,6 +465,9 @@ class RealClient : public PyClient {
                                                    size_t shm_size,
                                                    bool is_local_buffer,
                                                    const UUID &client_id);
+    tl::expected<void, ErrorCode> map_shm_internal_with_device(
+        int fd, uint64_t shm_base_addr, size_t shm_size, bool is_local_buffer,
+        int32_t physical_device_id, const UUID &client_id);
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
 
@@ -645,7 +660,8 @@ class RealClient : public PyClient {
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
-    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
@@ -666,6 +682,50 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, Slice> &objects);
+
+    /**
+     * @brief Mount a shared memory file region and return segment ids.
+     *        If size > max_mr_size, it will be split into multiple chunks
+     *        and mounted separately. RealClient will open(path) + mmap
+     *        internally for each chunk.
+     */
+    int mountSegment(const std::string &path, size_t offset, size_t size,
+                     const std::string &protocol, const std::string &location,
+                     std::vector<std::string> &out_segment_ids);
+
+    /**
+     * @brief Unmount segments by their ids and clean up local mmap/fd.
+     */
+    int unmountSegment(const std::vector<std::string> &segment_ids);
+
+    /**
+     * @brief Allocate memory internally and mount segments to master.
+     *        If size > max_mr_size, it will be split into multiple chunks.
+     *        Memory is allocated via allocate_buffer_allocator_memory.
+     *        The actual allocated size (aligned up to Slab::kSize) is written
+     *        to out_allocated_size if non-null.
+     */
+    int allocateAndMountSegment(size_t size, const std::string &protocol,
+                                const std::string &location,
+                                std::vector<std::string> &out_segment_ids,
+                                size_t *out_allocated_size = nullptr);
+
+    /**
+     * @brief Unmount segments by their ids and free locally allocated memory.
+     */
+    int unmountAndFreeSegment(const std::vector<std::string> &segment_ids);
+
+    struct MountedSegmentRecord {
+        void *mmap_base = nullptr;
+        size_t size = 0;
+        std::string path;
+    };
+
+    struct AllocatedSegmentRecord {
+        void *base = nullptr;
+        size_t size = 0;
+        std::string protocol;
+    };
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -718,7 +778,7 @@ class RealClient : public PyClient {
         bool is_ascend = false;
         bool is_ipc = false;
         // Ascend physical device id from dummy (dummy-real RPC).
-        int32_t device_id = -1;
+        int32_t device_id = kInvalidPhysicalDeviceId;
         uint64_t vmm_handle = 0;
         std::string ipc_key_data;
     };
@@ -803,6 +863,15 @@ class RealClient : public PyClient {
     void teardown_ascend_shm_buffer(MappedShm &shm);
     tl::expected<void, ErrorCode> setup_ascend_internal(
         size_t local_buffer_size);
+
+   private:
+    std::unordered_map<std::string, MountedSegmentRecord>
+        mounted_segment_records_;
+    std::mutex mounted_segment_records_mutex_;
+
+    std::unordered_map<std::string, AllocatedSegmentRecord>
+        allocated_segment_records_;
+    std::mutex allocated_segment_records_mutex_;
 };
 
 }  // namespace mooncake

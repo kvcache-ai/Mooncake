@@ -33,6 +33,7 @@
 #include <thread>
 #include <map>
 #include <unordered_map>
+#include <vector>
 
 #include "common.h"
 #include "efa_transport.h"
@@ -46,7 +47,7 @@ class EfaTransport;
 struct EfaCq {
     EfaCq() : cq(nullptr), outstanding(0) {}
     struct fid_cq* cq;
-    volatile int outstanding;
+    std::atomic<int> outstanding;
 };
 
 struct EfaMemoryRegionMeta {
@@ -56,63 +57,30 @@ struct EfaMemoryRegionMeta {
     uint64_t key;
 };
 
-// Endpoint store for EFA with LRU eviction support.
-// When the store approaches the AV capacity (max_endpoints), stale endpoints
-// that have been inactive beyond `inactive_timeout_sec` are evicted to free
-// AV slots.  This prevents AV exhaustion in long-running services that
-// communicate with many transient peers.
-class EfaEndpointStore {
-   public:
-    static constexpr double kDefaultInactiveTimeoutSec = 5.0;  // 5 seconds
-
-    explicit EfaEndpointStore(
-        size_t max_endpoints = 65536,
-        double inactive_timeout_sec = kDefaultInactiveTimeoutSec);
-
-    std::shared_ptr<EfaEndPoint> get(const std::string& peer_nic_path);
-    // Atomically get-or-insert: returns existing endpoint or inserts new_ep.
-    // Prevents duplicate endpoint creation from concurrent callers.
-    // Triggers eviction when the store is at or above max_endpoints.
-    std::shared_ptr<EfaEndPoint> getOrInsert(
-        const std::string& peer_nic_path, std::shared_ptr<EfaEndPoint> new_ep);
-    void add(const std::string& peer_nic_path,
-             std::shared_ptr<EfaEndPoint> endpoint);
-    void remove(const std::string& peer_nic_path);
-    int disconnectAll();
-    size_t size() const;
-
-    // Evict endpoints that have been inactive longer than the configured
-    // timeout.  Returns the number of evicted endpoints.
-    size_t evictStale();
-
-    // Remove endpoints whose connections are broken (not connected and not
-    // initializing).  Returns the number of removed endpoints.
-    size_t removeDisconnected();
-
-   private:
-    // Must be called with write lock held.
-    size_t evictStaleLocked();
-
-    mutable RWSpinlock lock_;
-    std::unordered_map<std::string, std::shared_ptr<EfaEndPoint>> endpoints_;
-    size_t max_endpoints_;
-    double inactive_timeout_sec_;
-};
-
 // EfaContext represents the set of resources controlled by each local EFA
-// device, including Memory Region, CQ, EndPoint, etc. using libfabric
+// device: one libfabric domain, one address vector (AV), one shared endpoint
+// (fid_ep), one or more CQs, and the MR table.
+//
+// Key design point (SRD shared-endpoint model): there is exactly ONE fid_ep
+// per local NIC for the entire process.  Every peer lives as an fi_addr_t
+// entry inside the AV.  Adding a peer is an O(1) `fi_av_insert` into the
+// existing AV — it does NOT consume a QP slot.  Consequences:
+//   * QP usage is a constant 1 per local NIC, regardless of peer count.
+//   * Cold warmup is ~ms per peer (handshake + fi_av_insert) instead of
+//     ~35 ms per peer (fi_endpoint + fi_enable).
+//   * Scale-out is bounded only by AV capacity (65536) instead of 768/NIC.
 class EfaContext {
    public:
     EfaContext(EfaTransport& engine, const std::string& device_name);
 
     ~EfaContext();
 
-    int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
-                  uint8_t port = 1, int gid_index = -1, size_t max_cqe = 4096,
+    int construct(size_t num_cq_list = 1, size_t max_cqe = 4096,
                   int max_endpoints = 65536);
 
    private:
     int deconstruct();
+    int buildSharedEndpoint(size_t max_wr, size_t max_inline);
 
    public:
     // Memory Region Management
@@ -132,10 +100,21 @@ class EfaContext {
     void set_active(bool flag) { active_ = flag; }
 
    public:
-    // EndPoint Management
+    // Get or create a per-peer handle.  Does NOT open an fid_ep or call
+    // fi_enable — the shared endpoint was created once at construct() time.
+    // The returned EfaEndPoint only carries {peer_fi_addr_t, status, mutex}
+    // and, when connected, routes sends through this context's shared_ep_.
     std::shared_ptr<EfaEndPoint> endpoint(const std::string& peer_nic_path);
+
+    // Non-creating lookup under the normalized key.  Returns nullptr if the
+    // peer handle does not yet exist.  Safe for idempotency checks.
+    std::shared_ptr<EfaEndPoint> peekEndpoint(const std::string& peer_nic_path);
+
     int deleteEndpoint(const std::string& peer_nic_path);
     int disconnectAllEndpoints();
+
+    // Number of live peer handles.  Historically named "QP number"; with the
+    // shared endpoint model the actual QP count is always 1 per context.
     size_t getTotalQPNumber() const;
 
    public:
@@ -146,29 +125,19 @@ class EfaContext {
     // Submit slices for transfer
     int submitPostSend(const std::vector<Transport::Slice*>& slice_list);
 
+    // Hot-path submit: post a batch of slices to `peer_fi_addr` via the
+    // shared endpoint.  Handles WR / CQ reservation, MR descriptor prep,
+    // and the fi_write / fi_read burst under post_lock_.  Called by
+    // EfaEndPoint::submitPostSend once the peer is connected.
+    int submitSlicesOnPeer(fi_addr_t peer_fi_addr,
+                           std::vector<Transport::Slice*>& slice_list,
+                           std::vector<Transport::Slice*>& failed_slice_list);
+
     // Poll completion queue for completed operations
     int pollCq(int max_entries, int cq_index = 0);
 
-    // Evict stale endpoints to free EFA resources
-    size_t evictStaleEndpoints() {
-        return endpoint_store_ ? endpoint_store_->evictStale() : 0;
-    }
-
     // Get CQ count
     size_t cqCount() const { return cq_list_.size(); }
-
-    // Round-robin CQ assignment for new endpoints (mirrors RDMA transport)
-    std::shared_ptr<EfaCq> nextCq() {
-        if (cq_list_.empty()) return nullptr;
-        int index = (next_cq_index_++) % cq_list_.size();
-        return cq_list_[index];
-    }
-
-    // Get CQ outstanding count pointer
-    volatile int* cqOutstandingCount(int cq_index) {
-        if (cq_index < 0 || (size_t)cq_index >= cq_list_.size()) return nullptr;
-        return &cq_list_[cq_index]->outstanding;
-    }
 
    public:
     // Device name, such as `rdmap0s2`
@@ -184,6 +153,29 @@ class EfaContext {
     struct fid_av* av() const { return av_; }
     struct fi_info* info() const { return fi_info_; }
     std::string localAddr() const;
+
+    // Local (shared-endpoint) address in hex, for inclusion in handshake.
+    // Populated by construct() -> buildSharedEndpoint().
+    std::string localEpAddr() const;
+
+    // Raw bytes of the local endpoint address.  Use this for loopback
+    // (skip the hex encode/decode round-trip) or for any caller that
+    // already has the bytes.
+    const std::vector<uint8_t>& localEpAddrBytes() const {
+        return local_ep_addr_;
+    }
+
+    // Insert a peer's hex-encoded EFA address into this context's AV and
+    // return the resulting fi_addr_t.  Thread-safe (fi_av_insert is safe
+    // under libfabric's domain-level threading).
+    int insertPeerAddr(const std::string& peer_hex_addr, fi_addr_t& out);
+
+    // Binary variant — avoids the hex-decode when the caller already
+    // has the raw address bytes (e.g. loopback).
+    int insertPeerAddrBytes(const uint8_t* addr, size_t len, fi_addr_t& out);
+
+    // Remove a peer from the AV.  No-op if fi_addr is FI_ADDR_UNSPEC.
+    void removePeerAddr(fi_addr_t fi_addr);
 
     // Compatibility methods (libfabric doesn't use lid/gid like ibverbs)
     uint16_t lid() const { return 0; }
@@ -202,9 +194,29 @@ class EfaContext {
 
     bool active_;
 
-    std::shared_ptr<EfaEndpointStore> endpoint_store_;
+    // ---- Shared endpoint (one per local NIC, serves ALL peers) ----
+    struct fid_ep* shared_ep_;
+    std::vector<uint8_t> local_ep_addr_;  // bytes returned by fi_getname()
+    // Pacing for outstanding work requests on the shared endpoint.  Shared
+    // across all peers routed through this context.  std::atomic<int> so the
+    // submit-path fetch_add and the CQ-poller fetch_sub obey the C++ memory
+    // model; plain `volatile int` + __sync_* was UB under the current
+    // standard.
+    std::atomic<int> wr_depth_;
+    int max_wr_depth_;
+    // CQ that shared_ep_ is bound to (FI_TRANSMIT|FI_RECV).  Points into
+    // cq_list_[0]; kept here to avoid re-indexing on the hot path.
+    std::shared_ptr<EfaCq> shared_cq_;
+    // Serializes fi_write / fi_read calls on shared_ep_.  libfabric's RDM
+    // endpoints are not thread-safe for concurrent post, even with
+    // FI_THREAD_SAFE at the domain level.
+    std::atomic_flag post_lock_;
+
     std::vector<std::shared_ptr<EfaCq>> cq_list_;
-    std::atomic<int> next_cq_index_{0};
+
+    // ---- Peer handles (one entry per peer, each ~constant size) ----
+    mutable RWSpinlock peer_map_lock_;
+    std::unordered_map<std::string, std::shared_ptr<EfaEndPoint>> peer_map_;
 
     RWSpinlock mr_lock_;
     std::map<uint64_t, EfaMemoryRegionMeta> mr_map_;

@@ -18,6 +18,29 @@ from pg_test_utils import (
 BROKEN_RANK = 1
 
 
+def _dynamic_world_size_worker(
+    ctx: MooncakePGWorkerContext,
+) -> None:
+    """Worker for testing that dist.get_world_size() reflects dynamic size after extend."""
+    initial_world_size = ctx.world_size
+    ctx.init_group()
+    backend = ctx.get_backend()
+
+    initial_ws = dist.get_world_size()
+    assert initial_ws == initial_world_size, (
+        f"rank {ctx.rank}: initial world_size={initial_ws}, expected {initial_world_size}"
+    )
+
+    pg.extend_group_size_to(backend, initial_world_size + 1)
+
+    new_ws = dist.get_world_size()
+    assert new_ws == initial_world_size + 1, (
+        f"rank {ctx.rank}: after extend world_size={new_ws}, expected {initial_world_size + 1}"
+    )
+
+    ctx.record_result({"initial_ws": initial_ws, "new_ws": new_ws})
+
+
 def _extension_worker(
     ctx: MooncakePGWorkerContext,
     extend_event: mp.Event,
@@ -186,6 +209,17 @@ def _replacement_recovery_worker(
 class _ElasticMixin:
     world_size = 4
     spawn_timeout_s = 30.0
+
+    def test_dynamic_world_size(self) -> None:
+        """Test that dist.get_world_size() returns updated value after extend_group_size_to."""
+        rows = self.spawn_backend_and_collect(
+            _dynamic_world_size_worker,
+            timeout_s=30.0,
+        )
+
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["new_ws"], self.world_size + 1)
 
     def test_failed_rank(self) -> None:
         """Test that survivors can continue collective after a rank fails."""
