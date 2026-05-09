@@ -216,18 +216,27 @@ static void freeMemoryPool(void* addr, size_t size) {
     } else {
 #ifndef USE_UBSHMEM
         // check pointer on GPU
+        // Use graceful error handling like transfer engine core (memory_location.cpp)
+        // to support environments without GPU
         cudaPointerAttributes attributes;
-        checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                       "Failed to get pointer attributes");
+        cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
 
-        if (attributes.type == cudaMemoryTypeDevice) {
+        if (result != cudaSuccess) {
+            // CUDA not available or pointer query failed
+            // Assume CPU memory and free with numa_free
+            LOG(WARNING) << "cudaPointerGetAttributes failed (Error code: "
+                         << result << " - " << cudaGetErrorString(result)
+                         << "), assuming CPU memory";
+            numa_free(addr, size);
+        } else if (attributes.type == cudaMemoryTypeDevice) {
             cudaFree(addr);
         } else if (attributes.type == cudaMemoryTypeHost ||
                    attributes.type == cudaMemoryTypeUnregistered) {
             numa_free(addr, size);
         } else {
             LOG(ERROR) << "Unknown memory type, " << addr << " "
-                       << attributes.type;
+                       << attributes.type << ", assuming CPU memory";
+            numa_free(addr, size);
         }
 #endif
     }
