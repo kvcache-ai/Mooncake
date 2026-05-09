@@ -47,6 +47,22 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_length = static_cast<uintptr_t>(region.mr->length);
     return region_start <= addr && addr - region_start < region_length;
 }
+
+#if defined(USE_CUDA)
+// Returns true if the WITH_NVIDIA_PEERMEM environment variable is set to a
+// truthy value (1/ON/TRUE/YES), meaning ibv_reg_mr() should be used for GPU
+// memory instead of ibv_reg_dmabuf_mr(). Defaults to false (dmabuf path).
+bool withNvidiaPeermem() {
+    static const bool val = []() {
+        const char *env = std::getenv("WITH_NVIDIA_PEERMEM");
+        if (env == nullptr || *env == '\0') return false;
+        const std::string s(env);
+        return s == "1" || s == "ON" || s == "on" || s == "TRUE" ||
+               s == "true" || s == "YES" || s == "yes";
+    }();
+    return val;
+}
+#endif
 }  // namespace
 
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
@@ -227,7 +243,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-#if defined(USE_MLU) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
+#if defined(USE_MLU) || defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
     // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
@@ -240,6 +256,13 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+#if defined(USE_CUDA)
+    } else if (memType == CU_MEMORYTYPE_DEVICE && withNvidiaPeermem()) {
+        // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
+        // GPU memory (requires the nvidia-peermem kernel module to be loaded).
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+#endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
         // Ensure a CUDA context is current — worker threads or callers
         // from non-CUDA threads may lack one.
@@ -614,7 +637,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             return ERR_CONTEXT;
         }
 
-#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+#if defined(USE_CUDA)
         // Verify DMA-BUF support against the CUDA device(s) that the local
         // topology explicitly maps to this RNIC, rather than assuming the
         // verbs enumeration order matches CUDA enumeration.
@@ -622,6 +645,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // not just GPUs listing it as preferred.  Runtime selection falls
         // back to avail_hca when a preferred NIC is disabled, so we must
         // validate both lists.
+        if (!withNvidiaPeermem()) {
         std::vector<int> mapped_cuda_devices;
         if (engine_.local_topology_) {
             const auto topology_matrix = engine_.local_topology_->getMatrix();
@@ -691,6 +715,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                 }
             }
         }
+        }  // !withNvidiaPeermem()
 #endif
 
         ibv_port_attr port_attr;

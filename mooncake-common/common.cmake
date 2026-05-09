@@ -1,15 +1,12 @@
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
 
-set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -g -Wall -Wextra -Wno-unused-parameter -fPIC")
-set(CMAKE_C_FLAGS
-    "${CMAKE_C_FLAGS} -g -Wall -Wextra -Wno-unused-parameter -fPIC")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -Wall -Wextra -Wno-unused-parameter -fPIC")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wall -Wextra -Wno-unused-parameter -fPIC")
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines")
-  set(CMAKE_CXX_FLAGS_RELEASE
-      "${CMAKE_CXX_FLAGS_RELEASE} -fno-tree-slp-vectorize")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fno-tree-slp-vectorize")
 endif()
 
 set(CMAKE_C_FLAGS_RELEASE "-O3")
@@ -24,7 +21,7 @@ endif()
 
 option(ENABLE_ASAN "enable address sanitizer" OFF)
 
-if(ENABLE_ASAN)
+if (ENABLE_ASAN)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=leak")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=leak")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
@@ -32,7 +29,7 @@ if(ENABLE_ASAN)
 endif()
 
 # keep debuginfo by default
-if(NOT CMAKE_BUILD_TYPE)
+if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "RelWithDebInfo")
 endif()
 
@@ -47,7 +44,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(${CMAKE_CURRENT_LIST_DIR}/limit_jobs.cmake)
 
 option(ENABLE_SCCACHE "Whether to open sccache" OFF)
-if(ENABLE_SCCACHE)
+if (ENABLE_SCCACHE)
   find_program(SCCACHE sccache REQUIRED)
 endif()
 if(SCCACHE AND ENABLE_SCCACHE)
@@ -74,35 +71,29 @@ option(USE_BAREX "option for using accl-barex transport" OFF)
 option(USE_ASCEND "option for using npu with HCCL" OFF)
 option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
 option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
-option(USE_ASCEND_HETEROGENEOUS
-       "option for transferring between ascend npu and gpu" OFF)
+option(USE_ASCEND_HETEROGENEOUS "option for transferring between ascend npu and gpu" OFF)
 option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
 
-if(USE_UB)
+if (USE_UB)
   add_compile_definitions(USE_UB)
   message(STATUS "ub transport is enabled")
   include(${CMAKE_CURRENT_LIST_DIR}/FindUrma.cmake)
 endif()
 
-if(USE_EFA)
+if (USE_EFA)
   # Find libfabric headers and library; default to AWS EFA installer path
-  find_path(
-    LIBFABRIC_INCLUDE_DIR rdma/fabric.h
+  find_path(LIBFABRIC_INCLUDE_DIR rdma/fabric.h
     HINTS /opt/amazon/efa/include
     PATH_SUFFIXES include)
-  find_library(
-    LIBFABRIC_LIBRARY fabric
+  find_library(LIBFABRIC_LIBRARY fabric
     HINTS /opt/amazon/efa/lib
     PATH_SUFFIXES lib lib64)
 
-  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
-    message(
-      FATAL_ERROR
-        "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY."
-    )
+  if (NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    message(FATAL_ERROR "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY.")
   endif()
 
   get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
@@ -117,165 +108,121 @@ option(USE_ETCD "option for enable etcd as metadata server" OFF)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" ON)
-option(WITH_RUST_EXAMPLE
-       "build the Rust interface and sample code for the transfer engine" OFF)
+option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
-option(USE_EVENT_DRIVEN_COMPLETION
-       "option for using event-driven completion (store & transfer engine)" OFF)
-
-if(DEFINED CACHE{WITH_NVIDIA_PEERMEM})
-  message(WARNING "CMake cache entry WITH_NVIDIA_PEERMEM is ignored. "
-                  "Set the WITH_NVIDIA_PEERMEM environment variable instead.")
-  unset(WITH_NVIDIA_PEERMEM CACHE)
-endif()
-
-if(DEFINED ENV{WITH_NVIDIA_PEERMEM} AND NOT "$ENV{WITH_NVIDIA_PEERMEM}"
-                                        STREQUAL "")
-  string(TOUPPER "$ENV{WITH_NVIDIA_PEERMEM}" WITH_NVIDIA_PEERMEM_ENV)
-  if(WITH_NVIDIA_PEERMEM_ENV STREQUAL "1"
-     OR WITH_NVIDIA_PEERMEM_ENV STREQUAL "ON"
-     OR WITH_NVIDIA_PEERMEM_ENV STREQUAL "TRUE"
-     OR WITH_NVIDIA_PEERMEM_ENV STREQUAL "YES")
-    set(WITH_NVIDIA_PEERMEM ON)
-  elseif(
-    WITH_NVIDIA_PEERMEM_ENV STREQUAL "0"
-    OR WITH_NVIDIA_PEERMEM_ENV STREQUAL "OFF"
-    OR WITH_NVIDIA_PEERMEM_ENV STREQUAL "FALSE"
-    OR WITH_NVIDIA_PEERMEM_ENV STREQUAL "NO")
-    set(WITH_NVIDIA_PEERMEM OFF)
-  else()
-    message(
-      FATAL_ERROR
-        "Invalid WITH_NVIDIA_PEERMEM environment variable: '$ENV{WITH_NVIDIA_PEERMEM}'. "
-        "Expected one of ON/OFF, TRUE/FALSE, YES/NO, or 1/0.")
-  endif()
-  message(
-    STATUS "WITH_NVIDIA_PEERMEM is ${WITH_NVIDIA_PEERMEM} (from environment)")
-else()
-  set(WITH_NVIDIA_PEERMEM ON)
-  message(
-    STATUS
-      "WITH_NVIDIA_PEERMEM is ${WITH_NVIDIA_PEERMEM} (default; set environment variable WITH_NVIDIA_PEERMEM to override)"
-  )
-endif()
+option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
-option(ENABLE_MULTI_PROTOCOL
-       "option for enabling multi-protocol support in transfer engine" OFF)
-if(ENABLE_MULTI_PROTOCOL)
-  add_compile_definitions(ENABLE_MULTI_PROTOCOL)
-  message(STATUS "Multi-protocol support is enabled")
+option(ENABLE_MULTI_PROTOCOL "option for enabling multi-protocol support in transfer engine" OFF)
+if (ENABLE_MULTI_PROTOCOL)
+    add_compile_definitions(ENABLE_MULTI_PROTOCOL)
+    message(STATUS "Multi-protocol support is enabled")
 endif()
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
 set(LRU_MAX_CAPACITY 1000)
 
-if(USE_LRU_MASTER)
+if (USE_LRU_MASTER)
   add_compile_definitions(USE_LRU_MASTER)
   add_compile_definitions(LRU_MAX_CAPACITY)
 endif()
 
-if(USE_EVENT_DRIVEN_COMPLETION)
+if (USE_EVENT_DRIVEN_COMPLETION)
   add_compile_definitions(USE_EVENT_DRIVEN_COMPLETION)
   message(STATUS "Event-driven completion is enabled")
 else()
   message(STATUS "Event-driven completion is disabled")
 endif()
 
-if(USE_NVMEOF)
+if (USE_NVMEOF)
   set(USE_CUDA ON)
   add_compile_definitions(USE_NVMEOF)
   message(STATUS "NVMe-oF support is enabled")
 endif()
 
-if(USE_MNNVL)
-  if(NOT USE_HIP
-     AND NOT USE_MUSA
-     AND NOT USE_MACA)
+if (USE_MNNVL)
+  if (NOT USE_HIP AND NOT USE_MUSA AND NOT USE_MACA)
     set(USE_CUDA ON)
   endif()
   add_compile_definitions(USE_MNNVL)
   message(STATUS "Multi-Node NVLink support is enabled")
 endif()
 
-if(USE_CUDA)
+if (USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
   include_directories(/usr/local/cuda/include)
-  link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
+  link_directories(
+    /usr/local/cuda/lib
+    /usr/local/cuda/lib64
+  )
 endif()
 
-if(NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
-  if(DEFINED ENV{NEUWARE_HOME} AND NOT "$ENV{NEUWARE_HOME}" STREQUAL "")
-    set(NEUWARE_ROOT
-        "$ENV{NEUWARE_HOME}"
-        CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
+if (NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
+  if (DEFINED ENV{NEUWARE_HOME} AND NOT "$ENV{NEUWARE_HOME}" STREQUAL "")
+    set(NEUWARE_ROOT "$ENV{NEUWARE_HOME}" CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
   else()
-    set(NEUWARE_ROOT
-        "/usr/local/neuware"
-        CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
+    set(NEUWARE_ROOT "/usr/local/neuware" CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
   endif()
 endif()
 
-if(NOT DEFINED MLU_INCLUDE_DIR OR MLU_INCLUDE_DIR STREQUAL "")
+if (NOT DEFINED MLU_INCLUDE_DIR OR MLU_INCLUDE_DIR STREQUAL "")
   set(MLU_INCLUDE_DIR "${NEUWARE_ROOT}/include")
 endif()
 
-if(NOT DEFINED MLU_LIB_DIR OR MLU_LIB_DIR STREQUAL "")
+if (NOT DEFINED MLU_LIB_DIR OR MLU_LIB_DIR STREQUAL "")
   set(MLU_LIB_DIR "${NEUWARE_ROOT}/lib64")
 endif()
 
-if(NOT DEFINED MACA_ROOT OR MACA_ROOT STREQUAL "")
-  if(DEFINED ENV{MACA_HOME} AND NOT "$ENV{MACA_HOME}" STREQUAL "")
-    set(MACA_ROOT
-        "$ENV{MACA_HOME}"
-        CACHE PATH "Path to MACA SDK" FORCE)
+if (NOT DEFINED MACA_ROOT OR MACA_ROOT STREQUAL "")
+  if (DEFINED ENV{MACA_HOME} AND NOT "$ENV{MACA_HOME}" STREQUAL "")
+    set(MACA_ROOT "$ENV{MACA_HOME}" CACHE PATH "Path to MACA SDK" FORCE)
   else()
-    set(MACA_ROOT
-        "/opt/maca"
-        CACHE PATH "Path to MACA SDK" FORCE)
+    set(MACA_ROOT "/opt/maca" CACHE PATH "Path to MACA SDK" FORCE)
   endif()
 endif()
 
-if(NOT DEFINED MACA_INCLUDE_DIR OR MACA_INCLUDE_DIR STREQUAL "")
+if (NOT DEFINED MACA_INCLUDE_DIR OR MACA_INCLUDE_DIR STREQUAL "")
   set(MACA_INCLUDE_DIR "${MACA_ROOT}/include")
 endif()
 
-if(NOT DEFINED MACA_LIB_DIR OR MACA_LIB_DIR STREQUAL "")
-  if(EXISTS "${MACA_ROOT}/lib64")
+if (NOT DEFINED MACA_LIB_DIR OR MACA_LIB_DIR STREQUAL "")
+  if (EXISTS "${MACA_ROOT}/lib64")
     set(MACA_LIB_DIR "${MACA_ROOT}/lib64")
   else()
     set(MACA_LIB_DIR "${MACA_ROOT}/lib")
   endif()
 endif()
 
-if(USE_MLU)
+if (USE_MLU)
   add_compile_definitions(USE_MLU)
   message(STATUS "MLU support is enabled")
   include_directories(${MLU_INCLUDE_DIR})
-  if(EXISTS "${MLU_LIB_DIR}")
+  if (EXISTS "${MLU_LIB_DIR}")
     link_directories(${MLU_LIB_DIR})
   endif()
 endif()
 
-if(USE_MACA)
+if (USE_MACA)
   add_compile_definitions(USE_MACA)
   message(STATUS "MACA support is enabled")
   include_directories(${MACA_INCLUDE_DIR})
-  if(EXISTS "${MACA_LIB_DIR}")
+  if (EXISTS "${MACA_LIB_DIR}")
     link_directories(${MACA_LIB_DIR})
   endif()
 endif()
 
-if(USE_MUSA)
+if (USE_MUSA)
   add_compile_definitions(USE_MUSA)
   message(STATUS "MUSA support is enabled")
   include_directories(/usr/local/musa/include)
-  link_directories(/usr/local/musa/lib)
+  link_directories(
+    /usr/local/musa/lib
+  )
 endif()
 
-if(USE_HIP)
+if (USE_HIP)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
   find_package(HIP REQUIRED)
   include_directories(${HIP_INCLUDE_DIRS})
@@ -284,56 +231,52 @@ if(USE_HIP)
 
   find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)
   if(NOT HIPIFY_PERL_EXECUTABLE)
-    message(
-      FATAL_ERROR
-        "hipify-perl not found.\n"
-        "Please ensure the ROCm or HIP SDK is installed and in your PATH.")
+    message(FATAL_ERROR
+            "hipify-perl not found.\n"
+            "Please ensure the ROCm or HIP SDK is installed and in your PATH.")
   endif()
 endif()
 
-# This function converts given CUDA source files into HIP-compatible files using
-# hipify-perl, placing the outputs in the build directory for use in project
-# compilation. The file path changes to a new location after hipify.
+# This function converts given CUDA source files into HIP-compatible
+# files using hipify-perl, placing the outputs in the build directory for use in
+# project compilation. The file path changes to a new location after hipify.
 function(hipify_files input_var_name)
-  set(result_files)
+    set(result_files)
 
-  foreach(input_file IN LISTS ${input_var_name})
-    file(RELATIVE_PATH rel_path ${CMAKE_SOURCE_DIR} ${input_file})
-    set(output_file "${CMAKE_BINARY_DIR}/${rel_path}")
+    foreach(input_file IN LISTS ${input_var_name})
+        file(RELATIVE_PATH rel_path ${CMAKE_SOURCE_DIR} ${input_file})
+        set(output_file "${CMAKE_BINARY_DIR}/${rel_path}")
 
-    get_filename_component(output_dir ${output_file} DIRECTORY)
-    file(MAKE_DIRECTORY ${output_dir})
+        get_filename_component(output_dir ${output_file} DIRECTORY)
+        file(MAKE_DIRECTORY ${output_dir})
 
-    add_custom_command(
-      OUTPUT ${output_file}
-      COMMAND ${HIPIFY_PERL_EXECUTABLE} ${input_file} > ${output_file}
-      DEPENDS ${input_file}
-      COMMENT "HIPifying ${input_file} → ${output_file}")
+        add_custom_command(
+            OUTPUT ${output_file}
+            COMMAND ${HIPIFY_PERL_EXECUTABLE} ${input_file} > ${output_file}
+            DEPENDS ${input_file}
+            COMMENT "HIPifying ${input_file} → ${output_file}"
+        )
 
-    list(APPEND result_files ${output_file})
-  endforeach()
+        list(APPEND result_files ${output_file})
+    endforeach()
 
-  set(${input_var_name}
-      ${result_files}
-      PARENT_SCOPE)
+    set(${input_var_name} ${result_files} PARENT_SCOPE)
 endfunction()
 
-if(USE_CXL)
+if (USE_CXL)
   add_compile_definitions(USE_CXL)
   message(STATUS "CXL support is enabled")
 endif()
 
-if(USE_TCP)
+if (USE_TCP)
   add_compile_definitions(USE_TCP)
 endif()
 
-if(USE_BAREX)
+if (USE_BAREX)
   add_compile_definitions(USE_BAREX)
 endif()
 
-if(USE_ASCEND
-   OR USE_ASCEND_DIRECT
-   OR USE_UBSHMEM)
+if (USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
@@ -349,8 +292,7 @@ if(USE_ASCEND
     message(STATUS "Use env ASCEND_HOME_PATH")
     file(GLOB ASCEND_TOOLKIT_ROOT "$ENV{ASCEND_HOME_PATH}/${CPU_ARCH}-linux")
   else()
-    file(GLOB ASCEND_TOOLKIT_ROOT
-         "/usr/local/Ascend/ascend-toolkit/latest/${CPU_ARCH}-linux")
+    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/${CPU_ARCH}-linux")
   endif()
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
@@ -359,25 +301,24 @@ if(USE_ASCEND
   link_directories(${ASCEND_LIB_DIR})
 endif()
 
-if(USE_ASCEND)
+if (USE_ASCEND)
   set(ASCEND_DEVLIB_DIR "${ASCEND_TOOLKIT_ROOT}/devlib")
   link_directories(${ASCEND_DEVLIB_DIR})
   add_compile_definitions(USE_ASCEND)
 endif()
 
-if(USE_ASCEND_DIRECT)
+if (USE_ASCEND_DIRECT)
   set(BUILD_SHARED_LIBS ON)
   add_compile_definitions(USE_ASCEND_DIRECT)
 endif()
 
-if(USE_UBSHMEM)
+if (USE_UBSHMEM)
   set(BUILD_SHARED_LIBS ON)
   add_compile_definitions(USE_UBSHMEM)
 endif()
 
-if(USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT
-       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if (USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
   add_compile_definitions(USE_ASCEND_HETEROGENEOUS)
@@ -385,26 +326,21 @@ if(USE_ASCEND_HETEROGENEOUS)
   link_directories(${ASCEND_LIB_DIR})
 endif()
 
-if(USE_REDIS)
+if (USE_REDIS)
   add_compile_definitions(USE_REDIS)
   message(STATUS "Redis as metadata server support is enabled")
 endif()
 
-if(USE_HTTP)
+if (USE_HTTP)
   add_compile_definitions(USE_HTTP)
   message(STATUS "Http as metadata server support is enabled")
 endif()
 
-if(NOT USE_ETCD
-   AND NOT USE_REDIS
-   AND NOT USE_HTTP)
-  message(
-    STATUS
-      "None of USE_ETCD, USE_REDIS, USE_HTTP is selected, only \"P2PHANDSHAKE\" is supported as metadata server"
-  )
+if (NOT USE_ETCD AND NOT USE_REDIS AND NOT USE_HTTP)
+  message(STATUS "None of USE_ETCD, USE_REDIS, USE_HTTP is selected, only \"P2PHANDSHAKE\" is supported as metadata server")
 endif()
 
-if(WITH_METRICS)
+if (WITH_METRICS)
   add_compile_definitions(WITH_METRICS)
   message(STATUS "metrics is enabled")
 endif()
@@ -412,10 +348,6 @@ endif()
 if(USE_3FS)
   add_compile_definitions(USE_3FS)
   message(STATUS "3FS storage backend is enabled")
-endif()
-
-if(WITH_NVIDIA_PEERMEM)
-  add_compile_definitions(WITH_NVIDIA_PEERMEM)
 endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")

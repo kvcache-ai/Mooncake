@@ -39,6 +39,19 @@ namespace mooncake {
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
 
+#if defined(USE_CUDA)
+static bool withNvidiaPeermem() {
+    static const bool val = []() {
+        const char *env = std::getenv("WITH_NVIDIA_PEERMEM");
+        if (env == nullptr || *env == '\0') return false;
+        const std::string s(env);
+        return s == "1" || s == "ON" || s == "on" || s == "TRUE" ||
+               s == "true" || s == "YES" || s == "yes";
+    }();
+    return val;
+}
+#endif
+
 // Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
 // 0 - disabled, 1 - enabled if supported, 2 - auto (default, same as 1 today).
 static int getIbRelaxedOrderingMode() {
@@ -383,16 +396,19 @@ int RdmaTransport::allocateLocalSegmentID() {
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
-#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
-    for (auto &buffer : buffer_list) {
-        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
-                                      true, false);
-        if (ret) {
-            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
-                         << buffer.addr << " length " << buffer.length;
+#if defined(USE_CUDA)
+    if (!withNvidiaPeermem()) {
+        for (auto &buffer : buffer_list) {
+            int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                          true, false);
+            if (ret) {
+                LOG(WARNING)
+                    << "RdmaTransport: Failed to register memory: addr "
+                    << buffer.addr << " length " << buffer.length;
+            }
         }
-    }
-#else
+    } else {
+#endif
     std::vector<std::future<int>> results;
     for (auto &buffer : buffer_list) {
         results.emplace_back(
@@ -410,6 +426,8 @@ int RdmaTransport::registerLocalMemoryBatch(
                          << buffer_list[i].length;
         }
     }
+#if defined(USE_CUDA)
+    }  // withNvidiaPeermem()
 #endif
 
     return metadata_->updateLocalSegmentDesc();
