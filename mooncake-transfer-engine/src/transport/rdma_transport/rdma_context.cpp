@@ -266,9 +266,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         size_t allocSize;
 #if defined(USE_MLU)
         allocBase = (CUdeviceptr)addr;
-        result = cuPointerGetAttribute(&allocSize,
-                                       CU_POINTER_ATTRIBUTE_RANGE_SIZE,
-                                       (CUdeviceptr)addr);
+        result = cuPointerGetAttribute(
+            &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
 #else
         result =
             cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
@@ -305,8 +304,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
             return ERR_CONTEXT;
         }
         mrMeta.addr = addr;
-        uint64_t dmabuf_offset =
-            (uintptr_t)addr - (uintptr_t)allocBase;
+        uint64_t dmabuf_offset = (uintptr_t)addr - (uintptr_t)allocBase;
         mrMeta.mr = ibv_reg_dmabuf_mr(pd_, dmabuf_offset, length,
                                       (uintptr_t)addr, dmabuf_fd, access);
         const int regErrno = errno;

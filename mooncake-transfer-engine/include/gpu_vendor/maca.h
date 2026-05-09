@@ -39,7 +39,8 @@ const static std::string GPU_PREFIX = "maca:";
 #define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR mcPointerAttributeRangeStartAddr
 #define CU_POINTER_ATTRIBUTE_RANGE_SIZE mcPointerAttributeRangeSize
 #define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD mcMemHandleTypePosixFileDescriptor
-#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED mcDeviceAttributeHandleTypePosixFileDescriptorSupported
+#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED \
+    mcDeviceAttributeHandleTypePosixFileDescriptorSupported
 
 static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
     if (err_str) {
