@@ -824,7 +824,6 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
     std::string_view key, const std::vector<RemoteBufferDesc>& dest_buffers) {
     ScopedVLogTimer timer(1, "DataManager::ReadRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", dest_buffers.size());
-    const KeyCtx kctx = BuildKeyCtx(key);
 
     auto validate_result = ValidateRemoteBuffers(dest_buffers);
     if (!validate_result) {
@@ -834,38 +833,19 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
         return tl::make_unexpected(validate_result.error());
     }
 
-    // Reverse RDMA path: use the same 3-phase pin/unpin semantics even though
-    // the control plane is still a single RPC.
-    auto pin_result = PinKeyInternal(kctx, std::nullopt);
-    if (!pin_result) {
-        timer.LogResponse("error_code=", pin_result.error());
-        return tl::make_unexpected(pin_result.error());
-    }
-    const UUID pin_token = pin_result->pin_token;
-
-    auto handle_result = LookupPinnedKeyHandleInternal(kctx, pin_token);
+    // Reverse RDMA read stays on the direct object-handle path. Only forward
+    // RDMA read uses the 3-phase PinKey -> TE Read -> UnPinKey flow.
+    auto handle_result = tiered_backend_->Get(key);
     if (!handle_result) {
-        (void)UnPinKeyInternal(kctx, pin_token);
         timer.LogResponse("error_code=", handle_result.error());
         return tl::make_unexpected(handle_result.error());
     }
 
     auto transfer_result =
         TransferDataToRemote(handle_result.value(), dest_buffers);
-    auto unpin_result = UnPinKeyInternal(kctx, pin_token);
-
     if (!transfer_result) {
         timer.LogResponse("error_code=", transfer_result.error());
-        if (!unpin_result) {
-            LOG(ERROR) << "Also failed to unpin key " << kctx.key
-                       << " after transfer failure: "
-                       << toString(unpin_result.error());
-        }
         return tl::make_unexpected(transfer_result.error());
-    }
-    if (!unpin_result) {
-        timer.LogResponse("error_code=", unpin_result.error());
-        return tl::make_unexpected(unpin_result.error());
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return {};
