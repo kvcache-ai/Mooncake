@@ -109,7 +109,7 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
         config = MooncakeConfig.load_from_env()
         base_config = config.__dict__
 
-        segment_unit = 16 * 1024 * 1024  # 16 MB
+        segment_unit = 64 * 1024 * 1024  # 64 MB (must be >= Slab::kSize)
         clients = [
             ("localhost:10001", segment_unit),
             ("localhost:10002", segment_unit),
