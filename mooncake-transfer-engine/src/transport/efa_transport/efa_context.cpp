@@ -48,7 +48,8 @@ EfaContext::EfaContext(EfaTransport& engine, const std::string& device_name)
       shared_ep_(nullptr),
       wr_depth_(0),
       max_wr_depth_(0),
-      post_lock_(ATOMIC_FLAG_INIT) {}
+      post_lock_(ATOMIC_FLAG_INIT),
+      peer_map_max_(0) {}
 
 EfaContext::~EfaContext() {
     if (fabric_) deconstruct();
@@ -150,6 +151,14 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     struct fi_av_attr av_attr = {};
     av_attr.type = FI_AV_TABLE;
     av_attr.count = max_endpoints;
+
+    // peer_map_ is bounded to the same capacity as the AV: once that many
+    // peers have been inserted, FIFO eviction kicks in (oldest entry
+    // disconnected + removed) before adding a new one.  Without this cap,
+    // schemes that embed volatile data in peer_nic_path (ip:port:timestamp)
+    // cause peer_map_ to grow without bound across peer restarts.
+    peer_map_max_ =
+        max_endpoints > 0 ? static_cast<size_t>(max_endpoints) : 0;
 
     ret = fi_av_open(domain_, &av_attr, &av_, nullptr);
     if (ret) {
@@ -278,10 +287,10 @@ int EfaContext::deconstruct() {
     {
         RWSpinlock::WriteGuard guard(peer_map_lock_);
         for (auto& entry : peer_map_) {
-            if (entry.second) entry.second->markDetachedForTeardown();
+            if (entry.second.ep) entry.second.ep->markDetachedForTeardown();
         }
         peer_map_.clear();
-        stable_key_to_path_.clear();
+        peer_lru_.clear();
     }
 
     {
@@ -479,40 +488,22 @@ void* EfaContext::mrDesc(void* addr) {
 
 std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     const std::string& peer_nic_path) {
-    // Key the peer map by the full "host:port@nic" path, not the
-    // port-stripped form.  Under sglang DP>1 every DP worker on a peer
-    // host is a distinct process with its own Mooncake TransferEngine
-    // and its own P2PHANDSHAKE RPC port.  They share the same host+NIC
-    // but map to different EFA QPNs / memory regions.  If we normalize
-    // the port away, every DP worker on that host collapses onto the
-    // same EfaEndPoint slot: each arriving handshake looks like a
-    // "peer reconnected with new address" to the previous holder,
-    // triggering fi_av_remove + fi_av_insert (and an AH warm-up) on
-    // every KV transfer.  At high DP this devolves into permanent
-    // thrashing and eventually "Remote MR invalid" when an in-flight
-    // fi_write runs against a stale AV slot.
-    //
-    // The port is stable for the lifetime of a sglang worker process
-    // (Mooncake only calls initialize() once), so keying by full path
-    // costs nothing in steady state.
-    //
-    // STALE-PEER EVICTION: when the same physical peer (same host+NIC)
-    // reconnects with a new volatile key (e.g. new RPC port or new
-    // timestamp in custom "ip:port:timestamp@nic" schemes), the old
-    // entry for that (host, NIC) is evicted before the new one is
-    // inserted.  Without this, libfabric's internal AH cache fills up
-    // across rolling upgrades and eventually fi_av_insert returns 0
-    // ("silent refuse"), breaking transfers long before the nominal
-    // MC_MAX_EP_PER_CTX (65536) is reached.  The eviction uses the
-    // stable "host@nic" key produced by stableHostNicKey().
+    // Key the peer map by the full peer_nic_path verbatim.  Each distinct
+    // value (including sglang DP>1 workers that share a host but own
+    // different RPC ports, or successive generations of the same process
+    // that encode a timestamp) gets its own EfaEndPoint + AV slot.  This
+    // preserves per-worker identity.  Growth is bounded by FIFO eviction
+    // when peer_map_.size() would exceed peer_map_max_ (sized from
+    // MC_MAX_EP_PER_CTX at construct()).  The oldest inserted entry is
+    // disconnected (fi_av_remove) and erased; this keeps the AV table
+    // bounded without aliasing concurrent peers onto a shared slot.
     const std::string& key = peer_nic_path;
-    const std::string stable_key = stableHostNicKey(peer_nic_path);
 
     {
         RWSpinlock::ReadGuard guard(peer_map_lock_);
         auto it = peer_map_.find(key);
         if (it != peer_map_.end()) {
-            return it->second;
+            return it->second.ep;
         }
     }
 
@@ -524,40 +515,41 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     // fi_av_remove) can run without holding peer_map_lock_.
     std::shared_ptr<EfaEndPoint> evicted_ep;
     std::string evicted_path;
+    size_t post_evict_size = 0;
     {
         RWSpinlock::WriteGuard guard(peer_map_lock_);
         auto it = peer_map_.find(key);
         if (it != peer_map_.end()) {
-            return it->second;
+            return it->second.ep;
         }
 
-        // If this (host, NIC) is already mapped to a different volatile
-        // key, it means the peer restarted (new port / timestamp).  Evict
-        // the old entry so the AV doesn't accumulate stale addresses.
-        auto stable_it = stable_key_to_path_.find(stable_key);
-        if (stable_it != stable_key_to_path_.end() &&
-            stable_it->second != key) {
-            auto old_it = peer_map_.find(stable_it->second);
-            if (old_it != peer_map_.end()) {
-                evicted_ep = old_it->second;
-                evicted_path = old_it->first;
-                peer_map_.erase(old_it);
+        // Enforce peer_map_ capacity.  Evict the oldest entry if adding
+        // this one would exceed peer_map_max_.  peer_map_max_ == 0 means
+        // "unbounded" (keeps legacy behaviour for tests that skip
+        // construct()).
+        if (peer_map_max_ > 0 && peer_map_.size() >= peer_map_max_ &&
+            !peer_lru_.empty()) {
+            evicted_path = peer_lru_.front();
+            auto evict_it = peer_map_.find(evicted_path);
+            if (evict_it != peer_map_.end()) {
+                evicted_ep = evict_it->second.ep;
+                peer_map_.erase(evict_it);
             }
-            // Overwrite the stable→volatile mapping below.
+            peer_lru_.pop_front();
         }
 
-        peer_map_[key] = new_ep;
-        stable_key_to_path_[stable_key] = key;
+        peer_lru_.push_back(key);
+        auto lru_it = std::prev(peer_lru_.end());
+        peer_map_[key] = PeerMapEntry{new_ep, lru_it};
+        post_evict_size = peer_map_.size();
     }
 
     if (evicted_ep) {
-        LOG(INFO) << "Evicting stale EFA peer on " << nicPath() << ": "
-                  << evicted_path << " -> " << peer_nic_path
-                  << " (stable_key=" << stable_key << ", peer_count=" <<
-            [&] {
-                RWSpinlock::ReadGuard g(peer_map_lock_);
-                return peer_map_.size();
-            }() << ")";
+        LOG(INFO) << "Evicting oldest EFA peer on " << nicPath()
+                  << " to make room: " << evicted_path << " -> "
+                  << peer_nic_path
+                  << " (peer_count=" << post_evict_size
+                  << ", peer_map_max=" << peer_map_max_ << ")";
         evicted_ep->disconnect();  // fi_av_remove(old_fi_addr)
     }
     return new_ep;
@@ -568,7 +560,7 @@ std::shared_ptr<EfaEndPoint> EfaContext::peekEndpoint(
     RWSpinlock::ReadGuard guard(peer_map_lock_);
     auto it = peer_map_.find(peer_nic_path);
     if (it == peer_map_.end()) return nullptr;
-    return it->second;
+    return it->second.ep;
 }
 
 int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
@@ -577,16 +569,9 @@ int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
         RWSpinlock::WriteGuard guard(peer_map_lock_);
         auto it = peer_map_.find(peer_nic_path);
         if (it == peer_map_.end()) return 0;
-        ep = it->second;
+        ep = it->second.ep;
+        peer_lru_.erase(it->second.lru_it);
         peer_map_.erase(it);
-        // Keep stable_key_to_path_ in sync: only erase the stable-key
-        // mapping if it still points at this volatile key (a newer
-        // endpoint() call might have already overwritten it).
-        const std::string stable_key = stableHostNicKey(peer_nic_path);
-        auto sit = stable_key_to_path_.find(stable_key);
-        if (sit != stable_key_to_path_.end() && sit->second == peer_nic_path) {
-            stable_key_to_path_.erase(sit);
-        }
     }
     if (ep) ep->disconnect();  // runs fi_av_remove
     return 0;
@@ -595,9 +580,8 @@ int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
 int EfaContext::disconnectAllEndpoints() {
     RWSpinlock::WriteGuard guard(peer_map_lock_);
     for (auto& entry : peer_map_) {
-        if (entry.second) entry.second->disconnect();
+        if (entry.second.ep) entry.second.ep->disconnect();
     }
-    stable_key_to_path_.clear();
     return 0;
 }
 

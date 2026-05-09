@@ -216,18 +216,26 @@ class EfaContext {
 
     // ---- Peer handles (one entry per peer, each ~constant size) ----
     mutable RWSpinlock peer_map_lock_;
-    std::unordered_map<std::string, std::shared_ptr<EfaEndPoint>> peer_map_;
-    // Secondary index: stable "host@nic" → current peer_nic_path stored in
-    // peer_map_ for that (host, nic) pair.  When endpoint() is invoked with
-    // a different peer_nic_path whose stable key already has an entry, the
-    // old entry is evicted (removed from peer_map_ + fi_av_remove) before
-    // the new one is inserted.  This prevents stale AV entries from
-    // accumulating across peer restarts in schemes that embed volatile
-    // data (port, timestamp) in peer_nic_path — without which libfabric's
-    // internal AH cache can overflow long before MC_MAX_EP_PER_CTX.
-    //
-    // Guarded by peer_map_lock_ (the two maps are always updated together).
-    std::unordered_map<std::string, std::string> stable_key_to_path_;
+
+    // FIFO eviction cap.  Bounds peer_map_ so that volatile peer_nic_path
+    // schemes (ip:port:timestamp@nic) cannot accumulate stale entries past
+    // the configured limit.  When peer_map_ would exceed peer_map_max_, the
+    // oldest inserted entry is evicted (fi_av_remove + erase) before the
+    // new one is added.  This keeps libfabric's AV table bounded without
+    // the per-process aliasing that a host+nic "stable key" would impose
+    // on sglang DP>1 workloads (each DP worker has its own RPC port and
+    // must retain its own peer_map_ slot).
+    size_t peer_map_max_;  // set from MC_MAX_PEER_MAP, 0 = unlimited
+
+    // peer_map_ entry storing both the endpoint and an iterator into the
+    // FIFO eviction list, so deletion from either side is O(1).
+    struct PeerMapEntry {
+        std::shared_ptr<EfaEndPoint> ep;
+        std::list<std::string>::iterator lru_it;
+    };
+    std::unordered_map<std::string, PeerMapEntry> peer_map_;
+    // Insertion order — front = oldest.  Guarded by peer_map_lock_.
+    std::list<std::string> peer_lru_;
 
     RWSpinlock mr_lock_;
     std::map<uint64_t, EfaMemoryRegionMeta> mr_map_;
