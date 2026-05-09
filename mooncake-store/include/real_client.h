@@ -131,9 +131,11 @@ class RealClient : public PyClient {
         RegisteredBufferGuard() = default;
         RegisteredBufferGuard(RealClient *client, void *base);
         RegisteredBufferGuard(const RegisteredBufferGuard &) = delete;
-        RegisteredBufferGuard &operator=(const RegisteredBufferGuard &) = delete;
+        RegisteredBufferGuard &operator=(const RegisteredBufferGuard &) =
+            delete;
         RegisteredBufferGuard(RegisteredBufferGuard &&other) noexcept;
-        RegisteredBufferGuard &operator=(RegisteredBufferGuard &&other) noexcept;
+        RegisteredBufferGuard &operator=(
+            RegisteredBufferGuard &&other) noexcept;
         ~RegisteredBufferGuard();
 
         const RegisteredBufferRegion &region() const { return region_; }
