@@ -708,7 +708,7 @@ The Python compatibility API treats KV cache data-plane failures as best-effort 
 - `get_into(...)`, `batch_get_into(...)`, and `batch_get_into_multi_buffers(...)` return copied lengths and use `-1` for soft misses
 - `put(...)`, `put_from(...)`, `batch_put_from(...)`, and related buffer write APIs return `-1` or per-item negative statuses on true write failures
 - `batch_put_from(...)` reports per-key best-effort statuses; route-CAS conflicts are success, preserving insert-if-absent cache semantics under concurrent writers without adding a metadata recheck
-- `batch_is_exist(...)` returns `1` for hit, `0` for miss, and negative status codes for soft backend failures
+- `batch_is_exist(...)` returns `1` only when an active route has a currently readable replica; stale routes whose owners are quarantined are reported as `0` so cache writers can repopulate them
 - soft-fail downgrade covers transient native exceptions, including metadata and transport errors, at the Python compatibility boundary
 
 ### Lifecycle and Capacity
@@ -919,6 +919,7 @@ These runners verify:
 - two real storage `mooncake-store-client` processes plus one routed rw-only gateway
 - two `python -m sglang.launch_server` processes using the packaged Mooncake backend
 - baseline cross-process put/get through Mooncake HiCache
+- one lightweight drain request after each writer phase before put metric assertions, matching SGLang's asynchronous write-through backup timing
 - storage expansion while requests are still served
 - forced storage kill with retry-based recovery instead of persistent request failure
 - graceful storage shrink with retry-based recovery instead of persistent request failure

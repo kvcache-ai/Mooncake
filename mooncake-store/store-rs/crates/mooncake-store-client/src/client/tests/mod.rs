@@ -12540,6 +12540,106 @@ fn readable_replica_selection_prefers_local_survivor() {
 }
 
 #[test]
+fn batch_is_readable_requires_a_live_replica() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let dead_transport = Arc::new(TestTransport::new("exist-readable-dead-segment"));
+    let live_transport = Arc::new(dead_transport.peer("exist-readable-live-segment"));
+    let writer_transport = Arc::new(dead_transport.peer("exist-readable-writer-segment"));
+    let reader_transport = Arc::new(dead_transport.peer("exist-readable-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let dead = StoreClientBuilder::new(metadata.clone(), "exist-readable-dead")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(dead_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("dead storage build should succeed");
+    let live = StoreClientBuilder::new(metadata.clone(), "exist-readable-live")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(live_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("live storage build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "exist-readable-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "exist-readable-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    dead.register_local_memory()
+        .expect("dead storage memory should register");
+    live.register_local_memory()
+        .expect("live storage memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&dead, &live, &writer, &reader]);
+
+    writer
+        .put_with_policy(
+            "dead-only",
+            b"dead-only-value",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([dead.runtime_id().storage_key()]),
+        )
+        .expect("dead-only route should be written");
+    writer
+        .put_with_policy(
+            "with-live-copy",
+            b"with-live-copy-value",
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    dead.runtime_id().storage_key(),
+                    live.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("replicated route should be written");
+
+    reader.mark_runtime_suspect(dead.runtime_id(), "test_dead_storage");
+    assert_eq!(
+        reader
+            .batch_is_readable(&[
+                ObjectRef::new("dead-only"),
+                ObjectRef::new("with-live-copy"),
+                ObjectRef::new("missing"),
+            ])
+            .expect("batch_is_readable should succeed"),
+        vec![false, true, false]
+    );
+}
+
+#[test]
 fn routed_put_skips_draining_storage_and_authority() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let victim_transport = Arc::new(TestTransport::new("drain-fallback-victim-segment"));
