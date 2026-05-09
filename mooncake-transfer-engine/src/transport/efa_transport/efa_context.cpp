@@ -551,13 +551,13 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     }
 
     if (evicted_ep) {
-        LOG(INFO) << "Evicting stale EFA peer on " << nicPath()
-                  << ": " << evicted_path << " -> " << peer_nic_path
-                  << " (stable_key=" << stable_key
-                  << ", peer_count=" << [&] {
-                         RWSpinlock::ReadGuard g(peer_map_lock_);
-                         return peer_map_.size();
-                     }() << ")";
+        LOG(INFO) << "Evicting stale EFA peer on " << nicPath() << ": "
+                  << evicted_path << " -> " << peer_nic_path
+                  << " (stable_key=" << stable_key << ", peer_count=" <<
+            [&] {
+                RWSpinlock::ReadGuard g(peer_map_lock_);
+                return peer_map_.size();
+            }() << ")";
         evicted_ep->disconnect();  // fi_av_remove(old_fi_addr)
     }
     return new_ep;
@@ -663,6 +663,43 @@ int EfaContext::insertPeerAddr(const std::string& peer_hex_addr,
 int EfaContext::insertPeerAddrBytes(const uint8_t* addr, size_t len,
                                     fi_addr_t& out) {
     if (!addr || len == 0) return ERR_INVALID_ARGUMENT;
+
+    // Defensive validation before handing bytes to libfabric.
+    //
+    // Some peer-restart races / partial-init bugs surface handshake
+    // payloads with malformed addresses: wrong length, all-zero bytes,
+    // truncated bytes, etc. libfabric's EFA provider does NOT validate
+    // the address layout; it will happily accept and later SEGV deep
+    // inside internal libs (observed: GPF in libc / libnuma / libfabric
+    // from provider-internal pointer deref).
+    //
+    // The legitimate endpoint address length on this system is set by
+    // fi_getname() when we built our own shared endpoint.  Any peer
+    // address must be exactly that length; otherwise the bytes are
+    // definitely malformed and must not be passed to fi_av_insert.
+    if (!local_ep_addr_.empty() && len != local_ep_addr_.size()) {
+        LOG(ERROR) << "insertPeerAddrBytes: peer address length mismatch on "
+                   << nicPath() << " (expected " << local_ep_addr_.size()
+                   << ", got " << len
+                   << ") — refusing to call fi_av_insert to avoid libfabric"
+                      " provider crash on malformed address";
+        return ERR_INVALID_ARGUMENT;
+    }
+    bool all_zero = true;
+    for (size_t i = 0; i < len; ++i) {
+        if (addr[i] != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    if (all_zero) {
+        LOG(ERROR) << "insertPeerAddrBytes: peer address is all-zero on "
+                   << nicPath()
+                   << " — refusing (likely half-initialized / uninitialized"
+                      " peer)";
+        return ERR_INVALID_ARGUMENT;
+    }
+
     int ret = fi_av_insert(av_, addr, 1, &out, 0, nullptr);
     if (ret != 1) {
         // libfabric's fi_av_insert returns three-valued:
@@ -690,14 +727,12 @@ int EfaContext::insertPeerAddrBytes(const uint8_t* addr, size_t len,
         }
         LOG(ERROR) << "fi_av_insert failed on " << nicPath()
                    << ": expected 1 inserted, got ret=" << ret
-                   << (ret < 0
-                           ? std::string(" (libfabric error: ") +
-                                 fi_strerror(-ret) + ")"
-                           : std::string(
-                                 " (libfabric silently refused — likely "
-                                 "stale/duplicate/malformed peer address)"))
-                   << ", peer_count=" << av_usage
-                   << ", addr_len=" << len
+                   << (ret < 0 ? std::string(" (libfabric error: ") +
+                                     fi_strerror(-ret) + ")"
+                               : std::string(
+                                     " (libfabric silently refused — likely "
+                                     "stale/duplicate/malformed peer address)"))
+                   << ", peer_count=" << av_usage << ", addr_len=" << len
                    << ", addr_prefix=0x" << addr_prefix
                    << (len > kPrefixBytes ? "..." : "");
         return ERR_ENDPOINT;
@@ -709,9 +744,8 @@ void EfaContext::removePeerAddr(fi_addr_t fi_addr) {
     if (fi_addr == FI_ADDR_UNSPEC) return;
     int ret = fi_av_remove(av_, &fi_addr, 1, 0);
     if (ret) {
-        LOG(WARNING) << "fi_av_remove failed on " << nicPath()
-                     << ": " << fi_strerror(-ret)
-                     << " (fi_addr=" << fi_addr << ")";
+        LOG(WARNING) << "fi_av_remove failed on " << nicPath() << ": "
+                     << fi_strerror(-ret) << " (fi_addr=" << fi_addr << ")";
     }
 }
 

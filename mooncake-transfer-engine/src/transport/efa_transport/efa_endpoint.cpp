@@ -76,8 +76,8 @@ int EfaEndPoint::setupConnectionsByActive() {
     if (peer_desc.efa_addr.empty()) {
         LOG(ERROR) << "Peer did not provide EFA address in handshake: "
                    << "local=" << context_.nicPath()
-                   << ", peer_nic_path=" << peer_nic_path_
-                   << ", reply_msg=\"" << peer_desc.reply_msg << "\""
+                   << ", peer_nic_path=" << peer_nic_path_ << ", reply_msg=\""
+                   << peer_desc.reply_msg << "\""
                    << " (peer may be in the middle of restart / not yet "
                       "fully initialized; consider retry with backoff)";
         return ERR_REJECT_HANDSHAKE;
