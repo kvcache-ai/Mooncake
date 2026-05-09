@@ -388,7 +388,7 @@ impl PyMooncakeDistributedStore {
                             object = object.object_set(scope.object_set.as_str());
                         }
                         client
-                            .batch_is_exist(&[object])
+                            .batch_is_readable(&[object])
                             .map(|items| items.first().copied().unwrap_or(false))
                     })
                 })
@@ -425,7 +425,7 @@ impl PyMooncakeDistributedStore {
                             })
                             .collect::<Vec<_>>();
                         client
-                            .batch_is_exist(&objects)
+                            .batch_is_readable(&objects)
                             .map(|items| items.into_iter().map(i32::from).collect())
                     })
                 })
