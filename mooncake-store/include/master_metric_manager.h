@@ -9,7 +9,8 @@
 
 namespace mooncake {
 
-struct ClientTransferStatsDelta;  // Forward declaration (defined in rpc_types.h)
+struct ClientTransferStatsDelta;  // Forward declaration (defined in
+                                  // rpc_types.h)
 
 class MasterMetricManager {
    public:

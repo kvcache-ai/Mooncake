@@ -1636,21 +1636,21 @@ std::string MasterMetricManager::get_summary_string() {
 
     // Global client-reported transfer stats (aggregated from Ping heartbeats)
     ss << " | Client Get by Tier: DRAM="
-       << global_get_from_memory_count_.load(std::memory_order_relaxed)
-       << " (" << byte_size_to_string(
+       << global_get_from_memory_count_.load(std::memory_order_relaxed) << " ("
+       << byte_size_to_string(
               global_get_from_memory_bytes_.load(std::memory_order_relaxed))
        << "), SSD="
-       << global_get_from_disk_count_.load(std::memory_order_relaxed)
-       << " (" << byte_size_to_string(
+       << global_get_from_disk_count_.load(std::memory_order_relaxed) << " ("
+       << byte_size_to_string(
               global_get_from_disk_bytes_.load(std::memory_order_relaxed))
        << ")";
     ss << " | Client Put by Tier: DRAM="
-       << global_put_to_memory_count_.load(std::memory_order_relaxed)
-       << " (" << byte_size_to_string(
+       << global_put_to_memory_count_.load(std::memory_order_relaxed) << " ("
+       << byte_size_to_string(
               global_put_to_memory_bytes_.load(std::memory_order_relaxed))
-       << "), SSD="
-       << global_put_to_disk_count_.load(std::memory_order_relaxed)
-       << " (" << byte_size_to_string(
+       << "), SSD=" << global_put_to_disk_count_.load(std::memory_order_relaxed)
+       << " ("
+       << byte_size_to_string(
               global_put_to_disk_bytes_.load(std::memory_order_relaxed))
        << ")";
 

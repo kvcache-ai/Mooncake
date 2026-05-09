@@ -1087,7 +1087,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             uint64_t total_bytes = CalculateSliceSize(slices_it->second);
             if (replica.is_memory_replica()) {
                 metrics_->transfer_metric.get_from_memory_count.inc();
-                metrics_->transfer_metric.get_from_memory_bytes.inc(total_bytes);
+                metrics_->transfer_metric.get_from_memory_bytes.inc(
+                    total_bytes);
             } else if (replica.is_disk_replica()) {
                 metrics_->transfer_metric.get_from_disk_count.inc();
                 metrics_->transfer_metric.get_from_disk_bytes.inc(total_bytes);
@@ -1252,7 +1253,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                 if (metrics_) {
                     uint64_t total_bytes = CalculateSliceSize(slices);
                     metrics_->transfer_metric.put_to_disk_count.inc();
-                    metrics_->transfer_metric.put_to_disk_bytes.inc(total_bytes);
+                    metrics_->transfer_metric.put_to_disk_bytes.inc(
+                        total_bytes);
                 }
                 // Store to local file if storage backend is available
                 auto disk_descriptor = replica.get_disk_descriptor();
@@ -1266,7 +1268,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (metrics_) {
         bool has_memory_replica = false;
         for (const auto& r : start_result.value()) {
-            if (r.is_memory_replica()) { has_memory_replica = true; break; }
+            if (r.is_memory_replica()) {
+                has_memory_replica = true;
+                break;
+            }
         }
         if (has_memory_replica) {
             uint64_t total_bytes = CalculateSliceSize(slices);
@@ -1625,7 +1630,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     if (metrics_) {
                         uint64_t total_bytes = CalculateSliceSize(op.slices);
                         metrics_->transfer_metric.put_to_disk_count.inc();
-                        metrics_->transfer_metric.put_to_disk_bytes.inc(total_bytes);
+                        metrics_->transfer_metric.put_to_disk_bytes.inc(
+                            total_bytes);
                     }
                     auto disk_descriptor = replica.get_disk_descriptor();
                     PutToLocalFile(op.key, op.slices, disk_descriptor);
@@ -1643,7 +1649,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                 if (!memory_counted && metrics_) {
                     uint64_t total_bytes = CalculateSliceSize(op.slices);
                     metrics_->transfer_metric.put_to_memory_count.inc();
-                    metrics_->transfer_metric.put_to_memory_bytes.inc(total_bytes);
+                    metrics_->transfer_metric.put_to_memory_bytes.inc(
+                        total_bytes);
                     memory_counted = true;
                 }
                 auto submit_result = transfer_submitter_->submit(

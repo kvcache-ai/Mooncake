@@ -124,23 +124,17 @@ struct TransferMetric {
                               "Get operations served from SSD/disk replicas",
                               labels),
           get_from_memory_bytes("mooncake_transfer_get_from_memory_bytes",
-                                "Bytes read from DRAM replicas",
-                                labels),
+                                "Bytes read from DRAM replicas", labels),
           get_from_disk_bytes("mooncake_transfer_get_from_disk_bytes",
-                              "Bytes read from SSD/disk replicas",
-                              labels),
+                              "Bytes read from SSD/disk replicas", labels),
           put_to_memory_count("mooncake_transfer_put_to_memory_count",
-                              "Put operations to DRAM replicas",
-                              labels),
+                              "Put operations to DRAM replicas", labels),
           put_to_disk_count("mooncake_transfer_put_to_disk_count",
-                            "Put operations to SSD/disk replicas",
-                            labels),
+                            "Put operations to SSD/disk replicas", labels),
           put_to_memory_bytes("mooncake_transfer_put_to_memory_bytes",
-                              "Bytes written to DRAM replicas",
-                              labels),
+                              "Bytes written to DRAM replicas", labels),
           put_to_disk_bytes("mooncake_transfer_put_to_disk_bytes",
-                            "Bytes written to SSD/disk replicas",
-                            labels),
+                            "Bytes written to SSD/disk replicas", labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t total_read_bytes;
@@ -188,23 +182,23 @@ struct TransferMetric {
         auto disk_gets = get_from_disk_count.value();
         auto mem_get_bytes = get_from_memory_bytes.value();
         auto disk_get_bytes = get_from_disk_bytes.value();
-        ss << "Get by Tier: DRAM=" << mem_gets
-           << " (" << byte_size_to_string(mem_get_bytes) << ")"
-           << ", SSD=" << disk_gets
-           << " (" << byte_size_to_string(disk_get_bytes) << ")"
-           << ", Total=" << (mem_gets + disk_gets)
-           << " (" << byte_size_to_string(mem_get_bytes + disk_get_bytes) << ")"
+        ss << "Get by Tier: DRAM=" << mem_gets << " ("
+           << byte_size_to_string(mem_get_bytes) << ")"
+           << ", SSD=" << disk_gets << " ("
+           << byte_size_to_string(disk_get_bytes) << ")"
+           << ", Total=" << (mem_gets + disk_gets) << " ("
+           << byte_size_to_string(mem_get_bytes + disk_get_bytes) << ")"
            << "\n";
         auto mem_puts = put_to_memory_count.value();
         auto disk_puts = put_to_disk_count.value();
         auto mem_put_bytes = put_to_memory_bytes.value();
         auto disk_put_bytes = put_to_disk_bytes.value();
-        ss << "Put by Tier: DRAM=" << mem_puts
-           << " (" << byte_size_to_string(mem_put_bytes) << ")"
-           << ", SSD=" << disk_puts
-           << " (" << byte_size_to_string(disk_put_bytes) << ")"
-           << ", Total=" << (mem_puts + disk_puts)
-           << " (" << byte_size_to_string(mem_put_bytes + disk_put_bytes) << ")"
+        ss << "Put by Tier: DRAM=" << mem_puts << " ("
+           << byte_size_to_string(mem_put_bytes) << ")"
+           << ", SSD=" << disk_puts << " ("
+           << byte_size_to_string(disk_put_bytes) << ")"
+           << ", Total=" << (mem_puts + disk_puts) << " ("
+           << byte_size_to_string(mem_put_bytes + disk_put_bytes) << ")"
            << "\n";
         if (include_bandwidth) {
             ss << "Average Read Throughput: "

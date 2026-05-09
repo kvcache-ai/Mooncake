@@ -71,7 +71,8 @@ struct ClientTransferStats {
     int64_t put_to_memory_bytes = 0;
     int64_t put_to_disk_bytes = 0;
 
-    ClientTransferStatsDelta compute_delta(const ClientTransferStats& last) const;
+    ClientTransferStatsDelta compute_delta(
+        const ClientTransferStats& last) const;
 };
 
 /**

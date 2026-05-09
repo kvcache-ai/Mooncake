@@ -739,9 +739,8 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping(
     ScopedVLogTimer timer(1, "MasterClient::Ping");
     timer.LogRequest("client_id=", client_id_);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id_,
-                                                               client_stats);
+    auto result = invoke_rpc<&WrappedMasterService::Ping, PingResponse>(
+        client_id_, client_stats);
     timer.LogResponseExpected(result);
     return result;
 }
