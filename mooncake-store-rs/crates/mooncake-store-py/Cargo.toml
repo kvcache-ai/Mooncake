@@ -31,5 +31,8 @@ url = "2"
 protoc-bin-vendored = "3"
 tonic-build = "0.12"
 
+[dev-dependencies]
+redis = "0.27"
+
 [lints]
 workspace = true

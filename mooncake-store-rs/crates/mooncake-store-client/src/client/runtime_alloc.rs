@@ -625,6 +625,7 @@ impl StoreClient {
             }
             state.memory = Some(memory);
         }
+        self.refresh_lease_for_local_segment_publish()?;
         self.publish_local_segments(&segment_infos, 0)?;
         Ok(())
     }
@@ -645,6 +646,15 @@ impl StoreClient {
         let announcement = segment.announcement(self.lease.runtime.clone(), used_bytes);
         self.allocator.lock().upsert(&announcement);
         self.metadata.publish_segment(&announcement)
+    }
+
+    fn refresh_lease_for_local_segment_publish(&self) -> Result<()> {
+        let mut lease = self.lease.clone();
+        lease.state = self.lifecycle_state();
+        lease.expires_at_ms = lease
+            .expires_at_ms
+            .max(now_ms().saturating_add(self.lease_ttl_ms));
+        self.metadata.upsert_client_lease(&lease)
     }
 
     fn publish_local_segments(&self, segments: &[StorageExtentInfo], used_bytes: u64) -> Result<()> {

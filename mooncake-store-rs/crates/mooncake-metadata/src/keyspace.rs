@@ -31,6 +31,10 @@ impl MetadataKeyspace {
         format!("{}/clients/{}", self.slot_tag, runtime.storage_key())
     }
 
+    pub fn client_lease_field(&self) -> &'static str {
+        "lease"
+    }
+
     pub fn client_prefix_for_stable(&self, stable_id: &ClientStableId) -> String {
         format!("{}/clients/{}:", self.slot_tag, stable_id.0)
     }
@@ -151,6 +155,14 @@ impl MetadataKeyspace {
             owner.storage_key(),
             encode_key_component(&segment.0)
         )
+    }
+
+    pub fn client_segment_field(&self, segment: &SegmentName) -> String {
+        format!("segment:{}", encode_key_component(&segment.0))
+    }
+
+    pub fn client_segment_field_prefix(&self) -> &'static str {
+        "segment:"
     }
 
     pub fn segment_prefix(&self, owner: Option<&ClientRuntimeId>) -> String {
@@ -459,7 +471,7 @@ fn decode_key_component_checked(value: &str) -> Option<Cow<'_, str>> {
 
 impl Default for MetadataKeyspace {
     fn default() -> Self {
-        Self::new("mc/store-rs/v1")
+        Self::new("mc/store-rs/v2")
     }
 }
 
@@ -569,6 +581,9 @@ mod tests {
             keyspace.segment(&runtime, &segment),
             "{tenant-a}/client-resources/writer:9/segments/seg-1"
         );
+        assert_eq!(keyspace.client_lease_field(), "lease");
+        assert_eq!(keyspace.client_segment_field(&segment), "segment:seg-1");
+        assert_eq!(keyspace.client_segment_field_prefix(), "segment:");
         assert_eq!(
             keyspace.segment_prefix(Some(&runtime)),
             "{tenant-a}/client-resources/writer:9/segments/"
@@ -619,7 +634,7 @@ mod tests {
 
     #[test]
     fn default_keyspace_uses_store_rs_namespace() {
-        assert_eq!(MetadataKeyspace::default().prefix(), "mc/store-rs/v1");
+        assert_eq!(MetadataKeyspace::default().prefix(), "mc/store-rs/v2");
     }
 
     #[test]
@@ -729,7 +744,7 @@ mod tests {
 
     #[test]
     fn all_keys_in_same_redis_cluster_slot() {
-        let keyspace = MetadataKeyspace::new("mc/store-rs/v1");
+        let keyspace = MetadataKeyspace::new("mc/store-rs/v2");
         let stable = ClientStableId::new("writer");
         let runtime = ClientRuntimeId::new("writer", ClientEpoch(1));
 

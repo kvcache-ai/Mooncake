@@ -2980,9 +2980,18 @@ mod tests {
             )
             .expect("redis backend should initialize"),
         );
-        let service = AdminService::new(backend.clone(), server.url.clone(), keyspace);
+        let service = AdminService::new(backend.clone(), server.url.clone(), keyspace.clone());
 
         let dead_runtime = ClientRuntimeId::new("dead-owner", ClientEpoch(9));
+        backend
+            .upsert_client_lease(&ClientLease {
+                runtime: dead_runtime.clone(),
+                state: ClientLifecycleState::Active,
+                compatibility: CompatibilityDescriptor::default(),
+                endpoints: ClientEndpointSet::default(),
+                expires_at_ms: super::now_ms() + 60_000,
+            })
+            .expect("dead owner lease should publish before segment");
         backend
             .publish_segment(&SegmentAnnouncement {
                 owner: dead_runtime.clone(),
@@ -2995,6 +3004,15 @@ mod tests {
                 tags: vec!["dram".to_string()],
             })
             .expect("dead segment publish should succeed");
+        let mut connection = redis::Client::open(server.url.clone())
+            .expect("redis client should open")
+            .get_connection()
+            .expect("redis connection should open");
+        redis::cmd("HDEL")
+            .arg(keyspace.client(&dead_runtime))
+            .arg(keyspace.client_lease_field())
+            .query::<()>(&mut connection)
+            .expect("lease field delete should simulate missing lease owner");
         backend
             .refresh_client_lease_expiry(&dead_runtime, super::now_ms().saturating_sub(1))
             .expect("expiry queue seed should succeed");

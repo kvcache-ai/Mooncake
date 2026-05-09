@@ -9411,6 +9411,35 @@ fn staged_activation_republishes_lease_without_state_patch() {
 }
 
 #[test]
+fn register_local_memory_refreshes_expired_startup_lease_before_segment_publish() {
+    let metadata = Arc::new(CountingMetadataBackend::with_reject_state_patch(
+        Arc::new(InMemoryMetadataBackend::new()),
+        true,
+    ));
+    let transport = Arc::new(TestTransport::new("expired-startup-lease-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "expired-startup-lease")
+        .state(ClientLifecycleState::Active)
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(storage_config_with_bytes(512))
+        .build(now_ms().saturating_add(1))
+        .expect("client should build with short startup lease");
+
+    sleep(Duration::from_millis(5));
+    let upserts_before = metadata.upsert_client_lease_calls();
+    client
+        .register_local_memory()
+        .expect("local memory registration should refresh lease before segment publish");
+
+    assert!(metadata.upsert_client_lease_calls() > upserts_before);
+    let lease = metadata
+        .get_client_lease(client.runtime_id())
+        .expect("lease lookup should succeed")
+        .expect("refreshed lease should exist");
+    assert!(lease.expires_at_ms > now_ms());
+}
+
+#[test]
 fn heartbeat_keeps_staged_client_active_after_local_memory_registration() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("staged-heartbeat-segment"));

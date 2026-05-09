@@ -212,6 +212,7 @@ What the script does:
 - starts two real storage clients plus one routed rw-only gateway client
 - starts two `python -m sglang.launch_server` processes against that standalone gateway
 - verifies baseline cross-process HiCache write/read through gateway `/metrics`
+- issues a one-token drain request after each writer phase before checking put metrics, because SGLang write-through backup is finalized on a later scheduler tick
 - starts an extra storage node and verifies SGLang keeps serving requests after expansion
 - hard-kills one storage node and retries completions until recovery, validating that requests do not stay broken after forced shrink
 - gracefully drains one storage node and retries completions until recovery, validating that requests do not stay broken after shrink
@@ -375,7 +376,7 @@ Important stress-benchmark inputs:
 For the shipped operator-facing benchmark, correctness checker, and soak runner,
 use `mooncake-store-bench`; see `docs/bench.md`. Its default mode is scratch-only
 RW benchmarking (`MC_BENCH_STORAGE_BYTES=0`) against separate `storage=true`
-daemons, and it joins `mc/store-rs/v1` when no explicit keyspace is provided.
+daemons, and it joins `mc/store-rs/v2` when no explicit keyspace is provided.
 
 ### Wheel packaging
 
@@ -501,24 +502,26 @@ Redis metadata supports two authentication forms:
 
 Credentials embedded in `redis://username:password@host:port/db` also work and take precedence over the environment variables. Prefer environment variables for cloud Redis passwords or any password containing URL-reserved characters.
 
-### Clean stale Redis segment registrations
+### Clean stale segment registrations
 
-Redis client leases expire automatically. etcd client leases do not; admin relies on
-the stored `expires_at_ms` field plus a backend work index. Segment registration keys
-do not expire automatically in either backend.
+Redis client resource hashes expire automatically. The Redis lease payload and owned
+segment records live in the same hash, so the lease TTL removes both. etcd client leases
+do not expire automatically; admin relies on the stored `expires_at_ms` field plus a
+backend work index, and etcd segment registration keys remain owner-scoped explicit keys.
 
-That means a hard-killed storage client can leave stale `segments/...` metadata and
-owner-scoped segment bookkeeping behind even after its lease has disappeared. Strict tenant
-quota reservations can also outlive a killed writer until an explicit reconcile
-repairs the state. Store-RS now supports one-shot repair plus stateless background
-maintenance in the same admin binary:
+That means a hard-killed etcd-backed storage client can leave stale `segments/...`
+metadata and owner-scoped segment bookkeeping behind even after its lease has disappeared.
+Redis can also need a repair sweep after abnormal metadata edits or legacy state. Strict
+tenant quota reservations can outlive a killed writer until an explicit reconcile repairs
+the state. Store-RS supports one-shot repair plus stateless background maintenance in the
+same admin binary:
 
 - a one-shot sweep through `cleanup-stale-segments`
 - a stateless background maintenance loop in `mooncake-store-admin server`
 - optional tenant quota reservation reconcile for an explicit tenant list in that same admin process
 
-Run the admin sweep when you want to remove dead-owner segment metadata. The same
-shape works with either `redis://...` or `etcd://...` metadata URLs:
+Run the admin sweep when you want to remove dead-owner segment metadata. The same shape
+works with either `redis://...` or `etcd://...` metadata URLs:
 
 ```bash
 mooncake-store-admin \
@@ -624,8 +627,9 @@ The local e2e now includes a focused strict tenant quota scenario that proves al
 
 The command removes:
 
-- stale segment hash keys owned by clients with no live lease
-- stale entries from owner-scoped segment indexes
+- stale Redis client resource hashes whose `lease` field is gone but resource fields remain
+- stale etcd segment keys owned by clients with no live lease
+- stale backend index entries used by the maintenance scheduler
 
 ### Transport metadata
 
