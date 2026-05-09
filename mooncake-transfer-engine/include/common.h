@@ -487,6 +487,47 @@ static inline std::string normalizeNicPath(const std::string &nic_path) {
     return server_name + NIC_PATH_DELIM + nic_name;
 }
 
+// Strip both port and any suffix-after-first-colon (e.g. timestamp segment
+// in custom key schemes like "ip:port:timestamp@nic") to get a stable key
+// that identifies the peer by host+NIC alone. Used by the EFA transport to
+// detect "same physical peer restarted with a new process-local key" and
+// evict the stale AV entry before inserting the new one.
+//
+//   "172.31.11.130:8998@rdmap85s0"             → "172.31.11.130@rdmap85s0"
+//   "172.31.11.130:8998:1730000000@rdmap85s0"  → "172.31.11.130@rdmap85s0"
+//   "[2001:db8::1]:8998@rdmap85s0"             → "2001:db8::1@rdmap85s0"
+//   "fe80::1%eth0:8998@rdmap85s0"              → "fe80::1%eth0@rdmap85s0"
+//
+// IPv6-safe: literals in bracketed or scoped form are recognized via
+// extractIPv6HostAndPort(), so the ':' characters inside the address are
+// not mistaken for the port/timestamp delimiter. For IPv4 / plain
+// hostnames the first ':' after the host is the delimiter; everything
+// after it (port, optional timestamp, etc.) is stripped.
+//
+// Differs from normalizeNicPath (which strips only the LAST ':' — keeps
+// the port but not any timestamp suffix, and is not itself IPv6-safe for
+// non-bracketed forms).
+static inline std::string stableHostNicKey(const std::string &nic_path) {
+    std::string server_name = getServerNameFromNicPath(nic_path);
+    std::string nic_name = getNicNameFromNicPath(nic_path);
+    if (server_name.empty() || nic_name.empty()) return nic_path;
+
+    // IPv6 literal (either "[2001:db8::1]:port" or "fe80::1%eth0:port"):
+    // use the parser's extracted host, which contains all internal colons
+    // as part of the address and strips only the trailing :port delimiter.
+    auto v6 = extractIPv6HostAndPort(server_name);
+    if (v6.matched) {
+        return v6.host + NIC_PATH_DELIM + nic_name;
+    }
+
+    // IPv4 / hostname: the first ':' delimits the host from port/timestamp/…
+    size_t colon = server_name.find(':');
+    if (colon != std::string::npos) {
+        server_name = server_name.substr(0, colon);
+    }
+    return server_name + NIC_PATH_DELIM + nic_name;
+}
+
 static inline bool overlap(const void *a, size_t a_len, const void *b,
                            size_t b_len) {
     return (a >= b && a < (char *)b + b_len) ||

@@ -217,6 +217,17 @@ class EfaContext {
     // ---- Peer handles (one entry per peer, each ~constant size) ----
     mutable RWSpinlock peer_map_lock_;
     std::unordered_map<std::string, std::shared_ptr<EfaEndPoint>> peer_map_;
+    // Secondary index: stable "host@nic" → current peer_nic_path stored in
+    // peer_map_ for that (host, nic) pair.  When endpoint() is invoked with
+    // a different peer_nic_path whose stable key already has an entry, the
+    // old entry is evicted (removed from peer_map_ + fi_av_remove) before
+    // the new one is inserted.  This prevents stale AV entries from
+    // accumulating across peer restarts in schemes that embed volatile
+    // data (port, timestamp) in peer_nic_path — without which libfabric's
+    // internal AH cache can overflow long before MC_MAX_EP_PER_CTX.
+    //
+    // Guarded by peer_map_lock_ (the two maps are always updated together).
+    std::unordered_map<std::string, std::string> stable_key_to_path_;
 
     RWSpinlock mr_lock_;
     std::map<uint64_t, EfaMemoryRegionMeta> mr_map_;

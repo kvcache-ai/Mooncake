@@ -281,6 +281,7 @@ int EfaContext::deconstruct() {
             if (entry.second) entry.second->markDetachedForTeardown();
         }
         peer_map_.clear();
+        stable_key_to_path_.clear();
     }
 
     {
@@ -493,11 +494,19 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     //
     // The port is stable for the lifetime of a sglang worker process
     // (Mooncake only calls initialize() once), so keying by full path
-    // costs nothing in steady state.  A genuine peer restart (process
-    // re-launch → new RPC port) creates a new map entry and leaks the
-    // old EfaEndPoint — that's at most a few bytes per ex-worker and
-    // far cheaper than the churn the old normalization caused.
+    // costs nothing in steady state.
+    //
+    // STALE-PEER EVICTION: when the same physical peer (same host+NIC)
+    // reconnects with a new volatile key (e.g. new RPC port or new
+    // timestamp in custom "ip:port:timestamp@nic" schemes), the old
+    // entry for that (host, NIC) is evicted before the new one is
+    // inserted.  Without this, libfabric's internal AH cache fills up
+    // across rolling upgrades and eventually fi_av_insert returns 0
+    // ("silent refuse"), breaking transfers long before the nominal
+    // MC_MAX_EP_PER_CTX (65536) is reached.  The eviction uses the
+    // stable "host@nic" key produced by stableHostNicKey().
     const std::string& key = peer_nic_path;
+    const std::string stable_key = stableHostNicKey(peer_nic_path);
 
     {
         RWSpinlock::ReadGuard guard(peer_map_lock_);
@@ -510,12 +519,47 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     auto new_ep = std::make_shared<EfaEndPoint>(*this);
     new_ep->setPeerNicPath(peer_nic_path);
 
-    RWSpinlock::WriteGuard guard(peer_map_lock_);
-    auto it = peer_map_.find(key);
-    if (it != peer_map_.end()) {
-        return it->second;
+    // Items set under the write lock and consumed after releasing it, so
+    // disconnect() (which takes EfaEndPoint's own lock + calls
+    // fi_av_remove) can run without holding peer_map_lock_.
+    std::shared_ptr<EfaEndPoint> evicted_ep;
+    std::string evicted_path;
+    {
+        RWSpinlock::WriteGuard guard(peer_map_lock_);
+        auto it = peer_map_.find(key);
+        if (it != peer_map_.end()) {
+            return it->second;
+        }
+
+        // If this (host, NIC) is already mapped to a different volatile
+        // key, it means the peer restarted (new port / timestamp).  Evict
+        // the old entry so the AV doesn't accumulate stale addresses.
+        auto stable_it = stable_key_to_path_.find(stable_key);
+        if (stable_it != stable_key_to_path_.end() &&
+            stable_it->second != key) {
+            auto old_it = peer_map_.find(stable_it->second);
+            if (old_it != peer_map_.end()) {
+                evicted_ep = old_it->second;
+                evicted_path = old_it->first;
+                peer_map_.erase(old_it);
+            }
+            // Overwrite the stable→volatile mapping below.
+        }
+
+        peer_map_[key] = new_ep;
+        stable_key_to_path_[stable_key] = key;
     }
-    peer_map_[key] = new_ep;
+
+    if (evicted_ep) {
+        LOG(INFO) << "Evicting stale EFA peer on " << nicPath()
+                  << ": " << evicted_path << " -> " << peer_nic_path
+                  << " (stable_key=" << stable_key
+                  << ", peer_count=" << [&] {
+                         RWSpinlock::ReadGuard g(peer_map_lock_);
+                         return peer_map_.size();
+                     }() << ")";
+        evicted_ep->disconnect();  // fi_av_remove(old_fi_addr)
+    }
     return new_ep;
 }
 
@@ -535,6 +579,14 @@ int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
         if (it == peer_map_.end()) return 0;
         ep = it->second;
         peer_map_.erase(it);
+        // Keep stable_key_to_path_ in sync: only erase the stable-key
+        // mapping if it still points at this volatile key (a newer
+        // endpoint() call might have already overwritten it).
+        const std::string stable_key = stableHostNicKey(peer_nic_path);
+        auto sit = stable_key_to_path_.find(stable_key);
+        if (sit != stable_key_to_path_.end() && sit->second == peer_nic_path) {
+            stable_key_to_path_.erase(sit);
+        }
     }
     if (ep) ep->disconnect();  // runs fi_av_remove
     return 0;
@@ -545,6 +597,7 @@ int EfaContext::disconnectAllEndpoints() {
     for (auto& entry : peer_map_) {
         if (entry.second) entry.second->disconnect();
     }
+    stable_key_to_path_.clear();
     return 0;
 }
 
@@ -612,7 +665,41 @@ int EfaContext::insertPeerAddrBytes(const uint8_t* addr, size_t len,
     if (!addr || len == 0) return ERR_INVALID_ARGUMENT;
     int ret = fi_av_insert(av_, addr, 1, &out, 0, nullptr);
     if (ret != 1) {
-        LOG(ERROR) << "fi_av_insert failed: " << fi_strerror(-ret);
+        // libfabric's fi_av_insert returns three-valued:
+        //   > 0 : number of addresses inserted (we expect 1)
+        //   == 0 : request accepted but no address inserted — "silent refuse",
+        //          usually means a stale / duplicate / malformed peer address
+        //          that the provider recognizes but rejects without setting
+        //          errno.  `fi_strerror(-0)` literally returns "Success" here,
+        //          which would mislead diagnosis; log the raw ret instead.
+        //   < 0 : negative errno from libfabric.
+        size_t av_usage = 0;
+        {
+            RWSpinlock::ReadGuard guard(peer_map_lock_);
+            av_usage = peer_map_.size();
+        }
+        // Prefix of the peer address in hex, for cross-host correlation.
+        std::string addr_prefix;
+        const size_t kPrefixBytes = 8;
+        const size_t show = std::min<size_t>(len, kPrefixBytes);
+        addr_prefix.reserve(show * 2);
+        static const char kHex[] = "0123456789abcdef";
+        for (size_t i = 0; i < show; ++i) {
+            addr_prefix.push_back(kHex[(addr[i] >> 4) & 0xF]);
+            addr_prefix.push_back(kHex[addr[i] & 0xF]);
+        }
+        LOG(ERROR) << "fi_av_insert failed on " << nicPath()
+                   << ": expected 1 inserted, got ret=" << ret
+                   << (ret < 0
+                           ? std::string(" (libfabric error: ") +
+                                 fi_strerror(-ret) + ")"
+                           : std::string(
+                                 " (libfabric silently refused — likely "
+                                 "stale/duplicate/malformed peer address)"))
+                   << ", peer_count=" << av_usage
+                   << ", addr_len=" << len
+                   << ", addr_prefix=0x" << addr_prefix
+                   << (len > kPrefixBytes ? "..." : "");
         return ERR_ENDPOINT;
     }
     return 0;
@@ -622,7 +709,9 @@ void EfaContext::removePeerAddr(fi_addr_t fi_addr) {
     if (fi_addr == FI_ADDR_UNSPEC) return;
     int ret = fi_av_remove(av_, &fi_addr, 1, 0);
     if (ret) {
-        LOG(WARNING) << "fi_av_remove failed: " << fi_strerror(-ret);
+        LOG(WARNING) << "fi_av_remove failed on " << nicPath()
+                     << ": " << fi_strerror(-ret)
+                     << " (fi_addr=" << fi_addr << ")";
     }
 }
 
