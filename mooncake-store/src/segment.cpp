@@ -283,9 +283,14 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
     if (segment != segment_manager_->mounted_segments_.end()) {
         segment_name = segment->second.segment.name;
-        // Also remove from segment_name_client_id_map_
-        segment_manager_->client_by_name_.erase(segment_name);
-        segment_manager_->segment_id_by_name_.erase(segment_name);
+        auto segment_id_by_name_it =
+            segment_manager_->segment_id_by_name_.find(segment_name);
+        if (segment_id_by_name_it !=
+                segment_manager_->segment_id_by_name_.end() &&
+            segment_id_by_name_it->second == segment_id) {
+            segment_manager_->segment_id_by_name_.erase(segment_id_by_name_it);
+            segment_manager_->client_by_name_.erase(segment_name);
+        }
         is_cxl = (segment->second.segment.protocol == "cxl");
     }
     // Remove from mounted_segments_

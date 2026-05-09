@@ -5290,6 +5290,10 @@ TEST_F(MasterServiceTest,
 
     EXPECT_FALSE(service_->QuerySegmentStatusById(old_segment.id).has_value());
     ASSERT_TRUE(service_->QuerySegmentStatusById(new_segment.id).has_value());
+
+    auto status_by_name = service_->QuerySegmentStatus(new_segment.name);
+    ASSERT_TRUE(status_by_name.has_value());
+    EXPECT_EQ(status_by_name.value(), SegmentStatus::OK);
 }
 
 TEST_F(MasterServiceTest, GracefulUnmountSegment_EarlierTimerPreemptsWait) {
