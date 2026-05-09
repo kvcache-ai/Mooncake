@@ -195,3 +195,29 @@ util ratio (min / p99 / p90 / p50 / max / avg):
 0.569255 / 0.712076 / 0.781224 / 0.855046 / 0.976057 / 0.848873
 avg alloc time: 142.508508 ns/op
 ```
+
+**OffsetAllocator (Before Optimization)**
+
+```
+util ratio (min / p99 / p90 / p50 / max / avg):
+0.569255 / 0.712076 / 0.781224 / 0.855046 / 0.976057 / 0.848873
+avg alloc time: 142.508508 ns/op
+```
+
+### Paired KV/Indexer Allocation Benchmark (DSA)
+
+In the DSA scenario, Mooncake Store stores both KV cache objects and indexer objects.
+We evaluated OffsetAllocator under a paired allocation workload using object sizes derived from a GLM-5.1-FP8 DSA serving configuration.
+
+In this configuration, Mooncake Store stores data at the page granularity, where each page contains 64 tokens. Therefore, the object sizes observed by the allocator are the packed page-level sizes rather than the per-token sizes:
+
+- KV cache object size: 3.12 MB
+- Indexer object size: 643 KB
+
+**OffsetAllocator**
+
+```
+util ratio (min / p99 / p90 / p50 / max / avg):
+0.948299 / 0.948765 / 0.949311 / 0.949884 / 0.952491 / 0.950091
+avg alloc time: 232.420141 ns/op
+```

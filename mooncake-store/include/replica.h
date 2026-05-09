@@ -169,17 +169,25 @@ class Replica {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
+    // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
             std::string transport_endpoint, ReplicaStatus status)
-        : data_(LocalDiskReplicaData{client_id, object_size,
+        : id_(next_id_.fetch_add(1)),
+          data_(LocalDiskReplicaData{client_id, object_size,
                                      std::move(transport_endpoint)}),
-          status_(status) {}
+          status_(status),
+          refcnt_(0) {
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
 
     ~Replica() {
-        if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
-            const auto& disk_data = std::get<DiskReplicaData>(data_);
+        if (status_ == ReplicaStatus::UNDEFINED) return;
+        if (is_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
-                disk_data.object_size);
+                std::get<DiskReplicaData>(data_).object_size);
+        } else if (is_local_disk_replica()) {
+            MasterMetricManager::instance().dec_allocated_file_size(
+                std::get<LocalDiskReplicaData>(data_).object_size);
         }
     }
 
@@ -205,10 +213,14 @@ class Replica {
         }
 
         // Decrement metric for the current object before overwriting.
-        if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
-            const auto& disk_data = std::get<DiskReplicaData>(data_);
-            MasterMetricManager::instance().dec_allocated_file_size(
-                disk_data.object_size);
+        if (status_ != ReplicaStatus::UNDEFINED) {
+            if (is_disk_replica()) {
+                MasterMetricManager::instance().dec_allocated_file_size(
+                    std::get<DiskReplicaData>(data_).object_size);
+            } else if (is_local_disk_replica()) {
+                MasterMetricManager::instance().dec_allocated_file_size(
+                    std::get<LocalDiskReplicaData>(data_).object_size);
+            }
         }
 
         id_ = src.id_;

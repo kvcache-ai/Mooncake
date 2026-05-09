@@ -698,10 +698,33 @@ class RealClient : public PyClient {
      */
     int unmountSegment(const std::vector<std::string> &segment_ids);
 
+    /**
+     * @brief Allocate memory internally and mount segments to master.
+     *        If size > max_mr_size, it will be split into multiple chunks.
+     *        Memory is allocated via allocate_buffer_allocator_memory.
+     *        The actual allocated size (aligned up to Slab::kSize) is written
+     *        to out_allocated_size if non-null.
+     */
+    int allocateAndMountSegment(size_t size, const std::string &protocol,
+                                const std::string &location,
+                                std::vector<std::string> &out_segment_ids,
+                                size_t *out_allocated_size = nullptr);
+
+    /**
+     * @brief Unmount segments by their ids and free locally allocated memory.
+     */
+    int unmountAndFreeSegment(const std::vector<std::string> &segment_ids);
+
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;
         size_t size = 0;
         std::string path;
+    };
+
+    struct AllocatedSegmentRecord {
+        void *base = nullptr;
+        size_t size = 0;
+        std::string protocol;
     };
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
@@ -845,6 +868,10 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;
+
+    std::unordered_map<std::string, AllocatedSegmentRecord>
+        allocated_segment_records_;
+    std::mutex allocated_segment_records_mutex_;
 };
 
 }  // namespace mooncake

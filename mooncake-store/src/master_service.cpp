@@ -2173,6 +2173,41 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return {};
 }
 
+auto MasterService::ReportSsdCapacity(const UUID& client_id,
+                                      int64_t ssd_total_capacity_bytes)
+    -> tl::expected<void, ErrorCode> {
+    if (ssd_total_capacity_bytes < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        LOG(ERROR) << "Local disk segment not found with client id = "
+                   << client_id;
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    int64_t old_capacity =
+        local_disk_segment_it->second->ssd_total_capacity_bytes;
+    if (ssd_total_capacity_bytes != old_capacity) {
+        local_disk_segment_it->second->ssd_total_capacity_bytes =
+            ssd_total_capacity_bytes;
+        if (old_capacity > 0) {
+            MasterMetricManager::instance().dec_total_file_capacity(
+                old_capacity);
+        }
+        if (ssd_total_capacity_bytes > 0) {
+            MasterMetricManager::instance().inc_total_file_capacity(
+                ssd_total_capacity_bytes);
+        }
+    }
+    return {};
+}
+
 auto MasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<StorageObjectMetadata>& metadatas)

@@ -50,6 +50,7 @@ struct MountedSegment {
 struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
+    int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         offloading_objects;
     explicit LocalDiskSegment(bool enable_offloading)

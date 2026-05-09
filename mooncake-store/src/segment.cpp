@@ -276,6 +276,20 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
 void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
     auto it = segment_manager_->client_local_disk_segment_.find(client_id);
     if (it != segment_manager_->client_local_disk_segment_.end()) {
+        // Hold offloading_mutex_ while reading ssd_total_capacity_bytes to
+        // avoid a data race with OffloadObjectHeartbeat, which writes the
+        // field under the same lock.  Release the lock before erase() so we
+        // don't unlock an already-destroyed mutex (erase destroys the
+        // LocalDiskSegment, including its mutex).
+        int64_t reported_capacity = 0;
+        {
+            MutexLocker locker(&it->second->offloading_mutex_);
+            reported_capacity = it->second->ssd_total_capacity_bytes;
+        }
+        if (reported_capacity > 0) {
+            MasterMetricManager::instance().dec_total_file_capacity(
+                reported_capacity);
+        }
         segment_manager_->client_local_disk_segment_.erase(it);
         LOG(INFO) << "client_id=" << client_id
                   << ", action=unmount_local_disk_segment";

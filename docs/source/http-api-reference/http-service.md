@@ -260,3 +260,74 @@ curl -X POST http://localhost:8080/api/unmount_shm \
   -H "Content-Type: application/json" \
   -d '{"segment_ids": ["00000000-0000-0000-0000-000000000001"]}'
 ```
+
+### `/api/mount`
+Allocate memory inside the store process and mount it as one or more Mooncake
+store segments. If the requested size exceeds the maximum registration size,
+the service may split it and return multiple segment ids. The response includes
+the actual allocated size after alignment.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "size": 16777216,
+  "protocol": "tcp",
+  "location": ""
+}
+```
+
+**Fields**:
+- `size` (integer, required): Number of bytes requested. Must be positive.
+- `protocol` (string, optional): Transfer protocol. Defaults to the service
+  configuration protocol.
+- `location` (string, optional): Device or locality hint. Defaults to an empty
+  string.
+
+**Success Response**:
+```json
+{
+  "status": "success",
+  "segment_ids": ["00000000-0000-0000-0000-000000000002"],
+  "allocated_size": 16777216
+}
+```
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/mount \
+  -H "Content-Type: application/json" \
+  -d '{"size": 16777216, "protocol": "tcp", "location": ""}'
+```
+
+### `/api/unmount`
+Unmount one or more segment ids previously returned by `/api/mount` and free
+the memory allocated by the store process.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "segment_ids": ["00000000-0000-0000-0000-000000000002"]
+}
+```
+
+`segment_ids` may also be provided as a single string for one segment.
+
+**Success Response**:
+```json
+{
+  "status": "success"
+}
+```
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/unmount \
+  -H "Content-Type: application/json" \
+  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000002"]}'
+```
