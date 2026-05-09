@@ -149,9 +149,8 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
             local_transfer_config_.local_memcpy_async_worker_num);
     }
 
-    lease_duration_ = std::chrono::milliseconds(
-        GetEnvOr<uint32_t>("P2P_RPC_LEASE_DURATION_MS",
-                           kDefaultLeaseDurationMs));
+    lease_duration_ = std::chrono::milliseconds(GetEnvOr<uint32_t>(
+        "P2P_RPC_LEASE_DURATION_MS", kDefaultLeaseDurationMs));
     lease_scan_interval_ = std::chrono::milliseconds(
         std::max<uint32_t>(1, GetEnvOr<uint32_t>("P2P_RPC_LEASE_SCAN_INTERVAL",
                                                  kDefaultLeaseScanIntervalMs)));
@@ -237,8 +236,7 @@ uint64_t DataManager::TimePointToDeadlineMs(TimePoint deadline) const {
         std::max(std::chrono::milliseconds::zero(),
                  std::chrono::duration_cast<std::chrono::milliseconds>(
                      deadline - std::chrono::steady_clock::now()));
-    const auto system_deadline =
-        std::chrono::system_clock::now() + remaining;
+    const auto system_deadline = std::chrono::system_clock::now() + remaining;
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             system_deadline.time_since_epoch())
@@ -247,9 +245,8 @@ uint64_t DataManager::TimePointToDeadlineMs(TimePoint deadline) const {
 
 DataManager::TimePoint DataManager::DeadlineMsToTimePoint(
     uint64_t deadline_ms) const {
-    const auto system_deadline =
-        std::chrono::system_clock::time_point(std::chrono::milliseconds(
-            static_cast<int64_t>(deadline_ms)));
+    const auto system_deadline = std::chrono::system_clock::time_point(
+        std::chrono::milliseconds(static_cast<int64_t>(deadline_ms)));
     const auto remaining =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             system_deadline - std::chrono::system_clock::now());
@@ -354,7 +351,8 @@ size_t DataManager::ScanExpiredPendingWrites(PendingWriteShard& shard,
     return removed;
 }
 
-size_t DataManager::ScanExpiredPinnedKeys(PinnedKeyShard& shard, TimePoint now) {
+size_t DataManager::ScanExpiredPinnedKeys(PinnedKeyShard& shard,
+                                          TimePoint now) {
     size_t removed = 0;
     while (!shard.ordered_list.empty()) {
         auto list_it = shard.ordered_list.begin();
@@ -404,8 +402,9 @@ tl::expected<AllocationHandle, ErrorCode> DataManager::LookupPinnedKeyHandle(
     return LookupPinnedKeyHandleInternal(BuildKeyCtx(key), pin_token);
 }
 
-tl::expected<AllocationHandle, ErrorCode> DataManager::LookupPinnedKeyHandleInternal(
-    const KeyCtx& ctx, const UUID& pin_token) {
+tl::expected<AllocationHandle, ErrorCode>
+DataManager::LookupPinnedKeyHandleInternal(const KeyCtx& ctx,
+                                           const UUID& pin_token) {
     const auto now = std::chrono::steady_clock::now();
     auto& shard = GetPinnedKeyShard(ctx);
     std::shared_lock shard_lock(shard.mutex);
@@ -423,7 +422,7 @@ tl::expected<AllocationHandle, ErrorCode> DataManager::LookupPinnedKeyHandleInte
 }
 
 void DataManager::AbortPendingWrite(std::string_view key,
-                                   const UUID& pending_write_token) {
+                                    const UUID& pending_write_token) {
     AbortPendingWriteInternal(BuildKeyCtx(key), pending_write_token);
 }
 
@@ -626,14 +625,13 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
 
     auto commit_fn = [this, kctx,
                       pending_write_token]() -> tl::expected<void, ErrorCode> {
-            auto commit_result =
-                WriteCommitInternal(kctx, pending_write_token);
-            if (!commit_result) {
-                LOG(ERROR) << "Failed to commit data for key: " << kctx.key
-                           << ", error: " << commit_result.error();
-                return tl::make_unexpected(commit_result.error());
-            }
-            return {};
+        auto commit_result = WriteCommitInternal(kctx, pending_write_token);
+        if (!commit_result) {
+            LOG(ERROR) << "Failed to commit data for key: " << kctx.key
+                       << ", error: " << commit_result.error();
+            return tl::make_unexpected(commit_result.error());
+        }
+        return {};
     };
 
     auto write_and_commit = [write_fn = std::move(write_fn),
@@ -852,7 +850,8 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
         return tl::make_unexpected(handle_result.error());
     }
 
-    auto transfer_result = TransferDataToRemote(handle_result.value(), dest_buffers);
+    auto transfer_result =
+        TransferDataToRemote(handle_result.value(), dest_buffers);
     auto unpin_result = UnPinKeyInternal(kctx, pin_token);
 
     if (!transfer_result) {
@@ -944,8 +943,9 @@ tl::expected<DataManager::PreWriteResult, ErrorCode> DataManager::PreWrite(
     return PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id);
 }
 
-tl::expected<DataManager::PreWriteResult, ErrorCode> DataManager::PreWriteInternal(
-    const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id) {
+tl::expected<DataManager::PreWriteResult, ErrorCode>
+DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
+                              std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::PreWrite");
     timer.LogRequest("key=", ctx.key, "size_bytes=", size_bytes);
 
@@ -978,8 +978,8 @@ tl::expected<DataManager::PreWriteResult, ErrorCode> DataManager::PreWriteIntern
     }
 
     auto handle = std::move(handle_result.value());
-    auto list_it =
-        shard.ordered_list.emplace(shard.ordered_list.end(), ctx.key_string, deadline);
+    auto list_it = shard.ordered_list.emplace(shard.ordered_list.end(),
+                                              ctx.key_string, deadline);
 
     const UUID pending_write_token = generate_uuid();
     PendingWriteRecord record;
@@ -1106,8 +1106,8 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     }
 
     auto handle = std::move(handle_result.value());
-    auto list_it =
-        shard.ordered_list.emplace(shard.ordered_list.end(), ctx.key_string, deadline);
+    auto list_it = shard.ordered_list.emplace(shard.ordered_list.end(),
+                                              ctx.key_string, deadline);
 
     const UUID pin_token_value = generate_uuid();
     PinnedKeyRecord record;
@@ -1692,10 +1692,10 @@ tl::expected<void, ErrorCode> DataManager::Delete(std::string_view key,
     timer.LogRequest("key=", key);
 
     // NOTE (weak delete semantics):
-    // TieredBackend::Delete only removes the metadata entry (or a replica entry)
-    // from the in-memory index. It does NOT directly free underlying memory.
-    // The actual buffer lifetime is still governed by AllocationHandle's RAII
-    // reference counting.
+    // TieredBackend::Delete only removes the metadata entry (or a replica
+    // entry) from the in-memory index. It does NOT directly free underlying
+    // memory. The actual buffer lifetime is still governed by
+    // AllocationHandle's RAII reference counting.
     //
     // We still guard Delete against in-flight 3-phase contexts:
     // - PendingWriteRecord holds a strong handle reference until WriteCommit or

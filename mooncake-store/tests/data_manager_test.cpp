@@ -348,7 +348,8 @@ TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
     }
 }
 
-// Test Pin/Unpin: ref_count increments on PinKey and reaches zero on final UnPinKey.
+// Test Pin/Unpin: ref_count increments on PinKey and reaches zero on final
+// UnPinKey.
 TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
     const std::string key = "pin_ref_count_key";
     const std::string test_data = "Pin key ref count payload";
@@ -392,7 +393,8 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
     }
 }
 
-// Test UnPinKey: token mismatch should fail without erasing or decrementing the record.
+// Test UnPinKey: token mismatch should fail without erasing or decrementing the
+// record.
 TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
     const std::string key = "unpin_token_mismatch_key";
     const std::string test_data = "Unpin token mismatch payload";
@@ -420,8 +422,10 @@ TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
     }
 }
 
-// Test WriteCommit: lease expiry causes commit failure and allows subsequent PreWrite.
-TEST_F(DataManagerTest, WriteCommitFailsAfterLeaseExpiryAndAllowsRetryPreWrite) {
+// Test WriteCommit: lease expiry causes commit failure and allows subsequent
+// PreWrite.
+TEST_F(DataManagerTest,
+       WriteCommitFailsAfterLeaseExpiryAndAllowsRetryPreWrite) {
     const std::string key = "expired_prewrite_key";
     auto prewrite_result = data_manager_->PreWrite(key, 512, GetTierId());
     ASSERT_TRUE(prewrite_result.has_value())
@@ -454,8 +458,10 @@ TEST_F(DataManagerTest, WriteCommitFailsAfterLeaseExpiryAndAllowsRetryPreWrite) 
         << toString(retry_prewrite.error());
 }
 
-// Test UnPinKey: lease expiry causes unpin failure and cleans up the pin record.
-TEST_F(DataManagerTest, ExpiredPinnedLeaseBlocksUnpinButDeleteCanProceedAfterCleanup) {
+// Test UnPinKey: lease expiry causes unpin failure and cleans up the pin
+// record.
+TEST_F(DataManagerTest,
+       ExpiredPinnedLeaseBlocksUnpinButDeleteCanProceedAfterCleanup) {
     const std::string key = "expired_pin_key";
     const std::string test_data = "Expired pin payload";
 

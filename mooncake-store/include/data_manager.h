@@ -207,8 +207,8 @@ class DataManager {
         std::string_view key, size_t size_bytes,
         std::optional<UUID> tier_id = std::nullopt);
 
-    tl::expected<void, ErrorCode> WriteCommit(
-        std::string_view key, const UUID& pending_write_token);
+    tl::expected<void, ErrorCode> WriteCommit(std::string_view key,
+                                              const UUID& pending_write_token);
 
     tl::expected<PinKeyResult, ErrorCode> PinKey(
         std::string_view key, std::optional<UUID> tier_id = std::nullopt);
@@ -262,8 +262,8 @@ class DataManager {
 
     tl::expected<PreWriteResult, ErrorCode> PreWriteInternal(
         const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id);
-    tl::expected<void, ErrorCode> WriteCommitInternal(const KeyCtx& ctx,
-                                                      const UUID& pending_write_token);
+    tl::expected<void, ErrorCode> WriteCommitInternal(
+        const KeyCtx& ctx, const UUID& pending_write_token);
     tl::expected<PinKeyResult, ErrorCode> PinKeyInternal(
         const KeyCtx& ctx, std::optional<UUID> tier_id);
     tl::expected<void, ErrorCode> UnPinKeyInternal(const KeyCtx& ctx,
@@ -463,7 +463,8 @@ class DataManager {
     uint64_t TimePointToDeadlineMs(TimePoint deadline) const;
     TimePoint DeadlineMsToTimePoint(uint64_t deadline_ms) const;
     bool IsExpired(TimePoint deadline) const;
-    RemoteBufferDesc BuildRemoteBufferDesc(const AllocationHandle& handle) const;
+    RemoteBufferDesc BuildRemoteBufferDesc(
+        const AllocationHandle& handle) const;
     void LeaseScannerMain();
     void ShutdownLeaseScanner();
     size_t ScanExpiredPendingWrites(PendingWriteShard& shard, TimePoint now);
@@ -472,8 +473,7 @@ class DataManager {
                                  const std::string& key);
     bool ErasePinnedKeyLocked(PinnedKeyShard& shard, const std::string& key);
     bool RemoveExpiredPendingWriteLocked(PendingWriteShard& shard,
-                                         const std::string& key,
-                                         TimePoint now);
+                                         const std::string& key, TimePoint now);
     bool RemoveExpiredPinnedKeyLocked(PinnedKeyShard& shard,
                                       const std::string& key, TimePoint now);
     void TouchOrderedDeadlineNode(OrderedDeadlineList& ordered_list,
@@ -484,7 +484,8 @@ class DataManager {
         std::string_view key, const UUID& pending_write_token);
     tl::expected<AllocationHandle, ErrorCode> LookupPinnedKeyHandle(
         std::string_view key, const UUID& pin_token);
-    void AbortPendingWrite(std::string_view key, const UUID& pending_write_token);
+    void AbortPendingWrite(std::string_view key,
+                           const UUID& pending_write_token);
 
    private:
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
