@@ -215,28 +215,35 @@ static void freeMemoryPool(void* addr, size_t size) {
 #endif
     } else {
 #ifndef USE_UBSHMEM
-        // check pointer on GPU
-        // Use graceful error handling like transfer engine core (memory_location.cpp)
-        // to support environments without GPU
-        cudaPointerAttributes attributes;
-        cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
-
-        if (result != cudaSuccess) {
-            // CUDA not available or pointer query failed
-            // Assume CPU memory and free with numa_free
-            LOG(WARNING) << "cudaPointerGetAttributes failed (Error code: "
-                         << result << " - " << cudaGetErrorString(result)
-                         << "), assuming CPU memory";
-            numa_free(addr, size);
-        } else if (attributes.type == cudaMemoryTypeDevice) {
-            cudaFree(addr);
-        } else if (attributes.type == cudaMemoryTypeHost ||
-                   attributes.type == cudaMemoryTypeUnregistered) {
+        // Check FLAGS_use_vram first to avoid unnecessary CUDA calls in non-GPU
+        // environments
+        if (!FLAGS_use_vram) {
+            // Memory was allocated via numa_alloc_onnode, free it directly
             numa_free(addr, size);
         } else {
-            LOG(ERROR) << "Unknown memory type, " << addr << " "
-                       << attributes.type << ", assuming CPU memory";
-            numa_free(addr, size);
+            // Memory may be on GPU, check pointer attributes
+            // Use graceful error handling like transfer engine core
+            // (memory_location.cpp)
+            cudaPointerAttributes attributes;
+            cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
+
+            if (result != cudaSuccess) {
+                // CUDA call failed when FLAGS_use_vram is true - this is an
+                // error
+                LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: "
+                           << result << " - " << cudaGetErrorString(result)
+                           << ")";
+                numa_free(addr, size);
+            } else if (attributes.type == cudaMemoryTypeDevice) {
+                cudaFree(addr);
+            } else if (attributes.type == cudaMemoryTypeHost ||
+                       attributes.type == cudaMemoryTypeUnregistered) {
+                numa_free(addr, size);
+            } else {
+                LOG(ERROR) << "Unknown memory type, " << addr << " "
+                           << attributes.type << ", assuming CPU memory";
+                numa_free(addr, size);
+            }
         }
 #endif
     }
