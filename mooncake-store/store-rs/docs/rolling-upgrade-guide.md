@@ -78,7 +78,13 @@ If you need to observe the per-stable-id epoch high-water mark, query it directl
 
 ```bash
 redis-cli -p 6380 GET "${KEYSPACE}/state/client-epoch-hwm/client-a"
+redis-cli -p 6380 PTTL "${KEYSPACE}/state/client-epoch-hwm/client-a"
 ```
+
+The Redis high-water mark is lease-scoped metadata: heartbeats and lifecycle
+state updates refresh its TTL with the client lease, including `Draining`
+during hot upgrade. It disappears after the stable client has no live epoch
+left.
 
 ### Step 2: Trigger Hot-Upgrade on the Predecessor
 

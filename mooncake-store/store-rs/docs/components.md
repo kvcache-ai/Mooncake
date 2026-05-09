@@ -52,7 +52,7 @@ Backends:
 Main responsibilities:
 
 - live client lease storage
-- segment announcement storage
+- segment announcement storage under the owning runtime; Redis stores these records in the same TTL-backed client resource hash as the lease
 - segment lifecycle updates
 - route policy and handoff storage
 - route storage for `MetadataOnly` mode

@@ -317,7 +317,7 @@ Heartbeat behavior:
 
 ## Metadata Maintenance
 
-Use the packaged admin binary when Redis still contains stale segment registrations
+Use the packaged admin binary when metadata still contains stale segment registrations
 from dead storage owners:
 
 ```bash
@@ -419,8 +419,8 @@ mooncake-store-admin \
 
 Notes:
 
-- client leases expire automatically; segment metadata is stored under the owning runtime namespace
-- cleanup consumes the lease-expiry work index and removes segment metadata for that exact dead owner after re-checking liveness
+- Redis stores the client lease and owned segment metadata in one TTL-backed client resource hash, so a normal lease expiry removes both
+- cleanup consumes the lease-expiry work index and repairs stale owner metadata only after re-checking liveness; this is the normal path for etcd and a fallback path for abnormal Redis metadata
 - tenant-scoped routing, quota, fairness, shaping, and placement defaults should be authored through admin-managed metadata policy
 - Python `setup(...)`, standalone client flags, and related env vars remain compatibility/bootstrap fallbacks when metadata does not provide the relevant section
 - `--keyspace <prefix>` scopes both policy operations and stale-segment cleanup to one metadata namespace
@@ -982,7 +982,7 @@ python -m sglang.launch_server \
 
 - use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the backend; the default is `classic_te`
 - use `MC_STORE_RS_TRANSPORT_METADATA_URL=P2PHANDSHAKE` only with `classic_te` when the transfer engine should use peer handshake instead of Redis-backed transport metadata
-- keep SGLang real clients and storage peers on the default metadata keyspace `mc/store-rs/v1`
+- keep SGLang real clients and storage peers on the default metadata keyspace `mc/store-rs/v2`
 - treat `--hicache-storage-backend-extra-config` as a legacy field bridge, not a full Store-RS setup dictionary
 - if a deployment needs custom `keyspace`, explicit `stable_id`, or per-process route labels, use the dummy gateway path or a patched SGLang fork
 

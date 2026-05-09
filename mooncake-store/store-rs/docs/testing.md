@@ -157,9 +157,10 @@ invariant must hold for every generated case.
 
 End-to-end flows that compose ≥2 real components without mocks.
 
-- `mooncake-metadata::redis_backend::tests::redis_backend_*` — 35 tests
+- `mooncake-metadata::redis_backend::tests::redis_backend_*` — 35+ tests
   spin up a local `redis-server` (falling back to no-op if absent), exercise
-  the full metadata surface, Lua-script atomicity, transient-error retry.
+  the full metadata surface, Lua-script atomicity, transient-error retry, and
+  TTL-backed client resource hashes.
 - `mooncake-metadata::etcd_backend::tests::etcd_backend_*` — 7 tests gated
   on a local `etcd` binary, covering round-trip metadata behavior plus expiry
   work-index and owner-scoped cleanup semantics.
@@ -333,7 +334,7 @@ Metadata backend scenarios covered (9 new + 26 pre-existing):
 Admin service scenarios covered:
 
 - due stale-owner entries remove orphaned segment metadata through the owner
-  index and clear the consumed expiry-queue entries
+  resource namespace and clear the consumed expiry-queue entries
 - live owners that happen to appear in the expiry queue are re-checked and
   skipped instead of being cleaned speculatively
 
@@ -355,6 +356,11 @@ Etcd scenarios covered:
 - owner-scoped stale-segment cleanup without a steady-state full scan
 - admin reconcile against real etcd metadata for both dead-owner cleanup and
   live-owner skip behavior
+
+Redis scenarios covered:
+
+- client leases and owned segment records share one TTL-backed resource hash
+- owner-scoped cleanup deletes abnormal resource hashes whose lease field is gone
 
 ### Transient-error classifier
 

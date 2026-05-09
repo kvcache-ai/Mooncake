@@ -44,7 +44,7 @@ Operational notes:
 
 ## Admin maintenance
 
-Redis-backed and etcd-backed deployments now support a stateless admin maintenance loop for stale segment cleanup.
+Redis-backed and etcd-backed deployments support explicit stale segment maintenance.
 The same admin server can also run tenant-quota reservation reconcile for an explicit tenant list.
 
 Relevant surfaces:
@@ -55,11 +55,14 @@ Relevant surfaces:
 
 Operational model:
 
-- Redis lease keys still use TTL as the liveness signal
+- the default metadata keyspace is `mc/store-rs/v2`; `v2` is the Redis schema boundary for
+  TTL-backed client resource hashes and intentionally does not read or migrate old `v1` keys
+- Redis client resource hashes use TTL as the liveness signal
+- Redis stores the lease and owned segment records in that single client resource hash; when the lease TTL expires, Redis removes both the lease and the segment records
 - etcd lease keys do not expire automatically; admin re-checks the stored `expires_at_ms` field when due work arrives
-- segment keys still do **not** use TTL in either backend, but they are stored under the owning client runtime namespace
+- etcd segment keys do not use TTL, but they are stored under the owning client runtime namespace
 - lease publish and heartbeat refresh now also update a backend-native expiry work index under the same metadata keyspace: Redis uses one sorted set, etcd uses `by-runtime` + lexicographically ordered `by-time` keys
-- the admin maintenance loop consumes due entries from that work index, re-checks lease liveness, and only then removes that owner's segment metadata through the owner-scoped segment namespace
+- the admin maintenance loop consumes due entries from that work index, re-checks lease liveness, and removes owner-scoped resource metadata only when the backend still has stale state to repair
 - same-epoch lease reclaim after an expired lease key is allowed when that epoch is still the historical HWM and no higher live epoch exists, so heartbeat repair does not fail with `StaleEpoch` after a TTL gap
 - tenant quota reconcile is intentionally opt-in per tenant because the current metadata model has no bounded global tenant-work index for the admin plane to consume safely
 
@@ -272,10 +275,11 @@ Reconnect behavior:
 - `classic_te` recreates its transport runtime before republishing local buffers
 - `tent` also recreates its transport runtime before re-registering the local buffers it still owns
 - peer restarts that invalidate a cached remote segment handle are repaired on demand: the read path drops the stale handle, reopens by segment name, and only quarantines that runtime if the fresh reopen still fails
-- segment metadata lookup starts from live clients. A leftover segment record whose owner lease is gone is ignored for allocation, preferred-segment resolution, and HTTP remote-runtime resolution.
+- segment metadata lookup starts from live clients. In Redis, segment records share the owner client hash TTL with the lease; in every backend, a leftover segment record whose owner lease is gone is ignored for allocation, preferred-segment resolution, and HTTP remote-runtime resolution.
 - remote read batches are split by storage owner and guarded by a short, rate-limited peer control-plane probe from the cached membership snapshot; the probe does not refresh metadata and only quarantines the owner when the cached peer endpoint is confirmed unreachable
 - routed writes apply the same stale-handle refresh once before escalating to outer soft-pin retry or failover, so a restarted live peer does not poison the cached remote-segment state
-- if Redis restarts from an empty dataset, surviving storage clients republish both lease state and segment metadata during recovery
+- if Redis restarts from an empty dataset, surviving storage clients republish both lease state and segment metadata into their client resource hash during recovery
+- local memory registration refreshes the runtime lease before publishing segment metadata, so slow startup registration does not publish into an expired Redis client resource hash
 - requests that arrive while Redis is unavailable can still fail fast; recovery is designed for self-healing after metadata service returns, not for serving through a metadata blackout
 
 ## Route Control

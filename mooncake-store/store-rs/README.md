@@ -499,7 +499,7 @@ Important runtime behavior:
 - `MC_BENCH_STORAGE_BYTES=0` by default, so the bench expects separate active `storage=true` daemons in the same metadata keyspace
 - `MC_BENCH_INTERFACES=<write>,<read>` can set both interface env defaults together
 - `MC_BENCH_WRITE_INTERFACE=batch-put-from` and `MC_BENCH_READ_INTERFACE=batch-get-into` by default
-- when `--keyspace` is omitted in scratch-only mode, bench joins `mc/store-rs/v1`
+- when `--keyspace` is omitted in scratch-only mode, bench joins `mc/store-rs/v2`
 - when `--storage-bytes > 0` and `--keyspace` is omitted, bench generates an isolated `mc/store-rs/bench/<unique>` keyspace
 - bench tracing goes to `stderr` by default, honors `--trace-filter` / `MC_STORE_RS_TRACE_FILTER` / `RUST_LOG`, and falls back to `info`
 - use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for a dedicated bench log file; `MC_STORE_RS_TRACE_FILE` does not redirect bench output

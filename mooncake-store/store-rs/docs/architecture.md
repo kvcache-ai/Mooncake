@@ -120,10 +120,16 @@ The membership snapshot is runtime cache, not protocol configuration:
 - request-level tenants affect scoped object keys, not the cluster-wide route-authority policy
 
 Segment metadata is scoped under its owning `ClientRuntimeId`. The client lease is the liveness
-truth; segment records are child resources that describe buffers owned by that live runtime. Write
-placement and preferred-segment resolution start from live compatible leases and then do exact
-`get_segment(owner, segment)` lookups for those owners. A stale segment record without a live
-client lease cannot make a runtime eligible for allocation.
+truth; segment records are child resources that describe buffers owned by that live runtime. In
+Redis, the lease payload and owned segment records live in the same client resource hash, so the
+lease TTL expires the whole resource bucket. Write placement and preferred-segment resolution start
+from live compatible leases and then do exact `get_segment(owner, segment)` lookups for those
+owners. A stale segment record without a live client lease cannot make a runtime eligible for
+allocation.
+
+The default Redis metadata keyspace is `mc/store-rs/v2`. That namespace is the schema boundary for
+client resource hashes, keeping old `v1` lease-string data from colliding with the current hash
+layout.
 
 ## Write Path
 
@@ -372,7 +378,12 @@ Metadata backends store four persistent categories of data:
 
 For membership specifically, metadata is the authoritative lease store, while the client runtime keeps a prewarmed and background-refreshed snapshot for request-path reads.
 
-Client-lease registration uses `allocate_client_lease`: the metadata backend atomically derives the next epoch from `max(active epochs for stable_id, persistent HWM) + 1`, writes the lease under that epoch, and returns the assigned `ClientRuntimeId`. Republishing the same `(stable_id, epoch)` through `upsert_client_lease` is a refresh and extends the lease TTL in place — heartbeat and lifecycle-state updates use that path. The backends implement the allocation differently: the in-memory backend holds the active-epoch set and HWM under its write lock, Redis uses a dedicated Lua script over a `by-stable` set and an HWM key, and etcd uses a txn loop over per-epoch marker keys and the HWM key. Callers never supply an epoch; the `ClientEpoch` type remains internal to serialization, handoff plans, and metadata keys.
+Client-lease registration uses `allocate_client_lease`: the metadata backend atomically derives the next epoch from `max(active epochs for stable_id, lease-scoped HWM) + 1`, writes the lease under that epoch, and returns the assigned `ClientRuntimeId`. Republishing the same `(stable_id, epoch)` through `upsert_client_lease` is a refresh and extends the lease TTL in place — heartbeat and lifecycle-state updates use that path, including `Draining` during hot upgrade. Redis stores the lease as the `lease` field in the client resource hash and stores owned segments as `segment:*` fields in that same hash, so lease refresh extends the TTL for all client-owned resource metadata. Redis also TTL-bounds the per-stable-id epoch HWM and `by-stable` helper index to the live lease horizon, so dead client IDs do not leave permanent per-client state. The in-memory backend holds the active-epoch set and HWM under its write lock, Redis uses a dedicated Lua script over a `by-stable` set and an HWM key, and etcd uses a txn loop over per-epoch marker keys and the HWM key. Callers never supply an epoch; the `ClientEpoch` type remains internal to serialization, handoff plans, and metadata keys.
+
+Local memory registration refreshes the runtime lease immediately before publishing local segment
+metadata. Large memory registration can consume most of the startup lease TTL; refreshing at the
+publication boundary keeps Redis' TTL-backed client resource hash present before `segment:*` fields
+are written.
 
 For strict quota rollout, the metadata model now also includes tenant-root quota primitives:
 
