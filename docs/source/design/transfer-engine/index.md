@@ -301,8 +301,8 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
 - `MC_INTRA_NVLINK` Enable intra-node NVLINK transport, and cannot be used together with MC_FORCE_MNNVL.
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
-- `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
-- `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
+- `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
+- `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.

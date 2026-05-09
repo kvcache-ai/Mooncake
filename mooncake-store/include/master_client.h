@@ -349,6 +349,9 @@ class MasterClient {
                                ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
+        const UUID& client_id, int64_t ssd_total_capacity_bytes);
+
     /**
      * @brief Adds multiple new objects to a specified client in batch.
      * @param keys         A list of object keys (names) that were successfully

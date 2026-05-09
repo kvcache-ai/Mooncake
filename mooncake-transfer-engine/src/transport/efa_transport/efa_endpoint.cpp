@@ -80,6 +80,7 @@ int EfaEndPoint::setupConnectionsByActive() {
 
     rc = context_.insertPeerAddr(peer_desc.efa_addr, peer_fi_addr_);
     if (rc != 0) return rc;
+    cached_peer_addr_ = peer_desc.efa_addr;
 
     status_.store(CONNECTED, std::memory_order_release);
     VLOG(1) << "EFA connection established: " << toString()
@@ -90,10 +91,6 @@ int EfaEndPoint::setupConnectionsByActive() {
 int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                            HandShakeDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (status_.load(std::memory_order_relaxed) == CONNECTED) {
-        LOG(WARNING) << "Re-establish EFA connection: " << toString();
-        disconnectUnlocked();
-    }
 
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {
@@ -112,11 +109,37 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
         return ERR_REJECT_HANDSHAKE;
     }
 
+    // Classify this passive handshake so we can emit the right log level
+    // without changing functional behavior: the AV reinsert below must
+    // still happen on every handshake because libfabric's EFA provider
+    // tracks per-peer transport state that depends on a fresh
+    // fi_av_insert (e.g. provider-internal AH activation and RNR state).
+    // Skipping reinsert caused request-level stalls under bilateral
+    // sglang P/D load even when the peer EFA address was unchanged.
+    //
+    // Log semantics:
+    //   * Same cached peer address → benign symmetric handshake under
+    //     bilateral traffic.  Demote to INFO to keep decode logs readable
+    //     without hiding real reconnects.
+    //   * Different cached peer address → genuine reconnect (peer
+    //     restart, port reshuffle that reached disconnect first, etc.).
+    //     Keep at WARNING so it stays visible.
+    if (status_.load(std::memory_order_relaxed) == CONNECTED) {
+        if (!cached_peer_addr_.empty() &&
+            peer_desc.efa_addr == cached_peer_addr_) {
+            VLOG(1) << "EFA passive handshake (same peer addr): " << toString();
+        } else {
+            LOG(WARNING) << "Re-establish EFA connection: " << toString();
+        }
+        disconnectUnlocked();
+    }
+
     int ret = context_.insertPeerAddr(peer_desc.efa_addr, peer_fi_addr_);
     if (ret != 0) {
         local_desc.reply_msg = "Failed to insert peer address";
         return ret;
     }
+    cached_peer_addr_ = peer_desc.efa_addr;
 
     local_desc.local_nic_path = context_.nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
@@ -138,12 +161,14 @@ void EfaEndPoint::disconnectUnlocked() {
         context_.removePeerAddr(peer_fi_addr_);
         peer_fi_addr_ = FI_ADDR_UNSPEC;
     }
+    cached_peer_addr_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);
 }
 
 void EfaEndPoint::markDetachedForTeardown() {
     RWSpinlock::WriteGuard guard(lock_);
     peer_fi_addr_ = FI_ADDR_UNSPEC;
+    cached_peer_addr_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);
 }
 
@@ -165,11 +190,26 @@ int EfaEndPoint::submitPostSend(
         }
     }
 
-    fi_addr_t peer;
-    {
-        RWSpinlock::ReadGuard guard(lock_);
-        peer = peer_fi_addr_;
+    // Hold a read lock for the entire submit window so setPeerNicPath() /
+    // disconnect() (which take the write lock) cannot fi_av_remove() our
+    // slot while an fi_write() inside submitSlicesOnPeer is still in
+    // flight.  The previous code latched peer_fi_addr_ under the lock and
+    // released it before calling into the context, leaving a race: a
+    // concurrent peer reconnect could remove the AV entry after the latch,
+    // and libfabric would segfault on the stale fi_addr_t.  Read locks
+    // stack, so multiple senders to the same peer still submit in parallel.
+    RWSpinlock::ReadGuard guard(lock_);
+
+    // Re-check status under the lock — a racing disconnect() could have
+    // flipped us to UNCONNECTED between the outer check and acquiring the
+    // lock.  Fail the batch so the caller retries with a fresh setup.
+    if (status_.load(std::memory_order_acquire) != CONNECTED) {
+        for (auto* slice : slice_list) failed_slice_list.push_back(slice);
+        slice_list.clear();
+        return ERR_ENDPOINT;
     }
+
+    fi_addr_t peer = peer_fi_addr_;
     if (peer == FI_ADDR_UNSPEC) {
         for (auto* slice : slice_list) failed_slice_list.push_back(slice);
         slice_list.clear();

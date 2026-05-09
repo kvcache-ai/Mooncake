@@ -75,6 +75,11 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y lcov gcovr ninja-build
 
+    - name: Test HugeTLB sizing helper
+      run: |
+        python3 scripts/test_hicache_hugepage_requirements.py
+      shell: bash
+
     - name: Set up coverage compilation flags
       run: |
         echo "Setting up coverage compilation flags..."

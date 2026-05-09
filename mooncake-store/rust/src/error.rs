@@ -40,4 +40,8 @@ pub enum StoreError {
     /// [`OperationFailed`](StoreError::OperationFailed) instead.
     #[error("key not found")]
     NotFound,
+
+    /// One or more arguments are invalid (e.g. mismatched array lengths).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }

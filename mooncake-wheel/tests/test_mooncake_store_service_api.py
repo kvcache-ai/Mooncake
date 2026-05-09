@@ -47,6 +47,8 @@ class FakeStore:
         self.unmount_calls = []
         self.fail_mount = False
         self.unmount_failures = set()
+        self.allocated_mount_calls = []
+        self.free_unmount_calls = []
 
     def mount_segment(self, path, size, offset, protocol, location):
         self.mount_calls.append((path, size, offset, protocol, location))
@@ -69,6 +71,19 @@ class FakeStore:
                 return -1
         for segment_id in segment_ids:
             self.mounted.pop(segment_id, None)
+        return 0
+
+    def allocate_and_mount_segment(self, size, protocol, location):
+        self.allocated_mount_calls.append((size, protocol, location))
+        segment_id = "00000000-0000-0000-0000-000000000002"
+        return {
+            "ret": 0,
+            "segment_ids": [segment_id],
+            "allocated_size": 4096,
+        }
+
+    def unmount_and_free_segment(self, segment_ids):
+        self.free_unmount_calls.append(list(segment_ids))
         return 0
 
 
@@ -174,6 +189,32 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.current_mode, "prefill")
         self.assertEqual(self.service.last_mount_info, {})
 
+    async def test_mount_allocates_and_frees_on_unmount(self):
+        mount_resp = await self.service.handle_mount(
+            FakeRequest({"size": 1, "protocol": "tcp", "location": "cpu:0"})
+        )
+        self.assertEqual(mount_resp.status, 200)
+        mount_body = json.loads(mount_resp.text)
+        self.assertEqual(mount_body["status"], "success")
+        self.assertEqual(
+            mount_body["segment_ids"],
+            ["00000000-0000-0000-0000-000000000002"],
+        )
+        self.assertEqual(mount_body["allocated_size"], 4096)
+        self.assertEqual(self.fake_store.allocated_mount_calls,
+                         [(1, "tcp", "cpu:0")])
+
+        unmount_resp = await self.service.handle_unmount(
+            FakeRequest({"segment_ids": mount_body["segment_ids"]})
+        )
+        self.assertEqual(unmount_resp.status, 200)
+        unmount_body = json.loads(unmount_resp.text)
+        self.assertEqual(unmount_body["status"], "success")
+        self.assertEqual(
+            self.fake_store.free_unmount_calls,
+            [["00000000-0000-0000-0000-000000000002"]],
+        )
+
     async def test_mount_shm_requires_name_and_size(self):
         resp = await self.service.handle_mount_shm(
             FakeRequest({"name": "mooncake-segment"})
@@ -189,6 +230,12 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 400)
         body = json.loads(resp.text)
         self.assertIn("name or size", body["error"])
+
+    async def test_mount_requires_positive_size(self):
+        resp = await self.service.handle_mount(FakeRequest({"size": 0}))
+        self.assertEqual(resp.status, 400)
+        body = json.loads(resp.text)
+        self.assertIn("Invalid size", body["error"])
 
     async def test_unmount_shm_requires_segment_ids(self):
         resp = await self.service.handle_unmount_shm(FakeRequest({}))

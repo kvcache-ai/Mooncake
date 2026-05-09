@@ -60,6 +60,16 @@
     } while (0)
 #endif
 
+#ifdef USE_HIP
+#define CHECK_HIP(call)                                                      \
+    do {                                                                     \
+        auto err = call;                                                     \
+        if (err != hipSuccess)                                               \
+            return Status::InternalError(std::string(#call) + ": " +         \
+                                         hipGetErrorString(err) + LOC_MARK); \
+    } while (0)
+#endif
+
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
 #define CHECK_ASCEND(call)                                                \
     do {                                                                  \
