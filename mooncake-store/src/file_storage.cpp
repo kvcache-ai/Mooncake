@@ -521,8 +521,131 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return offload_result;
     }
 
+    // Drive any pending L2->L1 promotion work for this client. Failures
+    // inside ProcessPromotionTasks are logged per-key and do not propagate;
+    // promotion is best-effort and must never break offload.
+    (void)ProcessPromotionTasks();
+
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
+    if (client_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::unordered_map<std::string, int64_t> promotion_objects;
+    auto heartbeat_result =
+        client_->PromotionObjectHeartbeat(promotion_objects);
+    if (!heartbeat_result) {
+        // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and the
+        // first heartbeat tick if the master forgets us (e.g. across a master
+        // restart): benign no-op until next ReMount.
+        if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+            return {};
+        }
+        LOG(WARNING) << "PromotionObjectHeartbeat failed: "
+                     << heartbeat_result.error();
+        return tl::make_unexpected(heartbeat_result.error());
+    }
+    if (promotion_objects.empty()) {
+        return {};
+    }
+
+    VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
+            << " promotion candidate(s) from master";
+
+    // Cap per-tick work at one task. Each task does a synchronous SSD
+    // read + RDMA write whose wall-time scales with object size; KV-cache
+    // workloads commonly use 64 MB–1 GB tensors, so even a handful of
+    // tasks can exceed the master's heartbeat / client-liveness window
+    // and get the client wrongly marked dead. Capping at 1 makes promotion
+    // tolerant of any object size at the cost of slow queue drain
+    // (~1 promotion per heartbeat interval). Excess tasks are processed
+    // on subsequent ticks; the master re-queues nothing because the
+    // per-client promotion_objects map was already drained by Heartbeat
+    // above. If sub-MB workloads need higher throughput, raise this with
+    // a per-deployment config knob and consider a byte-budget cap.
+    constexpr size_t kMaxPromotionsPerTick = 1;
+
+    // No segment preference in v1: let master pick from any DRAM segment.
+    const std::vector<std::string> preferred_segments;
+
+    size_t processed = 0;
+    for (const auto& [key, size] : promotion_objects) {
+        if (processed++ >= kMaxPromotionsPerTick) {
+            VLOG(1) << "ProcessPromotionTasks deferring "
+                    << (promotion_objects.size() - kMaxPromotionsPerTick)
+                    << " task(s) to next tick (per-tick cap "
+                    << kMaxPromotionsPerTick << ")";
+            break;
+        }
+        if (size <= 0) {
+            LOG(WARNING) << "Skipping promotion for key=" << key
+                         << " with non-positive size=" << size;
+            continue;
+        }
+
+        auto alloc_result = client_->PromotionAllocStart(
+            key, static_cast<uint64_t>(size), preferred_segments);
+        if (!alloc_result) {
+            VLOG(1) << "PromotionAllocStart failed for key=" << key
+                    << ", error=" << alloc_result.error()
+                    << " (likely no free DRAM); master will reap";
+            continue;
+        }
+
+        // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
+        // from the local SSD backend into it. AllocateBatch returns a
+        // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
+        // staging space when the local goes out of scope.
+        std::vector<std::string> single_key{key};
+        std::vector<int64_t> single_size{size};
+        auto allocate_res = AllocateBatch(single_key, single_size);
+        if (!allocate_res) {
+            LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
+                         << ", error=" << allocate_res.error();
+            continue;
+        }
+        auto staging = allocate_res.value();
+        auto load_res = BatchLoad(staging->slices);
+        if (!load_res) {
+            LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
+                         << ", error=" << load_res.error();
+            continue;
+        }
+
+        // (b) TE-write from the staging slice into the freshly-allocated
+        // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
+        // correction in BatchLoad, so re-read it from the slice map.
+        auto slice_it = staging->slices.find(key);
+        if (slice_it == staging->slices.end()) {
+            LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
+            continue;
+        }
+        std::vector<Slice> tx_slices{slice_it->second};
+        ErrorCode write_err = client_->PromotionWrite(
+            alloc_result.value().memory_descriptor, tx_slices);
+        if (write_err != ErrorCode::OK) {
+            LOG(WARNING) << "Promotion: TransferWrite failed for key=" << key
+                         << ", error=" << write_err;
+            continue;
+        }
+
+        // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
+        // becomes visible to readers.
+        auto notify_res = client_->NotifyPromotionSuccess(key);
+        if (!notify_res) {
+            LOG(WARNING) << "Promotion: NotifyPromotionSuccess failed for key="
+                         << key << ", error=" << notify_res.error();
+            continue;
+        }
+
+        VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+    }
+
     return {};
 }
 

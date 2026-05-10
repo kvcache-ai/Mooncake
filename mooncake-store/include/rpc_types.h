@@ -79,6 +79,15 @@ struct CopyStartResponse {
 YLT_REFL(CopyStartResponse, source, targets);
 
 /**
+ * @brief Response structure for PromotionAllocStart (L2->L1 promotion-on-hit).
+ * Carries the staged PROCESSING MEMORY replica descriptor.
+ */
+struct PromotionAllocStartResponse {
+    Replica::Descriptor memory_descriptor;
+};
+YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
+
+/**
  * @brief Response structure for MoveStart operation
  */
 struct MoveStartResponse {

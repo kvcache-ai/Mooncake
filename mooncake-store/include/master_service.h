@@ -20,6 +20,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "count_min_sketch.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -527,6 +528,34 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Heartbeat-driven pull of pending promotion work for a client.
+     * Returns the per-client promotion_objects map (key -> object size) and
+     * clears it. The per-shard promotion_tasks map remains populated as the
+     * source of truth until NotifyPromotionSuccess commits the new MEMORY
+     * replica.
+     */
+    auto PromotionObjectHeartbeat(const UUID& client_id)
+        -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
+
+    /**
+     * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
+     * DRAM via the existing AllocationStrategy, optionally biased toward the
+     * caller's local memory segment via preferred_segments. The new replica is
+     * invisible to readers until NotifyPromotionSuccess flips it to COMPLETE.
+     */
+    auto PromotionAllocStart(const std::string& key, uint64_t size,
+                             const std::vector<std::string>& preferred_segments)
+        -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
+
+    /**
+     * @brief Commit a staged MEMORY replica to COMPLETE; decrement source
+     * refcnt; erase per-shard and per-client task entries. Mirror of
+     * NotifyOffloadSuccess.
+     */
+    auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Create a copy task to copy an object's replicas to target segments
      * @return Copy task ID on success, ErrorCode on failure
      */
@@ -955,6 +984,19 @@ class MasterService {
         std::chrono::system_clock::time_point start_time;
     };
 
+    // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source LOCAL_DISK
+    // replica is refcnt-pinned for the duration of the task so it cannot be
+    // evicted. alloc_id pins down which staged replica
+    // NotifyPromotionSuccess should commit, so a concurrent Put creating
+    // another PROCESSING MEMORY replica cannot be confused with ours.
+    // alloc_id is 0 until PromotionAllocStart records the new replica.
+    struct PromotionTask {
+        ReplicaID source_id;    // the LOCAL_DISK replica being promoted
+        ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
+        uint64_t object_size;
+        std::chrono::system_clock::time_point start_time;
+    };
+
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     // Sharded metadata maps and their mutexes
@@ -966,6 +1008,8 @@ class MasterService {
         std::unordered_map<std::string, const ReplicationTask> replication_tasks
             GUARDED_BY(mutex);
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks
+            GUARDED_BY(mutex);
+        std::unordered_map<std::string, const PromotionTask> promotion_tasks
             GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
@@ -1077,6 +1121,25 @@ class MasterService {
         bool stopping_{false};
         std::condition_variable timer_cv_;
     } graceful_unmount_scheduler_;
+
+    /**
+     * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
+     * entry into the holder client's LocalDiskSegment::promotion_objects map.
+     * Caller is responsible for refcnt-pinning the source replica and
+     * recording the task in the shard's promotion_tasks map.
+     */
+    tl::expected<void, ErrorCode> PushPromotionQueue(const std::string& key,
+                                                     Replica& source_replica);
+
+    /**
+     * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
+     * observed. Applies the gating chain (frequency / watermark / dedup /
+     * cap), refcnt-pins the source LOCAL_DISK replica, records a
+     * PromotionTask, and pushes onto the holder client's promotion_objects
+     * map. Acquires its own RW shard accessor; safe to call after
+     * GetReplicaList's RO accessor has been released.
+     */
+    void TryPushPromotionQueue(const std::string& key);
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -1348,6 +1411,16 @@ class MasterService {
     // exceeded (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
+
+    // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
+    // when a Get observes a key with only LOCAL_DISK replicas.
+    bool promotion_on_hit_{false};
+    uint32_t promotion_admission_threshold_{2};
+    uint32_t promotion_queue_limit_{50000};
+    // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
+    // true. CountMinSketch is mutex-protected internally so we can call into it
+    // from any GetReplicaList caller without additional locking.
+    std::unique_ptr<CountMinSketch> promotion_sketch_;
 
     const std::string ha_backend_type_;
 

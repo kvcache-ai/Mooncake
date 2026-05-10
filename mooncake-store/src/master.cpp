@@ -126,6 +126,14 @@ DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_bool(promotion_on_hit, false,
+            "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
+            "offload_on_evict)");
+DEFINE_uint32(promotion_admission_threshold, 2,
+              "Min CountMinSketch count for a key before promotion fires "
+              "(set 1 to disable second-touch gating)");
+DEFINE_uint32(promotion_queue_limit, 50000,
+              "Max in-flight promotion tasks across all shards");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -342,6 +350,14 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
+                           FLAGS_promotion_on_hit);
+    default_config.GetUInt32("promotion_admission_threshold",
+                             &master_config.promotion_admission_threshold,
+                             FLAGS_promotion_admission_threshold);
+    default_config.GetUInt32("promotion_queue_limit",
+                             &master_config.promotion_queue_limit,
+                             FLAGS_promotion_queue_limit);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",
@@ -594,6 +610,46 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_offload = FLAGS_enable_offload;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_on_evict", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_on_evict = FLAGS_offload_on_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_force_evict", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_on_hit", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_on_hit = FLAGS_promotion_on_hit;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_admission_threshold",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_admission_threshold =
+            FLAGS_promotion_admission_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_queue_limit", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_queue_limit = FLAGS_promotion_queue_limit;
+    }
+    // Clamp promotion_admission_threshold into the sketch counter's
+    // representable range. The CountMinSketch uses 8-bit saturating
+    // counters (max 255) so any threshold beyond that would silently
+    // make the gate unreachable; clamping at parse time fails loudly and
+    // gives the gate a stable contract to compare uint8_t against.
+    if (master_config.promotion_admission_threshold > 255) {
+        LOG(WARNING) << "promotion_admission_threshold="
+                     << master_config.promotion_admission_threshold
+                     << " exceeds the CountMinSketch counter max (255). "
+                     << "Clamping to 255. Lower the configured value to "
+                     << "silence this warning.";
+        master_config.promotion_admission_threshold = 255;
     }
     if ((google::GetCommandLineFlagInfo("ha_backend_type", &info) &&
          !info.is_default) ||

@@ -420,6 +420,32 @@ class MasterClient {
         const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
+     * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
+     * client. Returns key->size pairs the caller should read from local
+     * SSD and stage as MEMORY replicas via PromotionAllocStart +
+     * NotifyPromotionSuccess.
+     */
+    [[nodiscard]] tl::expected<std::unordered_map<std::string, int64_t>,
+                               ErrorCode>
+    PromotionObjectHeartbeat(const UUID& client_id);
+
+    /**
+     * @brief Stage a PROCESSING MEMORY replica for an existing key during
+     * promotion. Returns the new replica's descriptor that the caller writes
+     * via Transfer Engine.
+     */
+    [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const std::string& key, uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
+
+    /**
+     * @brief Commit a staged MEMORY replica to COMPLETE; called after the
+     * client has written the bytes via Transfer Engine.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key);
+
+    /**
      * @brief Start a copy operation
      * @param key Object key
      * @param src_segment Source segment name

@@ -174,6 +174,17 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    // Promotion-on-hit RPCs.
+    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    PromotionObjectHeartbeat(const UUID& client_id);
+
+    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
+        const std::string& key, uint64_t size,
+        const std::vector<std::string>& preferred_segments);
+
+    tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key);
+
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 

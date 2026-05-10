@@ -1786,6 +1786,34 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     return result;
 }
 
+tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
+    ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
+    timer.LogRequest("action=promotion_object_heartbeat");
+    return master_service_.PromotionObjectHeartbeat(client_id);
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+WrappedMasterService::PromotionAllocStart(
+    const std::string& key, uint64_t size,
+    const std::vector<std::string>& preferred_segments) {
+    ScopedVLogTimer timer(1, "PromotionAllocStart");
+    timer.LogRequest("action=promotion_alloc_start");
+    auto result =
+        master_service_.PromotionAllocStart(key, size, preferred_segments);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
+    const UUID& client_id, const std::string& key) {
+    ScopedVLogTimer timer(1, "NotifyPromotionSuccess");
+    timer.LogRequest("action=notify_promotion_success");
+    auto result = master_service_.NotifyPromotionSuccess(client_id, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
     return master_service_.CreateDrainJob(request);
@@ -1906,6 +1934,15 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(
+            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyPromotionSuccess>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
         &wrapped_master_service);
