@@ -413,6 +413,8 @@ int initiator() {
             xport = engine->installTransport("nvlink", nullptr);
         } else if (FLAGS_protocol == "nvlink_intra") {
             xport = engine->installTransport("nvlink_intra", nullptr);
+        } else if (FLAGS_protocol == "maca") {
+            xport = engine->installTransport("maca", nullptr);
         } else if (FLAGS_protocol == "hip") {
             xport = engine->installTransport("hip", nullptr);
         } else {
@@ -536,6 +538,8 @@ int target() {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "maca") {
+            engine->installTransport("maca", nullptr);
         } else if (FLAGS_protocol == "hip") {
             engine->installTransport("hip", nullptr);
         } else {

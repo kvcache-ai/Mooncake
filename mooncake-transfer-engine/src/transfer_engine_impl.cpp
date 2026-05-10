@@ -268,6 +268,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(ERROR) << "Failed to install Ascend transport";
             return -1;
         }
+#elif defined(USE_MACA)
+
+        Transport* t = multi_transports_->installTransport("maca", nullptr);
+        if (!t) {
+            LOG(ERROR) << "Failed to install MACA transport";
+            return -1;
+        }
+        LOG(INFO) << "Using MACA transport";
+
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
