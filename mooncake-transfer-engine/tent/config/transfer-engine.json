@@ -10,6 +10,7 @@
         "rdma_blacklist": []
     },
     "log_level": "warning",
+    "max_failover_attempts": 3,
     "metrics": {
         "enabled": true,
         "http_port": 9100,
@@ -68,6 +69,13 @@
                 "grace_period_ns": 50000,
                 "rail_topo_path": "/path/to/rail_topo.json"
             }
+        },
+        "tcp": {
+            "enable": true,
+            "max_retry_count": 3,
+            "retry_base_delay_ms": 100,
+            "retry_max_delay_ms": 2000,
+            "max_concurrent_tasks": 16
         },
         "gds": {
             "enable" : true

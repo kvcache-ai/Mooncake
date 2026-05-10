@@ -41,7 +41,7 @@ def _elastic_worker(rank, num_processes, signals):
         if rank == 0:
             signals["extend"] = 1
 
-        backend = dist.group.WORLD._get_backend(TEST_DEVICE)
+        backend = dist.group.WORLD
         # Extend world
         # Note: `extend_group_size_to` is non-blocking. Blocking will only
         # occur at the first communication if some peers have not yet connected.
@@ -64,6 +64,10 @@ def _elastic_worker(rank, num_processes, signals):
         f"Rank {rank} expected {sum(range(1, num_processes + 1))}, "
         f"get {tensor.item()}"
     )
+    assert dist.get_world_size() == num_processes, (
+        f"Rank {rank}: expected world_size={num_processes} after extension, "
+        f"got {dist.get_world_size()}"
+    )
 
 
 def _deferred_recovery_worker(rank, num_processes, signals):
@@ -75,7 +79,7 @@ def _deferred_recovery_worker(rank, num_processes, signals):
             rank=rank,
             world_size=num_processes,
         )
-        backend = dist.group.WORLD._get_backend(TEST_DEVICE)
+        backend = dist.group.WORLD
         while pg.get_num_synced_ranks(backend) < num_processes:
             time.sleep(0.1)
         if rank == broken_rank:
@@ -124,7 +128,7 @@ def _deferred_recovery_worker(rank, num_processes, signals):
             ),
         )
 
-        backend = dist.group.WORLD._get_backend(TEST_DEVICE)
+        backend = dist.group.WORLD
 
         # Deferred join starts in a local-only mode so collectives stay self-contained.
         tensor = torch.tensor([broken_rank], dtype=torch.int32, device=TEST_DEVICE)

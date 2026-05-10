@@ -12,17 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// How to run:
-// etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls
-// http://127.0.0.1:2379
-// ./ub_transport_test --mode=target  --metadata_server=127.0.0.1:2379
-//   --local_server_name=127.0.0.2:12345 --device_name=bonding_dev_0
-// ./ub_transport_test --metadata_server=127.0.0.1:2379
-//   --segment_id=127.0.0.2:12345 --local_server_name=127.0.0.3:12346
-//   --device_name=bonding_dev_0
-
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <gtest/gtest.h>
 #include <sys/time.h>
 
 #include <cstdlib>
@@ -34,163 +26,28 @@
 #include "transport/transport.h"
 #include "common.h"
 
-#include "cuda_alike.h"
-#if defined(USE_CUDA) && defined(USE_NVMEOF)
-#include <cufile.h>
-#endif
+using namespace mooncake;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+namespace mooncake {
 
-#include <cassert>
-
-static void checkCudaError(cudaError_t result, const char* message) {
-    if (result != cudaSuccess) {
-        LOG(ERROR) << message << " (Error code: " << result << " - "
-                   << cudaGetErrorString(result) << ")" << std::endl;
-        exit(EXIT_FAILURE);
-    }
-}
-#endif
-
-#define NR_SOCKETS (1)
-
-DEFINE_string(local_server_name, mooncake::getHostname(),
+DEFINE_string(local_server_name, getHostname(),
               "Local server name for segment discovery");
-DEFINE_string(metadata_server, "192.168.3.77:2379", "etcd server host address");
+DEFINE_string(metadata_server, "127.0.0.1:2379", "etcd server host address");
 DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "ub", "Transfer protocol: ub|tcp");
+DEFINE_string(protocol, "ub", "Transfer protocol: ub");
 
-DEFINE_string(device_name, "bonding_dev_0",
+DEFINE_string(device_name, "mock_urma_device",
               "Device name to use, valid if protocol=ub");
 DEFINE_string(nic_priority_matrix, "",
               "Path to UB NIC priority matrix file (Advanced)");
 
-DEFINE_string(segment_id, "192.168.3.76", "Segment ID to access data");
+DEFINE_string(segment_id, "127.0.0.1", "Segment ID to access data");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
-DEFINE_int32(gpu_id, 0, "GPU ID to use");
-#endif
-
-using namespace mooncake;
-
-static void* allocateMemoryPool(size_t size, int socket_id,
-                                bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-    if (from_vram) {
-        int gpu_id = FLAGS_gpu_id;
-        void* d_buf;
-        checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-        checkCudaError(cudaMalloc(&d_buf, size),
-                       "Failed to allocate device memory");
-        return d_buf;
-    }
-#endif
-    return numa_alloc_onnode(size, socket_id);
-}
-
-static void freeMemoryPool(void* addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-    // check pointer on GPU
-    cudaPointerAttributes attributes;
-    checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                   "Failed to get pointer attributes");
-
-    if (attributes.type == cudaMemoryTypeDevice) {
-        cudaFree(addr);
-    } else if (attributes.type == cudaMemoryTypeHost) {
-        numa_free(addr, size);
-    } else {
-        LOG(ERROR) << "Unknown memory type";
-    }
-#else
-    numa_free(addr, size);
-#endif
-}
-
-int initiatorWorker(TransferEngine* engine, SegmentID segment_id, int thread_id,
-                    void* addr) {
-    bindToSocket(0);
-    auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
-    auto remote_base = (uint64_t)segment_desc->buffers[0].addr;
-    const size_t kDataLength = 4096000;
-    {
-        LOG(INFO) << "Stage 1: Write Data";
-        for (size_t offset = 0; offset < kDataLength; ++offset)
-            *((char*)(addr) + offset) = 'a' + lrand48() % 26;
-
-        LOG(INFO) << "Write Data: " << std::string((char*)(addr), 16) << "...";
-
-        auto batch_id = engine->allocateBatchID(1);
-        Status s;
-
-        TransferRequest entry;
-        entry.opcode = TransferRequest::WRITE;
-        entry.length = kDataLength;
-        entry.source = (uint8_t*)(addr);
-        entry.target_id = segment_id;
-        entry.target_offset = remote_base;
-        s = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(s.ok());
-        bool completed = false;
-        TransferStatus status;
-        while (!completed) {
-            Status s = engine->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(s.ok());
-            if (status.s == TransferStatusEnum::COMPLETED)
-                completed = true;
-            else if (status.s == TransferStatusEnum::FAILED) {
-                LOG(INFO) << "FAILED";
-                completed = true;
-            }
-        }
-        s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
-    }
-
-    {
-        LOG(INFO) << "Stage 2: Read Data";
-        auto batch_id = engine->allocateBatchID(1);
-        Status s;
-
-        TransferRequest entry;
-        entry.opcode = TransferRequest::READ;
-        entry.length = kDataLength;
-        entry.source = (uint8_t*)(addr) + kDataLength;
-        entry.target_id = segment_id;
-        entry.target_offset = remote_base;
-        s = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(s.ok());
-        bool completed = false;
-        TransferStatus status;
-        while (!completed) {
-            Status s = engine->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(s.ok());
-            if (status.s == TransferStatusEnum::COMPLETED)
-                completed = true;
-            else if (status.s == TransferStatusEnum::FAILED) {
-                LOG(INFO) << "FAILED";
-                completed = true;
-            }
-        }
-        s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
-    }
-
-    int ret =
-        memcmp((uint8_t*)(addr), (uint8_t*)(addr) + kDataLength, kDataLength);
-    LOG(INFO) << "Read Data: " << std::string((char*)(addr) + kDataLength, 16)
-              << "...";
-    LOG(INFO) << "Compare: " << (ret == 0 ? "OK" : "FAILED");
-
-    return 0;
-}
-
-std::string formatDeviceNames(const std::string& device_names) {
+std::string formatDeviceNames(const std::string &device_names) {
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
@@ -232,100 +89,162 @@ std::string loadNicPriorityMatrix() {
            device_names + "], []]}";
 }
 
-int initiator() {
-    const size_t ram_buffer_size = 1ull << 30;
-    // disable topology auto discovery for testing.
-    auto filters = std::vector<std::string>({FLAGS_device_name});
-    auto engine = std::make_unique<TransferEngine>(true, filters);
-
-    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name,
-                 hostname_port.first, hostname_port.second);
-
-    Transport* xport = nullptr;
-    if (FLAGS_protocol == "rdma") {
-        auto nic_priority_matrix = loadNicPriorityMatrix();
-        void** args = (void**)malloc(2 * sizeof(void*));
-        args[0] = (void*)nic_priority_matrix.c_str();
-        args[1] = nullptr;
-        xport = engine->installTransport("rdma", args);
-    } else if (FLAGS_protocol == "ub") {
-        xport = engine->installTransport("ub", nullptr);
-    } else if (FLAGS_protocol == "tcp") {
-        xport = engine->installTransport("tcp", nullptr);
-    } else {
-        LOG(ERROR) << "Unsupported protocol";
-    }
-
-    LOG_ASSERT(xport);
-
-    void* addr = nullptr;
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-    addr = allocateMemoryPool(ram_buffer_size, 0, FLAGS_use_vram);
-    std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
-    int name_suffix = FLAGS_use_vram ? FLAGS_gpu_id : 0;
-    int rc = engine->registerLocalMemory(
-        addr, ram_buffer_size, name_prefix + std::to_string(name_suffix));
-    LOG_ASSERT(!rc);
-#else
-    addr = allocateMemoryPool(ram_buffer_size, 0, false);
-    int rc =
-        engine->registerLocalMemory(addr, ram_buffer_size, kWildcardLocation);
-    LOG_ASSERT(!rc);
-#endif
-
-    auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
-    std::thread workers(initiatorWorker, engine.get(), segment_id, 0, addr);
-    workers.join();
-    engine->unregisterLocalMemory(addr);
-    freeMemoryPool(addr, ram_buffer_size);
-    return 0;
+static void *allocateMemoryPool(size_t size, int socket_id,
+                                bool from_vram = false) {
+    return numa_alloc_onnode(size, socket_id);
 }
 
-int target() {
+static void freeMemoryPool(void *addr, size_t size) { numa_free(addr, size); }
+
+class UBTransportTest : public ::testing::Test {
+   public:
+    std::shared_ptr<mooncake::TransferMetadata> metadata_client;
+    void *addr = nullptr;
+    std::pair<std::string, uint16_t> hostname_port;
+    std::unique_ptr<mooncake::TransferEngine> engine;
     const size_t ram_buffer_size = 1ull << 30;
-    // disable topology auto discovery for testing.
-    auto filters = std::vector<std::string>({FLAGS_device_name});
-    auto engine = std::make_unique<TransferEngine>(true, filters);
+    Transport *xport;
+    void **args;
+    mooncake::Transport::SegmentID segment_id;
+    std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
+    uint64_t remote_base;
 
-    auto hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
-    engine->init(FLAGS_metadata_server, FLAGS_local_server_name,
-                 hostname_port.first, hostname_port.second);
-
-    if (FLAGS_protocol == "rdma") {
-        auto nic_priority_matrix = loadNicPriorityMatrix();
-        void** args = (void**)malloc(2 * sizeof(void*));
-        args[0] = (void*)nic_priority_matrix.c_str();
+   protected:
+    void SetUp() override {
+        static int offset = 0;
+        google::InitGoogleLogging("UBTransportTest");
+        FLAGS_logtostderr = 1;
+        // disable topology auto discovery for testing.
+        engine = std::make_unique<TransferEngine>(false);
+        hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
+        engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
+                     hostname_port.first.c_str(),
+                     hostname_port.second + offset++);
+        xport = nullptr;
+        std::string nic_priority_matrix = loadNicPriorityMatrix();
+        args = (void **)malloc(2 * sizeof(void *));
+        args[0] = (void *)nic_priority_matrix.c_str();
         args[1] = nullptr;
-        engine->installTransport("rdma", args);
-    } else if (FLAGS_protocol == "ub") {
-        engine->installTransport("ub", nullptr);
-    } else if (FLAGS_protocol == "tcp") {
-        engine->installTransport("tcp", nullptr);
-    } else {
-        LOG(ERROR) << "Unsupported protocol";
+        xport = engine->installTransport("ub", args);
+        ASSERT_NE(xport, nullptr);
+        addr = allocateMemoryPool(ram_buffer_size, 0, false);
+        int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+        ASSERT_EQ(rc, 0);
+        // For testing purposes, we'll use the local memory address directly
+        // instead of trying to open a remote segment
+        segment_id = 0;  // Dummy segment ID for testing
+        remote_base = (uint64_t)addr;
     }
 
-    void* addr = nullptr;
-    addr = allocateMemoryPool(ram_buffer_size, 0);
-    int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
-    LOG_ASSERT(!rc);
+    void TearDown() override {
+        google::ShutdownGoogleLogging();
+        engine->unregisterLocalMemory(addr);
+        freeMemoryPool(addr, ram_buffer_size);
+        if (args) {
+            free(args);
+        }
+    }
+};
 
-    while (true) sleep(1);
-
-    engine->unregisterLocalMemory(addr);
-    freeMemoryPool(addr, ram_buffer_size);
-    return 0;
+TEST_F(UBTransportTest, MultiWrite) {
+    const size_t kDataLength = 4096000;
+    int times = 10;
+    while (times--) {
+        for (size_t offset = 0; offset < kDataLength; ++offset)
+            *((char *)(addr) + offset) = 'a' + lrand48() % 26;
+        auto batch_id = engine->allocateBatchID(1);
+        Status s;
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = kDataLength;
+        entry.source = (uint8_t *)(addr);
+        entry.target_id = segment_id;
+        entry.target_offset = remote_base;
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
+        bool completed = false;
+        TransferStatus status;
+        while (!completed) {
+            s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
+            if (status.s == TransferStatusEnum::COMPLETED)
+                completed = true;
+            else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(INFO) << "FAILED";
+                completed = true;
+            }
+        }
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
+    }
 }
 
-int main(int argc, char** argv) {
+TEST_F(UBTransportTest, MultipleRead) {
+    const size_t kDataLength = 4096000;
+    int times = 10;
+    while (times--) {
+        for (size_t offset = 0; offset < kDataLength; ++offset)
+            *((char *)(addr) + offset) = 'a' + lrand48() % 26;
+
+        auto batch_id = engine->allocateBatchID(1);
+        Status s;
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = kDataLength;
+        entry.source = (uint8_t *)(addr);
+        entry.target_id = segment_id;
+        entry.target_offset = remote_base;
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
+        bool completed = false;
+        TransferStatus status;
+        while (!completed) {
+            s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
+            if (status.s == TransferStatusEnum::COMPLETED)
+                completed = true;
+            else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(INFO) << "FAILED";
+                completed = true;
+            }
+        }
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
+    }
+    times = 10;
+    while (times--) {
+        auto batch_id = engine->allocateBatchID(1);
+
+        TransferRequest entry;
+        entry.opcode = TransferRequest::READ;
+        entry.length = kDataLength;
+        entry.source = (uint8_t *)(addr) + kDataLength;
+        entry.target_id = segment_id;
+        entry.target_offset = remote_base;
+        Status s;
+        s = engine->submitTransfer(batch_id, {entry});
+        ASSERT_EQ(s, Status::OK());
+        bool completed = false;
+        TransferStatus status;
+        while (!completed) {
+            s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
+            if (status.s == TransferStatusEnum::COMPLETED)
+                completed = true;
+            else if (status.s == TransferStatusEnum::FAILED) {
+                completed = true;
+            }
+        }
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
+    }
+}
+
+}  // namespace mooncake
+
+int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-
-    if (FLAGS_mode == "initiator")
-        return initiator();
-    else if (FLAGS_mode == "target")
-        return target();
-
-    LOG(ERROR) << "Unsupported mode: must be 'initiator' or 'target'";
-    exit(EXIT_FAILURE);
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

@@ -28,8 +28,13 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#include "gpu_staging_utils.h"
 
 namespace mooncake {
+
+using gpu_staging::CopyDeviceToHost;
+using gpu_staging::IsDevicePointer;
+using gpu_staging::SetDevice;
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
@@ -58,6 +63,7 @@ Client::Client(const std::string& local_hostname,
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
+      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
@@ -2080,11 +2086,70 @@ std::vector<int> Client::GetNicNumaNodes() const {
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
+    auto result = MountSegmentAndGetId(buffer, size, protocol, location);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
+    std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
+    auto unmount_result = master_client_.UnmountSegment(it->second.id);
+    if (!unmount_result) {
+        ErrorCode err = unmount_result.error();
+        LOG(ERROR) << "Failed to unmount segment from master: "
+                   << toString(err);
+        return tl::unexpected(err);
+    }
+
+    int rc = transfer_engine_->unregisterLocalMemory(
+        reinterpret_cast<void*>(it->second.base));
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
+                      "engine ret is "
+                   << rc;
+        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        // Otherwise, the segment is already unregistered from transfer
+        // engine, we can continue
+    }
+
+    mounted_segments_.erase(it);
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
+                                                     size_t size) {
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    auto segment = mounted_segments_.end();
+
+    for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
+         ++it) {
+        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
+            it->second.size == size) {
+            segment = it;
+            break;
+        }
+    }
+    if (segment == mounted_segments_.end()) {
+        LOG(ERROR) << "segment_not_found base=" << buffer << " size=" << size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return UnmountSegmentImpl(segment);
+}
+
+tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
+    const void* buffer, size_t size, const std::string& protocol,
+    const std::string& location) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
 
+    UUID segment_id;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
@@ -2111,17 +2176,12 @@ tl::expected<void, ErrorCode> Client::MountSegment(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        // Build segment with logical name; attach TE endpoint for transport
         Segment segment;
         segment.id = generate_uuid();
         segment.name = local_hostname_;
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
-        // For P2P handshake mode, publish the actual transport endpoint that
-        // was negotiated by the transfer engine. Otherwise, keep the logical
-        // hostname so metadata backends (HTTP/etcd/redis) can resolve the
-        // segment by name.
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {
@@ -2136,54 +2196,24 @@ tl::expected<void, ErrorCode> Client::MountSegment(
             return tl::unexpected(err);
         }
 
-        mounted_segments_[segment.id] = segment;
+        segment_id = segment.id;
+        mounted_segments_[segment_id] = segment;
     }
 
     EnsureStorageControlPlaneStarted();
-    return {};
+    return segment_id;
 }
 
-tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
-                                                     size_t size) {
+tl::expected<void, ErrorCode> Client::UnmountSegmentById(
+    const UUID& segment_id) {
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-    auto segment = mounted_segments_.end();
-
-    for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
-         ++it) {
-        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
-            it->second.size == size) {
-            segment = it;
-            break;
-        }
-    }
+    auto segment = mounted_segments_.find(segment_id);
     if (segment == mounted_segments_.end()) {
-        LOG(ERROR) << "segment_not_found base=" << buffer << " size=" << size;
+        LOG(ERROR) << "segment_not_found id=" << UuidToString(segment_id);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto unmount_result = master_client_.UnmountSegment(segment->second.id);
-    if (!unmount_result) {
-        ErrorCode err = unmount_result.error();
-        LOG(ERROR) << "Failed to unmount segment from master: "
-                   << toString(err);
-        return tl::unexpected(err);
-    }
-
-    int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(segment->second.base));
-    if (rc != 0) {
-        LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
-                      "engine ret is "
-                   << rc;
-        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        // Otherwise, the segment is already unregistered from transfer
-        // engine, we can continue
-    }
-
-    mounted_segments_.erase(segment);
-    return {};
+    return UnmountSegmentImpl(segment);
 }
 
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
@@ -2267,11 +2297,23 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
+    int64_t ssd_total_capacity_bytes) {
+    auto response =
+        master_client_.ReportSsdCapacity(client_id_, ssd_total_capacity_bytes);
+    if (!response) {
+        LOG(ERROR) << "ReportSsdCapacity failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batch_slices) {
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_slices) {
     auto future = transfer_submitter_->submit_batch_get_offload_object(
         transfer_engine_addr, keys, pointers, batch_slices);
     if (!future) {
@@ -2497,19 +2539,34 @@ void Client::PutToLocalFile(const std::string& key,
     }
 
     std::string path = disk_descriptor.file_path;
-    // Currently, persistence is achieved through asynchronous writes, but
-    // before asynchronous writing in 3FS, significant performance degradation
-    // may occur due to data copying. Profiling reveals that the number of page
-    // faults triggered in this scenario is nearly double the normal count.
-    // Future plans include introducing a reuse buffer list to address this
-    // performance degradation issue.
 
+    // Synchronous D2H staging + copy into std::string.
+    // Done on the calling thread to guarantee GPU buffers are still valid
+    // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+
     for (const auto& slice : slices) {
-        value.append(static_cast<char*>(slice.ptr), slice.size);
+        int device_id = -1;
+        if (IsDevicePointer(slice.ptr, &device_id)) {
+            SetDevice(device_id);
+            auto buf = pinned_buffer_pool_->Acquire(slice.size);
+            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                LOG(ERROR) << "D2H copy failed for key: " << key
+                           << ", triggering PutRevoke for disk replica";
+                pinned_buffer_pool_->Release(buf);
+                // Must revoke to avoid phantom replica in master
+                master_client_.PutRevoke(key, ReplicaType::DISK);
+                return;
+            }
+            value.append(buf.data, slice.size);
+            pinned_buffer_pool_->Release(buf);
+        } else {
+            value.append(static_cast<char*>(slice.ptr), slice.size);
+        }
     }
 
+    // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
         // Store the object

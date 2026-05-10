@@ -475,9 +475,9 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     }
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
     if (!entry) {
+        const void* end = static_cast<const char*>(addr) + length;
         PLOG(ERROR) << "Failed to register memory from " << addr << " to "
-                    << (char*)addr + length << " in RDMA device "
-                    << device_name_;
+                    << end << " in RDMA device " << device_name_;
         return nullptr;
     }
     mr_set_mutex_.lock();
@@ -519,9 +519,9 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     mr_set_mutex_.unlock();
 
     if (verbs_.ibv_dereg_mr(entry)) {
+        const void* end = static_cast<const char*>(entry->addr) + entry->length;
         LOG(ERROR) << "Failed to unregister memory from " << entry->addr
-                   << " to " << (char*)entry->addr + entry->length
-                   << " in RDMA device " << device_name_;
+                   << " to " << end << " in RDMA device " << device_name_;
     }
 
     return 0;

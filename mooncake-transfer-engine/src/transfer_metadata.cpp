@@ -68,6 +68,8 @@ struct TransferHandshakeUtil {
     static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
         Json::Value root;
         root["local_nic_path"] = desc.local_nic_path;
+        root["local_lid"] = desc.local_lid;
+        root["local_gid"] = desc.local_gid;
         root["peer_nic_path"] = desc.peer_nic_path;
 #ifdef USE_BAREX
         root["barex_port"] = desc.barex_port;
@@ -93,6 +95,16 @@ struct TransferHandshakeUtil {
 
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
         desc.local_nic_path = root["local_nic_path"].asString();
+        if (root.isMember("local_lid") && root["local_lid"].isUInt()) {
+            desc.local_lid = root["local_lid"].asUInt();
+        } else {
+            desc.local_lid = 0;
+        }
+        if (root.isMember("local_gid") && root["local_gid"].isString()) {
+            desc.local_gid = root["local_gid"].asString();
+        } else {
+            desc.local_gid.clear();
+        }
         desc.peer_nic_path = root["peer_nic_path"].asString();
 #ifdef USE_BAREX
         desc.barex_port = root["barex_port"].asInt();
@@ -412,6 +424,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     } else if (segmentJSON["protocol"] == "nvlink" ||
                segmentJSON["protocol"] == "nvlink_intra" ||
                segmentJSON["protocol"] == "hip" ||
+               segmentJSON["protocol"] == "maca" ||
                segmentJSON["protocol"] == "ubshmem") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
@@ -733,7 +746,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             desc->buffers.push_back(buffer);
         }
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
-               desc->protocol == "hip" || desc->protocol == "ubshmem") {
+               desc->protocol == "hip" || desc->protocol == "maca" ||
+               desc->protocol == "ubshmem") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();

@@ -35,6 +35,36 @@ bool MooncakeWorker::drainTasks(const TransferGroupMeta* meta) const {
         });
 }
 
+bool MooncakeWorker::waitUntilTasksSubmitted(
+    const std::vector<CudaTaskSubmissionToken>& tasks,
+    std::chrono::milliseconds timeout) const {
+    if (tasks.empty()) {
+        return true;
+    }
+
+    auto submitted = [this, &tasks] {
+        for (const auto& task : tasks) {
+            if (task.task_id >= kNumTasks_) {
+                LOG(ERROR) << "Invalid task id.";
+                return true;
+            }
+            if (submitted_task_sequence_[task.task_id].load(
+                    std::memory_order_acquire) < task.sequence) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    BackoffWaiter waiter(
+        BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
+    if (timeout == kNoTimeout) {
+        waiter.wait(submitted);
+        return true;
+    }
+    return waiter.wait_for(timeout, submitted);
+}
+
 void MooncakeWorker::startWorker() {
     running_ = true;
     worker_thread_ = std::thread([this] {
@@ -61,7 +91,10 @@ void MooncakeWorker::startWorker() {
                                      group->rank != task.broadcastRoot) ||
                                     task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
+                    const auto submit_sequence = task.submitSequence;
                     if (skipTransfer) {
+                        submitted_task_sequence_[i].store(
+                            submit_sequence, std::memory_order_release);
                         task_status[i].store(TRANSFERRED_1,
                                              std::memory_order_release);
                         continue;
@@ -133,6 +166,8 @@ void MooncakeWorker::startWorker() {
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
                     group->engine->submitTransfer(task.batchID, entries);
+                    submitted_task_sequence_[i].store(
+                        submit_sequence, std::memory_order_release);
                     activeTime[i] = clock::now();
                     task_status[i].store(TRANSFERRED_1,
                                          std::memory_order_release);

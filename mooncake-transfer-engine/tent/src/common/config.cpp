@@ -50,23 +50,7 @@ std::string Config::dump(int indent) const {
 static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
     const char* val = std::getenv(env_key.c_str());
-    if (val) {
-        std::string str_val(val);
-        // Try to parse as integer first
-        try {
-            size_t pos;
-            int int_val = std::stoi(str_val, &pos);
-            if (pos == str_val.length()) {
-                // Fully numeric, store as int
-                config.set(config_key, int_val);
-                return;
-            }
-        } catch (const std::exception& e) {
-            // Not an integer, continue to store as string
-        }
-        // Store as string
-        config.set(config_key, str_val);
-    }
+    if (val) config.setFromString(config_key, std::string(val));
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {

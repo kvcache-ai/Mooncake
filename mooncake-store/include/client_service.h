@@ -24,6 +24,7 @@
 #include "master_metric_manager.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
+#include "pinned_buffer_pool.h"
 
 namespace mooncake {
 
@@ -60,6 +61,8 @@ class QueryResult {
 class Client {
    public:
     ~Client();
+
+    const UUID& getClientId() const { return client_id_; }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -293,6 +296,20 @@ class Client {
                                                  size_t size);
 
     /**
+     * @brief Mounts a memory segment and returns its generated Segment UUID.
+     *        Logic is identical to MountSegment, but returns the segment id.
+     */
+    tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
+
+    /**
+     * @brief Unmounts a segment by its UUID.
+     *        Logic is identical to UnmountSegment, but looks up by id.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentById(const UUID& segment_id);
+
+    /**
      * @brief Registers memory buffer with TransferEngine for data transfer
      * @param addr Memory address to register
      * @param length Size of the memory region
@@ -385,6 +402,9 @@ class Client {
         bool enable_offloading,
         std::unordered_map<std::string, int64_t>& offloading_objects);
 
+    tl::expected<void, ErrorCode> ReportSsdCapacity(
+        int64_t ssd_total_capacity_bytes);
+
     /**
      * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
@@ -400,7 +420,8 @@ class Client {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batch_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batch_slices);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -444,6 +465,15 @@ class Client {
         return master_client_.CalcCacheStats();
     }
 
+    void ObserveTransferOperation(TransferOperationKind kind,
+                                  const std::string& op_name, uint64_t bytes,
+                                  uint64_t latency_us) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveTransferOperation(kind, op_name, bytes,
+                                               latency_us);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
@@ -454,8 +484,23 @@ class Client {
         return str;
     }
 
+    SsdMetric* GetSsdMetricPtr() {
+        return metrics_ ? &metrics_->ssd_metric : nullptr;
+    }
+
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
+    }
+
+    /**
+     * @brief Get the endpoint address for segment operations.
+     * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
+     *         For other modes, returns the logical local hostname used for
+     * segment registration.
+     */
+    [[nodiscard]] std::string GetSegmentEndpoint() {
+        return (metadata_connstring_ == P2PHANDSHAKE) ? GetTransportEndpoint()
+                                                      : local_hostname_;
     }
 
     // Return sorted NUMA node IDs that have at least one RDMA NIC.
@@ -463,6 +508,16 @@ class Client {
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
+
+    std::unordered_set<std::string> GetLocalEndpoints() const {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        std::unordered_set<std::string> endpoints;
+        for (const auto& [segment_id, segment] : mounted_segments_) {
+            endpoints.insert(segment.te_endpoint);
+        }
+        return endpoints;
+    }
+
     /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
@@ -647,8 +702,15 @@ class Client {
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
-    std::mutex mounted_segments_mutex_;
+    mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+
+    /**
+     * @brief Internal helper to unmount a segment by iterator.
+     *        Caller must hold mounted_segments_mutex_.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentImpl(
+        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
 
     // Configuration
     const std::string local_hostname_;
@@ -656,6 +718,9 @@ class Client {
     const std::string protocol_;
 
     // Client persistent thread pool for async operations
+    // Pinned host memory pool for GPU D2H staging (must outlive
+    // write_thread_pool_)
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
 

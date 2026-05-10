@@ -86,6 +86,7 @@ performance/vllm-benchmark-results-v1
 performance/sglang-hicache-benchmark-results-v1
 performance/vllm-v1-support-benchmark
 performance/allocator-benchmark-result
+performance/ssd-offload-benchmark-results
 :::
 
 % API Documentation
@@ -110,9 +111,12 @@ design/architecture
 design/mooncake-store
 design/p2p-store
 design/transfer-engine/index
+design/hicache-design
+design/engram
 design/tent/overview
 design/tent/tebench
-design/hicache-design
+design/conductor/conductor-architecture-design
+design/conductor/indexer-api-design
 :::
 
 % Q&A for Mooncake

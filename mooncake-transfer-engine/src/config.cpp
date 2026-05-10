@@ -43,6 +43,26 @@ void loadGlobalConfig(GlobalConfig &config) {
     int gid_index = env.GetGidIndex();
     if (gid_index >= 0 && gid_index < 256) config.gid_index = gid_index;
 
+    // MC_PKEY_INDEX: QP attribute override (validated with stoi for
+    // non-numeric input detection)
+    const char *pkey_index_env = std::getenv("MC_PKEY_INDEX");
+    if (pkey_index_env) {
+        try {
+            int val = std::stoi(pkey_index_env);
+            if (val >= 0 && val <= UINT16_MAX) {
+                config.pkey_index = static_cast<uint16_t>(val);
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_PKEY_INDEX, "
+                    << "value " << pkey_index_env
+                    << " out of range (should be 0-65535)";
+            }
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "Invalid MC_PKEY_INDEX environment value: "
+                         << pkey_index_env << ". Error: " << e.what();
+        }
+    }
+
     int max_cqe_per_ctx = env.GetMaxCqePerCtx();
     if (max_cqe_per_ctx > 0 && max_cqe_per_ctx <= UINT16_MAX)
         config.max_cqe = max_cqe_per_ctx;
@@ -152,13 +172,16 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    int min_prc_port = env.GetMinPrcPort();
-    if (min_prc_port > 0 && min_prc_port < 65536)
-        config.rpc_min_port = min_prc_port;
-
-    int max_prc_port = env.GetMaxPrcPort();
-    if (max_prc_port > 0 && max_prc_port < 65536)
-        config.rpc_max_port = max_prc_port;
+    // Environ::GetMinRpcPort()/GetMaxRpcPort() already handle both
+    // MC_MIN_RPC_PORT and MC_MIN_PRC_PORT fallbacks.
+    {
+        int raw_min = env.GetMinRpcPort();
+        int raw_max = env.GetMaxRpcPort();
+        auto [validated_min, validated_max] =
+            ValidatePortRange(raw_min, raw_max, 15000, 17000);
+        config.rpc_min_port = validated_min;
+        config.rpc_max_port = validated_max;
+    }
 
     if (env.GetUseIpv6()) {
         config.use_ipv6 = true;
@@ -192,12 +215,23 @@ void loadGlobalConfig(GlobalConfig &config) {
                         "MC_ENDPOINT_STORE_TYPE, it should be FIFO|SIEVE";
     }
 
-    int ib_tc = env.GetIbTc();
-    if (ib_tc >= 0 && ib_tc <= 255) {
-        config.ib_traffic_class = ib_tc;
-    } else if (ib_tc < -1) {
-        LOG(WARNING) << "Ignore value from environment variable MC_IB_TC, "
-                     << "value out of range (should be 0-255)";
+    // Use stoi for MC_IB_TC to properly detect and warn on non-numeric values
+    const char *traffic_class_env = std::getenv("MC_IB_TC");
+    if (traffic_class_env) {
+        try {
+            int val = std::stoi(traffic_class_env);
+            if (val >= 0 && val <= 255) {
+                config.ib_traffic_class = val;
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_IB_TC, "
+                    << "value " << traffic_class_env
+                    << " out of range (should be 0-255)";
+            }
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "Invalid MC_IB_TC environment value: "
+                         << traffic_class_env << ". Error: " << e.what();
+        }
     }
 
     int ib_pci_relaxed_ordering = env.GetIbPciRelaxedOrdering();
@@ -221,8 +255,8 @@ std::string mtuLengthToString(ibv_mtu mtu) {
         return "UNKNOWN";
 }
 
-void updateGlobalConfig(ibv_device_attr &device_attr) {
-    auto &config = globalConfig();
+void updateGlobalConfig(ibv_device_attr& device_attr) {
+    auto& config = globalConfig();
     if (config.max_ep_per_ctx * config.num_qp_per_ep >
         (size_t)device_attr.max_qp)
         config.max_ep_per_ctx = device_attr.max_qp / config.num_qp_per_ep;
@@ -239,13 +273,14 @@ void updateGlobalConfig(ibv_device_attr &device_attr) {
 }
 
 void dumpGlobalConfig() {
-    auto &config = globalConfig();
+    auto& config = globalConfig();
     LOG(INFO) << "=== GlobalConfig ===";
     LOG(INFO) << "num_cq_per_ctx = " << config.num_cq_per_ctx;
     LOG(INFO) << "num_comp_channels_per_ctx = "
               << config.num_comp_channels_per_ctx;
     LOG(INFO) << "port = " << config.port;
     LOG(INFO) << "gid_index = " << config.gid_index;
+    LOG(INFO) << "pkey_index = " << config.pkey_index;
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
@@ -258,7 +293,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
 }
 
-GlobalConfig &globalConfig() {
+GlobalConfig& globalConfig() {
     static GlobalConfig config;
     static std::once_flag g_once_flag;
     std::call_once(g_once_flag, []() { loadGlobalConfig(config); });
@@ -266,4 +301,26 @@ GlobalConfig &globalConfig() {
 }
 
 uint16_t getDefaultHandshakePort() { return globalConfig().handshake_port; }
+
+std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                      int default_min, int default_max) {
+    constexpr int kMinAllowed = 1024;
+    constexpr int kEphemeralStart = 32768;
+    constexpr int kEphemeralEnd = 60999;
+    constexpr int kMaxAllowed = 65535;
+
+    auto is_valid_port = [&](int p) {
+        return p >= kMinAllowed && p <= kMaxAllowed &&
+               !(p >= kEphemeralStart && p <= kEphemeralEnd);
+    };
+
+    if (!is_valid_port(min_port) || !is_valid_port(max_port) ||
+        min_port > max_port) {
+        LOG(WARNING) << "Invalid port range [" << min_port << ", " << max_port
+                     << "], falling back to default [" << default_min << ", "
+                     << default_max << "]";
+        return {default_min, default_max};
+    }
+    return {min_port, max_port};
+}
 }  // namespace mooncake

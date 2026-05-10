@@ -19,14 +19,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <thread>
 
 #include "tent/common/status.h"
-#include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/slab.h"
 
 namespace mooncake {
 namespace tent {
@@ -71,6 +73,21 @@ Status TcpTransport::install(std::string &local_segment_name,
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
+
+    if (conf) {
+        params_.max_retry_count = conf->get("transports/tcp/max_retry_count",
+                                            params_.max_retry_count);
+        params_.retry_base_delay_ms = conf->get(
+            "transports/tcp/retry_base_delay_ms", params_.retry_base_delay_ms);
+        params_.retry_max_delay_ms = conf->get(
+            "transports/tcp/retry_max_delay_ms", params_.retry_max_delay_ms);
+        params_.max_concurrent_tasks =
+            conf->get("transports/tcp/max_concurrent_tasks",
+                      params_.max_concurrent_tasks);
+    }
+
+    thread_pool_ = std::make_unique<ThreadPool>(params_.max_concurrent_tasks);
+
     installed_ = true;
     metadata_->setNotifyCallback([&](const Notification &message) -> int {
         RWSpinlock::WriteGuard guard(notify_lock_);
@@ -84,11 +101,18 @@ Status TcpTransport::install(std::string &local_segment_name,
         caps.gpu_to_dram = true;
         caps.gpu_to_gpu = true;
     }
+
+    LOG(INFO) << "TCP transport installed: max_retry_count="
+              << params_.max_retry_count
+              << " max_concurrent_tasks=" << params_.max_concurrent_tasks;
     return Status::OK();
 }
 
 Status TcpTransport::uninstall() {
     if (installed_) {
+        if (metadata_) metadata_->setNotifyCallback(nullptr);
+        shutting_down_.store(true, std::memory_order_release);
+        thread_pool_.reset();
         metadata_.reset();
         installed_ = false;
     }
@@ -121,14 +145,21 @@ Status TcpTransport::submitTransferTasks(
         return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
     if (request_list.size() + tcp_batch->task_list.size() > tcp_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    // Emplace all tasks first, then dispatch — pointers are stable because
+    // task_list was reserved to max_size in allocateSubBatch.
+    size_t start_idx = tcp_batch->task_list.size();
     for (auto &request : request_list) {
-        tcp_batch->task_list.push_back(TcpTask{});
-        auto &task = tcp_batch->task_list[tcp_batch->task_list.size() - 1];
-        uint64_t target_addr = request.target_offset;
-        task.target_addr = target_addr;
+        tcp_batch->task_list.emplace_back();
+        auto &task = tcp_batch->task_list.back();
         task.request = request;
-        task.status_word = TransferStatusEnum::PENDING;
-        startTransfer(&task);
+        task.status_word.store(TransferStatusEnum::PENDING,
+                               std::memory_order_release);
+    }
+
+    for (size_t i = start_idx; i < tcp_batch->task_list.size(); ++i) {
+        TcpTask *task_ptr = &tcp_batch->task_list[i];
+        thread_pool_->enqueue([this, task_ptr]() { startTransfer(task_ptr); });
     }
     return Status::OK();
 }
@@ -140,7 +171,9 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
     auto &task = tcp_batch->task_list[task_id];
-    status = TransferStatus{task.status_word, task.transferred_bytes};
+    status.s = task.status_word.load(std::memory_order_acquire);
+    status.transferred_bytes =
+        task.transferred_bytes.load(std::memory_order_acquire);
     return Status::OK();
 }
 
@@ -164,29 +197,82 @@ void TcpTransport::startTransfer(TcpTask *task) {
                "MC_STORE_MEMCPY=0, TCP local transfers will fail. Enable "
                "MC_STORE_MEMCPY or SHM, or use a non-loopback address.";
     }
+
+    auto status = doTransferWithRetry(task);
+    if (status.ok()) {
+        // Store bytes before status: a reader who acquires COMPLETED will
+        // also see the final transferred_bytes value.
+        task->transferred_bytes.store(task->request.length,
+                                      std::memory_order_release);
+        task->status_word.store(TransferStatusEnum::COMPLETED,
+                                std::memory_order_release);
+    } else {
+        LOG(WARNING) << "TCP transfer failed after " << params_.max_retry_count
+                     << " retries: " << status.ToString();
+        task->status_word.store(TransferStatusEnum::FAILED,
+                                std::memory_order_release);
+    }
+}
+
+Status TcpTransport::doTransferWithRetry(TcpTask *task) {
     std::string rpc_server_addr;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,
                           task->request.target_id, rpc_server_addr);
-    if (!status.ok()) {
-        task->status_word = TransferStatusEnum::FAILED;
-        return;
+    if (!status.ok()) return status;
+
+    Status last_error;
+    uint64_t delay_ms = params_.retry_base_delay_ms;
+
+    for (size_t attempt = 0; attempt <= params_.max_retry_count; ++attempt) {
+        if (shutting_down_.load(std::memory_order_acquire))
+            return Status::InternalError("Transport shutting down");
+
+        if (attempt > 0) {
+            LOG(INFO) << "TCP transfer retry attempt " << attempt << "/"
+                      << params_.max_retry_count << ", backoff " << delay_ms
+                      << "ms";
+            // Sleep in small increments so shutdown is not delayed
+            for (uint64_t i = 0; i < delay_ms; i += 100) {
+                if (shutting_down_.load(std::memory_order_acquire))
+                    return Status::InternalError("Transport shutting down");
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    std::min(static_cast<uint64_t>(100), delay_ms - i)));
+            }
+            delay_ms = std::min(delay_ms * 2, params_.retry_max_delay_ms);
+        }
+
+        if (task->request.opcode == Request::WRITE) {
+            status = ControlClient::sendData(
+                rpc_server_addr, task->request.target_offset,
+                task->request.source, task->request.length);
+        } else {
+            status = ControlClient::recvData(
+                rpc_server_addr, task->request.target_offset,
+                task->request.source, task->request.length);
+        }
+
+        if (status.ok()) return Status::OK();
+
+        last_error = status;
+        LOG(WARNING) << "TCP transfer attempt " << attempt
+                     << " failed: " << status.ToString();
+
+        if (!status.IsRpcServiceError() && !status.IsInternalError()) {
+            return status;
+        }
+
+        // Peer may have restarted with a new address; re-resolve before retry
+        if (status.IsRpcServiceError()) {
+            rpc_server_addr.clear();
+            auto resolve = findRemoteSegment(
+                task->request.target_offset, task->request.length,
+                task->request.target_id, rpc_server_addr);
+            if (!resolve.ok()) return resolve;
+        }
     }
-    if (task->request.opcode == Request::WRITE) {
-        status = ControlClient::sendData(
-            rpc_server_addr, task->request.target_offset, task->request.source,
-            task->request.length);
-    } else {
-        status = ControlClient::recvData(
-            rpc_server_addr, task->request.target_offset, task->request.source,
-            task->request.length);
-    }
-    if (!status.ok()) {
-        task->status_word = TransferStatusEnum::FAILED;
-        return;
-    }
-    task->transferred_bytes = task->request.length;
-    task->status_word = TransferStatusEnum::COMPLETED;
+
+    return last_error;
 }
 
 Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
@@ -230,7 +316,7 @@ Status TcpTransport::sendNotification(SegmentID target_id,
 
 Status TcpTransport::receiveNotification(
     std::vector<Notification> &notify_list) {
-    RWSpinlock::ReadGuard guard(notify_lock_);
+    RWSpinlock::WriteGuard guard(notify_lock_);
     notify_list.clear();
     notify_list.swap(notify_list_);
     return Status::OK();

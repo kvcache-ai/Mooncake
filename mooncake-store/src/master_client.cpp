@@ -188,6 +188,11 @@ struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
+    static constexpr const char* value = "ReportSsdCapacity";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
     static constexpr const char* value = "NotifyOffloadSuccess";
 };
@@ -806,6 +811,15 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
                              std::unordered_map<std::string, int64_t>>(
         client_id, enable_offloading);
     return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
+    const UUID& client_id, int64_t ssd_total_capacity_bytes) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportSsdCapacity");
+    timer.LogRequest("client_id=", client_id,
+                     ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
+    return invoke_rpc<&WrappedMasterService::ReportSsdCapacity, void>(
+        client_id, ssd_total_capacity_bytes);
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(

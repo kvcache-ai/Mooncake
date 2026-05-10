@@ -13,10 +13,11 @@ if (NOT GLOBAL_CONFIG)
   # transfer_engine links against the mooncake_common target.
   add_subdirectory(../mooncake-common ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common)
 
-  # Build asio_shared library for standalone build
-  # Set compile definitions before add_subdirectory to ensure proper compilation
+  # Build asio_shared in mooncake-common for standalone builds.
+  # Set compile definitions before adding targets that include ASIO headers.
   add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
-  add_subdirectory(../mooncake-asio ${CMAKE_CURRENT_BINARY_DIR}/mooncake-asio)
+  add_subdirectory(../mooncake-common/src
+                   ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
 endif() # GLOBAL_CONFIG
 
 if (USE_ASCEND)
@@ -76,5 +77,7 @@ endif()
 
 if (USE_TENT)
   add_subdirectory(tent)
-  add_subdirectory(benchmark)
+  if (BUILD_BENCHMARK)
+    add_subdirectory(benchmark)
+  endif()
 endif()
