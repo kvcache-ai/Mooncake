@@ -14,7 +14,6 @@
 #include <set>
 #include <ylt/struct_json/json_reader.h>
 
-#include "environ.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "transport/transport.h"
@@ -112,8 +111,8 @@ Client::~Client() {
 }
 
 static std::optional<bool> get_auto_discover() {
-    std::string ev_ad = Environ::Get().GetMsAutoDisc();
-    if (!ev_ad.empty()) {
+    const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
+    if (ev_ad) {
         int iv = std::stoi(ev_ad);
         if (iv == 1) {
             LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
@@ -145,13 +144,12 @@ static inline void rtrim(std::string& s) {
 
 static std::vector<std::string> get_auto_discover_filters() {
     std::vector<std::string> whitelst_filters;
-    std::string ev_ad = Environ::Get().GetMsFilters();
-    if (!ev_ad.empty()) {
+    char* ev_ad = std::getenv("MC_MS_FILTERS");
+    if (ev_ad) {
         LOG(INFO) << "whitelist filters: " << ev_ad;
         char delimiter = ',';
-        const char* start = ev_ad.c_str();
-        const char* end = start + ev_ad.length();
-        const char* pos = start;
+        char* end = ev_ad + std::strlen(ev_ad);
+        char *start = ev_ad, *pos = ev_ad;
         while ((pos = std::find(start, end, delimiter)) != end) {
             std::string str(start, pos);
             ltrim(str);
@@ -159,7 +157,7 @@ static std::vector<std::string> get_auto_discover_filters() {
             whitelst_filters.emplace_back(std::move(str));
             start = pos + 1;
         }
-        if (start != end) {
+        if (start != (end + 1)) {
             std::string str(start, end);
             ltrim(str);
             rtrim(str);
@@ -247,8 +245,8 @@ ErrorCode Client::InitTransferEngine(
     const std::optional<std::string>& device_names) {
     // Check if using TENT mode - TENT handles transport configuration
     // internally
-    auto& env = Environ::Get();
-    bool use_tent = env.GetUseTent() || env.GetUseTev1();
+    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
+                    (std::getenv("MC_USE_TEV1") != nullptr);
 
     bool auto_discover = false;
     if (!use_tent) {
@@ -277,8 +275,8 @@ ErrorCode Client::InitTransferEngine(
             auto filters = get_auto_discover_filters();
             transfer_engine_->setWhitelistFilters(std::move(filters));
         } else {
-            std::string env_filters = env.GetMsFilters();
-            if (!env_filters.empty()) {
+            const char* env_filters = std::getenv("MC_MS_FILTERS");
+            if (env_filters && *env_filters != '\0') {
                 LOG(WARNING)
                     << "MC_MS_FILTERS is set but auto discovery is disabled; "
                     << "ignoring whitelist: " << env_filters;

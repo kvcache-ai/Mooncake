@@ -31,7 +31,6 @@
 #include <sys/stat.h>
 
 #include "cuda_alike.h"
-#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 
@@ -337,7 +336,12 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 #endif  // USE_CUDA
 
 Topology::Topology() {
-    use_round_robin_ = Environ::Get().GetPathRoundrobin();
+    auto str = getenv("MC_PATH_ROUNDROBIN");
+    if (str && (strcmp(str, "1") == 0 || strcasecmp(str, "true") == 0)) {
+        use_round_robin_ = true;
+    } else {
+        use_round_robin_ = false;
+    }
 }
 
 Topology::~Topology() {}

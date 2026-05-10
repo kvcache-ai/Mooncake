@@ -56,7 +56,7 @@ static int getNumDevices() {
 }
 
 static bool supportFabricMem() {
-    if (Environ::Get().GetUseNvlinkIpc()) return false;
+    if (getenv("MC_USE_NVLINK_IPC")) return false;
 
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
