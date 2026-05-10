@@ -181,7 +181,13 @@ class KeyValueStore(Protocol):
     def get_into(self, key: str, buffer_ptr: int, size: int) -> int:
         ...
 
-    def batch_put_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int], config: Any = None) -> List[int]:
+    def batch_put_from(
+        self,
+        keys: List[str],
+        buffer_ptrs: List[int],
+        sizes: List[int],
+        config: Any = None,
+    ) -> List[int]:
         ...
 
     def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]:
@@ -249,8 +255,17 @@ class InMemoryMooncakeStore:
         ctypes.memmove(buffer_ptr, data, len(data))
         return len(data)
 
-    def batch_put_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int], config: Any = None) -> List[int]:
-        return [self.put_from(key, buffer_ptr, size, config) for key, buffer_ptr, size in zip(keys, buffer_ptrs, sizes)]
+    def batch_put_from(
+        self,
+        keys: List[str],
+        buffer_ptrs: List[int],
+        sizes: List[int],
+        config: Any = None,
+    ) -> List[int]:
+        return [
+            self.put_from(key, buffer_ptr, size, config)
+            for key, buffer_ptr, size in zip(keys, buffer_ptrs, sizes)
+        ]
 
     def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]:
         return [self.get_into(key, buffer_ptr, size) for key, buffer_ptr, size in zip(keys, buffer_ptrs, sizes)]
@@ -421,7 +436,12 @@ def can_json(values: List[Any]) -> CodecDecision:
         source_types.add(type(value).__name__)
     if total_sample_bytes > MAX_JSON_INLINE_BYTES:
         return reject("json_ragged_v1", "json", "sampled JSON payload is too large")
-    return accept("json_ragged_v1", "json", "sampled rows pass actual JSON serialization", {"source_types": sorted(source_types)})
+    return accept(
+        "json_ragged_v1",
+        "json",
+        "sampled rows pass actual JSON serialization",
+        {"source_types": sorted(source_types)},
+    )
 
 
 def choose_leaf_codec(values: List[Any]) -> CodecDecision:
@@ -437,7 +457,10 @@ def choose_leaf_codec(values: List[Any]) -> CodecDecision:
         "no optimized codec accepted the observed values",
         "fallback",
         "python object",
-        {"rejected_codecs": rejected, "sample_types": sorted({type(value).__name__ for value in all_not_none(values)})},
+        {
+            "rejected_codecs": rejected,
+            "sample_types": sorted({type(value).__name__ for value in all_not_none(values)}),
+        },
     )
 
 
@@ -501,7 +524,13 @@ def encode_ragged_tensor(path: str, values: List[Any]) -> EncodedLeaf:
         path=path,
         codec="ragged_tensor_v1",
         rows=len(values),
-        bytes=data_bytes + tensor_nbytes(offsets) + tensor_nbytes(shapes) + tensor_nbytes(ndims) + tensor_nbytes(nulls),
+        bytes=(
+            data_bytes
+            + tensor_nbytes(offsets)
+            + tensor_nbytes(shapes)
+            + tensor_nbytes(ndims)
+            + tensor_nbytes(nulls)
+        ),
         payload={"data": data, "offsets": offsets, "shapes": shapes, "ndims": ndims, "nulls": nulls},
         metadata={"dtype": str(data_dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"},
         encode_s=now() - start,
@@ -558,7 +587,13 @@ def encode_typed_ragged(path: str, values: List[Any]) -> EncodedLeaf:
         path=path,
         codec="typed_ragged_v1",
         rows=len(values),
-        bytes=numpy_nbytes(data) + numpy_nbytes(offsets) + numpy_nbytes(shapes) + numpy_nbytes(ndims) + numpy_nbytes(nulls),
+        bytes=(
+            numpy_nbytes(data)
+            + numpy_nbytes(offsets)
+            + numpy_nbytes(shapes)
+            + numpy_nbytes(ndims)
+            + numpy_nbytes(nulls)
+        ),
         payload={"data": data, "offsets": offsets, "shapes": shapes, "ndims": ndims, "nulls": nulls},
         metadata={"dtype": str(data.dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"},
         encode_s=now() - start,
@@ -659,8 +694,18 @@ def encode_media_list(path: str, values: List[Any]) -> EncodedLeaf:
         path=path,
         codec="media_list_ragged_v1",
         rows=len(values),
-        bytes=payload_bytes + numpy_nbytes(row_offsets_array) + numpy_nbytes(byte_offsets_array) + numpy_nbytes(nulls),
-        payload={"data": payload, "row_offsets": row_offsets_array, "byte_offsets": byte_offsets_array, "nulls": nulls},
+        bytes=(
+            payload_bytes
+            + numpy_nbytes(row_offsets_array)
+            + numpy_nbytes(byte_offsets_array)
+            + numpy_nbytes(nulls)
+        ),
+        payload={
+            "data": payload,
+            "row_offsets": row_offsets_array,
+            "byte_offsets": byte_offsets_array,
+            "nulls": nulls,
+        },
         metadata=metadata,
         encode_s=now() - start,
     )
@@ -752,7 +797,10 @@ def decode_utf8(payload: Dict[str, Any], rows: int) -> List[Any]:
 
 
 def encode_json(path: str, values: List[Any]) -> EncodedLeaf:
-    encoded = [None if value is None else json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8") for value in values]
+    encoded = [
+        None if value is None else json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        for value in values
+    ]
     return encode_bytes_like(path, encoded, "json_ragged_v1")
 
 
@@ -862,7 +910,10 @@ def infer_and_encode(path: str, values: List[Any], leaves: List[EncodedLeaf], no
         lengths = [len(value) if isinstance(value, (list, tuple)) else 0 for value in values]
         nodes.append({"path": path, "node_type": "list", "lengths": lengths, "children": list(range(max_len))})
         for index in range(max_len):
-            child_values = [value[index] if isinstance(value, (list, tuple)) and index < len(value) else None for value in values]
+            child_values = [
+                value[index] if isinstance(value, (list, tuple)) and index < len(value) else None
+                for value in values
+            ]
             infer_and_encode(f"{path}[{index}]", child_values, leaves, nodes)
         return
     leaves.append(encode_leaf(path, values, decision))
@@ -904,7 +955,11 @@ def create_local_pin_config(store: Any) -> Any:
 def payload_to_buffer(value: Any) -> Tuple[memoryview, Any, Dict[str, Any]]:
     if isinstance(value, torch.Tensor):
         array = tensor_to_numpy(value)
-        return numpy_as_bytes(array), array, {"kind": "tensor", "dtype": torch_dtype_name(value.dtype), "shape": list(value.shape)}
+        return (
+            numpy_as_bytes(array),
+            array,
+            {"kind": "tensor", "dtype": torch_dtype_name(value.dtype), "shape": list(value.shape)},
+        )
     if isinstance(value, np.ndarray):
         array = np.ascontiguousarray(value)
         return numpy_as_bytes(array), array, {"kind": "ndarray", "dtype": str(array.dtype), "shape": list(array.shape)}
@@ -1311,10 +1366,15 @@ def deserialize_payload(
 
 
 class MooncakeDataProtoTransferBackend:
-    def __init__(self, store: KeyValueStore, key_prefix: str = "dataproto", dataproto_cls: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        store: KeyValueStore,
+        key_prefix: str = "dataproto",
+        data_cls: Optional[Any] = None,
+    ) -> None:
         self.store = store
         self.key_prefix = key_prefix.rstrip("/")
-        self.dataproto_cls = dataproto_cls
+        self.data_cls = data_cls
 
     def put_dataproto(
         self,
@@ -1326,14 +1386,10 @@ class MooncakeDataProtoTransferBackend:
             return self.put_dataproto_sharded(data, partition=partition, shard_policy=shard_policy)
         return self._put_dataproto_single(data, partition=partition)
 
-    def _resolve_dataproto_cls(self) -> Any:
-        if self.dataproto_cls is not None:
-            return self.dataproto_cls
-        try:
-            from roll.distributed.scheduler.protocol import DataProto
-        except ImportError as exc:
-            raise ImportError("dataproto_cls is required when ROLL DataProto is not installed") from exc
-        return DataProto
+    def _resolve_data_cls(self) -> Any:
+        if self.data_cls is None:
+            raise ValueError("data_cls is required to materialize remote structured data")
+        return self.data_cls
 
     def _put_dataproto_single(self, data: Any, partition: str = "default") -> RemoteDataProtoRef:
         object_id = f"{partition}/{uuid.uuid4().hex}"
@@ -1480,7 +1536,12 @@ class MooncakeDataProtoTransferBackend:
         if rc != 0:
             self._remove_keys(written_keys)
             raise RuntimeError(f"put failed for {manifest_key}: {rc}")
-        return RemoteDataProtoRef(object_id=object_id, row_count=row_count, manifest_key=manifest_key, manifest=manifest)
+        return RemoteDataProtoRef(
+            object_id=object_id,
+            row_count=row_count,
+            manifest_key=manifest_key,
+            manifest=manifest,
+        )
 
     def put_dataproto_sharded(
         self,
@@ -1575,7 +1636,7 @@ class MooncakeDataProtoTransferBackend:
         manifest: Dict[str, Any],
         fast_media: bool = False,
     ) -> Any:
-        dataproto_cls = self._resolve_dataproto_cls()
+        data_cls = self._resolve_data_cls()
         materialize_profile = {
             "fast_media": fast_media,
             "manifest_s": 0.0,
@@ -1615,7 +1676,9 @@ class MooncakeDataProtoTransferBackend:
                 except RuntimeError as exc:
                     cleanup_errors.append(exc)
         if cleanup_errors:
-            raise RuntimeError(f"failed to unregister {len(cleanup_errors)} dense tensor buffers") from cleanup_errors[0]
+            raise RuntimeError(
+                f"failed to unregister {len(cleanup_errors)} dense tensor buffers"
+            ) from cleanup_errors[0]
         materialize_profile["batch_get_s"] = now() - batch_start
 
         leaves_by_field: Dict[str, List[Tuple[Dict[str, Any], List[Any]]]] = {}
@@ -1702,10 +1765,10 @@ class MooncakeDataProtoTransferBackend:
         meta_info["mooncake_materialize_profile"] = materialize_profile
         from_dict_start = now()
         if tensors:
-            proto = dataproto_cls.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info)
+            proto = data_cls.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info)
             materialize_profile["from_dict_s"] = now() - from_dict_start
             return proto
-        proto = dataproto_cls(batch=None, non_tensor_batch={}, meta_info=meta_info)
+        proto = data_cls(batch=None, non_tensor_batch={}, meta_info=meta_info)
         proto.non_tensor_batch = non_tensors
         materialize_profile["from_dict_s"] = now() - from_dict_start
         return proto
@@ -1717,7 +1780,7 @@ class MooncakeDataProtoTransferBackend:
         fast_media: bool = False,
         materialize_policy: Optional[DataProtoMaterializePolicy] = None,
     ) -> Any:
-        dataproto_cls = self._resolve_dataproto_cls()
+        data_cls = self._resolve_data_cls()
         shards = sorted(manifest["shards"], key=lambda shard: int(shard["row_start"]))
         if not shards:
             raise ValueError("sharded RemoteDataProtoRef has no shards")
@@ -1743,7 +1806,7 @@ class MooncakeDataProtoTransferBackend:
         results.sort(key=lambda item: item[0])
         materialized = [item[1] for item in results]
         concat_start = now()
-        proto = dataproto_cls.concat(materialized)
+        proto = data_cls.concat(materialized)
         concat_s = now() - concat_start
         total_s = now() - materialize_start
         shard_materialize_s = {str(shard_id): elapsed for shard_id, _proto, elapsed in results}
@@ -1843,7 +1906,9 @@ class MooncakeDataProtoTransferBackend:
             by_bytes = max(1, math.ceil(profile.total_bytes / max(policy.target_shard_bytes, 1)))
             shard_count = max(1, min(row_count, policy.max_shards, by_bytes))
 
-        byte_balanced = bool(policy.byte_balanced and (profile.row_skewed or not policy.adaptive or policy.num_shards is not None))
+        byte_balanced = bool(
+            policy.byte_balanced and (profile.row_skewed or not policy.adaptive or policy.num_shards is not None)
+        )
         recommended_max_inflight_get = self._recommend_materialize_inflight(shard_count, profile, policy)
         return DataProtoTransferDecision(
             shard_count=shard_count,
