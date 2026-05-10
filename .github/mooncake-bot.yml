@@ -11,8 +11,6 @@ labels:
 
 maintainers:
   - stmatengss
-  - alogfans
-  - Sind
 
 stale:
   daysUntilStale: 60
