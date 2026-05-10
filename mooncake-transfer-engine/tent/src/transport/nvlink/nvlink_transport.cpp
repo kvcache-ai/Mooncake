@@ -176,7 +176,6 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     err = cudaErrorCallRequiresNewerDriver;
 #endif
 
-    err = cudaErrorCallRequiresNewerDriver;
     if (err == cudaErrorCallRequiresNewerDriver) {
         cudaGetLastError();
         err = cudaSuccess;
