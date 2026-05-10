@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <optional>
 #include <cstdint>
 #include "types.h"
 #include "ylt/struct_json/json_reader.h"
@@ -83,5 +84,48 @@ struct BatchRemoteWriteRequest {
 };
 
 YLT_REFL(BatchRemoteWriteRequest, keys, src_buffers_list, target_tier_ids);
+
+struct PreWriteRequest {
+    std::string_view key;
+    uint64_t size_bytes = 0;
+    std::optional<UUID> target_tier_id;
+};
+
+YLT_REFL(PreWriteRequest, key, size_bytes, target_tier_id);
+
+struct PreWriteResponse {
+    RemoteBufferDesc remote_buffer;
+    UUID pending_write_token;
+};
+
+YLT_REFL(PreWriteResponse, remote_buffer, pending_write_token);
+
+struct WriteCommitRequest {
+    std::string_view key;
+    UUID pending_write_token;
+};
+
+YLT_REFL(WriteCommitRequest, key, pending_write_token);
+
+struct PinKeyRequest {
+    std::string_view key;
+    std::optional<UUID> target_tier_id;
+};
+
+YLT_REFL(PinKeyRequest, key, target_tier_id);
+
+struct PinKeyResponse {
+    RemoteBufferDesc remote_buffer;
+    UUID pin_token;
+};
+
+YLT_REFL(PinKeyResponse, remote_buffer, pin_token);
+
+struct UnPinKeyRequest {
+    std::string_view key;
+    UUID pin_token;
+};
+
+YLT_REFL(UnPinKeyRequest, key, pin_token);
 
 }  // namespace mooncake

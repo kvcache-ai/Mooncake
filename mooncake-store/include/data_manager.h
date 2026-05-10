@@ -84,9 +84,8 @@ class DataManager {
     struct PreWriteResult {
         RemoteBufferDesc remote_buffer;
         UUID write_operation_id{0, 0};
-        // Filled by PreWriteInternal for in-process callers
-        // (Put/WriteRemoteData). Public PreWrite omits this field for RPC
-        // responses.
+        // Filled by PreWriteInternal for in-process callers (Put/WriteRemoteData).
+        // Not exposed on PreWriteResponse (RPC).
         AllocationHandle handle;
     };
 
@@ -220,14 +219,14 @@ class DataManager {
         std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
 
-    tl::expected<PreWriteResult, ErrorCode> PreWrite(
+    tl::expected<PreWriteResponse, ErrorCode> PreWrite(
         std::string_view key, size_t size_bytes,
         std::optional<UUID> tier_id = std::nullopt);
 
     tl::expected<void, ErrorCode> WriteCommit(std::string_view key,
                                               const UUID& write_operation_id);
 
-    tl::expected<PinKeyResult, ErrorCode> PinKey(
+    tl::expected<PinKeyResponse, ErrorCode> PinKey(
         std::string_view key, std::optional<UUID> tier_id = std::nullopt);
 
     tl::expected<void, ErrorCode> UnPinKey(std::string_view key,
@@ -307,7 +306,8 @@ class DataManager {
     PinnedKeyShard& GetPinnedKeyShard(const KeyCtx& ctx);
 
     tl::expected<PreWriteResult, ErrorCode> PreWriteInternal(
-        const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id);
+        const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id,
+        bool enforce_dram_allocation);
     tl::expected<void, ErrorCode> WriteCommitInternal(
         const KeyCtx& ctx, const UUID& write_operation_id);
     tl::expected<PinKeyResult, ErrorCode> PinKeyInternal(

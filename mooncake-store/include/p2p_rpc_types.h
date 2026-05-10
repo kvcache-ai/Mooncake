@@ -2,6 +2,7 @@
 
 #include <string>
 #include <string_view>
+#include <optional>
 #include <vector>
 
 #include "replica.h"
@@ -40,6 +41,26 @@ inline std::ostream& operator<<(std::ostream& os,
        << ", prefer_local: " << (config.prefer_local ? "true" : "false")
        << ", early_return: " << (config.early_return ? "true" : "false")
        << ", priority_limit: " << config.priority_limit << " }";
+    return os;
+}
+
+struct P2PWriteRouteConfig {
+    WriteRouteRequestConfig route_config;
+    std::optional<RdmaDirectionMode> rdma_direction_mode;
+};
+YLT_REFL(P2PWriteRouteConfig, route_config, rdma_direction_mode);
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const P2PWriteRouteConfig& config) {
+    os << "P2PWriteRouteConfig: { route_config: [" << config.route_config
+       << "], rdma_direction_mode: ";
+    if (config.rdma_direction_mode.has_value()) {
+        os << *config.rdma_direction_mode;
+    } else {
+        // Unset: product rule is to resolve to REVERSE (see client default).
+        os << RdmaDirectionMode::REVERSE;
+    }
+    os << " }";
     return os;
 }
 

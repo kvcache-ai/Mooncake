@@ -489,6 +489,31 @@ inline std::ostream& operator<<(
     return os;
 }
 
+// Who initiates TE/RDMA for the data plane: REVERSE matches the historical
+// target-initiated path and is the conventional default when unset optional or
+// client-level config omits an explicit override.
+enum class RdmaDirectionMode : uint8_t {
+    REVERSE = 0,
+    FORWARD = 1,
+};
+
+// Logging only: prints REVERSE / FORWARD / UNKNOWN for invalid numeric values.
+inline std::ostream& operator<<(std::ostream& os,
+                                const RdmaDirectionMode& mode) noexcept {
+    switch (mode) {
+        case RdmaDirectionMode::REVERSE:
+            os << "REVERSE";
+            break;
+        case RdmaDirectionMode::FORWARD:
+            os << "FORWARD";
+            break;
+        default:
+            os << "UNKNOWN";
+            break;
+    }
+    return os;
+}
+
 }  // namespace mooncake
 
 namespace std {

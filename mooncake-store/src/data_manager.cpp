@@ -480,7 +480,9 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         return tl::unexpected(validate_result.error());
     }
 
-    auto prewrite_result = PreWriteInternal(kctx, total_size, std::nullopt);
+    // Local Put: allocation follows tier backend policy (not restricted to DRAM).
+    auto prewrite_result =
+        PreWriteInternal(kctx, total_size, std::nullopt, false);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaTe: PreWrite failed"
                    << ", key=" << key
@@ -554,7 +556,9 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
     const KeyCtx kctx = BuildKeyCtx(key);
     Slice slice = slices[0];
 
-    auto prewrite_result = PreWriteInternal(kctx, slice.size, std::nullopt);
+    // Same allocation policy as PutViaTe.
+    auto prewrite_result =
+        PreWriteInternal(kctx, slice.size, std::nullopt, false);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaMemcpy: PreWrite failed"
                    << ", key=" << key
@@ -849,8 +853,9 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     for (const auto& buf : src_buffers) total_size += buf.size;
 
     // Reverse RDMA path: still one RPC, but internally use the 3-phase write
-    // model (PreWrite -> transfer -> WriteCommit).
-    auto prewrite_result = PreWriteInternal(kctx, total_size, tier_id);
+    // model (PreWrite -> transfer -> WriteCommit). Target tier may be non-DRAM.
+    auto prewrite_result =
+        PreWriteInternal(kctx, total_size, tier_id, false);
     if (!prewrite_result) {
         timer.LogResponse("error_code=", prewrite_result.error());
         return tl::make_unexpected(prewrite_result.error());
@@ -878,25 +883,26 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     return result_tier_id;
 }
 
-tl::expected<DataManager::PreWriteResult, ErrorCode> DataManager::PreWrite(
+tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
     std::string_view key, size_t size_bytes, std::optional<UUID> tier_id) {
-    auto internal_result =
-        PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id);
+    auto internal_result = PreWriteInternal(BuildKeyCtx(key), size_bytes,
+                                            tier_id, true);
     if (!internal_result) {
         LOG(WARNING) << "PreWrite failed"
                      << ", key=" << key
                      << ", error=" << toString(internal_result.error());
         return tl::make_unexpected(internal_result.error());
     }
-    PreWriteResult rpc_result;
-    rpc_result.remote_buffer = std::move(internal_result->remote_buffer);
-    rpc_result.write_operation_id = internal_result->write_operation_id;
-    return rpc_result;
+    PreWriteResponse out;
+    out.remote_buffer = std::move(internal_result->remote_buffer);
+    out.pending_write_token = internal_result->write_operation_id;
+    return out;
 }
 
-tl::expected<DataManager::PreWriteResult, ErrorCode>
+tl::expected<PreWriteResult, ErrorCode>
 DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
-                              std::optional<UUID> tier_id) {
+                              std::optional<UUID> tier_id,
+                              bool enforce_dram_allocation) {
     ScopedVLogTimer timer(1, "DataManager::PreWrite");
     timer.LogRequest("key=", ctx.key, "size_bytes=", size_bytes);
 
@@ -946,6 +952,21 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     }
 
     auto handle = std::move(handle_result.value());
+
+    // Cross-node PreWrite (enforce_dram_allocation): data-owner forward TE path
+    // requires DRAM today. Local Put / WriteRemoteData pass false.
+    // TODO: Data-owner forward path currently supports DRAM tier only.
+    if (enforce_dram_allocation &&
+        handle->loc.data.type != MemoryType::DRAM) {
+        LOG(ERROR) << "PreWrite: DRAM allocation failed"
+                   << ", key=" << ctx.key
+                   << ", error=" << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        (void)ErasePendingWriteRecord(pending_write_shard, ctx.key,
+                                      write_operation_id);
+        timer.LogResponse("error_code=", ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+
     auto attach_result = AttachPendingWriteHandle(pending_write_shard, ctx.key,
                                                   write_operation_id, handle);
     if (!attach_result) {
@@ -1042,12 +1063,19 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
     return {};
 }
 
-tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKey(
+tl::expected<PinKeyResponse, ErrorCode> DataManager::PinKey(
     std::string_view key, std::optional<UUID> tier_id) {
-    return PinKeyInternal(BuildKeyCtx(key), tier_id);
+    auto internal_result = PinKeyInternal(BuildKeyCtx(key), tier_id);
+    if (!internal_result) {
+        return tl::make_unexpected(internal_result.error());
+    }
+    PinKeyResponse out;
+    out.remote_buffer = std::move(internal_result->remote_buffer);
+    out.pin_token = internal_result->read_operation_id;
+    return out;
 }
 
-tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
+tl::expected<PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     const KeyCtx& ctx, std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::PinKey");
     timer.LogRequest("key=", ctx.key);
@@ -1065,6 +1093,16 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     // Active pin: bump ref_count / renew lease; no tiered_backend::Get.
     const auto bump_existing_pin =
         [&](auto it) -> tl::expected<PinKeyResult, ErrorCode> {
+        // PinKey forward path: DRAM-only for now; non-DRAM replica handling TODO.
+        if (it->second.handle->loc.data.type != MemoryType::DRAM) {
+            LOG(ERROR) << "PinKey: DRAM-only forward path, non-DRAM replica"
+                       << ", key=" << ctx.key
+                       << ", error="
+                       << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+            timer.LogResponse("error_code=",
+                              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        }
         auto remote_buffer_result = BuildRemoteBufferDesc(it->second.handle);
         if (!remote_buffer_result) {
             timer.LogResponse("error_code=", remote_buffer_result.error());

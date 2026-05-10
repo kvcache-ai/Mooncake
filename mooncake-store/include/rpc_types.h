@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "types.h"
 #include "replica.h"
 #include "heartbeat_type.h"
@@ -36,6 +38,12 @@ YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config);
 // config for filter replicas in read route
 typedef GetReplicaListRequestConfig ReadRouteConfig;
 typedef P2PGetReplicaListConfigExtra P2PReadRouteConfigExtra;
+
+struct P2PReadRouteConfig {
+    ReadRouteConfig route_config;
+    std::optional<RdmaDirectionMode> rdma_direction_mode;
+};
+YLT_REFL(P2PReadRouteConfig, route_config, rdma_direction_mode);
 
 /**
  * @brief Extra info for centralized read route response (Internal use)
