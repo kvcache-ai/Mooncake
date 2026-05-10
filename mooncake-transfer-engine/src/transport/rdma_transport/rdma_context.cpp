@@ -27,6 +27,7 @@
 
 #include "config.h"
 #include "cuda_alike.h"
+#include "environ.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -47,22 +48,6 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_length = static_cast<uintptr_t>(region.mr->length);
     return region_start <= addr && addr - region_start < region_length;
 }
-
-#if defined(USE_CUDA)
-// Returns true if the WITH_NVIDIA_PEERMEM environment variable is set to a
-// truthy value (1/ON/TRUE/YES), meaning ibv_reg_mr() should be used for GPU
-// memory instead of ibv_reg_dmabuf_mr(). Defaults to false (dmabuf path).
-bool withNvidiaPeermem() {
-    static const bool val = []() {
-        const char *env = std::getenv("WITH_NVIDIA_PEERMEM");
-        if (env == nullptr || *env == '\0') return false;
-        const std::string s(env);
-        return s == "1" || s == "ON" || s == "on" || s == "TRUE" ||
-               s == "true" || s == "YES" || s == "yes";
-    }();
-    return val;
-}
-#endif
 }  // namespace
 
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
@@ -257,7 +242,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #if defined(USE_CUDA)
-    } else if (memType == CU_MEMORYTYPE_DEVICE && withNvidiaPeermem()) {
+    } else if (memType == CU_MEMORYTYPE_DEVICE && Environ::Get().GetWithNvidiaPeermem()) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         mrMeta.addr = addr;
@@ -645,7 +630,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // not just GPUs listing it as preferred.  Runtime selection falls
         // back to avail_hca when a preferred NIC is disabled, so we must
         // validate both lists.
-        if (!withNvidiaPeermem()) {
+        if (!Environ::Get().GetWithNvidiaPeermem()) {
         std::vector<int> mapped_cuda_devices;
         if (engine_.local_topology_) {
             const auto topology_matrix = engine_.local_topology_->getMatrix();
@@ -715,7 +700,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                 }
             }
         }
-        }  // !withNvidiaPeermem()
+        }  // !Environ::Get().GetWithNvidiaPeermem()
 #endif
 
         ibv_port_attr port_attr;
