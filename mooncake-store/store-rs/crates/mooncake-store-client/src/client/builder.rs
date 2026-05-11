@@ -333,9 +333,13 @@ impl StoreClientBuilder {
             && self.initial_state == ClientLifecycleState::Active
             && published_initial_state != self.initial_state;
 
+        let runtime_metadata = self
+            .metadata
+            .for_tenant(&self.default_tenant)
+            .unwrap_or_else(|| self.metadata.clone());
         let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
         let effective_tenant_policy =
-            resolve_effective_tenant_policy(self.metadata.as_ref(), &default_scope)?;
+            resolve_effective_tenant_policy(runtime_metadata.as_ref(), &default_scope)?;
         let effective_namespace_quota =
             resolved_namespace_quota(&effective_tenant_policy).or(self.namespace_quota.clone());
         let effective_route_policy = route_policy_from_tenant_spec(&effective_tenant_policy);
@@ -353,7 +357,7 @@ impl StoreClientBuilder {
             published_initial_state,
         )));
         let route_write_gate = Arc::new(Mutex::new(()));
-        let route_namespace = self.metadata.route_namespace();
+        let route_namespace = runtime_metadata.route_namespace();
         let live_client_cache = shared_live_client_cache(&route_namespace);
         let suspect_runtime_cache = shared_suspect_runtime_cache(&route_namespace);
         let remote_runtime_probe_cache = shared_remote_runtime_probe_cache(&route_namespace);
@@ -369,8 +373,8 @@ impl StoreClientBuilder {
             endpoints: endpoints.clone(),
             expires_at_ms,
         };
-        validate_startup_conflicts(self.metadata.as_ref(), control_client.as_ref(), &template)?;
-        let runtime = self.metadata.allocate_client_lease(&template)?;
+        validate_startup_conflicts(runtime_metadata.as_ref(), control_client.as_ref(), &template)?;
+        let runtime = runtime_metadata.allocate_client_lease(&template)?;
         let provisional_lease = ClientLease {
             runtime: runtime.clone(),
             state: template.state,
@@ -379,7 +383,7 @@ impl StoreClientBuilder {
             expires_at_ms,
         };
         bootstrap_route_policy(
-            self.metadata.as_ref(),
+            runtime_metadata.as_ref(),
             &provisional_lease,
             &self.default_tenant,
             effective_route_control,
@@ -392,7 +396,7 @@ impl StoreClientBuilder {
         let route_directory = build_route_directory(
             effective_route_control,
             effective_route_topk,
-            self.metadata.clone(),
+            runtime_metadata.clone(),
             &provisional_lease,
             control_client.clone(),
             live_client_cache.clone(),
@@ -416,7 +420,7 @@ impl StoreClientBuilder {
             Arc::new(LocalMigrationAdapter::new(LocalMigrationExecutionContext {
                 executor_stable_id: runtime.stable_id.clone(),
                 base_lease: provisional_lease.clone(),
-                metadata: self.metadata.clone(),
+                metadata: runtime_metadata.clone(),
                 transport_factory: self.transport_factory.clone(),
                 default_tenant: self.default_tenant.clone(),
                 local_memory: self.local_memory.clone(),
@@ -450,13 +454,13 @@ impl StoreClientBuilder {
             endpoints,
             expires_at_ms,
         };
-        self.metadata.upsert_client_lease(&lease)?;
-        prewarm_live_client_cache(self.metadata.as_ref(), &live_client_cache, &lease)?;
+        runtime_metadata.upsert_client_lease(&lease)?;
+        prewarm_live_client_cache(runtime_metadata.as_ref(), &live_client_cache, &lease)?;
         let prewarm_delay = startup_prewarm_delay(&runtime, self.startup_prewarm_max_delay);
         if !prewarm_delay.is_zero() {
             std::thread::sleep(prewarm_delay);
             refresh_live_client_cache(
-                self.metadata.as_ref(),
+                runtime_metadata.as_ref(),
                 &live_client_cache,
                 "live_client_snapshot_prewarm",
             )?;
@@ -477,7 +481,7 @@ impl StoreClientBuilder {
         );
         let membership_sync = MembershipSyncHandle::spawn(
             &runtime,
-            self.metadata.clone(),
+            runtime_metadata.clone(),
             live_client_cache.clone(),
             self.live_client_sync_interval,
         )?;
@@ -488,7 +492,7 @@ impl StoreClientBuilder {
             storage_owner.clone(),
         )?;
         Ok(StoreClient {
-            metadata: self.metadata,
+            metadata: runtime_metadata,
             route_directory,
             _control_plane: control_plane,
             control_client,

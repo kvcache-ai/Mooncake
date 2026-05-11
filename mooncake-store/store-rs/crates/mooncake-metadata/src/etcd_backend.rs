@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
@@ -38,6 +39,11 @@ impl EtcdMetadataConfig {
 
     pub fn keyspace(mut self, keyspace: MetadataKeyspace) -> Self {
         self.keyspace = keyspace;
+        self
+    }
+
+    pub fn tenant(mut self, tenant: &str) -> Self {
+        self.keyspace = self.keyspace.tenant_prefixed(tenant);
         self
     }
 }
@@ -451,6 +457,12 @@ impl MetadataBackend for EtcdMetadataBackend {
 
     fn backend_kind(&self) -> &'static str {
         "etcd"
+    }
+
+    fn for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
+        EtcdMetadataBackend::from_config(self.config.clone().tenant(tenant))
+            .ok()
+            .map(|backend| Arc::new(backend) as Arc<dyn MetadataBackend>)
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {

@@ -41,6 +41,8 @@ Use this split of responsibilities:
 - Store-RS runtimes enforce routing, quota, placement, and request-path isolation
 - `tenant` remains the default namespace selector used for startup policy lookup and request builders
 
+For metadata backends that support tenant binding, each Store-RS runtime binds metadata to its default tenant during bootstrap. Runtime control-plane metadata such as client leases, client resource records, object routes, and handoff plans is stored under a tenant-rooted keyspace like `<prefix>/tenants/<tenant>/...`; route-authority discovery uses that tenant-bound metadata namespace too. This is separate from request-path object identity: route keys still carry deterministic tenant/domain/object-set identity, but metadata listing and lookup for runtime state starts from the tenant root instead of scanning a global root and filtering in process.
+
 This keeps management explicit while avoiding control-plane policy decisions in the fast path.
 
 ## Python Compatibility Isolation Model
