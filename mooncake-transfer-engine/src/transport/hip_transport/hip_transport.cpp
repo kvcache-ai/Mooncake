@@ -321,7 +321,7 @@ static void setupP2PAccess(int num_devices) {
 }
 
 static int getNumStreams() {
-    const char *env = getenv("MC_HIP_NUM_STREAMS");
+    const char* env = getenv("MC_HIP_NUM_STREAMS");
     if (env) {
         try {
             int value = std::stoi(env);
@@ -340,7 +340,7 @@ static int getNumStreams() {
 }
 
 static int getNumEvents() {
-    const char *env = getenv("MC_HIP_NUM_EVENTS");
+    const char* env = getenv("MC_HIP_NUM_EVENTS");
     if (env) {
         try {
             int value = std::stoi(env);
