@@ -348,6 +348,8 @@ class MasterMetricManager {
         int64_t move_end_fails = 0;
         int64_t move_revokes = 0;
         int64_t move_revoke_fails = 0;
+        int64_t evict_disk_replicas = 0;
+        int64_t evict_disk_replica_fails = 0;
         int64_t batch_put_start_requests = 0;
         int64_t batch_put_start_fails = 0;
         int64_t batch_put_start_partial_successes = 0;

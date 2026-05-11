@@ -1625,6 +1625,8 @@ std::string MasterMetricManager::get_summary_string(
     current_counters.move_end_fails = move_end_fails;
     current_counters.move_revokes = move_revokes;
     current_counters.move_revoke_fails = move_revoke_fails;
+    current_counters.evict_disk_replicas = evict_disk_replicas;
+    current_counters.evict_disk_replica_fails = evict_disk_replica_fails;
     current_counters.batch_put_start_requests = batch_put_start_requests;
     current_counters.batch_put_start_fails = batch_put_start_fails;
     current_counters.batch_put_start_partial_successes =
@@ -1817,7 +1819,13 @@ std::string MasterMetricManager::get_summary_string(
     ss << "MoveRevoke="
        << format_rate_pair(delta(&SummaryCounters::move_revokes) -
                                delta(&SummaryCounters::move_revoke_fails),
-                           delta(&SummaryCounters::move_revokes));
+                           delta(&SummaryCounters::move_revokes))
+       << ", ";
+    ss << "EvictDiskReplica="
+       << format_rate_pair(
+              delta(&SummaryCounters::evict_disk_replicas) -
+                  delta(&SummaryCounters::evict_disk_replica_fails),
+              delta(&SummaryCounters::evict_disk_replicas));
 
     // Batch request summary
     ss << " | Batch Requests "
