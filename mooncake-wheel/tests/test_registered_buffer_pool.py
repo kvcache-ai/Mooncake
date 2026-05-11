@@ -3,13 +3,7 @@ import threading
 import time
 
 import pytest
-
-from mooncake.remote_tensor_batch import (
-    BatchReadPlanner,
-    RangeReadPlanner,
-    RegisteredBufferPool,
-    RegisteredBufferPoolConfig,
-)
+from mooncake.registered_buffer_pool import RegisteredBufferPool, RegisteredBufferPoolConfig
 
 
 class FakeStore:
@@ -77,49 +71,6 @@ class FakeStore:
                 buffer_results.append(key_results)
             results.append(buffer_results)
         return results
-
-
-def test_batch_read_planner_executes_whole_key_reads():
-    store = FakeStore()
-    store.objects["a"] = b"abc"
-    store.objects["b"] = b"defg"
-    first = bytearray(3)
-    second = bytearray(4)
-    planner = BatchReadPlanner(store)
-    planner.add("a", ctypes.addressof(ctypes.c_char.from_buffer(first)), len(first))
-    planner.add("b", ctypes.addressof(ctypes.c_char.from_buffer(second)), len(second))
-
-    planner.execute()
-
-    assert bytes(first) == b"abc"
-    assert bytes(second) == b"defg"
-    assert store.batch_get_into_count == 1
-
-
-def test_batch_read_planner_checks_result_sizes():
-    store = FakeStore()
-    store.objects["a"] = b"abc"
-    buffer = bytearray(2)
-    planner = BatchReadPlanner(store)
-    planner.add("a", ctypes.addressof(ctypes.c_char.from_buffer(buffer)), len(buffer))
-
-    with pytest.raises(RuntimeError, match="batch_get_into failed"):
-        planner.execute()
-
-
-def test_range_read_planner_executes_whole_key_reads_into_offsets():
-    store = FakeStore()
-    store.objects["a"] = b"abc"
-    store.objects["b"] = b"defg"
-    buffer = bytearray(7)
-    planner = RangeReadPlanner(store, ctypes.addressof(ctypes.c_char.from_buffer(buffer)))
-    planner.add_whole_key("a", 0, 3)
-    planner.add_whole_key("b", 3, 4)
-
-    planner.execute()
-
-    assert bytes(buffer) == b"abcdefg"
-    assert store.get_into_ranges_count == 1
 
 
 def test_registered_buffer_pool_registers_external_buffer_best_effort():

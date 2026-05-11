@@ -1,15 +1,14 @@
 import ctypes
 
+import mooncake.dataproto_transfer as dataproto_transfer
 import numpy as np
 import torch
-
 from mooncake.dataproto_transfer import (
     DataProtoMaterializePolicy,
     DataProtoShardPolicy,
     InMemoryMooncakeStore,
     MooncakeDataProtoTransferBackend,
 )
-import mooncake.dataproto_transfer as dataproto_transfer
 
 
 class StructuredData:
@@ -57,6 +56,20 @@ def make_skewed_dataproto() -> StructuredData:
         "ragged": np.array([torch.arange(index + 1, dtype=torch.float32) for index in range(row_count)], dtype=object),
     }
     return StructuredData.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info={"source": "test"})
+
+
+def make_selected_dataproto() -> StructuredData:
+    return StructuredData.from_dict(
+        tensors={
+            "input_ids": torch.arange(12, dtype=torch.int64).reshape(4, 3),
+            "attention_mask": torch.ones((4, 3), dtype=torch.int32),
+        },
+        non_tensors={
+            "prompt": np.array(["p0", "p1", "p2", "p3"], dtype=object),
+            "reward": np.array([1.0, 0.0, 0.5, -1.0], dtype=np.float32),
+        },
+        meta_info={"source": "unit", "step": 7},
+    )
 
 
 class CountingInMemoryMooncakeStore(InMemoryMooncakeStore):
@@ -157,7 +170,7 @@ def test_adaptive_policy_skips_small_dense_payload_sharding():
 
     ref = backend.put_dataproto(data, partition="test", shard_policy=DataProtoShardPolicy(adaptive=True))
 
-    assert not hasattr(ref, "manifest") or ref.manifest.get("layout") != "row_sharded_v1"
+    assert not hasattr(ref, "manifest") or ref.manifest.get("layout") != "row_sharded"
 
 
 def test_adaptive_policy_uses_bounded_parallelism_for_large_payload(monkeypatch):
@@ -184,31 +197,6 @@ def test_adaptive_policy_uses_bounded_parallelism_for_large_payload(monkeypatch)
     assert materialized.meta_info["mooncake_materialize_profile"]["max_inflight_get"] <= 4
 
 
-def test_materialize_feedback_throttles_next_parallelism(monkeypatch):
-    monkeypatch.setattr(dataproto_transfer, "RAGGED_TENSOR_PART_CHUNK_BYTES", 16)
-    store = CountingInMemoryMooncakeStore()
-    backend = MooncakeDataProtoTransferBackend(store, data_cls=StructuredData)
-    data = make_skewed_dataproto()
-    policy = DataProtoShardPolicy(
-        adaptive=True,
-        target_shard_bytes=1024,
-        small_payload_threshold=1,
-        max_shards=8,
-        max_inflight_get=4,
-    )
-    ref = backend.put_dataproto(data, partition="test", shard_policy=policy)
-
-    first = backend.materialize_dataproto(ref)
-    state = dataproto_transfer._TRANSFER_ADAPTIVE_STATES[id(store)]
-    state.pressure_level = "throttle"
-    second = backend.materialize_dataproto(ref)
-
-    first_inflight = first.meta_info["mooncake_materialize_profile"]["max_inflight_get"]
-    second_profile = second.meta_info["mooncake_materialize_profile"]
-    assert second_profile["max_inflight_get"] <= max(1, first_inflight // 2)
-    assert second_profile["parallel_feedback"]["max_inflight_get"] == second_profile["max_inflight_get"]
-
-
 def test_adaptive_policy_byte_balances_large_skewed_rows():
     store = CountingInMemoryMooncakeStore()
     backend = MooncakeDataProtoTransferBackend(store, data_cls=StructuredData)
@@ -232,6 +220,77 @@ def test_adaptive_policy_byte_balances_large_skewed_rows():
     assert ref.manifest["policy"]["byte_balanced"] is True
     assert ref.manifest["profile"]["transfer_profile"]["row_skewed"] is True
     assert [tuple(item) for item in ref.manifest["profile"]["shard_ranges"]] != [(0, 1), (1, 2), (2, 3), (3, 4)]
+
+
+def test_get_dataproto_manifest_reports_fields():
+    backend = MooncakeDataProtoTransferBackend(InMemoryMooncakeStore(), data_cls=StructuredData)
+    ref = backend.put_dataproto(make_selected_dataproto(), partition="selected")
+
+    manifest = backend.get_dataproto_manifest(ref)
+
+    assert manifest.row_count == 4
+    assert set(manifest.batch_fields) == {"input_ids", "attention_mask"}
+    assert manifest.batch_fields["input_ids"]["shape"] == [4, 3]
+    assert manifest.batch_fields["input_ids"]["dtype"] == "int64"
+    assert set(manifest.non_tensor_fields) == {"prompt", "reward"}
+    assert manifest.meta_info_key == ref.manifest["meta_info_key"]
+
+
+def test_materialize_dataproto_selects_fields_and_meta():
+    backend = MooncakeDataProtoTransferBackend(InMemoryMooncakeStore(), data_cls=StructuredData)
+    data = make_selected_dataproto()
+    ref = backend.put_dataproto(data, partition="selected")
+
+    materialized = backend.materialize_dataproto(
+        ref,
+        batch_fields=["input_ids"],
+        non_tensor_fields=["reward"],
+        meta_info_keys=["step"],
+    )
+
+    assert set(materialized.batch) == {"input_ids"}
+    assert torch.equal(materialized.batch["input_ids"], data.batch["input_ids"])
+    assert set(materialized.non_tensor_batch) == {"reward"}
+    assert materialized.non_tensor_batch["reward"].tolist() == data.non_tensor_batch["reward"].tolist()
+    assert materialized.meta_info["step"] == 7
+    assert "source" not in materialized.meta_info
+    assert "mooncake_materialize_profile" in materialized.meta_info
+
+
+def test_materialize_dataproto_can_skip_meta_info():
+    backend = MooncakeDataProtoTransferBackend(InMemoryMooncakeStore(), data_cls=StructuredData)
+    ref = backend.put_dataproto(make_selected_dataproto(), partition="selected")
+
+    materialized = backend.materialize_dataproto(ref, batch_fields=[], non_tensor_fields=[], include_meta_info=False)
+
+    assert materialized.batch is None
+    assert materialized.non_tensor_batch == {}
+    assert set(materialized.meta_info) == {"mooncake_materialize_profile"}
+
+
+def test_get_dataproto_remote_batch_materializes_selected_rows():
+    store = InMemoryMooncakeStore()
+    backend = MooncakeDataProtoTransferBackend(store, data_cls=StructuredData)
+    data = make_selected_dataproto()
+    ref = backend.put_dataproto(data, partition="selected")
+    remote = backend.get_dataproto_remote_batch(ref, batch_fields=["input_ids"])
+    selected = remote.slice(1, 3, None)
+    request = selected.read_requests(["input_ids"])[0]
+    output = torch.empty(request.output_shape(), dtype=torch.int64)
+
+    row_bytes = request.ref.nbytes() // request.ref.shape[0]
+    start, end, step = request.selections[0].value
+    assert step is None
+    result = store.get_into_ranges(
+        [output.data_ptr()],
+        [[request.ref.key]],
+        [[[0]]],
+        [[[request.ref.data_offset + start * row_bytes]]],
+        [[[(end - start) * row_bytes]]],
+    )
+
+    assert result == [[[(end - start) * row_bytes]]]
+    assert torch.equal(output, data.batch["input_ids"][1:3])
 
 
 def test_dense_batch_tensors_use_batch_get_into():

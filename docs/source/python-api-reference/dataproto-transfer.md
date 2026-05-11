@@ -85,7 +85,7 @@ The defaults are for local smoke tests. Performance reports should explicitly li
 
 ## Registered Buffer Pool
 
-Materialization uses `RegisteredBufferPool` from `mooncake.remote_tensor_batch` for reusable scratch buffers. The pool keeps buffers registered with Mooncake so repeated range reads avoid registration on the hot path.
+Materialization uses `RegisteredBufferPool` from `mooncake.registered_buffer_pool` for reusable scratch buffers. The pool keeps buffers registered with Mooncake so repeated range reads avoid registration on the hot path.
 
 Configuration is controlled by:
 
@@ -98,7 +98,17 @@ Configuration is controlled by:
 
 Registration and prewarm costs are setup/fixed costs. When benchmarking online transfer or materialization latency, report pool registration/prewarm time separately from online read time.
 
-Use `close_registered_buffer_pool(store)` when a process is shutting down or when a store is no longer used. Active leases must be released before closing the pool.
+Use `get_registered_buffer_pool(store)` to reuse the process-local pool for a store, and `close_registered_buffer_pool(store)` when a process is shutting down or when a store is no longer used. Active leases must be released before closing the pool.
+
+For direct use, import the pool helper from the dedicated module:
+
+```python
+from mooncake.registered_buffer_pool import RegisteredBufferPool
+
+with RegisteredBufferPool(store, max_bytes=2 * 1024**3) as pool:
+    with pool.acquire(64 * 1024 * 1024) as lease:
+        store.get_into(key, lease.ptr, lease.size)
+```
 
 ## Sharding
 

@@ -15,35 +15,31 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 import numpy as np
 import torch
 
+
 try:
-    from mooncake.remote_tensor_batch import (
-        BatchReadPlanner,
-        RangeReadPlanner,
-        RegisteredBufferPool,
-        RegisteredBufferPoolConfig,
-    )
+    from mooncake.registered_buffer_pool import RegisteredBufferPool, RegisteredBufferPoolConfig
+    from mooncake.remote_tensor_batch import RemoteTensorBatch, TensorFieldRef
 except ImportError:  # pragma: no cover - optional helper for local tests
-    BatchReadPlanner = None  # type: ignore[assignment]
-    RangeReadPlanner = None  # type: ignore[assignment]
     RegisteredBufferPool = None  # type: ignore[assignment]
     RegisteredBufferPoolConfig = None  # type: ignore[assignment]
+    RemoteTensorBatch = None  # type: ignore[assignment]
+    TensorFieldRef = None  # type: ignore[assignment]
 
 
 MAX_STRUCT_KEYS = 64
 MAX_EXPAND_LIST_LEN = 8
 MAX_SAMPLE_ROWS_FOR_INFERENCE = 128
 MAX_JSON_INLINE_BYTES = 1 << 20
-RAGGED_TENSOR_PART_CHUNK_BYTES = int(os.environ.get("MOONCAKE_DATAPROTO_RAGGED_PART_BYTES", str(512 * 1024 ** 2)))
-RAGGED_BYTES_PART_CHUNK_BYTES = int(os.environ.get("MOONCAKE_DATAPROTO_BYTES_PART_BYTES", str(512 * 1024 ** 2)))
-REGISTERED_BUFFER_POOL_BYTES = int(os.environ.get("MOONCAKE_REGISTERED_BUFFER_POOL_BYTES", str(2 * 1024 ** 3)))
+RAGGED_TENSOR_PART_CHUNK_BYTES = int(os.environ.get("MOONCAKE_DATAPROTO_RAGGED_PART_BYTES", str(512 * 1024**2)))
+RAGGED_BYTES_PART_CHUNK_BYTES = int(os.environ.get("MOONCAKE_DATAPROTO_BYTES_PART_BYTES", str(512 * 1024**2)))
+REGISTERED_BUFFER_POOL_BYTES = int(os.environ.get("MOONCAKE_REGISTERED_BUFFER_POOL_BYTES", str(2 * 1024**3)))
 REGISTERED_BUFFER_POOL_MAX_BUFFER_BYTES = int(
-    os.environ.get("MOONCAKE_REGISTERED_BUFFER_POOL_MAX_BUFFER_BYTES", str(512 * 1024 ** 2))
+    os.environ.get("MOONCAKE_REGISTERED_BUFFER_POOL_MAX_BUFFER_BYTES", str(512 * 1024**2))
 )
 REGISTERED_BUFFER_POOL_PREWARM_BYTES = int(os.environ.get("MOONCAKE_REGISTERED_BUFFER_POOL_PREWARM_BYTES", "0"))
 REGISTERED_BUFFER_POOL_PREWARM_COUNT = int(os.environ.get("MOONCAKE_REGISTERED_BUFFER_POOL_PREWARM_COUNT", "0"))
 _STORE_PROFILES: Dict[int, Dict[str, Any]] = {}
 _REGISTERED_BUFFER_POOLS: Dict[int, Any] = {}
-_TRANSFER_ADAPTIVE_STATES: Dict[int, "DataProtoTransferAdaptiveState"] = {}
 _STORE_STATE_LOCK = threading.RLock()
 
 
@@ -89,10 +85,10 @@ class DataProtoShardPolicy:
     enabled: bool = False
     adaptive: bool = False
     num_shards: Optional[int] = None
-    target_shard_bytes: int = 2 * 1024 ** 3
+    target_shard_bytes: int = 2 * 1024**3
     max_shards: int = 16
     max_inflight_get: int = 4
-    small_payload_threshold: int = 256 * 1024 ** 2
+    small_payload_threshold: int = 256 * 1024**2
     row_oriented_ratio_threshold: float = 0.5
     dense_ratio_threshold: float = 0.8
     byte_balanced: bool = True
@@ -120,22 +116,21 @@ class DataProtoTransferDecision:
 
 
 @dataclass
-class DataProtoTransferAdaptiveState:
-    pressure_level: str = "normal"
-    last_max_inflight_get: Optional[int] = None
-    ewma_parallel_efficiency: float = 0.0
-    ewma_pool_wait_count: float = 0.0
-    ewma_direct_range_fallback_count: float = 0.0
-    update_count: int = 0
-
-
-@dataclass
 class DataProtoMaterializePolicy:
     max_inflight_get: Optional[int] = None
     pool_prewarm: bool = True
     pool_prewarm_size: Optional[int] = None
     pool_prewarm_count: Optional[int] = None
-    adaptive_feedback: bool = True
+
+
+@dataclass(frozen=True)
+class DataProtoManifestView:
+    row_count: int
+    batch_fields: Dict[str, Dict[str, Any]]
+    non_tensor_fields: Dict[str, Dict[str, Any]]
+    meta_info_key: Optional[str]
+    layout: str = "single"
+    object_id: Optional[str] = None
 
 
 @dataclass
@@ -160,26 +155,19 @@ def chunk_offsets_by_size(sizes: List[int], target_bytes: int) -> List[int]:
 
 
 class KeyValueStore(Protocol):
-    def put(self, key: str, value: Any) -> int:
-        ...
+    def put(self, key: str, value: Any) -> int: ...
 
-    def get(self, key: str) -> bytes:
-        ...
+    def get(self, key: str) -> bytes: ...
 
-    def remove(self, key: str, force: bool = False) -> int:
-        ...
+    def remove(self, key: str, force: bool = False) -> int: ...
 
-    def register_buffer(self, buffer_ptr: int, size: int) -> int:
-        ...
+    def register_buffer(self, buffer_ptr: int, size: int) -> int: ...
 
-    def unregister_buffer(self, buffer_ptr: int) -> int:
-        ...
+    def unregister_buffer(self, buffer_ptr: int) -> int: ...
 
-    def put_from(self, key: str, buffer_ptr: int, size: int, config: Any = None) -> int:
-        ...
+    def put_from(self, key: str, buffer_ptr: int, size: int, config: Any = None) -> int: ...
 
-    def get_into(self, key: str, buffer_ptr: int, size: int) -> int:
-        ...
+    def get_into(self, key: str, buffer_ptr: int, size: int) -> int: ...
 
     def batch_put_from(
         self,
@@ -187,11 +175,9 @@ class KeyValueStore(Protocol):
         buffer_ptrs: List[int],
         sizes: List[int],
         config: Any = None,
-    ) -> List[int]:
-        ...
+    ) -> List[int]: ...
 
-    def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]:
-        ...
+    def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]: ...
 
 
 def create_mooncake_store_from_env() -> Any:
@@ -263,8 +249,7 @@ class InMemoryMooncakeStore:
         config: Any = None,
     ) -> List[int]:
         return [
-            self.put_from(key, buffer_ptr, size, config)
-            for key, buffer_ptr, size in zip(keys, buffer_ptrs, sizes)
+            self.put_from(key, buffer_ptr, size, config) for key, buffer_ptr, size in zip(keys, buffer_ptrs, sizes)
         ]
 
     def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]:
@@ -327,14 +312,14 @@ def is_scalar(value: Any) -> bool:
 def can_tensor(values: List[Any]) -> CodecDecision:
     non_null = all_not_none(values)
     if not non_null:
-        return reject("ragged_tensor_v1", "torch.Tensor", "all rows are null")
+        return reject("ragged_tensor", "torch.Tensor", "all rows are null")
     if not all(isinstance(value, torch.Tensor) for value in non_null):
-        return reject("ragged_tensor_v1", "torch.Tensor", "at least one non-null row is not torch.Tensor")
+        return reject("ragged_tensor", "torch.Tensor", "at least one non-null row is not torch.Tensor")
     dtypes = sorted({str(value.dtype) for value in non_null})
     if len(dtypes) != 1:
-        return reject("ragged_tensor_v1", "torch.Tensor", f"mixed tensor dtypes: {dtypes}")
+        return reject("ragged_tensor", "torch.Tensor", f"mixed tensor dtypes: {dtypes}")
     return accept(
-        "ragged_tensor_v1",
+        "ragged_tensor",
         "torch.Tensor",
         "all non-null rows are torch.Tensor with one dtype",
         {"source_type": "torch.Tensor", "dtype": dtypes[0]},
@@ -352,11 +337,11 @@ def is_media_list(value: Any) -> bool:
 def can_media_list(values: List[Any]) -> CodecDecision:
     non_null = all_not_none(values)
     if not non_null:
-        return reject("media_list_ragged_v1", "media list", "all rows are null")
+        return reject("media_list_ragged", "media list", "all rows are null")
     if not all(is_media_list(value) for value in non_null):
-        return reject("media_list_ragged_v1", "media list", "non-null row is not a supported media list")
+        return reject("media_list_ragged", "media list", "non-null row is not a supported media list")
     return accept(
-        "media_list_ragged_v1",
+        "media_list_ragged",
         "media list",
         "all non-null rows are lists of supported media objects",
         {"source_types": sorted({type(item).__name__ for value in non_null for item in value})},
@@ -366,7 +351,7 @@ def can_media_list(values: List[Any]) -> CodecDecision:
 def can_numeric_sequence(values: List[Any]) -> CodecDecision:
     non_null = all_not_none(values)
     if not non_null:
-        return reject("typed_ragged_v1", "numeric sequence", "all rows are null")
+        return reject("typed_ragged", "numeric sequence", "all rows are null")
     arrays = []
     for value in non_null:
         if isinstance(value, np.ndarray):
@@ -374,15 +359,15 @@ def can_numeric_sequence(values: List[Any]) -> CodecDecision:
         elif isinstance(value, (list, tuple)):
             array = np.asarray(value)
         else:
-            return reject("typed_ragged_v1", "numeric sequence", "non-null row is not ndarray/list/tuple")
+            return reject("typed_ragged", "numeric sequence", "non-null row is not ndarray/list/tuple")
         if array.dtype == object:
-            return reject("typed_ragged_v1", "numeric sequence", "row converts to object dtype")
+            return reject("typed_ragged", "numeric sequence", "row converts to object dtype")
         if not np.issubdtype(array.dtype, np.number):
-            return reject("typed_ragged_v1", "numeric sequence", f"non-numeric dtype observed: {array.dtype}")
+            return reject("typed_ragged", "numeric sequence", f"non-numeric dtype observed: {array.dtype}")
         arrays.append(array)
     dtype = np.result_type(*arrays)
     return accept(
-        "typed_ragged_v1",
+        "typed_ragged",
         "numeric sequence",
         "all non-null rows promote to a common numeric dtype",
         {"source_dtypes": sorted({str(array.dtype) for array in arrays}), "dtype": str(dtype)},
@@ -392,20 +377,32 @@ def can_numeric_sequence(values: List[Any]) -> CodecDecision:
 def can_bytes(values: List[Any]) -> CodecDecision:
     non_null = all_not_none(values)
     if not non_null:
-        return reject("bytes_ragged_v1", "bytes-like", "all rows are null")
+        return reject("bytes_ragged", "bytes-like", "all rows are null")
     if not all(is_bytes_like(value) for value in non_null):
-        return reject("bytes_ragged_v1", "bytes-like", "non-null row is not bytes-like")
-    return accept("bytes_ragged_v1", "bytes-like", "all non-null rows are bytes-like")
+        return reject("bytes_ragged", "bytes-like", "non-null row is not bytes-like")
+    return accept("bytes_ragged", "bytes-like", "all non-null rows are bytes-like")
+
+
+def can_numeric_scalar(values: List[Any]) -> CodecDecision:
+    non_null = all_not_none(values)
+    if not non_null:
+        return reject("ndarray", "numeric scalar", "all rows are null")
+    if not all(isinstance(value, (bool, int, float, np.number)) for value in non_null):
+        return reject("ndarray", "numeric scalar", "non-null row is not numeric scalar")
+    dtype = np.result_type(*non_null)
+    if not np.issubdtype(dtype, np.number) and not np.issubdtype(dtype, np.bool_):
+        return reject("ndarray", "numeric scalar", f"non-numeric dtype observed: {dtype}")
+    return accept("ndarray", "numeric scalar", "all non-null rows are numeric scalars", {"dtype": str(dtype)})
 
 
 def can_media(values: List[Any]) -> CodecDecision:
     non_null = all_not_none(values)
     if not non_null:
-        return reject("media_bytes_ragged_v1", "media", "all rows are null")
+        return reject("media_bytes", "media", "all rows are null")
     if not all(is_pil_image(value) for value in non_null):
-        return reject("media_bytes_ragged_v1", "media", "non-null row is not a supported media object")
+        return reject("media_bytes", "media", "non-null row is not a supported media object")
     return accept(
-        "media_bytes_ragged_v1",
+        "media_bytes",
         "media",
         "all non-null rows implement supported media encoding",
         {"source_types": sorted({type(value).__name__ for value in non_null})},
@@ -415,29 +412,29 @@ def can_media(values: List[Any]) -> CodecDecision:
 def can_text(values: List[Any]) -> CodecDecision:
     non_null = all_not_none(values)
     if not non_null:
-        return reject("utf8_ragged_v1", "str", "all rows are null")
+        return reject("utf8_ragged", "str", "all rows are null")
     if not all(isinstance(value, str) for value in non_null):
-        return reject("utf8_ragged_v1", "str", "non-null row is not str")
-    return accept("utf8_ragged_v1", "str", "all non-null rows are str", {"encoding": "utf-8"})
+        return reject("utf8_ragged", "str", "non-null row is not str")
+    return accept("utf8_ragged", "str", "all non-null rows are str", {"encoding": "utf-8"})
 
 
 def can_json(values: List[Any]) -> CodecDecision:
     non_null = all_not_none(values)
     if not non_null:
-        return reject("json_ragged_v1", "json", "all rows are null")
+        return reject("json_ragged", "json", "all rows are null")
     source_types = set()
     total_sample_bytes = 0
     for value in non_null[:MAX_SAMPLE_ROWS_FOR_INFERENCE]:
         try:
             encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         except (TypeError, ValueError) as exc:
-            return reject("json_ragged_v1", "json", f"JSON serialization failed: {exc}")
+            return reject("json_ragged", "json", f"JSON serialization failed: {exc}")
         total_sample_bytes += len(encoded)
         source_types.add(type(value).__name__)
     if total_sample_bytes > MAX_JSON_INLINE_BYTES:
-        return reject("json_ragged_v1", "json", "sampled JSON payload is too large")
+        return reject("json_ragged", "json", "sampled JSON payload is too large")
     return accept(
-        "json_ragged_v1",
+        "json_ragged",
         "json",
         "sampled rows pass actual JSON serialization",
         {"source_types": sorted(source_types)},
@@ -446,14 +443,23 @@ def can_json(values: List[Any]) -> CodecDecision:
 
 def choose_leaf_codec(values: List[Any]) -> CodecDecision:
     rejected = []
-    for predicate in (can_tensor, can_media_list, can_numeric_sequence, can_bytes, can_media, can_text, can_json):
+    for predicate in (
+        can_tensor,
+        can_media_list,
+        can_numeric_sequence,
+        can_numeric_scalar,
+        can_bytes,
+        can_media,
+        can_text,
+        can_json,
+    ):
         decision = predicate(values)
         if decision.accepted:
             return decision
         rejected.append({"codec": decision.codec, "reason": decision.reason})
     return CodecDecision(
         False,
-        "pickle_ragged_fallback_v1",
+        "pickle_ragged_fallback",
         "no optimized codec accepted the observed values",
         "fallback",
         "python object",
@@ -471,12 +477,16 @@ def value_to_media_bytes(value: Any) -> Tuple[bytes, Optional[str], Dict[str, An
         return bytes(value), None, {"kind": "bytes"}
     if is_pil_image(value):
         image = value.convert(value.mode) if getattr(value, "readonly", False) else value
-        return image.tobytes(), "image/raw", {
-            "kind": "pil_raw",
-            "mode": image.mode,
-            "size": list(image.size),
-            "format": getattr(value, "format", None),
-        }
+        return (
+            image.tobytes(),
+            "image/raw",
+            {
+                "kind": "pil_raw",
+                "mode": image.mode,
+                "size": list(image.size),
+                "format": getattr(value, "format", None),
+            },
+        )
     return bytes(value), None, {"kind": "bytes"}
 
 
@@ -522,14 +532,10 @@ def encode_ragged_tensor(path: str, values: List[Any]) -> EncodedLeaf:
     data_bytes = data_numel * element_size
     return EncodedLeaf(
         path=path,
-        codec="ragged_tensor_v1",
+        codec="ragged_tensor",
         rows=len(values),
         bytes=(
-            data_bytes
-            + tensor_nbytes(offsets)
-            + tensor_nbytes(shapes)
-            + tensor_nbytes(ndims)
-            + tensor_nbytes(nulls)
+            data_bytes + tensor_nbytes(offsets) + tensor_nbytes(shapes) + tensor_nbytes(ndims) + tensor_nbytes(nulls)
         ),
         payload={"data": data, "offsets": offsets, "shapes": shapes, "ndims": ndims, "nulls": nulls},
         metadata={"dtype": str(data_dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"},
@@ -585,7 +591,7 @@ def encode_typed_ragged(path: str, values: List[Any]) -> EncodedLeaf:
     data = np.concatenate(flat_arrays) if flat_arrays else np.asarray([], dtype=dtype or np.int64)
     return EncodedLeaf(
         path=path,
-        codec="typed_ragged_v1",
+        codec="typed_ragged",
         rows=len(values),
         bytes=(
             numpy_nbytes(data)
@@ -692,13 +698,10 @@ def encode_media_list(path: str, values: List[Any]) -> EncodedLeaf:
         metadata["media_types"] = non_null_media_types
     return EncodedLeaf(
         path=path,
-        codec="media_list_ragged_v1",
+        codec="media_list_ragged",
         rows=len(values),
         bytes=(
-            payload_bytes
-            + numpy_nbytes(row_offsets_array)
-            + numpy_nbytes(byte_offsets_array)
-            + numpy_nbytes(nulls)
+            payload_bytes + numpy_nbytes(row_offsets_array) + numpy_nbytes(byte_offsets_array) + numpy_nbytes(nulls)
         ),
         payload={
             "data": payload,
@@ -789,7 +792,7 @@ def decode_bytes_like(payload: Dict[str, Any], rows: int, metadata: Optional[Dic
 
 def encode_utf8(path: str, values: List[Any]) -> EncodedLeaf:
     encoded = [None if value is None else value.encode("utf-8") for value in values]
-    return encode_bytes_like(path, encoded, "utf8_ragged_v1")
+    return encode_bytes_like(path, encoded, "utf8_ragged")
 
 
 def decode_utf8(payload: Dict[str, Any], rows: int) -> List[Any]:
@@ -801,7 +804,7 @@ def encode_json(path: str, values: List[Any]) -> EncodedLeaf:
         None if value is None else json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         for value in values
     ]
-    return encode_bytes_like(path, encoded, "json_ragged_v1")
+    return encode_bytes_like(path, encoded, "json_ragged")
 
 
 def decode_json(payload: Dict[str, Any], rows: int) -> List[Any]:
@@ -810,27 +813,55 @@ def decode_json(payload: Dict[str, Any], rows: int) -> List[Any]:
 
 def encode_pickle(path: str, values: List[Any]) -> EncodedLeaf:
     encoded = [None if value is None else pickle.dumps(value, protocol=5) for value in values]
-    return encode_bytes_like(path, encoded, "pickle_ragged_fallback_v1")
+    return encode_bytes_like(path, encoded, "pickle_ragged_fallback")
 
 
 def decode_pickle(payload: Dict[str, Any], rows: int) -> List[Any]:
     return [None if value is None else pickle.loads(value) for value in decode_bytes_like(payload, rows)]
 
 
+def encode_numeric_scalar_array(path: str, values: List[Any], decision: CodecDecision) -> EncodedLeaf:
+    start = now()
+    dtype = np.dtype(decision.metadata["dtype"])
+    data = np.asarray(values, dtype=dtype)
+    nulls = np.asarray([value is None for value in values], dtype=np.bool_)
+    return EncodedLeaf(
+        path=path,
+        codec="ndarray",
+        rows=len(values),
+        bytes=numpy_nbytes(data) + numpy_nbytes(nulls),
+        payload={"data": data, "nulls": nulls},
+        metadata={"dtype": str(data.dtype), "shape": list(data.shape)},
+        encode_s=now() - start,
+    )
+
+
+def decode_numeric_scalar_array(payload: Dict[str, Any], rows: int) -> List[Any]:
+    data = payload["data"]
+    nulls = payload["nulls"]
+    if not bool(nulls.any()):
+        return data
+    out = data.astype(object)
+    out[nulls] = None
+    return out
+
+
 def encode_leaf(path: str, values: List[Any], decision: CodecDecision) -> EncodedLeaf:
-    if decision.codec == "ragged_tensor_v1":
+    if decision.codec == "ragged_tensor":
         leaf = encode_ragged_tensor(path, values)
-    elif decision.codec == "typed_ragged_v1":
+    elif decision.codec == "typed_ragged":
         leaf = encode_typed_ragged(path, values)
-    elif decision.codec == "media_list_ragged_v1":
+    elif decision.codec == "media_list_ragged":
         leaf = encode_media_list(path, values)
-    elif decision.codec == "bytes_ragged_v1":
-        leaf = encode_bytes_like(path, values, "bytes_ragged_v1")
-    elif decision.codec == "media_bytes_ragged_v1":
-        leaf = encode_bytes_like(path, values, "media_bytes_ragged_v1")
-    elif decision.codec == "utf8_ragged_v1":
+    elif decision.codec == "ndarray":
+        leaf = encode_numeric_scalar_array(path, values, decision)
+    elif decision.codec == "bytes_ragged":
+        leaf = encode_bytes_like(path, values, "bytes_ragged")
+    elif decision.codec == "media_bytes":
+        leaf = encode_bytes_like(path, values, "media_bytes")
+    elif decision.codec == "utf8_ragged":
         leaf = encode_utf8(path, values)
-    elif decision.codec == "json_ragged_v1":
+    elif decision.codec == "json_ragged":
         leaf = encode_json(path, values)
     else:
         leaf = encode_pickle(path, values)
@@ -840,7 +871,7 @@ def encode_leaf(path: str, values: List[Any], decision: CodecDecision) -> Encode
             "decision_reason": decision.reason,
             "decision_confidence": decision.confidence,
             "normalized_type": decision.normalized_type,
-            "fallback": decision.codec == "pickle_ragged_fallback_v1" and not decision.accepted,
+            "fallback": decision.codec == "pickle_ragged_fallback" and not decision.accepted,
             **decision.metadata,
         }
     )
@@ -850,23 +881,25 @@ def encode_leaf(path: str, values: List[Any], decision: CodecDecision) -> Encode
 def decode_leaf(
     codec: str, payload: Dict[str, Any], rows: int, metadata: Optional[Dict[str, Any]] = None, fast_media: bool = False
 ) -> List[Any]:
-    if codec == "ragged_tensor_v1":
+    if codec == "ragged_tensor":
         return decode_ragged_tensor(payload, rows)
-    if codec == "typed_ragged_v1":
+    if codec == "typed_ragged":
         return decode_typed_ragged(payload, rows)
-    if codec == "media_list_ragged_v1":
+    if codec == "media_list_ragged":
         if fast_media:
             return decode_media_list_fast(payload, rows, metadata)
         return decode_media_list(payload, rows, metadata)
-    if codec == "media_bytes_ragged_v1":
+    if codec == "ndarray":
+        return decode_numeric_scalar_array(payload, rows)
+    if codec == "media_bytes":
         return decode_bytes_like(payload, rows, metadata)
-    if codec == "bytes_ragged_v1":
+    if codec == "bytes_ragged":
         return decode_bytes_like(payload, rows)
-    if codec == "utf8_ragged_v1":
+    if codec == "utf8_ragged":
         return decode_utf8(payload, rows)
-    if codec == "json_ragged_v1":
+    if codec == "json_ragged":
         return decode_json(payload, rows)
-    if codec == "pickle_ragged_fallback_v1":
+    if codec == "pickle_ragged_fallback":
         return decode_pickle(payload, rows)
     raise ValueError(f"unknown codec: {codec}")
 
@@ -911,8 +944,7 @@ def infer_and_encode(path: str, values: List[Any], leaves: List[EncodedLeaf], no
         nodes.append({"path": path, "node_type": "list", "lengths": lengths, "children": list(range(max_len))})
         for index in range(max_len):
             child_values = [
-                value[index] if isinstance(value, (list, tuple)) and index < len(value) else None
-                for value in values
+                value[index] if isinstance(value, (list, tuple)) and index < len(value) else None for value in values
             ]
             infer_and_encode(f"{path}[{index}]", child_values, leaves, nodes)
         return
@@ -1019,19 +1051,26 @@ def put_buffers(store: KeyValueStore, buffers: List[Tuple[str, memoryview, Any]]
     keys = [key for key, _, _ in buffers]
     values = [buffer for _, buffer, _ in buffers]
     sizes = [len(buffer) for buffer in values]
-    written = []
+    registered_ptrs = []
     if keys:
         config = create_local_pin_config(store)
         ptrs = [ctypes.addressof(ctypes.c_char.from_buffer(buffer)) if len(buffer) else 0 for buffer in values]
-        results = store.batch_put_from(keys, ptrs, sizes, config)
-        if len(results) != len(keys):
-            cleanup_written_keys(store, keys)
-            raise RuntimeError(f"batch_put_from returned {len(results)} results for {len(keys)} buffers")
-        for key, rc in zip(keys, results):
-            if rc != 0:
+        try:
+            for key, ptr, size in zip(keys, ptrs, sizes):
+                if size:
+                    register_pointer(store, key, ptr, size)
+                    registered_ptrs.append(ptr)
+            results = store.batch_put_from(keys, ptrs, sizes, config)
+            if len(results) != len(keys):
                 cleanup_written_keys(store, keys)
-                raise RuntimeError(f"batch_put_from failed for {key}: {rc}")
-            written.append(key)
+                raise RuntimeError(f"batch_put_from returned {len(results)} results for {len(keys)} buffers")
+            for key, rc in zip(keys, results):
+                if rc != 0:
+                    cleanup_written_keys(store, keys)
+                    raise RuntimeError(f"batch_put_from failed for {key}: {rc}")
+        finally:
+            while registered_ptrs:
+                unregister_pointer(store, registered_ptrs.pop())
     return [{"key": key, "bytes": size} for key, size in zip(keys, sizes)]
 
 
@@ -1080,7 +1119,7 @@ def get_register_profile(store: Any) -> Dict[str, Any]:
 
 def get_registered_buffer_pool(store: KeyValueStore) -> Any:
     if RegisteredBufferPool is None or RegisteredBufferPoolConfig is None:
-        raise ImportError("mooncake.remote_tensor_batch.RegisteredBufferPool is required")
+        raise ImportError("mooncake.registered_buffer_pool.RegisteredBufferPool is required")
     with _STORE_STATE_LOCK:
         pool = _REGISTERED_BUFFER_POOLS.get(id(store))
         if pool is not None:
@@ -1127,45 +1166,79 @@ def unregister_pointer(store: KeyValueStore, ptr: int) -> None:
         raise RuntimeError(f"unregister_buffer failed: {rc}")
 
 
-def new_batch_read_planner(store: KeyValueStore) -> Any:
-    if BatchReadPlanner is None:
-        raise ImportError("mooncake.remote_tensor_batch.BatchReadPlanner is required")
-    return BatchReadPlanner(store)
-
-
-def new_range_read_planner(store: KeyValueStore, ptr: int, capacity: int) -> Any:
-    if RangeReadPlanner is None:
-        raise ImportError("mooncake.remote_tensor_batch.RangeReadPlanner is required")
-    return RangeReadPlanner(store, ptr, capacity)
-
-
 def batch_read_into_pointers(store: KeyValueStore, keys: List[str], ptrs: List[int], sizes: List[int]) -> None:
     if not (len(keys) == len(ptrs) == len(sizes)):
         raise ValueError("keys, ptrs, and sizes must have the same length")
-    planner = new_batch_read_planner(store)
-    for key, ptr, size in zip(keys, ptrs, sizes):
-        planner.add(key, ptr, size)
-    planner.execute()
+    items = [(key, ptr, size) for key, ptr, size in zip(keys, ptrs, sizes) if size]
+    if not items:
+        return
+    read_sizes = store.batch_get_into(
+        [key for key, _ptr, _size in items],
+        [ptr for _key, ptr, _size in items],
+        [size for _key, _ptr, size in items],
+    )
+    if len(read_sizes) != len(items):
+        raise RuntimeError(f"batch_get_into returned {len(read_sizes)} results for {len(items)} reads")
+    for (key, _ptr, expected_size), read_size in zip(items, read_sizes):
+        if read_size != expected_size:
+            raise RuntimeError(f"batch_get_into failed for {key}: expected {expected_size}, got {read_size}")
+
+
+def get_ranges_into_buffer(
+    store: KeyValueStore,
+    ptr: int,
+    keys: List[str],
+    dst_offsets: List[List[int]],
+    src_offsets: List[List[int]],
+    sizes: List[List[int]],
+) -> None:
+    results = store.get_into_ranges([ptr], [keys], [dst_offsets], [src_offsets], [sizes])
+    if len(results) != 1:
+        raise RuntimeError(f"get_into_ranges returned {len(results)} buffer results for one destination")
+    if len(results[0]) != len(keys):
+        raise RuntimeError(f"get_into_ranges returned {len(results[0])} key results for {len(keys)} keys")
+    for key, expected_sizes, key_results in zip(keys, sizes, results[0]):
+        if len(key_results) != len(expected_sizes):
+            raise RuntimeError(
+                f"get_into_ranges returned {len(key_results)} ranges for {key}, expected {len(expected_sizes)}"
+            )
+        for expected_size, read_size in zip(expected_sizes, key_results):
+            if read_size != expected_size:
+                raise RuntimeError(f"get_into_ranges failed for {key}: expected {expected_size}, got {read_size}")
 
 
 def prepare_tensor_payloads(
     store: KeyValueStore,
     entries: List[Dict[str, Any]],
-    planner: Any,
     registered_ptrs: List[int],
-) -> Dict[str, torch.Tensor]:
+    read_items: List[Tuple[str, int, int]],
+    allocator: Optional[Any] = None,
+) -> Tuple[Dict[str, torch.Tensor], List[Any]]:
     tensors = {}
+    regions = []
     try:
         for entry in entries:
             dtype = torch_dtype_from_name(entry["payload"]["dtype"])
-            tensor = torch.empty(entry["shape"], dtype=dtype)
+            tensor_shape = entry["shape"]
+            size = math.prod(tensor_shape) * torch.empty((), dtype=dtype).element_size()
+            if allocator is None:
+                tensor = torch.empty(tensor_shape, dtype=dtype)
+                ptr = tensor.data_ptr()
+                register_pointer(store, entry["key"], ptr, size)
+                registered_ptrs.append(ptr)
+            else:
+                region = allocator.allocate(size)
+                regions.append(region)
+                tensor = torch.frombuffer(region.buffer, dtype=dtype, count=math.prod(tensor_shape)).reshape(
+                    tensor_shape
+                )
+                ptr = region.ptr
+            read_items.append((entry["key"], ptr, size))
             tensors[entry["path"].removeprefix("batch.")] = tensor
-            size = tensor_nbytes(tensor)
-            register_pointer(store, entry["key"], tensor.data_ptr(), size)
-            registered_ptrs.append(tensor.data_ptr())
-            planner.add(entry["key"], tensor.data_ptr(), size, registered=True)
-        return tensors
+        return tensors, regions
     except BaseException:
+        for region in regions:
+            region.close()
         while registered_ptrs:
             unregister_pointer(store, registered_ptrs.pop())
         raise
@@ -1174,7 +1247,7 @@ def prepare_tensor_payloads(
 def prepare_whole_key_payload_reads(
     store: KeyValueStore,
     entries: List[Dict[str, Any]],
-    planner: Any,
+    read_items: List[Tuple[str, int, int]],
 ) -> Dict[str, Dict[str, Any]]:
     prepared = {}
     for entry in entries:
@@ -1186,31 +1259,28 @@ def prepare_whole_key_payload_reads(
             if "chunks" in spec and spec["chunks"] and "key" in spec["chunks"][0]:
                 chunks = spec["chunks"]
                 data = bytearray(int(spec["bytes"]))
-                offset = 0
-                buffers = []
-                for chunk in chunks:
-                    chunk_buffer = bytearray(int(chunk["bytes"]))
-                    buffers.append(chunk_buffer)
-                    chunk_ptr = ctypes.addressof(ctypes.c_char.from_buffer(chunk_buffer))
-                    planner.add(chunk["key"], chunk_ptr, len(chunk_buffer))
+                buffers = [bytearray(int(chunk["bytes"])) for chunk in chunks]
+                read_items.extend(
+                    (chunk["key"], ctypes.addressof(ctypes.c_char.from_buffer(buffer)), len(buffer))
+                    for chunk, buffer in zip(chunks, buffers)
+                )
                 entry_payload[name] = (kind, data, buffers)
                 continue
             if kind == "tensor":
                 dtype = torch_dtype_from_name(spec["dtype"])
                 tensor = torch.empty(spec["shape"], dtype=dtype)
-                planner.add(spec["key"], tensor.data_ptr(), tensor_nbytes(tensor))
+                read_items.append((spec["key"], tensor.data_ptr(), tensor_nbytes(tensor)))
                 entry_payload[name] = tensor
                 continue
             if kind == "ndarray":
                 array = np.empty(spec["shape"], dtype=np.dtype(spec["dtype"]))
-                planner.add(spec["key"], int(array.ctypes.data), numpy_nbytes(array))
+                read_items.append((spec["key"], int(array.ctypes.data), numpy_nbytes(array)))
                 entry_payload[name] = array
                 continue
             if kind in ("bytes", "pickle"):
                 data = bytearray(int(spec["bytes"]))
                 if data:
-                    data_ptr = ctypes.addressof(ctypes.c_char.from_buffer(data))
-                    planner.add(spec["key"], data_ptr, len(data))
+                    read_items.append((spec["key"], ctypes.addressof(ctypes.c_char.from_buffer(data)), len(data)))
                 entry_payload[name] = data
         if entry_payload:
             prepared[entry["path"]] = entry_payload
@@ -1244,13 +1314,18 @@ def read_chunked_tensor_direct(
     if lease is None:
         return False
     try:
-        range_planner = new_range_read_planner(store, tensor.data_ptr(), tensor_bytes)
+        keys = [chunk["key"] for chunk in chunks]
+        dst_offsets = []
+        src_offsets = []
+        sizes = []
         dst_offset = 0
-        for chunk, chunk_bytes in zip(chunks, chunk_sizes):
-            range_planner.add_whole_key(chunk["key"], dst_offset, chunk_bytes)
+        for chunk_bytes in chunk_sizes:
+            dst_offsets.append([dst_offset])
+            src_offsets.append([0])
+            sizes.append([chunk_bytes])
             dst_offset += chunk_bytes
         range_start = now()
-        range_planner.execute()
+        get_ranges_into_buffer(store, tensor.data_ptr(), keys, dst_offsets, src_offsets, sizes)
         profile["direct_range_read_s"] = profile.get("direct_range_read_s", 0.0) + now() - range_start
         profile["direct_range_group_count"] = profile.get("direct_range_group_count", 0) + 1
         profile.setdefault("direct_range_group_sizes", []).append(len(chunks))
@@ -1306,13 +1381,18 @@ def deserialize_payload(
                 if batch_bytes % tensor.element_size() != 0:
                     raise ValueError("range-read batch bytes must be divisible by tensor element size")
                 with pool.buffer(batch_bytes) as lease:
-                    range_planner = new_range_read_planner(store, lease.ptr, lease.size)
+                    keys = [chunk["key"] for chunk in batch_chunks]
+                    dst_offsets = []
+                    src_offsets = []
+                    sizes = []
                     dst_offset = 0
-                    for chunk, chunk_bytes in zip(batch_chunks, (chunk_sizes[index] for index in group)):
-                        range_planner.add_whole_key(chunk["key"], dst_offset, chunk_bytes)
+                    for chunk_bytes in (chunk_sizes[index] for index in group):
+                        dst_offsets.append([dst_offset])
+                        src_offsets.append([0])
+                        sizes.append([chunk_bytes])
                         dst_offset += chunk_bytes
                     range_start = now()
-                    range_planner.execute()
+                    get_ranges_into_buffer(store, lease.ptr, keys, dst_offsets, src_offsets, sizes)
                     range_read_s += now() - range_start
                     range_group_count += 1
                     range_group_sizes.append(len(batch_chunks))
@@ -1353,9 +1433,9 @@ def deserialize_payload(
         else:
             data = bytearray(int(spec["bytes"]))
             if data:
-                planner = new_batch_read_planner(store)
-                planner.add(spec["key"], ctypes.addressof(ctypes.c_char.from_buffer(data)), len(data))
-                planner.execute()
+                batch_read_into_pointers(
+                    store, [spec["key"]], [ctypes.addressof(ctypes.c_char.from_buffer(data))], [len(data)]
+                )
         if kind == "bytes":
             payload[name] = data
         elif kind == "pickle":
@@ -1420,7 +1500,7 @@ class MooncakeDataProtoTransferBackend:
                     {
                         "path": f"batch.{name}",
                         "key": tensor_key,
-                        "codec": "dense_tensor_v1",
+                        "codec": "dense_tensor",
                         "dtype": str(tensor.dtype),
                         "shape": list(tensor.shape),
                         "bytes": tensor_nbytes(tensor),
@@ -1438,10 +1518,10 @@ class MooncakeDataProtoTransferBackend:
             profile["batch"] = [{"path": entry["path"], "bytes": entry["bytes"]} for entry in batch_entries]
 
         infer_start = now()
-        for field, array in data.non_tensor_batch.items():
-            if not isinstance(array, np.ndarray) or array.dtype != object:
-                raise TypeError(f"non_tensor_batch.{field} must be np.ndarray(dtype=object)")
-            infer_and_encode(f"non_tensor_batch.{field}", list(array), leaves, nodes)
+        for field_name, array in data.non_tensor_batch.items():
+            if not isinstance(array, np.ndarray):
+                raise TypeError(f"non_tensor_batch.{field_name} must be np.ndarray")
+            infer_and_encode(f"non_tensor_batch.{field_name}", list(array), leaves, nodes)
         profile["infer_encode_s"] = now() - infer_start
 
         leaf_entries = []
@@ -1587,9 +1667,10 @@ class MooncakeDataProtoTransferBackend:
                 }
             )
 
+        shard_put_profiles = [ref.manifest.get("profile", {}) for ref in shard_refs]
         manifest = {
             "version": 2,
-            "layout": "row_sharded_v1",
+            "layout": "row_sharded",
             "object_id": object_id,
             "row_count": row_count,
             "shards": shards,
@@ -1600,6 +1681,12 @@ class MooncakeDataProtoTransferBackend:
                 "shard_ranges": shard_ranges,
                 "rows_per_shard": [row_end - row_start for row_start, row_end in shard_ranges],
                 "bytes_per_shard": [int(shard["logical_bytes"]) for shard in shards],
+                "batch_put_s": sum(float(profile.get("batch_put_s", 0.0)) for profile in shard_put_profiles),
+                "infer_encode_s": sum(float(profile.get("infer_encode_s", 0.0)) for profile in shard_put_profiles),
+                "leaf_put_s": sum(float(profile.get("leaf_put_s", 0.0)) for profile in shard_put_profiles),
+                "meta_put_s": sum(float(profile.get("meta_put_s", 0.0)) for profile in shard_put_profiles),
+                "manifest_put_s": sum(float(profile.get("manifest_put_s", 0.0)) for profile in shard_put_profiles),
+                "shard_profiles": shard_put_profiles,
                 "transfer_profile": self._transfer_profile_to_dict(decision.profile),
             },
         }
@@ -1622,19 +1709,82 @@ class MooncakeDataProtoTransferBackend:
         fast_media: bool = False,
         max_inflight_get: Optional[int] = None,
         materialize_policy: Optional[DataProtoMaterializePolicy] = None,
+        batch_fields: Optional[List[str]] = None,
+        non_tensor_fields: Optional[List[str]] = None,
+        meta_info_keys: Optional[List[str]] = None,
+        row_slice: Optional[slice | Tuple[int, int, Optional[int]]] = None,
+        indices: Optional[List[int]] = None,
+        include_meta_info: bool = True,
     ) -> Any:
         manifest = ref.manifest or json.loads(self.store.get(ref.manifest_key).decode("utf-8"))
         policy = materialize_policy or DataProtoMaterializePolicy(max_inflight_get=max_inflight_get)
-        if manifest.get("layout") == "row_sharded_v1":
-            return self._materialize_sharded_dataproto(ref, manifest, fast_media=fast_media, materialize_policy=policy)
+        if row_slice is not None or indices is not None:
+            raise NotImplementedError("row_slice/indices selected DataProto materialization is not implemented yet")
+        selection = None
+        if (
+            batch_fields is not None
+            or non_tensor_fields is not None
+            or meta_info_keys is not None
+            or not include_meta_info
+        ):
+            selection = {
+                "batch_fields": None if batch_fields is None else set(batch_fields),
+                "non_tensor_fields": None if non_tensor_fields is None else set(non_tensor_fields),
+                "meta_info_keys": None if meta_info_keys is None else set(meta_info_keys),
+                "include_meta_info": include_meta_info,
+            }
+        if manifest.get("layout") == "row_sharded":
+            return self._materialize_sharded_dataproto(
+                ref,
+                manifest,
+                fast_media=fast_media,
+                materialize_policy=policy,
+                selection=selection,
+            )
         self._prepare_materialize_pool([manifest], policy)
-        return self._materialize_single_dataproto(ref, manifest=manifest, fast_media=fast_media)
+        return self._materialize_single_dataproto(
+            ref,
+            manifest=manifest,
+            fast_media=fast_media,
+            materialize_policy=policy,
+            selection=selection,
+        )
+
+    def get_dataproto_manifest(self, ref: RemoteDataProtoRef | RemoteDataProtoShardedRef) -> DataProtoManifestView:
+        manifest = ref.manifest or json.loads(self.store.get(ref.manifest_key).decode("utf-8"))
+        return self._manifest_view(manifest)
+
+    def get_dataproto_remote_batch(
+        self,
+        ref: RemoteDataProtoRef | RemoteDataProtoShardedRef,
+        batch_fields: Optional[List[str]] = None,
+    ) -> Any:
+        manifest = ref.manifest or json.loads(self.store.get(ref.manifest_key).decode("utf-8"))
+        if manifest.get("layout") == "row_sharded":
+            raise ValueError("get_dataproto_remote_batch currently supports single-manifest refs only")
+        if RemoteTensorBatch is None or TensorFieldRef is None:
+            raise ImportError("mooncake.remote_tensor_batch helpers are required")
+        selected = None if batch_fields is None else set(batch_fields)
+        fields = {}
+        for entry in manifest.get("batch", []):
+            name = entry["path"].removeprefix("batch.")
+            if selected is not None and name not in selected:
+                continue
+            fields[name] = TensorFieldRef(
+                key=entry["key"],
+                shape=tuple(entry["shape"]),
+                dtype=entry["payload"]["dtype"],
+                data_offset=0,
+            )
+        return RemoteTensorBatch(fields=fields, batch_size=int(manifest["row_count"]))
 
     def _materialize_single_dataproto(
         self,
         ref: RemoteDataProtoRef,
         manifest: Dict[str, Any],
         fast_media: bool = False,
+        materialize_policy: Optional[DataProtoMaterializePolicy] = None,
+        selection: Optional[Dict[str, Any]] = None,
     ) -> Any:
         data_cls = self._resolve_data_cls()
         materialize_profile = {
@@ -1657,32 +1807,57 @@ class MooncakeDataProtoTransferBackend:
             "from_dict_s": 0.0,
             "leaves": [],
         }
+        store_profile_before = get_register_profile(self.store)
         registered_buffer_pool = get_registered_buffer_pool(self.store)
         pool_stats_before = registered_buffer_pool.stats()
-        planner = new_batch_read_planner(self.store)
         tensor_ptrs = []
+        tensor_regions = []
+        batch_fields = None if selection is None else selection["batch_fields"]
+        non_tensor_fields = None if selection is None else selection["non_tensor_fields"]
+        selected_batch_entries = (
+            manifest["batch"]
+            if batch_fields is None
+            else [entry for entry in manifest["batch"] if entry["path"].removeprefix("batch.") in batch_fields]
+        )
+        selected_leaf_entries = (
+            manifest["leaves"]
+            if non_tensor_fields is None
+            else [
+                entry
+                for entry in manifest["leaves"]
+                if self._leaf_non_tensor_field(entry["path"]) in non_tensor_fields
+            ]
+        )
         batch_start = now()
-        tensors = prepare_tensor_payloads(self.store, manifest["batch"], planner, tensor_ptrs)
+        batch_planner_start = now()
+        read_items = []
+        tensors, tensor_regions = prepare_tensor_payloads(self.store, selected_batch_entries, tensor_ptrs, read_items)
         cleanup_errors = []
         try:
-            prepared_payloads = prepare_whole_key_payload_reads(self.store, manifest["leaves"], planner)
-            planner_start = now()
-            planner.execute()
-            materialize_profile["batch_planner_s"] = now() - planner_start
+            prepared_payloads = prepare_whole_key_payload_reads(self.store, selected_leaf_entries, read_items)
+            materialize_profile["batch_planner_s"] = now() - batch_planner_start
+            batch_read_into_pointers(
+                self.store,
+                [key for key, _ptr, _size in read_items],
+                [ptr for _key, ptr, _size in read_items],
+                [size for _key, _ptr, size in read_items],
+            )
         finally:
+            for region in tensor_regions:
+                region.close()
             for ptr in tensor_ptrs:
                 try:
                     unregister_pointer(self.store, ptr)
                 except RuntimeError as exc:
                     cleanup_errors.append(exc)
         if cleanup_errors:
-            raise RuntimeError(
-                f"failed to unregister {len(cleanup_errors)} dense tensor buffers"
-            ) from cleanup_errors[0]
+            raise RuntimeError(f"failed to unregister {len(cleanup_errors)} dense tensor buffers") from cleanup_errors[
+                0
+            ]
         materialize_profile["batch_get_s"] = now() - batch_start
 
         leaves_by_field: Dict[str, List[Tuple[Dict[str, Any], List[Any]]]] = {}
-        for entry in manifest["leaves"]:
+        for entry in selected_leaf_entries:
             payload_start = now()
             leaf_profile: Dict[str, Any] = {}
             payload = deserialize_payload(
@@ -1694,9 +1869,7 @@ class MooncakeDataProtoTransferBackend:
             )
             payload_s = now() - payload_start
             decode_start = now()
-            values = decode_leaf(
-                entry["codec"], payload, entry["rows"], entry.get("metadata"), fast_media=fast_media
-            )
+            values = decode_leaf(entry["codec"], payload, entry["rows"], entry.get("metadata"), fast_media=fast_media)
             decode_s = now() - decode_start
             materialize_profile["leaf_payload_get_s"] += payload_s
             materialize_profile["leaf_decode_s"] += decode_s
@@ -1730,20 +1903,29 @@ class MooncakeDataProtoTransferBackend:
         reconstruct_start = now()
         non_tensors = {}
         nodes_by_path = {node["path"]: node for node in manifest["nodes"]}
-        for field, field_leaves in leaves_by_field.items():
-            root_path = f"non_tensor_batch.{field}"
+        for field_name, field_leaves in leaves_by_field.items():
+            root_path = f"non_tensor_batch.{field_name}"
             if root_path not in nodes_by_path and len(field_leaves) == 1 and field_leaves[0][0]["path"] == root_path:
                 values = field_leaves[0][1]
+                if isinstance(values, np.ndarray):
+                    non_tensors[field_name] = values
+                    continue
             else:
                 values = self._reconstruct_struct(root_path, field_leaves, nodes_by_path, manifest["row_count"])
             array = np.empty(len(values), dtype=object)
             array[:] = values
-            non_tensors[field] = array
+            non_tensors[field_name] = array
         materialize_profile["reconstruct_s"] = now() - reconstruct_start
 
         meta_start = now()
-        meta_info = pickle.loads(self.store.get(manifest["meta_info_key"]))
+        if selection is not None and not selection["include_meta_info"]:
+            meta_info = {}
+        else:
+            meta_info = pickle.loads(self.store.get(manifest["meta_info_key"]))
+            if selection is not None and selection["meta_info_keys"] is not None:
+                meta_info = {key: meta_info[key] for key in selection["meta_info_keys"] if key in meta_info}
         materialize_profile["meta_info_s"] = now() - meta_start
+        store_profile_after = get_register_profile(self.store)
         pool_stats_after = registered_buffer_pool.stats()
         materialize_profile["registered_buffer_pool"] = {
             "size_classes": pool_stats_after.size_classes,
@@ -1759,8 +1941,21 @@ class MooncakeDataProtoTransferBackend:
                 pool_stats_after.oversize_allocate_count - pool_stats_before.oversize_allocate_count
             ),
             "wait_count_delta": pool_stats_after.wait_count - pool_stats_before.wait_count,
+            "register_s_delta": pool_stats_after.register_s - pool_stats_before.register_s,
+            "unregister_s_delta": pool_stats_after.unregister_s - pool_stats_before.unregister_s,
             "register_s_total": pool_stats_after.register_s,
             "unregister_s_total": pool_stats_after.unregister_s,
+        }
+        materialize_profile["store_register"] = {
+            "register_count_delta": store_profile_after["register_count"] - store_profile_before["register_count"],
+            "unregister_count_delta": store_profile_after["unregister_count"]
+            - store_profile_before["unregister_count"],
+            "registered_bytes_delta": store_profile_after["registered_bytes"]
+            - store_profile_before["registered_bytes"],
+            "register_s_delta": store_profile_after["register_s"] - store_profile_before["register_s"],
+            "unregister_s_delta": store_profile_after["unregister_s"] - store_profile_before["unregister_s"],
+            "register_s_total": store_profile_after["register_s"],
+            "unregister_s_total": store_profile_after["unregister_s"],
         }
         meta_info["mooncake_materialize_profile"] = materialize_profile
         from_dict_start = now()
@@ -1779,6 +1974,7 @@ class MooncakeDataProtoTransferBackend:
         manifest: Dict[str, Any],
         fast_media: bool = False,
         materialize_policy: Optional[DataProtoMaterializePolicy] = None,
+        selection: Optional[Dict[str, Any]] = None,
     ) -> Any:
         data_cls = self._resolve_data_cls()
         shards = sorted(manifest["shards"], key=lambda shard: int(shard["row_start"]))
@@ -1787,7 +1983,12 @@ class MooncakeDataProtoTransferBackend:
         parent_policy = manifest.get("policy", {})
         policy = materialize_policy or DataProtoMaterializePolicy()
         max_workers = self._select_materialize_inflight(parent_policy, policy, len(shards))
+        registered_buffer_pool = get_registered_buffer_pool(self.store)
+        pool_stats_before = registered_buffer_pool.stats()
+        pool_prepare_start = now()
         self._prepare_materialize_pool([shard.get("manifest", {}) for shard in shards], policy, max_workers)
+        pool_stats_after_prepare = registered_buffer_pool.stats()
+        pool_prepare_s = now() - pool_prepare_start
         materialize_start = now()
 
         def materialize_shard(shard: Dict[str, Any]) -> Tuple[int, Any, float]:
@@ -1798,7 +1999,9 @@ class MooncakeDataProtoTransferBackend:
                 manifest=shard.get("manifest", {}),
             )
             shard_start = now()
-            proto = self._materialize_single_dataproto(shard_ref, shard_ref.manifest, fast_media)
+            proto = self._materialize_single_dataproto(
+                shard_ref, shard_ref.manifest, fast_media, materialize_policy=policy, selection=selection
+            )
             return int(shard["shard_id"]), proto, now() - shard_start
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1809,35 +2012,107 @@ class MooncakeDataProtoTransferBackend:
         proto = data_cls.concat(materialized)
         concat_s = now() - concat_start
         total_s = now() - materialize_start
+        pool_stats_after = registered_buffer_pool.stats()
         shard_materialize_s = {str(shard_id): elapsed for shard_id, _proto, elapsed in results}
         shard_profiles = [item[1].meta_info.get("mooncake_materialize_profile", {}) for item in results]
         feedback = self._build_sharded_feedback(total_s, shard_materialize_s, shard_profiles, max_workers)
-        self._update_adaptive_state(feedback, policy)
         materialize_profile = {
-            "layout": "row_sharded_v1",
+            "layout": "row_sharded",
             "fast_media": fast_media,
             "shard_count": len(shards),
             "max_inflight_get": max_workers,
             "shard_materialize_s": shard_materialize_s,
+            "shard_profiles": shard_profiles,
             "concat_s": concat_s,
             "total_s": total_s,
+            "registered_buffer_pool": {
+                "size_classes": pool_stats_after.size_classes,
+                "free_regions": pool_stats_after.free_regions,
+                "in_use_regions": pool_stats_after.in_use_regions,
+                "total_regions": pool_stats_after.total_regions,
+                "total_bytes": pool_stats_after.total_bytes,
+                "free_bytes": pool_stats_after.free_bytes,
+                "prepare_s": pool_prepare_s,
+                "prepare_register_s_delta": pool_stats_after_prepare.register_s - pool_stats_before.register_s,
+                "prepare_unregister_s_delta": pool_stats_after_prepare.unregister_s - pool_stats_before.unregister_s,
+                "register_s_delta": pool_stats_after.register_s - pool_stats_before.register_s,
+                "unregister_s_delta": pool_stats_after.unregister_s - pool_stats_before.unregister_s,
+                "register_s_total": pool_stats_after.register_s,
+                "unregister_s_total": pool_stats_after.unregister_s,
+            },
             "parallel_feedback": feedback,
-            "adaptive_state": self._adaptive_state_to_dict(),
             "parent_policy": parent_policy,
             "materialize_policy": {
                 "max_inflight_get": policy.max_inflight_get,
                 "pool_prewarm": policy.pool_prewarm,
                 "pool_prewarm_size": policy.pool_prewarm_size,
                 "pool_prewarm_count": policy.pool_prewarm_count,
-                "adaptive_feedback": policy.adaptive_feedback,
             },
         }
         proto.meta_info["mooncake_materialize_profile"] = materialize_profile
         return proto
 
+    def _leaf_non_tensor_field(self, path: str) -> str:
+        if not path.startswith("non_tensor_batch."):
+            return path_field(path)
+        remainder = path.removeprefix("non_tensor_batch.")
+        return remainder.split(".", 1)[0]
+
+    def _manifest_view(self, manifest: Dict[str, Any]) -> DataProtoManifestView:
+        if manifest.get("layout") == "row_sharded":
+            batch_fields: Dict[str, Dict[str, Any]] = {}
+            non_tensor_fields: Dict[str, Dict[str, Any]] = {}
+            for shard in manifest.get("shards", []):
+                view = self._manifest_view(shard["manifest"])
+                for name, info in view.batch_fields.items():
+                    merged = batch_fields.setdefault(name, dict(info, bytes=0, shards=0))
+                    merged["bytes"] += int(info.get("bytes", 0))
+                    merged["shards"] += 1
+                for name, info in view.non_tensor_fields.items():
+                    merged = non_tensor_fields.setdefault(name, dict(info, bytes=0, shards=0))
+                    merged["bytes"] += int(info.get("bytes", 0))
+                    merged["shards"] += 1
+            return DataProtoManifestView(
+                row_count=int(manifest["row_count"]),
+                batch_fields=batch_fields,
+                non_tensor_fields=non_tensor_fields,
+                meta_info_key=None,
+                layout="row_sharded",
+                object_id=manifest.get("object_id"),
+            )
+        batch_fields = {
+            entry["path"].removeprefix("batch."): {
+                "path": entry["path"],
+                "shape": list(entry["shape"]),
+                "dtype": entry["payload"]["dtype"],
+                "bytes": int(entry["bytes"]),
+            }
+            for entry in manifest.get("batch", [])
+        }
+        non_tensor_fields: Dict[str, Dict[str, Any]] = {}
+        for entry in manifest.get("leaves", []):
+            name = self._leaf_non_tensor_field(entry["path"])
+            info = non_tensor_fields.setdefault(
+                name,
+                {"path": f"non_tensor_batch.{name}", "bytes": 0, "codecs": set(), "leaves": 0},
+            )
+            info["bytes"] += int(entry.get("bytes", 0))
+            info["codecs"].add(entry.get("codec"))
+            info["leaves"] += 1
+        for info in non_tensor_fields.values():
+            info["codecs"] = sorted(codec for codec in info["codecs"] if codec is not None)
+        return DataProtoManifestView(
+            row_count=int(manifest["row_count"]),
+            batch_fields=batch_fields,
+            non_tensor_fields=non_tensor_fields,
+            meta_info_key=manifest.get("meta_info_key"),
+            layout="single",
+            object_id=manifest.get("object_id"),
+        )
+
     def remove_dataproto(self, ref: RemoteDataProtoRef | RemoteDataProtoShardedRef) -> None:
         manifest = ref.manifest or json.loads(self.store.get(ref.manifest_key).decode("utf-8"))
-        if manifest.get("layout") == "row_sharded_v1":
+        if manifest.get("layout") == "row_sharded":
             errors = []
             for shard in manifest["shards"]:
                 shard_ref = RemoteDataProtoRef(
@@ -1968,7 +2243,7 @@ class MooncakeDataProtoTransferBackend:
         row_bytes_p95 = self._percentile(row_bytes_sorted, 0.95)
         row_bytes_max = max(row_bytes_sorted, default=0)
         row_skew_ratio = float(row_bytes_max) / max(float(row_bytes_p50), 1.0)
-        row_skewed = row_skew_ratio >= 3.0 and row_bytes_max >= 64 * 1024 ** 2
+        row_skewed = row_skew_ratio >= 3.0 and row_bytes_max >= 64 * 1024**2
         return DataProtoTransferProfile(
             total_bytes=int(total_bytes),
             dense_tensor_bytes=int(dense_tensor_bytes),
@@ -2106,13 +2381,6 @@ class MooncakeDataProtoTransferBackend:
     ) -> int:
         requested = policy.max_inflight_get or parent_policy.get("max_inflight_get", 8)
         selected = max(1, min(shard_count, int(requested)))
-        if not policy.adaptive_feedback:
-            return selected
-        state = self._get_adaptive_state()
-        if state.pressure_level == "throttle":
-            selected = max(1, min(selected, max(1, int(math.ceil(selected / 2)))))
-        elif state.pressure_level == "elevated":
-            selected = max(1, min(selected, state.last_max_inflight_get or selected))
         return selected
 
     def _build_sharded_feedback(
@@ -2143,59 +2411,6 @@ class MooncakeDataProtoTransferBackend:
             "pressure_level": pressure_level,
             "max_inflight_get": max_workers,
         }
-
-    def _get_adaptive_state(self) -> DataProtoTransferAdaptiveState:
-        with _STORE_STATE_LOCK:
-            state = _TRANSFER_ADAPTIVE_STATES.get(id(self.store))
-            if state is None:
-                state = DataProtoTransferAdaptiveState()
-                _TRANSFER_ADAPTIVE_STATES[id(self.store)] = state
-            return state
-
-    def _update_adaptive_state(self, feedback: Dict[str, Any], policy: DataProtoMaterializePolicy) -> None:
-        if not policy.adaptive_feedback:
-            return
-        with _STORE_STATE_LOCK:
-            state = self._get_adaptive_state()
-            alpha = 0.25
-            if state.update_count == 0:
-                state.ewma_parallel_efficiency = float(feedback["parallel_efficiency"])
-                state.ewma_pool_wait_count = float(feedback["pool_wait_count"])
-                state.ewma_direct_range_fallback_count = float(feedback["direct_range_fallback_count"])
-            else:
-                state.ewma_parallel_efficiency = self._ewma(
-                    state.ewma_parallel_efficiency,
-                    float(feedback["parallel_efficiency"]),
-                    alpha,
-                )
-                state.ewma_pool_wait_count = self._ewma(
-                    state.ewma_pool_wait_count,
-                    float(feedback["pool_wait_count"]),
-                    alpha,
-                )
-                state.ewma_direct_range_fallback_count = self._ewma(
-                    state.ewma_direct_range_fallback_count,
-                    float(feedback["direct_range_fallback_count"]),
-                    alpha,
-                )
-            state.pressure_level = str(feedback["pressure_level"])
-            state.last_max_inflight_get = int(feedback.get("max_inflight_get", 0)) or state.last_max_inflight_get
-            state.update_count += 1
-
-    def _ewma(self, previous: float, current: float, alpha: float) -> float:
-        return previous * (1.0 - alpha) + current * alpha
-
-    def _adaptive_state_to_dict(self) -> Dict[str, Any]:
-        with _STORE_STATE_LOCK:
-            state = self._get_adaptive_state()
-            return {
-                "pressure_level": state.pressure_level,
-                "last_max_inflight_get": state.last_max_inflight_get,
-                "ewma_parallel_efficiency": state.ewma_parallel_efficiency,
-                "ewma_pool_wait_count": state.ewma_pool_wait_count,
-                "ewma_direct_range_fallback_count": state.ewma_direct_range_fallback_count,
-                "update_count": state.update_count,
-            }
 
     def _prepare_materialize_pool(
         self,
