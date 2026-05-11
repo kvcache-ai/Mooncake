@@ -2858,6 +2858,26 @@ void Client::StorageHeartbeatThreadMain() {
             ErrorCode err = remount_result.error();
             LOG(ERROR) << "Failed to remount segments: " << err;
         }
+        // Re-publish Transfer Engine segment descriptors to the HTTP
+        // metadata server.  When Master (which hosts the HTTP metadata
+        // server in the same process) is killed and restarted, all
+        // in-memory KV entries are lost.  ReMountSegment above only
+        // restores Master-side allocation state; it does NOT write back
+        // the transport-level segment descriptors.  Without this, remote
+        // peers get HTTP 404 when querying our segment descriptor and
+        // data transfers fail.
+        auto metadata = transfer_engine_->getMetadata();
+        if (metadata) {
+            int rc = metadata->updateLocalSegmentDesc();
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to re-publish segment descriptor "
+                           << "to metadata server, rc=" << rc;
+            }
+        }
+        // Note: LOCAL_DISK segment remount is NOT done here.
+        // It is handled by FileStorage::Heartbeat() when it detects
+        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
+        // re-register offloaded object metadata.
     };
     // Use another thread to remount segments to avoid blocking the ping
     // thread
