@@ -18,6 +18,8 @@ use parking_lot::RwLock;
 use crate::keyspace::encode_key_component;
 use crate::segment_state::StoredSegmentState;
 
+static NEXT_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Default)]
 struct InMemoryState {
     clients: BTreeMap<String, ClientLease>,
@@ -38,6 +40,7 @@ pub struct InMemoryMetadataBackend {
     state: Arc<RwLock<InMemoryState>>,
     namespace_id: u64,
     tenant_prefix: Option<String>,
+    default_tenant_legacy_mode: bool,
 }
 
 impl Default for InMemoryMetadataBackend {
@@ -48,17 +51,33 @@ impl Default for InMemoryMetadataBackend {
 
 impl InMemoryMetadataBackend {
     pub fn new() -> Self {
-        static NEXT_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
         Self {
             state: Arc::new(RwLock::new(InMemoryState::default())),
             namespace_id: NEXT_NAMESPACE_ID.fetch_add(1, Ordering::Relaxed),
             tenant_prefix: None,
+            default_tenant_legacy_mode: true,
+        }
+    }
+
+    pub fn new_hard_isolated() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(InMemoryState::default())),
+            namespace_id: NEXT_NAMESPACE_ID.fetch_add(1, Ordering::Relaxed),
+            tenant_prefix: None,
+            default_tenant_legacy_mode: false,
+        }
+    }
+
+    fn effective_tenant_prefix(&self) -> Option<&str> {
+        if self.default_tenant_legacy_mode {
+            None
+        } else {
+            self.tenant_prefix.as_deref()
         }
     }
 
     fn tenant_storage_prefix(&self) -> Option<String> {
-        self.tenant_prefix
-            .as_deref()
+        self.effective_tenant_prefix()
             .map(|tenant| format!("tenant:{}", encode_key_component(tenant)))
     }
 
@@ -221,7 +240,7 @@ fn now_ms() -> u64 {
 
 impl MetadataBackend for InMemoryMetadataBackend {
     fn route_namespace(&self) -> String {
-        match self.tenant_prefix.as_deref() {
+        match self.effective_tenant_prefix() {
             Some(prefix) => format!("inmemory://{}/tenants/{}", self.namespace_id, prefix),
             None => format!("inmemory://{}", self.namespace_id),
         }
@@ -232,6 +251,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             state: self.state.clone(),
             namespace_id: self.namespace_id,
             tenant_prefix: Some(tenant.to_string()),
+            default_tenant_legacy_mode: self.default_tenant_legacy_mode,
         }))
     }
 

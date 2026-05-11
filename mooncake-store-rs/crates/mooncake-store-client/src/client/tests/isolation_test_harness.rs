@@ -63,7 +63,7 @@ impl IsolationCluster {
     where
         F: FnOnce(&Arc<InMemoryMetadataBackend>),
     {
-        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let metadata = Arc::new(InMemoryMetadataBackend::new_hard_isolated());
         let hub = Arc::new(TestTransport::new(&format!("{prefix}-hub")));
         setup(&metadata);
         let mut clients = Vec::with_capacity(n);
