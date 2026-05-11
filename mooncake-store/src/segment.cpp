@@ -247,8 +247,6 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
         segment_manager_->allocator_manager_.removeAllocator(segment.name,
                                                              allocator);
     }
-    mounted_segment.buf_allocator.reset();
-
     // Set the segment status to GRACEFULLY_UNMOUNTING
     mounted_segment.status = SegmentStatus::GRACEFULLY_UNMOUNTING;
     return ErrorCode::OK;

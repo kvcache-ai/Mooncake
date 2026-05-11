@@ -5304,8 +5304,7 @@ void MasterService::GracefulUnmountScheduler::Schedule(
         if (stopping_) {
             return;
         }
-        auto generation = client_generations_[client_id];
-        queue_.push(Record{segment_id, client_id, generation, expire_time});
+        queue_.push(Record{segment_id, client_id, expire_time});
         if (!timer_running_.load()) {
             timer_running_.store(true);
             timer_thread_ = std::thread([this]() { this->TimerLoop(); });
@@ -5317,7 +5316,18 @@ void MasterService::GracefulUnmountScheduler::Schedule(
 void MasterService::GracefulUnmountScheduler::RemoveClientRecords(
     const UUID& client_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    ++client_generations_[client_id];
+    std::vector<Record> remaining;
+    remaining.reserve(queue_.size());
+    while (!queue_.empty()) {
+        auto rec = queue_.top();
+        queue_.pop();
+        if (rec.client_id != client_id) {
+            remaining.push_back(rec);
+        }
+    }
+    for (auto& rec : remaining) {
+        queue_.push(rec);
+    }
     timer_cv_.notify_one();
 }
 
@@ -5361,19 +5371,17 @@ void MasterService::GracefulUnmountScheduler::TimerLoop() {
             expired.push_back(queue_.top());
             queue_.pop();
         }
-        lock.unlock();
 
         for (auto& rec : expired) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto generation_it = client_generations_.find(rec.client_id);
-                if (generation_it != client_generations_.end() &&
-                    generation_it->second != rec.client_generation) {
-                    continue;
-                }
-            }
             if (service_) {
-                service_->UnmountSegment(rec.segment_id, rec.client_id);
+                auto result =
+                    service_->UnmountSegment(rec.segment_id, rec.client_id);
+                if (!result.has_value()) {
+                    LOG(WARNING)
+                        << "Failed to complete graceful unmount, segment_id="
+                        << rec.segment_id << ", client_id=" << rec.client_id
+                        << ", error=" << toString(result.error());
+                }
             }
         }
     }

@@ -100,9 +100,21 @@ Client::~Client() {
         leader_monitor_thread_.join();
     }
 
+    {
+        std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
+        graceful_unmount_timer_stopping_ = true;
+    }
+    graceful_unmount_timer_cv_.notify_all();
+
+    // Stop queued timer/task callbacks before tearing down segment state.
+    task_running_ = false;
+    task_thread_pool_.stop();
+
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
     std::vector<Segment> gracefully_unmounting_segments_copy;
+    std::vector<std::pair<UUID, std::function<void(const UUID&)>>>
+        graceful_cleanup_callbacks;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_copy.reserve(mounted_segments_.size());
@@ -112,6 +124,13 @@ Client::~Client() {
         for (auto& entry : gracefully_unmounting_segments_) {
             gracefully_unmounting_segments_copy.emplace_back(entry.second);
         }
+        graceful_cleanup_callbacks.reserve(
+            graceful_unmount_cleanup_callbacks_.size());
+        for (auto& entry : graceful_unmount_cleanup_callbacks_) {
+            graceful_cleanup_callbacks.emplace_back(entry.first,
+                                                    std::move(entry.second));
+        }
+        graceful_unmount_cleanup_callbacks_.clear();
     }
 
     // Unmount mounted segments: notify master + local cleanup
@@ -139,21 +158,17 @@ Client::~Client() {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_.clear();
         gracefully_unmounting_segments_.clear();
-        graceful_unmount_cleanup_callbacks_.clear();
     }
-    {
-        std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
-        graceful_unmount_timer_stopping_ = true;
+
+    for (auto& entry : graceful_cleanup_callbacks) {
+        if (entry.second) {
+            entry.second(entry.first);
+        }
     }
-    graceful_unmount_timer_cv_.notify_all();
 
     // Stop hot cache handler and hot cache
     hot_cache_handler_.reset();
     hot_cache_.reset();
-
-    // Stop task thread pool after task polling has stopped.
-    task_running_ = false;
-    task_thread_pool_.stop();
 }
 
 static std::optional<bool> get_auto_discover() {

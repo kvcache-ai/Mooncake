@@ -5356,6 +5356,16 @@ TEST_F(MasterServiceTest, GracefulUnmountSegment_PreventAllocation) {
     ASSERT_TRUE(status1.has_value());
     EXPECT_EQ(status1.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
 
+    // Existing replicas on the graceful segment should remain readable during
+    // the grace window.
+    auto existing_replicas = service_->GetReplicaList(key);
+    ASSERT_TRUE(existing_replicas.has_value());
+    ASSERT_EQ(existing_replicas->replicas.size(), 1u);
+    EXPECT_EQ(existing_replicas->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              segment1.name);
+
     // Segment2 status should still be OK
     auto status2 = service_->QuerySegmentStatus(segment2.name);
     ASSERT_TRUE(status2.has_value());
