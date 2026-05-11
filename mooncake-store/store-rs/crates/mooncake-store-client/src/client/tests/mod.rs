@@ -16,7 +16,7 @@ use mooncake_store_core::{
     TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantObjectAccounting,
     TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
     TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy, TenantQuotaReservation,
-    TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
+    TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy, DEFAULT_TENANT,
 };
 use mooncake_transport::{Opcode, TransferPacingMode};
 use parking_lot::Mutex;
@@ -2416,6 +2416,13 @@ fn test_segment_target_chunks(
 fn test_storage_nodes() -> &'static Mutex<Vec<Arc<StoreClient>>> {
     static STORAGE_NODES: OnceLock<Mutex<Vec<Arc<StoreClient>>>> = OnceLock::new();
     STORAGE_NODES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn tenant_metadata(
+    metadata: &Arc<InMemoryMetadataBackend>,
+    tenant: &str,
+) -> Arc<dyn MetadataBackend> {
+    metadata.for_tenant(tenant).expect("tenant metadata view")
 }
 
 fn wait_for_runtime_visibility(client: &StoreClient, runtime: &ClientRuntimeId) {
@@ -5848,7 +5855,7 @@ fn embedded_wrh_query_route_ignores_metadata_after_authority_miss() {
         )
         .expect("seed routed put should succeed");
 
-    let namespace = metadata.route_namespace();
+    let namespace = tenant_metadata(&metadata, DEFAULT_TENANT).route_namespace();
     let scoped_key = ObjectKey::new("default::route-repair-metadata");
     let seed_route = reader
         .query_route("route-repair-metadata")
@@ -9554,7 +9561,7 @@ fn builder_ignores_stale_segment_owner_index_without_live_lease() {
         .segment_name("stale-shared-segment")
         .build(test_future_expiry_ms())
         .expect("segment owner should build");
-    inner
+    tenant_metadata(&inner, DEFAULT_TENANT)
         .update_client_state(owner.runtime_id(), ClientLifecycleState::Draining)
         .expect("owner should be marked non-active");
 
@@ -9581,7 +9588,7 @@ fn builder_can_stage_active_until_local_memory_registration() {
         .expect("staged client should build");
 
     assert_eq!(client.lease().state, ClientLifecycleState::Standby);
-    let before = metadata
+    let before = tenant_metadata(&metadata, DEFAULT_TENANT)
         .get_client_lease(client.runtime_id())
         .expect("staged lease lookup should succeed")
         .expect("staged lease should exist");
@@ -9592,7 +9599,7 @@ fn builder_can_stage_active_until_local_memory_registration() {
         .expect("local memory registration should activate staged client");
 
     assert_eq!(client.lease().state, ClientLifecycleState::Active);
-    let after = metadata
+    let after = tenant_metadata(&metadata, DEFAULT_TENANT)
         .list_live_clients()
         .expect("live clients should list")
         .into_iter()
@@ -12600,7 +12607,7 @@ fn draining_route_authority_mirrors_local_routes_before_restart() {
         .expect("seed route should write to store");
     assert_eq!(route.replicas[0].owner, *store.runtime_id());
 
-    let namespace = metadata.route_namespace();
+    let namespace = tenant_metadata(&metadata, DEFAULT_TENANT).route_namespace();
     let scoped_key = ObjectKey::new(format!("default::{key}"));
     authority_replace(&namespace, &store.runtime_id().stable_id, &scoped_key, None)
         .expect("test should remove store mirror");
@@ -12705,7 +12712,7 @@ fn drain_migration_refreshes_the_draining_route_authority() {
         .expect("seed route should write to victim");
     assert_eq!(route.replicas[0].owner, *victim.runtime_id());
 
-    let namespace = metadata.route_namespace();
+    let namespace = tenant_metadata(&metadata, DEFAULT_TENANT).route_namespace();
     let scoped_key = ObjectKey::new(format!("default::{key}"));
     authority_replace(
         &namespace,
