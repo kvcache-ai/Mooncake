@@ -832,11 +832,13 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         if (desc->type == SegmentType::File) {
             if (checkAvailability(transport_list_[GDS], local_mtype)) {
                 if (priority-- == 0) result.transport = GDS;
-            } else if (checkAvailability(transport_list_[IOURING], local_mtype)) {
+            } else if (checkAvailability(transport_list_[IOURING],
+                                         local_mtype)) {
                 if (priority-- == 0) result.transport = IOURING;
             }
         } else {
-            auto entry = desc->findBuffer(request.target_offset, request.length);
+            auto entry =
+                desc->findBuffer(request.target_offset, request.length);
             if (entry) {
                 bool same_machine = (request.target_id == LOCAL_SEGMENT_ID);
                 if (!same_machine) {
@@ -845,9 +847,11 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                    !local_desc->machine_id.empty() &&
                                    desc->machine_id == local_desc->machine_id;
                 }
-                auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
+                auto remote_mtype =
+                    getTypeEnum(LocationParser(entry->location).type());
                 for (auto type : entry->transports) {
-                    if ((type == NVLINK || type == SHM) && !same_machine) continue;
+                    if ((type == NVLINK || type == SHM) && !same_machine)
+                        continue;
                     if (checkAvailability(transport_list_[type], local_mtype,
                                           remote_mtype)) {
                         if (priority-- == 0) {

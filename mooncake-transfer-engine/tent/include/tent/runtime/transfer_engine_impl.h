@@ -181,8 +181,7 @@ class TransferEngineImpl {
 
     Status lazyFreeBatch();
 
-    SelectionResult getTransportType(const Request& request,
-                                     int priority = 0);
+    SelectionResult getTransportType(const Request& request, int priority = 0);
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);

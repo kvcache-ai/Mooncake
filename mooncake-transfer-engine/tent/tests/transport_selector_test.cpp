@@ -48,7 +48,8 @@ class FakeTransport : public Transport {
 
     Status freeSubBatch(SubBatchRef&) override { return Status::OK(); }
 
-    Status submitTransferTasks(SubBatchRef, const std::vector<Request>&) override {
+    Status submitTransferTasks(SubBatchRef,
+                               const std::vector<Request>&) override {
         return Status::OK();
     }
 
@@ -79,7 +80,8 @@ TEST(TransportSelectorTest, DefaultPoliciesFileSegment) {
     TransportSelector selector(conf);
 
     // Create fake transports
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[GDS] = std::make_shared<FakeTransport>(GDS);
     transports[IOURING] = std::make_shared<FakeTransport>(IOURING);
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
@@ -109,7 +111,8 @@ TEST(TransportSelectorTest, DefaultPoliciesFileSegmentGpuMemory) {
     TransportSelector selector(conf);
 
     // Create fake transports
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[GDS] = std::make_shared<FakeTransport>(GDS);
     transports[IOURING] = std::make_shared<FakeTransport>(IOURING);
 
@@ -130,7 +133,8 @@ TEST(TransportSelectorTest, DefaultPoliciesFileSegmentGpuMemory) {
     ctx.buffer_transports = nullptr;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, GDS) << "File segment with GPU should prefer GDS first";
+    EXPECT_EQ(result.transport, GDS)
+        << "File segment with GPU should prefer GDS first";
 }
 
 TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
@@ -138,7 +142,8 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
     TransportSelector selector(conf);
 
     // Create fake transports
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     transports[TCP] = std::make_shared<FakeTransport>(TCP);
 
@@ -159,7 +164,8 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
     ctx.buffer_transports = &buffer_transports;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, RDMA) << "Should use first in buffer_transports";
+    EXPECT_EQ(result.transport, RDMA)
+        << "Should use first in buffer_transports";
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +203,8 @@ TEST(TransportSelectorTest, LegacyModeDefaultOff) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    EXPECT_FALSE(selector.isLegacyMode()) << "Legacy mode should be off by default";
+    EXPECT_FALSE(selector.isLegacyMode())
+        << "Legacy mode should be off by default";
 }
 
 TEST(TransportSelectorTest, LegacyModeCanBeEnabled) {
@@ -219,7 +226,8 @@ TEST(TransportSelectorTest, TransportCapabilityDramToDram) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
     rdma->setDramToDram(true);
@@ -233,14 +241,16 @@ TEST(TransportSelectorTest, TransportCapabilityDramToDram) {
     ctx.buffer_transports = &buffer_transports;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, RDMA) << "RDMA should be available for CPU-to-CPU";
+    EXPECT_EQ(result.transport, RDMA)
+        << "RDMA should be available for CPU-to-CPU";
 }
 
 TEST(TransportSelectorTest, TransportCapabilityGpuToGpu) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
     rdma->setGpuToGpu(true);
@@ -254,14 +264,16 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToGpu) {
     ctx.buffer_transports = &buffer_transports;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, RDMA) << "RDMA should be available for CUDA-to-CUDA";
+    EXPECT_EQ(result.transport, RDMA)
+        << "RDMA should be available for CUDA-to-CUDA";
 }
 
 TEST(TransportSelectorTest, TransportCapabilityDramToGpu) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
     rdma->setDramToGpu(true);
@@ -275,14 +287,16 @@ TEST(TransportSelectorTest, TransportCapabilityDramToGpu) {
     ctx.buffer_transports = &buffer_transports;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, RDMA) << "RDMA should be available for CPU-to-CUDA";
+    EXPECT_EQ(result.transport, RDMA)
+        << "RDMA should be available for CPU-to-CUDA";
 }
 
 TEST(TransportSelectorTest, TransportCapabilityGpuToDram) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
     rdma->setGpuToDram(true);
@@ -296,14 +310,16 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToDram) {
     ctx.buffer_transports = &buffer_transports;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, RDMA) << "RDMA should be available for CUDA-to-CPU";
+    EXPECT_EQ(result.transport, RDMA)
+        << "RDMA should be available for CUDA-to-CPU";
 }
 
 TEST(TransportSelectorTest, FileSegmentDramToFile) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[GDS] = std::make_shared<FakeTransport>(GDS);
     auto* gds = static_cast<FakeTransport*>(transports[GDS].get());
     gds->setDramToFile(true);
@@ -314,14 +330,16 @@ TEST(TransportSelectorTest, FileSegmentDramToFile) {
     ctx.buffer_transports = nullptr;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, GDS) << "GDS should be available for File segment with CPU memory";
+    EXPECT_EQ(result.transport, GDS)
+        << "GDS should be available for File segment with CPU memory";
 }
 
 TEST(TransportSelectorTest, FileSegmentGpuToFile) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[GDS] = std::make_shared<FakeTransport>(GDS);
     auto* gds = static_cast<FakeTransport*>(transports[GDS].get());
     gds->setGpuToFile(true);
@@ -332,7 +350,8 @@ TEST(TransportSelectorTest, FileSegmentGpuToFile) {
     ctx.buffer_transports = nullptr;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, GDS) << "GDS should be available for File segment with CUDA memory";
+    EXPECT_EQ(result.transport, GDS)
+        << "GDS should be available for File segment with CUDA memory";
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +362,8 @@ TEST(TransportSelectorTest, PriorityOffsetFallback) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     transports[TCP] = std::make_shared<FakeTransport>(TCP);
 
@@ -386,10 +406,12 @@ TEST(TransportSelectorTest, DeviceMaskDefaultAll) {
     ctx.segment_type = SegmentType::Memory;
     ctx.buffer_transports = nullptr;
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.device_mask, ~0ULL) << "Default device mask should be all devices";
+    EXPECT_EQ(result.device_mask, ~0ULL)
+        << "Default device mask should be all devices";
 }
 
 // ---------------------------------------------------------------------------
@@ -400,7 +422,8 @@ TEST(TransportSelectorTest, NvLinkRequiresSameMachine) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[NVLINK] = std::make_shared<FakeTransport>(NVLINK);
     auto* nvlink = static_cast<FakeTransport*>(transports[NVLINK].get());
     nvlink->setGpuToGpu(true);
@@ -416,14 +439,16 @@ TEST(TransportSelectorTest, NvLinkRequiresSameMachine) {
 
     // NVLINK should not be available for remote transfers
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, UNSPEC) << "NVLINK should not be available for remote transfers";
+    EXPECT_EQ(result.transport, UNSPEC)
+        << "NVLINK should not be available for remote transfers";
 }
 
 TEST(TransportSelectorTest, NvLinkAvailableSameMachine) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[NVLINK] = std::make_shared<FakeTransport>(NVLINK);
     auto* nvlink = static_cast<FakeTransport*>(transports[NVLINK].get());
     nvlink->setGpuToGpu(true);
@@ -438,7 +463,8 @@ TEST(TransportSelectorTest, NvLinkAvailableSameMachine) {
     ctx.buffer_transports = &buffer_transports;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, NVLINK) << "NVLINK should be available for same-machine transfers";
+    EXPECT_EQ(result.transport, NVLINK)
+        << "NVLINK should be available for same-machine transfers";
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +475,8 @@ TEST(TransportSelectorTest, RocmMemoryTypeSupported) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
 
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
     rdma->setGpuToGpu(true);
@@ -464,7 +491,8 @@ TEST(TransportSelectorTest, RocmMemoryTypeSupported) {
     ctx.buffer_transports = &buffer_transports;
 
     auto result = selector.select(ctx, transports);
-    EXPECT_EQ(result.transport, RDMA) << "RDMA should be available for ROCm-to-ROCm";
+    EXPECT_EQ(result.transport, RDMA)
+        << "RDMA should be available for ROCm-to-ROCm";
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +517,8 @@ TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     TransportSelector selector(conf);
 
     // Default behavior should still work
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     transports[TCP] = std::make_shared<FakeTransport>(TCP);
 

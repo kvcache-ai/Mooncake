@@ -168,7 +168,8 @@ class TransportSelector {
    private:
     std::vector<SelectionPolicy> getDefaultPolicies();
     void loadPolicies();
-    bool matchesMemoryPattern(const std::string& pattern, MemoryType type) const;
+    bool matchesMemoryPattern(const std::string& pattern,
+                              MemoryType type) const;
     bool matchesPolicy(const SelectionPolicy& policy,
                        const SelectionContext& context) const;
     bool isTransportAvailable(

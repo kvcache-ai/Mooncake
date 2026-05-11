@@ -25,27 +25,16 @@ namespace tent {
 // Transport type name mapping
 static const std::unordered_map<std::string, TransportType> kTransportNameMap =
     {
-        {"rdma", RDMA},
-        {"tcp", TCP},
-        {"shm", SHM},
-        {"nvlink", NVLINK},
-        {"gds", GDS},
-        {"io_uring", IOURING},
-        {"ascend", AscendDirect},
-        {"mnnvl", MNNVL},
+        {"rdma", RDMA},           {"tcp", TCP},     {"shm", SHM},
+        {"nvlink", NVLINK},       {"gds", GDS},     {"io_uring", IOURING},
+        {"ascend", AscendDirect}, {"mnnvl", MNNVL},
 };
 
 static const std::unordered_map<TransportType, std::string>
     kTransportTypeNames = {
-        {RDMA, "rdma"},
-        {TCP, "tcp"},
-        {SHM, "shm"},
-        {NVLINK, "nvlink"},
-        {GDS, "gds"},
-        {IOURING, "io_uring"},
-        {AscendDirect, "ascend"},
-        {MNNVL, "mnnvl"},
-        {UNSPEC, "unspec"},
+        {RDMA, "rdma"},           {TCP, "tcp"},     {SHM, "shm"},
+        {NVLINK, "nvlink"},       {GDS, "gds"},     {IOURING, "io_uring"},
+        {AscendDirect, "ascend"}, {MNNVL, "mnnvl"}, {UNSPEC, "unspec"},
 };
 
 // Memory type name mapping for pattern matching
@@ -306,10 +295,8 @@ bool TransportSelector::isTransportAvailable(
 
     // For file segments, check file-specific capabilities (original logic)
     if (context.segment_type == SegmentType::File) {
-        if (context.local_memory_type == MTYPE_CPU)
-            return caps.dram_to_file;
-        if (is_gpu(context.local_memory_type))
-            return caps.gpu_to_file;
+        if (context.local_memory_type == MTYPE_CPU) return caps.dram_to_file;
+        if (is_gpu(context.local_memory_type)) return caps.gpu_to_file;
         return false;
     }
 
