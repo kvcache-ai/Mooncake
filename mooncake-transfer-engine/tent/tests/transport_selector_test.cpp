@@ -32,7 +32,9 @@ namespace {
 
 class FakeTransport : public Transport {
    public:
-    explicit FakeTransport(TransportType type) : type_(type) {}
+    explicit FakeTransport(TransportType type) : type_(type) {
+        // Access protected member directly (inherited from Transport)
+    }
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -56,9 +58,13 @@ class FakeTransport : public Transport {
 
     const char* getName() const override { return "fake"; }
 
-    const TransportCapabilities& capabilities() const override { return caps_; }
-
-    TransportCapabilities caps_;
+    // Helper to set capabilities (accessing protected member)
+    void setDramToFile(bool val) { caps.dram_to_file = val; }
+    void setGpuToFile(bool val) { caps.gpu_to_file = val; }
+    void setDramToDram(bool val) { caps.dram_to_dram = val; }
+    void setGpuToGpu(bool val) { caps.gpu_to_gpu = val; }
+    void setDramToGpu(bool val) { caps.dram_to_gpu = val; }
+    void setGpuToDram(bool val) { caps.gpu_to_dram = val; }
 
    private:
     TransportType type_;
@@ -81,8 +87,8 @@ TEST(TransportSelectorTest, DefaultPoliciesFileSegment) {
     // Set capabilities
     auto* gds = static_cast<FakeTransport*>(transports[GDS].get());
     auto* iouring = static_cast<FakeTransport*>(transports[IOURING].get());
-    gds->caps_.dram_to_file = true;
-    iouring->caps_.dram_to_file = true;
+    gds->setDramToFile(true);
+    iouring->setDramToFile(true);
 
     // File segment with CPU memory should prefer GDS first
     SelectionContext ctx;
@@ -110,8 +116,8 @@ TEST(TransportSelectorTest, DefaultPoliciesFileSegmentGpuMemory) {
     // Set capabilities for GPU
     auto* gds = static_cast<FakeTransport*>(transports[GDS].get());
     auto* iouring = static_cast<FakeTransport*>(transports[IOURING].get());
-    gds->caps_.gpu_to_file = true;
-    iouring->caps_.gpu_to_file = true;
+    gds->setGpuToFile(true);
+    iouring->setGpuToFile(true);
 
     // File segment with GPU memory
     SelectionContext ctx;
@@ -138,7 +144,7 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
 
     // Set capabilities
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->caps_.dram_to_dram = true;
+    rdma->setDramToDram(true);
 
     // Memory segment should use buffer_transports order
     std::vector<TransportType> buffer_transports = {RDMA, TCP};
@@ -216,7 +222,7 @@ TEST(TransportSelectorTest, TransportCapabilityDramToDram) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->caps_.dram_to_dram = true;
+    rdma->setDramToDram(true);
 
     std::vector<TransportType> buffer_transports = {RDMA};
 
@@ -237,7 +243,7 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToGpu) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->caps_.gpu_to_gpu = true;
+    rdma->setGpuToGpu(true);
 
     std::vector<TransportType> buffer_transports = {RDMA};
 
@@ -258,7 +264,7 @@ TEST(TransportSelectorTest, TransportCapabilityDramToGpu) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->caps_.dram_to_gpu = true;
+    rdma->setDramToGpu(true);
 
     std::vector<TransportType> buffer_transports = {RDMA};
 
@@ -279,7 +285,7 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToDram) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->caps_.gpu_to_dram = true;
+    rdma->setGpuToDram(true);
 
     std::vector<TransportType> buffer_transports = {RDMA};
 
@@ -300,7 +306,7 @@ TEST(TransportSelectorTest, FileSegmentDramToFile) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[GDS] = std::make_shared<FakeTransport>(GDS);
     auto* gds = static_cast<FakeTransport*>(transports[GDS].get());
-    gds->caps_.dram_to_file = true;
+    gds->setDramToFile(true);
 
     SelectionContext ctx;
     ctx.segment_type = SegmentType::File;
@@ -318,7 +324,7 @@ TEST(TransportSelectorTest, FileSegmentGpuToFile) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[GDS] = std::make_shared<FakeTransport>(GDS);
     auto* gds = static_cast<FakeTransport*>(transports[GDS].get());
-    gds->caps_.gpu_to_file = true;
+    gds->setGpuToFile(true);
 
     SelectionContext ctx;
     ctx.segment_type = SegmentType::File;
@@ -342,9 +348,9 @@ TEST(TransportSelectorTest, PriorityOffsetFallback) {
     transports[TCP] = std::make_shared<FakeTransport>(TCP);
 
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->caps_.dram_to_dram = true;
+    rdma->setDramToDram(true);
     auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
-    tcp->caps_.dram_to_dram = true;
+    tcp->setDramToDram(true);
 
     std::vector<TransportType> buffer_transports = {RDMA, TCP};
 
@@ -397,7 +403,7 @@ TEST(TransportSelectorTest, NvLinkRequiresSameMachine) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[NVLINK] = std::make_shared<FakeTransport>(NVLINK);
     auto* nvlink = static_cast<FakeTransport*>(transports[NVLINK].get());
-    nvlink->caps_.gpu_to_gpu = true;
+    nvlink->setGpuToGpu(true);
 
     std::vector<TransportType> buffer_transports = {NVLINK};
 
@@ -420,7 +426,7 @@ TEST(TransportSelectorTest, NvLinkAvailableSameMachine) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[NVLINK] = std::make_shared<FakeTransport>(NVLINK);
     auto* nvlink = static_cast<FakeTransport*>(transports[NVLINK].get());
-    nvlink->caps_.gpu_to_gpu = true;
+    nvlink->setGpuToGpu(true);
 
     std::vector<TransportType> buffer_transports = {NVLINK};
 
@@ -446,7 +452,7 @@ TEST(TransportSelectorTest, RocmMemoryTypeSupported) {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes> transports{};
     transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->caps_.gpu_to_gpu = true;
+    rdma->setGpuToGpu(true);
 
     std::vector<TransportType> buffer_transports = {RDMA};
 
@@ -488,9 +494,9 @@ TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     transports[TCP] = std::make_shared<FakeTransport>(TCP);
 
     auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
-    rdma->caps_.dram_to_dram = true;
+    rdma->setDramToDram(true);
     auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
-    tcp->caps_.dram_to_dram = true;
+    tcp->setDramToDram(true);
 
     std::vector<TransportType> buffer_transports = {RDMA, TCP};
 
