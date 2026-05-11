@@ -333,13 +333,13 @@ impl StoreClientBuilder {
             && self.initial_state == ClientLifecycleState::Active
             && published_initial_state != self.initial_state;
 
+        let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
+        let effective_tenant_policy =
+            resolve_effective_tenant_policy(self.metadata.as_ref(), &default_scope)?;
         let runtime_metadata = self
             .metadata
             .for_tenant(&self.default_tenant)
             .unwrap_or_else(|| self.metadata.clone());
-        let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
-        let effective_tenant_policy =
-            resolve_effective_tenant_policy(runtime_metadata.as_ref(), &default_scope)?;
         let effective_namespace_quota =
             resolved_namespace_quota(&effective_tenant_policy).or(self.namespace_quota.clone());
         let effective_route_policy = route_policy_from_tenant_spec(&effective_tenant_policy);
@@ -547,8 +547,12 @@ fn bootstrap_route_policy(
             .as_millis() as u64,
     };
     bootstrap_default_route_policy(metadata, &local)?;
-    let effective = resolve_effective_route_policy(metadata, default_tenant)?;
-    validate_route_policy(&local, &effective)
+    match effective_route_policy(metadata, default_tenant)? {
+        Some(effective) => validate_route_policy(&local, &effective),
+        None => Err(StoreError::InvalidState(
+            "default route policy is missing".to_string(),
+        )),
+    }
 }
 
 fn resolve_effective_tenant_policy(
@@ -574,6 +578,23 @@ fn route_policy_from_tenant_spec(spec: &TenantPolicySpec) -> Option<RoutePolicy>
     })
 }
 
+fn effective_route_policy(
+    metadata: &dyn MetadataBackend,
+    default_tenant: &str,
+) -> Result<Option<RoutePolicy>> {
+    let scope = NamespaceScope::with_defaults(Some(default_tenant), None, None);
+    let tenant_spec = resolve_effective_tenant_policy(metadata, &scope)?;
+    if let Some(policy) = route_policy_from_tenant_spec(&tenant_spec) {
+        return Ok(Some(policy));
+    }
+    if let Some(tenant_policy) =
+        metadata.get_route_policy(&RoutePolicyDomain::Tenant(default_tenant.to_string()))?
+    {
+        return Ok(Some(tenant_policy));
+    }
+    metadata.get_route_policy(&RoutePolicyDomain::Default)
+}
+
 fn bootstrap_default_route_policy(
     metadata: &dyn MetadataBackend,
     local: &RoutePolicy,
@@ -596,25 +617,6 @@ fn bootstrap_default_route_policy(
                 .map(|_| ())
         }
     }
-}
-
-fn resolve_effective_route_policy(
-    metadata: &dyn MetadataBackend,
-    default_tenant: &str,
-) -> Result<RoutePolicy> {
-    let scope = NamespaceScope::with_defaults(Some(default_tenant), None, None);
-    let tenant_spec = resolve_effective_tenant_policy(metadata, &scope)?;
-    if let Some(policy) = route_policy_from_tenant_spec(&tenant_spec) {
-        return Ok(policy);
-    }
-    if let Some(tenant_policy) =
-        metadata.get_route_policy(&RoutePolicyDomain::Tenant(default_tenant.to_string()))?
-    {
-        return Ok(tenant_policy);
-    }
-    metadata
-        .get_route_policy(&RoutePolicyDomain::Default)?
-        .ok_or_else(|| StoreError::InvalidState("default route policy is missing".to_string()))
 }
 
 fn validate_route_policy(local: &RoutePolicy, existing: &RoutePolicy) -> Result<()> {

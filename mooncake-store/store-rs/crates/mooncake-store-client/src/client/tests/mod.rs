@@ -23,8 +23,8 @@ use parking_lot::Mutex;
 
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
-    control_bind_host, copy_into_region, encode_lifecycle_state, flatten_slices, now_ms,
-    payload_checksum, record_success_metric, resolve_effective_route_policy, scatter_into_buffers,
+    control_bind_host, copy_into_region, effective_route_policy, encode_lifecycle_state,
+    flatten_slices, now_ms, payload_checksum, record_success_metric, scatter_into_buffers,
     shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
     LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
     PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
@@ -9785,8 +9785,9 @@ fn bootstrap_route_policy_uses_tenant_override_when_present() {
     )
     .expect("tenant override should satisfy bootstrap");
 
-    let effective = resolve_effective_route_policy(metadata.as_ref(), "tenant-a")
-        .expect("effective route policy should resolve");
+    let effective = effective_route_policy(metadata.as_ref(), "tenant-a")
+        .expect("effective route policy should resolve")
+        .expect("effective policy should exist");
     assert_eq!(effective.route_topk, 4);
     assert_eq!(effective.route_control, RouteControlMode::MetadataOnly);
 }
@@ -9811,8 +9812,9 @@ fn bootstrap_route_policy_falls_back_to_default_when_tenant_override_missing() {
     )
     .expect("default bootstrap should succeed without tenant override");
 
-    let effective = resolve_effective_route_policy(metadata.as_ref(), "tenant-a")
-        .expect("effective route policy should fall back to default");
+    let effective = effective_route_policy(metadata.as_ref(), "tenant-a")
+        .expect("effective route policy should fall back to default")
+        .expect("effective policy should exist");
     assert_eq!(effective.route_control, RouteControlMode::EmbeddedWrh);
     assert_eq!(effective.route_topk, 3);
 }
@@ -9875,8 +9877,9 @@ fn builder_resolves_scoped_tenant_policy_without_listing_all_policies() {
     assert_eq!(client.route_control, RouteControlMode::MetadataOnly);
     assert_eq!(client.route_topk, 4);
 
-    let effective = resolve_effective_route_policy(inner.as_ref(), "tenant-a")
-        .expect("effective route policy should resolve from exact scope lookups");
+    let effective = effective_route_policy(inner.as_ref(), "tenant-a")
+        .expect("effective route policy should resolve from exact scope lookups")
+        .expect("effective policy should exist");
     assert_eq!(effective.route_control, RouteControlMode::MetadataOnly);
     assert_eq!(effective.route_topk, 4);
 }
