@@ -623,8 +623,8 @@ std::string mtuLengthToString(ibv_mtu mtu) {
         return "UNKNOWN";
 }
 
-void updateGlobalConfig(ibv_device_attr& device_attr) {
-    auto& config = globalConfig();
+void updateGlobalConfig(ibv_device_attr &device_attr) {
+    auto &config = globalConfig();
     if (config.max_ep_per_ctx * config.num_qp_per_ep >
         (size_t)device_attr.max_qp)
         config.max_ep_per_ctx = device_attr.max_qp / config.num_qp_per_ep;
@@ -641,7 +641,7 @@ void updateGlobalConfig(ibv_device_attr& device_attr) {
 }
 
 void dumpGlobalConfig() {
-    auto& config = globalConfig();
+    auto &config = globalConfig();
     LOG(INFO) << "=== GlobalConfig ===";
     LOG(INFO) << "num_cq_per_ctx = " << config.num_cq_per_ctx;
     LOG(INFO) << "num_comp_channels_per_ctx = "
@@ -680,7 +680,7 @@ void dumpGlobalConfig() {
               << (config.track_rdma_posted_slices ? "true" : "false");
 }
 
-GlobalConfig& globalConfig() {
+GlobalConfig &globalConfig() {
     static GlobalConfig config;
     static std::once_flag g_once_flag;
     std::call_once(g_once_flag, []() { loadGlobalConfig(config); });
