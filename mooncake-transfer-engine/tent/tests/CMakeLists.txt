@@ -96,6 +96,14 @@ target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
+# Transport Selector Unit Test
+add_executable(tent_transport_selector_test transport_selector_test.cpp)
+target_link_libraries(tent_transport_selector_test PRIVATE gtest gtest_main
+                                                            tent_link_group)
+target_include_directories(tent_transport_selector_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
+
 # End-to-end failover test: drives real TransferEngineImpl with
 # FaultProxyTransport-wrapped fakes to exercise resubmitTransferTask.
 add_executable(tent_engine_failover_e2e_test engine_failover_e2e_test.cpp)
