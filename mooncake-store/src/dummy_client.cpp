@@ -560,13 +560,13 @@ int64_t DummyClient::getSize(const std::string& key) {
 }
 
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(
-    const std::string& key, const ReadRouteConfig& config) {
+    const std::string& key, const ReadConfigExt& config) {
     // Dummy client does not use BufferHandle, so we return nullptr
     return nullptr;
 }
 
 std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
-    const std::string& key, const ReadRouteConfig& config) {
+    const std::string& key, const ReadConfigExt& config) {
     auto result =
         invoke_rpc<&RealClient::get_buffer_info_dummy_helper,
                    std::tuple<uint64_t, size_t>>(key, config, client_id_);
@@ -578,13 +578,13 @@ std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
 }
 
 std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
-    const std::vector<std::string>& keys, const ReadRouteConfig& config) {
+    const std::vector<std::string>& keys, const ReadConfigExt& config) {
     // TODO: implement this function
     return std::vector<std::shared_ptr<BufferHandle>>();
 }
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer, size_t size,
-                              const ReadRouteConfig& config) {
+                              const ReadConfigExt& config) {
     // TODO: implement this function
     return -1;
 }
@@ -622,7 +622,7 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
 
 std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
-    const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
+    const std::vector<size_t>& sizes, const ReadConfigExt& config) {
     std::vector<uint64_t> buffers;
     for (auto ptr : buffer_ptrs) {
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));
@@ -662,7 +662,7 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
-    bool aggregate_same_segment_task, const ReadRouteConfig& config) {
+    bool aggregate_same_segment_task, const ReadConfigExt& config) {
     // TODO: implement this function
     std::vector<int> vec(keys.size(), -1);
     return vec;

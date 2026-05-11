@@ -1336,6 +1336,30 @@ DataManager::SubmitTeTransferInternal(
             std::move(buffer_result.value());
     }
 
+    auto batches_result = SubmitTeTransferBatches(
+        transfer_ptr, total_data_size, remote_buffers, opcode);
+    if (!batches_result) {
+        return tl::unexpected(batches_result.error());
+    }
+
+    TeSubmitResult result;
+    result.transfer_batches = std::move(batches_result.value());
+    result.temp_buffer = std::move(temp_buffer_owner);
+    result.handle = handle;
+    return result;
+}
+
+tl::expected<std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
+             ErrorCode>
+DataManager::SubmitTeTransferBatches(
+    void* transfer_ptr, size_t total_data_size,
+    const std::vector<RemoteBufferDesc>& remote_buffers,
+    Transport::TransferRequest::OpCode opcode) {
+    if (!transfer_ptr || total_data_size == 0) {
+        LOG(ERROR) << "SubmitTeTransferBatches: invalid local transfer pointer";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::unordered_map<std::string, std::vector<size_t>> segment_buffers;
     for (size_t i = 0; i < remote_buffers.size(); ++i) {
         segment_buffers[remote_buffers[i].segment_endpoint].push_back(i);
@@ -1408,11 +1432,41 @@ DataManager::SubmitTeTransferInternal(
         return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
-    TeSubmitResult result;
-    result.transfer_batches = std::move(submitted_batches);
-    result.temp_buffer = std::move(temp_buffer_owner);
-    result.handle = handle;
-    return result;
+    return submitted_batches;
+}
+
+tl::expected<void, ErrorCode> DataManager::TransferWithTeNoTierStaging(
+    void* local_transfer_base, size_t total_size,
+    const std::vector<RemoteBufferDesc>& peer_buffers,
+    Transport::TransferRequest::OpCode opcode) {
+    auto validate_result = ValidateRemoteBuffers(peer_buffers);
+    if (!validate_result) {
+        return tl::make_unexpected(validate_result.error());
+    }
+    size_t total_remote_size = 0;
+    for (const auto& buf : peer_buffers) total_remote_size += buf.size;
+    if (total_remote_size != total_size) {
+        LOG(ERROR) << "TransferWithTeNoTierStaging: peer buffer size mismatch ("
+                   << total_remote_size << " vs " << total_size << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!transfer_engine_->getMetadata()) {
+        LOG(ERROR) << "TransferEngine not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto batches = SubmitTeTransferBatches(local_transfer_base, total_size,
+                                           peer_buffers, opcode);
+    if (!batches) {
+        return tl::unexpected(batches.error());
+    }
+    auto wait_result = WaitAllTransferBatches(batches.value());
+    if (!wait_result) {
+        LOG(ERROR) << "TransferWithTeNoTierStaging: WaitAllTransferBatches "
+                      "failed: "
+                   << toString(wait_result.error());
+        return wait_result;
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> DataManager::ValidateRemoteBuffers(

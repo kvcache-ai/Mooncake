@@ -44,23 +44,20 @@ inline std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
-struct P2PWriteRouteConfig {
-    WriteRouteRequestConfig route_config;
-    std::optional<RdmaDirectionMode> rdma_direction_mode;
+struct WriteConfigExt {
+    WriteRouteRequestConfig route_config{};
+    RdmaDirectionMode rdma_direction_mode = RdmaDirectionMode::REVERSE;
+
+    WriteConfigExt() = default;
+    /** Promotes legacy write-route-only config for variant overload resolution. */
+    WriteConfigExt(WriteRouteRequestConfig r) : route_config(std::move(r)) {}
 };
-YLT_REFL(P2PWriteRouteConfig, route_config, rdma_direction_mode);
+YLT_REFL(WriteConfigExt, route_config, rdma_direction_mode);
 
 inline std::ostream& operator<<(std::ostream& os,
-                                const P2PWriteRouteConfig& config) {
-    os << "P2PWriteRouteConfig: { route_config: [" << config.route_config
-       << "], rdma_direction_mode: ";
-    if (config.rdma_direction_mode.has_value()) {
-        os << *config.rdma_direction_mode;
-    } else {
-        // Unset: product rule is to resolve to REVERSE (see client default).
-        os << RdmaDirectionMode::REVERSE;
-    }
-    os << " }";
+                                const WriteConfigExt& config) {
+    os << "WriteConfigExt: { route_config: [" << config.route_config
+       << "], rdma_direction_mode: " << config.rdma_direction_mode << " }";
     return os;
 }
 

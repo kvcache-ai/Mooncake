@@ -39,11 +39,18 @@ YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config);
 typedef GetReplicaListRequestConfig ReadRouteConfig;
 typedef P2PGetReplicaListConfigExtra P2PReadRouteConfigExtra;
 
-struct P2PReadRouteConfig {
-    ReadRouteConfig route_config;
-    std::optional<RdmaDirectionMode> rdma_direction_mode;
+/**
+ * @brief P2P read API wrapper: master routing + optional RDMA direction.
+ */
+struct ReadConfigExt {
+    ReadRouteConfig route_config{};
+    RdmaDirectionMode rdma_direction_mode = RdmaDirectionMode::REVERSE;
+
+    ReadConfigExt() = default;
+    /** @brief Backward-compatible promotion from read-route-only config. */
+    ReadConfigExt(ReadRouteConfig r) : route_config(std::move(r)) {}
 };
-YLT_REFL(P2PReadRouteConfig, route_config, rdma_direction_mode);
+YLT_REFL(ReadConfigExt, route_config, rdma_direction_mode);
 
 /**
  * @brief Extra info for centralized read route response (Internal use)

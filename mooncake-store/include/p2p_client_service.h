@@ -90,7 +90,7 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<std::unique_ptr<QueryResult>, ErrorCode> Query(
         const std::string& object_key,
-        const ReadRouteConfig& config = {}) override;
+        const ReadConfigExt& config = {}) override;
 
     /**
      * @brief Batch query object metadata without transferring data
@@ -99,7 +99,7 @@ class P2PClientService final : public ClientService {
      */
     std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
     BatchQuery(const std::vector<std::string>& object_keys,
-               const ReadRouteConfig& config = {}) override;
+               const ReadConfigExt& config = {}) override;
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
@@ -113,23 +113,23 @@ class P2PClientService final : public ClientService {
     tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config = {}) override;
+        const ReadConfigExt& config = {}) override;
 
     std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
     BatchGet(const std::vector<std::string>& keys,
              std::shared_ptr<ClientBufferAllocator> allocator,
-             const ReadRouteConfig& config = {}) override;
+             const ReadConfigExt& config = {}) override;
 
     tl::expected<int64_t, ErrorCode> Get(
         const std::string& key, const std::vector<void*>& buffers,
         const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config = {}) override;
+        const ReadConfigExt& config = {}) override;
 
     std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        const ReadRouteConfig& config = {},
+        const ReadConfigExt& config = {},
         bool aggregate_same_segment_task = false) override;
 
     /**
@@ -244,7 +244,8 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const WriteRouteRequestConfig& route_config);
+        const WriteRouteRequestConfig& route_config,
+        RdmaDirectionMode rdma_direction_mode);
 
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPutDegraded(
         const std::vector<ObjectKey>& keys,
@@ -253,12 +254,14 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPutNormal(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const WriteRouteRequestConfig& route_config);
+        const WriteRouteRequestConfig& route_config,
+        RdmaDirectionMode rdma_direction_mode);
 
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
     CreatePutHandlesFromRoute(const std::vector<ObjectKey>& keys,
                               std::vector<std::vector<Slice>>& batched_slices,
                               const WriteRouteRequestConfig& route_config,
+                              RdmaDirectionMode rdma_direction_mode,
                               BatchGetWriteRouteResponse& batch_resp);
 
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
@@ -294,19 +297,30 @@ class P2PClientService final : public ClientService {
     };
 
     struct RemoteWriteOp : WriteOp {
+        P2PClientService* owner_service = nullptr;
         PeerClient* peer_ptr;
         std::shared_ptr<RemoteWriteRequest> write_req;
         P2PProxyDescriptor proxy;
         RouteCache* route_cache;
         std::string endpoint;
+        DataManager* forward_dm = nullptr;
+        std::vector<Slice>* forward_slices = nullptr;
+        RdmaDirectionMode rdma_direction_mode = RdmaDirectionMode::REVERSE;
 
-        RemoteWriteOp(PeerClient* p, std::shared_ptr<RemoteWriteRequest> wr,
-                      P2PProxyDescriptor px, RouteCache* rc, std::string ep)
-            : peer_ptr(p),
+        RemoteWriteOp(P2PClientService* owner, PeerClient* p,
+                      std::shared_ptr<RemoteWriteRequest> wr,
+                      P2PProxyDescriptor px, RouteCache* rc, std::string ep,
+                      DataManager* fwd_dm, std::vector<Slice>* fwd_slices,
+                      RdmaDirectionMode rdma_mode)
+            : owner_service(owner),
+              peer_ptr(p),
               write_req(std::move(wr)),
               proxy(std::move(px)),
               route_cache(rc),
-              endpoint(std::move(ep)) {}
+              endpoint(std::move(ep)),
+              forward_dm(fwd_dm),
+              forward_slices(fwd_slices),
+              rdma_direction_mode(rdma_mode) {}
 
         std::string_view route() const override { return endpoint; }
         std::unique_ptr<TaskHandle<void>> Dispatch() override;
@@ -315,6 +329,7 @@ class P2PClientService final : public ClientService {
     tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode>
     BuildWriteOps(std::string_view key, std::vector<Slice>& slices,
                   const WriteRouteRequestConfig& config,
+                  RdmaDirectionMode rdma_direction_mode,
                   std::vector<WriteCandidate> candidates);
 
     async_simple::coro::Lazy<void> RunWriteWithRetry(
@@ -369,10 +384,10 @@ class P2PClientService final : public ClientService {
         const std::vector<Replica::Descriptor>& replicas);
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
-        std::string_view key, const ReadRouteConfig& config);
+        std::string_view key, const ReadConfigExt& config);
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
-        std::string_view key, const ReadRouteConfig& config,
+        std::string_view key, const ReadConfigExt& config,
         std::vector<ResolvedRoute> pre_fetched);
 
    private:
@@ -384,30 +399,30 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
         const std::vector<std::string>& keys,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config);
+        const ReadConfigExt& config);
 
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
         const std::vector<std::string>& keys,
         std::vector<std::vector<Slice>>& all_slices,
-        const ReadRouteConfig& config);
+        const ReadConfigExt& config);
 
     template <typename LocalGetFn, typename RemoteGetFn>
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
     BatchCreateGetHandlesImpl(const std::vector<std::string>& keys,
-                              const ReadRouteConfig& config,
+                              const ReadConfigExt& config,
                               LocalGetFn&& local_get, RemoteGetFn&& remote_get);
 
     std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>>
     BatchFetchReadRoutes(const std::vector<std::string_view>& keys,
-                         const ReadRouteConfig& config);
+                         const ReadConfigExt& config);
 
     tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
         std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched);
+        const ReadConfigExt& config, std::vector<ResolvedRoute> pre_fetched);
 
     tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
         std::string_view key, std::vector<Slice>& slices,
-        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched);
+        const ReadConfigExt& config, std::vector<ResolvedRoute> pre_fetched);
 
     /**
      * @brief Launch async reads driven by a RouteIterator.
@@ -416,16 +431,44 @@ class P2PClientService final : public ClientService {
      * and chains subsequent candidates on failure (no stack recursion).
      */
     tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
-        std::string_view key, std::vector<Slice>& slices, RouteIterator iter);
+        std::string_view key, std::vector<Slice>& slices, RouteIterator iter,
+        RdmaDirectionMode rdma_direction_mode);
 
     async_simple::coro::Lazy<void> RunReadWithRetry(
         RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
-            promise);
+            promise,
+        RdmaDirectionMode rdma_direction_mode);
+
+    // true = promise set, caller co_return; false = try next route (incl. hard
+    // UnPin failure after TE success on this replica).
+    async_simple::coro::Lazy<bool> RunForwardReadOnRoute(
+        const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
+        std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+            promise,
+        RouteIterator& iter, ErrorCode& final_result);
+
+    async_simple::coro::Lazy<void> RunForwardRemotePut(
+        std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+            promise,
+        PeerClient* peer, DataManager* dm,
+        std::shared_ptr<RemoteWriteRequest> write_req,
+        std::vector<Slice>* slices);
+
+    // RemoteWriteOp forward path: promise + RunForwardRemotePut coroutine.
+    std::unique_ptr<TaskHandle<void>> StartForwardRemotePut(
+        PeerClient* peer, DataManager* forward_dm,
+        std::vector<Slice>* forward_slices,
+        std::shared_ptr<RemoteWriteRequest> write_req);
+
+    // RemoteWriteOp reverse path: AsyncWriteRemoteData + route cache upsert.
+    std::unique_ptr<TaskHandle<void>> RunReverseRemotePut(
+        PeerClient* peer, std::shared_ptr<RemoteWriteRequest> write_req,
+        const P2PProxyDescriptor& proxy, RouteCache* route_cache);
 
     async_simple::coro::Lazy<std::vector<ResolvedRoute>>
     AsyncResolveRoutesFromMaster(std::string_view key,
-                                 const ReadRouteConfig& config);
+                                 const ReadConfigExt& config);
 
     /**
      * @brief Get or create a PeerClient for the given endpoint.

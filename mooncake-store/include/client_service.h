@@ -18,6 +18,7 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "p2p_rpc_types.h"
+#include "rpc_types.h"
 #include "replica.h"
 #include "master_client.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -27,7 +28,8 @@
 
 namespace mooncake {
 
-using WriteConfig = std::variant<ReplicateConfig, WriteRouteRequestConfig>;
+using WriteConfig =
+    std::variant<ReplicateConfig, WriteRouteRequestConfig, WriteConfigExt>;
 
 /**
  * @brief Result of a query operation containing replica information
@@ -117,7 +119,7 @@ class ClientService {
      * indicating failure
      */
     virtual tl::expected<std::unique_ptr<QueryResult>, ErrorCode> Query(
-        const std::string& object_key, const ReadRouteConfig& config = {}) = 0;
+        const std::string& object_key, const ReadConfigExt& config = {}) = 0;
 
     /**
      * @brief Batch query object metadata without transferring data
@@ -126,7 +128,7 @@ class ClientService {
      */
     virtual std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
     BatchQuery(const std::vector<std::string>& object_keys,
-               const ReadRouteConfig& config = {}) = 0;
+               const ReadConfigExt& config = {}) = 0;
 
     /**
      * @brief Gets data with memory allocation
@@ -139,12 +141,12 @@ class ClientService {
     virtual tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config = {}) = 0;
+        const ReadConfigExt& config = {}) = 0;
 
     virtual std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
     BatchGet(const std::vector<std::string>& keys,
              std::shared_ptr<ClientBufferAllocator> allocator,
-             const ReadRouteConfig& config = {}) = 0;
+             const ReadConfigExt& config = {}) = 0;
 
     /**
      * @brief Gets data into user-provided buffers without memory allocation
@@ -157,7 +159,7 @@ class ClientService {
     virtual tl::expected<int64_t, ErrorCode> Get(
         const std::string& key, const std::vector<void*>& buffers,
         const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config = {}) = 0;
+        const ReadConfigExt& config = {}) = 0;
 
     /**
      * @brief Batch get data into user-provided buffers
@@ -175,7 +177,7 @@ class ClientService {
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        const ReadRouteConfig& config = {},
+        const ReadConfigExt& config = {},
         bool aggregate_same_segment_task = false) = 0;
 
     /**

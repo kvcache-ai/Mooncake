@@ -98,7 +98,7 @@ class RealClient : public PyClient {
      * register_buffer() for zero-copy operations
      */
     int64_t get_into(const std::string& key, void* buffer, size_t size,
-                     const ReadRouteConfig& config = {}) override;
+                     const ReadConfigExt& config = {}) override;
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -114,7 +114,7 @@ class RealClient : public PyClient {
     std::vector<int64_t> batch_get_into(
         const std::vector<std::string>& keys, const std::vector<void*>& buffers,
         const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config = {}) override;
+        const ReadConfigExt& config = {}) override;
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -133,7 +133,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
         bool aggregate_same_segment_task,
-        const ReadRouteConfig& config = {}) override;
+        const ReadConfigExt& config = {}) override;
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -222,7 +222,7 @@ class RealClient : public PyClient {
      * nullptr if error
      */
     std::shared_ptr<BufferHandle> get_buffer(
-        const std::string& key, const ReadRouteConfig& config = {}) override;
+        const std::string& key, const ReadConfigExt& config = {}) override;
 
     /**
      * @brief Get buffer information (address and size) for a key
@@ -230,7 +230,7 @@ class RealClient : public PyClient {
      * @return Tuple containing buffer address and size, or (0, 0) if error
      */
     std::tuple<uint64_t, size_t> get_buffer_info(
-        const std::string& key, const ReadRouteConfig& config = {}) override;
+        const std::string& key, const ReadConfigExt& config = {}) override;
 
     /**
      * @brief Get buffers containing the data for multiple keys (batch version)
@@ -240,7 +240,7 @@ class RealClient : public PyClient {
      */
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string>& keys,
-        const ReadRouteConfig& config = {}) override;
+        const ReadConfigExt& config = {}) override;
 
     int remove(const std::string& key) override;
 
@@ -310,7 +310,7 @@ class RealClient : public PyClient {
     // Dummy client helper functions that return tl::expected
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
     get_buffer_info_dummy_helper(const std::string& key,
-                                 const ReadRouteConfig& config,
+                                 const ReadConfigExt& config,
                                  const UUID& client_id);
 
     tl::expected<void, ErrorCode> put_dummy_helper(const std::string& key,
@@ -330,7 +330,7 @@ class RealClient : public PyClient {
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_dummy_helper(
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& buffers, const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config, const UUID& client_id);
+        const ReadConfigExt& config, const UUID& client_id);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string>& keys,
@@ -376,18 +376,18 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> get_into_internal(
         const std::string& key, void* buffer, size_t size,
-        const ReadRouteConfig& config = {});
+        const ReadConfigExt& config = {});
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes, const ReadRouteConfig& config = {});
+        const std::vector<size_t>& sizes, const ReadConfigExt& config = {});
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        bool aggregate_same_segment_task, const ReadRouteConfig& config = {});
+        bool aggregate_same_segment_task, const ReadConfigExt& config = {});
 
     tl::expected<void, ErrorCode> put_from_internal(const std::string& key,
                                                     void* buffer, size_t size,
@@ -437,11 +437,11 @@ class RealClient : public PyClient {
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr,
-        const ReadRouteConfig& config = {});
+        const ReadConfigExt& config = {});
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string>& keys,
-        const ReadRouteConfig& config = {});
+        const ReadConfigExt& config = {});
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string>& keys);
