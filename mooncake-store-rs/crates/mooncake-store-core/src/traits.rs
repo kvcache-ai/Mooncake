@@ -11,9 +11,14 @@ use crate::route::{
     TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaReservationRequest,
     TenantQuotaState,
 };
+use std::sync::Arc;
 
 pub trait MetadataBackend: Send + Sync {
     fn route_namespace(&self) -> String;
+
+    fn for_tenant(&self, _tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
+        None
+    }
 
     /// Low-cardinality backend label for Store-RS metadata metrics.
     fn backend_kind(&self) -> &'static str {

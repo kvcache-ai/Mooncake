@@ -361,6 +361,14 @@ impl MetadataKeyspace {
     pub fn prefix(&self) -> &str {
         &self.raw_prefix
     }
+
+    pub fn tenant_prefixed(&self, tenant: &str) -> Self {
+        Self::new(format!(
+            "{}/tenants/{}",
+            self.raw_prefix,
+            encode_key_component(tenant)
+        ))
+    }
 }
 
 pub fn parse_route_policy_domain(
@@ -492,6 +500,40 @@ mod tests {
         decode_key_component_checked, encode_key_component, parse_route_policy_domain,
         parse_tenant_eviction_candidate_key, parse_tenant_policy_scope, MetadataKeyspace,
     };
+
+    #[test]
+    fn tenant_prefixed_keyspace_roots_control_plane_under_tenant() {
+        let keyspace = MetadataKeyspace::new("mc/store-rs/v2").tenant_prefixed("tenant/a");
+        let runtime = ClientRuntimeId::new("writer", ClientEpoch(9));
+        let stable = ClientStableId::new("writer");
+        let object = ObjectKey::new("alpha");
+        let segment = SegmentName::new("seg-1");
+
+        assert_eq!(
+            keyspace.client(&runtime),
+            "{mc/store-rs/v2/tenants/tenant%2Fa}/clients/writer:9"
+        );
+        assert_eq!(
+            keyspace.client_index(),
+            "{mc/store-rs/v2/tenants/tenant%2Fa}/indexes/clients"
+        );
+        assert_eq!(
+            keyspace.client_by_stable_index(&stable),
+            "{mc/store-rs/v2/tenants/tenant%2Fa}/indexes/clients/by-stable/writer"
+        );
+        assert_eq!(
+            keyspace.segment(&runtime, &segment),
+            "{mc/store-rs/v2/tenants/tenant%2Fa}/client-resources/writer:9/segments/seg-1"
+        );
+        assert_eq!(
+            keyspace.object(&object),
+            "{mc/store-rs/v2/tenants/tenant%2Fa}/objects/alpha"
+        );
+        assert_eq!(
+            keyspace.handoff(&stable),
+            "{mc/store-rs/v2/tenants/tenant%2Fa}/handoffs/writer"
+        );
+    }
 
     #[test]
     fn keyspace_builds_scoped_keys_and_patterns() {

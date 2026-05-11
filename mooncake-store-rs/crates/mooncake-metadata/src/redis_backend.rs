@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::error::QuotaKind;
@@ -906,6 +907,11 @@ impl RedisMetadataConfig {
         self
     }
 
+    pub fn tenant(mut self, tenant: &str) -> Self {
+        self.keyspace = self.keyspace.tenant_prefixed(tenant);
+        self
+    }
+
     pub fn tenant_quota_terminal_ttl(mut self, ttl: Duration) -> Self {
         self.tenant_quota_terminal_ttl = ttl;
         self
@@ -1005,6 +1011,7 @@ pub struct RedisMetadataBackend {
     legacy_auth_pool: Option<Box<RedisConnectionPool>>,
     prefer_legacy_auth: AtomicBool,
     connection_diagnostic_events: AtomicU64,
+    url: String,
     keyspace: MetadataKeyspace,
     route_namespace: String,
     tenant_quota_terminal_ttl: Duration,
@@ -1058,6 +1065,7 @@ impl RedisMetadataBackend {
             legacy_auth_pool,
             prefer_legacy_auth: AtomicBool::new(false),
             connection_diagnostic_events: AtomicU64::new(0),
+            url: config.url,
             keyspace: config.keyspace,
             route_namespace,
             tenant_quota_terminal_ttl: config.tenant_quota_terminal_ttl,
@@ -1505,6 +1513,17 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn backend_kind(&self) -> &'static str {
         "redis"
+    }
+
+    fn for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
+        let config = RedisMetadataConfig {
+            url: self.url.clone(),
+            keyspace: self.keyspace.tenant_prefixed(tenant),
+            tenant_quota_terminal_ttl: self.tenant_quota_terminal_ttl,
+        };
+        RedisMetadataBackend::new(config)
+            .ok()
+            .map(|backend| Arc::new(backend) as Arc<dyn MetadataBackend>)
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {

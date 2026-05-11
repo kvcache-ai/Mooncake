@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::error::QuotaKind;
@@ -33,8 +34,9 @@ struct InMemoryState {
 }
 
 pub struct InMemoryMetadataBackend {
-    state: RwLock<InMemoryState>,
+    state: Arc<RwLock<InMemoryState>>,
     namespace_id: u64,
+    tenant_prefix: Option<String>,
 }
 
 impl Default for InMemoryMetadataBackend {
@@ -47,12 +49,59 @@ impl InMemoryMetadataBackend {
     pub fn new() -> Self {
         static NEXT_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
         Self {
-            state: RwLock::new(InMemoryState::default()),
+            state: Arc::new(RwLock::new(InMemoryState::default())),
             namespace_id: NEXT_NAMESPACE_ID.fetch_add(1, Ordering::Relaxed),
+            tenant_prefix: None,
         }
     }
 
-    fn segment_key(owner: &ClientRuntimeId, segment: &SegmentName) -> String {
+    fn scoped_key(&self, key: impl AsRef<str>) -> String {
+        match self.tenant_prefix.as_deref() {
+            Some(prefix) => format!("{prefix}/{}", key.as_ref()),
+            None => key.as_ref().to_string(),
+        }
+    }
+
+    fn scoped_stable_id_key(&self, stable_id: &ClientStableId) -> ClientStableId {
+        match self.tenant_prefix.as_deref() {
+            Some(prefix) => ClientStableId(format!("{prefix}/{}", stable_id.0)),
+            None => stable_id.clone(),
+        }
+    }
+
+    fn scoped_runtime(&self, runtime: &ClientRuntimeId) -> ClientRuntimeId {
+        ClientRuntimeId::new(self.scoped_key(&runtime.stable_id.0), runtime.epoch)
+    }
+
+    fn unscoped_runtime(&self, runtime: ClientRuntimeId) -> ClientRuntimeId {
+        match self.tenant_prefix.as_deref() {
+            Some(prefix) => {
+                let stable_id = runtime
+                    .stable_id
+                    .0
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .unwrap_or(runtime.stable_id.0.as_str());
+                ClientRuntimeId::new(stable_id, runtime.epoch)
+            }
+            None => runtime,
+        }
+    }
+
+    fn scope_lease(&self, lease: &ClientLease) -> ClientLease {
+        let mut lease = lease.clone();
+        lease.runtime = self.scoped_runtime(&lease.runtime);
+        lease
+    }
+
+    fn unscope_lease(&self, lease: ClientLease) -> ClientLease {
+        let mut lease = lease;
+        lease.runtime = self.unscoped_runtime(lease.runtime);
+        lease
+    }
+
+    fn segment_key(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> String {
+        let owner = self.scoped_runtime(owner);
         format!("{}:{}", owner.storage_key(), segment.0)
     }
 
@@ -165,7 +214,18 @@ fn now_ms() -> u64 {
 
 impl MetadataBackend for InMemoryMetadataBackend {
     fn route_namespace(&self) -> String {
-        format!("inmemory://{}", self.namespace_id)
+        match self.tenant_prefix.as_deref() {
+            Some(prefix) => format!("inmemory://{}/tenants/{}", self.namespace_id, prefix),
+            None => format!("inmemory://{}", self.namespace_id),
+        }
+    }
+
+    fn for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
+        Some(Arc::new(Self {
+            state: self.state.clone(),
+            namespace_id: self.namespace_id,
+            tenant_prefix: Some(tenant.to_string()),
+        }))
     }
 
     fn backend_kind(&self) -> &'static str {
@@ -175,6 +235,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
         use std::collections::btree_map::Entry;
 
+        let lease = self.scope_lease(lease);
         let storage_key = lease.runtime.storage_key();
         let stable_id = lease.runtime.stable_id.clone();
         let stable_id_key = stable_id.0.clone();
@@ -225,6 +286,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn allocate_client_lease(&self, template: &ClientLease) -> Result<ClientRuntimeId> {
+        let template = self.scope_lease(template);
         let stable_id = template.runtime.stable_id.0.clone();
         let mut state = self.state.write();
 
@@ -244,7 +306,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .or_default()
             .insert(new_epoch);
         state.client_epoch_hwm.insert(stable_id, new_epoch);
-        Ok(runtime)
+        Ok(self.unscoped_runtime(runtime))
     }
 
     fn update_client_state(
@@ -253,9 +315,11 @@ impl MetadataBackend for InMemoryMetadataBackend {
         next: ClientLifecycleState,
     ) -> Result<()> {
         let mut state = self.state.write();
+        let runtime = self.scoped_runtime(runtime);
+        let runtime_key = runtime.storage_key();
         {
-            let Some(lease) = state.clients.get_mut(&runtime.storage_key()) else {
-                return Err(StoreError::NotFound(runtime.storage_key()));
+            let Some(lease) = state.clients.get_mut(&runtime_key) else {
+                return Err(StoreError::NotFound(runtime_key));
             };
             lease.state = next;
         }
@@ -270,9 +334,10 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .state
             .read()
             .clients
-            .get(&runtime.storage_key())
+            .get(&self.scoped_runtime(runtime).storage_key())
             .filter(|lease| Self::is_present_lease(lease))
-            .cloned())
+            .cloned()
+            .map(|lease| self.unscope_lease(lease)))
     }
 
     fn get_live_runtime_by_stable_id(
@@ -280,29 +345,43 @@ impl MetadataBackend for InMemoryMetadataBackend {
         stable_id: &ClientStableId,
     ) -> Result<Option<ClientLease>> {
         let state = self.state.read();
-        let Some(runtime_key) = state.stable_runtimes.get(stable_id) else {
+        let stable_id = self.scoped_stable_id_key(stable_id);
+        let Some(runtime_key) = state.stable_runtimes.get(&stable_id) else {
             return Ok(None);
         };
         Ok(state
             .clients
             .get(runtime_key)
             .filter(|lease| Self::is_readable_lease(lease))
-            .cloned())
+            .cloned()
+            .map(|lease| self.unscope_lease(lease)))
     }
 
     fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
-        Ok(self.state.read().clients.values().cloned().collect())
+        Ok(self
+            .state
+            .read()
+            .clients
+            .values()
+            .filter(|lease| {
+                self.tenant_prefix.as_deref().is_none_or(|prefix| {
+                    lease.runtime.stable_id.0.starts_with(&format!("{prefix}/"))
+                })
+            })
+            .cloned()
+            .map(|lease| self.unscope_lease(lease))
+            .collect())
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
-        let key = Self::segment_key(&segment.owner, &segment.segment_name);
+        let key = self.segment_key(&segment.owner, &segment.segment_name);
+        let mut segment = segment.clone();
+        segment.owner = self.scoped_runtime(&segment.owner);
         let mut state = self.state.write();
         match state.segments.get_mut(&key) {
-            Some(current) => current.merge_announcement(segment),
+            Some(current) => current.merge_announcement(&segment),
             None => {
-                state
-                    .segments
-                    .insert(key, StoredSegmentState::new(segment.clone()));
+                state.segments.insert(key, StoredSegmentState::new(segment));
             }
         }
         Ok(())
@@ -310,7 +389,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
         let mut state = self.state.write();
-        state.segments.remove(&Self::segment_key(owner, segment));
+        state.segments.remove(&self.segment_key(owner, segment));
         Ok(())
     }
 
@@ -323,18 +402,39 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .state
             .read()
             .segments
-            .get(&Self::segment_key(owner, segment))
-            .map(|segment| segment.announcement.clone()))
+            .get(&self.segment_key(owner, segment))
+            .map(|segment| {
+                let mut announcement = segment.announcement.clone();
+                announcement.owner = self.unscoped_runtime(announcement.owner);
+                announcement
+            }))
     }
 
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
+        let scoped_owner = owner.map(|owner| self.scoped_runtime(owner));
         Ok(self
             .state
             .read()
             .segments
             .values()
-            .filter(|segment| owner.is_none_or(|owner| &segment.announcement.owner == owner))
-            .map(|segment| segment.announcement.clone())
+            .filter(|segment| {
+                scoped_owner
+                    .as_ref()
+                    .is_none_or(|owner| &segment.announcement.owner == owner)
+                    && self.tenant_prefix.as_deref().is_none_or(|prefix| {
+                        segment
+                            .announcement
+                            .owner
+                            .stable_id
+                            .0
+                            .starts_with(&format!("{prefix}/"))
+                    })
+            })
+            .map(|segment| {
+                let mut announcement = segment.announcement.clone();
+                announcement.owner = self.unscoped_runtime(announcement.owner);
+                announcement
+            })
             .collect())
     }
 
@@ -344,7 +444,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         segment: &SegmentName,
         next: SegmentLifecycleState,
     ) -> Result<()> {
-        let key = Self::segment_key(owner, segment);
+        let key = self.segment_key(owner, segment);
         let mut state = self.state.write();
         let segment_state = state
             .segments
@@ -361,12 +461,13 @@ impl MetadataBackend for InMemoryMetadataBackend {
         length_bytes: u64,
     ) -> Result<SegmentReservation> {
         let mut state = self.state.write();
-        let key = Self::segment_key(owner, segment);
+        let key = self.segment_key(owner, segment);
+        let scoped_owner = self.scoped_runtime(owner);
         let segment_state = state
             .segments
             .get_mut(&key)
             .ok_or_else(|| StoreError::NotFound(key.clone()))?;
-        segment_state.reserve(owner, segment, length_bytes)
+        segment_state.reserve(&scoped_owner, segment, length_bytes)
     }
 
     fn release_segment(
@@ -377,20 +478,37 @@ impl MetadataBackend for InMemoryMetadataBackend {
         length_bytes: u64,
     ) -> Result<()> {
         let mut state = self.state.write();
-        let key = Self::segment_key(owner, segment);
+        let key = self.segment_key(owner, segment);
+        let scoped_owner = self.scoped_runtime(owner);
         let segment_state = state
             .segments
             .get_mut(&key)
             .ok_or_else(|| StoreError::NotFound(key.clone()))?;
-        segment_state.release(owner, segment, offset_bytes, length_bytes)
+        segment_state.release(&scoped_owner, segment, offset_bytes, length_bytes)
     }
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
-        Ok(self.state.read().objects.get(&key.0).cloned())
+        Ok(self
+            .state
+            .read()
+            .objects
+            .get(&self.scoped_key(&key.0))
+            .cloned())
     }
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
-        Ok(self.state.read().objects.values().cloned().collect())
+        Ok(self
+            .state
+            .read()
+            .objects
+            .iter()
+            .filter(|(key, _)| {
+                self.tenant_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| key.starts_with(&format!("{prefix}/")))
+            })
+            .map(|(_, route)| route.clone())
+            .collect())
     }
 
     fn compare_and_swap_object_route(
@@ -400,7 +518,8 @@ impl MetadataBackend for InMemoryMetadataBackend {
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
         let mut state = self.state.write();
-        let current = state.objects.get(&key.0).cloned();
+        let storage_key = self.scoped_key(&key.0);
+        let current = state.objects.get(&storage_key).cloned();
         let matches = match (expected, current.as_ref()) {
             (None, None) => true,
             (Some(version), Some(route)) => route.version == version,
@@ -416,10 +535,10 @@ impl MetadataBackend for InMemoryMetadataBackend {
 
         match next {
             Some(route) => {
-                state.objects.insert(key.0.clone(), route.clone());
+                state.objects.insert(storage_key.clone(), route.clone());
             }
             None => {
-                state.objects.remove(&key.0);
+                state.objects.remove(&storage_key);
             }
         }
 
@@ -1015,12 +1134,17 @@ impl MetadataBackend for InMemoryMetadataBackend {
         self.state
             .write()
             .handoffs
-            .insert(handoff.stable_id.0.clone(), handoff.clone());
+            .insert(self.scoped_key(&handoff.stable_id.0), handoff.clone());
         Ok(())
     }
 
     fn get_handoff(&self, stable_id: &ClientStableId) -> Result<Option<HandoffPlan>> {
-        Ok(self.state.read().handoffs.get(&stable_id.0).cloned())
+        Ok(self
+            .state
+            .read()
+            .handoffs
+            .get(&self.scoped_key(&stable_id.0))
+            .cloned())
     }
 }
 
@@ -1029,9 +1153,9 @@ mod tests {
     use mooncake_store_core::error::QuotaKind;
     use mooncake_store_core::{
         ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
-        CompatibilityDescriptor, MetadataBackend, ObjectKey, RouteControlMode, RoutePolicy,
-        RoutePolicyDomain, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
-        TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+        CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey, RouteControlMode,
+        RoutePolicy, RoutePolicyDomain, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
+        StoreError, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
         TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
         TenantQuotaReservationState,
     };
@@ -1084,6 +1208,70 @@ mod tests {
                 priority: 0,
             }],
         }
+    }
+
+    #[test]
+    fn tenant_views_isolate_runtime_segments_objects_and_handoffs() {
+        let metadata = InMemoryMetadataBackend::new();
+        let tenant_a = metadata.for_tenant("tenant-a").expect("tenant view");
+        let tenant_b = metadata.for_tenant("tenant-b").expect("tenant view");
+        assert_ne!(tenant_a.route_namespace(), tenant_b.route_namespace());
+
+        let lease = active_lease("writer", 1);
+        tenant_a
+            .upsert_client_lease(&lease)
+            .expect("tenant-a lease should write");
+        assert!(tenant_a.get_client_lease(&lease.runtime).unwrap().is_some());
+        assert!(tenant_b.get_client_lease(&lease.runtime).unwrap().is_none());
+        assert_eq!(tenant_a.list_live_clients().unwrap().len(), 1);
+        assert!(tenant_b.list_live_clients().unwrap().is_empty());
+
+        let segment = sample_segment(&lease.runtime, "seg-a", 4096);
+        tenant_a
+            .publish_segment(&segment)
+            .expect("tenant-a segment should write");
+        assert!(tenant_a
+            .get_segment(&lease.runtime, &SegmentName::new("seg-a"))
+            .unwrap()
+            .is_some());
+        assert!(tenant_b
+            .get_segment(&lease.runtime, &SegmentName::new("seg-a"))
+            .unwrap()
+            .is_none());
+        assert_eq!(tenant_a.list_segments(None).unwrap().len(), 1);
+        assert!(tenant_b.list_segments(None).unwrap().is_empty());
+
+        let key = ObjectKey::new("object-a");
+        let route = sample_route("object-a", "writer", "seg-a");
+        assert!(
+            tenant_a
+                .compare_and_swap_object_route(&key, None, Some(&route))
+                .unwrap()
+                .applied
+        );
+        assert!(tenant_a.get_object_route(&key).unwrap().is_some());
+        assert!(tenant_b.get_object_route(&key).unwrap().is_none());
+        assert_eq!(tenant_a.list_object_routes().unwrap().len(), 1);
+        assert!(tenant_b.list_object_routes().unwrap().is_empty());
+
+        let handoff = mooncake_store_core::HandoffPlan {
+            stable_id: ClientStableId::new("writer"),
+            from: lease.runtime.clone(),
+            to: ClientRuntimeId::new("writer", ClientEpoch(2)),
+            kind: HandoffKind::HotUpgrade,
+            barrier_version: 1,
+            created_at_ms: now_ms(),
+            deadline_ms: Some(now_ms() + 10_000),
+        };
+        tenant_a.put_handoff(&handoff).expect("handoff write");
+        assert!(tenant_a
+            .get_handoff(&ClientStableId::new("writer"))
+            .unwrap()
+            .is_some());
+        assert!(tenant_b
+            .get_handoff(&ClientStableId::new("writer"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
