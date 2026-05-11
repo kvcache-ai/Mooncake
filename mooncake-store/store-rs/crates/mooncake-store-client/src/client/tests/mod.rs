@@ -2264,6 +2264,26 @@ fn publish_storage_node(
     publish_storage_node_with_capacity(metadata, transport, stable_id, segment_name, pool, 4096, 64)
 }
 
+fn publish_tenant_storage_node(
+    metadata: &Arc<InMemoryMetadataBackend>,
+    tenant: &str,
+    transport: &Arc<TestTransport>,
+    stable_id: &str,
+    segment_name: &str,
+    pool: &str,
+) -> ClientRuntimeId {
+    publish_storage_node_on_metadata(
+        metadata.clone(),
+        Some(tenant),
+        transport,
+        stable_id,
+        segment_name,
+        pool,
+        4096,
+        64,
+    )
+}
+
 fn publish_storage_node_with_capacity(
     metadata: &Arc<InMemoryMetadataBackend>,
     transport: &Arc<TestTransport>,
@@ -2273,20 +2293,46 @@ fn publish_storage_node_with_capacity(
     capacity_bytes: u64,
     alignment_bytes: u64,
 ) -> ClientRuntimeId {
+    publish_storage_node_on_metadata(
+        metadata.clone(),
+        None,
+        transport,
+        stable_id,
+        segment_name,
+        pool,
+        capacity_bytes,
+        alignment_bytes,
+    )
+}
+
+fn publish_storage_node_on_metadata(
+    metadata: Arc<dyn MetadataBackend>,
+    tenant: Option<&str>,
+    transport: &Arc<TestTransport>,
+    stable_id: &str,
+    segment_name: &str,
+    pool: &str,
+    capacity_bytes: u64,
+    alignment_bytes: u64,
+) -> ClientRuntimeId {
     let storage_transport = Arc::new(transport.peer(segment_name));
+    let mut builder = StoreClientBuilder::new(metadata.clone(), stable_id)
+        .state(ClientLifecycleState::Active)
+        .label("pool", pool)
+        .label("storage", "true")
+        .segment_name(segment_name)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config_with_layout(
+            capacity_bytes as usize,
+            4096,
+            alignment_bytes as usize,
+        ));
+    if let Some(tenant) = tenant {
+        builder = builder.tenant(tenant);
+    }
     let storage = Arc::new(
-        StoreClientBuilder::new(metadata.clone(), stable_id)
-            .state(ClientLifecycleState::Active)
-            .label("pool", pool)
-            .label("storage", "true")
-            .segment_name(segment_name)
-            .live_client_sync_interval(fast_live_client_sync_interval())
-            .transport(storage_transport)
-            .local_memory(storage_config_with_layout(
-                capacity_bytes as usize,
-                4096,
-                alignment_bytes as usize,
-            ))
+        builder
             .build(test_future_expiry_ms())
             .expect("storage client build should succeed"),
     );
@@ -10670,7 +10716,9 @@ fn put_returns_error_when_route_publish_succeeds_but_quota_finalize_fails() {
 fn runtime_uses_metadata_authored_fairness_shaping_and_placement_defaults() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("runtime-policy-client-segment"));
-    let owner_a = publish_storage_node(&metadata, &transport, "owner-a", "seg-a", "pool-a");
+    let owner_a = publish_tenant_storage_node(
+        &metadata, "tenant-a", &transport, "owner-a", "seg-a", "pool-a",
+    );
     metadata
         .put_tenant_policy(
             &TenantPolicy {
@@ -10740,8 +10788,9 @@ fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
     reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("tenant-policy-fallback-writer-segment"));
-    let owner = publish_storage_node(
+    let owner = publish_tenant_storage_node(
         &metadata,
+        "tenant-a",
         &transport,
         "fallback-owner",
         "seg-live",
@@ -10810,7 +10859,14 @@ fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
 fn request_preferred_segments_preserve_hard_and_soft_pin_semantics() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("request-preferred-segment-writer"));
-    let owner = publish_storage_node(&metadata, &transport, "request-owner", "seg-live", "pool-a");
+    let owner = publish_tenant_storage_node(
+        &metadata,
+        "tenant-a",
+        &transport,
+        "request-owner",
+        "seg-live",
+        "pool-a",
+    );
     let client = StoreClientBuilder::new(metadata.clone(), "request-preferred-segment-client")
         .tenant("tenant-a")
         .state(ClientLifecycleState::Active)
@@ -10863,8 +10919,22 @@ fn request_preferred_segments_preserve_hard_and_soft_pin_semantics() {
 fn tenant_policy_preferred_segments_still_prefer_live_segment() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("tenant-policy-preferred-live-writer"));
-    let owner_a = publish_storage_node(&metadata, &transport, "prefer-owner-a", "seg-a", "pool-a");
-    let _owner_b = publish_storage_node(&metadata, &transport, "prefer-owner-b", "seg-b", "pool-a");
+    let owner_a = publish_tenant_storage_node(
+        &metadata,
+        "tenant-a",
+        &transport,
+        "prefer-owner-a",
+        "seg-a",
+        "pool-a",
+    );
+    let _owner_b = publish_tenant_storage_node(
+        &metadata,
+        "tenant-a",
+        &transport,
+        "prefer-owner-b",
+        "seg-b",
+        "pool-a",
+    );
     metadata
         .put_tenant_policy(
             &TenantPolicy {
