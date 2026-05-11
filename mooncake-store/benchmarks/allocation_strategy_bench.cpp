@@ -1183,7 +1183,7 @@ static void runDsaMatrix() {
     std::vector<bool> skewed_options = {false, true};
     std::vector<int> segment_counts = {1, 2, 4, 8, 16};
     std::vector<int> replica_nums = {1, 2, 3};
-    std::vector<bool> paired_modes = {true, false};
+    std::vector<bool> paired_modes = {false, true};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
         AllocationStrategyType::FREE_RATIO_FIRST,
