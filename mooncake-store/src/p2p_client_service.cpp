@@ -194,9 +194,11 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         config.rpc_thread_num, client_rpc_port_);
     RegisterClientRpcService(*client_rpc_server_, *client_rpc_service_);
 
-    client_rpc_server_thread_ = std::thread([this]() {
+    auto rpc_start_failed = std::make_shared<std::atomic<bool>>(false);
+    client_rpc_server_thread_ = std::thread([this, rpc_start_failed]() {
         auto ec = client_rpc_server_->start();
         if (ec) {
+            rpc_start_failed->store(true);
             LOG(ERROR) << "P2P RPC server failed to start on port "
                        << client_rpc_port_ << ": " << ec.message();
         }
@@ -206,6 +208,11 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 
     // Give RPC server a moment to start
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (rpc_start_failed->load()) {
+        LOG(ERROR) << "P2P RPC server could not bind on port "
+                   << client_rpc_port_ << "; aborting service initialization.";
+        return ErrorCode::INTERNAL_ERROR;
+    }
     LOG(INFO) << "P2P RPC server started on port " << client_rpc_port_;
 
     // 9. If started in FULL state, notify master that sync is complete.
@@ -1441,18 +1448,33 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                     if (result.error() != ErrorCode::OBJECT_NOT_FOUND) {
                         LOG(ERROR)
                             << "Failed to get from remote, key: " << req->key
-                            << ", error: " << result.error();
+                            << ", error: " << result.error()
+                            << ", route: " << route->proxy.ip_address << ":"
+                            << route->proxy.rpc_port
+                            << ", client_id: " << route->proxy.client_id
+                            << ", segment_id: " << route->proxy.segment_id
+                            << ", is_cached: " << route->is_cached;
                     }
                     final_result = result.error();
                 }
             } catch (const std::exception& e) {
                 final_result = ErrorCode::INTERNAL_ERROR;
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                           << ", exception: " << e.what();
+                           << ", exception: " << e.what()
+                           << ", route: " << route->proxy.ip_address << ":"
+                           << route->proxy.rpc_port
+                           << ", client_id: " << route->proxy.client_id
+                           << ", segment_id: " << route->proxy.segment_id
+                           << ", is_cached: " << route->is_cached;
             } catch (...) {
                 final_result = ErrorCode::INTERNAL_ERROR;
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
-                           << ", unknown exception";
+                           << ", unknown exception"
+                           << ", route: " << route->proxy.ip_address << ":"
+                           << route->proxy.rpc_port
+                           << ", client_id: " << route->proxy.client_id
+                           << ", segment_id: " << route->proxy.segment_id
+                           << ", is_cached: " << route->is_cached;
             }
             iter.Evict(*route);
         }
