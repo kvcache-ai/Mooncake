@@ -44,8 +44,34 @@ DEFINE_int32(
     "measured allocation loop (0 = disabled, original behavior). "
     "When >0, early exit on consecutive failures is suppressed so that "
     "all num_allocations are attempted under near-full conditions.");
-DEFINE_int64(dsa_segment_capacity, 600ULL * 1024,
+DEFINE_int64(dsa_segment_capacity, 1024ULL * 1024,
              "Per-segment capacity in MB for DSA workload");
+DEFINE_double(dsa_capacity_multiplier, 3.0,
+              "DSA workload measures (multiplier * cluster_capacity) worth "
+              "of allocations under steady-state churn. Combined with "
+              "--dsa_warmup_multiplier, total per-case work is "
+              "(warmup + capacity) * cluster_capacity, clamped to "
+              "[kDsaMinAllocs, --dsa_max_allocs]; --num_allocations is "
+              "ignored in DSA mode.");
+DEFINE_double(dsa_warmup_multiplier, 1.0,
+              "DSA warmup-phase write volume in units of cluster_capacity, "
+              "executed BEFORE the measurement window so the cluster is in "
+              "post-fill eviction churn when stats start being collected. "
+              "All stats during warmup (latencies, util_ratios, evict "
+              "rounds, succ/total) are discarded. Set to 0.0 to disable "
+              "warmup entirely (legacy behavior).");
+DEFINE_int32(dsa_max_allocs, 50000000,
+             "Per-case upper bound on the auto-derived DSA allocation count. "
+             "Raise this if you use very large segments (e.g. 100GB+) and "
+             "want big clusters to actually reach steady-state eviction; "
+             "lower it to bound benchmark runtime. Each allocation costs ~1-3 "
+             "us, so the default upper bound can take minutes per saturated "
+             "case.");
+DEFINE_double(dsa_evict_ratio, 0.05,
+              "Fraction of live objects to evict on each Allocate failure "
+              "(default 0.05 = 5%). Lower values keep "
+              "the steady-state cluster fill closer to the fragmentation "
+              "ceiling but trigger evictions more frequently.");
 
 using namespace mooncake;
 
@@ -62,15 +88,16 @@ constexpr size_t kMaxExpectedAllocs = 600000;
 constexpr double kLargeClusterThresholdGB = 500.0;
 constexpr int kPreFillSampleInterval = 100;
 constexpr int kMinMeasurementAllocs = 100;
-constexpr int kMaxMeasurementAllocs = 200000;
+constexpr int kMaxMeasurementAllocs = 50000000;
 constexpr int kMinSamplesForConvergence = 10;
 
 // DSA workload sizes (DeepSeek defaults; adjust in source for other models).
 constexpr size_t kDsaKvSize = 3274752;       // ~3.12 MB per KV page
 constexpr size_t kDsaIndexerSize = 658432;   // 643 KB per indexer entry
 constexpr int kDsaMaxBatch = 128;            // per-round batch upper bound
-constexpr double kDsaEvictRatio = 0.10;
 constexpr int kDsaMaxRetries = 5;
+// Lower bound on the auto-derived allocation count per DSA case.
+constexpr int kDsaMinAllocs = 100;
 
 enum class WorkloadType {
     FILL_UP,    // Only allocate, measure throughput/latency
@@ -187,9 +214,7 @@ static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
 
 static void setupResourceLimits() {
     struct rlimit rl;
-    // Cap virtual address space (RLIMIT_AS). Bumped from the original 4TB to
-    // 200TB so the DSA matrix (up to 256 segments x 600GB = 150TB) fits.
-    // Original fill-up / scale-out matrices are unaffected.
+    // DSA cases simulate multi-TB clusters via virtual address space.
     rl.rlim_cur = 200ULL * 1024 * 1024 * 1024 * 1024;
     rl.rlim_max = 200ULL * 1024 * 1024 * 1024 * 1024;
     setrlimit(RLIMIT_AS, &rl);
@@ -363,16 +388,6 @@ static UtilRatioStats computeUtilRatioStats(std::vector<double>& util_ratios) {
                 util_ratios.size();
     stats.valid = true;
     return stats;
-}
-
-static std::string formatUtilRatioStats(const UtilRatioStats& stats) {
-    if (!stats.valid) return "N/A";
-
-    std::ostringstream ss;
-    ss << std::fixed << std::setprecision(6) << stats.min << " / "
-       << stats.p99 << " / " << stats.p90 << " / " << stats.p50 << " / "
-       << stats.max << " / " << stats.avg;
-    return ss.str();
 }
 
 static std::string strategyName(AllocationStrategyType type) {
@@ -754,12 +769,13 @@ static void evictRandomFraction(std::vector<std::vector<Replica>>& live,
     }
 }
 
-// Try to allocate `size` once. On failure, evict 10%
+// Try to allocate once; on failure, sample utilization before eviction.
 static bool dsaAllocateWithEvict(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, size_t size, int replica_num,
     std::vector<std::vector<Replica>>& live, std::mt19937& rng,
-    int& evict_count) {
+    int& evict_count, double evict_ratio,
+    std::vector<double>* pre_evict_util = nullptr) {
     for (int attempt = 0; attempt <= kDsaMaxRetries; ++attempt) {
         auto result = strategy->Allocate(manager, size, replica_num);
         if (result.has_value()) {
@@ -769,52 +785,93 @@ static bool dsaAllocateWithEvict(
 
         if (live.empty()) return false;
 
-        evictRandomFraction(live, kDsaEvictRatio, rng);
+        if (attempt == 0 && pre_evict_util != nullptr) {
+            pre_evict_util->push_back(computeAverageUtilAll(manager));
+        }
+
+        evictRandomFraction(live, evict_ratio, rng);
         ++evict_count;
     }
 
     return false;
 }
 
-/**
- * @brief Run DSA benchmark with fail-triggered random eviction.
- *
- * When `cfg.dsa_paired` is false, each round allocates N kvcache objects
- * (N uniform in [1, kDsaMaxBatch]). When true, each round allocates N kvcache
- * objects followed by N indexer objects, with N redrawn each round.
- * `cfg.num_allocations` is the total number of strategy->Allocate invocations
- * to attempt across all rounds.
- */
+// Run DSA workload; the allocation count is derived from cluster capacity.
 static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     auto strategy = CreateAllocationStrategy(cfg.strategy_type);
 
+    const size_t total_capacity = computeTotalCapacity(manager);
+    const size_t avg_obj_size =
+        cfg.dsa_paired ? (kDsaKvSize + kDsaIndexerSize) / 2 : kDsaKvSize;
+    const size_t bytes_per_alloc = avg_obj_size * cfg.replica_num;
+    const double warmup_mult = std::max(0.0, FLAGS_dsa_warmup_multiplier);
+    const double measure_mult = std::max(0.0, FLAGS_dsa_capacity_multiplier);
+    const double total_mult = warmup_mult + measure_mult;
+
+    int total_allocs =
+        (bytes_per_alloc == 0)
+            ? kDsaMinAllocs
+            : static_cast<int>(total_mult * total_capacity / bytes_per_alloc);
+    total_allocs =
+        std::clamp(total_allocs, kDsaMinAllocs, FLAGS_dsa_max_allocs);
+    int warmup_allocs =
+        (total_mult > 0.0)
+            ? static_cast<int>(total_allocs * (warmup_mult / total_mult))
+            : 0;
+    int measure_allocs = std::max(0, total_allocs - warmup_allocs);
+
     std::vector<double> latencies;
-    latencies.reserve(cfg.num_allocations);
+    latencies.reserve(measure_allocs);
 
     std::vector<double> util_ratios;
-    util_ratios.reserve(cfg.num_allocations);
+    util_ratios.reserve(measure_allocs);
 
-    std::vector<std::vector<Replica>> kv_live;
-    std::vector<std::vector<Replica>> idx_live;
-    kv_live.reserve(std::min(cfg.num_allocations, 1 << 20));
-    idx_live.reserve(std::min(cfg.num_allocations, 1 << 20));
+    // Use one live set so eviction matches allocator_bench.
+    std::vector<std::vector<Replica>> live_allocations;
+    live_allocations.reserve(std::min(total_allocs, 1 << 20));
 
-    std::mt19937 rng(0x0D5A5EEDu);  // fixed seed for reproducibility
+    std::mt19937 rng(42);
     std::uniform_int_distribution<int> batch_dist(1, kDsaMaxBatch);
+
+    if (warmup_allocs > 0) {
+        int warmup_count = 0;
+        int warmup_evict_throwaway = 0;
+        auto warmup_run = [&](size_t size,
+                              std::vector<std::vector<Replica>>& live) {
+            (void)dsaAllocateWithEvict(strategy, manager, size,
+                                       cfg.replica_num, live, rng,
+                                       warmup_evict_throwaway,
+                                       FLAGS_dsa_evict_ratio);
+            ++warmup_count;
+        };
+
+        while (warmup_count < warmup_allocs) {
+            int batch = batch_dist(rng);
+            for (int i = 0; i < batch && warmup_count < warmup_allocs; ++i) {
+                warmup_run(kDsaKvSize, live_allocations);
+            }
+            if (cfg.dsa_paired) {
+                for (int i = 0; i < batch && warmup_count < warmup_allocs;
+                     ++i) {
+                    warmup_run(kDsaIndexerSize, live_allocations);
+                }
+            }
+        }
+    }
 
     int success_count = 0;
     int total_count = 0;
     int evict_count = 0;
-    double instrumentation_time_us = 0.0;
 
     auto run_one = [&](size_t size,
                        std::vector<std::vector<Replica>>& live) -> bool {
         auto t0 = std::chrono::high_resolution_clock::now();
         bool ok = dsaAllocateWithEvict(strategy, manager, size,
                                        cfg.replica_num, live, rng,
-                                       evict_count);
+                                       evict_count, FLAGS_dsa_evict_ratio,
+                                       &util_ratios);
         auto t1 = std::chrono::high_resolution_clock::now();
 
         latencies.push_back(
@@ -822,30 +879,21 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
         ++total_count;
         if (ok) ++success_count;
 
-        auto s0 = std::chrono::high_resolution_clock::now();
-        util_ratios.push_back(computeAverageUtilAll(manager));
-        auto s1 = std::chrono::high_resolution_clock::now();
-        instrumentation_time_us +=
-            std::chrono::duration<double, std::micro>(s1 - s0).count();
-
         return ok;
     };
 
     auto total_start = std::chrono::high_resolution_clock::now();
 
-    while (total_count < cfg.num_allocations) {
+    while (total_count < measure_allocs) {
         int batch = batch_dist(rng);
 
-        // KV burst.
-        for (int i = 0; i < batch && total_count < cfg.num_allocations; ++i) {
-            run_one(kDsaKvSize, kv_live);
+        for (int i = 0; i < batch && total_count < measure_allocs; ++i) {
+            run_one(kDsaKvSize, live_allocations);
         }
 
-        // Indexer burst (paired mode only).
         if (cfg.dsa_paired) {
-            for (int i = 0; i < batch && total_count < cfg.num_allocations;
-                 ++i) {
-                run_one(kDsaIndexerSize, idx_live);
+            for (int i = 0; i < batch && total_count < measure_allocs; ++i) {
+                run_one(kDsaIndexerSize, live_allocations);
             }
         }
     }
@@ -854,7 +902,6 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     double total_us =
         std::chrono::duration<double, std::micro>(total_end - total_start)
             .count();
-    total_us -= instrumentation_time_us;
 
     FillUpResult res;
     res.strategy_name = cfg.strategy_name;
@@ -894,10 +941,11 @@ static void printFillUpResult(const FillUpResult& r) {
         std::to_string(r.success_count) + "/" + std::to_string(r.total_count);
     std::ostringstream cap_ss;
     cap_ss << std::fixed << std::setprecision(1) << r.cluster_capacity_gb;
-    std::string alloc_size_str = r.dsa_paired
-                                     ? std::string("KV+Idx")
-                                     : (std::to_string(r.alloc_size / KiB) +
-                                        "KB");
+    std::string alloc_size_str =
+        r.dsa_paired
+            ? (std::to_string(r.alloc_size / KiB) + "+" +
+               std::to_string(kDsaIndexerSize / KiB) + "KB")
+            : (std::to_string(r.alloc_size / KiB) + "KB");
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
               << r.replica_num << std::setw(10) << r.num_segments
               << std::setw(12) << alloc_size_str
@@ -913,18 +961,21 @@ static void printFillUpResult(const FillUpResult& r) {
 }
 
 static void printDsaHeader() {
-    std::cout << std::string(256, '-') << std::endl;
+    std::cout << std::string(264, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
               << "Replica" << std::setw(10) << "Segments" << std::setw(12)
               << "AllocSize" << std::setw(12) << "Cluster(GB)" << std::setw(8)
-              << "Skewed" << std::right << std::setw(14) << "Throughput"
+              << "Skewed" << std::right << std::setw(14) << "UtilRatio_min"
+              << std::setw(14) << "UtilRatio_p99" << std::setw(14)
+              << "UtilRatio_p90" << std::setw(14) << "UtilRatio_p50"
+              << std::setw(14) << "UtilRatio_max" << std::setw(14)
+              << "UtilRatio_avg" << std::setw(14) << "Throughput"
               << std::setw(12) << "Avg(ns)" << std::setw(12) << "P50(ns)"
               << std::setw(12) << "P90(ns)" << std::setw(12) << "P99(ns)"
-              << std::setw(12) << "UtilStdDev" << std::setw(10) << "AvgUtil%"
-              << std::setw(15) << "Succ/Total" << std::setw(14)
-              << "Evictions" << std::setw(58)
-              << "UtilRatio(min/p99/p90/p50/max/avg)" << std::endl;
-    std::cout << std::string(256, '-') << std::endl;
+              << std::setw(12) << "UtilStdDev" << std::setw(17)
+              << "Evictions(round)" << std::setw(20) << "Succ/Total"
+              << std::endl;
+    std::cout << std::string(264, '-') << std::endl;
 }
 
 static void printDsaResult(const FillUpResult& r) {
@@ -932,23 +983,26 @@ static void printDsaResult(const FillUpResult& r) {
         std::to_string(r.success_count) + "/" + std::to_string(r.total_count);
     std::ostringstream cap_ss;
     cap_ss << std::fixed << std::setprecision(1) << r.cluster_capacity_gb;
-    std::string alloc_size_str = r.dsa_paired
-                                     ? std::string("KV+Idx")
-                                     : (std::to_string(r.alloc_size / KiB) +
-                                        "KB");
+    std::string alloc_size_str =
+        r.dsa_paired
+            ? (std::to_string(r.alloc_size / KiB) + "+" +
+               std::to_string(kDsaIndexerSize / KiB) + "KB")
+            : (std::to_string(r.alloc_size / KiB) + "KB");
+    const auto& urs = r.util_ratio_stats;
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
               << r.replica_num << std::setw(10) << r.num_segments
               << std::setw(12) << alloc_size_str << std::setw(12)
               << cap_ss.str() << std::setw(8) << (r.skewed ? "yes" : "no")
-              << std::right << std::fixed << std::setprecision(0)
-              << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
-              << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
-              << std::setw(12) << r.p99_ns << std::setprecision(4)
-              << std::setw(12) << r.final_util_stddev << std::setprecision(2)
-              << std::setw(9) << (r.final_avg_util * 100.0) << "%"
-              << std::setw(15) << alloc_ratio << std::setw(14)
-              << r.evict_count << std::setw(58)
-              << formatUtilRatioStats(r.util_ratio_stats) << std::endl;
+              << std::right << std::fixed << std::setprecision(6)
+              << std::setw(14) << urs.min << std::setw(14) << urs.p99
+              << std::setw(14) << urs.p90 << std::setw(14) << urs.p50
+              << std::setw(14) << urs.max << std::setw(14) << urs.avg
+              << std::setprecision(0) << std::setw(14) << r.throughput
+              << std::setw(12) << r.avg_ns << std::setw(12) << r.p50_ns
+              << std::setw(12) << r.p90_ns << std::setw(12) << r.p99_ns
+              << std::setprecision(4) << std::setw(12) << r.final_util_stddev
+              << std::setprecision(0) << std::setw(17) << r.evict_count
+              << std::setw(20) << alloc_ratio << std::endl;
 }
 
 static void printScaleOutHeader() {
@@ -1129,9 +1183,9 @@ static void runScaleOutMatrix() {
 // DSA matrix runner
 static void runDsaMatrix() {
     std::vector<bool> skewed_options = {false, true};
-    std::vector<int> segment_counts = {1, 8, 32, 128, 256};
+    std::vector<int> segment_counts = {1, 2, 4, 8, 16};
     std::vector<int> replica_nums = {1, 2, 3};
-    std::vector<bool> paired_modes = {false, true};
+    std::vector<bool> paired_modes = {true, false};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
         AllocationStrategyType::FREE_RATIO_FIRST,
@@ -1139,6 +1193,8 @@ static void runDsaMatrix() {
 
     size_t seg_cap_mb = static_cast<size_t>(FLAGS_dsa_segment_capacity);
 
+    const double total_mult = std::max(0.0, FLAGS_dsa_warmup_multiplier) +
+                              std::max(0.0, FLAGS_dsa_capacity_multiplier);
     std::cout
         << "\n=== DSA Paired KV+Indexer Benchmark Matrix ===\n"
         << "Workload: per-round burst of N kvcache (" << kDsaKvSize
@@ -1146,13 +1202,30 @@ static void runDsaMatrix() {
         << kDsaIndexerSize << " B) allocations; N uniform in [1, "
         << kDsaMaxBatch << "].\n"
         << "Eviction: on Allocate failure, drop "
-        << static_cast<int>(kDsaEvictRatio * 100)
-        << "% of live objects of the failing class at random; retry up to "
+        << (FLAGS_dsa_evict_ratio * 100.0)
+        << "% of live objects at random; retry up to "
         << kDsaMaxRetries
-        << " times. Latency includes evict+retry time.\n"
-        << "Config: num_allocations=" << FLAGS_num_allocations
-        << ", dsa_segment_capacity=" << seg_cap_mb << " MB ("
-        << (seg_cap_mb / 1024.0) << " GB)\n"
+        << " times. Latency includes evict+retry time. Evictions(round) "
+           "counts how many such drop cycles fire during measurement, "
+           "NOT the number of objects evicted.\n"
+        << "UtilRatio_*: cluster utilization sampled at each eviction "
+           "trigger (peak fill the strategy reached before being forced "
+           "to evict), NOT a time-weighted average over all allocations.\n"
+        << "Phases: warmup writes "
+        << FLAGS_dsa_warmup_multiplier
+        << "x cluster_capacity worth of allocations to reach steady state "
+           "(stats discarded), then measurement writes "
+        << FLAGS_dsa_capacity_multiplier
+        << "x cluster_capacity (stats collected). "
+           "Set --dsa_warmup_multiplier=0 to disable warmup.\n"
+        << "Config: dsa_segment_capacity=" << seg_cap_mb << " MB ("
+        << (seg_cap_mb / 1024.0) << " GB), dsa_max_allocs="
+        << FLAGS_dsa_max_allocs << "\n"
+        << "Total per-case allocations auto-derived as " << total_mult
+        << "x * cluster_capacity / (avg_obj_size * replica), clamped to ["
+        << kDsaMinAllocs << ", " << FLAGS_dsa_max_allocs
+        << "]; warmup/measurement budgets split proportionally when clamp "
+           "activates. --num_allocations is ignored in DSA mode.\n"
         << "Skewed setup: half nodes are (base + 50%) capacity, half are "
            "(base - 50%)\n"
         << std::endl;
@@ -1169,7 +1242,10 @@ static void runDsaMatrix() {
                         cfg.segment_capacity = seg_cap_mb * MiB;
                         cfg.alloc_size = kDsaKvSize;
                         cfg.replica_num = rep;
-                        cfg.num_allocations = FLAGS_num_allocations;
+                        // num_allocations is auto-derived inside
+                        // runDsaBenchmark from cluster capacity; the flag
+                        // value is intentionally not propagated.
+                        cfg.num_allocations = 0;
                         cfg.skewed = skew;
                         cfg.strategy_type = strategy;
                         cfg.strategy_name = strategyName(strategy);
