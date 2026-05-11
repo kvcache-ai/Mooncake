@@ -6,13 +6,14 @@
  * instances, and exercises the client→master→client round-trip for the main
  * P2P operations (Put, Get, Query, IsExist, BatchPut, BatchGet, etc.).
  *
- * Transport is "tcp" with loopback; no RDMA hardware is required.
+ * Transport is "tcp" with loopback; no dedicated RDMA hardware is required.
  */
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,17 +34,23 @@ class P2PClientIntegrationTest : public ::testing::Test {
     // --- Factory helpers ---
 
     static std::shared_ptr<P2PClientService> CreateP2PClient(
-        const std::string& host_name, uint32_t rpc_port = 0) {
+        const std::string& host_name, uint32_t rpc_port = 0,
+        const std::string& local_transfer_mode = "te") {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
 
         auto config = ClientConfigBuilder::build_p2p_real_client(
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
             R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
             /*local_buffer_size=*/0, nullptr, "", rpc_port);
+        if (local_transfer_mode == "te") {
+            config.local_transfer_mode = LocalTransferMode::TE;
+        } else {
+            config.local_transfer_mode = LocalTransferMode::MEMCPY;
+        }
 
         auto client = std::make_shared<P2PClientService>(
             config.local_ip, config.te_port, config.metadata_connstring,
-            config.labels);
+            config.metrics_port, config.enable_metrics_http, config.labels);
 
         auto err = client->Init(config);
         EXPECT_EQ(err, ErrorCode::OK)
@@ -94,12 +101,26 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
     const std::string key = "p2p_local_put_get";
     const std::string data = "Hello P2P world!";
 
+    // Get metrics baseline before operations
+    auto metrics_before = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_before.has_value());
+
     // Put
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
     auto put_result = client_->Put(key, put_slices, WriteRouteRequestConfig{});
     ASSERT_TRUE(put_result.has_value())
         << "Put failed: " << static_cast<int>(put_result.error());
+
+    // Verify Put metrics: should have 1 local put request with correct bytes
+    auto metrics_after_put = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_after_put.has_value());
+    EXPECT_TRUE(metrics_after_put.value().find(
+                    "mooncake_p2p_local_put_requests_total 1") !=
+                std::string::npos);
+    EXPECT_TRUE(metrics_after_put.value().find(
+                    "mooncake_p2p_local_put_bytes_total " +
+                    std::to_string(data.size())) != std::string::npos);
 
     // Get (local mode reads from DataManager directly)
     std::vector<char> buf(data.size(), 0);
@@ -115,6 +136,19 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
         << "Get failed: " << static_cast<int>(get_result.error());
 
     EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+    // Verify Get metrics: should have 1 local get request with 1 hit
+    auto metrics_after_get = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_after_get.has_value());
+    EXPECT_TRUE(metrics_after_get.value().find(
+                    "mooncake_p2p_local_get_requests_total 1") !=
+                std::string::npos);
+    EXPECT_TRUE(
+        metrics_after_get.value().find("mooncake_p2p_local_get_hits_total 1") !=
+        std::string::npos);
+    EXPECT_TRUE(metrics_after_get.value().find(
+                    "mooncake_p2p_local_get_bytes_total " +
+                    std::to_string(data.size())) != std::string::npos);
 }
 
 // ============================================================================
@@ -140,6 +174,32 @@ TEST_F(P2PClientIntegrationTest, IsExist) {
     auto exist_after = client_->IsExist(key);
     ASSERT_TRUE(exist_after.has_value());
     EXPECT_TRUE(exist_after.value());
+}
+
+// ============================================================================
+// Get miss metrics
+// ============================================================================
+
+TEST_F(P2PClientIntegrationTest, GetMissMetrics) {
+    const std::string key = "p2p_nonexistent_key_for_miss_test";
+
+    // Get metrics baseline
+    auto metrics_before = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_before.has_value());
+
+    // Try to get a non-existent key (should be a miss)
+    std::vector<char> buf(100, 0);
+    auto get_result = client_->Get(key, {(void*)buf.data()}, {buf.size()});
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // Verify Get miss metrics
+    auto metrics_after = client_->SerializeMetrics();
+    ASSERT_TRUE(metrics_after.has_value());
+    // The miss count should have increased
+    EXPECT_TRUE(
+        metrics_after.value().find("mooncake_p2p_local_get_misses_total") !=
+        std::string::npos);
 }
 
 // ============================================================================
@@ -239,6 +299,98 @@ TEST_F(P2PClientIntegrationTest, BatchPutAndBatchQuery) {
         EXPECT_TRUE(query_results[i].has_value())
             << "BatchQuery failed for key: " << keys[i]
             << ", error: " << static_cast<int>(query_results[i].error());
+    }
+}
+
+TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
+    // Test both local transfer modes: te and memcpy.
+    const std::vector<std::string> transfer_modes = {"te", "memcpy"};
+
+    for (const auto& mode : transfer_modes) {
+        SCOPED_TRACE("local_transfer_mode=" + mode);
+
+        std::string host = "localhost:" + std::to_string(getFreeTcpPort());
+        auto remote_writer = CreateP2PClient(host, /*rpc_port=*/0, mode);
+        ASSERT_NE(remote_writer, nullptr);
+
+        const int batch_size = 6;
+        std::vector<std::string> keys;
+        std::vector<std::string> payloads;
+        std::vector<std::vector<Slice>> batched_slices;
+
+        keys.reserve(batch_size);
+        payloads.reserve(batch_size);
+        batched_slices.reserve(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            std::string key_prefix = "p2p_remote_batch_" + mode + "_";
+            keys.push_back(key_prefix + "key_" + std::to_string(i));
+            payloads.push_back(key_prefix + "payload_" + std::to_string(i));
+        }
+        for (int i = 0; i < batch_size; ++i) {
+            std::vector<Slice> slices;
+            slices.emplace_back(Slice{const_cast<char*>(payloads[i].data()),
+                                      payloads[i].size()});
+            batched_slices.push_back(std::move(slices));
+        }
+
+        // Force write route to exclude local candidate so the writer must
+        // execute remote Put RPCs.
+        WriteRouteRequestConfig remote_put_config;
+        remote_put_config.allow_local = false;
+        remote_put_config.prefer_local = false;
+        remote_put_config.max_candidates =
+            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+        auto put_results =
+            remote_writer->BatchPut(keys, batched_slices, remote_put_config);
+        ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
+        for (const auto& r : put_results) {
+            ASSERT_TRUE(r.has_value())
+                << "Remote BatchPut failed: " << static_cast<int>(r.error());
+        }
+
+        // Validate remote BatchGet(raw buffers) path.
+        std::vector<std::vector<char>> read_payloads(batch_size);
+        std::vector<std::vector<void*>> all_buffers(batch_size);
+        std::vector<std::vector<size_t>> all_sizes(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            read_payloads[i].resize(payloads[i].size(), 0);
+            all_buffers[i].push_back(read_payloads[i].data());
+            all_sizes[i].push_back(read_payloads[i].size());
+        }
+
+        auto batch_get_results = remote_writer->BatchGet(
+            keys, all_buffers, all_sizes, ReadRouteConfig{});
+        ASSERT_EQ(batch_get_results.size(), static_cast<size_t>(batch_size));
+        for (int i = 0; i < batch_size; ++i) {
+            ASSERT_TRUE(batch_get_results[i].has_value())
+                << "Remote BatchGet(raw) failed for key " << keys[i]
+                << ", error: "
+                << static_cast<int>(batch_get_results[i].error());
+            EXPECT_EQ(static_cast<size_t>(batch_get_results[i].value()),
+                      payloads[i].size());
+            EXPECT_EQ(
+                std::string(read_payloads[i].data(), read_payloads[i].size()),
+                payloads[i]);
+        }
+
+        // Validate remote BatchGet(allocator) path.
+        auto allocator = ClientBufferAllocator::create(8 * 1024 * 1024);
+        ASSERT_NE(allocator, nullptr);
+        auto batch_get_handles =
+            remote_writer->BatchGet(keys, allocator, ReadRouteConfig{});
+        ASSERT_EQ(batch_get_handles.size(), static_cast<size_t>(batch_size));
+        for (int i = 0; i < batch_size; ++i) {
+            ASSERT_TRUE(batch_get_handles[i].has_value())
+                << "Remote BatchGet(allocator) failed for key " << keys[i]
+                << ", error: "
+                << static_cast<int>(batch_get_handles[i].error());
+            auto buffer_handle = batch_get_handles[i].value();
+            ASSERT_NE(buffer_handle, nullptr);
+            ASSERT_EQ(buffer_handle->size(), payloads[i].size());
+            EXPECT_EQ(std::string(static_cast<char*>(buffer_handle->ptr()),
+                                  buffer_handle->size()),
+                      payloads[i]);
+        }
     }
 }
 
@@ -380,6 +532,94 @@ TEST_F(P2PClientIntegrationTest, LargePutGet) {
         << "Large Get failed: " << static_cast<int>(get.error());
 
     EXPECT_EQ(payload, read_buf);
+}
+
+TEST_F(P2PClientIntegrationTest, LocalPutGetWithTeTransferMode) {
+    auto te_client = CreateP2PClient(
+        "localhost:" + std::to_string(getFreeTcpPort()), /*rpc_port=*/0, "te");
+    ASSERT_NE(te_client, nullptr);
+
+    const std::string key = "p2p_local_te_put_get";
+    const size_t kHalf = 1024;
+    std::vector<char> part1(kHalf, 'A');
+    std::vector<char> part2(kHalf, 'B');
+    std::vector<char> read_buf(kHalf * 2, 0);
+
+    // TE local transfer path needs registered source/destination buffers.
+    auto reg1 = te_client->RegisterLocalMemory(part1.data(), part1.size(), "*",
+                                               false, false);
+    auto reg2 = te_client->RegisterLocalMemory(part2.data(), part2.size(), "*",
+                                               false, false);
+    auto reg3 = te_client->RegisterLocalMemory(read_buf.data(), read_buf.size(),
+                                               "*", false, false);
+    ASSERT_TRUE(reg1.has_value());
+    ASSERT_TRUE(reg2.has_value());
+    ASSERT_TRUE(reg3.has_value());
+
+    std::vector<Slice> put_slices = {Slice{part1.data(), part1.size()},
+                                     Slice{part2.data(), part2.size()}};
+    auto put_result =
+        te_client->Put(key, put_slices, WriteRouteRequestConfig{});
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << static_cast<int>(put_result.error());
+
+    auto get_result =
+        te_client->Get(key, {(void*)read_buf.data()}, {read_buf.size()});
+    ASSERT_TRUE(get_result.has_value())
+        << "Get failed: " << static_cast<int>(get_result.error());
+    ASSERT_EQ(static_cast<size_t>(get_result.value()), read_buf.size());
+
+    EXPECT_EQ(0, std::memcmp(read_buf.data(), part1.data(), part1.size()));
+    EXPECT_EQ(0, std::memcmp(read_buf.data() + part1.size(), part2.data(),
+                             part2.size()));
+
+    auto unreg1 = te_client->unregisterLocalMemory(part1.data(), false);
+    auto unreg2 = te_client->unregisterLocalMemory(part2.data(), false);
+    auto unreg3 = te_client->unregisterLocalMemory(read_buf.data(), false);
+    EXPECT_TRUE(unreg1.has_value());
+    EXPECT_TRUE(unreg2.has_value());
+    EXPECT_TRUE(unreg3.has_value());
+}
+
+TEST_F(P2PClientIntegrationTest, LocalGetBufferHandleWithTeTransferMode) {
+    auto te_client = CreateP2PClient(
+        "localhost:" + std::to_string(getFreeTcpPort()), /*rpc_port=*/0, "te");
+    ASSERT_NE(te_client, nullptr);
+
+    const std::string key = "p2p_local_te_get_buffer";
+    std::vector<char> payload(2048, 'R');
+
+    auto reg_src = te_client->RegisterLocalMemory(
+        payload.data(), payload.size(), "*", false, false);
+    ASSERT_TRUE(reg_src.has_value());
+
+    std::vector<Slice> put_slices = {{payload.data(), payload.size()}};
+    auto put_result =
+        te_client->Put(key, put_slices, WriteRouteRequestConfig{});
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << static_cast<int>(put_result.error());
+
+    auto allocator = ClientBufferAllocator::create(payload.size());
+    ASSERT_NE(allocator, nullptr);
+    auto reg_dst = te_client->RegisterLocalMemory(
+        allocator->getBase(), allocator->size(), "*", false, false);
+    ASSERT_TRUE(reg_dst.has_value());
+
+    auto get_result = te_client->Get(key, allocator, ReadRouteConfig{});
+    ASSERT_TRUE(get_result.has_value())
+        << "Get(buffer) failed: " << static_cast<int>(get_result.error());
+
+    auto buffer_handle = get_result.value();
+    ASSERT_NE(buffer_handle, nullptr);
+    ASSERT_EQ(buffer_handle->size(), payload.size());
+    EXPECT_EQ(
+        0, std::memcmp(buffer_handle->ptr(), payload.data(), payload.size()));
+
+    auto unreg_dst =
+        te_client->unregisterLocalMemory(allocator->getBase(), false);
+    auto unreg_src = te_client->unregisterLocalMemory(payload.data(), false);
+    EXPECT_TRUE(unreg_dst.has_value());
+    EXPECT_TRUE(unreg_src.has_value());
 }
 
 }  // namespace testing

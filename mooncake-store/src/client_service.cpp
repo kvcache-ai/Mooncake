@@ -10,11 +10,25 @@
 #include <thread>
 
 #include "config.h"
+#include "transfer_engine.h"
 #include "types.h"
 #include "p2p_client_service.h"
 #include "centralized_client_service.h"
+#include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
+
+void ClientService::initTeEndpoint() {
+    // For P2PHANDSHAKE the TE picks a random port and updates
+    // local_server_name_ accordingly, so getLocalIpAndPort() is authoritative.
+    // For HTTP/etcd/redis metadata the segment is published under the
+    // configured local_endpoint().
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        te_endpoint_ = transfer_engine_->getLocalIpAndPort();
+    } else {
+        te_endpoint_ = local_endpoint();
+    }
+}
 
 size_t ClientService::CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
@@ -34,34 +48,23 @@ size_t ClientService::CalculateSliceSize(std::span<const Slice> slices) {
 
 ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
                              const std::string& metadata_connstring,
+                             uint16_t metrics_port, bool enable_metrics_http,
                              const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
-      metrics_(ClientMetric::Create(merge_labels(labels))),
       local_ip_(local_ip),
       te_port_(te_port),
-      metadata_connstring_(metadata_connstring) {
+      metadata_connstring_(metadata_connstring),
+      metrics_port_(metrics_port),
+      enable_metrics_http_(enable_metrics_http) {
     LOG(INFO) << "client_id=" << client_id_;
-
-    if (metrics_) {
-        if (metrics_->GetReportingInterval() > 0) {
-            LOG(INFO) << "Client metrics enabled with reporting thread started "
-                         "(interval: "
-                      << metrics_->GetReportingInterval() << "s)";
-        } else {
-            LOG(INFO)
-                << "Client metrics enabled but reporting disabled (interval=0)";
-        }
-    } else {
-        LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
-                     "enable)";
-    }
+    metrics_port_ = StartMetricsHttpServer(enable_metrics_http_, metrics_port_);
 }
 
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const CentralizedClientConfig& config) {
     auto client = std::make_shared<CentralizedClientService>(
         config.local_ip, config.te_port, config.metadata_connstring,
-        config.labels);
+        config.metrics_port, config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -77,7 +80,7 @@ std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const P2PClientConfig& config) {
     auto client = std::make_shared<P2PClientService>(
         config.local_ip, config.te_port, config.metadata_connstring,
-        config.labels);
+        config.metrics_port, config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -94,7 +97,10 @@ ClientService::~ClientService() {
     Destroy();
 }
 
-void ClientService::Stop() { StopHeartbeat(); }
+void ClientService::Stop() {
+    StopMetricsHttpServer();
+    StopHeartbeat();
+}
 
 void ClientService::StopHeartbeat() {
     // Stop ping thread only after no need to contact master anymore
@@ -126,24 +132,28 @@ void ClientService::StartHeartbeat(const std::string& master_server_entry) {
     std::string current_master_address;
 
     if (is_ha_mode) {
-        // For HA mode, resolve the actual address from etcd
+        // For HA mode, try to resolve the actual address from etcd.
+        // If etcd is unavailable, start heartbeat thread anyway - it will
+        // retry and recover when etcd/master becomes available.
         ViewVersionId master_version = 0;
         auto err = master_view_helper_.GetMasterView(current_master_address,
                                                      master_version);
         if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to get master address for heartbeat";
-            return;
+            LOG(WARNING) << "Failed to get master address from etcd, "
+                         << "starting heartbeat thread in degraded mode "
+                         << "(will retry): " << err;
+            // Don't return - Let heartbeat thread handle reconnection
         }
     } else {
         current_master_address = master_server_entry;
     }
 
     heartbeat_running_ = true;
-    heartbeat_thread_ =
-        std::thread([this, is_ha_mode, current_master_address]() mutable {
-            this->HeartbeatThreadMain(is_ha_mode,
-                                      std::move(current_master_address));
-        });
+    heartbeat_thread_ = std::thread([this, is_ha_mode, current_master_address,
+                                     master_server_entry]() mutable {
+        this->HeartbeatThreadMain(is_ha_mode, std::move(current_master_address),
+                                  master_server_entry);
+    });
 }
 
 ErrorCode ClientService::ConnectToMaster(
@@ -432,10 +442,11 @@ tl::expected<void, ErrorCode> ClientService::unregisterLocalMemory(
     return {};
 }
 
-void ClientService::HeartbeatThreadMain(bool is_ha_mode,
-                                        std::string current_master_address) {
+void ClientService::HeartbeatThreadMain(
+    bool is_ha_mode, std::string current_master_address,
+    const std::string& master_server_entry) {
     // How many failed heartbeats before getting latest master view from etcd
-    const int max_heartbeat_fail_count = 3;
+    const int max_heartbeat_fail_count = 10;
     // How long to wait for next heartbeat after success
     const int success_heartbeat_interval_ms = 1000;
     // How long to wait for next heartbeat after failure
@@ -455,6 +466,7 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
             LOG(INFO) << "Client registered successfully"
                       << ", client_id=" << client_id_
                       << ", view_version=" << res.value().view_version;
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
         }
     };
     // Use another thread to register client to avoid blocking the heartbeat
@@ -484,7 +496,11 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
                 // just retry
                 LOG(ERROR) << "Failed to send heartbeat to master";
             } else {
-                // Exceeded failure threshold, attempt reconnect
+                if (!connection_interrupted_) {
+                    OnHAEvent(HAEvent::MASTER_UNREACHABLE);
+                    connection_interrupted_ = true;
+                }
+                // Attempt reconnect
                 if (ReconnectToMaster(is_ha_mode, current_master_address)) {
                     heartbeat_fail_count = 0;
                     // Do NOT sleep here, immediately loop back to send
@@ -514,18 +530,25 @@ bool ClientService::HandleHeartbeatResponse(
     const std::string& current_master_address,
     const std::function<void()>& register_client,
     std::future<void>& register_client_future) {
-    if (response.view_version != view_version_) {
+    if (response.view_version != view_version_.load()) {
         LOG(WARNING) << "Master view_version changed"
                      << ", client status in master: " << (int)response.status
                      << ", master address: " << current_master_address
                      << ", Master version: " << response.view_version
-                     << ", Client version: " << view_version_;
+                     << ", Client version: " << view_version_.load();
     }
     for (auto& task_result : response.task_results) {
         HandleHeartbeatTaskResult(task_result);
     }
-    if (response.status == ClientStatus::UNDEFINED &&
-        !register_client_future.valid()) {
+    if (response.status == ClientStatus::HEALTH) {
+        // Heartbeat recovered after a connection interruption: master still
+        // knows this client. Fire MASTER_RECONNECTED once to trigger re-sync.
+        if (connection_interrupted_) {
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
+            connection_interrupted_ = false;
+        }
+    } else if (response.status == ClientStatus::UNDEFINED &&
+               !register_client_future.valid()) {
         // Ensure at most one register client thread is running
         register_client_future =
             std::async(std::launch::async, register_client);
@@ -588,6 +611,85 @@ bool ClientService::ReconnectToMaster(bool is_ha_mode,
         }
         LOG(INFO) << "Reconnected to master " << current_master_address;
         return true;
+    }
+}
+
+uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
+                                               uint16_t metrics_port) {
+    // Check if metrics HTTP is disabled
+    if (!enable_metrics_http) {
+        LOG(INFO) << "Client metrics HTTP server disabled";
+        return 0;
+    }
+
+    try {
+        // Create HTTP server with 1 thread for metrics
+        metrics_http_server_ =
+            std::make_unique<coro_http::coro_http_server>(1, metrics_port);
+
+        using namespace coro_http;
+
+        // Prometheus-style metrics endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/metrics",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                ClientMetric* metrics = GetMetrics();
+                if (!metrics) {
+                    resp.set_status_and_content(
+                        status_type::service_unavailable,
+                        "Metrics not available");
+                    return;
+                }
+                std::string metrics_str;
+                metrics->serialize(metrics_str);
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok,
+                                            std::move(metrics_str));
+            });
+
+        // Human-readable summary endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/metrics/summary",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                ClientMetric* metrics = GetMetrics();
+                if (!metrics) {
+                    resp.set_status_and_content(
+                        status_type::service_unavailable,
+                        "Metrics not available");
+                    return;
+                }
+                std::string summary = metrics->summary_metrics();
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok,
+                                            std::move(summary));
+            });
+
+        // Health check endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/health",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok, GetHealthStatus());
+            });
+
+        metrics_http_server_->async_start();
+        uint16_t actual_port = metrics_http_server_->port();
+        LOG(INFO) << "Client metrics HTTP server started on port "
+                  << actual_port;
+        return actual_port;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to start client metrics HTTP server: "
+                   << e.what();
+        return 0;
+    }
+}
+
+void ClientService::StopMetricsHttpServer() {
+    if (metrics_http_server_) {
+        LOG(INFO) << "Stopping client metrics HTTP server on port "
+                  << metrics_port_;
+        metrics_http_server_->stop();
+        metrics_http_server_.reset();
     }
 }
 

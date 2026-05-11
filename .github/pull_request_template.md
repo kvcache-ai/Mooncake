@@ -25,5 +25,6 @@
 ## Checklist
 
 - [ ] I have performed a self-review of my own code.
+- [ ] I have formatted my own code using `./scripts/code_format.sh` before submitting.
 - [ ] I have updated the documentation.
 - [ ] I have added tests to prove my changes are effective.

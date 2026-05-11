@@ -16,11 +16,11 @@ DEFINE_string(master_server_address, "127.0.0.1:50051",
 DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
-DEFINE_int32(threads, 1, "Number of threads for client service");
+DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
-DEFINE_string(tiered_backend_config, "",
-              "Tiered backend config json. Empty means load from env "
-              "MOONCAKE_TIERED_CONFIG");
+DEFINE_string(tiered_backend_config, "conf/tiered_backend.json",
+              "Tiered backend config: accepts a JSON string or a path to a "
+              "JSON config file.");
 DEFINE_string(deployment_mode, "Centralization",
               "Client type: 'Centralization' or 'P2P'");
 DEFINE_uint32(client_rpc_port, 12345, "Client RPC service port (P2P mode)");
@@ -30,6 +30,21 @@ DEFINE_uint64(lock_shard_count, 1024,
 DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
 DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
               "TTL for RouteCache entries in ms");
+DEFINE_uint64(async_sender_thread_count, 0,
+              "Async route notifier sender thread count. "
+              "0=disabled (sync RPCs), >0=enable async notifier");
+DEFINE_uint64(async_max_batch_size, 2000,
+              "Max ops per batch in async route notifier.");
+DEFINE_uint64(async_route_queue_size, 0,
+              "Async route notifier queue size when async is enabled "
+              "(min='async_max_batch_size * async_sender_thread_count').");
+DEFINE_string(p2p_local_transfer_mode, "te",
+              "Local transfer mode for P2P local Get/Put path: memcpy|te");
+DEFINE_uint64(local_memcpy_async_worker_num, 32,
+              "If set p2p_local_transfer_mode=memcpy, Worker number for async "
+              "local memcpy executor (P2P), 0 means forbid async memcpy");
+DEFINE_uint32(metrics_port, 9003, "Port for HTTP metrics server");
+DEFINE_bool(enable_metrics_http, true, "Enable HTTP metrics endpoint");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -90,7 +105,12 @@ int main(int argc, char* argv[]) {
                 static_cast<uint32_t>(FLAGS_rpc_thread_num),
                 FLAGS_lock_shard_count,
                 string_to_byte_size(FLAGS_route_cache_max_memory),
-                FLAGS_route_cache_ttl_ms);
+                FLAGS_route_cache_ttl_ms, FLAGS_p2p_local_transfer_mode,
+                static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
+                static_cast<uint16_t>(FLAGS_metrics_port),
+                FLAGS_enable_metrics_http, {},  // labels
+                FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
+                FLAGS_async_route_queue_size);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)
@@ -105,7 +125,8 @@ int main(int argc, char* argv[]) {
                 FLAGS_master_server_address, global_segment_size,
                 local_buffer_size, nullptr,
                 "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-                FLAGS_enable_offload);
+                FLAGS_enable_offload, static_cast<uint16_t>(FLAGS_metrics_port),
+                FLAGS_enable_metrics_http);
         }
     }();
 

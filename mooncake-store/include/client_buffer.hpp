@@ -115,8 +115,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica);
  * @return 0 on success, non-zero on error
  */
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   void* buffer_ptr);
+                   const Replica::Descriptor& replica, void* buffer_ptr);
 
 /**
  * @brief Build slices from user-provided buffers, trimmed to total_size.
@@ -125,9 +124,8 @@ int allocateSlices(std::vector<Slice>& slices,
  * @param total_size Maximum total bytes across all slices.
  * @return Vector of slices whose combined size equals total_size.
  */
-std::vector<Slice> BuildSlicesFromBuffers(
-    const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes,
-    uint64_t total_size);
+std::vector<Slice> BuildSlicesFromBuffers(const std::vector<void*>& buffers,
+                                          const std::vector<size_t>& sizes,
+                                          uint64_t total_size);
 
 }  // namespace mooncake

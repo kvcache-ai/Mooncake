@@ -74,6 +74,7 @@ class InProcMaster {
             wms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
             wms_cfg.allow_evict_soft_pinned_objects = true;
             wms_cfg.enable_metric_reporting = false;
+            wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
             wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
             wms_cfg.eviction_high_watermark_ratio =
                 DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;

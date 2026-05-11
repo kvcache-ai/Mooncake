@@ -737,29 +737,36 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO) << "client_id=" << client_id << ", shm already unmapped";
+        return {};
     }
 
     auto& context = it->second;
     context.client_buffer_allocator.reset();
 
+    bool had_error = false;
     for (auto& shm : context.mapped_shms) {
-        if (shm.shm_buffer) {
+        if (!shm.shm_buffer) continue;
+        if (shm.shm_size > 0) {
             auto rc = client_service_->unregisterLocalMemory(shm.shm_buffer,
                                                              shm.shm_size);
             if (!rc) {
-                LOG(ERROR) << "Failed to unregister memory";
-                munmap(shm.shm_buffer, shm.shm_size);
-                context.mapped_shms.clear();
-                shm_contexts_.erase(it);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                LOG(WARNING)
+                    << "Failed to unregister memory for " << shm.shm_name
+                    << ", error=" << toString(rc.error())
+                    << ", proceeding with cleanup";
+                had_error = true;
             }
-            munmap(shm.shm_buffer, shm.shm_size);
+        }
+        if (munmap(shm.shm_buffer, shm.shm_size) != 0) {
+            LOG(WARNING) << "munmap failed for " << shm.shm_name << ": "
+                         << strerror(errno);
+            had_error = true;
         }
     }
     context.mapped_shms.clear();
     shm_contexts_.erase(it);
+    if (had_error) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     return {};
 }
 
@@ -768,8 +775,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO) << "client_id=" << client_id << ", shm already unmapped";
+        return {};
     }
     auto& context = it->second;
 

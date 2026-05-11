@@ -82,8 +82,12 @@ class PeerClientPerfTest : public ::testing::Test {
         ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 
+        LocalTransferConfig local_transfer_config;
+        local_transfer_config.mode = LocalTransferMode::MEMCPY;
+        local_transfer_config.local_memcpy_async_worker_num = 32;
         data_manager_ = std::make_unique<DataManager>(
-            std::move(tiered_backend_), transfer_engine_);
+            std::move(tiered_backend_), transfer_engine_, 1024,
+            local_transfer_config);
 
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
 
@@ -122,9 +126,9 @@ class PeerClientPerfTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
-    RemoteReadRequest MakeReadRequest(size_t index) {
+    RemoteReadRequest MakeReadRequest(std::string_view key, size_t index) {
         RemoteReadRequest request;
-        request.key = "perf_key_" + std::to_string(index);
+        request.key = key;
         RemoteBufferDesc desc;
         desc.segment_endpoint = "perf_segment";
         desc.addr = 0x1000 + index * 0x100;
@@ -133,9 +137,9 @@ class PeerClientPerfTest : public ::testing::Test {
         return request;
     }
 
-    RemoteWriteRequest MakeWriteRequest(size_t index) {
+    RemoteWriteRequest MakeWriteRequest(std::string_view key, size_t index) {
         RemoteWriteRequest request;
-        request.key = "perf_write_key_" + std::to_string(index);
+        request.key = key;
         RemoteBufferDesc desc;
         desc.segment_endpoint = "perf_segment";
         desc.addr = 0x1000 + index * 0x100;
@@ -158,7 +162,8 @@ class PeerClientPerfTest : public ::testing::Test {
     double RunSyncReads(size_t n) {
         auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < n; ++i) {
-            auto req = MakeReadRequest(i);
+            std::string key = "perf_key_" + std::to_string(i);
+            auto req = MakeReadRequest(key, i);
             auto result = peer_client_->ReadRemoteData(req);
             (void)result;
         }
@@ -171,12 +176,16 @@ class PeerClientPerfTest : public ::testing::Test {
         auto start = std::chrono::steady_clock::now();
 
         auto coro = [this, n]() -> async_simple::coro::Lazy<void> {
-            // Requests must outlive all coroutines since
-            // AsyncReadRemoteData takes const& references.
+            // Keys and requests must outlive all coroutines:
+            // AsyncReadRemoteData holds a const& to the request, which holds a
+            // string_view of key.
+            std::vector<std::string> keys(n);
+            for (size_t i = 0; i < n; ++i)
+                keys[i] = "perf_key_" + std::to_string(i);
             std::vector<RemoteReadRequest> requests;
             requests.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                requests.push_back(MakeReadRequest(i));
+                requests.push_back(MakeReadRequest(keys[i], i));
             }
 
             std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
@@ -201,7 +210,8 @@ class PeerClientPerfTest : public ::testing::Test {
     double RunSyncWrites(size_t n) {
         auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < n; ++i) {
-            auto req = MakeWriteRequest(i);
+            std::string key = "perf_write_key_" + std::to_string(i);
+            auto req = MakeWriteRequest(key, i);
             auto result = peer_client_->WriteRemoteData(req);
             (void)result;
         }
@@ -214,10 +224,13 @@ class PeerClientPerfTest : public ::testing::Test {
         auto start = std::chrono::steady_clock::now();
 
         auto coro = [this, n]() -> async_simple::coro::Lazy<void> {
+            std::vector<std::string> keys(n);
+            for (size_t i = 0; i < n; ++i)
+                keys[i] = "perf_write_key_" + std::to_string(i);
             std::vector<RemoteWriteRequest> requests;
             requests.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                requests.push_back(MakeWriteRequest(i));
+                requests.push_back(MakeWriteRequest(keys[i], i));
             }
 
             std::vector<async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>>
@@ -401,10 +414,13 @@ TEST_F(PeerClientPerfTest, WindowedAsyncConcurrency) {
         auto start = std::chrono::steady_clock::now();
 
         auto coro = [this, total, w]() -> async_simple::coro::Lazy<void> {
+            std::vector<std::string> keys(total);
+            for (size_t i = 0; i < total; ++i)
+                keys[i] = "perf_key_" + std::to_string(i);
             std::vector<RemoteReadRequest> requests;
             requests.reserve(total);
             for (size_t i = 0; i < total; ++i) {
-                requests.push_back(MakeReadRequest(i));
+                requests.push_back(MakeReadRequest(keys[i], i));
             }
 
             std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
@@ -530,8 +546,12 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         ASSERT_TRUE(backend_rc.has_value())
             << "Failed to initialize TieredBackend";
 
+        LocalTransferConfig local_transfer_config;
+        local_transfer_config.mode = LocalTransferMode::MEMCPY;
+        local_transfer_config.local_memcpy_async_worker_num = 32;
         data_manager_ = std::make_unique<DataManager>(
-            std::move(tiered_backend_), transfer_engine_);
+            std::move(tiered_backend_), transfer_engine_, 1024,
+            local_transfer_config);
 
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
 
@@ -592,13 +612,16 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
     void PopulateKey(const std::string& key, size_t data_size) {
         auto data = std::make_unique<char[]>(data_size);
         std::memset(data.get(), 'A', data_size);
-        auto rc = data_manager_->Put(key, {data.get(), data_size});
+        std::vector<Slice> slices{{data.get(), data_size}};
+        auto rc = data_manager_->Put(key, slices);
         ASSERT_TRUE(rc.has_value()) << "PopulateKey failed for " << key;
+        rc.value()->Wait();
     }
 
-    RemoteReadRequest MakeRdmaReadRequest(size_t index, size_t data_size) {
+    RemoteReadRequest MakeRdmaReadRequest(std::string_view key, size_t index,
+                                          size_t data_size) {
         RemoteReadRequest request;
-        request.key = "rdma_perf_key_" + std::to_string(index);
+        request.key = key;
         RemoteBufferDesc desc;
         desc.segment_endpoint = local_hostname_;
         desc.addr = reinterpret_cast<uintptr_t>(
@@ -608,9 +631,10 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         return request;
     }
 
-    RemoteWriteRequest MakeRdmaWriteRequest(size_t index, size_t data_size) {
+    RemoteWriteRequest MakeRdmaWriteRequest(std::string_view key, size_t index,
+                                            size_t data_size) {
         RemoteWriteRequest request;
-        request.key = "rdma_perf_write_key_" + std::to_string(index);
+        request.key = key;
         // Pre-fill source region with data
         char* src = static_cast<char*>(rdma_buffer_) + index * data_size;
         std::memset(src, 'B', data_size);
@@ -638,7 +662,8 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
     double RunRdmaSyncReads(size_t n, size_t data_size) {
         auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < n; ++i) {
-            auto req = MakeRdmaReadRequest(i, data_size);
+            std::string key = "rdma_perf_key_" + std::to_string(i);
+            auto req = MakeRdmaReadRequest(key, i, data_size);
             auto result = peer_client_->ReadRemoteData(req);
             (void)result;
         }
@@ -653,10 +678,13 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
 
         auto coro = [this, n, data_size,
                      window]() -> async_simple::coro::Lazy<void> {
+            std::vector<std::string> keys(n);
+            for (size_t i = 0; i < n; ++i)
+                keys[i] = "rdma_perf_key_" + std::to_string(i);
             std::vector<RemoteReadRequest> requests;
             requests.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                requests.push_back(MakeRdmaReadRequest(i, data_size));
+                requests.push_back(MakeRdmaReadRequest(keys[i], i, data_size));
             }
 
             std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
@@ -688,7 +716,8 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
     double RunRdmaSyncWrites(size_t n, size_t data_size) {
         auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < n; ++i) {
-            auto req = MakeRdmaWriteRequest(i, data_size);
+            std::string key = "rdma_perf_write_key_" + std::to_string(i);
+            auto req = MakeRdmaWriteRequest(key, i, data_size);
             auto result = peer_client_->WriteRemoteData(req);
             (void)result;
         }
@@ -703,10 +732,13 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
 
         auto coro = [this, n, data_size,
                      window]() -> async_simple::coro::Lazy<void> {
+            std::vector<std::string> keys(n);
+            for (size_t i = 0; i < n; ++i)
+                keys[i] = "rdma_perf_write_key_" + std::to_string(i);
             std::vector<RemoteWriteRequest> requests;
             requests.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                requests.push_back(MakeRdmaWriteRequest(i, data_size));
+                requests.push_back(MakeRdmaWriteRequest(keys[i], i, data_size));
             }
 
             std::vector<async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>>
@@ -953,8 +985,7 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
             // Verify one write for correctness (not timed)
             RunRdmaAsyncWrites(1, data_size);
             std::string first_key = "rdma_perf_write_key_0";
-            auto get_rc = data_manager_->Get(first_key);
-            bool write_ok = get_rc.has_value();
+            bool write_ok = data_manager_->Exist(first_key);
             data_manager_->Delete(first_key);
 
             double sync_tp = ThroughputMBps(n, data_size, sync_ms);

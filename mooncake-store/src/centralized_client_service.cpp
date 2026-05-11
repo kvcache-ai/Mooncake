@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <string_view>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -21,9 +22,11 @@ namespace mooncake {
 
 CentralizedClientService::CentralizedClientService(
     const std::string& local_ip, uint16_t te_port,
-    const std::string& metadata_connstring,
-    const std::map<std::string, std::string>& labels)
-    : ClientService(local_ip, te_port, metadata_connstring, labels),
+    const std::string& metadata_connstring, uint16_t metrics_port,
+    bool enable_metrics_http, const std::map<std::string, std::string>& labels)
+    : ClientService(local_ip, te_port, metadata_connstring, metrics_port,
+                    enable_metrics_http, labels),
+      metrics_(ClientMetric::Create(labels)),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       write_thread_pool_(2) {}
@@ -151,6 +154,7 @@ ErrorCode CentralizedClientService::Init(
         LOG(INFO) << "Use existing transfer engine instance. Skip its "
                      "initialization.";
     }
+    initTeEndpoint();
 
     InitTransferSubmitter();
 
@@ -273,7 +277,9 @@ CentralizedClientService::BatchQuery(
     }
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto response = master_client_.BatchGetReplicaList(object_keys, config);
+    std::vector<std::string_view> key_views(object_keys.begin(),
+                                            object_keys.end());
+    auto response = master_client_.BatchGetReplicaList(key_views, config);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -335,7 +341,8 @@ CentralizedClientService::BatchIsExist(const std::vector<std::string>& keys) {
         return std::vector<tl::expected<bool, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::SHUTTING_DOWN));
     }
-    auto results = master_client_.BatchExistKey(keys);
+    std::vector<std::string_view> key_views(keys.begin(), keys.end());
+    auto results = master_client_.BatchExistKey(key_views);
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
             LOG(ERROR) << "Failed to query key"
@@ -1639,14 +1646,7 @@ tl::expected<void, ErrorCode> CentralizedClientService::MountSegment(
     CentralizedSegmentExtraData extra;
     extra.base = reinterpret_cast<uintptr_t>(buffer);
 
-    // For P2P handshake mode, publish the actual transport endpoint that was
-    // negotiated by the transfer engine. Otherwise, keep the logical hostname
-    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
-    if (metadata_connstring_ == P2PHANDSHAKE) {
-        extra.te_endpoint = transfer_engine_->getLocalIpAndPort();
-    } else {
-        extra.te_endpoint = local_endpoint();
-    }
+    extra.te_endpoint = get_te_endpoint();
     segment.extra = extra;
 
     auto mount_result = master_client_.MountSegment(segment);

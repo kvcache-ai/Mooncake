@@ -13,6 +13,9 @@ void RegisterP2PRpcService(
     RegisterRpcService(server, wrapped_master_service);
     server.register_handler<&mooncake::WrappedP2PMasterService::GetWriteRoute>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedP2PMasterService::BatchGetWriteRoute>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedP2PMasterService::AddReplica>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedP2PMasterService::RemoveReplica>(
@@ -20,6 +23,12 @@ void RegisterP2PRpcService(
     server.register_handler<
         &mooncake::WrappedP2PMasterService::BatchRemoveReplica>(
         &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedP2PMasterService::BatchSyncReplica>(
+            &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedP2PMasterService::SetSyncCompleted>(
+            &wrapped_master_service);
 }
 
 tl::expected<WriteRouteResponse, ErrorCode>
@@ -29,6 +38,35 @@ WrappedP2PMasterService::GetWriteRoute(const WriteRouteRequest& req) {
         [&](auto& timer) { timer.LogRequest("key=", req.key); },
         [] { MasterMetricManager::instance().inc_get_write_route_requests(); },
         [] { MasterMetricManager::instance().inc_get_write_route_failures(); });
+}
+
+BatchGetWriteRouteResponse WrappedP2PMasterService::BatchGetWriteRoute(
+    const BatchGetWriteRouteRequest& req) {
+    ScopedVLogTimer timer(1, "BatchGetWriteRoute");
+    const size_t total = req.keys.size();
+    timer.LogRequest("client_id=", req.client_id, ", key_count=", total);
+    MasterMetricManager::instance().inc_batch_get_write_route_requests(total);
+
+    auto response = master_service_.BatchGetWriteRoute(req);
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < response.error_codes.size(); ++i) {
+        if (response.error_codes[i] != ErrorCode::OK) {
+            failure_count++;
+            LOG(ERROR) << "BatchGetWriteRoute failed for key '" << req.keys[i]
+                       << "': " << toString(response.error_codes[i]);
+        }
+    }
+    if (failure_count == total && total > 0) {
+        MasterMetricManager::instance().inc_batch_get_write_route_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance()
+            .inc_batch_get_write_route_partial_success(failure_count);
+    }
+    timer.LogResponse("total=", total, ", success=", total - failure_count,
+                      ", failures=", failure_count);
+    return response;
 }
 
 tl::expected<void, ErrorCode> WrappedP2PMasterService::AddReplica(
@@ -83,6 +121,41 @@ WrappedP2PMasterService::BatchRemoveReplica(
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     return results;
+}
+
+BatchSyncReplicaResponse WrappedP2PMasterService::BatchSyncReplica(
+    const BatchSyncReplicaRequest& req) {
+    ScopedVLogTimer timer(1, "BatchSyncReplica");
+    timer.LogRequest("client_id=", req.client_id,
+                     ", adds=", req.add_keys.size(),
+                     ", removes=", req.remove_keys.size());
+
+    auto response = master_service_.BatchSyncReplica(req);
+
+    size_t add_failures = 0;
+    for (auto ec : response.add_results) {
+        if (ec != ErrorCode::OK) add_failures++;
+    }
+    size_t remove_failures = 0;
+    for (auto ec : response.remove_results) {
+        if (ec != ErrorCode::OK) remove_failures++;
+    }
+
+    timer.LogResponse("add_failures=", add_failures,
+                      ", remove_failures=", remove_failures);
+    return response;
+}
+
+tl::expected<void, ErrorCode> WrappedP2PMasterService::SetSyncCompleted(
+    UUID client_id) {
+    ScopedVLogTimer timer(1, "SetSyncCompleted");
+    timer.LogRequest("client_id=", client_id);
+
+    auto result = master_service_.SetSyncCompleted(client_id);
+    if (!result) {
+        LOG(ERROR) << "SetSyncCompleted failed: " << toString(result.error());
+    }
+    return result;
 }
 
 }  // namespace mooncake

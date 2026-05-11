@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <vector>
 #include <limits>
-#include <string_view>
 
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"
@@ -12,12 +11,20 @@
 #endif
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/scheduler/client_scheduler.h"
+#include "utils.h"
 
 namespace mooncake {
 
 namespace {
 constexpr std::string_view kDefaultSegmentGroupId = "default";
+
+static size_t ParseByteSize(const Json::Value& v) {
+    if (v.isString()) {
+        return static_cast<size_t>(string_to_byte_size(v.asString()));
+    }
+    return static_cast<size_t>(v.asUInt64());
 }
+}  // namespace
 
 AllocationEntry::~AllocationEntry() {
     if (loc.tier) {
@@ -115,6 +122,10 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+#ifdef USE_ASCEND_CACHE_TIER
+    bool ascend_tier_initialized = false;
+#endif
+
     for (const auto& tier_config : root["tiers"]) {
         // Parse required fields
         if (!tier_config.isMember("type")) {
@@ -131,7 +142,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         }
 
         std::string type = tier_config["type"].asString();
-        size_t capacity = tier_config["capacity"].asUInt64();
+        size_t capacity = ParseByteSize(tier_config["capacity"]);
         int priority = tier_config["priority"].asInt();
         std::string group_id = tier_config.isMember("segment_group")
                                    ? tier_config["segment_group"].asString()
@@ -188,7 +199,6 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             }
             LOG(INFO) << "Creating DRAM tier: id=" << id
                       << ", capacity=" << capacity << ", priority=" << priority
-                      << ", group_id=" << group_id
                       << ", allocator_type=" << allocator_type
                       << (numa_node.has_value()
                               ? ", numa_node=" + std::to_string(*numa_node)
@@ -210,6 +220,11 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         }
 #ifdef USE_ASCEND_CACHE_TIER
         else if (type == "ASCEND_NPU" || type == "ASCEND") {
+            if (ascend_tier_initialized) {
+                LOG(ERROR) << "Multiple Ascend tiers are not allowed, skipping "
+                              "this tier";
+                continue;
+            }
             // Parse device_id
             int device_id = 0;
             if (tier_config.isMember("device_id")) {
@@ -218,7 +233,6 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
 
             LOG(INFO) << "Creating ASCEND_NPU tier: id=" << id
                       << ", capacity=" << capacity << ", priority=" << priority
-                      << ", group_id=" << group_id
                       << ", device_id=" << device_id;
 
             auto tier = std::make_shared<AscendCacheTier>(id, capacity, tags,
@@ -234,14 +248,14 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             tier_info_[id] = {priority, tags, group_id};
             memory_type = MemoryType::ASCEND_NPU;
             LOG(INFO) << "Successfully initialized ASCEND_NPU tier: id=" << id;
+            ascend_tier_initialized = true;
         }
 #endif
         else if (type == "STORAGE" || type == "DISK") {
             LOG(INFO) << "Creating Storage tier: id=" << id
-                      << ", capacity=" << capacity << ", priority=" << priority
-                      << ", group_id=" << group_id;
+                      << ", capacity=" << capacity << ", priority=" << priority;
             auto tier = std::make_shared<StorageTier>(id, tags, capacity);
-            auto init_result = tier->Init(this, engine);
+            auto init_result = tier->Init(this, engine, tier_config);
             if (!init_result) {
                 LOG(ERROR) << "Failed to initialize Storage tier: id=" << id
                            << ", error=" << init_result.error();
@@ -466,7 +480,7 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Commit(
-    const std::string& key, AllocationHandle handle,
+    std::string_view key, AllocationHandle handle,
     std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
@@ -475,29 +489,30 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
     std::shared_ptr<MetadataEntry> entry = nullptr;
+    auto& shard = GetMetadataShard(key);
 
-    // Try to find existing entry (Global Read Lock)
+    // Try to find existing entry (Shard Read Lock)
     {
-        std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
-        auto it = metadata_index_.find(key);
-        if (it != metadata_index_.end()) {
+        std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
+        auto it = shard.index.find(key);
+        if (it != shard.index.end()) {
             entry = it->second;
         }
     }
 
-    // Create if not exists (Global Write Lock)
+    // Create if not exists (Shard Write Lock)
     if (!entry) {
         if (expected_version.has_value()) {
             return tl::make_unexpected(ErrorCode::CAS_FAILED);
         }
 
-        std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
-        auto it = metadata_index_.find(key);
-        if (it != metadata_index_.end()) {
+        std::unique_lock<std::shared_mutex> write_lock(shard.mutex);
+        auto it = shard.index.find(key);
+        if (it != shard.index.end()) {
             entry = it->second;
         } else {
             entry = std::make_shared<MetadataEntry>();
-            metadata_index_[key] = entry;
+            shard.index.emplace(std::string(key), entry);
         }
     }
 
@@ -583,7 +598,7 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
-    const std::string& key, std::optional<UUID> tier_id, bool record_access,
+    std::string_view key, std::optional<UUID> tier_id, bool record_access,
     uint64_t* out_version) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
@@ -591,11 +606,12 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     }
     std::shared_ptr<MetadataEntry> entry = nullptr;
 
-    // Find Entry (Global Read Lock)
+    // Find Entry (Shard Read Lock)
     {
-        std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
-        auto it = metadata_index_.find(key);
-        if (it == metadata_index_.end()) {
+        auto& shard = GetMetadataShard(key);
+        std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
+        auto it = shard.index.find(key);
+        if (it == shard.index.end()) {
             LOG(ERROR) << "Key not found: " << key;
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
@@ -633,11 +649,12 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     return entry->replicas.begin()->second;
 }
 
-bool TieredBackend::Exist(const std::string& key,
+bool TieredBackend::Exist(std::string_view key,
                           std::optional<UUID> tier_id) const {
-    std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
-    auto it = metadata_index_.find(key);
-    if (it == metadata_index_.end()) {
+    auto& shard = GetMetadataShard(key);
+    std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
+    auto it = shard.index.find(key);
+    if (it == shard.index.end()) {
         return false;  // Key not found
     }
     if (!tier_id.has_value()) {
@@ -655,7 +672,7 @@ bool TieredBackend::Exist(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Delete(
-    const std::string& key, std::optional<UUID> tier_id) {
+    std::string_view key, std::optional<UUID> tier_id) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -671,12 +688,12 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         bool need_cleanup = false;
         bool found_tier = false;
 
-        // Optimistic Delete (Global Read Lock + Entry Write Lock)
-        // This is fast and allows high concurrency.
+        auto& shard = GetMetadataShard(key);
+        // Optimistic Delete (Shard Read Lock + Entry Write Lock)
         {
-            std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
-            auto it = metadata_index_.find(key);
-            if (it == metadata_index_.end()) {
+            std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
+            auto it = shard.index.find(key);
+            if (it == shard.index.end()) {
                 LOG(ERROR) << "Key not found: " << key;
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             }
@@ -722,10 +739,10 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         // remove it. This prevents memory leaks from empty "zombie"
         // entries.
         if (need_cleanup) {
-            std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
+            std::unique_lock<std::shared_mutex> write_lock(shard.mutex);
 
-            auto it = metadata_index_.find(key);
-            if (it != metadata_index_.end()) {
+            auto it = shard.index.find(key);
+            if (it != shard.index.end()) {
                 auto entry = it->second;
 
                 // Double-Check Locking:
@@ -733,8 +750,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
                 std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
 
                 if (entry->replicas.empty()) {
-                    // Confirmed empty, safe to remove from global index
-                    metadata_index_.erase(it);
+                    shard.index.erase(it);
                 }
             }
         }
@@ -750,11 +766,10 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         }
     } else {
         // Delete All Replicas (Full Key Deletion)
-        // Requires Global Write Lock since we are modifying the map
-        // structure.
-        std::unique_lock<std::shared_mutex> global_write_lock(map_mutex_);
-        auto it = metadata_index_.find(key);
-        if (it == metadata_index_.end()) {
+        auto& shard = GetMetadataShard(key);
+        std::unique_lock<std::shared_mutex> shard_write_lock(shard.mutex);
+        auto it = shard.index.find(key);
+        if (it == shard.index.end()) {
             LOG(ERROR) << "Key not found: " << key;
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
@@ -779,8 +794,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
             entry->replicas.clear();
         }
 
-        // Remove the entry from the global index
-        metadata_index_.erase(it);
+        shard.index.erase(it);
     }
 
     // Handles go out of scope here.
@@ -793,7 +807,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
 }
 
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
-    const std::string& key, const DataSource& source, UUID dest_tier_id,
+    std::string_view key, const DataSource& source, UUID dest_tier_id,
     std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
@@ -817,8 +831,6 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
         return tl::make_unexpected(write_result.error());
     }
 
-    // Commit (Add Replica)
-    // Takes ownership of dest_handle into the map
     auto commit_result =
         Commit(key, dest_handle.value(), expected_version, record_access);
     if (!commit_result.has_value()) {
@@ -833,7 +845,7 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
     return tl::expected<void, ErrorCode>{};
 }
 
-tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
+tl::expected<void, ErrorCode> TieredBackend::Transfer(std::string_view key,
                                                       UUID source_tier_id,
                                                       UUID dest_tier_id,
                                                       bool record_access) {
@@ -884,11 +896,11 @@ std::vector<TierView> TieredBackend::GetTierViews() const {
     return views;
 }
 
-std::vector<UUID> TieredBackend::GetReplicaTierIds(
-    const std::string& key) const {
-    std::shared_lock map_lock(map_mutex_);
-    auto it = metadata_index_.find(key);
-    if (it == metadata_index_.end()) {
+std::vector<UUID> TieredBackend::GetReplicaTierIds(std::string_view key) const {
+    auto& shard = GetMetadataShard(key);
+    std::shared_lock map_lock(shard.mutex);
+    auto it = shard.index.find(key);
+    if (it == shard.index.end()) {
         return {};
     }
 
@@ -909,6 +921,48 @@ const CacheTier* TieredBackend::GetTier(UUID tier_id) const {
 const DataCopier& TieredBackend::GetDataCopier() const {
     CHECK(data_copier_) << "TieredBackend not initialized";
     return *data_copier_;
+}
+
+void TieredBackend::ForEachKeyBatch(
+    const std::function<bool(std::vector<ReplicaLocation>&&)>& callback) const {
+    // Iterate per-shard. Each shard is locked independently.
+    for (size_t s = 0; s < kMetadataShardCount; ++s) {
+        auto& shard = metadata_shards_[s];
+
+        // Copy entry pointers under shard shared lock
+        std::vector<std::pair<std::string, std::shared_ptr<MetadataEntry>>>
+            shard_entries;
+        {
+            std::shared_lock<std::shared_mutex> lock(shard.mutex);
+            shard_entries.reserve(shard.index.size());
+            for (const auto& [key, entry] : shard.index) {
+                shard_entries.emplace_back(key, entry);
+            }
+        }
+
+        // Read per-entry data outside shard lock
+        std::vector<ReplicaLocation> result;
+        result.reserve(shard_entries.size());
+        for (auto& [key, entry] : shard_entries) {
+            std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+            for (const auto& [tier_id, handle] : entry->replicas) {
+                size_t size = 0;
+                if (handle && handle->loc.data.buffer) {
+                    size = handle->loc.data.buffer->size();
+                }
+                result.push_back({key, tier_id, size});
+            }
+        }
+
+        if (!result.empty() && !callback(std::move(result))) return;
+    }
+}
+
+AccessStats TieredBackend::GetHotKeyStats() const {
+    if (scheduler_) {
+        return scheduler_->GetHotKeyStats();
+    }
+    return {};
 }
 
 }  // namespace mooncake

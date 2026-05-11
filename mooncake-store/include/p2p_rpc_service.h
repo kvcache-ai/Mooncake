@@ -18,6 +18,9 @@ class WrappedP2PMasterService final : public WrappedMasterService {
     tl::expected<WriteRouteResponse, ErrorCode> GetWriteRoute(
         const WriteRouteRequest& req);
 
+    BatchGetWriteRouteResponse BatchGetWriteRoute(
+        const BatchGetWriteRouteRequest& req);
+
     tl::expected<void, ErrorCode> AddReplica(const AddReplicaRequest& req);
 
     tl::expected<void, ErrorCode> RemoveReplica(
@@ -25,6 +28,11 @@ class WrappedP2PMasterService final : public WrappedMasterService {
 
     std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
         const BatchRemoveReplicaRequest& req);
+
+    BatchSyncReplicaResponse BatchSyncReplica(
+        const BatchSyncReplicaRequest& req);
+
+    tl::expected<void, ErrorCode> SetSyncCompleted(UUID client_id);
 
    private:
     P2PMasterService master_service_;

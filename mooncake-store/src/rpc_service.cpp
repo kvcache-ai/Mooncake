@@ -102,7 +102,7 @@ WrappedMasterService::CalcCacheStats() {
 }
 
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
-    const std::string& key) {
+    std::string_view key) {
     return execute_rpc(
         "ExistKey", [&] { return GetMasterService().ExistKey(key); },
         [&](auto& timer) { timer.LogRequest("key=", key); },
@@ -111,7 +111,7 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string_view>& keys) {
     ScopedVLogTimer timer(1, "BatchExistKey");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -202,7 +202,7 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
 
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(
-    const std::string& key, const GetReplicaListRequestConfig& config) {
+    std::string_view key, const GetReplicaListRequestConfig& config) {
     return execute_rpc(
         "GetReplicaList",
         [&] { return GetMasterService().GetReplicaList(key, config); },
@@ -215,7 +215,7 @@ WrappedMasterService::GetReplicaList(
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(
-    const std::vector<std::string>& keys,
+    const std::vector<std::string_view>& keys,
     const GetReplicaListRequestConfig& config) {
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_requests = keys.size();
@@ -261,7 +261,7 @@ WrappedMasterService::BatchGetReplicaList(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
-    const std::string& key) {
+    std::string_view key) {
     return execute_rpc(
         "Remove", [&] { return GetMasterService().Remove(key); },
         [&](auto& timer) { timer.LogRequest("key=", key); },
@@ -270,7 +270,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
-    const std::string& str) {
+    std::string_view str) {
     return execute_rpc(
         "RemoveByRegex", [&] { return GetMasterService().RemoveByRegex(str); },
         [&](auto& timer) { timer.LogRequest("regex=", str); },

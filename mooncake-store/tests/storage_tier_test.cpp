@@ -87,7 +87,7 @@ class StorageTierTest : public ::testing::Test {
 TEST_F(StorageTierTest, StorageTierBasic) {
     // Setup environment for Storage Backend (FilePerKey)
     setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-           "file_per_key_storage_backend", 1);
+           "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_test_storage",
            1);
 
@@ -148,17 +148,16 @@ TEST_F(StorageTierTest, StorageTierBasic) {
         auto get_result = backend.Get("storage_key");
         ASSERT_TRUE(get_result.has_value());
 
-        // Verify file exists on disk
-        bool found = false;
+        // Verify bucket files exist on disk
+        bool bucket_found = false;
+        bool meta_found = false;
         for (const auto& entry :
              fs::recursive_directory_iterator("/tmp/mooncake_test_storage")) {
-            if (entry.path().filename() == "storage_key") {
-                found = true;
-                break;
-            }
+            if (entry.path().extension() == ".bucket") bucket_found = true;
+            if (entry.path().extension() == ".meta") meta_found = true;
         }
-        EXPECT_TRUE(found)
-            << "File 'storage_key' not found in storage directory";
+        EXPECT_TRUE(bucket_found) << ".bucket file should be created";
+        EXPECT_TRUE(meta_found) << ".meta file should be created";
     }
 
     // Cleanup
@@ -167,11 +166,9 @@ TEST_F(StorageTierTest, StorageTierBasic) {
 
 TEST_F(StorageTierTest, StorageTierUsesConfiguredLocalBufferPool) {
     setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-           "file_per_key_storage_backend", 1);
+           "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
            "/tmp/mooncake_test_local_buffer_pool", 1);
-    setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "1024", 1);
-
     fs::remove_all("/tmp/mooncake_test_local_buffer_pool");
     fs::create_directories("/tmp/mooncake_test_local_buffer_pool");
 
@@ -181,6 +178,7 @@ TEST_F(StorageTierTest, StorageTierUsesConfiguredLocalBufferPool) {
                 "type": "STORAGE",
                 "capacity": 1073741824,
                 "priority": 5,
+                "staging_buffer_capacity": 1024,
                 "tags": ["ssd"]
             }
         ]
@@ -230,11 +228,9 @@ TEST_F(StorageTierTest, StorageTierUsesConfiguredLocalBufferPool) {
 
 TEST_F(StorageTierTest, StorageTierCapacityCountsUncommittedStaging) {
     setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-           "file_per_key_storage_backend", 1);
+           "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
            "/tmp/mooncake_test_capacity_accounting", 1);
-    setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "4096", 1);
-
     fs::remove_all("/tmp/mooncake_test_capacity_accounting");
     fs::create_directories("/tmp/mooncake_test_capacity_accounting");
 
@@ -244,6 +240,7 @@ TEST_F(StorageTierTest, StorageTierCapacityCountsUncommittedStaging) {
                 "type": "STORAGE",
                 "capacity": 2048,
                 "priority": 5,
+                "staging_buffer_capacity": 4096,
                 "tags": ["ssd"]
             }
         ]
@@ -281,11 +278,9 @@ TEST_F(StorageTierTest, StorageTierCapacityCountsUncommittedStaging) {
 TEST_F(StorageTierTest,
        StorageHandleKeepsPersistedDataAliveAfterBackendDestruction) {
     setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-           "file_per_key_storage_backend", 1);
+           "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
            "/tmp/mooncake_test_handle_lifetime", 1);
-    setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "4096", 1);
-
     fs::remove_all("/tmp/mooncake_test_handle_lifetime");
     fs::create_directories("/tmp/mooncake_test_handle_lifetime");
 
@@ -295,6 +290,7 @@ TEST_F(StorageTierTest,
                 "type": "STORAGE",
                 "capacity": 1073741824,
                 "priority": 5,
+                "staging_buffer_capacity": 4096,
                 "tags": ["ssd"]
             }
         ]
@@ -672,7 +668,7 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
 // Test concurrent Allocate+Write+Commit and Get on TieredBackend
 TEST_F(StorageTierTest, ConcurrentReadWrite) {
     setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-           "file_per_key_storage_backend", 1);
+           "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
            "/tmp/mooncake_test_concurrent_rw", 1);
 

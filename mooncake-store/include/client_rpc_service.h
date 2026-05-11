@@ -4,6 +4,7 @@
 #include <ylt/util/tl/expected.hpp>
 #include "client_rpc_types.h"
 #include "data_manager.h"
+#include "p2p_client_metric.h"
 #include "types.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
@@ -24,8 +25,11 @@ class ClientRpcService {
      * @brief Constructor
      * @param data_manager Reference to DataManager instance (must outlive this
      * object)
+     * @param metrics Optional pointer to P2PClientMetric for recording peer
+     * request metrics
      */
-    explicit ClientRpcService(DataManager& data_manager);
+    explicit ClientRpcService(DataManager& data_manager,
+                              P2PClientMetric* metrics = nullptr);
 
     /**
      * @brief Read remote data: Client A requests Client B to read data and
@@ -55,6 +59,7 @@ class ClientRpcService {
 
    private:
     DataManager& data_manager_;  // Reference: owned by Client, same lifetime
+    P2PClientMetric* metrics_;   // Optional: owned by P2PClientService
 };
 
 /**

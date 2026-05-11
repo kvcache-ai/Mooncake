@@ -21,6 +21,7 @@
 #include "replica.h"
 #include "master_client.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_http/coro_http_server.hpp>
 #include "client_config_builder.h"
 #include "client_buffer.hpp"
 
@@ -279,10 +280,11 @@ class ClientService {
 
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
-        if (metrics_ == nullptr) {
+        ClientMetric* metrics = GetMetrics();
+        if (metrics == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        return metrics_->summary_metrics();
+        return metrics->summary_metrics();
     }
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
@@ -297,13 +299,32 @@ class ClientService {
 
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
-        if (metrics_ == nullptr) {
+        ClientMetric* metrics = GetMetrics();
+        if (metrics == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         std::string str;
-        metrics_->serialize(str);
+        metrics->serialize(str);
         return str;
     }
+
+    /**
+     * @brief Gets the metrics HTTP server port.
+     * @return The port number, or 0 if metrics server is disabled.
+     */
+    uint16_t GetMetricsPort() const { return metrics_port_; }
+
+    /**
+     * @brief Checks if metrics HTTP server is enabled.
+     * @return True if enabled, false otherwise.
+     */
+    bool IsMetricsHttpEnabled() const { return enable_metrics_http_; }
+
+    /**
+     * @brief Gets the health status for the /health endpoint.
+     * @return A string representing the health status.
+     */
+    virtual std::string GetHealthStatus() const { return "OK"; }
 
    public:
     /**
@@ -314,7 +335,7 @@ class ClientService {
         return transfer_engine_->getLocalIpAndPort();
     }
     UUID GetClientID() const { return client_id_; }
-    ViewVersionId GetViewVersion() const { return view_version_; }
+    ViewVersionId GetViewVersion() const { return view_version_.load(); }
 
    public:
     /**
@@ -348,6 +369,7 @@ class ClientService {
      */
     ClientService(const std::string& local_ip, uint16_t te_port,
                   const std::string& metadata_connstring,
+                  uint16_t metrics_port = 9003, bool enable_metrics_http = true,
                   const std::map<std::string, std::string>& labels = {});
 
     /**
@@ -355,6 +377,12 @@ class ClientService {
      * @return Reference to MasterClient
      */
     virtual MasterClient& GetMasterClient() = 0;
+
+    /**
+     * @brief Get the metrics object for this client.
+     * @return Pointer to ClientMetric, or nullptr if metrics are disabled.
+     */
+    virtual ClientMetric* GetMetrics() = 0;
 
     /**
      * @brief Connects to the master server.
@@ -386,11 +414,13 @@ class ClientService {
     void StartHeartbeat(const std::string& master_server_entry);
 
     void HeartbeatThreadMain(bool is_ha_mode,
-                             std::string current_master_address);
+                             std::string current_master_address,
+                             const std::string& master_server_entry);
 
     /**
      * @brief Handles a successful heartbeat response.
      * Triggers async RegisterClient if master reports UNDEFINED status.
+     * Fires MASTER_RECONNECTED if connection_interrupted_ was set.
      * @return true if heartbeat was successfully processed.
      */
     bool HandleHeartbeatResponse(const HeartbeatResponse& response,
@@ -407,7 +437,10 @@ class ClientService {
     /**
      * @brief Attempts to reconnect to master after heartbeat failures.
      * For HA mode, fetches the latest master address from etcd.
-     * For non-HA mode, reconnects to the same address.
+     * For non-HA mode, reconnects to the current_master_address.
+     * @param is_ha_mode Whether HA mode is enabled.
+     * @param current_master_address Current master address, may be updated
+     * after successful reconnection in HA mode.
      * @return true if reconnect succeeded, false otherwise.
      */
     bool ReconnectToMaster(bool is_ha_mode,
@@ -421,11 +454,31 @@ class ClientService {
     virtual HeartbeatRequest build_heartbeat_request() = 0;
 
     /**
+     * @brief Starts the metrics HTTP server.
+     * @param enable_metrics_http Whether to enable the HTTP server.
+     * @param metrics_port Port to use.
+     * @return The actual port number, or 0 if disabled.
+     */
+    uint16_t StartMetricsHttpServer(bool enable_metrics_http,
+                                    uint16_t metrics_port);
+
+    /**
+     * @brief Stops the metrics HTTP server.
+     */
+    void StopMetricsHttpServer();
+
+    /**
      * @brief Registers the client into the master server.
      * @return An ErrorCode indicating success or failure.
      */
     virtual tl::expected<RegisterClientResponse, ErrorCode>
     RegisterClient() = 0;
+
+    /**
+     * @brief Single hook for all HA-related events from the heartbeat loop.
+     * Subclasses override to handle state transitions.
+     */
+    virtual void OnHAEvent(HAEvent event) { (void)event; }
 
    protected:
     /**
@@ -481,9 +534,6 @@ class ClientService {
     // Client identification
     const UUID client_id_;
 
-    // Client-side metrics
-    std::unique_ptr<ClientMetric> metrics_;
-
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
     // Global segment pointers
@@ -513,6 +563,12 @@ class ClientService {
         return local_ip_ + ":" + std::to_string(te_port_);
     }
 
+    // The segment endpoint that the transfer engine registered with the
+    // metadata backend.
+    std::string te_endpoint_;
+    void initTeEndpoint();
+    const std::string& get_te_endpoint() const { return te_endpoint_; }
+
     const std::string metadata_connstring_;
     // For high availability
     MasterViewHelper master_view_helper_;
@@ -520,11 +576,21 @@ class ClientService {
     std::atomic<bool> heartbeat_running_{false};
     std::condition_variable heartbeat_cv_;
     std::mutex heartbeat_mtx_;
-    ViewVersionId view_version_{0};
+    /// View version from master. Updated by async registration thread,
+    /// read by heartbeat thread.
+    std::atomic<ViewVersionId> view_version_{0};
+    /// True after MASTER_UNREACHABLE fires; cleared when MASTER_RECONNECTED
+    /// fires. Only accessed from the heartbeat thread — no locking required.
+    bool connection_interrupted_ = false;
 
     // Shutdown protection
     SharedMutex running_rw_mtx_;
     bool is_running_ GUARDED_BY(running_rw_mtx_) = false;
+
+    // Metrics HTTP server
+    std::unique_ptr<coro_http::coro_http_server> metrics_http_server_;
+    uint16_t metrics_port_ = 0;  // 0 means disabled
+    bool enable_metrics_http_ = true;
 };
 
 }  // namespace mooncake

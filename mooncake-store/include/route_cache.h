@@ -6,6 +6,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <span>
 #include <vector>
@@ -26,6 +27,7 @@ struct P2PRouteData {
         UUID client_id;
         UUID segment_id;
         char ip_address[48];
+        char segment_group_id[64];
         uint16_t rpc_port;
         uint64_t object_size;
     };
@@ -51,7 +53,7 @@ struct P2PRouteData {
      * @brief Serialize replica data and key into a continuous memory block.
      * @return Total bytes written.
      */
-    static size_t Serialize(void* dest, const std::string& key,
+    static size_t Serialize(void* dest, std::string_view key,
                             const std::vector<P2PProxyDescriptor>& replicas);
 };
 
@@ -105,21 +107,21 @@ class RouteCache {
     /**
      * @brief Lock-free lookup protected by EBR epoch guard.
      */
-    P2PRouteHandle Get(const std::string& key);
+    P2PRouteHandle Get(std::string_view key);
 
     /**
      * @brief overwrite
      */
-    void Replace(const std::string& key,
+    void Replace(std::string_view key,
                  const std::vector<P2PProxyDescriptor>& replicas);
 
     /**
      * @brief update if key exists, otherwise insert
      */
-    void Upsert(const std::string& key,
+    void Upsert(std::string_view key,
                 const std::vector<P2PProxyDescriptor>& replicas);
 
-    void RemoveReplica(const std::string& key,
+    void RemoveReplica(std::string_view key,
                        const std::vector<P2PProxyDescriptor>& remove_replicas);
 
     struct Metrics {
@@ -308,7 +310,7 @@ class RouteCache {
 
    private:
     void InnerPut(Shard& shard, size_t bucket_idx, size_t hash_val,
-                  const std::string& key,
+                  std::string_view key,
                   const std::vector<P2PProxyDescriptor>& replicas, bool merge);
 
     void BuildReplicaList(

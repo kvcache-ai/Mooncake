@@ -43,6 +43,14 @@ class P2PClientMeta final : public ClientMeta {
     void DoOnDisconnected() override {}
     void DoOnRecovered() override {}
 
+    // HA sync tracking
+    void SetSyncing(bool syncing) {
+        is_syncing_.store(syncing, std::memory_order_release);
+    }
+    bool IsSyncing() const {
+        return is_syncing_.load(std::memory_order_acquire);
+    }
+
    private:
     static constexpr size_t INF_PRIORITY = 10000;
 
@@ -53,6 +61,8 @@ class P2PClientMeta final : public ClientMeta {
     mutable SpinRWLock capacity_mutex_;
     size_t client_capacity_ GUARDED_BY(capacity_mutex_) = 0;
     size_t client_usage_ GUARDED_BY(capacity_mutex_) = 0;
+
+    std::atomic<bool> is_syncing_{false};
 };
 
 }  // namespace mooncake

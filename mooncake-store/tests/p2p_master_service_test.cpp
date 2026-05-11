@@ -1,5 +1,3 @@
-#include "p2p_master_service.h"
-
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -7,7 +5,14 @@
 #include <string>
 #include <vector>
 
+#define private public
+#define protected public
+#include "p2p_master_service.h"
+#undef protected
+#undef private
+
 #include "master_config.h"
+#include "p2p_client_meta.h"
 #include "p2p_rpc_types.h"
 #include "rpc_types.h"
 #include "types.h"
@@ -77,8 +82,8 @@ class P2PMasterServiceTest : public ::testing::Test {
         AddReplicaRequest req;
         req.key = key;
         req.size = size;
-        req.replica.client_id = client_id;
-        req.replica.segment_id = segment_id;
+        req.client_id = client_id;
+        req.segment_id = segment_id;
         auto res = service.AddReplica(req);
         EXPECT_TRUE(res.has_value())
             << "Failed to add replica: " << res.error();
@@ -437,8 +442,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaBasic) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client_id;
-    req.replica.segment_id = seg.id;
+    req.client_id = client_id;
+    req.segment_id = seg.id;
     auto res = service->AddReplica(req);
     ASSERT_TRUE(res.has_value());
 
@@ -453,7 +458,7 @@ TEST_F(P2PMasterServiceTest, AddReplicaBasic) {
     EXPECT_EQ(seg.id, desc.get_p2p_proxy_descriptor().segment_id);
 }
 
-TEST_F(P2PMasterServiceTest, AddReplicaRejectsMismatchedSegmentGroup) {
+TEST_F(P2PMasterServiceTest, AddReplicaUsesRegisteredSegmentGroup) {
     auto service = CreateService();
     auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {}, 1,
                               MemoryType::DRAM, "hot");
@@ -463,17 +468,18 @@ TEST_F(P2PMasterServiceTest, AddReplicaRejectsMismatchedSegmentGroup) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client_id;
-    req.replica.segment_id = seg.id;
-    req.replica.segment_group_id = "cold";
+    req.client_id = client_id;
+    req.segment_id = seg.id;
 
     auto res = service->AddReplica(req);
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, res.error());
+    ASSERT_TRUE(res.has_value());
 
     auto get_res = service->GetReplicaList(req.key);
-    EXPECT_FALSE(get_res.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_res.error());
+    ASSERT_TRUE(get_res.has_value());
+    ASSERT_EQ(1, get_res.value().replicas.size());
+    auto& proxy = get_res.value().replicas[0].get_p2p_proxy_descriptor();
+    ASSERT_TRUE(proxy.segment_group_id.has_value());
+    EXPECT_EQ("hot", *proxy.segment_group_id);
 }
 
 TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
@@ -485,8 +491,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client_id;
-    req.replica.segment_id = seg.id;
+    req.client_id = client_id;
+    req.segment_id = seg.id;
 
     // First add
     auto res1 = service->AddReplica(req);
@@ -518,8 +524,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client3;
-    req.replica.segment_id = seg3.id;
+    req.client_id = client3;
+    req.segment_id = seg3.id;
     auto res = service->AddReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NUM_EXCEEDED, res.error());
@@ -549,8 +555,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaMaxLimitCountsGroups) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client_cold;
-    req.replica.segment_id = seg_cold.id;
+    req.client_id = client_cold;
+    req.segment_id = seg_cold.id;
     auto res = service->AddReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NUM_EXCEEDED, res.error());
@@ -563,8 +569,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaClientNotFound) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = generate_uuid();  // non-existent
-    req.replica.segment_id = seg.id;
+    req.client_id = generate_uuid();  // non-existent
+    req.segment_id = seg.id;
     auto res = service->AddReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::CLIENT_NOT_FOUND, res.error());
@@ -579,8 +585,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaSegmentNotFound) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client_id;
-    req.replica.segment_id = generate_uuid();  // non-existent segment
+    req.client_id = client_id;
+    req.segment_id = generate_uuid();  // non-existent segment
     auto res = service->AddReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, res.error());
@@ -958,7 +964,8 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     AddReplicaRequest a_req;
     a_req.key = "data_001";
     a_req.size = 4096;
-    a_req.replica = candidate.replica;
+    a_req.client_id = candidate.replica.client_id;
+    a_req.segment_id = candidate.replica.segment_id;
     auto a_res = service->AddReplica(a_req);
     ASSERT_TRUE(a_res.has_value());
 
@@ -979,6 +986,51 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     auto r_res2 = service->GetReplicaList("data_001");
     EXPECT_FALSE(r_res2.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, r_res2.error());
+}
+
+// ============================================================
+// SetSyncCompleted Tests
+// ============================================================
+
+TEST_F(P2PMasterServiceTest, SetSyncCompletedSuccess) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    // After registration, OnClientRegistered sets is_syncing = true
+    auto client = service->client_manager_->GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    ASSERT_NE(p2p_client, nullptr);
+    EXPECT_TRUE(p2p_client->IsSyncing());
+
+    // SetSyncCompleted should clear is_syncing
+    auto result = service->SetSyncCompleted(client_id);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(p2p_client->IsSyncing());
+}
+
+TEST_F(P2PMasterServiceTest, SetSyncCompletedClientNotFound) {
+    auto service = CreateService();
+    auto result = service->SetSyncCompleted(generate_uuid());
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::CLIENT_NOT_FOUND);
+}
+
+TEST_F(P2PMasterServiceTest, SetSyncCompletedIdempotent) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    // Call twice — should succeed both times
+    EXPECT_TRUE(service->SetSyncCompleted(client_id).has_value());
+    EXPECT_TRUE(service->SetSyncCompleted(client_id).has_value());
+
+    auto client = service->client_manager_->GetClient(client_id);
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    EXPECT_FALSE(p2p_client->IsSyncing());
 }
 
 }  // namespace mooncake::test

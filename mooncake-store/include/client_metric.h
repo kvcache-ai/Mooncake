@@ -4,6 +4,7 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+#include <glog/logging.h>
 #include <ylt/metric/counter.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
@@ -21,6 +22,22 @@ const std::vector<double> kLatencyBucket = {
     1500, 2000, 3000, 5000, 7000, 15000, 20000,
     // safeguards for long tails
     50000, 100000, 200000, 500000, 1000000};
+
+// Simple stopwatch for measuring elapsed time in microseconds
+class Stopwatch {
+   public:
+    Stopwatch() : start_time_(std::chrono::steady_clock::now()) {}
+
+    int64_t elapsed_us() const {
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   now - start_time_)
+            .count();
+    }
+
+   private:
+    std::chrono::steady_clock::time_point start_time_;
+};
 
 static inline std::string get_env_or_default(
     const char* env_var, const std::string& default_val = "") {
@@ -277,6 +294,25 @@ struct ClientMetric {
     MasterClientMetric master_client_metric;
 
     /**
+     * @brief Check if metrics are enabled via environment variable
+     * @return true if enabled, false if disabled
+     *
+     * Environment variable:
+     * - MC_STORE_CLIENT_METRIC: Enable/disable metrics (enabled by default,
+     *   set to 0/false to disable)
+     */
+    static bool IsEnabled();
+
+    /**
+     * @brief Get the default reporting interval from environment variable
+     * @return Reporting interval in seconds (default: 0)
+     *
+     * Environment variable:
+     * - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds
+     */
+    static uint64_t GetDefaultInterval();
+
+    /**
      * @brief Creates a ClientMetric instance based on environment variables
      * @return std::unique_ptr<ClientMetric> containing the instance if enabled,
      *         nullptr if disabled
@@ -288,16 +324,43 @@ struct ClientMetric {
      *   (default: 0, 0 = collect but don't report)
      */
     static std::unique_ptr<ClientMetric> Create(
-        std::map<std::string, std::string> labels = {});
+        const std::map<std::string, std::string>& labels = {}) {
+        return CreatePtr<ClientMetric>(labels);
+    }
 
-    void serialize(std::string& str);
-    std::string summary_metrics();
+    virtual void serialize(std::string& str);
+    virtual std::string summary_metrics();
 
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
 
-    explicit ClientMetric(uint64_t interval_seconds = 0,
-                          std::map<std::string, std::string> labels = {});
-    ~ClientMetric();
+    explicit ClientMetric(
+        uint64_t interval_seconds = 0,
+        const std::map<std::string, std::string>& labels = {});
+    virtual ~ClientMetric();
+
+   protected:
+    /**
+     * @brief Template helper for creating metric instances.
+     * Used by Create() in base and derived classes.
+     */
+    template <typename T>
+    static std::unique_ptr<T> CreatePtr(
+        const std::map<std::string, std::string>& labels) {
+        if (!IsEnabled()) {
+            LOG(INFO) << "Client metrics disabled (set "
+                         "MC_STORE_CLIENT_METRIC=1 to enable)";
+            return nullptr;
+        }
+        uint64_t interval = GetDefaultInterval();
+        if (interval > 0) {
+            LOG(INFO) << "Client metrics enabled with reporting interval: "
+                      << interval << "s";
+        } else {
+            LOG(INFO)
+                << "Client metrics enabled but reporting disabled (interval=0)";
+        }
+        return std::make_unique<T>(interval, merge_labels(labels));
+    }
 
    private:
     // Metrics reporting thread management

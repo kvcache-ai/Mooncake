@@ -5,6 +5,7 @@
 #include <string>
 
 #include "client_metric.h"
+#include "p2p_client_metric.h"
 
 namespace mooncake::test {
 
@@ -264,6 +265,346 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
         std::string serialized;
         metrics.serialize(serialized);
         verify(serialized);
+    }
+}
+
+TEST_F(ClientMetricsTest, P2PClientMetricBasicTest) {
+    P2PClientMetric metrics;
+
+    // Test empty metrics
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Get: 0 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Put: 0 requests") != std::string::npos);
+
+    // Add put data
+    metrics.local_request.put_requests.inc();
+    metrics.local_request.put_requests.inc();
+    metrics.local_request.put_failures.inc();
+    metrics.local_request.put_bytes.inc(1024 * 1024);  // 1 MB
+    metrics.local_request.put_latency_success.observe(200);
+    metrics.local_request.put_latency_success.observe(300);
+    metrics.local_request.put_latency_failure.observe(500);
+
+    // Add get data
+    metrics.local_request.get_requests.inc();
+    metrics.local_request.get_requests.inc();
+    metrics.local_request.get_requests.inc();
+    metrics.local_request.get_failures.inc();
+    metrics.local_request.get_misses.inc();
+    metrics.local_request.get_hits.inc();
+    metrics.local_request.get_bytes.inc(2 * 1024 * 1024);  // 2 MB
+    metrics.local_request.get_latency_success.observe(100);
+    metrics.local_request.get_latency_success.observe(150);
+    metrics.local_request.get_latency_failure.observe(400);
+
+    summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Put: 2 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("1.00 MB written") != std::string::npos);
+    EXPECT_TRUE(summary.find("Get: 3 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("2.00 MB read") != std::string::npos);
+    EXPECT_TRUE(summary.find("1 misses") != std::string::npos);
+    EXPECT_TRUE(summary.find("1 hits") != std::string::npos);
+
+    std::cout << "P2P Client Metrics Summary:\n" << summary << std::endl;
+}
+
+TEST_F(ClientMetricsTest, P2PClientMetricSerializeTest) {
+    P2PClientMetric metrics;
+
+    // Add some data
+    metrics.local_request.put_requests.inc(100);
+    metrics.local_request.put_bytes.inc(50 * 1024 * 1024);  // 50 MB
+    metrics.local_request.get_requests.inc(500);
+    metrics.local_request.get_misses.inc(20);
+    metrics.local_request.get_hits.inc(480);
+    metrics.local_request.get_bytes.inc(100 * 1024 * 1024);  // 100 MB
+
+    // Add latency data to test histogram output
+    metrics.local_request.put_latency_success.observe(200);
+    metrics.local_request.put_latency_success.observe(300);
+    metrics.local_request.put_latency_failure.observe(500);
+    metrics.local_request.get_latency_success.observe(100);
+    metrics.local_request.get_latency_failure.observe(400);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    // Verify Prometheus format output
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_requests_total 100") !=
+                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_local_put_bytes_total 52428800") !=
+        std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total 500") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_misses_total 20") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_hits_total 480") !=
+                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_local_get_bytes_total 104857600") !=
+        std::string::npos);
+
+    // Verify histogram metrics are present (only output when data exists)
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_latency_success_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_latency_failure_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_latency_success_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_latency_failure_us") !=
+                std::string::npos);
+
+    std::cout << "P2P Client Serialized Metrics:\n" << serialized << std::endl;
+}
+
+TEST_F(ClientMetricsTest, P2PClientMetricWithLabelsTest) {
+    std::map<std::string, std::string> labels = {
+        {"instance_id", "test-instance"}, {"deployment_mode", "p2p"}};
+
+    auto metrics = P2PClientMetric::Create(labels);
+    ASSERT_NE(metrics, nullptr);
+    metrics->local_request.put_requests.inc();
+    metrics->local_request.get_requests.inc();
+
+    std::string serialized;
+    metrics->serialize(serialized);
+
+    // Verify labels are present in output
+    EXPECT_TRUE(serialized.find("instance_id=\"test-instance\"") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("deployment_mode=\"p2p\"") !=
+                std::string::npos);
+}
+
+// Test P2PClientMetric inheritance from ClientMetric
+TEST_F(ClientMetricsTest, P2PClientMetricInheritanceTest) {
+    auto p2p_metrics = P2PClientMetric::Create({});
+    ASSERT_NE(p2p_metrics, nullptr);
+
+    // Add data to both base class metrics and P2P-specific metrics
+    p2p_metrics->transfer_metric.total_read_bytes.inc(1024 * 1024);  // 1 MB
+    p2p_metrics->transfer_metric.total_write_bytes.inc(2 * 1024 *
+                                                       1024);  // 2 MB
+    p2p_metrics->local_request.get_requests.inc(100);
+    p2p_metrics->local_request.put_requests.inc(50);
+
+    // Test serialize includes both base and P2P metrics
+    std::string serialized;
+    p2p_metrics->serialize(serialized);
+    EXPECT_TRUE(serialized.find("mooncake_transfer_read_bytes") !=
+                std::string::npos);  // Base class metric
+    EXPECT_TRUE(serialized.find("mooncake_transfer_write_bytes") !=
+                std::string::npos);  // Base class metric
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total") !=
+                std::string::npos);  // P2P-specific metric
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_requests_total") !=
+                std::string::npos);  // P2P-specific metric
+
+    // Test summary_metrics includes both base and P2P metrics
+    std::string summary = p2p_metrics->summary_metrics();
+    EXPECT_TRUE(summary.find("Transfer Metrics Summary") !=
+                std::string::npos);  // Base class summary
+    EXPECT_TRUE(summary.find("RPC Metrics Summary") !=
+                std::string::npos);  // Base class summary
+    EXPECT_TRUE(summary.find("P2P Local Request Metrics") !=
+                std::string::npos);  // P2P-specific summary
+    EXPECT_TRUE(summary.find("Get: 100 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("Put: 50 requests") != std::string::npos);
+}
+
+// Test P2PClientMetric peer_request metrics
+TEST_F(ClientMetricsTest, P2PClientMetricPeerRequestTest) {
+    P2PClientMetric metrics;
+
+    // Test peer_request metrics are present and work correctly
+    metrics.peer_request.get_requests.inc(100);
+    metrics.peer_request.get_hits.inc(80);
+    metrics.peer_request.get_misses.inc(15);
+    metrics.peer_request.get_failures.inc(5);
+    metrics.peer_request.get_bytes.inc(10 * 1024 * 1024);  // 10 MB
+    metrics.peer_request.get_latency_success.observe(100);
+    metrics.peer_request.get_latency_success.observe(200);
+    metrics.peer_request.get_latency_failure.observe(500);
+    metrics.peer_request.get_latency_failure.observe(600);
+
+    metrics.peer_request.put_requests.inc(50);
+    metrics.peer_request.put_failures.inc(2);
+    metrics.peer_request.put_bytes.inc(5 * 1024 * 1024);  // 5 MB
+    metrics.peer_request.put_latency_success.observe(300);
+    metrics.peer_request.put_latency_success.observe(400);
+    metrics.peer_request.put_latency_failure.observe(700);
+    metrics.peer_request.put_latency_failure.observe(800);
+
+    // Test serialize includes peer_request metrics
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    // Verify peer_request metrics are present with correct prefix
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_requests_total 100") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_hits_total 80") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_misses_total 15") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_failures_total 5") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_bytes_total") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_latency_success_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_latency_failure_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_put_requests_total 50") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_put_failures_total 2") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_put_bytes_total") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_put_latency_success_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_put_latency_failure_us") !=
+                std::string::npos);
+
+    // Test summary_metrics includes peer_request metrics
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("P2P Peer Request Metrics") != std::string::npos);
+    EXPECT_TRUE(summary.find("Get: 100 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("80 hits") != std::string::npos);
+    EXPECT_TRUE(summary.find("15 misses") != std::string::npos);
+    EXPECT_TRUE(summary.find("5 failures") != std::string::npos);
+    EXPECT_TRUE(summary.find("Put: 50 requests") != std::string::npos);
+    EXPECT_TRUE(summary.find("2 failures") != std::string::npos);
+
+    std::cout << "P2P Peer Request Metrics Summary:\n" << summary << std::endl;
+}
+
+// Test both local_request and peer_request together
+TEST_F(ClientMetricsTest, P2PClientMetricBothLocalAndPeerTest) {
+    P2PClientMetric metrics;
+
+    // Add data to both local_request and peer_request
+    metrics.local_request.get_requests.inc(1000);
+    metrics.local_request.get_hits.inc(900);
+    metrics.local_request.get_misses.inc(50);
+    metrics.local_request.get_failures.inc(50);
+    metrics.local_request.get_bytes.inc(100 * 1024 * 1024);  // 100 MB
+
+    metrics.peer_request.get_requests.inc(500);
+    metrics.peer_request.get_hits.inc(400);
+    metrics.peer_request.get_misses.inc(80);
+    metrics.peer_request.get_failures.inc(20);
+    metrics.peer_request.get_bytes.inc(50 * 1024 * 1024);  // 50 MB
+
+    // Test serialize includes both
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    // Verify both local and peer metrics are present
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total 1000") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_requests_total 500") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_hits_total 900") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_get_hits_total 400") !=
+                std::string::npos);
+
+    // Test summary_metrics includes both
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("P2P Local Request Metrics") != std::string::npos);
+    EXPECT_TRUE(summary.find("P2P Peer Request Metrics") != std::string::npos);
+
+    std::cout << "P2P Both Local and Peer Metrics Summary:\n"
+              << summary << std::endl;
+}
+
+// Test ClientMetric::Create returns nullptr when disabled
+TEST_F(ClientMetricsTest, ClientMetricCreateDisabledTest) {
+    // Save current env and set to disable
+    const char* original = std::getenv("MC_STORE_CLIENT_METRIC");
+
+    // Set to disable
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+    auto metrics_disabled = ClientMetric::Create({});
+    EXPECT_EQ(metrics_disabled, nullptr);
+
+    // Set to enable
+    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
+    auto metrics_enabled = ClientMetric::Create({});
+    EXPECT_NE(metrics_enabled, nullptr);
+
+    // Restore original value
+    if (original) {
+        setenv("MC_STORE_CLIENT_METRIC", original, 1);
+    } else {
+        unsetenv("MC_STORE_CLIENT_METRIC");
+    }
+}
+
+// Test P2PClientMetric::Create returns nullptr when disabled
+TEST_F(ClientMetricsTest, P2PClientMetricCreateDisabledTest) {
+    // Save current env and set to disable
+    const char* original = std::getenv("MC_STORE_CLIENT_METRIC");
+
+    // Set to disable
+    setenv("MC_STORE_CLIENT_METRIC", "false", 1);
+    auto p2p_disabled = P2PClientMetric::Create({});
+    EXPECT_EQ(p2p_disabled, nullptr);
+
+    // Set to enable
+    setenv("MC_STORE_CLIENT_METRIC", "true", 1);
+    auto p2p_enabled = P2PClientMetric::Create({});
+    EXPECT_NE(p2p_enabled, nullptr);
+
+    // Restore original value
+    if (original) {
+        setenv("MC_STORE_CLIENT_METRIC", original, 1);
+    } else {
+        unsetenv("MC_STORE_CLIENT_METRIC");
+    }
+}
+
+// Test IsEnabled and GetDefaultInterval
+TEST_F(ClientMetricsTest, MetricEnvironmentVariablesTest) {
+    const char* original_metric = std::getenv("MC_STORE_CLIENT_METRIC");
+    const char* original_interval =
+        std::getenv("MC_STORE_CLIENT_METRIC_INTERVAL");
+
+    // Test IsEnabled with various values
+    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
+    EXPECT_TRUE(ClientMetric::IsEnabled());
+
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+    EXPECT_FALSE(ClientMetric::IsEnabled());
+
+    setenv("MC_STORE_CLIENT_METRIC", "true", 1);
+    EXPECT_TRUE(ClientMetric::IsEnabled());
+
+    setenv("MC_STORE_CLIENT_METRIC", "false", 1);
+    EXPECT_FALSE(ClientMetric::IsEnabled());
+
+    // Test GetDefaultInterval
+    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "10", 1);
+    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 10);
+
+    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "0", 1);
+    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 0);
+
+    // Test with invalid value
+    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "invalid", 1);
+    EXPECT_EQ(ClientMetric::GetDefaultInterval(), 0);
+
+    // Restore original values
+    if (original_metric) {
+        setenv("MC_STORE_CLIENT_METRIC", original_metric, 1);
+    } else {
+        unsetenv("MC_STORE_CLIENT_METRIC");
+    }
+    if (original_interval) {
+        setenv("MC_STORE_CLIENT_METRIC_INTERVAL", original_interval, 1);
+    } else {
+        unsetenv("MC_STORE_CLIENT_METRIC_INTERVAL");
     }
 }
 

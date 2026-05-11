@@ -7,6 +7,7 @@
 #include "real_client.h"
 
 #include <cstdlib>  // for atexit
+#include <map>
 
 #include "integration_utils.h"
 
@@ -1005,13 +1006,23 @@ PYBIND11_MODULE(store, m) {
             "setup_p2p_real_client",
             [](MooncakeStorePyWrapper& self, const std::string& local_hostname,
                const std::string& metadata_server,
-               const std::string& tiered_backend_config_json = "",
+               const std::string& tiered_backend_config_json =
+                   "conf/tiered_backend.json",
                size_t local_buffer_size = 1024 * 1024 * 16,
                const std::string& protocol = "tcp",
                const std::string& rdma_devices = "",
                const std::string& master_server_addr = "127.0.0.1:50051",
                uint16_t client_rpc_port = 12345,
                uint32_t client_rpc_thread_num = 16,
+               size_t lock_shard_count = 1024,
+               size_t route_cache_max_memory = 300 * 1024 * 1024,
+               uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
+               const std::string& local_transfer_mode = "te",
+               size_t local_memcpy_async_worker_num = 32,
+               uint16_t metrics_port = 9003, bool enable_metrics_http = true,
+               size_t async_sender_thread_count = 0,
+               size_t async_max_batch_size = 2000,
+               size_t async_route_queue_size = 0,
                const py::object& engine = py::none()) {
                 auto& resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = false;
@@ -1032,7 +1043,12 @@ PYBIND11_MODULE(store, m) {
                         : std::optional<std::string>(rdma_devices),
                     master_server_addr, tiered_backend_config_json,
                     local_buffer_size, transfer_engine, "", client_rpc_port,
-                    client_rpc_thread_num);
+                    client_rpc_thread_num, lock_shard_count,
+                    route_cache_max_memory, route_cache_ttl_ms,
+                    local_transfer_mode, local_memcpy_async_worker_num,
+                    metrics_port, enable_metrics_http, {},
+                    async_sender_thread_count, async_max_batch_size,
+                    async_route_queue_size);
 
                 auto ret = real_client->setup(config);
                 self.store_ = real_client;
@@ -1043,6 +1059,16 @@ PYBIND11_MODULE(store, m) {
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("client_rpc_port") = 12345,
             py::arg("client_rpc_thread_num") = 16,
+            py::arg("lock_shard_count") = 1024,
+            py::arg("route_cache_max_memory") = 300 * 1024 * 1024,
+            py::arg("route_cache_ttl_ms") = 5 * 60 * 1000,
+            py::arg("local_transfer_mode") = "te",
+            py::arg("local_memcpy_async_worker_num") = 32,
+            py::arg("metrics_port") = 9003,
+            py::arg("enable_metrics_http") = true,
+            py::arg("async_sender_thread_count") = 0,
+            py::arg("async_max_batch_size") = 2000,
+            py::arg("async_route_queue_size") = 0,
             py::arg("engine") = py::none(),
             "Setup the store in P2P architecture.")
         .def(
@@ -1054,7 +1080,9 @@ PYBIND11_MODULE(store, m) {
                const std::string& protocol = "tcp",
                const std::string& rdma_devices = "",
                const std::string& master_server_addr = "127.0.0.1:50051",
-               const py::object& engine = py::none()) {
+               const py::object& engine = py::none(),
+               bool enable_offload = false, uint16_t metrics_port = 9003,
+               bool enable_metrics_http = true) {
                 auto& resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = false;
                 auto real_client = std::make_shared<RealClient>();
@@ -1073,7 +1101,8 @@ PYBIND11_MODULE(store, m) {
                             ? std::optional<std::string>(std::nullopt)
                             : std::optional<std::string>(rdma_devices),
                         master_server_addr, global_segment_size,
-                        local_buffer_size, transfer_engine);
+                        local_buffer_size, transfer_engine, "", enable_offload,
+                        metrics_port, enable_metrics_http, {});
 
                 auto ret = real_client->setup(config);
                 self.store_ = real_client;
@@ -1082,7 +1111,9 @@ PYBIND11_MODULE(store, m) {
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
-            py::arg("master_server_addr"), py::arg("engine") = py::none())
+            py::arg("master_server_addr"), py::arg("engine") = py::none(),
+            py::arg("enable_offload") = false, py::arg("metrics_port") = 9003,
+            py::arg("enable_metrics_http") = true)
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper& self, size_t mem_pool_size,

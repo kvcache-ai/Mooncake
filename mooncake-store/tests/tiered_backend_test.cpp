@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <json/json.h>
+#include <numa.h>
 #include <fstream>
 #include <filesystem>
 #include <cstdlib>
@@ -53,7 +54,7 @@ class TieredBackendTest : public ::testing::Test {
 
     void ConfigureFilePerKeyStorage(const std::string& path) {
         setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-               "file_per_key_storage_backend", 1);
+               "bucket_storage_backend", 1);
         setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", path.c_str(), 1);
         std::filesystem::remove_all(path);
         std::filesystem::create_directories(path);
@@ -158,6 +159,10 @@ TEST_F(TieredBackendTest, BasicDRAMTierInit) {
 
 // Test DRAM tier with NUMA node
 TEST_F(TieredBackendTest, DRAMTierWithNUMA) {
+    if (numa_available() < 0) {
+        GTEST_SKIP() << "NUMA is not available in this environment";
+    }
+
     std::string json_config_str = R"({
         "tiers": [
             {
@@ -1251,9 +1256,8 @@ TEST_F(TieredBackendTest, ConcurrentAllocations) {
 
 // Test Interaction between DRAM and Storage Tier
 TEST_F(TieredBackendTest, MultiTierInteraction) {
-    // defaults to file_per_key for this test
     setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-           "file_per_key_storage_backend", 1);
+           "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_test_multitier",
            1);
     std::filesystem::remove_all("/tmp/mooncake_test_multitier");
@@ -1341,17 +1345,19 @@ TEST_F(TieredBackendTest, MultiTierInteraction) {
     ASSERT_TRUE(get_hot_storage.has_value());
     EXPECT_EQ(get_hot_storage.value()->loc.tier->GetTierId(), storage_id);
 
-    // Flux Storage to verify persistence
+    // Flush Storage to verify persistence
     const_cast<CacheTier*>(backend.GetTier(storage_id))->Flush();
-    // Check file exists for hot_key (since it was copied there)
-    // Filename in FilePerKey is hashed, but we can search.
+    // BucketStorageBackend writes data into bucket files named by bucket ID
+    // (e.g. "7281256148992.bucket"), not per-key files.
+    // Verify that at least one .bucket file was created, which confirms the
+    // flush wrote data to disk.
     bool found = false;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(
              "/tmp/mooncake_test_multitier")) {
-        // key might be sanitized or hashed, but let's check if we find any file
-        // created recently? Actually, FilePerKey backend sanitizes key.
-        // "hot_key" -> "hot_key" usually.
-        if (entry.path().filename() == "hot_key") found = true;
+        if (entry.path().extension() == ".bucket") {
+            found = true;
+            break;
+        }
     }
     EXPECT_TRUE(found) << "hot_key should be present in storage backend";
 }
@@ -1380,12 +1386,11 @@ TEST_F(TieredBackendTest, StoragePrefetch) {
 
     TieredBackend backend;
 
-    // Configure Storage Backend (FilePerKey)
-    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "file_per_key", 1);
-    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
-           "/tmp/mooncake_test_prefetch/file_per_key_dir", 1);
-    std::filesystem::create_directories(
-        "/tmp/mooncake_test_prefetch/file_per_key_dir");
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_test_prefetch",
+           1);
+    std::filesystem::create_directories("/tmp/mooncake_test_prefetch");
 
     ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
@@ -1443,6 +1448,52 @@ TEST_F(TieredBackendTest, StoragePrefetch) {
     EXPECT_EQ(read_str, data);
 
     std::filesystem::remove_all("/tmp/mooncake_test_prefetch");
+}
+
+// ---- ParseByteSize: capacity accepts human-readable string ----
+
+TEST_F(TieredBackendTest, CapacityAsHumanReadableString) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": "1GB",
+                "priority": 10
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto result = InitTieredBackendForTest(backend, config);
+    EXPECT_TRUE(result.has_value());
+
+    auto tier_views = backend.GetTierViews();
+    ASSERT_EQ(tier_views.size(), 1u);
+    EXPECT_EQ(tier_views[0].capacity, 1024ULL * 1024 * 1024);
+}
+
+TEST_F(TieredBackendTest, CapacityAsPlainInteger) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 536870912,
+                "priority": 10
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto result = InitTieredBackendForTest(backend, config);
+    EXPECT_TRUE(result.has_value());
+
+    auto tier_views = backend.GetTierViews();
+    ASSERT_EQ(tier_views.size(), 1u);
+    EXPECT_EQ(tier_views[0].capacity, 512ULL * 1024 * 1024);
 }
 
 }  // namespace mooncake

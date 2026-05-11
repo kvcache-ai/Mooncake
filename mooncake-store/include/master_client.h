@@ -1,5 +1,6 @@
 #pragma once
 
+#include <coroutine>
 #include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
@@ -7,6 +8,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cstdlib>
 #include <boost/functional/hash.hpp>
@@ -48,7 +50,7 @@ class MasterClient {
      * @return tl::expected<bool, ErrorCode> indicating exist or not
      */
     [[nodiscard]] tl::expected<bool, ErrorCode> ExistKey(
-        const std::string& object_key);
+        std::string_view object_key);
 
     /**
      * @brief Checks if multiple objects exist
@@ -56,7 +58,7 @@ class MasterClient {
      * @return Vector containing existence status for each key
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& object_keys);
+        const std::vector<std::string_view>& object_keys);
     /**
      * @brief Gets replica list for an object
      * @param object_key Key to query
@@ -64,15 +66,21 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
-    GetReplicaList(const std::string& key,
+    GetReplicaList(std::string_view key,
                    const GetReplicaListRequestConfig& config =
                        GetReplicaListRequestConfig());
+
+    [[nodiscard]] async_simple::coro::Lazy<
+        tl::expected<GetReplicaListResponse, ErrorCode>>
+    AsyncGetReplicaList(std::string_view key,
+                        const GetReplicaListRequestConfig& config =
+                            GetReplicaListRequestConfig());
 
     /**
      * @brief Batch query read routes
      */
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
+    BatchGetReplicaList(const std::vector<std::string_view>& keys,
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig());
 
@@ -112,7 +120,7 @@ class MasterClient {
      * @param key Key to remove
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> Remove(std::string_view key);
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
@@ -121,7 +129,7 @@ class MasterClient {
      * success, or an ErrorCode on failure.
      */
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
-        const std::string& str);
+        std::string_view str);
 
     /**
      * @brief Removes all objects and all its replicas
@@ -192,8 +200,8 @@ class MasterClient {
      * @return The result of the RPC call
      */
     template <auto ServiceMethod, typename ReturnType, typename... Args>
-    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
-        Args&&... args) {
+    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
+    invoke_rpc_async(Args&&... args) {
         auto pool = client_accessor_.GetClientPool();
 
         // Increment RPC counter
@@ -202,34 +210,37 @@ class MasterClient {
         }
 
         auto start_time = std::chrono::steady_clock::now();
+        auto ret = co_await pool->send_request(
+            [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+                return client.send_request<ServiceMethod>(
+                    std::forward<Args>(args)...);
+            });
+        if (!ret.has_value()) {
+            LOG(ERROR) << "Client not available";
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        auto result = co_await std::move(ret.value());
+        if (!result) {
+            LOG(ERROR) << "RPC call failed: " << result.error().msg;
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        if (metrics_) {
+            auto end_time = std::chrono::steady_clock::now();
+            auto latency =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    end_time - start_time);
+            metrics_->rpc_latency.observe({RpcNameTraits<ServiceMethod>::value},
+                                          latency.count());
+        }
+        co_return result->result();
+    }
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
+        Args&&... args) {
         return async_simple::coro::syncAwait(
-            [&]() -> async_simple::coro::Lazy<
-                      tl::expected<ReturnType, ErrorCode>> {
-                auto ret = co_await pool->send_request(
-                    [&](coro_io::client_reuse_hint,
-                        coro_rpc::coro_rpc_client& client) {
-                        return client.send_request<ServiceMethod>(
-                            std::forward<Args>(args)...);
-                    });
-                if (!ret.has_value()) {
-                    LOG(ERROR) << "Client not available";
-                    co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-                }
-                auto result = co_await std::move(ret.value());
-                if (!result) {
-                    LOG(ERROR) << "RPC call failed: " << result.error().msg;
-                    co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-                }
-                if (metrics_) {
-                    auto end_time = std::chrono::steady_clock::now();
-                    auto latency =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time);
-                    metrics_->rpc_latency.observe(
-                        {RpcNameTraits<ServiceMethod>::value}, latency.count());
-                }
-                co_return result->result();
-            }());
+            invoke_rpc_async<ServiceMethod, ReturnType>(
+                std::forward<Args>(args)...));
     }
 
     /**

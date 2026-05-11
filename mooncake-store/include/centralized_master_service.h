@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,7 +45,7 @@ class CentralizedMasterService final : public MasterService {
     explicit CentralizedMasterService(const MasterServiceConfig& config);
     ~CentralizedMasterService() override;
 
-    auto GetReplicaList(const std::string& key,
+    auto GetReplicaList(std::string_view key,
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig())
         -> tl::expected<GetReplicaListResponse, ErrorCode> override;
@@ -301,7 +302,8 @@ class CentralizedMasterService final : public MasterService {
     struct CentralizedMetadataShard : public MetadataShard {
         // Keys currently being written (PutStart called, but not yet PutEnd)
         // Protected by the inherited mutex from MetadataShard
-        std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
+        std::unordered_set<std::string, StringHash, std::equal_to<>>
+            processing_keys GUARDED_BY(mutex);
     };
 
     // Override GetShard to return our extended shard type
@@ -321,8 +323,8 @@ class CentralizedMasterService final : public MasterService {
     }
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
     // Helper to get shard index from key
-    size_t GetShardIndex(const std::string& key) const override {
-        return std::hash<std::string>{}(key) % kNumShards;
+    size_t GetShardIndex(std::string_view key) const override {
+        return std::hash<std::string_view>{}(key) % kNumShards;
     }
     size_t GetShardCount() const override { return kNumShards; }
 
@@ -331,7 +333,7 @@ class CentralizedMasterService final : public MasterService {
         : public MasterService::MetadataAccessor {
        public:
         CentralizedMetadataAccessor(CentralizedMasterService* service,
-                                    const std::string& key)
+                                    std::string_view key)
             : MasterService::MetadataAccessor(service, key),
               c_shard_(static_cast<CentralizedMetadataShard&>(shard_)),
               processing_it_(c_shard_.processing_keys.find(key)) {}
@@ -355,11 +357,12 @@ class CentralizedMasterService final : public MasterService {
 
        private:
         CentralizedMetadataShard& c_shard_;
-        std::unordered_set<std::string>::iterator processing_it_;
+        std::unordered_set<std::string, StringHash, std::equal_to<>>::iterator
+            processing_it_;
     };
 
     std::unique_ptr<MetadataAccessor> GetMetadataAccessor(
-        const std::string& key) override {
+        std::string_view key) override {
         return std::make_unique<CentralizedMetadataAccessor>(this, key);
     }
 
