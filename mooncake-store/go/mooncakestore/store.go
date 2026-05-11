@@ -556,7 +556,7 @@ func (s *Store) CalcCacheStats() (map[string]float64, error) {
 	buf := make([]byte, 1024)
 	ret := C.mooncake_store_calc_cache_stats(s.handle, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
 	if ret < 0 {
-		return nil, ErrInternal
+		return nil, ErrGet
 	}
 	// Find null terminator
 	n := int(ret)
@@ -583,7 +583,7 @@ func (s *Store) GetClientStats() (map[string]int64, error) {
 	buf := make([]byte, 1024)
 	ret := C.mooncake_store_get_client_stats(s.handle, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
 	if ret < 0 {
-		return nil, ErrInternal
+		return nil, ErrGet
 	}
 	n := int(ret)
 	if n > len(buf)-1 {
