@@ -1295,6 +1295,11 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
 
     uint64_t grace_period_ms = grace_period_seconds * 1000;
     int first_error = 0;
+    struct SegmentToUnmount {
+        std::string segment_id;
+        UUID id;
+    };
+    std::vector<SegmentToUnmount> to_unmount;
     std::vector<std::pair<std::string, MountedSegmentRecord>> to_cleanup;
     {
         std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
@@ -1314,27 +1319,35 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
                 continue;
             }
 
-            std::function<void(const UUID &)> cleanup_callback;
-            if (grace_period_ms != 0) {
-                cleanup_callback = [this](const UUID &cleanup_id) {
-                    ReleaseMountedSegmentRecord(UuidToString(cleanup_id));
-                };
-            }
-            auto result = client_->UnmountSegmentById(
-                id, grace_period_ms, std::move(cleanup_callback));
-            if (!result.has_value()) {
-                LOG(ERROR) << "UnmountSegmentById failed for " << segment_id;
-                if (first_error == 0) {
-                    first_error = static_cast<int>(result.error());
-                }
-                continue;  // Don't release local resources on failure
-            }
+            to_unmount.push_back({segment_id, id});
+        }
+    }
 
-            // For immediate unmount, clean up local mmap/fd right away.
-            // For graceful unmount, local mmap/fd is kept until the segment
-            // is actually removed or the client destructor runs.
-            if (grace_period_ms == 0) {
-                to_cleanup.emplace_back(segment_id, it->second);
+    for (auto &entry : to_unmount) {
+        std::function<void(const UUID &)> cleanup_callback;
+        if (grace_period_ms != 0) {
+            cleanup_callback = [this](const UUID &cleanup_id) {
+                ReleaseMountedSegmentRecord(UuidToString(cleanup_id));
+            };
+        }
+        auto result = client_->UnmountSegmentById(entry.id, grace_period_ms,
+                                                  std::move(cleanup_callback));
+        if (!result.has_value()) {
+            LOG(ERROR) << "UnmountSegmentById failed for " << entry.segment_id;
+            if (first_error == 0) {
+                first_error = static_cast<int>(result.error());
+            }
+            continue;  // Don't release local resources on failure
+        }
+
+        // For immediate unmount, clean up local mmap/fd right away.
+        // For graceful unmount, local mmap/fd is kept until the segment
+        // is actually removed or the client destructor runs.
+        if (grace_period_ms == 0) {
+            std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+            auto it = mounted_segment_records_.find(entry.segment_id);
+            if (it != mounted_segment_records_.end()) {
+                to_cleanup.emplace_back(entry.segment_id, it->second);
                 mounted_segment_records_.erase(it);
             }
         }
@@ -1462,6 +1475,11 @@ int RealClient::unmountAndFreeSegment(
 
     uint64_t grace_period_ms = grace_period_seconds * 1000;
     int first_error = 0;
+    struct SegmentToUnmount {
+        std::string segment_id;
+        UUID id;
+    };
+    std::vector<SegmentToUnmount> to_unmount;
     std::vector<std::pair<std::string, AllocatedSegmentRecord>> to_cleanup;
     {
         std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
@@ -1481,24 +1499,32 @@ int RealClient::unmountAndFreeSegment(
                 continue;
             }
 
-            std::function<void(const UUID &)> cleanup_callback;
-            if (grace_period_ms != 0) {
-                cleanup_callback = [this](const UUID &cleanup_id) {
-                    ReleaseAllocatedSegmentRecord(UuidToString(cleanup_id));
-                };
-            }
-            auto result = client_->UnmountSegmentById(
-                id, grace_period_ms, std::move(cleanup_callback));
-            if (!result.has_value()) {
-                LOG(ERROR) << "UnmountSegmentById failed for " << segment_id;
-                if (first_error == 0) {
-                    first_error = static_cast<int>(result.error());
-                }
-                continue;  // Don't release local resources on failure
-            }
+            to_unmount.push_back({segment_id, id});
+        }
+    }
 
-            if (grace_period_ms == 0) {
-                to_cleanup.emplace_back(segment_id, it->second);
+    for (auto &entry : to_unmount) {
+        std::function<void(const UUID &)> cleanup_callback;
+        if (grace_period_ms != 0) {
+            cleanup_callback = [this](const UUID &cleanup_id) {
+                ReleaseAllocatedSegmentRecord(UuidToString(cleanup_id));
+            };
+        }
+        auto result = client_->UnmountSegmentById(entry.id, grace_period_ms,
+                                                  std::move(cleanup_callback));
+        if (!result.has_value()) {
+            LOG(ERROR) << "UnmountSegmentById failed for " << entry.segment_id;
+            if (first_error == 0) {
+                first_error = static_cast<int>(result.error());
+            }
+            continue;  // Don't release local resources on failure
+        }
+
+        if (grace_period_ms == 0) {
+            std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+            auto it = allocated_segment_records_.find(entry.segment_id);
+            if (it != allocated_segment_records_.end()) {
+                to_cleanup.emplace_back(entry.segment_id, it->second);
                 allocated_segment_records_.erase(it);
             }
         }

@@ -466,7 +466,7 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            const UUID& client_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     // Verify ownership: the segment must belong to the calling client
@@ -5301,7 +5301,11 @@ void MasterService::GracefulUnmountScheduler::Schedule(
     std::chrono::steady_clock::time_point expire_time) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push(Record{segment_id, client_id, expire_time});
+        if (stopping_) {
+            return;
+        }
+        auto generation = client_generations_[client_id];
+        queue_.push(Record{segment_id, client_id, generation, expire_time});
         if (!timer_running_.load()) {
             timer_running_.store(true);
             timer_thread_ = std::thread([this]() { this->TimerLoop(); });
@@ -5313,23 +5317,14 @@ void MasterService::GracefulUnmountScheduler::Schedule(
 void MasterService::GracefulUnmountScheduler::RemoveClientRecords(
     const UUID& client_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<Record> remaining;
-    remaining.reserve(queue_.size());
-    while (!queue_.empty()) {
-        auto rec = queue_.top();
-        queue_.pop();
-        if (rec.client_id != client_id) {
-            remaining.push_back(rec);
-        }
-    }
-    for (auto& rec : remaining) {
-        queue_.push(rec);
-    }
+    ++client_generations_[client_id];
+    timer_cv_.notify_one();
 }
 
 void MasterService::GracefulUnmountScheduler::Stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
         timer_running_.store(false);
     }
     timer_cv_.notify_all();
@@ -5369,6 +5364,14 @@ void MasterService::GracefulUnmountScheduler::TimerLoop() {
         lock.unlock();
 
         for (auto& rec : expired) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto generation_it = client_generations_.find(rec.client_id);
+                if (generation_it != client_generations_.end() &&
+                    generation_it->second != rec.client_generation) {
+                    continue;
+                }
+            }
             if (service_) {
                 service_->UnmountSegment(rec.segment_id, rec.client_id);
             }

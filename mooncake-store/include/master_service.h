@@ -960,6 +960,7 @@ class MasterService {
         struct Record {
             UUID segment_id;
             UUID client_id;
+            uint64_t client_generation;
             std::chrono::steady_clock::time_point expire_time;
             bool operator>(const Record& other) const {
                 return expire_time > other.expire_time;
@@ -969,8 +970,11 @@ class MasterService {
         std::mutex mutex_;
         std::priority_queue<Record, std::vector<Record>, std::greater<Record>>
             queue_;
+        std::unordered_map<UUID, uint64_t, boost::hash<UUID>>
+            client_generations_;
         std::thread timer_thread_;
         std::atomic<bool> timer_running_{false};
+        bool stopping_{false};
         std::condition_variable timer_cv_;
     } graceful_unmount_scheduler_;
 
