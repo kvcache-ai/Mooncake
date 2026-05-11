@@ -242,11 +242,31 @@ bool MasterAdminServer::Start() {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_.load()) {
                 const auto snapshot = SnapshotState();
-                LOG(INFO) << "Master Admin Metrics: role="
-                          << ha::MasterRuntimeRoleToString(snapshot.state)
-                          << ", state="
-                          << ha::MasterRuntimeStateToString(snapshot.state)
-                          << ", summary=" << BuildMetricsSummaryText();
+                std::ostringstream log_stream;
+                log_stream << "Master Admin Metrics: role="
+                           << ha::MasterRuntimeRoleToString(snapshot.state)
+                           << ", state="
+                           << ha::MasterRuntimeStateToString(snapshot.state)
+                           << ", summary=role="
+                           << ha::MasterRuntimeRoleToString(snapshot.state)
+                           << ", state="
+                           << ha::MasterRuntimeStateToString(snapshot.state)
+                           << ", service_ready="
+                           << (snapshot.service_available ? "true" : "false")
+                           << ", master={"
+                           << MasterMetricManager::instance()
+                                  .get_summary_string_and_update_snapshot()
+                           << "}"
+                           << ", ha={"
+                           << HAMetricManager::instance().get_summary_string()
+                           << "}";
+                if (snapshot.leader_view.has_value()) {
+                    log_stream
+                        << ", leader=" << snapshot.leader_view->leader_address
+                        << ", view_version="
+                        << snapshot.leader_view->view_version;
+                }
+                LOG(INFO) << log_stream.str();
                 std::this_thread::sleep_for(
                     std::chrono::seconds(kMetricReportIntervalSeconds));
             }
