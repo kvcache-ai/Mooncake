@@ -31,6 +31,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/common/concurrent/thread_local_storage.h"
+#include "tent/runtime/transport_selector.h"
 
 namespace mooncake {
 namespace tent {
@@ -49,14 +50,15 @@ class ProxyManager;
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
-    bool derived{false};  // merged by other tasks
-    int xport_priority{0};
+    bool derived{false};          // merged by other tasks
+    int xport_priority{0};        // transport priority (for fallback)
+    int failover_count{0};        // number of failover attempts
+    uint64_t device_mask{~0ULL};  // Device mask for quota allocation
     Request request;
     bool staging{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
     std::chrono::steady_clock::time_point start_time{};  // For latency tracking
-    int failover_count{0};  // Number of cross-transport failover attempts
 };
 
 class TransferEngineImpl {
@@ -179,15 +181,16 @@ class TransferEngineImpl {
 
     Status lazyFreeBatch();
 
-    TransportType getTransportType(const Request& request, int priority = 0);
+    SelectionResult getTransportType(const Request& request,
+                                     int priority = 0);
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
-    TransportType resolveTransport(const Request& req, int priority,
-                                   bool invalidate_on_fail = true);
+    SelectionResult resolveTransport(const Request& req, int priority,
+                                     bool invalidate_on_fail = true);
 
     Status loadTransports();
 
@@ -217,6 +220,7 @@ class TransferEngineImpl {
     std::shared_ptr<Config> conf_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
+    std::unique_ptr<TransportSelector> transport_selector_;
     bool available_;
 
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
