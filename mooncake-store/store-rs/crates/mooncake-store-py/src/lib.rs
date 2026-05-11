@@ -831,7 +831,7 @@ impl PyMooncakeDistributedStore {
                                         }
                                         let result = client.batch_put_from(&[request]);
                                         match result {
-                                            Ok(_) | Err(StoreError::Conflict(_)) => 0,
+                                            Ok(_) => 0,
                                             Err(error) => {
                                                 eprintln!(
                                                     "[mooncake-store] batch_put_from per-key failed runtime={} key={} bytes={} elapsed_ms={} error={}",

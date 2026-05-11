@@ -201,7 +201,7 @@ Behavior boundary:
 
 - `put_from` and `batch_put_from` send remote writes from the registered source buffer directly
 - `batch_get_into` reads remote payloads directly into registered destination buffers
-- routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races, releases its own temporary reservation, and returns a route entry for that key without failing the batch
+- routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races when metadata returns or an exact bounded recheck finds an already published active route, releases its own temporary reservation, and returns that route entry without failing the batch
 - `segment_offset` is the durable storage coordinate for the payload; remote reads, local reads, and drain migration all derive the live TE target offset from `segment_offset` and the segment's published storage target chunks, then verify the target range is present in the current TE segment buffers before touching storage
 - unregistered `get_into` targets and `batch_put_from_multi_buffers` still fall back to the staged copy paths
 
