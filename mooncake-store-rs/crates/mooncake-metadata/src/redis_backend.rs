@@ -1007,10 +1007,10 @@ impl Drop for RedisConnectionLease<'_> {
 }
 
 pub struct RedisMetadataBackend {
-    connection_pool: Box<RedisConnectionPool>,
-    legacy_auth_pool: Option<Box<RedisConnectionPool>>,
-    prefer_legacy_auth: AtomicBool,
-    connection_diagnostic_events: AtomicU64,
+    connection_pool: Arc<RedisConnectionPool>,
+    legacy_auth_pool: Option<Arc<RedisConnectionPool>>,
+    prefer_legacy_auth: Arc<AtomicBool>,
+    connection_diagnostic_events: Arc<AtomicU64>,
     url: String,
     keyspace: MetadataKeyspace,
     route_namespace: String,
@@ -1061,10 +1061,10 @@ impl RedisMetadataBackend {
             .map(RedisConnectionPool::new)
             .map(Box::new);
         Ok(Self {
-            connection_pool: Box::new(RedisConnectionPool::new(client)),
-            legacy_auth_pool,
-            prefer_legacy_auth: AtomicBool::new(false),
-            connection_diagnostic_events: AtomicU64::new(0),
+            connection_pool: Arc::new(RedisConnectionPool::new(client)),
+            legacy_auth_pool: legacy_auth_pool.map(Arc::from),
+            prefer_legacy_auth: Arc::new(AtomicBool::new(false)),
+            connection_diagnostic_events: Arc::new(AtomicU64::new(0)),
             url: config.url,
             keyspace: config.keyspace,
             route_namespace,
@@ -1516,14 +1516,22 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
-        let config = RedisMetadataConfig {
+        let keyspace = self.keyspace.tenant_prefixed(tenant);
+        let route_namespace = format!(
+            "{}#{}",
+            redacted_route_namespace_source(&self.url),
+            keyspace.prefix()
+        );
+        Some(Arc::new(Self {
+            connection_pool: self.connection_pool.clone(),
+            legacy_auth_pool: self.legacy_auth_pool.clone(),
+            prefer_legacy_auth: self.prefer_legacy_auth.clone(),
+            connection_diagnostic_events: self.connection_diagnostic_events.clone(),
             url: self.url.clone(),
-            keyspace: self.keyspace.tenant_prefixed(tenant),
+            keyspace,
+            route_namespace,
             tenant_quota_terminal_ttl: self.tenant_quota_terminal_ttl,
-        };
-        RedisMetadataBackend::new(config)
-            .ok()
-            .map(|backend| Arc::new(backend) as Arc<dyn MetadataBackend>)
+        }))
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {

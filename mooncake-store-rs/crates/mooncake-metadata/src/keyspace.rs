@@ -435,7 +435,7 @@ pub fn parse_tenant_policy_scope(
     Some(scope)
 }
 
-fn encode_key_component(value: &str) -> String {
+pub(crate) fn encode_key_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len() * 2);
     for byte in value.as_bytes() {
         match byte {

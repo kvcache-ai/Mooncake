@@ -115,6 +115,12 @@ impl MetadataBackend for ObservedMetadataBackend {
         true
     }
 
+    fn for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
+        self.inner
+            .for_tenant(tenant)
+            .map(|metadata| observe_metadata_backend_with_registry(metadata, self.registry.clone()))
+    }
+
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
         self.observe("upsert_client_lease", || {
             self.inner.upsert_client_lease(lease)

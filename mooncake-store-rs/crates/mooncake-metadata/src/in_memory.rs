@@ -15,6 +15,7 @@ use mooncake_store_core::{
 };
 use parking_lot::RwLock;
 
+use crate::keyspace::encode_key_component;
 use crate::segment_state::StoredSegmentState;
 
 #[derive(Default)]
@@ -55,15 +56,21 @@ impl InMemoryMetadataBackend {
         }
     }
 
+    fn tenant_storage_prefix(&self) -> Option<String> {
+        self.tenant_prefix
+            .as_deref()
+            .map(|tenant| format!("tenant:{}", encode_key_component(tenant)))
+    }
+
     fn scoped_key(&self, key: impl AsRef<str>) -> String {
-        match self.tenant_prefix.as_deref() {
+        match self.tenant_storage_prefix() {
             Some(prefix) => format!("{prefix}/{}", key.as_ref()),
             None => key.as_ref().to_string(),
         }
     }
 
     fn scoped_stable_id_key(&self, stable_id: &ClientStableId) -> ClientStableId {
-        match self.tenant_prefix.as_deref() {
+        match self.tenant_storage_prefix() {
             Some(prefix) => ClientStableId(format!("{prefix}/{}", stable_id.0)),
             None => stable_id.clone(),
         }
@@ -74,12 +81,12 @@ impl InMemoryMetadataBackend {
     }
 
     fn unscoped_runtime(&self, runtime: ClientRuntimeId) -> ClientRuntimeId {
-        match self.tenant_prefix.as_deref() {
+        match self.tenant_storage_prefix() {
             Some(prefix) => {
                 let stable_id = runtime
                     .stable_id
                     .0
-                    .strip_prefix(prefix)
+                    .strip_prefix(&prefix)
                     .and_then(|rest| rest.strip_prefix('/'))
                     .unwrap_or(runtime.stable_id.0.as_str());
                 ClientRuntimeId::new(stable_id, runtime.epoch)
@@ -364,9 +371,11 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .clients
             .values()
             .filter(|lease| {
-                self.tenant_prefix.as_deref().is_none_or(|prefix| {
-                    lease.runtime.stable_id.0.starts_with(&format!("{prefix}/"))
-                })
+                self.tenant_storage_prefix()
+                    .as_deref()
+                    .is_none_or(|prefix| {
+                        lease.runtime.stable_id.0.starts_with(&format!("{prefix}/"))
+                    })
             })
             .cloned()
             .map(|lease| self.unscope_lease(lease))
@@ -421,14 +430,17 @@ impl MetadataBackend for InMemoryMetadataBackend {
                 scoped_owner
                     .as_ref()
                     .is_none_or(|owner| &segment.announcement.owner == owner)
-                    && self.tenant_prefix.as_deref().is_none_or(|prefix| {
-                        segment
-                            .announcement
-                            .owner
-                            .stable_id
-                            .0
-                            .starts_with(&format!("{prefix}/"))
-                    })
+                    && self
+                        .tenant_storage_prefix()
+                        .as_deref()
+                        .is_none_or(|prefix| {
+                            segment
+                                .announcement
+                                .owner
+                                .stable_id
+                                .0
+                                .starts_with(&format!("{prefix}/"))
+                        })
             })
             .map(|segment| {
                 let mut announcement = segment.announcement.clone();
@@ -503,7 +515,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .objects
             .iter()
             .filter(|(key, _)| {
-                self.tenant_prefix
+                self.tenant_storage_prefix()
                     .as_deref()
                     .is_none_or(|prefix| key.starts_with(&format!("{prefix}/")))
             })
@@ -1131,10 +1143,14 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
+        let mut handoff = handoff.clone();
+        handoff.stable_id = self.scoped_stable_id_key(&handoff.stable_id);
+        handoff.from = self.scoped_runtime(&handoff.from);
+        handoff.to = self.scoped_runtime(&handoff.to);
         self.state
             .write()
             .handoffs
-            .insert(self.scoped_key(&handoff.stable_id.0), handoff.clone());
+            .insert(handoff.stable_id.0.clone(), handoff);
         Ok(())
     }
 
@@ -1144,7 +1160,18 @@ impl MetadataBackend for InMemoryMetadataBackend {
             .read()
             .handoffs
             .get(&self.scoped_key(&stable_id.0))
-            .cloned())
+            .cloned()
+            .map(|mut handoff| {
+                handoff.stable_id = self
+                    .unscoped_runtime(ClientRuntimeId::new(
+                        handoff.stable_id.0.as_str(),
+                        ClientEpoch(0),
+                    ))
+                    .stable_id;
+                handoff.from = self.unscoped_runtime(handoff.from);
+                handoff.to = self.unscoped_runtime(handoff.to);
+                handoff
+            }))
     }
 }
 
@@ -1264,14 +1291,51 @@ mod tests {
             deadline_ms: Some(now_ms() + 10_000),
         };
         tenant_a.put_handoff(&handoff).expect("handoff write");
-        assert!(tenant_a
+        let stored_handoff = tenant_a
             .get_handoff(&ClientStableId::new("writer"))
             .unwrap()
-            .is_some());
+            .expect("tenant-a handoff should be visible");
+        assert_eq!(stored_handoff, handoff);
         assert!(tenant_b
             .get_handoff(&ClientStableId::new("writer"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn tenant_views_do_not_overlap_when_tenant_names_share_prefixes() {
+        let metadata = InMemoryMetadataBackend::new();
+        let tenant_a = metadata.for_tenant("a").expect("tenant view");
+        let tenant_ab = metadata.for_tenant("a/b").expect("tenant view");
+        let lease = active_lease("writer", 1);
+
+        tenant_ab
+            .upsert_client_lease(&lease)
+            .expect("tenant a/b lease should write");
+        tenant_ab
+            .publish_segment(&sample_segment(&lease.runtime, "seg", 4096))
+            .expect("tenant a/b segment should write");
+        let key = ObjectKey::new("object");
+        assert!(
+            tenant_ab
+                .compare_and_swap_object_route(
+                    &key,
+                    None,
+                    Some(&sample_route("object", "writer", "seg"))
+                )
+                .unwrap()
+                .applied
+        );
+
+        assert!(tenant_a.list_live_clients().unwrap().is_empty());
+        assert!(tenant_a.list_segments(None).unwrap().is_empty());
+        assert!(tenant_a.list_object_routes().unwrap().is_empty());
+        assert!(tenant_a.get_client_lease(&lease.runtime).unwrap().is_none());
+        assert!(tenant_a
+            .get_segment(&lease.runtime, &SegmentName::new("seg"))
+            .unwrap()
+            .is_none());
+        assert!(tenant_a.get_object_route(&key).unwrap().is_none());
     }
 
     #[test]
