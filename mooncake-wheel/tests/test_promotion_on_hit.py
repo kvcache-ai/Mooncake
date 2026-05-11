@@ -207,12 +207,19 @@ class TestPromotionOnHit(unittest.TestCase):
                 f"{PROMOTION_WAIT_SECONDS}s.",
             )
 
-            # Phase 5: post-promotion bytes-back. Now that the freshly
-            # staged MEMORY replica is COMPLETE, store.get should serve
-            # from MEMORY (per SelectBestReplica's preference order) and
-            # return the same bytes the holder originally PUT. This locks
-            # in that NotifyPromotionSuccess produced a readable replica,
-            # not just a metadata entry.
+            # Phase 5: post-promotion bytes-back AND prove MEMORY was the
+            # replica actually served. SelectBestReplica should prefer the
+            # newly-COMPLETE MEMORY replica over the older LOCAL_DISK; if
+            # it does, no offload-RPC call is issued for this read.
+            #
+            # offload_rpc_read_count counts every invocation of
+            # batch_get_into_offload_object_internal — the single
+            # chokepoint for LOCAL_DISK reads served via peer offload-RPC.
+            # We snapshot the counter before the post-promotion read and
+            # assert it didn't move, which means MEMORY served the read.
+            # Bytes-back alone wouldn't distinguish MEMORY from LOCAL_DISK
+            # (the offload-RPC path returns the correct bytes too).
+            offload_count_before = self.store.get_offload_rpc_read_count()
             self.assertEqual(
                 self.store.get(cold_key),
                 expected_bytes,
@@ -221,6 +228,18 @@ class TestPromotionOnHit(unittest.TestCase):
                 f"not byte-correct. NotifyPromotionSuccess flipped "
                 f"PROCESSING -> COMPLETE before the TE write finished, "
                 f"or the TE write landed at the wrong address.",
+            )
+            offload_count_after = self.store.get_offload_rpc_read_count()
+            self.assertEqual(
+                offload_count_after,
+                offload_count_before,
+                f"post-promotion store.get on {cold_key} bumped the "
+                f"offload-RPC counter from {offload_count_before} to "
+                f"{offload_count_after}: it served from LOCAL_DISK SSD, "
+                f"not the freshly-promoted MEMORY replica. The RFC's "
+                f"'subsequent reads avoid SSD' invariant is broken; "
+                f"check SelectBestReplica preference and the post-"
+                f"promotion replica order in metadata.",
             )
         finally:
             for key in keys:

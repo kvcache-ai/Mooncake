@@ -2884,7 +2884,23 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    return std::move(local_disk_segment_it->second->promotion_objects);
+    // Return at most kMaxPerHeartbeat tasks to the client. Each task does a
+    // synchronous SSD read + RDMA write on the client side; allowing more
+    // than one per heartbeat risks blocking past the heartbeat / client-
+    // liveness window and the master marking the client dead. The rest
+    // stay queued in promotion_objects for subsequent heartbeats — this
+    // preserves leftover work and avoids the prior bug where the client
+    // capped its own loop at 1 and silently dropped the remainder (their
+    // promotion_tasks entries would stay refcnt-pinned until the reaper
+    // TTL expired).
+    constexpr size_t kMaxPerHeartbeat = 1;
+    auto& src = local_disk_segment_it->second->promotion_objects;
+    std::unordered_map<std::string, int64_t> result;
+    while (result.size() < kMaxPerHeartbeat && !src.empty()) {
+        auto node = src.extract(src.begin());
+        result.insert(std::move(node));
+    }
+    return result;
 }
 
 auto MasterService::PromotionAllocStart(

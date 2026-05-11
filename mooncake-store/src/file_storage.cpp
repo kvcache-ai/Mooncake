@@ -557,31 +557,16 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
             << " promotion candidate(s) from master";
 
-    // Cap per-tick work at one task. Each task does a synchronous SSD
-    // read + RDMA write whose wall-time scales with object size; KV-cache
-    // workloads commonly use 64 MB–1 GB tensors, so even a handful of
-    // tasks can exceed the master's heartbeat / client-liveness window
-    // and get the client wrongly marked dead. Capping at 1 makes promotion
-    // tolerant of any object size at the cost of slow queue drain
-    // (~1 promotion per heartbeat interval). Excess tasks are processed
-    // on subsequent ticks; the master re-queues nothing because the
-    // per-client promotion_objects map was already drained by Heartbeat
-    // above. If sub-MB workloads need higher throughput, raise this with
-    // a per-deployment config knob and consider a byte-budget cap.
-    constexpr size_t kMaxPromotionsPerTick = 1;
-
     // No segment preference in v1: let master pick from any DRAM segment.
     const std::vector<std::string> preferred_segments;
 
-    size_t processed = 0;
+    // The master caps per-heartbeat work via PromotionObjectHeartbeat,
+    // returning at most one task per call so the heartbeat thread stays
+    // within the client-liveness window even for large objects. Leftover
+    // work stays queued in the master's promotion_objects map and is
+    // returned on subsequent heartbeats; we process whatever we received
+    // here without a second client-side cap.
     for (const auto& [key, size] : promotion_objects) {
-        if (processed++ >= kMaxPromotionsPerTick) {
-            VLOG(1) << "ProcessPromotionTasks deferring "
-                    << (promotion_objects.size() - kMaxPromotionsPerTick)
-                    << " task(s) to next tick (per-tick cap "
-                    << kMaxPromotionsPerTick << ")";
-            break;
-        }
         if (size <= 0) {
             LOG(WARNING) << "Skipping promotion for key=" << key
                          << " with non-positive size=" << size;

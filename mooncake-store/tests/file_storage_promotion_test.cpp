@@ -39,14 +39,19 @@ class FakeClient : public Client {
         if (!heartbeat_result.has_value()) {
             return tl::make_unexpected(heartbeat_result.error());
         }
-        // Mirror production: master returns the per-client promotion_objects
-        // map and clears it. Subsequent heartbeat calls return only what's
-        // been pushed since the last drain. This lets tests iterate
-        // ProcessPromotionTasks multiple times to drain a multi-key queue
-        // (the per-tick cap inside ProcessPromotionTasks may process only
-        // one task per call).
-        promotion_objects = std::move(heartbeat_queue);
-        heartbeat_queue.clear();
+        // Mirror production master: PromotionObjectHeartbeat returns at
+        // most kMaxPerHeartbeat keys per call (see
+        // MasterService::PromotionObjectHeartbeat) and leaves the rest
+        // queued for subsequent calls. Tests iterate by calling
+        // ProcessPromotionTasks multiple times until heartbeat_queue is
+        // empty.
+        constexpr size_t kMaxPerHeartbeat = 1;
+        promotion_objects.clear();
+        while (promotion_objects.size() < kMaxPerHeartbeat &&
+               !heartbeat_queue.empty()) {
+            auto node = heartbeat_queue.extract(heartbeat_queue.begin());
+            promotion_objects.insert(std::move(node));
+        }
         return {};
     }
 
