@@ -499,9 +499,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     // Join previous rescan if completed
-    if (rescan_future_.valid() &&
-        rescan_future_.wait_for(std::chrono::seconds(0)) ==
-            std::future_status::ready) {
+    if (rescan_future_.valid() && rescan_future_.wait_for(std::chrono::seconds(
+                                      0)) == std::future_status::ready) {
         rescan_future_ = std::future<void>();
     }
 
@@ -539,13 +538,14 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                     if (!rescan_future_.valid()) {
                         LOG(INFO) << "Triggering background metadata rescan "
                                   << "after LOCAL_DISK segment re-registration";
-                        rescan_future_ = std::async(std::launch::async, [this]() {
-                            auto result = ReRegisterOffloadedObjects();
-                            if (!result) {
-                                LOG(ERROR) << "Background metadata rescan "
-                                           << "failed: " << result.error();
-                            }
-                        });
+                        rescan_future_ =
+                            std::async(std::launch::async, [this]() {
+                                auto result = ReRegisterOffloadedObjects();
+                                if (!result) {
+                                    LOG(ERROR) << "Background metadata rescan "
+                                               << "failed: " << result.error();
+                                }
+                            });
                     }
                 } else {
                     LOG(ERROR) << "Failed to re-register local disk segment: "
@@ -764,31 +764,34 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     // after Init() completes the cursor is 0 and HasNext() returns false,
     // which would make ScanMeta skip all buckets.
     storage_backend_->ResetScanIterator();
-    LOG(INFO) << "ReRegisterOffloadedObjects: about to call storage_backend_->ScanMeta()";
-    auto scan_meta_result = storage_backend_->ScanMeta(
-        [this, &total_keys, &total_batches, &total_failures](
-            const std::vector<std::string>& keys,
-            std::vector<StorageObjectMetadata>& metadatas) {
-            total_batches++;
-            total_keys += keys.size();
-            for (auto& metadata : metadatas) {
-                metadata.transport_endpoint = local_rpc_addr_;
-            }
-            auto add_object_result =
-                client_->NotifyOffloadSuccess(keys, metadatas);
-            if (!add_object_result) {
-                total_failures++;
-                LOG(ERROR) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                           << "failed for batch " << total_batches
-                           << " with " << keys.size() << " keys, error: "
-                           << add_object_result.error();
-                return add_object_result.error();
-            }
-            LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                      << "succeeded for batch " << total_batches
-                      << " with " << keys.size() << " keys";
-            return ErrorCode::OK;
-        });
+    LOG(INFO) << "ReRegisterOffloadedObjects: about to call "
+                 "storage_backend_->ScanMeta()";
+    auto scan_meta_result =
+        storage_backend_->ScanMeta(
+            [this, &total_keys, &total_batches, &total_failures](
+                const std::vector<std::string>& keys,
+                std::vector<StorageObjectMetadata>& metadatas) {
+                total_batches++;
+                total_keys += keys.size();
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = local_rpc_addr_;
+                }
+                auto add_object_result =
+                    client_->NotifyOffloadSuccess(keys, metadatas);
+                if (!add_object_result) {
+                    total_failures++;
+                    LOG(ERROR)
+                        << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
+                        << "failed for batch " << total_batches << " with "
+                        << keys.size()
+                        << " keys, error: " << add_object_result.error();
+                    return add_object_result.error();
+                }
+                LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
+                          << "succeeded for batch " << total_batches << " with "
+                          << keys.size() << " keys";
+                return ErrorCode::OK;
+            });
 
     LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
               << scan_meta_result.has_value();
