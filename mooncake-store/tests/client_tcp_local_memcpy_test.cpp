@@ -19,6 +19,8 @@
 namespace mooncake {
 namespace testing {
 
+enum class HandshakeMode { P2P, Metadata };
+
 namespace {
 
 class EnvGuard {
@@ -112,6 +114,41 @@ Replica::Descriptor FindFirstCompleteMemoryReplica(const QueryResult& result) {
         }
     }
     throw std::runtime_error("No complete memory replica found");
+}
+
+bool PutHotKeyHelper(LocalHotCache& cache, const std::string& key,
+                     const Slice& slice) {
+    if (key.empty() || slice.ptr == nullptr || slice.size == 0) {
+        return false;
+    }
+    if (cache.TouchHotKey(key)) {
+        return true;
+    }
+
+    HotMemBlock* block = cache.GetFreeBlock();
+    if (block == nullptr) {
+        return false;
+    }
+    if (slice.size > block->size) {
+        block->key_.clear();
+        cache.PutHotKey(block);
+        return false;
+    }
+
+    std::memcpy(block->addr, slice.ptr, slice.size);
+    block->size = slice.size;
+    block->key_ = key;
+    return cache.PutHotKey(block);
+}
+
+const char* HandshakeModeName(HandshakeMode mode) {
+    switch (mode) {
+        case HandshakeMode::P2P:
+            return "P2P";
+        case HandshakeMode::Metadata:
+            return "Metadata";
+    }
+    return "Unknown";
 }
 
 }  // namespace
@@ -390,6 +427,82 @@ TEST_F(TcpLocalMemcpyAutoEnableTest,
     ASSERT_EQ(std::memcmp(out.data(), prepared.payload.data(), out.size()), 0);
     EXPECT_EQ(sink.strategy(), "TRANSFER_ENGINE");
 }
+
+class HotCacheRedirectStrategyTest
+    : public TcpLocalMemcpyAutoEnableTest,
+      public ::testing::WithParamInterface<HandshakeMode> {};
+
+TEST_P(HotCacheRedirectStrategyTest, CacheHitUsesLocalMemcpy) {
+    EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB
+
+    const HandshakeMode mode = GetParam();
+    const bool is_p2p = mode == HandshakeMode::P2P;
+    const std::string metadata_conn = is_p2p ? "P2PHANDSHAKE" : metadata_url_;
+    const std::string host_name =
+        is_p2p ? "localhost" : "metadata-hot-cache-host";
+
+    runtime_ = CreateRuntime(host_name, metadata_conn);
+    ASSERT_TRUE(runtime_.client != nullptr) << HandshakeModeName(mode);
+    ASSERT_TRUE(runtime_.client->IsHotCacheEnabled())
+        << HandshakeModeName(mode);
+
+    const std::string key = is_p2p ? "p2p_hot_cache_redirect_key"
+                                   : "metadata_hot_cache_redirect_key";
+    const std::string payload =
+        is_p2p ? "p2p-hot-cache-data" : "metadata-hot-cache-data";
+
+    Slice cache_slice{const_cast<char*>(payload.data()), payload.size()};
+    ASSERT_TRUE(
+        PutHotKeyHelper(*runtime_.client->GetHotCache(), key, cache_slice));
+    ASSERT_TRUE(runtime_.client->GetHotCache()->HasHotKey(key));
+
+    Replica::Descriptor replica;
+    replica.id = is_p2p ? 1 : 2;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptor.transport_endpoint_ = "remote:9999";
+    mem_desc.buffer_descriptor.buffer_address_ = 0;
+    mem_desc.buffer_descriptor.size_ = payload.size();
+    replica.descriptor_variant = mem_desc;
+
+    ASSERT_FALSE(runtime_.client->IsReplicaOnLocalMemory(replica))
+        << HandshakeModeName(mode);
+
+    std::vector<Replica::Descriptor> replicas;
+    replicas.emplace_back(replica);
+    QueryResult query_result(
+        std::move(replicas),
+        std::chrono::steady_clock::now() + std::chrono::seconds(60));
+
+    StrategyCaptureSink sink;
+    google::AddLogSink(&sink);
+
+    std::vector<char> out(payload.size(), '\0');
+    std::vector<Slice> read_slices;
+    read_slices.emplace_back(Slice{out.data(), out.size()});
+
+    auto get = runtime_.client->Get(key, query_result, read_slices);
+
+    google::RemoveLogSink(&sink);
+
+    ASSERT_TRUE(get.has_value()) << "Get failed: " << toString(get.error());
+    ASSERT_EQ(std::memcmp(out.data(), payload.data(), out.size()), 0);
+    EXPECT_EQ(sink.strategy(), "LOCAL_MEMCPY");
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllModes, HotCacheRedirectStrategyTest,
+    ::testing::Values(HandshakeMode::P2P, HandshakeMode::Metadata),
+    [](const ::testing::TestParamInfo<HandshakeMode>& info) {
+        switch (info.param) {
+            case HandshakeMode::P2P:
+                return "P2P";
+            case HandshakeMode::Metadata:
+                return "Metadata";
+        }
+        return "Unknown";
+    });
 
 }  // namespace testing
 }  // namespace mooncake

@@ -82,53 +82,6 @@ std::string getLocalIpAddress() {
     return ip;
 }
 
-class VLogGuard {
-   public:
-    explicit VLogGuard(int new_v) : old_v_(FLAGS_v) { FLAGS_v = new_v; }
-    ~VLogGuard() { FLAGS_v = old_v_; }
-
-   private:
-    int old_v_;
-};
-
-class StrategyCaptureSink : public google::LogSink {
-   public:
-    void send(google::LogSeverity severity, const char* full_filename,
-              const char* base_filename, int line, const struct ::tm* tm_time,
-              const char* message, size_t message_len) override {
-        (void)severity;
-        (void)full_filename;
-        (void)base_filename;
-        (void)line;
-        (void)tm_time;
-
-        std::string msg(message, message_len);
-        constexpr char kPrefix[] = "Using transfer strategy: ";
-        size_t pos = msg.find(kPrefix);
-        if (pos == std::string::npos) {
-            return;
-        }
-
-        captured_strategy_ = msg.substr(pos + std::strlen(kPrefix));
-        TrimInPlace(captured_strategy_);
-    }
-
-    const std::string& strategy() const { return captured_strategy_; }
-
-   private:
-    static void TrimInPlace(std::string& value) {
-        auto begin = value.find_first_not_of(" \t\n\r");
-        if (begin == std::string::npos) {
-            value.clear();
-            return;
-        }
-        auto end = value.find_last_not_of(" \t\n\r");
-        value = value.substr(begin, end - begin + 1);
-    }
-
-    std::string captured_strategy_;
-};
-
 class LocalHotCacheTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -1188,7 +1141,7 @@ TEST_F(LocalHotCacheTest, CacheBlockWriteAndRetrieve) {
     EXPECT_EQ(blk->ref_count.load(), 0);
 }
 
-TEST_F(LocalHotCacheTest, P2PAdmissionSketchNotIncrementedOnCacheHit) {
+TEST_F(LocalHotCacheTest, AdmissionSketchNotIncrementedOnCacheHit) {
     class EnvGuard {
        public:
         explicit EnvGuard(const char* key) : key_(key) {
@@ -1214,9 +1167,6 @@ TEST_F(LocalHotCacheTest, P2PAdmissionSketchNotIncrementedOnCacheHit) {
     EnvGuard memcpy_guard("MC_STORE_MEMCPY");
     setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB
     setenv("MC_STORE_MEMCPY", "1", 1);
-    VLogGuard vlog_guard(1);
-    StrategyCaptureSink sink;
-    google::AddLogSink(&sink);
 
     auto client_opt = CreateTestClient("localhost");
     ASSERT_TRUE(client_opt.has_value());
@@ -1267,94 +1217,7 @@ TEST_F(LocalHotCacheTest, P2PAdmissionSketchNotIncrementedOnCacheHit) {
     do_cache_hit_get();
     do_cache_hit_get();
 
-    google::RemoveLogSink(&sink);
-
-    EXPECT_EQ(sink.strategy(), "LOCAL_MEMCPY");
-
     // Admission sketch must not be incremented on cache hits.
-    EXPECT_EQ(client->GetAdmissionCount(key), count_before);
-}
-
-TEST_F(LocalHotCacheTest, MetadataAdmissionSketchNotIncrementedOnCacheHit) {
-    class EnvGuard {
-       public:
-        explicit EnvGuard(const char* key) : key_(key) {
-            if (const char* value = std::getenv(key_)) {
-                old_value_ = value;
-            }
-        }
-
-        ~EnvGuard() {
-            if (old_value_.has_value()) {
-                setenv(key_, old_value_->c_str(), 1);
-            } else {
-                unsetenv(key_);
-            }
-        }
-
-       private:
-        const char* key_;
-        std::optional<std::string> old_value_;
-    };
-
-    EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");
-    EnvGuard memcpy_guard("MC_STORE_MEMCPY");
-    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB
-    setenv("MC_STORE_MEMCPY", "1", 1);
-    VLogGuard vlog_guard(1);
-    StrategyCaptureSink sink;
-    google::AddLogSink(&sink);
-
-    auto client_opt = Client::Create("localhost", metadata_url_, "tcp",
-                                     std::nullopt, master_address_);
-    ASSERT_TRUE(client_opt.has_value());
-    auto client = client_opt.value();
-    ASSERT_TRUE(client->IsHotCacheEnabled());
-
-    const std::string key = "metadata_admission_skip_on_cache_hit_key";
-    const std::string cached_data = "metadata-cache-hit-data";
-
-    Slice cache_slice{const_cast<char*>(cached_data.data()),
-                      cached_data.size()};
-    ASSERT_TRUE(PutHotKeyHelper(*client->GetHotCache(), key, cache_slice));
-    ASSERT_TRUE(client->GetHotCache()->HasHotKey(key));
-
-    Replica::Descriptor replica;
-    replica.id = 2;
-    replica.status = ReplicaStatus::COMPLETE;
-    MemoryDescriptor mem_desc;
-    mem_desc.buffer_descriptor.transport_endpoint_ = "remote:9998";
-    mem_desc.buffer_descriptor.buffer_address_ = 0;
-    mem_desc.buffer_descriptor.size_ = cached_data.size();
-    replica.descriptor_variant = mem_desc;
-
-    std::vector<Replica::Descriptor> replicas;
-    replicas.emplace_back(replica);
-    QueryResult query_result(
-        std::move(replicas),
-        std::chrono::steady_clock::now() + std::chrono::seconds(60));
-
-    const uint8_t count_before = client->GetAdmissionCount(key);
-    EXPECT_EQ(count_before, 0);
-
-    auto do_cache_hit_get = [&]() {
-        std::vector<char> out(cached_data.size(), '\0');
-        std::vector<Slice> slices;
-        slices.emplace_back(Slice{out.data(), out.size()});
-        auto get_result = client->Get(key, query_result, slices);
-        EXPECT_TRUE(get_result.has_value());
-        EXPECT_EQ(
-            std::memcmp(out.data(), cached_data.data(), cached_data.size()), 0);
-    };
-
-    do_cache_hit_get();
-    do_cache_hit_get();
-    do_cache_hit_get();
-
-    google::RemoveLogSink(&sink);
-
-    EXPECT_EQ(sink.strategy(), "LOCAL_MEMCPY");
-
     EXPECT_EQ(client->GetAdmissionCount(key), count_before);
 }
 
