@@ -195,8 +195,8 @@ void paired_kv_indexer_allocation_benchmark() {
               << "=== Paired KV/Indexer Allocation Benchmark (DSA) ==="
               << std::endl;
 
-    const uint32_t kvcache_size = 3274752;                 // 3,274,752 B
-    const uint32_t indexer_size = 643u * 1024;             // 643 KB
+    const uint32_t kvcache_size = 3274752;                  // 3,274,752 B
+    const uint32_t indexer_size = 643u * 1024;              // 643 KB
     const size_t pool_size = 1024ull * 1024 * 1024 * 1024;  // 1TB
     const int max_per_round = 128;
     const int warmup_rounds = 5000;
