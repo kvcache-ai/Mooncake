@@ -504,6 +504,20 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         rescan_future_ = std::future<void>();
     }
 
+    // Retry metadata resync if previous attempt failed.
+    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
+        LOG(INFO) << "Retrying background metadata rescan";
+        rescan_future_ = std::async(std::launch::async, [this]() {
+            auto result = ReRegisterOffloadedObjects();
+            if (!result) {
+                LOG(ERROR) << "Background metadata rescan retry "
+                           << "failed: " << result.error();
+            } else {
+                metadata_resync_pending_.store(false);
+            }
+        });
+    }
+
     std::unordered_map<std::string, int64_t>
         offloading_objects;  // Objects selected for offloading
 
@@ -538,12 +552,15 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                     if (!rescan_future_.valid()) {
                         LOG(INFO) << "Triggering background metadata rescan "
                                   << "after LOCAL_DISK segment re-registration";
+                        metadata_resync_pending_.store(true);
                         rescan_future_ =
                             std::async(std::launch::async, [this]() {
                                 auto result = ReRegisterOffloadedObjects();
                                 if (!result) {
                                     LOG(ERROR) << "Background metadata rescan "
                                                << "failed: " << result.error();
+                                } else {
+                                    metadata_resync_pending_.store(false);
                                 }
                             });
                     }

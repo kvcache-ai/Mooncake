@@ -129,6 +129,7 @@ class FileStorage {
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
+    std::atomic<bool> metadata_resync_pending_{false};
 };
 
 }  // namespace mooncake

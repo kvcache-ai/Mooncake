@@ -178,6 +178,9 @@ class TransferMetadata {
 
     int removeRpcMetaEntry(const std::string &server_name);
 
+    // Re-publish the local RPC meta entry to the HTTP metadata server.
+    int rePublishRpcMetaEntry(const std::string &server_name);
+
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
     int getNotifies(std::vector<NotifyDesc> &notifies);
 
