@@ -305,7 +305,7 @@ bool TransportSelector::isTransportAvailable(
 
     // CPU to CPU
     if (context.local_memory_type == MTYPE_CPU && remote_mtype == MTYPE_CPU)
-        return caps.dram_to_dram || caps.dram_to_file;
+        return caps.dram_to_dram;
 
     // GPU/NPU to GPU/NPU (same type)
     if (is_gpu(context.local_memory_type) && is_gpu(remote_mtype))
@@ -317,7 +317,7 @@ bool TransportSelector::isTransportAvailable(
 
     // GPU/NPU to CPU
     if (is_gpu(context.local_memory_type) && remote_mtype == MTYPE_CPU)
-        return caps.gpu_to_dram || caps.gpu_to_file;
+        return caps.gpu_to_dram;
 
     return false;
 }
