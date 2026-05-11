@@ -8,14 +8,15 @@ use std::time::{Duration, Instant};
 
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
-    ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+    CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
-    NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
-    RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    SegmentTargetChunk, StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
-    TenantObjectAccounting, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
-    TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy,
-    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
+    NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,
+    RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement,
+    SegmentLifecycleState, SegmentName, SegmentTargetChunk, StoreError,
+    TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantObjectAccounting,
+    TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy, TenantQuotaReservation,
+    TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
 };
 use mooncake_transport::{Opcode, TransferPacingMode};
 use parking_lot::Mutex;
@@ -205,6 +206,13 @@ struct BlockingCasMetadataBackend {
     block_key: ObjectKey,
     empty_conflict_key: Option<ObjectKey>,
     gate: Arc<(StdMutex<BlockingCasGateState>, Condvar)>,
+}
+
+struct EmptyConflictRouteDirectory {
+    inner: Arc<dyn RouteDirectory>,
+    conflict_key: ObjectKey,
+    bounded_reads: Arc<AtomicUsize>,
+    conflicted: Arc<AtomicBool>,
 }
 
 struct RecoverableMetadataBackend {
@@ -416,6 +424,62 @@ impl BlockingCasMetadataBackend {
         let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
         state.released = true;
         condvar.notify_all();
+    }
+}
+
+impl RouteDirectory for EmptyConflictRouteDirectory {
+    fn get_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        if self.conflicted.load(Ordering::Relaxed) {
+            return Err(StoreError::Unsupported(format!(
+                "unbounded route read is disabled for {}",
+                key.0
+            )));
+        }
+        self.inner.get_object_route(observer, key)
+    }
+
+    fn get_object_routes(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        if self.conflicted.load(Ordering::Relaxed) {
+            return Err(StoreError::Unsupported(
+                "unbounded route batch read is disabled after conflict".to_string(),
+            ));
+        }
+        self.inner.get_object_routes(observer, keys)
+    }
+
+    fn get_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.bounded_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_object_routes_bounded(observer, keys)
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<CasResult> {
+        if *key == self.conflict_key {
+            self.conflicted.store(true, Ordering::Relaxed);
+            return Ok(CasResult {
+                applied: false,
+                current: None,
+            });
+        }
+        self.inner
+            .compare_and_swap_object_route(observer, key, expected, next)
     }
 }
 
@@ -6378,7 +6442,7 @@ fn routed_batch_put_from_treats_route_conflicts_as_per_key_success() {
 }
 
 #[test]
-fn routed_batch_put_from_accepts_route_conflict_without_current_route() {
+fn routed_batch_put_from_rejects_route_conflict_without_current_route() {
     let metadata: Arc<dyn MetadataBackend> =
         Arc::new(BlockingCasMetadataBackend::with_empty_conflict(
             Arc::new(InMemoryMetadataBackend::new()),
@@ -6423,7 +6487,7 @@ fn routed_batch_put_from_accepts_route_conflict_without_current_route() {
     writer
         .register_buffer(source.as_mut_ptr().cast(), source.len())
         .expect("writer source buffer should register");
-    let routes = writer
+    let error = writer
         .batch_put_from(&[PutFromRequest::new(
             "batch-put-empty-conflict-key",
             source.as_ptr().cast(),
@@ -6435,12 +6499,119 @@ fn routed_batch_put_from_accepts_route_conflict_without_current_route() {
                 .prefer_local(false)
                 .preferred_storage_owner(storage.runtime_id().storage_key()),
         )])
-        .expect("route conflict is a best-effort cache put success");
+        .expect_err("route conflict without active current route must fail");
+
+    assert!(matches!(error, StoreError::Conflict(_)));
+    assert!(
+        !writer
+            .batch_is_exist(&[ObjectRef::new("batch-put-empty-conflict-key")])
+            .expect("exist check should succeed")[0],
+        "unpublished conflict loser route must not be visible as a cache hit"
+    );
+}
+
+#[test]
+fn routed_batch_put_from_accepts_empty_conflict_when_recheck_finds_active_route() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let metadata: Arc<dyn MetadataBackend> = inner.clone();
+    let storage_transport = Arc::new(TestTransport::new(
+        "batch-put-empty-conflict-visible-store-segment",
+    ));
+    let writer_transport =
+        Arc::new(storage_transport.peer("batch-put-empty-conflict-visible-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let storage =
+        StoreClientBuilder::new(metadata.clone(), "batch-put-empty-conflict-visible-store")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .route_control(RouteControlMode::MetadataOnly)
+            .live_client_sync_interval(fast_live_client_sync_interval())
+            .transport(storage_transport)
+            .local_memory(storage_config())
+            .build(test_future_expiry_ms())
+            .expect("storage build should succeed");
+    let mut writer = StoreClientBuilder::new(metadata, "batch-put-empty-conflict-visible-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&storage, &writer]);
+
+    let key = "batch-put-empty-conflict-visible-key";
+    let object_id = LogicalObjectId::new(NamespaceScope::default(), key);
+    let segment = storage
+        .segment_name()
+        .expect("storage segment should exist");
+    let mut route = ObjectRoute {
+        key: ObjectKey::from_logical_id(&object_id),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: RouteState::Active,
+        compatibility: storage.lease().compatibility,
+        replicas: vec![ReplicaRoute {
+            owner: storage.runtime_id().clone(),
+            segment_name: segment,
+            segment_offset: 0,
+            length: 32,
+            checksum: None,
+            tier: ReplicaTier::Dram,
+            priority: 0,
+        }],
+    };
+    mooncake_store_core::apply_route_identity(&mut route, &object_id);
+    inner
+        .compare_and_swap_object_route(&route.key, None, Some(&route))
+        .expect("seed route publish should succeed");
+    let bounded_reads = Arc::new(AtomicUsize::new(0));
+    writer.route_directory = Arc::new(EmptyConflictRouteDirectory {
+        inner: writer.route_directory.clone(),
+        conflict_key: route.key.clone(),
+        bounded_reads: bounded_reads.clone(),
+        conflicted: Arc::new(AtomicBool::new(false)),
+    });
+
+    let mut source = b"batch-put-empty-conflict-visible".to_vec();
+    writer
+        .register_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("writer source buffer should register");
+    let routes = writer
+        .batch_put_from(&[
+            PutFromRequest::new(key, source.as_ptr().cast(), source.len()).replication(
+                ReplicationPolicy::new()
+                    .replica_count(1)
+                    .prefer_local(false)
+                    .preferred_storage_owner(storage.runtime_id().storage_key()),
+            ),
+        ])
+        .expect("empty conflict should use exact recheck to find active route");
 
     assert_eq!(routes.len(), 1);
-    assert_eq!(
-        routes[0].key,
-        ObjectKey::new("default::batch-put-empty-conflict-key")
+    assert_eq!(routes[0].version, RouteVersion(1));
+    assert_eq!(bounded_reads.load(Ordering::Relaxed), 1);
+    assert!(
+        writer
+            .batch_is_exist(&[ObjectRef::new(key)])
+            .expect("exist check should succeed")[0],
+        "active route found by conflict recheck must stay visible"
     );
 }
 

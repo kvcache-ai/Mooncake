@@ -653,7 +653,10 @@ impl StoreClient {
         lease.state = self.lifecycle_state();
         lease.expires_at_ms = lease
             .expires_at_ms
-            .max(now_ms().saturating_add(self.lease_ttl_ms));
+            .max(now_ms().saturating_add(
+                self.lease_ttl_ms
+                    .max(DEFAULT_SEGMENT_PUBLISH_LEASE_TTL_MS),
+            ));
         self.metadata.upsert_client_lease(&lease)
     }
 

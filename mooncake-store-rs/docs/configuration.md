@@ -279,7 +279,7 @@ Reconnect behavior:
 - remote read batches are split by storage owner and guarded by a short, rate-limited peer control-plane probe from the cached membership snapshot; the probe does not refresh metadata and only quarantines the owner when the cached peer endpoint is confirmed unreachable
 - routed writes apply the same stale-handle refresh once before escalating to outer soft-pin retry or failover, so a restarted live peer does not poison the cached remote-segment state
 - if Redis restarts from an empty dataset, surviving storage clients republish both lease state and segment metadata into their client resource hash during recovery
-- local memory registration refreshes the runtime lease before publishing segment metadata, so slow startup registration does not publish into an expired Redis client resource hash
+- local memory registration refreshes the runtime lease for at least 30 seconds before publishing segment metadata, so slow startup registration does not publish into an expired Redis client resource hash
 - requests that arrive while Redis is unavailable can still fail fast; recovery is designed for self-healing after metadata service returns, not for serving through a metadata blackout
 
 ## Route Control

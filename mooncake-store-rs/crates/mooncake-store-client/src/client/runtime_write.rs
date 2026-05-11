@@ -28,6 +28,34 @@ impl StoreClient {
             .ok_or_else(|| StoreError::InvalidState("segment_name is not configured".to_string()))
     }
 
+    fn active_route_after_batch_put_conflict(
+        &self,
+        key: &ObjectKey,
+        current: Option<ObjectRoute>,
+    ) -> Result<Option<ObjectRoute>> {
+        if let Some(route) = current.filter(|route| route.state == RouteState::Active) {
+            return Ok(Some(route));
+        }
+
+        for attempt in 0..DEFAULT_BATCH_PUT_CONFLICT_RECHECK_ATTEMPTS {
+            if attempt > 0 {
+                sleep(DEFAULT_BATCH_PUT_CONFLICT_RECHECK_DELAY);
+            }
+            if let Some(route) = self
+                .route_directory
+                .get_object_routes_bounded(&self.lease, std::slice::from_ref(key))?
+                .into_iter()
+                .next()
+                .flatten()
+            {
+                if route.state == RouteState::Active {
+                    return Ok(Some(route));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn write_reserved_replicas(
         &self,
         targets: &[ReplicaWriteTarget],
@@ -1162,17 +1190,25 @@ impl StoreClient {
                     );
                     match conflict_policy {
                         BatchPutRouteConflictPolicy::AcceptConflictAsSuccess => {
-                            let route = cas
-                                .current
-                                .filter(|route| route.state == RouteState::Active)
-                                .unwrap_or_else(|| pending.route.clone());
-                            debug!(
-                                runtime = %self.lease.runtime,
-                                key = %pending.key.0,
-                                route_version = route.version.0,
-                                "batch put route conflict accepted as cache insert success"
-                            );
-                            returned.push(route);
+                            if let Some(route) = self.active_route_after_batch_put_conflict(
+                                &pending.key,
+                                cas.current,
+                            )? {
+                                debug!(
+                                    runtime = %self.lease.runtime,
+                                    key = %pending.key.0,
+                                    route_version = route.version.0,
+                                    "batch put route conflict accepted as cache insert success"
+                                );
+                                returned.push(route);
+                            } else {
+                                first_error.get_or_insert_with(|| {
+                                    StoreError::Conflict(format!(
+                                        "route update lost race for key {} without active current route",
+                                        pending.key.0
+                                    ))
+                                });
+                            }
                         }
                         BatchPutRouteConflictPolicy::Strict => {
                             first_error.get_or_insert_with(|| {
