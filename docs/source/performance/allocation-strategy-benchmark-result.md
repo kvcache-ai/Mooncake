@@ -23,7 +23,7 @@ The benchmark compares two workload types:
 - Segment counts: 1, 2, 4, 8, 16.
 - Replica counts: 1, 2, 3 when enough segments are available.
 - On allocation failure, the benchmark randomly evicts 5% of all live objects and retries.
-- `UtilRatio_`* is sampled only when eviction is triggered, immediately before evicting objects.
+- `UtilRatio_*` is sampled only when eviction is triggered, immediately before evicting objects.
 
 `skewed=no` uses uniform segment capacity. `skewed=yes` alternates segment capacity between 1.5x and 0.5x the base capacity.
 

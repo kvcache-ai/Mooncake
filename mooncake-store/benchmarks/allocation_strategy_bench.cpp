@@ -784,6 +784,7 @@ static bool dsaAllocateWithEvict(
         }
 
         if (live.empty()) return false;
+        if (attempt == kDsaMaxRetries) return false;
 
         if (attempt == 0 && pre_evict_util != nullptr) {
             pre_evict_util->push_back(computeAverageUtilAll(manager));
