@@ -574,25 +574,38 @@ std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+    // Open the segment once — all keys share the same transfer_engine_addr.
+    SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+        // nullopt = failure (caller checks !future).  The function returns
+        // std::optional so tl::unexpected is not available here.
+        return std::nullopt;
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = keys[i];
-        auto pointer = pointers[i];
-        SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
-            return std::nullopt;
+        const auto& key = keys[i];
+        const uint64_t pointer = pointers[i];
+        auto it = batched_slices.find(key);
+        if (it == batched_slices.end()) {
+            LOG(ERROR) << "Key not found in batched_slices: " << key;
+            return std::nullopt;  // fail closed
         }
-        const auto& slice = batched_slices.find(key)->second;
-        TransferRequest request;
-        request.opcode = TransferRequest::READ;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = pointer;
-        request.length = slice.size;
-        requests.emplace_back(request);
+        // Emit one TransferRequest per slice: the on-disk blob is read
+        // sequentially while slices may point to non-contiguous GPU memory.
+        uint64_t offset = 0;
+        for (const auto& slice : it->second) {
+            TransferRequest request;
+            request.opcode = TransferRequest::READ;
+            request.source = static_cast<char*>(slice.ptr);
+            request.target_id = seg;
+            request.target_offset = pointer + offset;
+            request.length = slice.size;
+            requests.emplace_back(request);
+            offset += slice.size;
+        }
     }
     return submitTransfer(requests);
 }

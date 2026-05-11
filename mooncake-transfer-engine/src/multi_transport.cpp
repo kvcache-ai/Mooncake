@@ -44,6 +44,9 @@
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
 #endif
+#ifdef USE_MACA
+#include "transport/maca_transport/maca_transport.h"
+#endif
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
@@ -320,6 +323,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_HIP
     else if (std::string(proto) == "hip") {
         transport = new HipTransport();
+    }
+#endif
+#ifdef USE_MACA
+    else if (std::string(proto) == "maca") {
+        transport = new MacaTransport();
     }
 #endif
 #ifdef USE_MNNVL

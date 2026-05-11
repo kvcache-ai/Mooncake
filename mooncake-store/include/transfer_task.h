@@ -406,7 +406,8 @@ class TransferSubmitter {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batched_slices);
 
    private:
     TransferEngine& engine_;

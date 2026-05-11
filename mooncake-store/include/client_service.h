@@ -420,7 +420,8 @@ class Client {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batch_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batch_slices);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -507,6 +508,16 @@ class Client {
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
+
+    std::unordered_set<std::string> GetLocalEndpoints() const {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        std::unordered_set<std::string> endpoints;
+        for (const auto& [segment_id, segment] : mounted_segments_) {
+            endpoints.insert(segment.te_endpoint);
+        }
+        return endpoints;
+    }
+
     /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
@@ -691,7 +702,7 @@ class Client {
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
-    std::mutex mounted_segments_mutex_;
+    mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
     /**
