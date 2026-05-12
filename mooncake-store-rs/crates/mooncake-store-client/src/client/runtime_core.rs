@@ -335,6 +335,7 @@ impl StoreClient {
             .max(Self::current_time_ms().saturating_add(30_000));
 
         let mut builder = StoreClientBuilder::new(self.metadata.clone(), helper_stable_id)
+            .tenant_scoped_metadata()
             .state(ClientLifecycleState::Active)
             .activate_on_local_memory_registration()
             .tenant(self.default_tenant.clone())
