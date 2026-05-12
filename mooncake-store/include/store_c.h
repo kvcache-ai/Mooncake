@@ -125,6 +125,43 @@ int mooncake_store_register_buffer(mooncake_store_t store, void *buffer,
 
 int mooncake_store_unregister_buffer(mooncake_store_t store, void *buffer);
 
+// ---------------------------------------------------------------------------
+// Cache statistics (DRAM vs SSD split)
+// ---------------------------------------------------------------------------
+
+/**
+ * Calculate cache hit statistics split by DRAM and SSD.
+ * Returns a JSON string with keys: memory_hits, ssd_hits, memory_total,
+ * ssd_total, memory_hit_rate, ssd_hit_rate, overall_hit_rate, valid_get_rate.
+ *
+ * NOTE: ssd_hits and ssd_hit_rate are approximate. The master-side SSD
+ * counters track metadata lookups (first replica type in GetReplicaList),
+ * not actual SSD reads. For accurate per-tier Get observability, use the
+ * client-side Prometheus metrics: get_from_memory_count,
+ * get_from_disk_count, get_from_memory_bytes, get_from_disk_bytes.
+ *
+ * @param store The store handle.
+ * @param buf_out Output buffer to write the JSON string.
+ * @param buf_len Size of the output buffer.
+ * @return Length of the JSON string on success (may exceed buf_len if
+ *         truncated), or -1 on error.
+ */
+int mooncake_store_calc_cache_stats(mooncake_store_t store, char *buf_out,
+                                    size_t buf_len);
+
+/**
+ * Get client-side transfer statistics by storage tier.
+ * Returns a JSON string with per-tier Get and Put counts and bytes.
+ * These are local counters (no RPC to master).
+ *
+ * @param store The store handle.
+ * @param buf_out Output buffer to write the JSON string.
+ * @param buf_len Size of the output buffer.
+ * @return Length of the JSON string on success, or -1 on error.
+ */
+int mooncake_store_get_client_stats(mooncake_store_t store, char *buf_out,
+                                    size_t buf_len);
+
 #ifdef __cplusplus
 }
 #endif

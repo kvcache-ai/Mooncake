@@ -9,6 +9,9 @@
 
 namespace mooncake {
 
+struct ClientTransferStatsDelta;  // Forward declaration (defined in
+                                  // rpc_types.h)
+
 class MasterMetricManager {
    public:
     // --- Singleton Access ---
@@ -51,6 +54,9 @@ class MasterMetricManager {
     using CacheHitStatDict = std::unordered_map<CacheHitStat, double>;
     void add_stat_to_dict(CacheHitStatDict&, CacheHitStat, double);
     CacheHitStatDict calculate_cache_stats();
+
+    // Aggregate client-reported transfer stats (called from Ping handler)
+    void aggregate_client_stats(const ClientTransferStatsDelta& delta);
 
     // Memory Storage Metrics
     void inc_allocated_mem_size(int64_t val = 1);
@@ -405,6 +411,16 @@ class MasterMetricManager {
 
     ylt::metric::counter_t valid_get_nums_;
     ylt::metric::counter_t total_get_nums_;
+
+    // Global aggregated client-reported transfer stats (from Ping heartbeats)
+    std::atomic<int64_t> global_get_from_memory_count_{0};
+    std::atomic<int64_t> global_get_from_disk_count_{0};
+    std::atomic<int64_t> global_get_from_memory_bytes_{0};
+    std::atomic<int64_t> global_get_from_disk_bytes_{0};
+    std::atomic<int64_t> global_put_to_memory_count_{0};
+    std::atomic<int64_t> global_put_to_disk_count_{0};
+    std::atomic<int64_t> global_put_to_memory_bytes_{0};
+    std::atomic<int64_t> global_put_to_disk_bytes_{0};
 
     static const inline std::unordered_map<CacheHitStat, std::string>
         stat_names_ = {{CacheHitStat::MEMORY_HITS, "memory_hits"},

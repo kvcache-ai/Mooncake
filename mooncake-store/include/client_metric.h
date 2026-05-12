@@ -117,6 +117,24 @@ struct TransferMetric {
                          "Get transfer latency (us)", kLatencyBucket, labels),
           put_latency_us("mooncake_transfer_put_latency",
                          "Put transfer latency (us)", kLatencyBucket, labels),
+          get_from_memory_count("mooncake_transfer_get_from_memory_count",
+                                "Get operations served from DRAM replicas",
+                                labels),
+          get_from_disk_count("mooncake_transfer_get_from_disk_count",
+                              "Get operations served from SSD/disk replicas",
+                              labels),
+          get_from_memory_bytes("mooncake_transfer_get_from_memory_bytes",
+                                "Bytes read from DRAM replicas", labels),
+          get_from_disk_bytes("mooncake_transfer_get_from_disk_bytes",
+                              "Bytes read from SSD/disk replicas", labels),
+          put_to_memory_count("mooncake_transfer_put_to_memory_count",
+                              "Put operations to DRAM replicas", labels),
+          put_to_disk_count("mooncake_transfer_put_to_disk_count",
+                            "Put operations to SSD/disk replicas", labels),
+          put_to_memory_bytes("mooncake_transfer_put_to_memory_bytes",
+                              "Bytes written to DRAM replicas", labels),
+          put_to_disk_bytes("mooncake_transfer_put_to_disk_bytes",
+                            "Bytes written to SSD/disk replicas", labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t total_read_bytes;
@@ -125,6 +143,14 @@ struct TransferMetric {
     ylt::metric::histogram_t batch_get_latency_us;
     ylt::metric::histogram_t get_latency_us;
     ylt::metric::histogram_t put_latency_us;
+    ylt::metric::counter_t get_from_memory_count;
+    ylt::metric::counter_t get_from_disk_count;
+    ylt::metric::counter_t get_from_memory_bytes;
+    ylt::metric::counter_t get_from_disk_bytes;
+    ylt::metric::counter_t put_to_memory_count;
+    ylt::metric::counter_t put_to_disk_count;
+    ylt::metric::counter_t put_to_memory_bytes;
+    ylt::metric::counter_t put_to_disk_bytes;
 
     void serialize(std::string& str) {
         total_read_bytes.serialize(str);
@@ -133,6 +159,14 @@ struct TransferMetric {
         batch_get_latency_us.serialize(str);
         get_latency_us.serialize(str);
         put_latency_us.serialize(str);
+        get_from_memory_count.serialize(str);
+        get_from_disk_count.serialize(str);
+        get_from_memory_bytes.serialize(str);
+        get_from_disk_bytes.serialize(str);
+        put_to_memory_count.serialize(str);
+        put_to_disk_count.serialize(str);
+        put_to_memory_bytes.serialize(str);
+        put_to_disk_bytes.serialize(str);
     }
 
     std::string summary_metrics(bool include_bandwidth = true) {
@@ -144,6 +178,28 @@ struct TransferMetric {
         auto write_bytes = total_write_bytes.value();
         ss << "Total Read: " << byte_size_to_string(read_bytes) << "\n";
         ss << "Total Write: " << byte_size_to_string(write_bytes) << "\n";
+        auto mem_gets = get_from_memory_count.value();
+        auto disk_gets = get_from_disk_count.value();
+        auto mem_get_bytes = get_from_memory_bytes.value();
+        auto disk_get_bytes = get_from_disk_bytes.value();
+        ss << "Get by Tier: DRAM=" << mem_gets << " ("
+           << byte_size_to_string(mem_get_bytes) << ")"
+           << ", SSD=" << disk_gets << " ("
+           << byte_size_to_string(disk_get_bytes) << ")"
+           << ", Total=" << (mem_gets + disk_gets) << " ("
+           << byte_size_to_string(mem_get_bytes + disk_get_bytes) << ")"
+           << "\n";
+        auto mem_puts = put_to_memory_count.value();
+        auto disk_puts = put_to_disk_count.value();
+        auto mem_put_bytes = put_to_memory_bytes.value();
+        auto disk_put_bytes = put_to_disk_bytes.value();
+        ss << "Put by Tier: DRAM=" << mem_puts << " ("
+           << byte_size_to_string(mem_put_bytes) << ")"
+           << ", SSD=" << disk_puts << " ("
+           << byte_size_to_string(disk_put_bytes) << ")"
+           << ", Total=" << (mem_puts + disk_puts) << " ("
+           << byte_size_to_string(mem_put_bytes + disk_put_bytes) << ")"
+           << "\n";
         if (include_bandwidth) {
             ss << "Average Read Throughput: "
                << format_metric_bandwidth(read_bytes, elapsed_seconds())

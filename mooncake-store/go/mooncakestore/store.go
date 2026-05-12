@@ -23,6 +23,7 @@ package mooncakestore
 */
 import "C"
 import (
+	"encoding/json"
 	"unsafe"
 )
 
@@ -537,4 +538,60 @@ func (s *Store) UnregisterBuffer(ptr uintptr) error {
 		return ErrUnregisterBuffer
 	}
 	return nil
+}
+
+// CalcCacheStats returns cache hit statistics split by DRAM and SSD.
+// The returned map contains keys: memory_hits, ssd_hits, memory_total,
+// ssd_total, memory_hit_rate, ssd_hit_rate, overall_hit_rate, valid_get_rate.
+//
+// NOTE: ssd_hits and ssd_hit_rate are approximate. The master-side SSD
+// counters track metadata lookups (first replica type), not actual SSD reads.
+// For accurate per-tier Get observability, use the client-side Prometheus
+// metrics: get_from_memory_count, get_from_disk_count,
+// get_from_memory_bytes, get_from_disk_bytes.
+func (s *Store) CalcCacheStats() (map[string]float64, error) {
+	if s.handle == nil {
+		return nil, ErrStoreNil
+	}
+	buf := make([]byte, 1024)
+	ret := C.mooncake_store_calc_cache_stats(s.handle, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	if ret < 0 {
+		return nil, ErrGet
+	}
+	// Find null terminator
+	n := int(ret)
+	if n > len(buf)-1 {
+		n = len(buf) - 1
+	}
+	var result map[string]float64
+	if err := json.Unmarshal(buf[:n], &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetClientStats returns client-side transfer statistics by storage tier.
+// These are local counters (no RPC to master). For global view, use
+// Prometheus or the master's /metrics/summary endpoint.
+// Keys: get_from_memory_count, get_from_disk_count, get_from_memory_bytes,
+// get_from_disk_bytes, put_to_memory_count, put_to_disk_count,
+// put_to_memory_bytes, put_to_disk_bytes.
+func (s *Store) GetClientStats() (map[string]int64, error) {
+	if s.handle == nil {
+		return nil, ErrStoreNil
+	}
+	buf := make([]byte, 1024)
+	ret := C.mooncake_store_get_client_stats(s.handle, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	if ret < 0 {
+		return nil, ErrGet
+	}
+	n := int(ret)
+	if n > len(buf)-1 {
+		n = len(buf) - 1
+	}
+	var result map[string]int64
+	if err := json.Unmarshal(buf[:n], &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

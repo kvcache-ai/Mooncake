@@ -51,6 +51,18 @@ using gpu_staging::SetDevice;
     return slice_size;
 }
 
+ClientTransferStatsDelta ClientTransferStats::compute_delta(
+    const ClientTransferStats& last) const {
+    return {get_from_memory_count - last.get_from_memory_count,
+            get_from_disk_count - last.get_from_disk_count,
+            get_from_memory_bytes - last.get_from_memory_bytes,
+            get_from_disk_bytes - last.get_from_disk_bytes,
+            put_to_memory_count - last.put_to_memory_count,
+            put_to_disk_count - last.put_to_disk_count,
+            put_to_memory_bytes - last.put_to_memory_bytes,
+            put_to_disk_bytes - last.put_to_disk_bytes};
+}
+
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
@@ -779,6 +791,18 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(err);
     }
 
+    // Track which storage tier this Get reads from
+    if (metrics_) {
+        uint64_t total_bytes = CalculateSliceSize(slices);
+        if (replica.is_memory_replica()) {
+            metrics_->transfer_metric.get_from_memory_count.inc();
+            metrics_->transfer_metric.get_from_memory_bytes.inc(total_bytes);
+        } else if (replica.is_disk_replica()) {
+            metrics_->transfer_metric.get_from_disk_count.inc();
+            metrics_->transfer_metric.get_from_disk_bytes.inc(total_bytes);
+        }
+    }
+
     // Check local hot cache and update replica descriptor if cache hit
     bool cache_used = false;
     if (hot_cache_ && replica.is_memory_replica()) {
@@ -1058,6 +1082,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         }
 
+        // Track which storage tier this Get reads from
+        if (metrics_) {
+            uint64_t total_bytes = CalculateSliceSize(slices_it->second);
+            if (replica.is_memory_replica()) {
+                metrics_->transfer_metric.get_from_memory_count.inc();
+                metrics_->transfer_metric.get_from_memory_bytes.inc(
+                    total_bytes);
+            } else if (replica.is_disk_replica()) {
+                metrics_->transfer_metric.get_from_disk_count.inc();
+                metrics_->transfer_metric.get_from_disk_bytes.inc(total_bytes);
+            }
+        }
+
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
             cache_used = RedirectToHotCache(key, replica);
@@ -1212,11 +1249,34 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
              it != start_result.value().rend(); ++it) {
             const auto& replica = *it;
             if (replica.is_disk_replica()) {
+                // Track Put to disk tier
+                if (metrics_) {
+                    uint64_t total_bytes = CalculateSliceSize(slices);
+                    metrics_->transfer_metric.put_to_disk_count.inc();
+                    metrics_->transfer_metric.put_to_disk_bytes.inc(
+                        total_bytes);
+                }
                 // Store to local file if storage backend is available
                 auto disk_descriptor = replica.get_disk_descriptor();
                 PutToLocalFile(key, slices, disk_descriptor);
                 break;  // Only one disk replica is needed
             }
+        }
+    }
+
+    // Track Put to memory tier (once per key, not per replica)
+    if (metrics_) {
+        bool has_memory_replica = false;
+        for (const auto& r : start_result.value()) {
+            if (r.is_memory_replica()) {
+                has_memory_replica = true;
+                break;
+            }
+        }
+        if (has_memory_replica) {
+            uint64_t total_bytes = CalculateSliceSize(slices);
+            metrics_->transfer_metric.put_to_memory_count.inc();
+            metrics_->transfer_metric.put_to_memory_bytes.inc(total_bytes);
         }
     }
 
@@ -1566,6 +1626,13 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                  ++it) {
                 const auto& replica = *it;
                 if (replica.is_disk_replica()) {
+                    // Track Put to disk tier
+                    if (metrics_) {
+                        uint64_t total_bytes = CalculateSliceSize(op.slices);
+                        metrics_->transfer_metric.put_to_disk_count.inc();
+                        metrics_->transfer_metric.put_to_disk_bytes.inc(
+                            total_bytes);
+                    }
                     auto disk_descriptor = replica.get_disk_descriptor();
                     PutToLocalFile(op.key, op.slices, disk_descriptor);
                     break;  // Only one disk replica is needed
@@ -1573,10 +1640,19 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             }
         }
 
+        bool memory_counted = false;
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
             if (replica.is_memory_replica()) {
+                // Track Put to memory tier (once per key)
+                if (!memory_counted && metrics_) {
+                    uint64_t total_bytes = CalculateSliceSize(op.slices);
+                    metrics_->transfer_metric.put_to_memory_count.inc();
+                    metrics_->transfer_metric.put_to_memory_bytes.inc(
+                        total_bytes);
+                    memory_counted = true;
+                }
                 auto submit_result = transfer_submitter_->submit(
                     replica, op.slices, TransferRequest::WRITE);
 
@@ -2871,9 +2947,19 @@ void Client::StorageHeartbeatThreadMain() {
             remount_segment_future = std::future<void>();
         }
 
-        // Ping master
-        auto ping_result = master_client_.Ping();
+        // Compute delta stats since last ping
+        ClientTransferStatsDelta delta;
+        ClientTransferStats snap{};
+        if (metrics_) {
+            snap = GetClientStats();
+            delta = snap.compute_delta(last_stats_snapshot_);
+        }
+
+        // Ping master with stats delta
+        auto ping_result = master_client_.Ping(delta);
         if (ping_result) {
+            // Update snapshot only on success so deltas accumulate on failure
+            last_stats_snapshot_ = snap;
             // Reset ping failure count
             ping_fail_count = 0;
             last_ping_success_.store(true);

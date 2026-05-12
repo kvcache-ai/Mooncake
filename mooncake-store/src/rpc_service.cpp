@@ -1596,11 +1596,14 @@ WrappedMasterService::GetStorageConfig() {
 }
 
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
-    const UUID& client_id) {
+    const UUID& client_id, const ClientTransferStatsDelta& client_stats) {
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 
     MasterMetricManager::instance().inc_ping_requests();
+
+    // Aggregate client-reported transfer stats
+    MasterMetricManager::instance().aggregate_client_stats(client_stats);
 
     auto result = master_service_.Ping(client_id);
 

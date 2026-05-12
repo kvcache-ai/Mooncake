@@ -7,6 +7,24 @@
 namespace mooncake {
 
 /**
+ * @brief Client-side transfer statistics by storage tier, for heartbeat
+ * reporting.
+ */
+struct ClientTransferStatsDelta {
+    int64_t get_from_memory_count = 0;
+    int64_t get_from_disk_count = 0;
+    int64_t get_from_memory_bytes = 0;
+    int64_t get_from_disk_bytes = 0;
+    int64_t put_to_memory_count = 0;
+    int64_t put_to_disk_count = 0;
+    int64_t put_to_memory_bytes = 0;
+    int64_t put_to_disk_bytes = 0;
+};
+YLT_REFL(ClientTransferStatsDelta, get_from_memory_count, get_from_disk_count,
+         get_from_memory_bytes, get_from_disk_bytes, put_to_memory_count,
+         put_to_disk_count, put_to_memory_bytes, put_to_disk_bytes);
+
+/**
  * @brief Response structure for Ping operation
  */
 struct PingResponse {

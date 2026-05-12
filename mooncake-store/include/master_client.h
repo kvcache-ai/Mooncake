@@ -330,7 +330,8 @@ class MasterClient {
      * @return tl::expected<PingResponse, ErrorCode>
      * containing view version and client status
      */
-    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
+    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping(
+        const ClientTransferStatsDelta& client_stats = {});
 
     /**
      * @brief Mounts a local disk segment into the master.
