@@ -10,6 +10,10 @@ namespace mooncake {
 
 namespace {
 
+bool IsZeroUuid(const UUID& uuid) {
+    return uuid.first == 0 && uuid.second == 0;
+}
+
 size_t CalculateBufferSize(const std::vector<RemoteBufferDesc>& buffers) {
     size_t total = 0;
     for (const auto& buf : buffers) total += buf.size;

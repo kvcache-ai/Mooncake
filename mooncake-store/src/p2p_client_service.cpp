@@ -1084,13 +1084,13 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
     std::shared_ptr<RemoteWriteRequest> write_req,
     std::vector<Slice>* slices) {
     if (!peer || !dm || !write_req || !slices) {
-        promise->setValue(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INTERNAL_ERROR));
         co_return;
     }
     if (!SlicesAreContiguous(*slices)) {
         LOG(ERROR) << "Forward RDMA write requires contiguous slice buffers, key="
                    << write_req->key;
-        promise->setValue(tl::unexpected(ErrorCode::INVALID_PARAMS));
+        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INVALID_PARAMS));
         co_return;
     }
     PreWriteRequest pre_req;
@@ -1104,7 +1104,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
             LOG(ERROR) << "AsyncPreWrite failed, key=" << write_req->key
                        << ", error=" << pre.error();
         }
-        promise->setValue(tl::make_unexpected(pre.error()));
+        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, pre.error()));
         co_return;
     }
 
@@ -1139,7 +1139,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
             LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
                          << write_req->key << ", error=" << revoke_res.error();
         }
-        promise->setValue(tl::make_unexpected(te.error()));
+        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, te.error()));
         co_return;
     }
 
@@ -1148,7 +1148,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
     commit.pending_write_token = pre.value().pending_write_token;
     auto cm = co_await peer->AsyncWriteCommit(commit);
     if (!cm) {
-        promise->setValue(tl::make_unexpected(cm.error()));
+        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, cm.error()));
         co_return;
     }
     promise->setValue(tl::expected<void, ErrorCode>{});
@@ -1651,13 +1651,13 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
     RouteIterator& iter, ErrorCode& final_result) {
     if (!data_manager_.has_value()) {
         LOG(ERROR) << "Forward RDMA read requires DataManager";
-        promise->setValue(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INTERNAL_ERROR));
         co_return true;
     }
     if (!RemoteDestBuffersContiguous(req->dest_buffers)) {
         LOG(ERROR) << "Forward RDMA read requires contiguous dest buffers, key="
                    << req->key;
-        promise->setValue(tl::unexpected(ErrorCode::INVALID_PARAMS));
+        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INVALID_PARAMS));
         co_return true;
     }
     PinKeyRequest pin_req;
