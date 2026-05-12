@@ -1259,7 +1259,7 @@ mod tests {
 
     #[test]
     fn tenant_views_isolate_runtime_segments_objects_and_handoffs() {
-        let metadata = InMemoryMetadataBackend::new();
+        let metadata = InMemoryMetadataBackend::new_hard_isolated();
         let tenant_a = metadata.for_tenant("tenant-a").expect("tenant view");
         let tenant_b = metadata.for_tenant("tenant-b").expect("tenant view");
         assert_ne!(tenant_a.route_namespace(), tenant_b.route_namespace());
@@ -1324,7 +1324,7 @@ mod tests {
 
     #[test]
     fn tenant_views_do_not_overlap_when_tenant_names_share_prefixes() {
-        let metadata = InMemoryMetadataBackend::new();
+        let metadata = InMemoryMetadataBackend::new_hard_isolated();
         let tenant_a = metadata.for_tenant("a").expect("tenant view");
         let tenant_ab = metadata.for_tenant("a/b").expect("tenant view");
         let lease = active_lease("writer", 1);
