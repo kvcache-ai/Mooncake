@@ -204,14 +204,6 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
     auto it = shard.metadata.find(key);
     if (it != shard.metadata.end()) {
         auto& metadata = *it->second;
-        if (max_replicas_per_key_ > 0 &&
-            metadata.replicas_.size() >= max_replicas_per_key_) {
-            LOG(WARNING) << "replica num exceeded"
-                         << ", key: " << key << ", client_id: " << client_id
-                         << ", segment_id: " << segment_id
-                         << ", current replica num:" << max_replicas_per_key_;
-            return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
-        }
         for (const auto& replica : metadata.replicas_) {
             if (!replica.is_p2p_proxy_replica()) {
                 LOG(ERROR) << "unexpected replica type"
@@ -230,6 +222,14 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
                              << ", segment_id: " << segment_id;
                 return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
             }
+        }
+        if (max_replicas_per_key_ > 0 &&
+            metadata.replicas_.size() >= max_replicas_per_key_) {
+            LOG(WARNING) << "replica num exceeded"
+                         << ", key: " << key << ", client_id: " << client_id
+                         << ", segment_id: " << segment_id
+                         << ", current replica num:" << max_replicas_per_key_;
+            return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
         }
         AddReplicaToSegmentIndex(shard, it->first, new_replica);
         OnReplicaAdded(new_replica);

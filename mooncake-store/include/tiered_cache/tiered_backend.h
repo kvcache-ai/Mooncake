@@ -195,7 +195,8 @@ class TieredBackend {
      * If nullopt, removes ALL replicas for this key (and the key entry itself).
      */
     tl::expected<void, ErrorCode> Delete(
-        std::string_view key, std::optional<UUID> tier_id = std::nullopt);
+        std::string_view key, std::optional<UUID> tier_id = std::nullopt,
+        bool notify_master = true);
 
     // --- Composite Operations ---
 

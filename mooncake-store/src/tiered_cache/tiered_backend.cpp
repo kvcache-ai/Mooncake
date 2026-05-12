@@ -656,8 +656,9 @@ bool TieredBackend::Exist(std::string_view key,
     return false;  // Key does not exist in target tier
 }
 
-tl::expected<void, ErrorCode> TieredBackend::Delete(
-    std::string_view key, std::optional<UUID> tier_id) {
+tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
+                                                    std::optional<UUID> tier_id,
+                                                    bool notify_master) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -695,7 +696,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
             }
 
             if (tier_it != entry->replicas.end()) {
-                if (remove_replica_callback_) {
+                if (notify_master && remove_replica_callback_) {
                     auto result = remove_replica_callback_(
                         key, tier_it->second->loc.tier->GetTierId(), DELETE);
                     if (!result.has_value()) {
@@ -759,7 +760,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         UUID invalid_id{0, 0};
-        if (remove_replica_callback_) {
+        if (notify_master && remove_replica_callback_) {
             auto result = remove_replica_callback_(key, invalid_id, DELETE_ALL);
             if (!result.has_value()) {
                 LOG(ERROR) << "Failed to Delete key " << key
