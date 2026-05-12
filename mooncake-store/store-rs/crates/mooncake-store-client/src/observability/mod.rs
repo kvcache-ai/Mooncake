@@ -764,6 +764,28 @@ mod tests {
     }
 
     #[test]
+    fn reset_metrics_restores_default_process_tenant_label() {
+        let _guard = metrics_test_lock().lock();
+        reset_metrics();
+        registry::set_process_tenant("tenant-a");
+
+        let result: Result<()> = Ok(());
+        OperationTracker::new("put").finish(&result, 0);
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains(
+            "mooncake_store_request_total{tenant=\"tenant-a\",operation=\"put\",scope=\"foreground\",result=\"ok\"} 1"
+        ));
+
+        reset_metrics();
+        OperationTracker::new("put").finish(&result, 0);
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains(
+            "mooncake_store_request_total{tenant=\"default\",operation=\"put\",scope=\"foreground\",result=\"ok\"} 1"
+        ));
+        assert!(!metrics.contains("tenant=\"tenant-a\""));
+    }
+
+    #[test]
     fn metadata_backend_metrics_include_backend_operation_result_and_inflight() {
         let _guard = metrics_test_lock().lock();
         let registry = registry::new_metrics_registry();

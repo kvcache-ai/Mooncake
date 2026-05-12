@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -438,15 +440,29 @@ impl SharedMetricsRegistry {
     fn lock(&self) -> std::sync::MutexGuard<'_, MetricsRegistry> {
         self.inner.lock().expect("metrics lock poisoned")
     }
+
+    #[cfg(test)]
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl MetricsRegistry {
     fn tenant_label(&self) -> String {
         if self.tenant.is_empty() {
-            "default".to_string()
+            DEFAULT_PROCESS_TENANT.to_string()
         } else {
             self.tenant.clone()
         }
+    }
+
+    fn snapshot_with_tenant(
+        &self,
+        process: ProcessSnapshot,
+        tenant_override: Option<String>,
+    ) -> MetricsSnapshot {
+        let tenant = tenant_override.unwrap_or_else(|| self.tenant_label());
+        self.snapshot_inner(process, tenant)
     }
 
     fn record_request(
@@ -497,8 +513,12 @@ impl MetricsRegistry {
     }
 
     fn snapshot(&self, process: ProcessSnapshot) -> MetricsSnapshot {
+        self.snapshot_with_tenant(process, None)
+    }
+
+    fn snapshot_inner(&self, process: ProcessSnapshot, tenant: String) -> MetricsSnapshot {
         MetricsSnapshot {
-            tenant: self.tenant_label(),
+            tenant,
             operations: self
                 .operations
                 .iter()
@@ -691,6 +711,12 @@ fn segment_lifecycle_keys() -> impl Iterator<Item = ActionResultKey> {
 }
 
 static METRICS: OnceLock<SharedMetricsRegistry> = OnceLock::new();
+const DEFAULT_PROCESS_TENANT: &str = "default";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PROCESS_TENANT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 #[derive(Clone, Debug)]
 struct RuntimeLeaseMetric {
@@ -713,13 +739,39 @@ pub(crate) fn record_request_with_registry(
         .record_request(operation, scope, result, bytes_in, bytes_out, duration);
 }
 
+#[cfg(not(test))]
 pub(crate) fn set_process_tenant(tenant: &str) {
     global_metrics_registry().lock().tenant = tenant.to_string();
 }
 
 #[cfg(test)]
+pub(crate) fn set_process_tenant(tenant: &str) {
+    set_test_process_tenant(Some(tenant));
+}
+
+#[cfg(test)]
 pub(crate) fn set_process_tenant_with_registry(registry: &SharedMetricsRegistry, tenant: &str) {
     registry.lock().tenant = tenant.to_string();
+}
+
+#[cfg(test)]
+fn set_test_process_tenant(tenant: Option<&str>) {
+    TEST_PROCESS_TENANT.with(|current| {
+        *current.borrow_mut() = tenant.map(ToString::to_string);
+    });
+}
+
+#[cfg(test)]
+fn test_process_tenant_label() -> Option<String> {
+    TEST_PROCESS_TENANT.with(|current| {
+        current.borrow().as_ref().map(|tenant| {
+            if tenant.is_empty() {
+                DEFAULT_PROCESS_TENANT.to_string()
+            } else {
+                tenant.clone()
+            }
+        })
+    })
 }
 
 pub(crate) fn record_request_bytes(
@@ -1025,11 +1077,19 @@ pub(crate) fn snapshot_metrics_with_registry(
     registry: &SharedMetricsRegistry,
     process: ProcessSnapshot,
 ) -> MetricsSnapshot {
+    #[cfg(test)]
+    if registry.ptr_eq(global_metrics_registry()) {
+        return registry
+            .lock()
+            .snapshot_with_tenant(process, test_process_tenant_label());
+    }
+
     registry.lock().snapshot(process)
 }
 
 #[cfg(test)]
 pub(crate) fn reset_metrics() {
+    set_test_process_tenant(None);
     reset_metrics_with_registry(global_metrics_registry());
 }
 
