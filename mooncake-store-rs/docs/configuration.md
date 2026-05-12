@@ -266,6 +266,7 @@ Notes:
 - when no explicit selection is present, the compatibility layer defaults to `classic_te`
 - `classic`, `classic-te`, and `te` are accepted as compatibility aliases by the parser
 - set `MC_STORE_RS_GID_INDEX=<n>` when `classic_te` over RDMA must use a non-default RoCE GID index; Store-RS forwards it to upstream `MC_GID_INDEX`
+- for `classic_te` with Redis-backed transport metadata, Store-RS derives the upstream TE Redis key prefix from the default tenant and forwards `tenants/<tenant>` as the Mooncake metadata cluster id
 - low-level Rust transport construction remains explicit; runtime backend selection is only a compatibility-layer feature
 - current upstream SGLang Mooncake integration does not forward `transport_backend` from `--hicache-storage-backend-extra-config`; use `MC_STORE_RS_TRANSPORT_BACKEND` when SGLang real mode must select `tent` or `classic_te`
 
