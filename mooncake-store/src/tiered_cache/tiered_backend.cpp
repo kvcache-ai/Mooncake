@@ -656,8 +656,9 @@ bool TieredBackend::Exist(std::string_view key,
     return false;  // Key does not exist in target tier
 }
 
-tl::expected<void, ErrorCode> TieredBackend::Delete(
-    std::string_view key, std::optional<UUID> tier_id, bool notify_master) {
+tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
+                                                    std::optional<UUID> tier_id,
+                                                    bool notify_master) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
