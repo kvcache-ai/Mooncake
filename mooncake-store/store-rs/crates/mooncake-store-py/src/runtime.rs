@@ -44,6 +44,10 @@ impl CompatRuntimeArgs {
             .local_segment_name
             .unwrap_or_else(|| default_segment_name(&stable_id));
         let transport_config = plan.transport_config.clone();
+        let http_transport_metadata = plan
+            .metadata
+            .for_tenant(&plan.tenant)
+            .unwrap_or_else(|| plan.metadata.clone());
         let http_transport_server = match transport_config {
             CompatTransportConfig::Http => Some(HttpTransportServerHandle::start("127.0.0.1:0")?),
             _ => None,
@@ -54,7 +58,7 @@ impl CompatRuntimeArgs {
                 Arc::new(ClassicTeTransportFactory::new(config))
             }
             CompatTransportConfig::Http => Arc::new(HttpStoreTransportFactory::new(
-                plan.metadata.clone(),
+                http_transport_metadata,
                 http_transport_server
                     .as_ref()
                     .map(|server| server.address().to_string())
