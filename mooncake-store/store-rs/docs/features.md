@@ -186,13 +186,14 @@ What it provides:
 ## Observability
 
 The client Prometheus exporter reports both request-level and internal operation-level store
-health. Remote data-plane transfers now expose explicit transport operation outcomes through
-`mooncake_store_transport_operation_total{direction,peer_kind,result}` in addition to successful
-byte volume through `mooncake_store_transport_bytes_total{direction,peer_kind}`.
+health. Every exported sample carries the process-bound `tenant` label. Remote data-plane transfers
+now expose explicit transport operation outcomes through
+`mooncake_store_transport_operation_total{tenant,direction,peer_kind,result}` in addition to
+successful byte volume through `mooncake_store_transport_bytes_total{tenant,direction,peer_kind}`.
 
-Route publication also exposes `mooncake_store_replication_publish_total{result}` alongside the
-existing publish latency histogram. Operators can therefore distinguish publish failures from slow
-successful publishes without inferring result counts from histogram internals.
+Route publication also exposes `mooncake_store_replication_publish_total{tenant,result}` alongside
+the existing publish latency histogram. Operators can therefore distinguish publish failures from
+slow successful publishes without inferring result counts from histogram internals.
 
 ## Allocation and Segment Management
 

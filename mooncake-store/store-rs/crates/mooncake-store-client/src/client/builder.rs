@@ -302,6 +302,7 @@ impl StoreClientBuilder {
                 "route_topk must be greater than or equal to 2".to_string(),
             ));
         }
+        registry::set_process_tenant(&self.default_tenant);
         let lease_ttl_ms = expires_at_ms.saturating_sub(now_ms()).max(1);
 
         let mut endpoints = self.endpoints;

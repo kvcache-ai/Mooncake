@@ -67,6 +67,7 @@ pub struct OperationMetricSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub struct MetricsSnapshot {
+    pub tenant: String,
     pub operations: Vec<OperationMetricSnapshot>,
     pub request_totals: Vec<CounterSample<RequestKey>>,
     pub request_bytes: Vec<CounterSample<RequestBytesKey>>,
@@ -387,6 +388,7 @@ type OperationKey = (&'static str, &'static str);
 
 #[derive(Default)]
 struct MetricsRegistry {
+    tenant: String,
     operations: BTreeMap<OperationKey, OperationMetricState>,
     request_totals: CounterFamily<RequestKey>,
     request_bytes: CounterFamily<RequestBytesKey>,
@@ -439,6 +441,14 @@ impl SharedMetricsRegistry {
 }
 
 impl MetricsRegistry {
+    fn tenant_label(&self) -> String {
+        if self.tenant.is_empty() {
+            "default".to_string()
+        } else {
+            self.tenant.clone()
+        }
+    }
+
     fn record_request(
         &mut self,
         operation: &'static str,
@@ -488,6 +498,7 @@ impl MetricsRegistry {
 
     fn snapshot(&self, process: ProcessSnapshot) -> MetricsSnapshot {
         MetricsSnapshot {
+            tenant: self.tenant_label(),
             operations: self
                 .operations
                 .iter()
@@ -559,12 +570,7 @@ impl MetricsRegistry {
     fn object_route_snapshot(&self) -> Vec<GaugeSample<TenantKey>> {
         let mut by_tenant = BTreeMap::<String, u64>::new();
         for route in self.routes.values() {
-            let tenant = route
-                .key
-                .0
-                .split_once("::")
-                .map(|(tenant, _)| tenant)
-                .unwrap_or("default");
+            let tenant = object_key_tenant(&route.key.0);
             *by_tenant.entry(tenant.to_string()).or_default() += 1;
         }
         by_tenant
@@ -705,6 +711,15 @@ pub(crate) fn record_request_with_registry(
     registry
         .lock()
         .record_request(operation, scope, result, bytes_in, bytes_out, duration);
+}
+
+pub(crate) fn set_process_tenant(tenant: &str) {
+    global_metrics_registry().lock().tenant = tenant.to_string();
+}
+
+#[cfg(test)]
+pub(crate) fn set_process_tenant_with_registry(registry: &SharedMetricsRegistry, tenant: &str) {
+    registry.lock().tenant = tenant.to_string();
 }
 
 pub(crate) fn record_request_bytes(
@@ -1062,6 +1077,13 @@ fn segment_identity(announcement: &SegmentAnnouncement) -> (String, String) {
         announcement.owner.to_string(),
         announcement.segment_name.0.clone(),
     )
+}
+
+fn object_key_tenant(key: &str) -> &str {
+    key.split_once("::")
+        .or_else(|| key.split_once('/'))
+        .map(|(tenant, _)| tenant)
+        .unwrap_or("default")
 }
 
 fn segment_sample(announcement: &SegmentAnnouncement) -> SegmentSample {

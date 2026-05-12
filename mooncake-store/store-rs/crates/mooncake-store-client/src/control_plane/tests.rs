@@ -1768,49 +1768,49 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
         assert_metric_delta_at_least(
             &metrics_before,
             &metrics,
-            "mooncake_store_request_bytes_total{operation=\"storage_owner_report_route_hits\",direction=\"read\",scope=\"control\"}",
+            "mooncake_store_request_bytes_total{tenant=\"default\",operation=\"storage_owner_report_route_hits\",direction=\"read\",scope=\"control\"}",
             32,
         );
         assert_metric_delta_at_least(
             &metrics_before,
             &metrics,
-            "mooncake_store_request_bytes_total{operation=\"storage_owner_track_replica_routes\",direction=\"write\",scope=\"control\"}",
+            "mooncake_store_request_bytes_total{tenant=\"default\",operation=\"storage_owner_track_replica_routes\",direction=\"write\",scope=\"control\"}",
             16,
         );
         assert_metric_delta_at_least(
             &metrics_before,
             &metrics,
-            "mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"client\"}",
+            "mooncake_store_transport_bytes_total{tenant=\"default\",direction=\"read\",peer_kind=\"client\"}",
             32,
         );
         assert_metric_delta_at_least(
             &metrics_before,
             &metrics,
-            "mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"client\"}",
+            "mooncake_store_transport_bytes_total{tenant=\"default\",direction=\"write\",peer_kind=\"client\"}",
             16,
         );
         assert_metric_delta_at_least(
             &metrics_before,
             &metrics,
-            "mooncake_store_transport_operation_total{direction=\"read\",peer_kind=\"client\",result=\"ok\"}",
+            "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"read\",peer_kind=\"client\",result=\"ok\"}",
             1,
         );
         assert_metric_delta_at_least(
             &metrics_before,
             &metrics,
-            "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"client\",result=\"ok\"}",
+            "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"write\",peer_kind=\"client\",result=\"ok\"}",
             1,
         );
         assert_metric_delta_at_least(
             &metrics_before,
             &metrics,
-            "mooncake_store_checksum_validation_total{result=\"ok\"}",
+            "mooncake_store_checksum_validation_total{tenant=\"default\",result=\"ok\"}",
             2,
         );
         assert_metric_delta_at_least(
             &metrics_before,
             &metrics,
-            "mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"}",
+            "mooncake_store_replication_publish_duration_seconds_count{tenant=\"default\",result=\"ok\"}",
             1,
         );
 

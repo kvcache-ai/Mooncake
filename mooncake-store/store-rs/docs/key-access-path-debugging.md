@@ -295,21 +295,21 @@ curl -s http://127.0.0.1:19101/metrics | grep -E \
 
 Useful metric families:
 
-- `mooncake_store_request_total{operation="route_lookup_many",...}` tracks route
+- `mooncake_store_request_total{tenant="...",operation="route_lookup_many",...}` tracks route
   lookup results.
-- `mooncake_store_request_total{operation="control_route_batch_get",...}` tracks
+- `mooncake_store_request_total{tenant="...",operation="control_route_batch_get",...}` tracks
   control-plane route reads.
-- `mooncake_store_request_total{operation="put_stage_reserve",...}` tracks
+- `mooncake_store_request_total{tenant="...",operation="put_stage_reserve",...}` tracks
   reservation stage results.
-- `mooncake_store_request_total{operation="put_stage_write",...}` tracks data
+- `mooncake_store_request_total{tenant="...",operation="put_stage_write",...}` tracks data
   write stage results.
-- `mooncake_store_request_total{operation="put_stage_route_cas",...}` tracks
+- `mooncake_store_request_total{tenant="...",operation="put_stage_route_cas",...}` tracks
   route publish CAS stage results.
-- `mooncake_store_segment_used_bytes{runtime=...,segment=...}` shows segment
+- `mooncake_store_segment_used_bytes{tenant="...",runtime=...,segment=...}` shows segment
   usage.
-- `mooncake_store_replica_distribution{runtime=...,tier="dram"}` shows replica
+- `mooncake_store_replica_distribution{tenant="...",runtime=...,tier="dram"}` shows replica
   distribution.
-- `mooncake_store_transport_bytes_total{direction="read"|"write",peer_kind="storage"}` shows
+- `mooncake_store_transport_bytes_total{tenant="...",direction="read"|"write",peer_kind="storage"}` shows
   storage transport traffic.
 
 Metrics are process-level aggregate signals. They cannot reconstruct one key's
