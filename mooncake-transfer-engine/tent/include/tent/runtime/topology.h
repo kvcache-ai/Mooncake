@@ -44,6 +44,7 @@ class Topology {
         std::string pci_bus_id;
         NicType type;
         int numa_node;
+        double bw_gbps{200.0};  // Bandwidth in Gbps (e.g., 200.0 for HDR)
     };
 
     using MemID = int;

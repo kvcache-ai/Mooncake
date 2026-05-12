@@ -771,7 +771,7 @@ Status TransferEngineImpl::lazyFreeBatch() {
 }
 
 static bool isGpuType(MemoryType t) {
-    return t == MTYPE_CUDA || t == MTYPE_ROCM;
+    return t == MTYPE_CUDA || t == MTYPE_HIP;
 }
 
 static bool checkAvailability(const std::shared_ptr<Transport>& xport,
@@ -798,7 +798,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
-    if (type == "rocm") return MTYPE_ROCM;
+    if (type == "rocm") return MTYPE_HIP;
     return MTYPE_UNKNOWN;
 }
 

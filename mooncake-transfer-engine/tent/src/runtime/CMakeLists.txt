@@ -100,7 +100,6 @@ add_library(tent_runtime_impl STATIC
     segment_tracker.cpp
     transfer_engine_impl.cpp
     transport_loader.cpp
-    transport_selector.cpp
 )
 
 # Define build mode for transport_loader.cpp
