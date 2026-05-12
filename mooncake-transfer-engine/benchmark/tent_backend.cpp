@@ -54,9 +54,9 @@ std::shared_ptr<Config> loadConfig() {
     if (!XferBenchConfig::xport_type.empty()) {
         // Map of transport names to their config keys (handle name mismatches)
         std::unordered_map<std::string, std::string> transport_map = {
-            {"rdma", "rdma"},        {"tcp", "tcp"},    {"shm", "shm"},
+            {"rdma", "rdma"},        {"tcp", "tcp"},     {"shm", "shm"},
             {"iouring", "io_uring"},  // Note: iouring -> io_uring
-            {"gds", "gds"},          {"mnnvl", "mnnvl"}};
+            {"gds", "gds"},          {"mnnvl", "mnnvl"}, {"nvlink", "nvlink"}};
 
         // Disable all transports by default
         for (const auto& entry : transport_map) {
@@ -78,6 +78,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "shm") return SHM;
     if (xport_type == "gds") return GDS;
     if (xport_type == "mnnvl") return MNNVL;
+    if (xport_type == "nvlink") return NVLINK;
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
     return UNSPEC;
@@ -129,38 +130,37 @@ int TENTBenchRunner::allocateBuffers() {
         return -1;
     }
 
-    // Allocate
     pinned_buffer_list_.resize(num_buffers, nullptr);
-    auto start_ts = getCurrentTimeInNano();
+    uint64_t alloc_ns = 0, reg_ns = 0;
     for (int i = 0; i < num_buffers; ++i) {
         auto location = device_prefix + ":" + std::to_string(start_idx + i);
+        MemoryOptions options;
         if (!xport_type.empty()) {
-            MemoryOptions options;
             options.type = getTransportType(xport_type);
-            options.location = std::move(location);
+        }
+
+        auto t0 = getCurrentTimeInNano();
+        if (!xport_type.empty()) {
+            options.location = location;
             CHECK_FAIL(engine_->allocateLocalMemory(
                 &pinned_buffer_list_[i], total_buffer_size, options));
         } else {
             CHECK_FAIL(engine_->allocateLocalMemory(
                 &pinned_buffer_list_[i], total_buffer_size, location));
         }
-    }
+        auto t1 = getCurrentTimeInNano();
 
-    // Register
-    auto allocated_ts = getCurrentTimeInNano();
-    std::vector<size_t> buffers_size(num_buffers, total_buffer_size);
-    MemoryOptions options;
-    if (!xport_type.empty()) {
-        options.type = getTransportType(xport_type);
+        CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
+                                                total_buffer_size, options));
+        auto t2 = getCurrentTimeInNano();
+
+        alloc_ns += (t1 - t0);
+        reg_ns += (t2 - t1);
     }
-    CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_, buffers_size,
-                                            options));
-    auto registered_ts = getCurrentTimeInNano();
 
     LOG(INFO) << "Allocated " << total_buffer_size * num_buffers << " bytes "
-              << seg_type << " buffers in " << (allocated_ts - start_ts) / 1e6
-              << " ms, registered in " << (registered_ts - allocated_ts) / 1e6
-              << " ms";
+              << seg_type << " buffers in " << alloc_ns / 1e6
+              << " ms, registered in " << reg_ns / 1e6 << " ms";
     return 0;
 }
 

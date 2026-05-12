@@ -164,7 +164,8 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
                                srcs.size(), &attr, &attrs_idx, 1, &fail_idx,
                                batch->async_stream.get());
-    if (err != cudaSuccess && fail_idx < tasks.size()) {
+    if (err != cudaSuccess && err != cudaErrorCallRequiresNewerDriver &&
+        fail_idx < tasks.size()) {
         LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
                    << "cudaMemcpyBatchAsync failed at task index " << fail_idx
                    << " (src=" << srcs[fail_idx] << ", dst=" << dsts[fail_idx]
@@ -173,17 +174,22 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
         tasks[fail_idx]->status_word = TransferStatusEnum::FAILED;
     }
 #else
-    err = cudaSuccess;
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        auto single_err =
-            cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
-                            batch->async_stream.get());
-        if (single_err != cudaSuccess) {
-            tasks[i]->status_word = TransferStatusEnum::FAILED;
-            err = single_err;
+    err = cudaErrorCallRequiresNewerDriver;
+#endif
+
+    if (err == cudaErrorCallRequiresNewerDriver) {
+        cudaGetLastError();
+        err = cudaSuccess;
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            auto single_err =
+                cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
+                                batch->async_stream.get());
+            if (single_err != cudaSuccess) {
+                tasks[i]->status_word = TransferStatusEnum::FAILED;
+                err = single_err;
+            }
         }
     }
-#endif
 
     if (err != cudaSuccess) {
         for (auto* task : tasks) {

@@ -397,23 +397,25 @@ int RdmaTransport::registerLocalMemoryBatch(
         }
     } else {
 #endif
-    std::vector<std::future<int>> results;
-    for (auto &buffer : buffer_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, buffer, location]() -> int {
-                // Use force_sequential=true to avoid nested parallelism
-                return registerLocalMemoryInternal(buffer.addr, buffer.length,
-                                                   location, true, false, true);
-            }));
-    }
-
-    for (size_t i = 0; i < buffer_list.size(); ++i) {
-        if (results[i].get()) {
-            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
-                         << buffer_list[i].addr << " length "
-                         << buffer_list[i].length;
+        std::vector<std::future<int>> results;
+        for (auto &buffer : buffer_list) {
+            results.emplace_back(std::async(
+                std::launch::async, [this, buffer, location]() -> int {
+                    // Use force_sequential=true to avoid nested parallelism
+                    return registerLocalMemoryInternal(buffer.addr,
+                                                       buffer.length, location,
+                                                       true, false, true);
+                }));
         }
-    }
+
+        for (size_t i = 0; i < buffer_list.size(); ++i) {
+            if (results[i].get()) {
+                LOG(WARNING)
+                    << "RdmaTransport: Failed to register memory: addr "
+                    << buffer_list[i].addr << " length "
+                    << buffer_list[i].length;
+            }
+        }
 #if defined(USE_CUDA)
     }  // Environ::Get().GetWithNvidiaPeermem()
 #endif
