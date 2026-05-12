@@ -55,7 +55,7 @@ MasterMetricManager::MasterMetricManager()
       put_start_failures_("master_put_start_failures_total",
                           "Total number of failed PutStart requests"),
       put_start_alloc_failures_(
-          "master_put_start_alloc_fail_total",
+          "master_put_start_alloc_failures_total",
           "Total number of PutStart failures caused by replica allocation "
           "failure"),
       put_end_requests_("master_put_end_requests_total",
@@ -1306,6 +1306,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
     serialize_metric(put_start_failures_);
+    serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_end_requests_);
     serialize_metric(put_end_failures_);
     serialize_metric(put_revoke_requests_);
@@ -1935,22 +1936,22 @@ std::string MasterMetricManager::get_summary_string(
                                delta(&SummaryCounters::create_copy_task_fails),
                            delta(&SummaryCounters::create_copy_tasks))
        << "), ";
-    ss << "QueryTask=(Req="
+    ss << "QueryTask:(Req="
        << format_rate_pair(delta(&SummaryCounters::query_tasks) -
                                delta(&SummaryCounters::query_task_fails),
                            delta(&SummaryCounters::query_tasks))
        << "), ";
-    ss << "FetchTasks=(Req="
+    ss << "FetchTasks:(Req="
        << format_rate_pair(delta(&SummaryCounters::fetch_tasks) -
                                delta(&SummaryCounters::fetch_task_fails),
                            delta(&SummaryCounters::fetch_tasks))
        << "), ";
-    ss << "MarkTaskToComplete= (Req="
+    ss << "MarkTaskToComplete:(Req="
        << format_rate_pair(
               delta(&SummaryCounters::mark_task_to_complete_requests) -
                   delta(&SummaryCounters::mark_task_to_complete_fails),
               delta(&SummaryCounters::mark_task_to_complete_requests))
-       << "), ";
+       << ")";
     // Eviction summary
     ss << " | Eviction: "
        << "Success/Attempts=" << delta(&SummaryCounters::eviction_success)

@@ -9,12 +9,12 @@ When started, the Mooncake master periodically prints a metrics summary log ever
 ### Log Format
 
 ```
-I0509 11:18:59.784252 2889628 rpc_service.cpp:64] Master Admin Metrics: role=leader, state=serving, summary=role=leader, state=serving, service_ready=true, master={...}, ha={...}, leader=127.0.0.1:50051, view_version=1
+I0512 15:03:30.321475 239489 rpc_service.cpp:269] Master Admin Metrics: role=leader, state=serving, service_ready=true, master={...}, ha={...}, leader=127.0.0.1:50051, view_version=1
 ```
 
 Each log line contains:
 - **GLog header**: timestamp, thread ID, source file and line number
-- **role**: HA role — `leader`, `standby`, or `candidate`
+- **role**: HA role — `leader` or `standby`
 - **state**: HA runtime state — `serving`, `starting`, `stopping`, etc.
 - **service_ready**: whether the gRPC service is accepting requests
 - **master**: master metrics block (see below)
@@ -26,7 +26,7 @@ Each log line contains:
 A typical `master={...}` block looks like this:
 
 ```
-Mem Storage: 94.09 MB / 100.00 MB (94.1%) | SSD Storage: 0 B / 0 B | Keys: 16058 (soft-pinned: 0) | Clients: 1 | Requests (Success/Total per sec): PutStart=0.00/0.00, PutEnd=0.00/0.00, PutRevoke=0.00/0.00, Get=0.00/0.00, Exist=0.00/0.00, Del=0.00/0.00, DelAll=0.00/0.00, Ping=1.00/1.00, CopyStart=0.00/0.00, CopyEnd=0.00/0.00, CopyRevoke=0.00/0.00, MoveStart=0.00/0.00, MoveEnd=0.00/0.00, MoveRevoke=0.00/0.00, EvictDiskReplica=0.00/0.00 | Batch Requests (per sec, Req=Success/PartialSuccess/Total, Item=Success/Total): PutStart:(Req=0.00/0.00/0.00, Item=0.00/0.00), PutEnd:(Req=0.00/0.00/0.00, Item=0.00/0.00), PutRevoke:(Req=0.00/0.00/0.00, Item=0.00/0.00), Get:(Req=0.00/0.00/0.00, Item=0.00/0.00), ExistKey:(Req=0.00/0.00/0.00, Item=0.00/0.00), QueryIp:(Req=0.00/0.00/0.00, Item=0.00/0.00), Clear:(Req=0.00/0.00/0.00, Item=0.00/0.00), CreateMoveTask:(Req=0.00/0.00), CreateCopyTask:(Req=0.00/0.00), QueryTask=(Req=0.00/0.00), FetchTasks=(Req=0.00/0.00), MarkTaskToComplete= (Req=0.00/0.00),  | Eviction: Success/Attempts=0/0, AllocFail=0, keys=0, size=0 B | Discard: Released/Total=0/0, StagingSize=0 B | Snapshots: Success=0, Fail=0
+Mem Storage: 94.09 MB / 100.00 MB (94.1%) | SSD Storage: 0 B / 0 B | Keys: 16058 (soft-pinned: 0) | Clients: 1 | Requests (Success/Total per sec): PutStart=0.00/0.00, PutEnd=0.00/0.00, PutRevoke=0.00/0.00, Get=0.00/0.00, Exist=0.00/0.00, Del=0.00/0.00, DelAll=0.00/0.00, Ping=1.00/1.00, CopyStart=0.00/0.00, CopyEnd=0.00/0.00, CopyRevoke=0.00/0.00, MoveStart=0.00/0.00, MoveEnd=0.00/0.00, MoveRevoke=0.00/0.00, EvictDiskReplica=0.00/0.00 | Batch Requests (per sec, Req=Success/PartialSuccess/Total, Item=Success/Total): PutStart:(Req=0.00/0.00/0.00, Item=0.00/0.00), PutEnd:(Req=0.00/0.00/0.00, Item=0.00/0.00), PutRevoke:(Req=0.00/0.00/0.00, Item=0.00/0.00), Get:(Req=0.00/0.00/0.00, Item=0.00/0.00), ExistKey:(Req=0.00/0.00/0.00, Item=0.00/0.00), QueryIp:(Req=0.00/0.00/0.00, Item=0.00/0.00), Clear:(Req=0.00/0.00/0.00, Item=0.00/0.00), CreateMoveTask:(Req=0.00/0.00), CreateCopyTask:(Req=0.00/0.00), QueryTask:(Req=0.00/0.00), FetchTasks:(Req=0.00/0.00), MarkTaskToComplete:(Req=0.00/0.00) | Eviction: Success/Attempts=0/0, AllocFail=0, keys=0, size=0 B | Discard: Released/Total=0/0, StagingSize=0 B | Snapshots: Success=0, Fail=0
 ```
 
 Request counters are reported as **rates per second** over the time window between two consecutive log outputs (10 seconds by default). Real-time state values (storage, key count, client count, discard staging size) are not rate-limited and reflect the current value at log time.
@@ -122,7 +122,7 @@ The admin HTTP server runs on `metrics_port` (default: **9003**) and exposes the
 | `GET /metrics` | `text/plain; version=0.0.4` | All metrics in Prometheus exposition format |
 | `GET /metrics/summary` | `text/plain; version=0.0.4` | Human-readable summary (same content as the periodic log) |
 | `GET /health` | `application/json` | Health check with role, HA state, and service readiness |
-| `GET /role` | `text/plain` | Current HA role (`leader` / `standby` / `candidate`) |
+| `GET /role` | `text/plain` | Current HA role (`leader` / `standby`) |
 | `GET /ha_status` | `text/plain` | Current HA runtime state (`serving` / `starting` / etc.) |
 
 ### Usage
@@ -164,4 +164,4 @@ The admin HTTP server is configured in the master config file (`master.json` or 
 }
 ```
 
-Set `enable_metric_reporting` to `false` to disable both the periodic log and the HTTP metrics server.
+Set `enable_metric_reporting` to `false` to disable the periodic metrics log. HTTP endpoints (`/metrics`, `/health`, etc.) remain available regardless of this setting.

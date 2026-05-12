@@ -247,10 +247,6 @@ bool MasterAdminServer::Start() {
                            << ha::MasterRuntimeRoleToString(snapshot.state)
                            << ", state="
                            << ha::MasterRuntimeStateToString(snapshot.state)
-                           << ", summary=role="
-                           << ha::MasterRuntimeRoleToString(snapshot.state)
-                           << ", state="
-                           << ha::MasterRuntimeStateToString(snapshot.state)
                            << ", service_ready="
                            << (snapshot.service_available ? "true" : "false")
                            << ", master={"
