@@ -6510,6 +6510,47 @@ fn routed_batch_put_from_rejects_route_conflict_without_current_route() {
             .expect("exist check should succeed")[0],
         "unpublished conflict loser route must not be visible as a cache hit"
     );
+
+    let mut batch_source = b"batch-put-status-good".to_vec();
+    writer
+        .register_buffer(batch_source.as_mut_ptr().cast(), batch_source.len())
+        .expect("writer batch source buffer should register");
+    let statuses = writer.batch_put_from_statuses(&[
+        PutFromRequest::new(
+            "batch-put-empty-conflict-key",
+            batch_source.as_ptr().cast(),
+            batch_source.len(),
+        )
+        .replication(
+            ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owner(storage.runtime_id().storage_key()),
+        ),
+        PutFromRequest::new(
+            "batch-put-empty-conflict-good-key",
+            batch_source.as_ptr().cast(),
+            batch_source.len(),
+        )
+        .replication(
+            ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owner(storage.runtime_id().storage_key()),
+        ),
+    ]);
+    assert_eq!(statuses.len(), 2);
+    assert!(matches!(statuses[0].as_ref(), Err(StoreError::Conflict(_))));
+    assert!(
+        statuses[1].is_ok(),
+        "independent batch item should keep its success status"
+    );
+    assert_eq!(
+        writer
+            .get("batch-put-empty-conflict-good-key")
+            .expect("successful status item should be readable"),
+        batch_source
+    );
 }
 
 #[test]

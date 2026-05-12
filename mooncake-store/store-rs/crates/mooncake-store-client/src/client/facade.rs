@@ -190,6 +190,172 @@ impl StoreClient {
             .all(|request| request.policy.clone().unwrap_or_default() == shared)
             .then_some(Some(shared))
     }
+
+    pub fn batch_put_from_statuses(
+        &self,
+        requests: &[PutFromRequest<'_>],
+    ) -> Vec<Result<ObjectRoute>> {
+        let bytes_in = requests
+            .iter()
+            .map(|request| request.size as u64)
+            .sum::<u64>();
+        let _span = info_span!(
+            "store.batch_put_from",
+            runtime = %self.lease.runtime,
+            items = requests.len(),
+            bytes_in
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_put_from").input_bytes(bytes_in);
+        let statuses = self.batch_put_from_statuses_inner(requests);
+        let aggregate = Self::aggregate_batch_put_statuses(&statuses);
+        tracker.finish(&aggregate, bytes_in);
+        statuses
+    }
+
+    fn aggregate_batch_put_statuses(statuses: &[Result<ObjectRoute>]) -> Result<Vec<ObjectRoute>> {
+        let mut routes = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            match status {
+                Ok(route) => routes.push(route.clone()),
+                Err(error) => return Err(error.clone()),
+            }
+        }
+        Ok(routes)
+    }
+
+    fn batch_put_from_statuses_inner(
+        &self,
+        requests: &[PutFromRequest<'_>],
+    ) -> Vec<Result<ObjectRoute>> {
+        let mut statuses = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<_>>();
+        let mut routed_indices = Vec::with_capacity(requests.len());
+        let mut routed_requests = Vec::with_capacity(requests.len());
+        let mut routed_sources = Vec::with_capacity(requests.len());
+        let mut routed_originals = Vec::with_capacity(requests.len());
+
+        for (index, request) in requests.iter().enumerate() {
+            if request.buffer.is_null() {
+                statuses[index] = Some(Err(StoreError::Allocator(
+                    "put_from buffer must not be null".to_string(),
+                )));
+                continue;
+            }
+            {
+                let state = self.state.lock();
+                if !state.buffer_is_registered(request.buffer.cast_mut(), request.size) {
+                    let tenant = request.tenant.unwrap_or(self.default_tenant());
+                    statuses[index] = Some(Err(StoreError::Allocator(format!(
+                        "put_from buffer is not registered for tenant={tenant} key={}",
+                        request.key
+                    ))));
+                    continue;
+                }
+            }
+
+            if matches!(self.write_mode, WriteMode::Routed { .. }) {
+                let value =
+                    unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
+                let mut routed = PutRequest::new(request.key, value);
+                if let Some(tenant) = request.tenant {
+                    routed = routed.tenant(tenant);
+                }
+                if let Some(domain) = request.domain {
+                    routed = routed.domain(domain);
+                }
+                if let Some(object_set) = request.object_set {
+                    routed = routed.object_set(object_set);
+                }
+                if let Some(qos_tier) = request.qos_tier {
+                    routed = routed.qos_tier(qos_tier);
+                }
+                if let Some(policy) = request.policy.clone() {
+                    routed = routed.replication(policy);
+                }
+                routed_indices.push(index);
+                routed_requests.push(routed);
+                routed_sources.push(request.buffer.cast_mut());
+                routed_originals.push(request.clone());
+                continue;
+            }
+
+            let mut object = ObjectRef::new(request.key);
+            if let Some(tenant) = request.tenant {
+                object = object.tenant(tenant);
+            }
+            if let Some(domain) = request.domain {
+                object = object.domain(domain);
+            }
+            if let Some(object_set) = request.object_set {
+                object = object.object_set(object_set);
+            }
+            if let Some(qos_tier) = request.qos_tier {
+                object = object.qos_tier(qos_tier);
+            }
+            statuses[index] = Some(self.put_object_from_registered(
+                &object,
+                request.buffer.cast_mut(),
+                request.size,
+                request.policy.as_ref(),
+            ));
+        }
+
+        if !routed_requests.is_empty() {
+            let routed_statuses =
+                if let Some(shared_policy) =
+                    Self::shared_batch_put_from_replication_policy(&routed_originals)
+                {
+                    self.batch_put_scoped_routed_accept_existing_statuses(
+                        &routed_requests,
+                        &routed_sources,
+                        shared_policy.as_ref(),
+                    )
+                } else {
+                    routed_requests
+                        .iter()
+                        .zip(routed_sources.iter())
+                        .map(|(request, source)| {
+                            let mut object = ObjectRef::new(request.key);
+                            if let Some(tenant) = request.tenant {
+                                object = object.tenant(tenant);
+                            }
+                            if let Some(domain) = request.domain {
+                                object = object.domain(domain);
+                            }
+                            if let Some(object_set) = request.object_set {
+                                object = object.object_set(object_set);
+                            }
+                            if let Some(qos_tier) = request.qos_tier {
+                                object = object.qos_tier(qos_tier);
+                            }
+                            self.put_object_from_registered(
+                                &object,
+                                *source,
+                                request.value.len(),
+                                request.policy.as_ref(),
+                            )
+                        })
+                        .collect()
+                };
+
+            for (index, status) in routed_indices.into_iter().zip(routed_statuses) {
+                statuses[index] = Some(status);
+            }
+        }
+
+        statuses
+            .into_iter()
+            .map(|status| {
+                status.unwrap_or_else(|| {
+                    Err(StoreError::InvalidState(
+                        "batch_put_from status was not recorded".to_string(),
+                    ))
+                })
+            })
+            .collect()
+    }
 }
 
 impl MooncakeCompatibilityFacade for StoreClient {
@@ -1003,119 +1169,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn batch_put_from(&self, requests: &[PutFromRequest<'_>]) -> Result<Vec<ObjectRoute>> {
-        let bytes_in = requests
-            .iter()
-            .map(|request| request.size as u64)
-            .sum::<u64>();
-        let _span = info_span!(
-            "store.batch_put_from",
-            runtime = %self.lease.runtime,
-            items = requests.len(),
-            bytes_in
-        )
-        .entered();
-        let tracker = OperationTracker::new("batch_put_from").input_bytes(bytes_in);
-        let mut routed_requests = Vec::with_capacity(requests.len());
-        let mut registered_sources = Vec::with_capacity(requests.len());
-        let mut routes = Vec::with_capacity(requests.len());
-        for request in requests {
-            if request.buffer.is_null() {
-                let result = Err(StoreError::Allocator(
-                    "put_from buffer must not be null".to_string(),
-                ));
-                tracker.finish(&result, 0);
-                return result;
-            }
-            {
-                let state = self.state.lock();
-                if !state.buffer_is_registered(request.buffer.cast_mut(), request.size) {
-                    let tenant = request.tenant.unwrap_or(self.default_tenant());
-                    let result = Err(StoreError::Allocator(format!(
-                        "put_from buffer is not registered for tenant={tenant} key={}",
-                        request.key
-                    )));
-                    tracker.finish(&result, 0);
-                    return result;
-                }
-            }
-            if matches!(self.write_mode, WriteMode::Routed { .. }) {
-                let value =
-                    unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
-                let mut routed = PutRequest::new(request.key, value);
-                if let Some(tenant) = request.tenant {
-                    routed = routed.tenant(tenant);
-                }
-                if let Some(domain) = request.domain {
-                    routed = routed.domain(domain);
-                }
-                if let Some(object_set) = request.object_set {
-                    routed = routed.object_set(object_set);
-                }
-                if let Some(qos_tier) = request.qos_tier {
-                    routed = routed.qos_tier(qos_tier);
-                }
-                if let Some(policy) = request.policy.clone() {
-                    routed = routed.replication(policy);
-                }
-                routed_requests.push(routed);
-                registered_sources.push(request.buffer.cast_mut());
-                continue;
-            }
-            let mut object = ObjectRef::new(request.key);
-            if let Some(tenant) = request.tenant {
-                object = object.tenant(tenant);
-            }
-            if let Some(domain) = request.domain {
-                object = object.domain(domain);
-            }
-            if let Some(object_set) = request.object_set {
-                object = object.object_set(object_set);
-            }
-            if let Some(qos_tier) = request.qos_tier {
-                object = object.qos_tier(qos_tier);
-            }
-            routes.push(self.put_object_from_registered(
-                &object,
-                request.buffer.cast_mut(),
-                request.size,
-                request.policy.as_ref(),
-            )?);
-        }
-        if !routed_requests.is_empty() {
-            if let Some(shared_policy) = Self::shared_batch_put_from_replication_policy(requests) {
-                let result = self.batch_put_scoped_routed_accept_existing(
-                    &routed_requests,
-                    Some(&registered_sources),
-                    shared_policy.as_ref(),
-                );
-                tracker.finish(&result, bytes_in);
-                return result;
-            }
-            for (request, source) in routed_requests.iter().zip(registered_sources.iter()) {
-                let mut object = ObjectRef::new(request.key);
-                if let Some(tenant) = request.tenant {
-                    object = object.tenant(tenant);
-                }
-                if let Some(domain) = request.domain {
-                    object = object.domain(domain);
-                }
-                if let Some(object_set) = request.object_set {
-                    object = object.object_set(object_set);
-                }
-                if let Some(qos_tier) = request.qos_tier {
-                    object = object.qos_tier(qos_tier);
-                }
-                routes.push(self.put_object_from_registered(
-                    &object,
-                    *source,
-                    request.value.len(),
-                    request.policy.as_ref(),
-                )?);
-            }
-        }
-        let result = Ok(routes);
-        tracker.finish(&result, bytes_in);
-        result
+        let statuses = self.batch_put_from_statuses(requests);
+        Self::aggregate_batch_put_statuses(&statuses)
     }
 
     fn batch_put_from_multi_buffers(
