@@ -28,6 +28,7 @@ pub(crate) fn render_prometheus_metrics(snapshot: &MetricsSnapshot) -> String {
 }
 
 fn render_metadata_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
+    let tenant = escape(&snapshot.tenant);
     counter_family(
         output,
         METADATA_OPERATION_TOTAL,
@@ -40,8 +41,9 @@ fn render_metadata_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
             result,
         } = key;
         output.push_str(&format!(
-            "{}{{backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
             METADATA_OPERATION_TOTAL,
+            tenant,
             escape(backend),
             escape(operation),
             escape(result),
@@ -57,8 +59,9 @@ fn render_metadata_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for GaugeSample { key, value } in &snapshot.metadata_inflight {
         let MetadataInflightKey { backend, operation } = key;
         output.push_str(&format!(
-            "{}{{backend=\"{}\",operation=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",backend=\"{}\",operation=\"{}\"}} {}\n",
             METADATA_OPERATION_INFLIGHT,
+            tenant,
             escape(backend),
             escape(operation),
             value
@@ -71,11 +74,12 @@ fn render_metadata_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
         "Metadata backend operation duration in seconds.",
     );
     for sample in &snapshot.metadata_duration {
-        render_metadata_histogram(output, METADATA_OPERATION_DURATION, sample);
+        render_metadata_histogram(output, METADATA_OPERATION_DURATION, &tenant, sample);
     }
 }
 
 fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
+    let tenant = escape(&snapshot.tenant);
     gauge_family(
         output,
         SEGMENT_CAPACITY_BYTES,
@@ -83,8 +87,9 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     );
     for sample in &snapshot.segments {
         output.push_str(&format!(
-            "{}{{runtime=\"{}\",segment=\"{}\",state=\"{}\",tier=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",runtime=\"{}\",segment=\"{}\",state=\"{}\",tier=\"{}\"}} {}\n",
             SEGMENT_CAPACITY_BYTES,
+            tenant,
             escape(&sample.runtime),
             escape(&sample.segment),
             escape(sample.state),
@@ -100,8 +105,9 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     );
     for sample in &snapshot.segments {
         output.push_str(&format!(
-            "{}{{runtime=\"{}\",segment=\"{}\",state=\"{}\",tier=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",runtime=\"{}\",segment=\"{}\",state=\"{}\",tier=\"{}\"}} {}\n",
             SEGMENT_USED_BYTES,
+            tenant,
             escape(&sample.runtime),
             escape(&sample.segment),
             escape(sample.state),
@@ -129,8 +135,9 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     for GaugeSample { key, value } in &snapshot.replica_distribution {
         let ReplicaDistributionKey { runtime, tier } = key;
         output.push_str(&format!(
-            "{}{{runtime=\"{}\",tier=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",runtime=\"{}\",tier=\"{}\"}} {}\n",
             REPLICA_DISTRIBUTION,
+            tenant,
             escape(runtime),
             escape(tier),
             value
@@ -141,8 +148,9 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     for GaugeSample { key, value } in &snapshot.runtime_status {
         let RuntimeStatusKey { runtime, state } = key;
         output.push_str(&format!(
-            "{}{{runtime=\"{}\",state=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",runtime=\"{}\",state=\"{}\"}} {}\n",
             RUNTIME_STATUS,
+            tenant,
             escape(runtime),
             escape(state),
             value
@@ -157,8 +165,9 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     for GaugeSample { key, value } in &snapshot.runtime_lease_expires_at_ms {
         let RuntimeKey { runtime } = key;
         output.push_str(&format!(
-            "{}{{runtime=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",runtime=\"{}\"}} {}\n",
             RUNTIME_LEASE_EXPIRES_AT_MS,
+            tenant,
             escape(runtime),
             value
         ));
@@ -172,8 +181,9 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     for GaugeSample { key, value } in &snapshot.heartbeat_consecutive_failures {
         let RuntimeKey { runtime } = key;
         output.push_str(&format!(
-            "{}{{runtime=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",runtime=\"{}\"}} {}\n",
             HEARTBEAT_CONSECUTIVE_FAILURES,
+            tenant,
             escape(runtime),
             value
         ));
@@ -187,8 +197,9 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     for GaugeSample { key, value } in &snapshot.heartbeat_last_success_ms {
         let RuntimeKey { runtime } = key;
         output.push_str(&format!(
-            "{}{{runtime=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",runtime=\"{}\"}} {}\n",
             HEARTBEAT_LAST_SUCCESS_MS,
+            tenant,
             escape(runtime),
             value
         ));
@@ -202,6 +213,7 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
     for_result_counter(
         output,
         MEMBERSHIP_REFRESH_TOTAL,
+        &tenant,
         &snapshot.membership_refresh,
     );
 
@@ -211,16 +223,18 @@ fn render_cluster_state_metrics(output: &mut String, snapshot: &MetricsSnapshot)
         "Membership refresh duration in seconds.",
     );
     for sample in &snapshot.membership_refresh_duration {
-        render_result_histogram(output, MEMBERSHIP_REFRESH_DURATION, sample);
+        render_result_histogram(output, MEMBERSHIP_REFRESH_DURATION, &tenant, sample);
     }
 }
 
 fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
+    let tenant = escape(&snapshot.tenant);
     output.push_str("# HELP mooncake_store_operation_total Total store operations.\n");
     output.push_str("# TYPE mooncake_store_operation_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_operation_total{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_total{{tenant=\"{}\",operation=\"{}\",status=\"{}\"}} {}\n",
+            tenant,
             escape(sample.operation),
             escape(sample.status),
             sample.calls_total
@@ -233,7 +247,8 @@ fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapsh
     output.push_str("# TYPE mooncake_store_operation_bytes_in_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_operation_bytes_in_total{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_bytes_in_total{{tenant=\"{}\",operation=\"{}\",status=\"{}\"}} {}\n",
+            tenant,
             escape(sample.operation),
             escape(sample.status),
             sample.bytes_in_total
@@ -246,7 +261,8 @@ fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapsh
     output.push_str("# TYPE mooncake_store_operation_bytes_out_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_operation_bytes_out_total{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_bytes_out_total{{tenant=\"{}\",operation=\"{}\",status=\"{}\"}} {}\n",
+            tenant,
             escape(sample.operation),
             escape(sample.status),
             sample.bytes_out_total
@@ -257,7 +273,8 @@ fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapsh
     output.push_str("# TYPE mooncake_store_operation_latency_microseconds_total counter\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_operation_latency_microseconds_total{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_latency_microseconds_total{{tenant=\"{}\",operation=\"{}\",status=\"{}\"}} {}\n",
+            tenant,
             escape(sample.operation),
             escape(sample.status),
             sample.latency_total_us
@@ -268,7 +285,8 @@ fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapsh
     output.push_str("# TYPE mooncake_store_operation_latency_microseconds_max gauge\n");
     for sample in &snapshot.operations {
         output.push_str(&format!(
-            "mooncake_store_operation_latency_microseconds_max{{operation=\"{}\",status=\"{}\"}} {}\n",
+            "mooncake_store_operation_latency_microseconds_max{{tenant=\"{}\",operation=\"{}\",status=\"{}\"}} {}\n",
+            tenant,
             escape(sample.operation),
             escape(sample.status),
             sample.latency_max_us
@@ -277,6 +295,7 @@ fn render_legacy_operation_metrics(output: &mut String, snapshot: &MetricsSnapsh
 }
 
 fn render_request_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
+    let tenant = escape(&snapshot.tenant);
     counter_family(
         output,
         REQUEST_TOTAL,
@@ -285,8 +304,9 @@ fn render_request_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for sample in &snapshot.request_totals {
         let key = &sample.key;
         output.push_str(&format!(
-            "{}{{operation=\"{}\",scope=\"{}\",result=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",operation=\"{}\",scope=\"{}\",result=\"{}\"}} {}\n",
             REQUEST_TOTAL,
+            tenant,
             escape(key.operation),
             escape(key.scope),
             escape(key.result),
@@ -302,8 +322,9 @@ fn render_request_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for GaugeSample { key, value } in &snapshot.request_inflight {
         let RequestInflightKey { operation, scope } = key;
         output.push_str(&format!(
-            "{}{{operation=\"{}\",scope=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",operation=\"{}\",scope=\"{}\"}} {}\n",
             REQUEST_INFLIGHT,
+            tenant,
             escape(operation),
             escape(scope),
             value
@@ -322,8 +343,9 @@ fn render_request_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
             scope,
         } = key;
         output.push_str(&format!(
-            "{}{{operation=\"{}\",direction=\"{}\",scope=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",operation=\"{}\",direction=\"{}\",scope=\"{}\"}} {}\n",
             REQUEST_BYTES,
+            tenant,
             escape(operation),
             escape(direction),
             escape(scope),
@@ -339,18 +361,28 @@ fn render_request_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
         sum,
     } in &snapshot.request_duration
     {
-        render_request_histogram(output, REQUEST_DURATION, key, buckets, *count, *sum);
+        render_request_histogram(
+            output,
+            REQUEST_DURATION,
+            &tenant,
+            key,
+            buckets,
+            *count,
+            *sum,
+        );
     }
 }
 
 fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
+    let tenant = escape(&snapshot.tenant);
     counter_family(output, ROUTE_CAS_TOTAL, "Route CAS outcomes.");
-    for_result_counter(output, ROUTE_CAS_TOTAL, &snapshot.route_cas);
+    for_result_counter(output, ROUTE_CAS_TOTAL, &tenant, &snapshot.route_cas);
 
     counter_family(output, REPLICATION_PUBLISH_TOTAL, "Route publish outcomes.");
     for_result_counter(
         output,
         REPLICATION_PUBLISH_TOTAL,
+        &tenant,
         &snapshot.replication_publish,
     );
 
@@ -360,7 +392,7 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
         "Route publish duration in seconds.",
     );
     for sample in &snapshot.replication_publish_duration {
-        render_result_histogram(output, REPLICATION_PUBLISH_DURATION, sample);
+        render_result_histogram(output, REPLICATION_PUBLISH_DURATION, &tenant, sample);
     }
 
     counter_family(
@@ -371,6 +403,7 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for_result_counter(
         output,
         CHECKSUM_VALIDATION_TOTAL,
+        &tenant,
         &snapshot.checksum_validation,
     );
 
@@ -382,6 +415,7 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for_result_counter(
         output,
         TENANT_QUOTA_RESERVATION_TOTAL,
+        &tenant,
         &snapshot.tenant_quota_reservation,
     );
 
@@ -393,6 +427,7 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for_result_counter(
         output,
         TENANT_QUOTA_FINALIZE_TOTAL,
+        &tenant,
         &snapshot.tenant_quota_finalize,
     );
 
@@ -404,6 +439,7 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for_result_counter(
         output,
         TENANT_QUOTA_ABORT_TOTAL,
+        &tenant,
         &snapshot.tenant_quota_abort,
     );
 
@@ -415,6 +451,7 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for_result_counter(
         output,
         TENANT_QUOTA_RECONCILE_TOTAL,
+        &tenant,
         &snapshot.tenant_quota_reconcile,
     );
 
@@ -426,6 +463,7 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for_result_counter(
         output,
         TENANT_LOCAL_EVICTION_TOTAL,
+        &tenant,
         &snapshot.tenant_local_eviction,
     );
 
@@ -437,8 +475,9 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for CounterSample { key, value } in &snapshot.preferred_segment_skip {
         let PreferredSegmentSkipKey { source, reason } = key;
         output.push_str(&format!(
-            "{}{{source=\"{}\",reason=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",source=\"{}\",reason=\"{}\"}} {}\n",
             PREFERRED_SEGMENT_SKIP_TOTAL,
+            tenant,
             escape(source),
             escape(reason),
             value
@@ -447,12 +486,14 @@ fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
 }
 
 fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
+    let tenant = escape(&snapshot.tenant);
     counter_family(output, REBALANCE_ROUTES_TOTAL, "Rebalance route outcomes.");
     for CounterSample { key, value } in &snapshot.rebalance_routes {
         let PhaseResultKey { phase, result } = key;
         output.push_str(&format!(
-            "{}{{phase=\"{}\",result=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",phase=\"{}\",result=\"{}\"}} {}\n",
             REBALANCE_ROUTES_TOTAL,
+            tenant,
             escape(phase),
             escape(result),
             value
@@ -463,8 +504,9 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for CounterSample { key, value } in &snapshot.rebalance_bytes {
         let PhaseKey { phase } = key;
         output.push_str(&format!(
-            "{}{{phase=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",phase=\"{}\"}} {}\n",
             REBALANCE_BYTES_TOTAL,
+            tenant,
             escape(phase),
             value
         ));
@@ -478,8 +520,9 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for CounterSample { key, value } in &snapshot.segment_lifecycle {
         let ActionResultKey { action, result } = key;
         output.push_str(&format!(
-            "{}{{action=\"{}\",result=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",action=\"{}\",result=\"{}\"}} {}\n",
             SEGMENT_LIFECYCLE_TOTAL,
+            tenant,
             escape(action),
             escape(result),
             value
@@ -487,7 +530,7 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     }
 
     counter_family(output, EVICTION_TOTAL, "Eviction loop outcomes.");
-    for_result_counter(output, EVICTION_TOTAL, &snapshot.eviction);
+    for_result_counter(output, EVICTION_TOTAL, &tenant, &snapshot.eviction);
 
     histogram_family(
         output,
@@ -495,7 +538,7 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
         "Eviction loop duration in seconds.",
     );
     for sample in &snapshot.eviction_duration {
-        render_result_histogram(output, EVICTION_DURATION, sample);
+        render_result_histogram(output, EVICTION_DURATION, &tenant, sample);
     }
 
     counter_family(
@@ -510,8 +553,9 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
             result,
         } = key;
         output.push_str(&format!(
-            "{}{{direction=\"{}\",peer_kind=\"{}\",result=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",direction=\"{}\",peer_kind=\"{}\",result=\"{}\"}} {}\n",
             TRANSPORT_OPERATION_TOTAL,
+            tenant,
             escape(direction),
             escape(peer_kind),
             escape(result),
@@ -530,8 +574,9 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
             peer_kind,
         } = key;
         output.push_str(&format!(
-            "{}{{direction=\"{}\",peer_kind=\"{}\"}} {}\n",
+            "{}{{tenant=\"{}\",direction=\"{}\",peer_kind=\"{}\"}} {}\n",
             TRANSPORT_BYTES_TOTAL,
+            tenant,
             escape(direction),
             escape(peer_kind),
             value
@@ -540,14 +585,15 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
 }
 
 fn render_process_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
+    let tenant = escape(&snapshot.tenant);
     counter_family(
         output,
         "process_cpu_seconds_total",
         "Total user and system CPU time.",
     );
     output.push_str(&format!(
-        "process_cpu_seconds_total {}\n",
-        snapshot.process.cpu_seconds_total
+        "process_cpu_seconds_total{{tenant=\"{}\"}} {}\n",
+        tenant, snapshot.process.cpu_seconds_total
     ));
 
     gauge_family(
@@ -556,8 +602,8 @@ fn render_process_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
         "Resident memory used by this process.",
     );
     output.push_str(&format!(
-        "process_resident_memory_bytes {}\n",
-        snapshot.process.resident_memory_bytes
+        "process_resident_memory_bytes{{tenant=\"{}\"}} {}\n",
+        tenant, snapshot.process.resident_memory_bytes
     ));
 
     if let Some(open_fds) = snapshot.process.open_fds {
@@ -566,13 +612,17 @@ fn render_process_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
             "process_open_fds",
             "Open file descriptors for this process.",
         );
-        output.push_str(&format!("process_open_fds {}\n", open_fds));
+        output.push_str(&format!(
+            "process_open_fds{{tenant=\"{}\"}} {}\n",
+            tenant, open_fds
+        ));
     }
 }
 
 fn render_request_histogram(
     output: &mut String,
     metric: &str,
+    tenant: &str,
     key: &RequestKey,
     buckets: &[u64],
     count: u64,
@@ -580,7 +630,8 @@ fn render_request_histogram(
 ) {
     for (le, value) in REQUEST_DURATION_BUCKETS.iter().zip(buckets.iter()) {
         output.push_str(&format!(
-            "{metric}_bucket{{operation=\"{}\",scope=\"{}\",result=\"{}\",le=\"{}\"}} {}\n",
+            "{metric}_bucket{{tenant=\"{}\",operation=\"{}\",scope=\"{}\",result=\"{}\",le=\"{}\"}} {}\n",
+            tenant,
             escape(key.operation),
             escape(key.scope),
             escape(key.result),
@@ -589,46 +640,58 @@ fn render_request_histogram(
         ));
     }
     output.push_str(&format!(
-        "{metric}_bucket{{operation=\"{}\",scope=\"{}\",result=\"{}\",le=\"+Inf\"}} {count}\n",
+        "{metric}_bucket{{tenant=\"{}\",operation=\"{}\",scope=\"{}\",result=\"{}\",le=\"+Inf\"}} {count}\n",
+        tenant,
         escape(key.operation),
         escape(key.scope),
         escape(key.result)
     ));
     output.push_str(&format!(
-        "{metric}_sum{{operation=\"{}\",scope=\"{}\",result=\"{}\"}} {sum}\n",
+        "{metric}_sum{{tenant=\"{}\",operation=\"{}\",scope=\"{}\",result=\"{}\"}} {sum}\n",
+        tenant,
         escape(key.operation),
         escape(key.scope),
         escape(key.result)
     ));
     output.push_str(&format!(
-        "{metric}_count{{operation=\"{}\",scope=\"{}\",result=\"{}\"}} {count}\n",
+        "{metric}_count{{tenant=\"{}\",operation=\"{}\",scope=\"{}\",result=\"{}\"}} {count}\n",
+        tenant,
         escape(key.operation),
         escape(key.scope),
         escape(key.result)
     ));
 }
 
-fn render_result_histogram(output: &mut String, metric: &str, sample: &HistogramSample<ResultKey>) {
+fn render_result_histogram(
+    output: &mut String,
+    metric: &str,
+    tenant: &str,
+    sample: &HistogramSample<ResultKey>,
+) {
     for (le, value) in REQUEST_DURATION_BUCKETS.iter().zip(sample.buckets.iter()) {
         output.push_str(&format!(
-            "{metric}_bucket{{result=\"{}\",le=\"{}\"}} {}\n",
+            "{metric}_bucket{{tenant=\"{}\",result=\"{}\",le=\"{}\"}} {}\n",
+            tenant,
             escape(sample.key.result),
             format_bucket(*le),
             value
         ));
     }
     output.push_str(&format!(
-        "{metric}_bucket{{result=\"{}\",le=\"+Inf\"}} {}\n",
+        "{metric}_bucket{{tenant=\"{}\",result=\"{}\",le=\"+Inf\"}} {}\n",
+        tenant,
         escape(sample.key.result),
         sample.count
     ));
     output.push_str(&format!(
-        "{metric}_sum{{result=\"{}\"}} {}\n",
+        "{metric}_sum{{tenant=\"{}\",result=\"{}\"}} {}\n",
+        tenant,
         escape(sample.key.result),
         sample.sum
     ));
     output.push_str(&format!(
-        "{metric}_count{{result=\"{}\"}} {}\n",
+        "{metric}_count{{tenant=\"{}\",result=\"{}\"}} {}\n",
+        tenant,
         escape(sample.key.result),
         sample.count
     ));
@@ -637,11 +700,13 @@ fn render_result_histogram(output: &mut String, metric: &str, sample: &Histogram
 fn render_metadata_histogram(
     output: &mut String,
     metric: &str,
+    tenant: &str,
     sample: &HistogramSample<MetadataOperationKey>,
 ) {
     for (le, value) in REQUEST_DURATION_BUCKETS.iter().zip(sample.buckets.iter()) {
         output.push_str(&format!(
-            "{metric}_bucket{{backend=\"{}\",operation=\"{}\",result=\"{}\",le=\"{}\"}} {}\n",
+            "{metric}_bucket{{tenant=\"{}\",backend=\"{}\",operation=\"{}\",result=\"{}\",le=\"{}\"}} {}\n",
+            tenant,
             escape(sample.key.backend),
             escape(sample.key.operation),
             escape(sample.key.result),
@@ -650,21 +715,24 @@ fn render_metadata_histogram(
         ));
     }
     output.push_str(&format!(
-        "{metric}_bucket{{backend=\"{}\",operation=\"{}\",result=\"{}\",le=\"+Inf\"}} {}\n",
+        "{metric}_bucket{{tenant=\"{}\",backend=\"{}\",operation=\"{}\",result=\"{}\",le=\"+Inf\"}} {}\n",
+        tenant,
         escape(sample.key.backend),
         escape(sample.key.operation),
         escape(sample.key.result),
         sample.count
     ));
     output.push_str(&format!(
-        "{metric}_sum{{backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
+        "{metric}_sum{{tenant=\"{}\",backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
+        tenant,
         escape(sample.key.backend),
         escape(sample.key.operation),
         escape(sample.key.result),
         sample.sum
     ));
     output.push_str(&format!(
-        "{metric}_count{{backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
+        "{metric}_count{{tenant=\"{}\",backend=\"{}\",operation=\"{}\",result=\"{}\"}} {}\n",
+        tenant,
         escape(sample.key.backend),
         escape(sample.key.operation),
         escape(sample.key.result),
@@ -672,10 +740,16 @@ fn render_metadata_histogram(
     ));
 }
 
-fn for_result_counter(output: &mut String, metric: &str, samples: &[CounterSample<ResultKey>]) {
+fn for_result_counter(
+    output: &mut String,
+    metric: &str,
+    tenant: &str,
+    samples: &[CounterSample<ResultKey>],
+) {
     for CounterSample { key, value } in samples {
         output.push_str(&format!(
-            "{metric}{{result=\"{}\"}} {}\n",
+            "{metric}{{tenant=\"{}\",result=\"{}\"}} {}\n",
+            tenant,
             escape(key.result),
             value
         ));

@@ -722,25 +722,45 @@ mod tests {
 
             let active = render_prometheus_metrics_with_registry(&registry);
             assert!(active.contains(
-                "mooncake_store_request_inflight{operation=\"put\",scope=\"foreground\"} 1"
+                "mooncake_store_request_inflight{tenant=\"default\",operation=\"put\",scope=\"foreground\"} 1"
             ));
             assert!(active.contains(
-                "mooncake_store_request_total{operation=\"put\",scope=\"foreground\",result=\"ok\"} 1"
+                "mooncake_store_request_total{tenant=\"default\",operation=\"put\",scope=\"foreground\",result=\"ok\"} 1"
             ));
             assert!(active.contains(
-                "mooncake_store_request_duration_seconds_bucket{operation=\"put\",scope=\"foreground\",result=\"ok\",le=\"+Inf\"} 1"
+                "mooncake_store_request_duration_seconds_bucket{tenant=\"default\",operation=\"put\",scope=\"foreground\",result=\"ok\",le=\"+Inf\"} 1"
             ));
             assert!(active.contains(
-                "mooncake_store_request_bytes_total{operation=\"put\",direction=\"in\",scope=\"foreground\"} 16"
+                "mooncake_store_request_bytes_total{tenant=\"default\",operation=\"put\",direction=\"in\",scope=\"foreground\"} 16"
             ));
             assert!(active.contains(
-                "mooncake_store_request_bytes_total{operation=\"put\",direction=\"out\",scope=\"foreground\"} 8"
+                "mooncake_store_request_bytes_total{tenant=\"default\",operation=\"put\",direction=\"out\",scope=\"foreground\"} 8"
             ));
         }
 
         let idle = render_prometheus_metrics_with_registry(&registry);
-        assert!(idle
-            .contains("mooncake_store_request_inflight{operation=\"put\",scope=\"foreground\"} 0"));
+        assert!(idle.contains(
+            "mooncake_store_request_inflight{tenant=\"default\",operation=\"put\",scope=\"foreground\"} 0"
+        ));
+    }
+
+    #[test]
+    fn prometheus_metrics_include_process_tenant_label() {
+        let _guard = metrics_test_lock().lock();
+        let registry = registry::new_metrics_registry();
+        registry::set_process_tenant_with_registry(&registry, "tenant-a");
+
+        let result: Result<()> = Ok(());
+        OperationTracker::with_registry("put", registry.clone()).finish(&result, 0);
+
+        let metrics = render_prometheus_metrics_with_registry(&registry);
+        assert!(metrics.contains(
+            "mooncake_store_operation_total{tenant=\"tenant-a\",operation=\"put\",status=\"ok\"} 1"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_request_total{tenant=\"tenant-a\",operation=\"put\",scope=\"foreground\",result=\"ok\"} 1"
+        ));
+        assert!(metrics.contains("process_cpu_seconds_total{tenant=\"tenant-a\"}"));
     }
 
     #[test]
@@ -768,13 +788,13 @@ mod tests {
         assert!(fetched.is_some());
         let metrics = render_prometheus_metrics_with_registry(&registry);
         assert!(metrics.contains(
-            "mooncake_store_metadata_operation_total{backend=\"in_memory\",operation=\"upsert_client_lease\",result=\"ok\"} 1"
+            "mooncake_store_metadata_operation_total{tenant=\"default\",backend=\"in_memory\",operation=\"upsert_client_lease\",result=\"ok\"} 1"
         ));
         assert!(metrics.contains(
-            "mooncake_store_metadata_operation_duration_seconds_bucket{backend=\"in_memory\",operation=\"upsert_client_lease\",result=\"ok\",le=\"+Inf\"} 1"
+            "mooncake_store_metadata_operation_duration_seconds_bucket{tenant=\"default\",backend=\"in_memory\",operation=\"upsert_client_lease\",result=\"ok\",le=\"+Inf\"} 1"
         ));
         assert!(metrics.contains(
-            "mooncake_store_metadata_operation_inflight{backend=\"in_memory\",operation=\"upsert_client_lease\"} 0"
+            "mooncake_store_metadata_operation_inflight{tenant=\"default\",backend=\"in_memory\",operation=\"upsert_client_lease\"} 0"
         ));
     }
 
@@ -804,9 +824,11 @@ mod tests {
         registry::record_transport_operation("write", "storage", "error");
 
         let metrics = render_prometheus_metrics();
-        assert!(metrics.contains("mooncake_store_replication_publish_total{result=\"error\"} 1"));
         assert!(metrics.contains(
-            "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"storage\",result=\"error\"} 1"
+            "mooncake_store_replication_publish_total{tenant=\"default\",result=\"error\"} 1"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"write\",peer_kind=\"storage\",result=\"error\"} 1"
         ));
     }
 
@@ -816,23 +838,32 @@ mod tests {
         registry::reset_metrics();
 
         let metrics = render_prometheus_metrics();
-        assert!(metrics.contains("mooncake_store_tenant_quota_reservation_total{result=\"ok\"} 0"));
-        assert!(
-            metrics.contains("mooncake_store_tenant_quota_finalize_total{result=\"conflict\"} 0")
-        );
-        assert!(metrics.contains("mooncake_store_tenant_quota_abort_total{result=\"error\"} 0"));
-        assert!(
-            metrics.contains("mooncake_store_tenant_quota_reconcile_total{result=\"aborted\"} 0")
-        );
-        assert!(metrics.contains("mooncake_store_tenant_local_eviction_total{result=\"miss\"} 0"));
         assert!(metrics.contains(
-            "mooncake_store_preferred_segment_skip_total{source=\"tenant_policy\",reason=\"not_found\"} 0"
+            "mooncake_store_tenant_quota_reservation_total{tenant=\"default\",result=\"ok\"} 0"
         ));
-        assert!(metrics
-            .contains("mooncake_store_rebalance_routes_total{phase=\"migrate\",result=\"ok\"} 0"));
-        assert!(metrics.contains("mooncake_store_rebalance_bytes_total{phase=\"migrate\"} 0"));
         assert!(metrics.contains(
-            "mooncake_store_segment_lifecycle_total{action=\"mount_segment\",result=\"ok\"} 0"
+            "mooncake_store_tenant_quota_finalize_total{tenant=\"default\",result=\"conflict\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_tenant_quota_abort_total{tenant=\"default\",result=\"error\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_tenant_quota_reconcile_total{tenant=\"default\",result=\"aborted\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_tenant_local_eviction_total{tenant=\"default\",result=\"miss\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_preferred_segment_skip_total{tenant=\"default\",source=\"tenant_policy\",reason=\"not_found\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_rebalance_routes_total{tenant=\"default\",phase=\"migrate\",result=\"ok\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_rebalance_bytes_total{tenant=\"default\",phase=\"migrate\"} 0"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_segment_lifecycle_total{tenant=\"default\",action=\"mount_segment\",result=\"ok\"} 0"
         ));
     }
 
@@ -1135,10 +1166,10 @@ mod tests {
 
         let metrics = render_prometheus_metrics_with_registry(&registry);
         assert!(metrics.contains(
-            "mooncake_store_heartbeat_consecutive_failures{runtime=\"runtime-heartbeat:3\"} 2"
+            "mooncake_store_heartbeat_consecutive_failures{tenant=\"default\",runtime=\"runtime-heartbeat:3\"} 2"
         ));
         assert!(metrics.contains(
-            "mooncake_store_heartbeat_last_success_ms{runtime=\"runtime-heartbeat:3\"} 123456"
+            "mooncake_store_heartbeat_last_success_ms{tenant=\"default\",runtime=\"runtime-heartbeat:3\"} 123456"
         ));
     }
 
@@ -1156,10 +1187,10 @@ mod tests {
 
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.contains(
-            "mooncake_store_heartbeat_consecutive_failures{runtime=\"runtime-heartbeat-http:5\"} 4"
+            "mooncake_store_heartbeat_consecutive_failures{tenant=\"default\",runtime=\"runtime-heartbeat-http:5\"} 4"
         ));
         assert!(response.contains(
-            "mooncake_store_heartbeat_last_success_ms{runtime=\"runtime-heartbeat-http:5\"} 456789"
+            "mooncake_store_heartbeat_last_success_ms{tenant=\"default\",runtime=\"runtime-heartbeat-http:5\"} 456789"
         ));
 
         server

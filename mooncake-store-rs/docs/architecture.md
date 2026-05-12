@@ -437,6 +437,9 @@ This avoids continuing to grow one branchy `operation -> counters` map and keeps
 ### Metrics
 
 Metrics are recorded per operation and status.
+Each Prometheus sample carries the process-bound tenant label selected by the
+runtime's default tenant, so dashboards can filter a fully isolated tenant
+without inferring it from pod or process identity.
 
 Examples include:
 

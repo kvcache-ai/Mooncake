@@ -731,7 +731,7 @@ Exporter families:
 - `mooncake_store_checksum_validation_total`, `mooncake_store_replication_publish_duration_seconds`
 - `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`
 
-All metrics use the `mooncake_store_` prefix to reflect the store cluster perspective. Each runtime instance exports its own view through the `/metrics` endpoint regardless of its role (storage node or routed client).
+All Store-RS and process metrics exported by this endpoint include `tenant="<default tenant>"`, where the value is the process-bound tenant selected by `StoreClientBuilder::tenant(...)` or the corresponding compatibility-layer startup option. All Store-RS metric families use the `mooncake_store_` prefix to reflect the store cluster perspective. Each runtime instance exports its own view through the `/metrics` endpoint regardless of its role (storage node or routed client).
 
 Sparse operational counter families emit zero-valued baseline series for their known label set. This makes steady-state dashboards report an explicit zero for tenant quota, tenant-local eviction, preferred-segment skip, rebalance, and segment lifecycle activity until the corresponding real event occurs and increments the counter.
 
@@ -742,11 +742,11 @@ Storage and route-authority clients also record control-plane-derived traffic: r
 Recommended recording queries:
 
 ```promql
-rate(mooncake_store_request_total{operation="get",result="error"}[5m])
-histogram_quantile(0.99, sum by (le, operation) (rate(mooncake_store_request_duration_seconds_bucket[5m])))
-rate(mooncake_store_metadata_operation_total{backend=~"redis|etcd",result!="ok"}[5m])
-histogram_quantile(0.99, sum by (le, backend, operation) (rate(mooncake_store_metadata_operation_duration_seconds_bucket[5m])))
-mooncake_store_segment_used_bytes / mooncake_store_segment_capacity_bytes
+rate(mooncake_store_request_total{tenant="$tenant",operation="get",result="error"}[5m])
+histogram_quantile(0.99, sum by (le, tenant, operation) (rate(mooncake_store_request_duration_seconds_bucket{tenant="$tenant"}[5m])))
+rate(mooncake_store_metadata_operation_total{tenant="$tenant",backend=~"redis|etcd",result!="ok"}[5m])
+histogram_quantile(0.99, sum by (le, tenant, backend, operation) (rate(mooncake_store_metadata_operation_duration_seconds_bucket{tenant="$tenant"}[5m])))
+mooncake_store_segment_used_bytes{tenant="$tenant"} / mooncake_store_segment_capacity_bytes{tenant="$tenant"}
 ```
 
 Infrastructure split:

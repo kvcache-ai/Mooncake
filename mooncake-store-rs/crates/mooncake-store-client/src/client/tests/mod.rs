@@ -2760,21 +2760,23 @@ fn observability_metrics_render_remote_datapaths() {
     assert!(metrics.contains("operation=\"get_remote_batch_chunk\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get_remote_direct\",status=\"ok\""));
     assert!(metrics
-        .contains("mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"}"));
-    assert!(metrics.contains("mooncake_store_replication_publish_total{result=\"ok\"}"));
+        .contains("mooncake_store_replication_publish_duration_seconds_count{tenant=\"default\",result=\"ok\"}"));
+    assert!(metrics
+        .contains("mooncake_store_replication_publish_total{tenant=\"default\",result=\"ok\"}"));
     assert!(metrics.contains(
-        "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"storage\",result=\"ok\"}"
+        "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"write\",peer_kind=\"storage\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_operation_total{direction=\"read\",peer_kind=\"storage\",result=\"ok\"}"
+        "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"read\",peer_kind=\"storage\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"storage\"}"
+        "mooncake_store_transport_bytes_total{tenant=\"default\",direction=\"write\",peer_kind=\"storage\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"storage\"}"
+        "mooncake_store_transport_bytes_total{tenant=\"default\",direction=\"read\",peer_kind=\"storage\"}"
     ));
-    assert!(metrics.contains("mooncake_store_checksum_validation_total{result=\"ok\"}"));
+    assert!(metrics
+        .contains("mooncake_store_checksum_validation_total{tenant=\"default\",result=\"ok\"}"));
 }
 
 #[test]
@@ -10802,7 +10804,7 @@ fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
 
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains(
-        "mooncake_store_preferred_segment_skip_total{source=\"tenant_policy\",reason=\"not_found\"} 2"
+        "mooncake_store_preferred_segment_skip_total{tenant=\"tenant-a\",source=\"tenant_policy\",reason=\"not_found\"} 2"
     ));
 }
 
@@ -13398,15 +13400,16 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
 
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains(
-        "mooncake_store_segment_lifecycle_total{action=\"mount_segment\",result=\"ok\"}"
+        "mooncake_store_segment_lifecycle_total{tenant=\"default\",action=\"mount_segment\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_segment_lifecycle_total{action=\"retire_segment\",result=\"ok\"}"
+        "mooncake_store_segment_lifecycle_total{tenant=\"default\",action=\"retire_segment\",result=\"ok\"}"
     ));
-    assert!(
-        metrics.contains("mooncake_store_rebalance_routes_total{phase=\"migrate\",result=\"ok\"}")
-    );
-    assert!(metrics.contains("mooncake_store_rebalance_bytes_total{phase=\"migrate\"}"));
+    assert!(metrics.contains(
+        "mooncake_store_rebalance_routes_total{tenant=\"default\",phase=\"migrate\",result=\"ok\"}"
+    ));
+    assert!(metrics
+        .contains("mooncake_store_rebalance_bytes_total{tenant=\"default\",phase=\"migrate\"}"));
 }
 
 #[test]
