@@ -273,6 +273,206 @@ TEST_F(PeerClientTest, AsyncReadRemoteDataWithExistingKey) {
 }
 
 // ============================================================================
+// PinKey / UnPinKey (async) — forward read control plane over PeerClient
+// ============================================================================
+
+TEST_F(PeerClientTest, AsyncPinKeyEmptyKey) {
+    PinKeyRequest req;
+    req.key = "";
+    req.target_tier_id = std::nullopt;
+
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(req));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncPinKeyKeyNotFound) {
+    PinKeyRequest req;
+    req.key = "peer_async_pin_missing_key";
+    req.target_tier_id = std::nullopt;
+
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(req));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(PeerClientTest, AsyncPinKeyAfterPut) {
+    const std::string key = "peer_async_pin_after_put";
+    const std::string blob = "payload";
+    auto buf = StringToBuffer(blob);
+    std::vector<Slice> slices{{buf.get(), blob.size()}};
+    auto put = data_manager_->Put(key, slices);
+    ASSERT_TRUE(put.has_value()) << "Put failed";
+    put.value()->Wait();
+
+    PinKeyRequest req;
+    req.key = key;
+    req.target_tier_id = std::nullopt;
+
+    auto pin_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(req));
+    ASSERT_TRUE(pin_res.has_value())
+        << "AsyncPinKey failed: " << static_cast<int>(pin_res.error());
+    EXPECT_GT(pin_res->remote_buffer.size, 0u);
+    EXPECT_NE(pin_res->pin_token.first, 0u);
+    EXPECT_NE(pin_res->pin_token.second, 0u);
+
+    // TransferEngine is not initialized in this unit test, so no TE read
+    // occurs; UnPinKey only drives DataManager pin refcount via RPC.
+    UnPinKeyRequest unpin;
+    unpin.key = key;
+    unpin.pin_token = pin_res->pin_token;
+    auto unpin_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
+    ASSERT_TRUE(unpin_res.has_value())
+        << "AsyncUnPinKey failed: " << static_cast<int>(unpin_res.error());
+}
+
+TEST_F(PeerClientTest, AsyncPinKeyTwiceSameTokenThenUnpinTwice) {
+    const std::string key = "peer_async_pin_twice_ref";
+    const std::string blob = "ref";
+    auto buf = StringToBuffer(blob);
+    std::vector<Slice> slices{{buf.get(), blob.size()}};
+    auto put = data_manager_->Put(key, slices);
+    ASSERT_TRUE(put.has_value());
+    put.value()->Wait();
+
+    PinKeyRequest pin_req;
+    pin_req.key = key;
+    pin_req.target_tier_id = std::nullopt;
+
+    auto first =
+        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(pin_req));
+    ASSERT_TRUE(first.has_value())
+        << "first AsyncPinKey failed: " << static_cast<int>(first.error());
+    auto second =
+        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(pin_req));
+    ASSERT_TRUE(second.has_value())
+        << "second AsyncPinKey failed: " << static_cast<int>(second.error());
+
+    EXPECT_EQ(first->pin_token, second->pin_token);
+
+    // TransferEngine is not initialized in this unit test, so no TE read
+    // occurs; UnPinKey only drives DataManager pin refcount via RPC.
+    UnPinKeyRequest unpin;
+    unpin.key = key;
+    unpin.pin_token = first->pin_token;
+    auto u1 =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
+    ASSERT_TRUE(u1.has_value())
+        << "first AsyncUnPinKey failed: " << static_cast<int>(u1.error());
+
+    auto u2 =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
+    ASSERT_TRUE(u2.has_value())
+        << "second AsyncUnPinKey failed: " << static_cast<int>(u2.error());
+}
+
+TEST_F(PeerClientTest, AsyncPinKeyAfterUnpinNewToken) {
+    const std::string key = "peer_async_pin_new_token_after_unpin";
+    const std::string blob = "tok";
+    auto buf = StringToBuffer(blob);
+    std::vector<Slice> slices{{buf.get(), blob.size()}};
+    auto put = data_manager_->Put(key, slices);
+    ASSERT_TRUE(put.has_value());
+    put.value()->Wait();
+
+    PinKeyRequest pin_req;
+    pin_req.key = key;
+    pin_req.target_tier_id = std::nullopt;
+
+    auto pin1 =
+        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(pin_req));
+    ASSERT_TRUE(pin1.has_value())
+        << "first AsyncPinKey failed: " << static_cast<int>(pin1.error());
+
+    // TransferEngine is not initialized in this unit test, so no TE read
+    // occurs; UnPinKey only drives DataManager pin refcount via RPC.
+    UnPinKeyRequest unpin1;
+    unpin1.key = key;
+    unpin1.pin_token = pin1->pin_token;
+    auto un1 =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin1));
+    ASSERT_TRUE(un1.has_value())
+        << "first AsyncUnPinKey failed: " << static_cast<int>(un1.error());
+
+    auto pin2 =
+        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(pin_req));
+    ASSERT_TRUE(pin2.has_value())
+        << "second AsyncPinKey after unpin failed: "
+        << static_cast<int>(pin2.error());
+    EXPECT_NE(pin1->pin_token, pin2->pin_token);
+
+    UnPinKeyRequest unpin2;
+    unpin2.key = key;
+    unpin2.pin_token = pin2->pin_token;
+    auto un2 =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin2));
+    ASSERT_TRUE(un2.has_value())
+        << "second AsyncUnPinKey failed: " << static_cast<int>(un2.error());
+}
+
+TEST_F(PeerClientTest, AsyncUnPinKeyEmptyKey) {
+    UnPinKeyRequest req;
+    req.key = "";
+    req.pin_token = {1, 2};
+
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(req));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncUnPinKeyZeroToken) {
+    const std::string key = "peer_async_unpin_zero_token";
+    UnPinKeyRequest req;
+    req.key = key;
+    req.pin_token = {0, 0};
+
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(req));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncUnPinKeyWrongTokenAfterPin) {
+    const std::string key = "peer_async_unpin_wrong_token";
+    const std::string blob = "x";
+    auto buf = StringToBuffer(blob);
+    std::vector<Slice> slices{{buf.get(), blob.size()}};
+    auto put = data_manager_->Put(key, slices);
+    ASSERT_TRUE(put.has_value());
+    put.value()->Wait();
+
+    PinKeyRequest pin_req;
+    pin_req.key = key;
+    pin_req.target_tier_id = std::nullopt;
+    auto pin_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(pin_req));
+    ASSERT_TRUE(pin_res.has_value());
+
+    UnPinKeyRequest bad;
+    bad.key = key;
+    bad.pin_token = pin_res->pin_token;
+    bad.pin_token.first += 1;
+    auto bad_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(bad));
+    ASSERT_FALSE(bad_res.has_value());
+    EXPECT_EQ(bad_res.error(), ErrorCode::INVALID_READ);
+
+    UnPinKeyRequest ok;
+    ok.key = key;
+    ok.pin_token = pin_res->pin_token;
+    auto ok_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(ok));
+    ASSERT_TRUE(ok_res.has_value())
+        << "AsyncUnPinKey with correct token failed: "
+        << static_cast<int>(ok_res.error());
+}
+
+// ============================================================================
 // AsyncWriteRemoteData Tests
 // ============================================================================
 
@@ -355,6 +555,215 @@ TEST_F(PeerClientTest, AsyncWriteRemoteDataWithTierId) {
 }
 
 // ============================================================================
+// PreWrite / WriteCommit / WriteRevoke (async)
+// ============================================================================
+
+TEST_F(PeerClientTest, AsyncPreWriteEmptyKey) {
+    PreWriteRequest pre;
+    pre.key = "";
+    pre.size_bytes = 64;
+    // target_tier_id optional; invalid key fails before tier selection.
+
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncPreWrite(pre));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncPreWriteZeroSize) {
+    const std::string key = "peer_async_pre_zero_size";
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 0;
+
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncPreWrite(pre));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncPreWriteValidRequest) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    const std::string key = "peer_async_pre_valid";
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 256;
+    pre.target_tier_id = tier_id;
+
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncPreWrite(pre));
+    ASSERT_TRUE(result.has_value())
+        << "AsyncPreWrite failed: " << static_cast<int>(result.error());
+    EXPECT_GT(result->remote_buffer.size, 0u);
+    EXPECT_NE(result->pending_write_token.first, 0u);
+    EXPECT_NE(result->pending_write_token.second, 0u);
+
+    WriteRevokeRequest revoke;
+    revoke.key = key;
+    revoke.pending_write_token = result->pending_write_token;
+    auto rev = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteRevoke(revoke));
+    ASSERT_TRUE(rev.has_value())
+        << "Cleanup AsyncWriteRevoke failed: " << static_cast<int>(rev.error());
+}
+
+TEST_F(PeerClientTest, AsyncPreWriteWhenObjectAlreadyExists) {
+    const std::string key = "peer_async_pre_key_exists";
+    const std::string blob = "existing";
+    auto buffer = StringToBuffer(blob);
+    std::vector<Slice> put_slices{{buffer.get(), blob.size()}};
+    auto put_result = data_manager_->Put(key, put_slices);
+    ASSERT_TRUE(put_result.has_value()) << "Put failed";
+    put_result.value()->Wait();
+
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 128;
+
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncPreWrite(pre));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+}
+
+TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    const std::string key = "peer_async_commit_after_pre";
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 256;
+    pre.target_tier_id = tier_id;
+
+    auto pre_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
+    ASSERT_TRUE(pre_res.has_value())
+        << "AsyncPreWrite failed: " << static_cast<int>(pre_res.error());
+
+    // TransferEngine is not initialized in this unit test, so no real data-plane
+    // write occurs. Assume the access side has already filled the buffer via TE;
+    // this case only checks WriteCommit RPC / metadata outcome.
+    WriteCommitRequest commit;
+    commit.key = key;
+    commit.pending_write_token = pre_res->pending_write_token;
+    auto commit_res = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteCommit(commit));
+    ASSERT_TRUE(commit_res.has_value())
+        << "AsyncWriteCommit failed: " << static_cast<int>(commit_res.error());
+}
+
+TEST_F(PeerClientTest, AsyncWriteCommitEmptyKey) {
+    WriteCommitRequest commit;
+    commit.key = "";
+    commit.pending_write_token = {1, 2};
+
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteCommit(commit));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncWriteCommitZeroToken) {
+    const std::string key = "peer_async_commit_zero_token";
+    WriteCommitRequest commit;
+    commit.key = key;
+    commit.pending_write_token = {0, 0};
+
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteCommit(commit));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncWriteCommitTokenMismatchAfterPreWrite) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    const std::string key = "peer_async_commit_token_bad";
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 128;
+    pre.target_tier_id = tier_id;
+
+    auto pre_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
+    ASSERT_TRUE(pre_res.has_value());
+
+    WriteCommitRequest commit;
+    commit.key = key;
+    UUID wrong_token = pre_res->pending_write_token;
+    wrong_token.first += 1;
+    commit.pending_write_token = wrong_token;
+
+    auto bad = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteCommit(commit));
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_EQ(bad.error(), ErrorCode::INVALID_WRITE);
+
+    WriteRevokeRequest revoke;
+    revoke.key = key;
+    revoke.pending_write_token = pre_res->pending_write_token;
+    auto rev = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteRevoke(revoke));
+    ASSERT_TRUE(rev.has_value());
+}
+
+TEST_F(PeerClientTest, AsyncWriteRevokeEmptyKey) {
+    WriteRevokeRequest request;
+    request.key = "";
+    request.pending_write_token = {1, 2};
+
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteRevoke(request));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncWriteRevokeZeroToken) {
+    const std::string key = "peer_async_revoke_zero_token";
+    WriteRevokeRequest request;
+    request.key = key;
+    request.pending_write_token = {0, 0};
+
+    auto result = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteRevoke(request));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, AsyncPreWriteThenWriteRevokeIdempotent) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    const std::string key = "peer_async_revoke_after_prewrite";
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 256;
+    pre.target_tier_id = tier_id;
+
+    auto pre_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
+    ASSERT_TRUE(pre_res.has_value())
+        << "AsyncPreWrite failed: " << static_cast<int>(pre_res.error());
+
+    WriteRevokeRequest revoke;
+    revoke.key = key;
+    revoke.pending_write_token = pre_res->pending_write_token;
+    auto rev_res = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteRevoke(revoke));
+    ASSERT_TRUE(rev_res.has_value())
+        << "AsyncWriteRevoke failed: " << static_cast<int>(rev_res.error());
+
+    auto idem =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRevoke(revoke));
+    ASSERT_TRUE(idem.has_value())
+        << "Second AsyncWriteRevoke should be idempotent OK";
+}
+
+// ============================================================================
 // Sync ReadRemoteData Tests (wrappers around async)
 // ============================================================================
 
@@ -413,6 +822,134 @@ TEST_F(PeerClientTest, SyncReadRemoteDataWithExistingKey) {
 }
 
 // ============================================================================
+// Sync PinKey / UnPinKey (wrappers around async)
+// ============================================================================
+
+TEST_F(PeerClientTest, SyncPinKeyEmptyKey) {
+    PinKeyRequest req;
+    req.key = "";
+    req.target_tier_id = std::nullopt;
+
+    auto result = peer_client_->PinKey(req);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, SyncPinKeyAfterPut) {
+    const std::string key = "peer_sync_pin_after_put";
+    const std::string blob = "sync-payload";
+    auto buf = StringToBuffer(blob);
+    std::vector<Slice> slices{{buf.get(), blob.size()}};
+    auto put = data_manager_->Put(key, slices);
+    ASSERT_TRUE(put.has_value());
+    put.value()->Wait();
+
+    PinKeyRequest req;
+    req.key = key;
+    req.target_tier_id = std::nullopt;
+
+    auto pin_res = peer_client_->PinKey(req);
+    ASSERT_TRUE(pin_res.has_value())
+        << "PinKey failed: " << static_cast<int>(pin_res.error());
+    EXPECT_GT(pin_res->remote_buffer.size, 0u);
+
+    // TransferEngine is not initialized in this unit test, so no TE read
+    // occurs; UnPinKey only drives DataManager pin refcount via RPC.
+    UnPinKeyRequest unpin;
+    unpin.key = key;
+    unpin.pin_token = pin_res->pin_token;
+    auto unpin_res = peer_client_->UnPinKey(unpin);
+    ASSERT_TRUE(unpin_res.has_value())
+        << "UnPinKey failed: " << static_cast<int>(unpin_res.error());
+}
+
+TEST_F(PeerClientTest, SyncPinKeyTwiceSameTokenThenUnpinTwice) {
+    const std::string key = "peer_sync_pin_twice_ref";
+    const std::string blob = "ref";
+    auto buf = StringToBuffer(blob);
+    std::vector<Slice> slices{{buf.get(), blob.size()}};
+    auto put = data_manager_->Put(key, slices);
+    ASSERT_TRUE(put.has_value());
+    put.value()->Wait();
+
+    PinKeyRequest pin_req;
+    pin_req.key = key;
+    pin_req.target_tier_id = std::nullopt;
+
+    auto first = peer_client_->PinKey(pin_req);
+    ASSERT_TRUE(first.has_value())
+        << "first PinKey failed: " << static_cast<int>(first.error());
+    auto second = peer_client_->PinKey(pin_req);
+    ASSERT_TRUE(second.has_value())
+        << "second PinKey failed: " << static_cast<int>(second.error());
+
+    EXPECT_EQ(first->pin_token, second->pin_token);
+
+    // TransferEngine is not initialized in this unit test, so no TE read
+    // occurs; UnPinKey only drives DataManager pin refcount via RPC.
+    UnPinKeyRequest unpin;
+    unpin.key = key;
+    unpin.pin_token = first->pin_token;
+    auto u1 = peer_client_->UnPinKey(unpin);
+    ASSERT_TRUE(u1.has_value())
+        << "first UnPinKey failed: " << static_cast<int>(u1.error());
+
+    auto u2 = peer_client_->UnPinKey(unpin);
+    ASSERT_TRUE(u2.has_value())
+        << "second UnPinKey failed: " << static_cast<int>(u2.error());
+}
+
+TEST_F(PeerClientTest, SyncPinKeyAfterUnpinNewToken) {
+    const std::string key = "peer_sync_pin_new_token_after_unpin";
+    const std::string blob = "tok";
+    auto buf = StringToBuffer(blob);
+    std::vector<Slice> slices{{buf.get(), blob.size()}};
+    auto put = data_manager_->Put(key, slices);
+    ASSERT_TRUE(put.has_value());
+    put.value()->Wait();
+
+    PinKeyRequest pin_req;
+    pin_req.key = key;
+    pin_req.target_tier_id = std::nullopt;
+
+    auto pin1 = peer_client_->PinKey(pin_req);
+    ASSERT_TRUE(pin1.has_value())
+        << "first PinKey failed: " << static_cast<int>(pin1.error());
+
+    // TransferEngine is not initialized in this unit test, so no TE read
+    // occurs; UnPinKey only drives DataManager pin refcount via RPC.
+    UnPinKeyRequest unpin1;
+    unpin1.key = key;
+    unpin1.pin_token = pin1->pin_token;
+    auto un1 = peer_client_->UnPinKey(unpin1);
+    ASSERT_TRUE(un1.has_value())
+        << "first UnPinKey failed: " << static_cast<int>(un1.error());
+
+    auto pin2 = peer_client_->PinKey(pin_req);
+    ASSERT_TRUE(pin2.has_value())
+        << "second PinKey after unpin failed: "
+        << static_cast<int>(pin2.error());
+    EXPECT_NE(pin1->pin_token, pin2->pin_token);
+
+    UnPinKeyRequest unpin2;
+    unpin2.key = key;
+    unpin2.pin_token = pin2->pin_token;
+    auto un2 = peer_client_->UnPinKey(unpin2);
+    ASSERT_TRUE(un2.has_value())
+        << "second UnPinKey failed: " << static_cast<int>(un2.error());
+}
+
+TEST_F(PeerClientTest, SyncUnPinKeyZeroToken) {
+    UnPinKeyRequest req;
+    req.key = "peer_sync_unpin_zero";
+    req.pin_token = {0, 0};
+
+    auto result = peer_client_->UnPinKey(req);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+// ============================================================================
 // Sync WriteRemoteData Tests (wrappers around async)
 // ============================================================================
 
@@ -447,6 +984,87 @@ TEST_F(PeerClientTest, SyncWriteRemoteDataValidRequest) {
     auto result = peer_client_->WriteRemoteData(request);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+// ============================================================================
+// Sync PreWrite / WriteCommit / WriteRevoke
+// ============================================================================
+
+TEST_F(PeerClientTest, SyncPreWriteEmptyKey) {
+    PreWriteRequest pre;
+    pre.key = "";
+    pre.size_bytes = 32;
+
+    auto result = peer_client_->PreWrite(pre);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, SyncWriteCommitEmptyKey) {
+    WriteCommitRequest commit;
+    commit.key = "";
+    commit.pending_write_token = {5, 6};
+
+    auto result = peer_client_->WriteCommit(commit);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, SyncWriteCommitAfterPreWrite) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    const std::string key = "peer_sync_commit_after_pre";
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 128;
+    pre.target_tier_id = tier_id;
+
+    auto pre_res = peer_client_->PreWrite(pre);
+    ASSERT_TRUE(pre_res.has_value())
+        << "PreWrite failed: " << static_cast<int>(pre_res.error());
+
+    // TransferEngine is not initialized in this unit test, so no real data-plane
+    // write occurs. Assume the access side has already filled the buffer via TE;
+    // this case only checks WriteCommit RPC / metadata outcome.
+    WriteCommitRequest commit;
+    commit.key = key;
+    commit.pending_write_token = pre_res->pending_write_token;
+    auto commit_res = peer_client_->WriteCommit(commit);
+    ASSERT_TRUE(commit_res.has_value())
+        << "WriteCommit failed: " << static_cast<int>(commit_res.error());
+}
+
+TEST_F(PeerClientTest, SyncWriteRevokeEmptyKey) {
+    WriteRevokeRequest request;
+    request.key = "";
+    request.pending_write_token = {3, 4};
+
+    auto result = peer_client_->WriteRevoke(request);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(PeerClientTest, SyncWriteRevokeAfterPreWrite) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    const std::string key = "peer_sync_revoke_after_prewrite";
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 128;
+    pre.target_tier_id = tier_id;
+
+    auto pre_res = peer_client_->PreWrite(pre);
+    ASSERT_TRUE(pre_res.has_value())
+        << "PreWrite failed: " << static_cast<int>(pre_res.error());
+
+    WriteRevokeRequest revoke;
+    revoke.key = key;
+    revoke.pending_write_token = pre_res->pending_write_token;
+    auto rev_res = peer_client_->WriteRevoke(revoke);
+    ASSERT_TRUE(rev_res.has_value())
+        << "WriteRevoke failed: " << static_cast<int>(rev_res.error());
 }
 
 // ============================================================================
@@ -505,6 +1123,81 @@ TEST_F(PeerClientTest, SyncWriteWithoutConnect) {
         CreateBufferDesc("test_segment", 0x1000, 100));
 
     auto result = unconnected_client.WriteRemoteData(request);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, AsyncPinKeyWithoutConnect) {
+    PeerClient unconnected_client;
+
+    PinKeyRequest req;
+    req.key = "k";
+    req.target_tier_id = std::nullopt;
+
+    auto result =
+        async_simple::coro::syncAwait(unconnected_client.AsyncPinKey(req));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, AsyncUnPinKeyWithoutConnect) {
+    PeerClient unconnected_client;
+
+    UnPinKeyRequest req;
+    req.key = "k";
+    req.pin_token = {1, 1};
+
+    auto result =
+        async_simple::coro::syncAwait(unconnected_client.AsyncUnPinKey(req));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, SyncPinKeyWithoutConnect) {
+    PeerClient unconnected_client;
+
+    PinKeyRequest req;
+    req.key = "k";
+    req.target_tier_id = std::nullopt;
+
+    auto result = unconnected_client.PinKey(req);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, SyncUnPinKeyWithoutConnect) {
+    PeerClient unconnected_client;
+
+    UnPinKeyRequest req;
+    req.key = "k";
+    req.pin_token = {1, 1};
+
+    auto result = unconnected_client.UnPinKey(req);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, AsyncWriteRevokeWithoutConnect) {
+    PeerClient unconnected_client;
+
+    WriteRevokeRequest request;
+    request.key = "test_key";
+    request.pending_write_token = {1, 1};
+
+    auto result = async_simple::coro::syncAwait(
+        unconnected_client.AsyncWriteRevoke(request));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, SyncWriteRevokeWithoutConnect) {
+    PeerClient unconnected_client;
+
+    WriteRevokeRequest request;
+    request.key = "test_key";
+    request.pending_write_token = {2, 2};
+
+    auto result = unconnected_client.WriteRevoke(request);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }

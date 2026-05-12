@@ -622,5 +622,49 @@ TEST_F(P2PClientIntegrationTest, LocalGetBufferHandleWithTeTransferMode) {
     EXPECT_TRUE(unreg_src.has_value());
 }
 
+TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
+    const std::vector<std::string> transfer_modes = {"te", "memcpy"};
+    for (const auto& mode : transfer_modes) {
+        SCOPED_TRACE("local_transfer_mode=" + mode);
+
+        std::string host = "localhost:" + std::to_string(getFreeTcpPort());
+        auto remote_writer = CreateP2PClient(host, /*rpc_port=*/0, mode);
+        ASSERT_NE(remote_writer, nullptr);
+
+        const std::string key = "p2p_fwd_put_get_" + mode + "_" + host;
+        const std::string payload = "forward_payload_" + mode + "_data";
+
+        WriteRouteRequestConfig route;
+        route.allow_local = false;
+        route.prefer_local = false;
+        route.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+
+        WriteConfigExt wcfg(route);
+        wcfg.rdma_direction_mode = RdmaDirectionMode::FORWARD;
+
+        std::vector<Slice> slices;
+        slices.emplace_back(
+            Slice{const_cast<char*>(payload.data()), payload.size()});
+        auto put_res = remote_writer->Put(key, slices, wcfg);
+        ASSERT_TRUE(put_res.has_value())
+            << "Forward Put failed mode=" << mode
+            << " err=" << static_cast<int>(put_res.error());
+
+        ReadConfigExt rcfg;
+        rcfg.route_config.max_candidates =
+            GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+        rcfg.rdma_direction_mode = RdmaDirectionMode::FORWARD;
+
+        std::vector<char> buf(payload.size(), 0);
+        auto get_res = remote_writer->Get(key, {(void*)buf.data()}, {buf.size()},
+                                          rcfg);
+        ASSERT_TRUE(get_res.has_value())
+            << "Forward Get failed mode=" << mode
+            << " err=" << static_cast<int>(get_res.error());
+        EXPECT_EQ(static_cast<size_t>(get_res.value()), payload.size());
+        EXPECT_EQ(std::string(buf.data(), buf.size()), payload);
+    }
+}
+
 }  // namespace testing
 }  // namespace mooncake
