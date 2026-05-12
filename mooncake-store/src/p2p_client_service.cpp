@@ -23,6 +23,7 @@ namespace {
 // "other" errors. INVALID_READ = token mismatch (treat as released for flow).
 // RPC_FAIL = transport/timeout-like (no repeat; owner may TTL-clean). LEASE_EXPIRED
 // = server already expired the pin record.
+// Same max-attempt count is used for WriteRevoke after forward write TE failure.
 constexpr int kForwardReadUnpinMaxAttempts = 3;
 
 bool UnPinErrorTreatAsEffectiveOk(ErrorCode e) {
@@ -30,6 +31,16 @@ bool UnPinErrorTreatAsEffectiveOk(ErrorCode e) {
         case ErrorCode::INVALID_READ:
         case ErrorCode::RPC_FAIL:
         case ErrorCode::LEASE_EXPIRED:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool WriteRevokeErrorTreatAsEffectiveOk(ErrorCode e) {
+    switch (e) {
+        case ErrorCode::INVALID_WRITE:
+        case ErrorCode::RPC_FAIL:
             return true;
         default:
             return false;
@@ -1103,6 +1114,31 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
         base, TotalSliceBytes(*slices), dest,
         Transport::TransferRequest::WRITE);
     if (!te) {
+        LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
+                   << ", error=" << te.error();
+        WriteRevokeRequest revoke_req;
+        revoke_req.key = write_req->key;
+        revoke_req.pending_write_token = pre.value().pending_write_token;
+        tl::expected<void, ErrorCode> revoke_res;
+        for (int attempt = 0; attempt < kForwardReadUnpinMaxAttempts; ++attempt) {
+            revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
+            if (revoke_res) {
+                break;
+            }
+            if (WriteRevokeErrorTreatAsEffectiveOk(revoke_res.error())) {
+                revoke_res = tl::expected<void, ErrorCode>{};
+                break;
+            }
+            if (attempt + 1 < kForwardReadUnpinMaxAttempts) {
+                LOG(WARNING) << "AsyncWriteRevoke retry after TE failure, key="
+                             << write_req->key << ", attempt=" << (attempt + 1)
+                             << ", error=" << revoke_res.error();
+            }
+        }
+        if (!revoke_res) {
+            LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
+                         << write_req->key << ", error=" << revoke_res.error();
+        }
         promise->setValue(tl::make_unexpected(te.error()));
         co_return;
     }

@@ -397,6 +397,48 @@ TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
     }
 }
 
+// WriteRevoke removes pending allocation without committing the object.
+TEST_F(DataManagerTest, WriteRevokeErasesPendingWriteRecord) {
+    const std::string key = "write_revoke_erases_record_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value())
+        << "PreWrite failed: " << toString(prewrite_result.error());
+
+    auto revoke_result =
+        data_manager_->WriteRevoke(key, prewrite_result->pending_write_token);
+    ASSERT_TRUE(revoke_result.has_value())
+        << "WriteRevoke failed: " << toString(revoke_result.error());
+
+    auto& shard = data_manager_->GetPendingWriteShard(key);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        EXPECT_EQ(shard.by_key.count(key), 0U);
+    }
+}
+
+// WriteRevoke: wrong token should not erase the pending record.
+TEST_F(DataManagerTest, WriteRevokeTokenMismatchKeepsPendingWriteRecord) {
+    const std::string key = "write_revoke_token_mismatch_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value())
+        << "PreWrite failed: " << toString(prewrite_result.error());
+
+    UUID wrong_token = prewrite_result->pending_write_token;
+    wrong_token.first += 1;
+    auto wrong_revoke = data_manager_->WriteRevoke(key, wrong_token);
+    ASSERT_FALSE(wrong_revoke.has_value());
+    EXPECT_EQ(wrong_revoke.error(), ErrorCode::INVALID_WRITE);
+
+    auto& shard = data_manager_->GetPendingWriteShard(key);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        auto it = shard.by_key.find(key);
+        ASSERT_NE(it, shard.by_key.end());
+        EXPECT_EQ(it->second.pending_write_token,
+                  prewrite_result->pending_write_token);
+    }
+}
+
 // Test Pin/Unpin: ref_count increments on PinKey and reaches zero on final
 // UnPinKey.
 TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {

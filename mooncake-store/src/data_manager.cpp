@@ -291,27 +291,6 @@ DataManager::PendingWriteEraseResult DataManager::ErasePendingWriteRecord(
     return PendingWriteEraseResult::Erased;
 }
 
-void DataManager::AbortPendingWriteInternal(const KeyCtx& ctx,
-                                            const UUID& write_operation_id) {
-    if (ctx.key.empty() || IsZeroUUID(write_operation_id)) return;
-    auto& pending_write_shard = GetPendingWriteShard(ctx);
-    switch (ErasePendingWriteRecord(pending_write_shard, ctx.key,
-                                    write_operation_id)) {
-        case PendingWriteEraseResult::NotFound:
-            LOG(WARNING)
-                << "AbortPendingWrite: no pending write record for key: "
-                << ctx.key;
-            break;
-        case PendingWriteEraseResult::WriteOperationIdMismatch:
-            LOG(ERROR)
-                << "AbortPendingWrite: write_operation_id mismatch for key: "
-                << ctx.key;
-            break;
-        case PendingWriteEraseResult::Erased:
-            break;
-    }
-}
-
 tl::expected<void, ErrorCode> DataManager::ReservePendingWriteSlot(
     PendingWriteShard& shard, std::string_view key, TimePoint now,
     TimePoint deadline, const UUID& write_operation_id) {
@@ -399,6 +378,39 @@ DataManager::ValidatePendingWriteForCommit(PendingWriteShard& shard,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
     return record_it->second.handle;
+}
+
+tl::expected<void, ErrorCode> DataManager::WriteRevoke(
+    std::string_view key, const UUID& pending_write_token) {
+    return WriteRevokeInternal(BuildKeyCtx(key), pending_write_token);
+}
+
+tl::expected<void, ErrorCode> DataManager::WriteRevokeInternal(
+    const KeyCtx& ctx, const UUID& pending_write_token) {
+    ScopedVLogTimer timer(1, "DataManager::WriteRevoke");
+    timer.LogRequest("key=", ctx.key);
+
+    if (ctx.key.empty() || IsZeroUUID(pending_write_token)) {
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& pending_write_shard = GetPendingWriteShard(ctx);
+    switch (ErasePendingWriteRecord(pending_write_shard, ctx.key,
+                                    pending_write_token)) {
+        case PendingWriteEraseResult::Erased:
+            timer.LogResponse("error_code=", ErrorCode::OK, "record_erased=",
+                              true);
+            return {};
+        case PendingWriteEraseResult::NotFound:
+            timer.LogResponse("error_code=", ErrorCode::OK, "idempotent=",
+                              true);
+            return {};
+        case PendingWriteEraseResult::WriteOperationIdMismatch:
+            timer.LogResponse("error_code=", ErrorCode::INVALID_WRITE);
+            return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+    return {};
 }
 
 void DataManager::ShutdownLeaseScanner() {
@@ -498,7 +510,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         LOG(ERROR) << "SubmitTeTransferInternal failed"
                    << ", key=" << key
                    << ", error_code=" << toString(submit_result.error());
-        AbortPendingWriteInternal(kctx, write_operation_id);
+        (void)WriteRevokeInternal(kctx, write_operation_id);
         return tl::unexpected(submit_result.error());
     }
 
@@ -513,7 +525,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
                 LOG(ERROR) << "WaitAllTransferBatches failed"
                            << ", key=" << kctx.key
                            << ", error_code=" << toString(wait_result.error());
-                AbortPendingWriteInternal(kctx, write_operation_id);
+                (void)WriteRevokeInternal(kctx, write_operation_id);
                 return tl::unexpected(wait_result.error());
             }
 
@@ -530,7 +542,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
                         << "CopyFromDRAMBuffer failed"
                         << ", key=" << kctx.key
                         << ", error_code=" << toString(copy_result.error());
-                    AbortPendingWriteInternal(kctx, write_operation_id);
+                    (void)WriteRevokeInternal(kctx, write_operation_id);
                     return tl::unexpected(copy_result.error());
                 }
             }
@@ -578,7 +590,7 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
         if (!write_result.has_value()) {
             LOG(ERROR) << "Failed to write data for key: " << kctx.key
                        << ", error: " << write_result.error();
-            AbortPendingWriteInternal(kctx, write_operation_id);
+            (void)WriteRevokeInternal(kctx, write_operation_id);
             return tl::make_unexpected(write_result.error());
         }
         return {};
@@ -867,7 +879,7 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     // Transfer phase — no long key lock held.
     auto transfer_result = TransferDataFromRemote(handle, src_buffers);
     if (!transfer_result) {
-        AbortPendingWriteInternal(kctx, write_operation_id);
+        (void)WriteRevokeInternal(kctx, write_operation_id);
         timer.LogResponse("error_code=", transfer_result.error());
         return tl::make_unexpected(transfer_result.error());
     }

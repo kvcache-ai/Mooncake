@@ -61,6 +61,9 @@ class ClientRpcService {
     tl::expected<void, ErrorCode> WriteCommit(
         const WriteCommitRequest& request);
 
+    tl::expected<void, ErrorCode> WriteRevoke(
+        const WriteRevokeRequest& request);
+
     tl::expected<PinKeyResponse, ErrorCode> PinKey(
         const PinKeyRequest& request);
 

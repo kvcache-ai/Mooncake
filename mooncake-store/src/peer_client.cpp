@@ -127,6 +127,31 @@ PeerClient::AsyncWriteCommit(const WriteCommitRequest& request) {
     co_return result->result();
 }
 
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+PeerClient::AsyncWriteRevoke(const WriteRevokeRequest& request) {
+    if (!client_pool_) {
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    auto ret = co_await client_pool_->send_request(
+        [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+            return client.send_request<&ClientRpcService::WriteRevoke>(request);
+        });
+    if (!ret.has_value()) {
+        LOG(ERROR) << "AsyncWriteRevoke: client not available";
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    auto result = co_await std::move(ret.value());
+    if (!result) {
+        LOG(ERROR) << "AsyncWriteRevoke: RPC call failed: "
+                   << result.error().msg;
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    co_return result->result();
+}
+
 async_simple::coro::Lazy<tl::expected<PinKeyResponse, ErrorCode>>
 PeerClient::AsyncPinKey(const PinKeyRequest& request) {
     if (!client_pool_) {
@@ -194,6 +219,11 @@ tl::expected<PreWriteResponse, ErrorCode> PeerClient::PreWrite(
 tl::expected<void, ErrorCode> PeerClient::WriteCommit(
     const WriteCommitRequest& request) {
     return async_simple::coro::syncAwait(AsyncWriteCommit(request));
+}
+
+tl::expected<void, ErrorCode> PeerClient::WriteRevoke(
+    const WriteRevokeRequest& request) {
+    return async_simple::coro::syncAwait(AsyncWriteRevoke(request));
 }
 
 tl::expected<PinKeyResponse, ErrorCode> PeerClient::PinKey(

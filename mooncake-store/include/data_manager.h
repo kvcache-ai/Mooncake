@@ -226,6 +226,13 @@ class DataManager {
     tl::expected<void, ErrorCode> WriteCommit(std::string_view key,
                                               const UUID& write_operation_id);
 
+    /**
+     * @brief Remove pending write record for key + token (no tier Commit).
+     *        Used when forward TE fails after PreWrite on the peer.
+     */
+    tl::expected<void, ErrorCode> WriteRevoke(std::string_view key,
+                                             const UUID& pending_write_token);
+
     tl::expected<PinKeyResponse, ErrorCode> PinKey(
         std::string_view key, std::optional<UUID> tier_id = std::nullopt);
 
@@ -328,9 +335,8 @@ class DataManager {
         const KeyCtx& ctx, std::optional<UUID> tier_id);
     tl::expected<void, ErrorCode> UnPinKeyInternal(
         const KeyCtx& ctx, const UUID& read_operation_id);
-
-    void AbortPendingWriteInternal(const KeyCtx& ctx,
-                                   const UUID& write_operation_id);
+    tl::expected<void, ErrorCode> WriteRevokeInternal(
+        const KeyCtx& ctx, const UUID& write_operation_id);
 
     enum class PendingWriteEraseResult {
         Erased,

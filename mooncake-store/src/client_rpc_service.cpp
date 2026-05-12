@@ -70,6 +70,14 @@ bool IsValidRequest(const WriteCommitRequest& request) {
     return true;
 }
 
+bool IsValidRequest(const WriteRevokeRequest& request) {
+    if (request.key.empty() || IsZeroUuid(request.pending_write_token)) {
+        LOG(ERROR) << "WriteRevokeRequest: invalid key or token";
+        return false;
+    }
+    return true;
+}
+
 bool IsValidRequest(const PinKeyRequest& request) {
     if (request.key.empty()) {
         LOG(ERROR) << "PinKeyRequest: empty key";
@@ -238,6 +246,29 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteCommit(
     return {};
 }
 
+tl::expected<void, ErrorCode> ClientRpcService::WriteRevoke(
+    const WriteRevokeRequest& request) {
+    ScopedVLogTimer timer(1, "ClientRpcService::WriteRevoke");
+    timer.LogRequest("key=", request.key);
+
+    if (!IsValidRequest(request)) {
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto result =
+        data_manager_.WriteRevoke(request.key, request.pending_write_token);
+    if (!result) {
+        LOG(ERROR) << "WriteRevoke failed for key: " << request.key
+                   << ", error: " << toString(result.error());
+        timer.LogResponse("error_code=", result.error());
+        return result;
+    }
+
+    timer.LogResponse("error_code=", ErrorCode::OK);
+    return {};
+}
+
 tl::expected<PinKeyResponse, ErrorCode> ClientRpcService::PinKey(
     const PinKeyRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::PinKey");
@@ -288,6 +319,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
     server.register_handler<&ClientRpcService::WriteRemoteData>(&service);
     server.register_handler<&ClientRpcService::PreWrite>(&service);
     server.register_handler<&ClientRpcService::WriteCommit>(&service);
+    server.register_handler<&ClientRpcService::WriteRevoke>(&service);
     server.register_handler<&ClientRpcService::PinKey>(&service);
     server.register_handler<&ClientRpcService::UnPinKey>(&service);
 }
