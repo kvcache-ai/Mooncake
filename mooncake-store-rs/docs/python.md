@@ -708,7 +708,7 @@ The Python compatibility API treats KV cache data-plane failures as best-effort 
 - `get(...)` and `batch_get(...)` return empty byte payloads on soft failures
 - `get_into(...)`, `batch_get_into(...)`, and `batch_get_into_multi_buffers(...)` return copied lengths and use `-1` for soft misses
 - `put(...)`, `put_from(...)`, `batch_put_from(...)`, and related buffer write APIs return `-1` or per-item negative statuses on true write failures
-- `batch_put_from(...)` reports per-key best-effort statuses; route-CAS conflicts are success when metadata returns or an exact bounded recheck finds an already published active route, preserving insert-if-absent cache semantics under concurrent writers
+- `batch_put_from(...)` reports per-key best-effort statuses from the Rust batch writer; route-CAS conflicts are success when metadata returns or an exact bounded recheck finds an already published active route, preserving insert-if-absent cache semantics under concurrent writers without a Python-side per-key replay loop
 - `batch_is_exist(...)` returns `1` only when an active route has a currently readable replica; stale routes whose owners are quarantined are reported as `0` so cache writers can repopulate them
 - soft-fail downgrade covers transient native exceptions, including metadata and transport errors, at the Python compatibility boundary
 
