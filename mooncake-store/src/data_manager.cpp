@@ -1130,13 +1130,14 @@ tl::expected<size_t, ErrorCode> DataManager::QueryObjectSize(
 }
 
 tl::expected<void, ErrorCode> DataManager::Delete(std::string_view key,
-                                                  std::optional<UUID> tier_id) {
+                                                  std::optional<UUID> tier_id,
+                                                  bool notify_master) {
     ScopedVLogTimer timer(1, "DataManager::Delete");
     timer.LogRequest("key=", key);
 
     std::unique_lock lock(GetKeyLock(key));
 
-    auto result = tiered_backend_->Delete(key, tier_id);
+    auto result = tiered_backend_->Delete(key, tier_id, notify_master);
     if (!result.has_value()) {
         LOG(ERROR) << "Failed to delete key: " << key;
         timer.LogResponse("error_code=", result.error());

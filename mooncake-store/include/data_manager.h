@@ -131,7 +131,8 @@ class DataManager {
     tl::expected<size_t, ErrorCode> QueryObjectSize(std::string_view key);
 
     tl::expected<void, ErrorCode> Delete(
-        std::string_view key, std::optional<UUID> tier_id = std::nullopt);
+        std::string_view key, std::optional<UUID> tier_id = std::nullopt,
+        bool notify_master = true);
 
     /**
      * @brief Get tier views from underlying tiered storage

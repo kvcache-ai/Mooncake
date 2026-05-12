@@ -171,7 +171,8 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
             LOG(WARNING) << "Async ADD rejected by Master, deleting local"
                          << ", key=" << key << ", error=" << error;
             if (data_manager_.has_value()) {
-                auto r = data_manager_->Delete(key, segment_id);
+                auto r = data_manager_->Delete(key, segment_id,
+                                               /*notify_master=*/false);
                 if (!r) {
                     LOG(ERROR) << "Failed to delete local replica"
                                << ", key=" << key << ", error=" << r.error();
