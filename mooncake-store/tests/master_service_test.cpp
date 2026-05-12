@@ -44,6 +44,22 @@ class MasterServiceTest : public ::testing::Test {
         return segment;
     }
 
+#ifdef USE_NOF
+    NoFSegment MakeNoFSegment(
+        std::string name = "test_nof_segment",
+        std::string endpoint = "test_nof_segment_endpoint",
+        size_t base = kDefaultSegmentBase + kDefaultSegmentSize,
+        size_t size = kDefaultSegmentSize) const {
+        NoFSegment segment;
+        segment.id = generate_uuid();
+        segment.name = std::move(name);
+        segment.base = base;
+        segment.size = size;
+        segment.te_endpoint = std::move(endpoint);
+        return segment;
+    }
+#endif
+
     MountedSegmentContext PrepareSimpleSegment(
         MasterService& service, std::string name = "test_segment",
         size_t base = kDefaultSegmentBase,
@@ -406,8 +422,9 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     std::string key = "test_key";
     ReplicateConfig config;
 
-    // Test invalid replica_num
+    // Test invalid replica config
     config.replica_num = 0;
+    config.nof_replica_num = 0;
     auto put_result1 = service_->PutStart(client_id, key, 1024, config);
     EXPECT_FALSE(put_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result1.error());
@@ -417,6 +434,117 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     auto put_result2 = service_->PutStart(client_id, key, 0, config);
     EXPECT_FALSE(put_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
+
+    // Test prefer_alloc_in_same_node with nof replicas
+    config.nof_replica_num = 1;
+    config.prefer_alloc_in_same_node = true;
+    auto put_result3 = service_->PutStart(client_id, key, 1024, config);
+    EXPECT_FALSE(put_result3.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result3.error());
+}
+
+#ifdef USE_NOF
+TEST_F(MasterServiceTest, PutEndAllCompletesMemoryAndNoFReplicas) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
+    NoFSegment nof_segment = MakeNoFSegment();
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountNoFSegment(nof_segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    auto put_start_result = service_->PutStart(client_id, "test_key_all", 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+
+    auto put_end_result =
+        service_->PutEnd(client_id, "test_key_all", ReplicaType::ALL);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    auto get_replica_result = service_->GetReplicaList("test_key_all");
+    ASSERT_TRUE(get_replica_result.has_value());
+
+    bool has_complete_memory = false;
+    bool has_complete_nof = false;
+    for (const auto& replica : get_replica_result->replicas) {
+        if (replica.is_memory_replica() &&
+            replica.status == ReplicaStatus::COMPLETE) {
+            has_complete_memory = true;
+        }
+        if (replica.is_nof_replica() &&
+            replica.status == ReplicaStatus::COMPLETE) {
+            has_complete_nof = true;
+        }
+    }
+    EXPECT_TRUE(has_complete_memory);
+    EXPECT_TRUE(has_complete_nof);
+}
+
+TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
+    NoFSegment nof_segment =
+        MakeNoFSegment("test_nof_segment_2", "test_nof_segment_endpoint_2");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountNoFSegment(nof_segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, "test_key_split", 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+
+    auto put_end_result =
+        service_->PutEnd(client_id, "test_key_split", ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    auto get_replica_result = service_->GetReplicaList("test_key_split");
+    ASSERT_TRUE(get_replica_result.has_value());
+    ASSERT_EQ(get_replica_result->replicas.size(), 1u);
+    EXPECT_TRUE(get_replica_result->replicas[0].is_memory_replica());
+    EXPECT_EQ(get_replica_result->replicas[0].status,
+              ReplicaStatus::COMPLETE);
+
+    auto put_revoke_result =
+        service_->PutRevoke(client_id, "test_key_split", ReplicaType::NOF_SSD);
+    ASSERT_TRUE(put_revoke_result.has_value());
+
+    auto final_replica_result = service_->GetReplicaList("test_key_split");
+    ASSERT_TRUE(final_replica_result.has_value());
+    ASSERT_EQ(final_replica_result->replicas.size(), 1u);
+    EXPECT_TRUE(final_replica_result->replicas[0].is_memory_replica());
+    EXPECT_EQ(final_replica_result->replicas[0].status,
+              ReplicaStatus::COMPLETE);
+}
+
+TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, "test_key_one_plus_one", 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    ASSERT_EQ(put_start_result->size(), 1u);
+    EXPECT_TRUE(put_start_result->front().is_memory_replica());
+}
+#endif
+
+TEST_F(MasterServiceTest, PutStartStrictReplicaCountRequiresAllReplicas) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto put_start_result =
+        service_->PutStart(client_id, "test_key_strict_count", 1024, config);
+    ASSERT_FALSE(put_start_result.has_value());
+    EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
 TEST_F(MasterServiceTest, PutStartEndFlow) {
@@ -3011,8 +3139,8 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(
         *service_, "single_segment", kBaseAddr, kSegmentSize);
 
-    // Request replication factor 2 with a single 1KB slice
-    // With best-effort semantics, should succeed with 1 replica
+    // Request replication factor 2 with a single 1KB slice.
+    // Strict replica-count semantics require PutStart to fail.
     const std::string key = "replication_factor_two_single_segment";
     uint64_t slice_length = 1024;
     ReplicateConfig config;
@@ -3020,17 +3148,8 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
 
     auto put_start_result =
         service_->PutStart(client_id, key, slice_length, config);
-    ASSERT_TRUE(put_start_result.has_value());
-    auto replicas = put_start_result.value();
-
-    // Should get 1 replica instead of the requested 2 (best-effort)
-    EXPECT_EQ(1u, replicas.size());
-    EXPECT_TRUE(replicas[0].is_memory_replica());
-
-    // Verify the replica is properly allocated on the single segment
-    auto mem_desc = replicas[0].get_memory_descriptor();
-    EXPECT_EQ("single_segment", mem_desc.buffer_descriptor.transport_endpoint_);
-    EXPECT_EQ(1024u, mem_desc.buffer_descriptor.size_);
+    ASSERT_FALSE(put_start_result.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_start_result.error());
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTest) {

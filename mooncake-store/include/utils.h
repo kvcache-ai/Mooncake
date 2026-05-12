@@ -294,7 +294,8 @@ constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
  */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+    size_t alignment = facebook::cachelib::Slab::kSize,
+    bool use_spdk_dma = false);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
@@ -394,7 +395,7 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
  *
  * Reserves a single VMA via mmap, divides it into N equal regions,
  * binds each region to the corresponding NUMA node via mbind(MPOL_BIND).
- * No explicit prefault — ibv_reg_mr() will fault and pin pages respecting
+ * No explicit prefault 鈥?ibv_reg_mr() will fault and pin pages respecting
  * the mbind policy, allocating directly on the target NUMA node.
  *
  * @param total_size  Total buffer size in bytes

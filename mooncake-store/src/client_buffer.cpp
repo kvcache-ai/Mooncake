@@ -13,9 +13,9 @@
 namespace mooncake {
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
-    size_t size, const std::string& protocol, bool use_hugepage) {
+    size_t size, const std::string& protocol, bool use_hugepage, bool use_spdk_dma) {
     return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(size, protocol, use_hugepage));
+        new ClientBufferAllocator(size, protocol, use_hugepage, use_spdk_dma));
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
@@ -26,8 +26,8 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
                                              const std::string& protocol,
-                                             bool use_hugepage)
-    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage) {
+                                             bool use_hugepage, bool use_spdk_dma)
+    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage), use_spdk_dma_(use_spdk_dma) {
     if (size == 0) {
         buffer_ = nullptr;
         allocator_ = nullptr;
@@ -38,7 +38,7 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {
-        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
+        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment, use_spdk_dma_);
     }
     if (!buffer_) {
         throw std::bad_alloc();
@@ -132,6 +132,8 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         total_length = disk_descriptor.object_size;
     } else if (replica.is_local_disk_replica()) {
         total_length = replica.get_local_disk_descriptor().object_size;
+    } else if (replica.is_nof_replica()) {
+        total_length = replica.get_nof_descriptor().buffer_descriptor.size_;
     } else {
         total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }
@@ -153,6 +155,10 @@ int allocateSlices(std::vector<Slice>& slices,
     } else if (replica.is_local_disk_replica()) {
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
+    } else if (replica.is_nof_replica()) {
+        auto& handle = replica.get_nof_descriptor().buffer_descriptor;
+        void* chunk_ptr = buffer_ptr;
+        slices.emplace_back(Slice{chunk_ptr, handle.size_});
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors

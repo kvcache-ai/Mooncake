@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
@@ -60,9 +61,18 @@ class MasterService {
     friend class test::SnapshotChildProcessTest;
 
    public:
+    using NoFProbeFn =
+        std::function<bool(const std::string&, uint32_t, std::string*)>;
+
     MasterService();
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
+
+    void SetNoFProbeFnForTesting(NoFProbeFn fn);
+    size_t GetMountedNoFSegmentCountForTesting();
+    bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
+    std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
+        const UUID& segment_id);
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -74,6 +84,18 @@ class MasterService {
      *         ErrorCode::INTERNAL_ERROR on internal errors.
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Mount a NoF SSD segment for buffer allocation. This function is
+     * idempotent.
+     * @return ErrorCode::OK on success,
+     *         ErrorCode::INVALID_PARAMS on invalid parameters,
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment cannot
+     *         be mounted temporarily,
+     *         ErrorCode::INTERNAL_ERROR on internal errors.
+     */
+    auto MountNoFSegment(const NoFSegment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -91,12 +113,35 @@ class MasterService {
                         const UUID& client_id) -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Re-mount NoF SSD segments, invoked when the client is the first time to
+     * connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @return ErrorCode::OK means either all segments are remounted
+     * successfully or the fail is not solvable by a new remount request.
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment cannot
+     *         be mounted temporarily.
+     *         ErrorCode::INTERNAL_ERROR if something temporary error happens.
+     */
+    auto ReMountNoFSegment(const std::vector<NoFSegment>& segments,
+                        const UUID& client_id) -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Unmount a memory segment. This function is idempotent.
      * @return ErrorCode::OK on success,
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
      *         currently unmounting.
      */
     auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Unmount a NoF ssd segment. This function is idempotent.
+     * @return ErrorCode::OK on success,
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
+     *         currently unmounting.
+     */
+    auto UnmountNoFSegment(const UUID& segment_id, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -121,6 +166,21 @@ class MasterService {
      * @return ErrorCode::OK if exists
      */
     auto GetAllSegments() -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
+     * @brief Fetch all mounted NoF segments.
+     * @return std::vector<MountedNoFSegmentSnapshot> on success, error code otherwise.
+     */
+    auto GetAllNoFSegments() -> tl::expected<std::vector<NoFSegment>, ErrorCode>;
+
+    /**
+     * @brief Query mounted NoF segments by segment name and return their
+     * segment ids together with owner client ids.
+     * @param segment_name Mounted NoF segment name.
+     * @return Matching segment owner info list on success, error code otherwise.
+     */
+    auto GetNoFSegmentsByName(const std::string& segment_name)
+        -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>;
 
     /**
      * @brief Query a segment's capacity and used size in bytes.
@@ -231,7 +291,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revoke a batch of put operations
@@ -239,7 +300,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Start an upsert operation. If the key does not exist, behaves
@@ -565,6 +627,8 @@ class MasterService {
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    void NoFBatchEvict(double evict_ratio_target,
+                       double evict_ratio_lowerbound);
 
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
@@ -750,6 +814,32 @@ class MasterService {
             return num_erased > 0;
         }
 
+        size_t EraseReplica(ReplicaType replica_type) {
+            return EraseReplicas([replica_type](const Replica& replica) {
+                if (replica_type == ReplicaType::ALL) {
+                    return replica.is_memory_replica() ||
+                           replica.is_nof_replica();
+                }
+                return replica.type() == replica_type;
+            });
+        }
+
+        bool HasMemReplica() const {
+            return HasReplica(&Replica::fn_is_memory_replica);
+        }
+
+        bool HasNoFReplica() const {
+            return HasReplica(&Replica::fn_is_nof_replica);
+        }
+
+        size_t GetMemReplicaCount() const {
+            return CountReplicas(&Replica::fn_is_memory_replica);
+        }
+
+        size_t GetNoFReplicaCount() const {
+            return CountReplicas(&Replica::fn_is_nof_replica);
+        }
+
         Replica* GetReplicaBySegmentName(const std::string& segment_name) {
             return GetFirstReplica([&segment_name](const Replica& replica) {
                 auto names = replica.get_segment_names();
@@ -931,6 +1021,12 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
+    void NofHeartbeatThreadFunc();
+    bool TryUnmountNoFSegmentByHeartbeat(
+        const MountedNoFSegmentSnapshot& snapshot,
+        const std::string& error_reason);
+    bool ProbeNoFSegment(const std::string& te_endpoint,
+                         std::string* error_reason);
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
                                                       Replica& replica);
@@ -945,6 +1041,8 @@ class MasterService {
         false};  // Set to trigger eviction when not enough space left
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_; // in range [0.0, 1.0]
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -1166,6 +1264,27 @@ class MasterService {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
     const int64_t client_live_ttl_sec_;
+    const std::chrono::seconds nof_heartbeat_interval_sec_;
+    const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
+    const uint32_t nof_heartbeat_failures_threshold_;
+
+    struct NoFHeartbeatState {
+        UUID owner_client_id{0, 0};
+        std::string segment_name;
+        std::string te_endpoint;
+        std::chrono::steady_clock::time_point next_probe_at{};
+        std::chrono::steady_clock::time_point last_success_at{};
+        uint32_t consecutive_failures{0};
+        std::string last_error_reason;
+    };
+    std::mutex nof_heartbeat_mutex_;
+    std::unordered_map<UUID, NoFHeartbeatState, boost::hash<UUID>>
+        nof_heartbeat_states_;
+    std::thread nof_heartbeat_thread_;
+    std::atomic<bool> nof_heartbeat_running_{false};
+    static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
+    mutable std::mutex nof_probe_fn_mutex_;
+    NoFProbeFn nof_probe_fn_;
 
     // if high availability features enabled
     const bool enable_ha_;
@@ -1198,6 +1317,7 @@ class MasterService {
 
     // Segment management
     SegmentManager segment_manager_;
+    NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 

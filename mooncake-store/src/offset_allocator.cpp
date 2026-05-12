@@ -93,15 +93,15 @@ uint32 uintToFloatRoundDown(uint32 size) {
         mantissa = size;
     } else {
         // Normalized: Hidden high bit always 1. Not stored. Just like float.
-        uint32 leadingZeros = lzcnt_nonzero(size);
-        uint32 highestSetBit = 31 - leadingZeros;
+        uint32 leadingZeros = lzcnt_nonzero(size); // size二进制前导0的个数
+        uint32 highestSetBit = 31 - leadingZeros; // size二进制第一个不是0的bit的索引（从0开始）
 
         uint32 mantissaStartBit = highestSetBit - MANTISSA_BITS;
-        exp = mantissaStartBit + 1;
-        mantissa = (size >> mantissaStartBit) & MANTISSA_MASK;
+        exp = mantissaStartBit + 1; // 指数部分
+        mantissa = (size >> mantissaStartBit) & MANTISSA_MASK; // 保留MANTISSA_BITS位，作为尾数
     }
 
-    return (exp << MANTISSA_BITS) | mantissa;
+    return (exp << MANTISSA_BITS) | mantissa; // 将指数部分和尾数部分拼接起来
 }
 
 uint32 floatToUint(uint32 floatValue) {
@@ -352,14 +352,17 @@ void __Allocator::free(OffsetAllocation allocation) {
 
 uint32 __Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset) {
     // Round down to bin index to ensure that bin >= alloc
+    // 将size表示为exp+mantissa的形式
+    // [31:MANTISSA_BITS][MANTISSA_BITS-1:0], the left part is exp, the right part is mantissa
     uint32 binIndex = SmallFloat::uintToFloatRoundDown(size);
 
-    uint32 topBinIndex = binIndex >> TOP_BINS_INDEX_SHIFT;
-    uint32 leafBinIndex = binIndex & LEAF_BINS_INDEX_MASK;
+    uint32 topBinIndex = binIndex >> TOP_BINS_INDEX_SHIFT; // exp, [0,31]
+    uint32 leafBinIndex = binIndex & LEAF_BINS_INDEX_MASK; // matissa, [0,7]
 
     // Bin was empty before?
     if (m_binIndices[binIndex] == Node::unused) {
         // Set bin mask bits
+        // 一共NUM_TOP_BINS（32）个bin，每个bin包含8个leaf
         m_usedBins[topBinIndex] |= 1 << leafBinIndex;
         m_usedBinsTop |= 1 << topBinIndex;
     }
