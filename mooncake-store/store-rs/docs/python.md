@@ -61,6 +61,7 @@ Isolation knobs:
 
 - `keyspace` isolates metadata-backed routing, policy lookup, and object visibility
 - `tenant`, `domain`, and `object_set` select the default namespace scope applied to Python compatibility read/write operations
+- with `classic_te` and Redis-backed transport metadata, the default `tenant` also scopes upstream transfer-engine Redis keys under `mooncake/tenants/<tenant>/...`
 - `worker_scope` isolates compat-local worker state such as the dispatcher executor and local hot-cache domain
 - when `worker_scope` is omitted, the Python layer derives it from `keyspace` when present; otherwise dummy mode falls back to the legacy `worker-1` scope so omitted-scope clients keep matching standalone daemon side-channel aliases
 

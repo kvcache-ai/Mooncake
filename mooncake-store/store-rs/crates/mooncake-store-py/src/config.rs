@@ -241,6 +241,7 @@ impl CompatSetupArgs {
             &protocol,
             transport_rpc_port,
             timeouts,
+            &tenant,
         )?;
         let mut labels = labels;
         if route_topk < 2 {
@@ -327,6 +328,7 @@ fn build_transport_config(
     protocol: &str,
     transport_rpc_port: Option<u16>,
     timeouts: CompatTimeoutConfig,
+    tenant: &str,
 ) -> Result<CompatTransportConfig> {
     match backend {
         TransportBackend::Tent if is_p2p_handshake_metadata(transport_metadata_uri) => {
@@ -347,6 +349,7 @@ fn build_transport_config(
             protocol,
             transport_rpc_port,
             timeouts,
+            tenant,
         )?)),
         TransportBackend::Http => match protocol.to_ascii_lowercase().as_str() {
             "http" | "tcp" | "" | "auto" => Ok(CompatTransportConfig::Http),
@@ -526,6 +529,7 @@ fn build_classic_config(
     protocol: &str,
     transport_rpc_port: Option<u16>,
     timeouts: CompatTimeoutConfig,
+    tenant: &str,
 ) -> Result<ClassicEngineConfig> {
     let (rpc_bind_host, rpc_port) =
         normalize_transport_listen_endpoint(local_hostname, transport_rpc_port)?;
@@ -542,7 +546,8 @@ fn build_classic_config(
     if is_p2p_handshake_metadata(transport_metadata_uri) {
         let mut config = ClassicEngineConfig::new(P2P_HANDSHAKE_METADATA, rpc_bind_host)
             .protocol(protocol)
-            .slice_timeout(timeouts.transfer_stall_timeout);
+            .slice_timeout(timeouts.transfer_stall_timeout)
+            .metadata_cluster_id(classic_metadata_cluster_id(tenant));
         if let Some(rpc_port) = rpc_port {
             config = config.rpc_port(rpc_port);
         }
@@ -564,7 +569,8 @@ fn build_classic_config(
     let metadata_uri = format!("redis://{}:{port}", format_redis_host(host));
     let mut config = ClassicEngineConfig::new(metadata_uri, rpc_bind_host)
         .protocol(protocol)
-        .slice_timeout(timeouts.transfer_stall_timeout);
+        .slice_timeout(timeouts.transfer_stall_timeout)
+        .metadata_cluster_id(classic_metadata_cluster_id(tenant));
     if let Some(rpc_port) = rpc_port {
         config = config.rpc_port(rpc_port);
     }
@@ -581,6 +587,10 @@ fn build_classic_config(
         }
     }
     Ok(config)
+}
+
+fn classic_metadata_cluster_id(tenant: &str) -> String {
+    format!("tenants/{tenant}")
 }
 
 fn duration_from_env_ms(keys: &[&str]) -> Option<Duration> {
@@ -721,6 +731,7 @@ mod tests {
             "tcp",
             None,
             sample_timeouts(),
+            "tenant-a",
         )
         .expect("classic config should build");
         assert_eq!(config.metadata_uri(), "redis://cache.local:6381");
@@ -730,6 +741,7 @@ mod tests {
         assert_eq!(config.redis_username_value(), Some("user"));
         assert_eq!(config.redis_password_value(), Some("pass"));
         assert_eq!(config.redis_db_index_value(), Some("4"));
+        assert_eq!(config.metadata_cluster_id_value(), Some("tenants/tenant-a"));
     }
 
     #[test]
@@ -762,6 +774,7 @@ mod tests {
             "tcp",
             None,
             sample_timeouts(),
+            "tenant-a",
         )
         .expect("classic config should accept p2p handshake metadata");
         assert_eq!(config.metadata_uri(), P2P_HANDSHAKE_METADATA);
@@ -771,6 +784,7 @@ mod tests {
         assert_eq!(config.redis_username_value(), None);
         assert_eq!(config.redis_password_value(), None);
         assert_eq!(config.redis_db_index_value(), None);
+        assert_eq!(config.metadata_cluster_id_value(), Some("tenants/tenant-a"));
     }
 
     #[test]
