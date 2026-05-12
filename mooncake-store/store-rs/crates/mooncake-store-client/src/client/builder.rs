@@ -112,6 +112,7 @@ fn normalize_route_label(local_memory: &LocalMemoryConfig, labels: &mut BTreeMap
 
 pub struct StoreClientBuilder {
     metadata: Arc<dyn MetadataBackend>,
+    metadata_is_tenant_scoped: bool,
     stable_id: ClientStableId,
     compatibility: CompatibilityDescriptor,
     endpoints: ClientEndpointSet,
@@ -137,6 +138,7 @@ impl StoreClientBuilder {
     pub fn new(metadata: Arc<dyn MetadataBackend>, stable_id: impl Into<String>) -> Self {
         Self {
             metadata: crate::observability::observe_metadata_backend(metadata),
+            metadata_is_tenant_scoped: false,
             stable_id: ClientStableId::new(stable_id),
             compatibility: CompatibilityDescriptor::default(),
             endpoints: ClientEndpointSet::default(),
@@ -190,6 +192,11 @@ impl StoreClientBuilder {
     /// It is not itself a tenant-policy authoring surface.
     pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
         self.default_tenant = tenant.into();
+        self
+    }
+
+    pub(crate) fn tenant_scoped_metadata(mut self) -> Self {
+        self.metadata_is_tenant_scoped = true;
         self
     }
 
@@ -334,12 +341,15 @@ impl StoreClientBuilder {
             && published_initial_state != self.initial_state;
 
         let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
+        let runtime_metadata = if self.metadata_is_tenant_scoped {
+            self.metadata.clone()
+        } else {
+            self.metadata
+                .for_tenant(&self.default_tenant)
+                .unwrap_or_else(|| self.metadata.clone())
+        };
         let effective_tenant_policy =
-            resolve_effective_tenant_policy(self.metadata.as_ref(), &default_scope)?;
-        let runtime_metadata = self
-            .metadata
-            .for_tenant(&self.default_tenant)
-            .unwrap_or_else(|| self.metadata.clone());
+            resolve_effective_tenant_policy(runtime_metadata.as_ref(), &default_scope)?;
         let effective_namespace_quota =
             resolved_namespace_quota(&effective_tenant_policy).or(self.namespace_quota.clone());
         let effective_route_policy = route_policy_from_tenant_spec(&effective_tenant_policy);
