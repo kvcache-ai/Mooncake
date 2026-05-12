@@ -149,6 +149,9 @@ TEST_F(TransferTaskTest, TransferStrategyEnum) {
     // Test enum values
     EXPECT_EQ(static_cast<int>(TransferStrategy::LOCAL_MEMCPY), 0);
     EXPECT_EQ(static_cast<int>(TransferStrategy::TRANSFER_ENGINE), 1);
+    EXPECT_EQ(static_cast<int>(TransferStrategy::SPDK_NVMF), 2);
+    EXPECT_EQ(static_cast<int>(TransferStrategy::FILE_READ), 3);
+    EXPECT_EQ(static_cast<int>(TransferStrategy::EMPTY), 4);
 
     // Test stream operator
     std::ostringstream oss;
@@ -158,6 +161,18 @@ TEST_F(TransferTaskTest, TransferStrategyEnum) {
     oss.str("");
     oss << TransferStrategy::TRANSFER_ENGINE;
     EXPECT_EQ(oss.str(), "TRANSFER_ENGINE");
+
+    oss.str("");
+    oss << TransferStrategy::SPDK_NVMF;
+    EXPECT_EQ(oss.str(), "SPDK_NVMF");
+
+    oss.str("");
+    oss << TransferStrategy::FILE_READ;
+    EXPECT_EQ(oss.str(), "FILE_READ");
+
+    oss.str("");
+    oss << TransferStrategy::EMPTY;
+    EXPECT_EQ(oss.str(), "EMPTY");
 }
 
 }  // namespace mooncake

@@ -918,7 +918,7 @@ StorageBackend::EnsureDiskSpace(size_t required_size) {
     const size_t kMaxEvictionAttempts = 1000;
     size_t attempts = 0;
 
-    bool space_reserved = CheckDiskSpace(required_size);
+    bool space_reserved = CheckDiskSpace(required_size); // check if there is enough space for required size
 
     while (!space_reserved && attempts < kMaxEvictionAttempts) {
         FileRecord evicted = EvictFile();
@@ -1313,7 +1313,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
     auto bucket = build_bucket_result.value();
 
-    // Phase 1: eviction — remove oldest buckets from metadata maps to make
+    // Phase 1: eviction 鈥?remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
     const int64_t required_size = bucket->data_size + bucket->meta_size;
     PendingEviction pending = PrepareEviction(required_size);
