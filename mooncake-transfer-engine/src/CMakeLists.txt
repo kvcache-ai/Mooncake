@@ -48,6 +48,7 @@ target_link_libraries(
   PUBLIC base
          transport
          rdma_transport
+         mooncake_common
          ibverbs
          glog::glog
          gflags::gflags
