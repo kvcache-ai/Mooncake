@@ -159,7 +159,8 @@ enum class StorageBackendType {
     kFilePerKey,
     kBucket,
     kOffsetAllocator,
-    kDistributed
+    kDistributed,
+    kNvmeKv,
 };
 
 static constexpr size_t kKB = 1024;

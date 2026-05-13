@@ -15,10 +15,14 @@
 #include <algorithm>
 #include <chrono>
 #include <unordered_set>
+#include <array>
+#include <span>
+#include <string_view>
 
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
+#include "nvme_kv_backend.h"
 #include "utils.h"
 
 #include <ylt/util/tl/expected.hpp>
@@ -3302,6 +3306,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
             }
             return std::make_shared<DistributedStorageBackend>(
                 config, distributed_config, std::move(adapter));
+        }
+        case StorageBackendType::kNvmeKv: {
+            return std::make_shared<NvmeKvStorageBackend>(config);
         }
         default: {
             LOG(ERROR) << "Unsupported backend type: "
