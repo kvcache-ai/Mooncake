@@ -53,7 +53,8 @@ struct ProxyManagerMetrics {
 
     double getThroughputGBps() const {
         uint64_t us = total_latency_us.load();
-        return us > 0 ? (total_bytes_transferred.load() / 1e9) / (us / 1e6) : 0.0;
+        return us > 0 ? (total_bytes_transferred.load() / 1e9) / (us / 1e6)
+                      : 0.0;
     }
 };
 
@@ -73,8 +74,7 @@ class ProxyManager {
    public:
     explicit ProxyManager(TransferEngineImpl* impl,
                           size_t chunk_size = 4 * 1024 * 1024,
-                          size_t chunk_count = 64,
-                          int max_retries = 3);
+                          size_t chunk_count = 64, int max_retries = 3);
 
     ~ProxyManager();
 

@@ -247,7 +247,8 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
 
     auto start_time = std::chrono::steady_clock::now();
     metrics_.total_transfers.fetch_add(1, std::memory_order_relaxed);
-    metrics_.total_bytes_transferred.fetch_add(request.length, std::memory_order_relaxed);
+    metrics_.total_bytes_transferred.fetch_add(request.length,
+                                               std::memory_order_relaxed);
     if (local_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
             local_stage_buffer[i] =
@@ -337,7 +338,8 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                       remote_futures[id]);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT_REMOTE;
-                    metrics_.remote_staging_count.fetch_add(1, std::memory_order_relaxed);
+                    metrics_.remote_staging_count.fetch_add(
+                        1, std::memory_order_relaxed);
                 } else {
                     chunk.state = StageState::CROSS;
                 }
@@ -375,7 +377,8 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                       remote_futures[id]);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT_REMOTE;
-                    metrics_.remote_staging_count.fetch_add(1, std::memory_order_relaxed);
+                    metrics_.remote_staging_count.fetch_add(
+                        1, std::memory_order_relaxed);
                 } else if (request.opcode == Request::READ && local_staging) {
                     chunk.batch = submitLocalStage(request, chunk.local_buf,
                                                    chunk.length, chunk.offset);
@@ -443,19 +446,22 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                     if (!rs.ok()) {
                         if (chunk.retry_count < max_retries_) {
                             chunk.retry_count++;
-                            metrics_.retry_count.fetch_add(1, std::memory_order_relaxed);
-                            LOG(WARNING) << "Remote staging failed for chunk " << id
-                                         << ", retrying (attempt " << chunk.retry_count
-                                         << "/" << max_retries_ << "): " << rs.ToString();
-                            submitRemoteStage(server_addr, request, chunk.remote_buf,
-                                              chunk.length, chunk.offset,
-                                              remote_futures[id]);
+                            metrics_.retry_count.fetch_add(
+                                1, std::memory_order_relaxed);
+                            LOG(WARNING)
+                                << "Remote staging failed for chunk " << id
+                                << ", retrying (attempt " << chunk.retry_count
+                                << "/" << max_retries_
+                                << "): " << rs.ToString();
+                            submitRemoteStage(server_addr, request,
+                                              chunk.remote_buf, chunk.length,
+                                              chunk.offset, remote_futures[id]);
                             event_queue.push(id);
                             break;
                         } else {
-                            LOG(ERROR) << "Remote staging failed for chunk " << id
-                                      << " after " << max_retries_ << " retries: "
-                                      << rs.ToString();
+                            LOG(ERROR) << "Remote staging failed for chunk "
+                                       << id << " after " << max_retries_
+                                       << " retries: " << rs.ToString();
                             chunk.state = StageState::FAILED;
                             event_queue.push(id);
                             break;
@@ -484,7 +490,8 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                           end_time - start_time)
                           .count();
     metrics_.total_latency_us.fetch_add(latency_us, std::memory_order_relaxed);
-    metrics_.pipeline_parallel_chunks.fetch_add(kStageBuffers, std::memory_order_relaxed);
+    metrics_.pipeline_parallel_chunks.fetch_add(kStageBuffers,
+                                                std::memory_order_relaxed);
 
     return Status::OK();
 }
