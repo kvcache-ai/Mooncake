@@ -150,6 +150,62 @@ Each object is stored as an individual file. The file path is derived from the k
 
 A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space within the file is managed by an `OffsetAllocator`. Metadata is sharded across 1024 independent maps to reduce lock contention under high concurrency. Records follow the layout `[key_len: u32 | value_len: u32 | key | value]`.
 
+### NvmeKvStorageBackend
+
+`NvmeKvStorageBackend` stores offloaded objects on NVMe KV devices through the Linux NVMe passthrough ioctl interface. It is intended for environments with real NVMe KV command support. The command behavior follows the NVM Express Key Value Command Set specification: https://nvmexpress.org/specification/key-value-command-set-specification/.
+
+Responsibilities are split as follows:
+
+- `NvmeKvStorageBackend` owns Mooncake-level object layout, catalog metadata, placement, and load/offload orchestration.
+- `NvmeKvConnector` resolves the configured device path and creates the real command executor.
+- `NvmeKvIoctlExecutor` submits NVMe KV commands with `NVME_IOCTL_IO64_CMD`.
+
+Object values are stored as opaque binary NVMe KV values. Mooncake uses a compact binary layout:
+
+- Inline objects: `[NvmeKvObjectHeader][payload]`
+- Large objects: a root manifest value plus chunk values
+
+Mooncake derives a fixed-width 16-byte physical key from each logical object key before submitting NVMe KV commands. This keeps device keys compact and independent of logical key length. Large-object chunks derive independent physical keys from the logical key plus chunk index, so the root manifest and chunks have separate device entries. All 16 physical-key bytes are available to Mooncake; device-specific key interpretation remains inside the NVMe KV device implementation.
+
+The header carries magic/version, object type, payload size, payload checksum, header checksum, and a verification hash derived from the logical object key. The verification hash preserves the logical-key binding in the value itself, so reads can reject hash collisions, stale catalog entries, or corrupted values. The NVMe KV device does not interpret this layout.
+
+This backend is selected with:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=nvme_kv_storage_backend
+```
+
+Required device configuration:
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_NVME_KV_DEVICE_PATH` | unset | Default NVMe character device path used by all NVMe KV device IDs, for example `/dev/<nvme-kv-device>`. |
+| `MOONCAKE_NVME_KV_DEVICE_PATH_<device_id>` | unset | Per-device override. `<device_id>` must contain only letters, digits, or `_` so it maps directly to an environment-variable suffix. If omitted, `MOONCAKE_NVME_KV_DEVICE_PATH` is used. |
+| `MOONCAKE_NVME_KV_DEVICE_IDS` | `default` | Comma-separated logical device IDs used for placement. |
+| `MOONCAKE_NVME_KV_NSID` | `1` | NVMe namespace identifier submitted in ioctl commands for all configured NVMe KV devices. |
+| `MOONCAKE_NVME_KV_TRACE_COMMANDS` | unset | When set to a non-zero value, logs built and completed NVMe KV ioctl commands. |
+
+During initialization, the ioctl executor probes the namespace's NVMe KV format with Identify and uses the reported value-size capability. If probing is unavailable, it uses an internal conservative value-size fallback only for that unprobed path.
+
+Example single-device configuration:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=nvme_kv_storage_backend
+export MOONCAKE_NVME_KV_DEVICE_PATH=/dev/<nvme-kv-device>
+export MOONCAKE_NVME_KV_NSID=1
+```
+
+Example multi-device configuration:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=nvme_kv_storage_backend
+export MOONCAKE_NVME_KV_DEVICE_IDS=dev0,dev1
+export MOONCAKE_NVME_KV_DEVICE_PATH_dev0=/dev/<nvme-kv-device>
+export MOONCAKE_NVME_KV_DEVICE_PATH_dev1=/dev/<second-nvme-kv-device>
+```
+
+The backend requires a configured NVMe KV-capable device path and validates the device during initialization.
+
 ---
 
 ## Eviction (BucketStorageBackend)

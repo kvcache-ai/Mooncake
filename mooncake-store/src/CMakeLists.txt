@@ -12,6 +12,11 @@ set(MOONCAKE_STORE_SOURCES
     mmap_arena.cpp
     master_metric_manager.cpp
     storage_backend.cpp
+    nvme_kv_backend.cpp
+    nvme_kv_connector.cpp
+    nvme_kv_executor_ioctl.cpp
+    nvme_kv_key_codec.cpp
+    nvme_kv_object_layout.cpp
     thread_pool.cpp
     etcd_helper.cpp
     segment.cpp
@@ -161,11 +166,6 @@ if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
-if(URING_LIB AND URING_INCLUDE)
-  target_compile_definitions(mooncake_store PUBLIC USE_URING)
-  target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
-endif()
-
 if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
@@ -257,4 +257,6 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
     target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
     target_link_libraries(mooncake_client PRIVATE ascendcl)
 endif()
+
+
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
