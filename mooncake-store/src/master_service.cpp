@@ -244,6 +244,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
     promotion_on_hit_ = enable_offload_ && config.promotion_on_hit;
     promotion_admission_threshold_ = config.promotion_admission_threshold;
     promotion_queue_limit_ = config.promotion_queue_limit;
+    if (config.promotion_on_hit && !enable_offload_) {
+        LOG(WARNING) << "promotion_on_hit=true was requested but "
+                     << "enable_offload=false; promotion is silently "
+                     << "disabled because it requires offload to produce "
+                     << "LOCAL_DISK replicas. Set enable_offload=true to "
+                     << "use this feature.";
+    }
     if (promotion_on_hit_) {
         promotion_sketch_ = std::make_unique<CountMinSketch>();
         LOG(INFO) << "Promotion-on-hit mode enabled: LOCAL_DISK-only Gets "
@@ -2830,11 +2837,15 @@ void MasterService::TryPushPromotionQueue(const std::string& key) {
         return;
     }
 
-    // Cap gate: cheap stat — read this shard's count under our held RW lock,
-    // which already gives an upper bound that's typically tight enough.
-    // Cluster-wide cap can be added in a follow-up; for v1 the per-shard
-    // count × shard count gives a soft cap.
-    if (shard->promotion_tasks.size() * kNumShards >= promotion_queue_limit_) {
+    // Cap gate: read the cluster-wide in-flight count. Soft cap — a
+    // benign TOCTOU race between this load and the emplace below can let
+    // a few extra tasks slip in, but the per-shard mutex already
+    // serializes inserts within a shard and the dedup gate above prevents
+    // duplicate work, so the worst case is N concurrent inserters across
+    // distinct shards each admitting one extra task. Atomic load is
+    // relaxed because the value is purely advisory.
+    if (promotion_in_flight_.load(std::memory_order_relaxed) >=
+        promotion_queue_limit_) {
         return;
     }
 
@@ -2869,6 +2880,7 @@ void MasterService::TryPushPromotionQueue(const std::string& key) {
                            .alloc_id = 0,
                            .object_size = object_size,
                            .start_time = std::chrono::system_clock::now()});
+    promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     VLOG(1) << "promotion_queued key=" << key << " size=" << object_size;
 }
 
@@ -2953,10 +2965,7 @@ auto MasterService::PromotionAllocStart(
     auto& shard = accessor.GetShard();
     auto task_it = shard->promotion_tasks.find(key);
     if (task_it != shard->promotion_tasks.end()) {
-        // const_cast: promotion_tasks holds const PromotionTask values for
-        // generic safety, but we own the entry under the shard write lock
-        // and need to record the alloc_id post-Allocate.
-        const_cast<PromotionTask&>(task_it->second).alloc_id = new_id;
+        task_it->second.alloc_id = new_id;
     }
     return PromotionAllocStartResponse{std::move(desc)};
 }
@@ -2997,6 +3006,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         source->dec_refcnt();
     }
     shard->promotion_tasks.erase(task_it);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
 
     // Erase the per-client promotion_objects entry (best-effort; the
     // heartbeat may have already drained it).
@@ -3207,13 +3217,23 @@ void MasterService::DiscardExpiredProcessingReplicas(
         task_it = shard->offloading_tasks.erase(task_it);
     }
 
-    // Part 4: Discard expired promotion-on-hit tasks. Drops the source
-    // LOCAL_DISK replica's refcnt and erases the task entry; the per-client
-    // promotion_objects map is best-effort garbage collected on the next
-    // heartbeat (entries for vanished tasks are harmless — the client will
-    // allocate, transfer, then NotifyPromotionSuccess will return
-    // REPLICA_IS_NOT_READY and the new MEMORY replica is reaped via the
-    // discarded-replicas path).
+    // Part 4: Discard expired promotion-on-hit tasks. For each expired
+    // task:
+    //   - Drop the source LOCAL_DISK replica's refcnt so it can be
+    //     evicted normally.
+    //   - If PromotionAllocStart already staged a PROCESSING MEMORY
+    //     replica (alloc_id != 0), pop it via EraseReplicaByID. The
+    //     staged replica is not in shard->processing_keys, so
+    //     DiscardExpiredProcessingReplicas would never reap it; this is
+    //     the only place that does. Without this the buffer leaks until
+    //     the object itself is removed or evicted.
+    //   - Erase the task entry and decrement the global in-flight
+    //     counter.
+    // The per-client promotion_objects map is best-effort garbage
+    // collected on the next heartbeat (entries for vanished tasks are
+    // harmless — the client will allocate, transfer, then
+    // NotifyPromotionSuccess will return REPLICA_IS_NOT_READY since the
+    // task entry is gone).
     for (auto task_it = shard->promotion_tasks.begin();
          task_it != shard->promotion_tasks.end();) {
         const auto ttl =
@@ -3229,9 +3249,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (source != nullptr) {
                 source->dec_refcnt();
             }
+            if (task_it->second.alloc_id != 0) {
+                metadata_it->second.EraseReplicaByID(task_it->second.alloc_id);
+            }
         }
         LOG(WARNING) << "Promotion task expired for key: " << task_it->first;
         task_it = shard->promotion_tasks.erase(task_it);
+        promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     }
 
     if (!discarded_replicas.empty()) {

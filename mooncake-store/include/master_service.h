@@ -1009,7 +1009,7 @@ class MasterService {
             GUARDED_BY(mutex);
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks
             GUARDED_BY(mutex);
-        std::unordered_map<std::string, const PromotionTask> promotion_tasks
+        std::unordered_map<std::string, PromotionTask> promotion_tasks
             GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
@@ -1417,6 +1417,18 @@ class MasterService {
     bool promotion_on_hit_{false};
     uint32_t promotion_admission_threshold_{2};
     uint32_t promotion_queue_limit_{50000};
+    // Global in-flight task counter, checked against promotion_queue_limit_
+    // as the gate cap. A previous per-shard heuristic (shard->size() *
+    // kNumShards) was effectively right for uniform workloads but ~1024x
+    // tight on skewed workloads, where hot keys cluster in a few shards and
+    // would saturate one shard's projection of the cap while the cluster
+    // had near-zero in-flight tasks. Promotion specifically targets skewed
+    // access (hot keys re-accessed after eviction), so the global counter
+    // is the correct primitive. Incremented in TryPushPromotionQueue after
+    // successful enqueue; decremented in NotifyPromotionSuccess and in the
+    // promotion task reaper after the task entry is erased. Relaxed memory
+    // order is safe — the value is an advisory soft cap, not a barrier.
+    std::atomic<uint64_t> promotion_in_flight_{0};
     // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
     // true. CountMinSketch is mutex-protected internally so we can call into it
     // from any GetReplicaList caller without additional locking.

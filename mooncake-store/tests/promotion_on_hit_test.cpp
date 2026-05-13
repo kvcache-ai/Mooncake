@@ -559,8 +559,9 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     auto r1 = service->GetReplicaList(k1);
     ASSERT_TRUE(r1.has_value());
 
-    // Second read on k2 (same shard S, different key, so no dedup) must be
-    // dropped by the cap gate: shard already has 1 task and 1*1024 >= 1.
+    // Second read on k2 (same shard S, different key, so no dedup) must
+    // be dropped by the cap gate: the cluster-wide in-flight counter is
+    // already 1, which meets promotion_queue_limit_ = 1.
     auto r2 = service->GetReplicaList(k2);
     ASSERT_TRUE(r2.has_value()) << "read itself must still succeed; "
                                 << "queue gate is silent";
@@ -569,8 +570,8 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(heartbeat.has_value());
     EXPECT_EQ(heartbeat->size(), 1u)
-        << "queue_limit=1 should cap the same shard at 1 task; "
-        << "k2's enqueue must be dropped";
+        << "promotion_queue_limit=1 should admit only the first task "
+        << "globally; k2's enqueue must be dropped";
     EXPECT_EQ(heartbeat->count(k1), 1u)
         << "k1 was read first and should be the surviving task";
     EXPECT_EQ(heartbeat->count(k2), 0u)
@@ -646,6 +647,142 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
         auto rl = service->GetReplicaList(k);
         ASSERT_TRUE(rl.has_value()) << "key " << k << " should still exist";
     }
+
+    service->RemoveAll();
+}
+
+// Issue 1 regression: the promotion task reaper must pop the staged
+// PROCESSING MEMORY replica added by PromotionAllocStart. Without it,
+// the staged replica was orphaned forever: it's not in
+// shard->processing_keys (so DiscardExpiredProcessingReplicas can't see
+// it) and the previous reaper code only touched the source LOCAL_DISK
+// refcnt and the task entry. The orphan held its allocator buffer
+// indefinitely.
+//
+// We can't observe the staged replica via GetReplicaList because the
+// master filters out PROCESSING entries (clients can only read COMPLETE
+// replicas), so we use QuerySegments to watch the DRAM allocator's used
+// bytes: AllocStart bumps it, and the reaper must return it to baseline.
+// NotifyPromotionSuccess on a reaped task must also fail cleanly.
+TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.put_start_discard_timeout_sec = 0;
+    config.put_start_release_timeout_sec = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
+                                       ctx.segment_name));
+
+    // Baseline allocator usage on the DRAM segment.
+    auto seg_baseline = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_baseline.has_value());
+    const size_t used_baseline = seg_baseline->first;
+
+    // Trigger the gate to enqueue a PromotionTask.
+    {
+        auto r = service->GetReplicaList("k_cold");
+        ASSERT_TRUE(r.has_value());
+    }
+    // Drive the AllocStart side so alloc_id != 0 — this is the exact
+    // setup that left an orphaned PROCESSING MEMORY replica pre-fix.
+    auto alloc = service->PromotionAllocStart("k_cold", 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+
+    // After AllocStart, the DRAM allocator must have committed bytes for
+    // the staged PROCESSING MEMORY replica.
+    auto seg_after_alloc = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_after_alloc.has_value());
+    EXPECT_GT(seg_after_alloc->first, used_baseline)
+        << "PromotionAllocStart should bump segment used bytes "
+        << "(allocator-tracked PROCESSING MEMORY replica)";
+
+    // Sleep past the staleness window; the eviction thread reaps the
+    // task and (with the fix) pops the staged replica via
+    // EraseReplicaByID, which releases the buffer back to the allocator.
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    auto seg_after_reap = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_after_reap.has_value());
+    EXPECT_EQ(seg_after_reap->first, used_baseline)
+        << "after reap: staged PROCESSING MEMORY replica's buffer must "
+        << "be freed back to the DRAM allocator. Pre-fix the buffer "
+        << "leaked and used bytes stayed elevated until the object "
+        << "itself was removed or evicted.";
+
+    // NotifyPromotionSuccess for a reaped task must not commit anything
+    // and must return REPLICA_IS_NOT_READY (the task entry is gone, so
+    // the alloc_id lookup at the top of NotifyPromotionSuccess fails
+    // fast).
+    auto notify = service->NotifyPromotionSuccess(ctx.client_id, "k_cold");
+    ASSERT_FALSE(notify.has_value());
+    EXPECT_EQ(notify.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    service->RemoveAll();
+}
+
+// Issue 2 regression: the cap gate must be cluster-wide. The old
+// implementation used `shard->size() * kNumShards >= promotion_queue_limit_`,
+// which made the cap fire ~1024x too eagerly on skewed workloads (hot
+// keys cluster in few shards). With a global atomic counter, a task in
+// shard A counts toward the cap that gates a task in shard B.
+TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;  // 1 in-flight task globally
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+
+    // Find two keys hashing to *different* shards. With the old per-shard
+    // heuristic this would let both through (each shard's count is 0
+    // independently). With the global counter, only the first goes in.
+    constexpr size_t kNumShardsLocal = 1024;
+    auto shard_of = [](const std::string& k) {
+        return std::hash<std::string>{}(k) % kNumShardsLocal;
+    };
+    const std::string k1 = "xshard_first";
+    std::string k2;
+    for (int i = 0; i < 100000 && k2.empty(); ++i) {
+        std::string candidate = "xshard_other_" + std::to_string(i);
+        if (shard_of(candidate) != shard_of(k1)) {
+            k2 = candidate;
+        }
+    }
+    ASSERT_FALSE(k2.empty()) << "couldn't find a different-shard key";
+    ASSERT_NE(shard_of(k1), shard_of(k2));
+
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k1, 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k2, 1024,
+                                       seg.segment_name));
+
+    auto r1 = service->GetReplicaList(k1);
+    ASSERT_TRUE(r1.has_value());
+
+    // k2 lives in a different shard, but the global cap is already met
+    // by k1's task — k2 must be rejected.
+    auto r2 = service->GetReplicaList(k2);
+    ASSERT_TRUE(r2.has_value()) << "read itself still succeeds";
+
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    EXPECT_EQ(heartbeat->size(), 1u)
+        << "with global cap=1 and one task already in shard " << shard_of(k1)
+        << ", a key hashing to shard " << shard_of(k2)
+        << " must be rejected by the global gate (pre-fix it would have "
+        << "been admitted since its shard's local count was 0)";
+    EXPECT_EQ(heartbeat->count(k1), 1u);
+    EXPECT_EQ(heartbeat->count(k2), 0u);
 
     service->RemoveAll();
 }
