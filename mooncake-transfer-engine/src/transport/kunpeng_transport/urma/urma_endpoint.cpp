@@ -420,13 +420,16 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             return ERR_CONTEXT;
         }
         for (int p = 0; p < MAX_PORT_CNT; p++) {
-            if (dev_attr_.port_attr[p].state == URMA_PORT_ACTIVE) {
+            auto port_attr = dev_attr_.port_attr[p];
+            if (port_attr.state == URMA_PORT_ACTIVE ||
+                port_attr.state == URMA_PORT_ACTIVE_DEFER) {
                 port_ = p;
                 break;
             }
         }
-        if (dev_attr_.port_cnt != 0 &&
-            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE) {
+        if (dev_attr_.port_cnt != 0 && (
+            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE ||
+            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER)) {
             LOG(WARNING) << "Device " << device_name
                          << " not found active port";
             if (urma_delete_context(context)) {
@@ -966,6 +969,8 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
     rjetty.jetty_id.eid = eid;
     rjetty.trans_mode = URMA_TM_RC;
     rjetty.type = URMA_JETTY;
+    rjetty.tp_type = URMA_CTP;
+    rjetty.flag.value = 0;
     LOG(INFO) << "Peer jetty id = " << peer_jetty_num;
     urma_target_jetty_t* imported_jetty =
         urma_import_jetty(context_->urma_context_, &rjetty, &urma_token);

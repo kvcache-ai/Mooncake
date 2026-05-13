@@ -328,6 +328,7 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libllm_datadist*.so \
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
+    --exclude liburma.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)

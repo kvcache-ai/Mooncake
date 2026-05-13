@@ -524,6 +524,21 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ub") {
+            if (!device_names.has_value() || device_names->empty()) {
+                LOG(ERROR) << "ub protocol requires device names when auto "
+                              "discovery is disabled";
+                return ErrorCode::INVALID_PARAMS;
+            }
+            auto deviceName = device_names.value_or("bonding_dev_0");
+            auto devices = splitString(deviceName, ',', true);
+            transfer_engine_->getLocalTopology()->discover(devices);
+            transport = transfer_engine_->installTransport("ub", nullptr);
+            if (!transport) {
+                LOG(ERROR) << "Failed to install ub transport with specified "
+                              "devices";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
