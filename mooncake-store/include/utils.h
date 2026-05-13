@@ -294,7 +294,8 @@ constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
  */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+    size_t alignment = facebook::cachelib::Slab::kSize,
+    bool use_spdk_dma = false);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
