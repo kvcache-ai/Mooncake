@@ -170,30 +170,19 @@ class TestPromotionOnHit(unittest.TestCase):
                 "tuning. Histogram above shows the actual replica state.",
             )
 
-            # Phase 3: clear the admission threshold via per-key reads, and
-            # time each read so we can compare LOCAL_DISK (pre-promotion)
-            # latency against MEMORY (post-promotion) latency in phase 5.
-            #
+            # Phase 3: clear the admission threshold via per-key reads.
             # ``store.get`` goes through ``Client::Query`` → master's
-            # ``GetReplicaList`` (the same trigger ``batch_get_replica_desc``
-            # walks), so each call fires the promotion gate once; 4 calls
-            # comfortably clear any reasonable admission threshold. We also
-            # assert bit-exact bytes back, exercising the LOCAL_DISK
-            # read path end-to-end via the offload-RPC route (this
-            # transitively guards the read-side fix the promotion feature
-            # relies on; reads only return the offloaded bytes if the
-            # peer's offload-RPC + segment-name resolution work).
-            #
-            # All 4 reads complete in well under one heartbeat interval,
-            # so they should all hit LOCAL_DISK before the worker has a
-            # chance to process the promotion (the trigger only enqueues,
-            # it doesn't synchronously stage MEMORY).
+            # ``GetReplicaList``, so each call fires the promotion gate
+            # once; 4 calls comfortably clear any reasonable admission
+            # threshold. We also assert bit-exact bytes back, exercising
+            # the LOCAL_DISK read path end-to-end via the offload-RPC
+            # route (this transitively guards the read-side fix the
+            # promotion feature relies on; reads only return the
+            # offloaded bytes if the peer's offload-RPC + segment-name
+            # resolution work).
             expected_bytes = reference[cold_key]
-            pre_promotion_latencies_ms = []
             for _ in range(4):
-                t0 = time.perf_counter()
                 got = self.store.get(cold_key)
-                t1 = time.perf_counter()
                 self.assertEqual(
                     got,
                     expected_bytes,
@@ -202,7 +191,6 @@ class TestPromotionOnHit(unittest.TestCase):
                     f"expected len={len(expected_bytes)}). The LOCAL_DISK "
                     f"read path is broken — promotion cannot be tested.",
                 )
-                pre_promotion_latencies_ms.append((t1 - t0) * 1000.0)
 
             # Phase 4: wait for the master to enqueue the promotion task and
             # for the client's next FileStorage heartbeat to execute it.
@@ -228,87 +216,34 @@ class TestPromotionOnHit(unittest.TestCase):
             # offload_rpc_read_count counts every invocation of
             # batch_get_into_offload_object_internal — the single
             # chokepoint for LOCAL_DISK reads served via peer offload-RPC.
-            # We snapshot the counter, do N timed reads, then assert the
-            # counter didn't move. Bytes-back alone wouldn't distinguish
-            # MEMORY from LOCAL_DISK (the offload-RPC path returns correct
-            # bytes too), but the counter delta and the latency drop both
-            # serve as orthogonal evidence the MEMORY path was used.
-            N_POST_READS = 10
+            # We snapshot the counter, do a read, then assert the counter
+            # didn't move. Bytes-back alone wouldn't distinguish MEMORY
+            # from LOCAL_DISK (the offload-RPC path returns correct bytes
+            # too); the counter delta is the hard correctness signal that
+            # the MEMORY path was used. The BenchPromotionLatency class
+            # below offers a heavier latency-based view of the same
+            # invariant when richer numbers are wanted.
             offload_count_before = self.store.get_offload_rpc_read_count()
-            post_promotion_latencies_ms = []
-            for _ in range(N_POST_READS):
-                t0 = time.perf_counter()
-                got = self.store.get(cold_key)
-                t1 = time.perf_counter()
-                self.assertEqual(
-                    got,
-                    expected_bytes,
-                    f"post-promotion store.get on {cold_key} returned wrong "
-                    f"bytes; the new MEMORY replica is metadata-visible but "
-                    f"not byte-correct. NotifyPromotionSuccess flipped "
-                    f"PROCESSING -> COMPLETE before the TE write finished, "
-                    f"or the TE write landed at the wrong address.",
-                )
-                post_promotion_latencies_ms.append((t1 - t0) * 1000.0)
+            self.assertEqual(
+                self.store.get(cold_key),
+                expected_bytes,
+                f"post-promotion store.get on {cold_key} returned wrong "
+                f"bytes; the new MEMORY replica is metadata-visible but "
+                f"not byte-correct. NotifyPromotionSuccess flipped "
+                f"PROCESSING -> COMPLETE before the TE write finished, "
+                f"or the TE write landed at the wrong address.",
+            )
             offload_count_after = self.store.get_offload_rpc_read_count()
             self.assertEqual(
                 offload_count_after,
                 offload_count_before,
-                f"{N_POST_READS} post-promotion store.get calls on "
-                f"{cold_key} bumped the offload-RPC counter from "
-                f"{offload_count_before} to {offload_count_after}: at "
-                f"least one served from LOCAL_DISK SSD instead of the "
-                f"freshly-promoted MEMORY replica. The RFC's 'subsequent "
-                f"reads avoid SSD' invariant is broken; check "
-                f"SelectBestReplica preference and the post-promotion "
-                f"replica order in metadata.",
-            )
-
-            # Empirical latency comparison: LOCAL_DISK reads go through
-            # an offload-RPC roundtrip + peer SSD/file backend read,
-            # MEMORY reads go through TE directly to DRAM. Observed
-            # speedup is 10–50x on real SSDs + RDMA NIC. On docker tmpfs
-            # with small objects most wall-time is Python/C++ marshalling
-            # overhead, so the SSD-vs-DRAM cost gap shrinks to ~2-3x;
-            # we therefore assert only a modest 1.3x median speedup, just
-            # tight enough to catch a regression where MEMORY isn't being
-            # preferred (in that case the offload-RPC counter assertion
-            # above would fire first) but loose enough to survive noisy
-            # CI. The printed summary is the primary empirical signal.
-            pre_median_ms = statistics.median(pre_promotion_latencies_ms)
-            post_median_ms = statistics.median(post_promotion_latencies_ms)
-            pre_min_ms = min(pre_promotion_latencies_ms)
-            pre_max_ms = max(pre_promotion_latencies_ms)
-            post_min_ms = min(post_promotion_latencies_ms)
-            post_max_ms = max(post_promotion_latencies_ms)
-            speedup = (pre_median_ms / post_median_ms
-                       if post_median_ms > 0 else float("inf"))
-            print()
-            print(f"=== promotion latency comparison "
-                  f"(cold_key={cold_key}) ===")
-            print(
-                f"pre-promotion  (LOCAL_DISK via offload-RPC): "
-                f"n={len(pre_promotion_latencies_ms)}, "
-                f"median={pre_median_ms:.2f} ms, "
-                f"min={pre_min_ms:.2f} ms, max={pre_max_ms:.2f} ms"
-            )
-            print(
-                f"post-promotion (MEMORY direct):              "
-                f"n={len(post_promotion_latencies_ms)}, "
-                f"median={post_median_ms:.2f} ms, "
-                f"min={post_min_ms:.2f} ms, max={post_max_ms:.2f} ms"
-            )
-            print(f"speedup: {speedup:.1f}x")
-            self.assertLess(
-                post_median_ms,
-                pre_median_ms / 1.3,
-                f"post-promotion median latency ({post_median_ms:.2f} ms) "
-                f"is not meaningfully lower than pre-promotion median "
-                f"({pre_median_ms:.2f} ms). Promotion should produce at "
-                f"least a 1.3x latency improvement even on docker tmpfs; "
-                f"hitting this assertion means MEMORY is likely not being "
-                f"preferred by SelectBestReplica or the test setup is "
-                f"broken (real-hardware speedup is typically 10–50x).",
+                f"post-promotion store.get on {cold_key} bumped the "
+                f"offload-RPC counter from {offload_count_before} to "
+                f"{offload_count_after}: it served from LOCAL_DISK SSD, "
+                f"not the freshly-promoted MEMORY replica. The RFC's "
+                f"'subsequent reads avoid SSD' invariant is broken; "
+                f"check SelectBestReplica preference and the post-"
+                f"promotion replica order in metadata.",
             )
         finally:
             for key in keys:
@@ -366,6 +301,183 @@ class TestPromotionDoesNotFire(unittest.TestCase):
                 f"or LOCAL_DISK replicas: {unexpected[:5]}. Either "
                 f"eviction is firing prematurely or PutEnd is auto-"
                 f"creating LOCAL_DISK.",
+            )
+        finally:
+            for key in keys:
+                try:
+                    self.store.remove(key)
+                except Exception:
+                    pass
+            time.sleep(default_kv_lease_ttl / 1000 + 0.5)
+
+
+@unittest.skipUnless(
+    os.getenv("MC_BENCH_PROMOTION_LATENCY"),
+    "opt-in benchmark — set MC_BENCH_PROMOTION_LATENCY=1 to run. "
+    "Not part of CI; gives p50/p95/p99 latency comparison of LOCAL_DISK "
+    "reads (pre-promotion) vs MEMORY reads (post-promotion).",
+)
+class BenchPromotionLatency(unittest.TestCase):
+    """Ad-hoc latency benchmark for the L2->L1 promotion feature.
+
+    Runs the same overflow → eviction → promote workflow as
+    ``TestPromotionOnHit`` but:
+      - times every read with ``time.perf_counter``;
+      - aborts the pre-promotion sample loop the moment a read serves
+        from MEMORY (detected via the offload-RPC counter) to keep the
+        LOCAL_DISK distribution uncontaminated;
+      - prints p50/p95/p99 + min/max for both phases and a per-percentile
+        speedup table;
+      - asserts a conservative 1.3x p50 speedup so a regression where
+        MEMORY isn't being preferred breaks the bench.
+
+    Sample size is controlled by ``LATENCY_SAMPLES`` (default 1000).
+    For larger samples (e.g. N=10000) bump
+    ``MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS`` so the worker
+    doesn't race the pre-promotion read loop.
+
+    Expected speedup on docker tmpfs with 1 MiB objects is ~2x at every
+    percentile (most wall-time is Python/C++ marshalling, not the
+    SSD-vs-DRAM cost gap). On real SSDs + RDMA NICs expect 10-50x.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.store = MooncakeDistributedStore()
+        get_client(cls.store)
+
+    def test_latency_comparison(self):
+        VALUE_SIZE = 1024 * 1024  # 1 MB
+        NUM_KEYS = 96
+
+        timestamp = int(time.time())
+        keys = [f"bench_poh_{i}_{timestamp}" for i in range(NUM_KEYS)]
+        reference = {}
+
+        try:
+            # Overflow DRAM, force offload-on-evict.
+            for key in keys:
+                value = os.urandom(VALUE_SIZE)
+                if self.store.put(key, value) == 0:
+                    reference[key] = value
+            self.assertGreater(len(reference), 0)
+
+            time.sleep(PROMOTION_WAIT_SECONDS)
+
+            descs = self.store.batch_get_replica_desc(list(reference.keys()))
+            cold_key = None
+            for key in reference.keys():
+                types = _replica_types(descs, key)
+                if (
+                    cold_key is None
+                    and types
+                    and all("MEMORY" not in t for t in types)
+                    and any("LOCAL_DISK" in t for t in types)
+                ):
+                    cold_key = key
+            self.assertIsNotNone(cold_key, "no LOCAL_DISK-only key after eviction")
+
+            # Pre-promotion: timed LOCAL_DISK reads, bail when a read
+            # serves from MEMORY (= worker raced the loop).
+            N = int(os.getenv("LATENCY_SAMPLES", "1000"))
+            expected_bytes = reference[cold_key]
+            pre_latencies_ms = []
+            for i in range(N):
+                count_before = self.store.get_offload_rpc_read_count()
+                t0 = time.perf_counter()
+                got = self.store.get(cold_key)
+                t1 = time.perf_counter()
+                count_after = self.store.get_offload_rpc_read_count()
+                self.assertEqual(got, expected_bytes)
+                if count_after == count_before:
+                    print(
+                        f"  pre-promotion loop: promotion fired at "
+                        f"sample {i}/{N}; stopping to keep the "
+                        f"LOCAL_DISK sample uncontaminated"
+                    )
+                    break
+                pre_latencies_ms.append((t1 - t0) * 1000.0)
+            self.assertGreater(
+                len(pre_latencies_ms),
+                1,
+                "collected <2 pre-promotion samples — promotion fired "
+                "before measurement could capture LOCAL_DISK latency. "
+                "Bump MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS or "
+                "lower LATENCY_SAMPLES.",
+            )
+
+            # Wait for promotion to complete.
+            time.sleep(PROMOTION_WAIT_SECONDS)
+            descs_after = self.store.batch_get_replica_desc([cold_key])
+            types_after = _replica_types(descs_after, cold_key)
+            self.assertIn("MEMORY", types_after)
+
+            # Post-promotion: timed MEMORY reads; the counter must stay
+            # put (otherwise at least one read still hit LOCAL_DISK).
+            count_before = self.store.get_offload_rpc_read_count()
+            post_latencies_ms = []
+            for _ in range(N):
+                t0 = time.perf_counter()
+                got = self.store.get(cold_key)
+                t1 = time.perf_counter()
+                self.assertEqual(got, expected_bytes)
+                post_latencies_ms.append((t1 - t0) * 1000.0)
+            count_after = self.store.get_offload_rpc_read_count()
+            self.assertEqual(
+                count_after,
+                count_before,
+                f"post-promotion reads bumped the offload-RPC counter "
+                f"from {count_before} to {count_after}: at least one "
+                f"read served from LOCAL_DISK SSD instead of MEMORY.",
+            )
+
+            def _pcts(samples):
+                """{p: value_ms} for p in [50, 95, 99]."""
+                if len(samples) >= 2:
+                    cuts = statistics.quantiles(samples, n=100)
+                    return {50: cuts[49], 95: cuts[94], 99: cuts[98]}
+                v = samples[0] if samples else 0.0
+                return {50: v, 95: v, 99: v}
+
+            def _speedup(a, b):
+                return a / b if b > 0 else float("inf")
+
+            pre = _pcts(pre_latencies_ms)
+            post = _pcts(post_latencies_ms)
+
+            print()
+            print(f"=== promotion latency comparison "
+                  f"(cold_key={cold_key}) ===")
+            print(
+                f"pre-promotion  (LOCAL_DISK via offload-RPC): "
+                f"n={len(pre_latencies_ms)}, "
+                f"p50={pre[50]:.2f} ms, p95={pre[95]:.2f} ms, "
+                f"p99={pre[99]:.2f} ms, "
+                f"min={min(pre_latencies_ms):.2f} ms, "
+                f"max={max(pre_latencies_ms):.2f} ms"
+            )
+            print(
+                f"post-promotion (MEMORY direct):              "
+                f"n={len(post_latencies_ms)}, "
+                f"p50={post[50]:.2f} ms, p95={post[95]:.2f} ms, "
+                f"p99={post[99]:.2f} ms, "
+                f"min={min(post_latencies_ms):.2f} ms, "
+                f"max={max(post_latencies_ms):.2f} ms"
+            )
+            print(
+                f"speedup: p50={_speedup(pre[50], post[50]):.1f}x  "
+                f"|  p95={_speedup(pre[95], post[95]):.1f}x  "
+                f"|  p99={_speedup(pre[99], post[99]):.1f}x"
+            )
+
+            self.assertLess(
+                post[50],
+                pre[50] / 1.3,
+                f"post-promotion p50 latency ({post[50]:.2f} ms) is not "
+                f"meaningfully lower than pre-promotion p50 "
+                f"({pre[50]:.2f} ms). Real-hardware speedup is typically "
+                f"10–50x; failing this 1.3x check means MEMORY likely "
+                f"isn't being preferred.",
             )
         finally:
             for key in keys:
