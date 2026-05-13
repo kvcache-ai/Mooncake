@@ -26,6 +26,7 @@ RUN apt-get install -y libibverbs-dev \
     libzstd-dev \
     libmsgpack-dev \
     libgflags-dev \
+    libxxhash-dev \
     pkg-config \
     patchelf
 

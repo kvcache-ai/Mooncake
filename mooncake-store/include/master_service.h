@@ -598,10 +598,12 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin, bool enable_hard_pin = false)
+            bool enable_soft_pin, bool enable_hard_pin = false,
+            ObjectDataType data_type_ = ObjectDataType::UNKNOWN)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
+              data_type(data_type_),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -624,6 +626,7 @@ class MasterService {
         // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+        const ObjectDataType data_type{ObjectDataType::UNKNOWN};
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -1040,7 +1043,8 @@ class MasterService {
 
         void Create(const UUID& client_id, uint64_t total_length,
                     std::vector<Replica> replicas, bool enable_soft_pin,
-                    bool enable_hard_pin = false) {
+                    bool enable_hard_pin = false,
+                    ObjectDataType data_type = ObjectDataType::UNKNOWN) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -1049,7 +1053,7 @@ class MasterService {
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
                                       std::move(replicas), enable_soft_pin,
-                                      enable_hard_pin));
+                                      enable_hard_pin, data_type));
             it_ = result.first;
         }
 
