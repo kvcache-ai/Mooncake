@@ -407,12 +407,6 @@ impl StoreClient {
         let rank_result = planner.rank_many(self, &object_refs);
         rank_tracker.finish(&rank_result, 0);
         let plans = rank_result?;
-        let abort_prepared_quota = |entries: &[PreparedObjectWrite<'_>], context: &str| {
-            for entry in entries {
-                let _ =
-                    self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
-            }
-        };
         let release_prepared = |entries: &[PreparedObjectWrite<'_>], context: &str| {
             for entry in entries {
                 let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
@@ -420,7 +414,7 @@ impl StoreClient {
                     self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
             }
         };
-        let (routes, prepared) = loop {
+        let (routes, _prepared) = loop {
             write_attempt = write_attempt.saturating_add(1);
             self.flush_due_reclaims()?;
 
@@ -797,7 +791,12 @@ impl StoreClient {
             let mut refreshed = false;
             loop {
                 let attempt_result = (|| {
+                    struct BatchWriteOutcome {
+                        returned: Vec<ObjectRoute>,
+                    }
+
                     struct RemoteBatchWrite<'a> {
+                        route_index: usize,
                         tenant: &'a str,
                         value: &'a [u8],
                         registered_source: Option<*mut c_void>,
@@ -813,300 +812,628 @@ impl StoreClient {
                         info: SegmentInfo,
                     }
 
+                    struct InFlightRemoteChunk {
+                        batch_id: u64,
+                        route_indices: Vec<usize>,
+                        tenant: String,
+                        item_count: usize,
+                        transfer_count: usize,
+                        remote_bytes: u64,
+                        target_summary: String,
+                        request_deadline: RequestDeadline,
+                        _scratch: Option<ScratchReservation>,
+                    }
+
                     let mut routes = Vec::with_capacity(prepared.len());
                     let mut remote_writes = Vec::new();
+                    let mut local_ready = Vec::new();
                     let mut checked_runtimes = BTreeSet::new();
-                    for (entry, current) in prepared.iter().zip(current_routes.iter().cloned()) {
-                let checksum = payload_checksum(entry.value);
-                let mut replicas = Vec::with_capacity(entry.targets.len());
-                let mut remote_requests = Vec::new();
-                for (priority, (target, reservation)) in entry
-                    .targets
-                    .iter()
-                    .zip(entry.reservations.iter())
-                    .enumerate()
-                {
-                    let is_local = target.storage_runtime == self.lease.runtime
-                        && self
-                            .state
-                            .lock()
-                            .memory_ref()
-                            .map(|memory| memory.has_storage_segment(&target.segment_name))
-                            .unwrap_or(false);
-                    if is_local {
-                        let addr = {
-                            let state = self.state.lock();
-                            state.memory_ref()?.storage_address(
-                                &target.segment_name,
-                                reservation.offset_bytes as usize,
-                            )?
-                        };
-                        unsafe {
-                            ptr::copy_nonoverlapping(
-                                entry.value.as_ptr(),
-                                addr.cast::<u8>(),
-                                entry.value.len(),
+                    let mut completed = vec![false; prepared.len()];
+                    let fail = |error: StoreError, completed: &[bool]| {
+                        for (index, entry) in prepared.iter().enumerate() {
+                            if completed[index] {
+                                continue;
+                            }
+                            let _ = self
+                                .release_reserved_allocations(&entry.targets, &entry.reservations);
+                            let _ = self.abort_tenant_quota_reservation(
+                                entry.quota_reservation.as_ref(),
+                                "batch_put_failed_before_publish",
                             );
                         }
-                    } else {
-                        if target.storage_runtime != self.lease.runtime
-                            && checked_runtimes.insert(target.storage_runtime.clone())
-                        {
-                            self.ensure_remote_runtime_reachable(
-                                &target.storage_runtime,
-                                &target.segment_name.0,
-                            )?;
-                        }
-                        let (handle, info) = {
-                            let mut state = self.state.lock();
-                            state.open_segment_with_info(transport, &target.segment_name.0)?
-                        };
-                        let target_offset = Self::storage_target_offset(
-                            &target.target_chunks,
-                            &target.segment_name,
-                            reservation.offset_bytes,
-                            entry.value.len() as u64,
-                        )?;
-                        remote_requests.push(RemoteBatchTarget {
-                            owner: target.storage_runtime.clone(),
-                            segment_name: target.segment_name.clone(),
-                            segment: handle,
-                            offset: target_offset,
-                            length: entry.value.len() as u64,
-                            info,
-                        });
+                        (error, completed.iter().any(|done| *done))
                     };
-                    replicas.push(ReplicaRoute {
-                        owner: target.storage_runtime.clone(),
-                        segment_name: target.segment_name.clone(),
-                        segment_offset: reservation.offset_bytes,
-                        length: entry.value.len() as u64,
-                        checksum: Some(checksum),
-                        tier: ReplicaTier::Dram,
-                        priority: priority as u16,
-                    });
-                }
-                if !remote_requests.is_empty() {
-                    remote_writes.push(RemoteBatchWrite {
-                        tenant: entry.value_tenant(),
-                        value: entry.value,
-                        registered_source: entry.registered_source,
-                        requests: remote_requests,
-                    });
-                }
-
-                let expected_version = current.as_ref().map(|route| route.version);
-                let next_version = current
-                    .as_ref()
-                    .map(|route| route.version.next())
-                    .unwrap_or(RouteVersion(1));
-                let mut route = ObjectRoute {
-                    key: entry.scoped_key.clone(),
-                    namespace: None,
-                    logical_key: None,
-                    canonical_key: None,
-                    sharing_scope: None,
-                    qos_tier: None,
-                    version: next_version,
-                    state: RouteState::Active,
-                    compatibility: self.lease.compatibility.clone(),
-                    replicas,
-                };
-                mooncake_store_core::apply_route_identity(&mut route, &entry.object_id);
-                route.qos_tier = Some(
-                    entry
-                        .qos_tier
-                        .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
-                        .to_string(),
-                );
-                routes.push(PendingRoutePublish {
-                    key: entry.scoped_key.clone(),
-                    expected_version,
-                    previous: current,
-                    quota_reservation: entry.quota_reservation.clone(),
-                    route,
-                });
-            }
-            let mut remote_order = (0..remote_writes.len()).collect::<Vec<_>>();
-            remote_order.sort_by(|left, right| {
-                remote_writes[*left].tenant.cmp(remote_writes[*right].tenant)
-            });
-            let mut cursor = 0usize;
-            while cursor < remote_order.len() {
-                let tenant = remote_writes[remote_order[cursor]].tenant;
-                let same_tenant_end = remote_order[cursor..]
-                    .iter()
-                    .position(|index| remote_writes[*index].tenant != tenant)
-                    .map(|offset| cursor + offset)
-                    .unwrap_or(remote_order.len());
-                let remaining_items = same_tenant_end - cursor;
-                let item_limit = self
-                    .fairness_max_remote_batch_items_per_tenant()
-                    .unwrap_or(remaining_items)
-                    .min(
-                        self.shaping_max_remote_batch_burst_items()
-                            .unwrap_or(remaining_items),
-                    )
-                    .max(1)
-                    .min(remaining_items);
-                let byte_limit = self.shaping_max_remote_batch_bytes();
-                let mut selected = Vec::new();
-                let mut scratch_lengths = Vec::new();
-                let mut remote_bytes = 0u64;
-                for index in &remote_order[cursor..same_tenant_end] {
-                    if selected.len() >= item_limit {
-                        break;
-                    }
-                    let write = &remote_writes[*index];
-                    let write_remote_bytes =
-                        write.requests.iter().map(|request| request.length).sum::<u64>();
-                    if let Some(max_bytes) = byte_limit {
-                        if !selected.is_empty()
-                            && remote_bytes.saturating_add(write_remote_bytes) > max_bytes as u64
+                    for (route_index, (entry, current)) in prepared
+                        .iter()
+                        .zip(current_routes.iter().cloned())
+                        .enumerate()
+                    {
+                        let checksum = payload_checksum(entry.value);
+                        let mut replicas = Vec::with_capacity(entry.targets.len());
+                        let mut remote_requests = Vec::new();
+                        for (priority, (target, reservation)) in entry
+                            .targets
+                            .iter()
+                            .zip(entry.reservations.iter())
+                            .enumerate()
                         {
-                            break;
+                            let is_local = target.storage_runtime == self.lease.runtime
+                                && self
+                                    .state
+                                    .lock()
+                                    .memory_ref()
+                                    .map(|memory| memory.has_storage_segment(&target.segment_name))
+                                    .unwrap_or(false);
+                            if is_local {
+                                let addr = {
+                                    let state = self.state.lock();
+                                    state
+                                        .memory_ref()
+                                        .map_err(|error| fail(error, &completed))?
+                                        .storage_address(
+                                            &target.segment_name,
+                                            reservation.offset_bytes as usize,
+                                        )
+                                        .map_err(|error| fail(error, &completed))?
+                                };
+                                unsafe {
+                                    ptr::copy_nonoverlapping(
+                                        entry.value.as_ptr(),
+                                        addr.cast::<u8>(),
+                                        entry.value.len(),
+                                    );
+                                }
+                            } else {
+                                if target.storage_runtime != self.lease.runtime
+                                    && checked_runtimes.insert(target.storage_runtime.clone())
+                                {
+                                    self.ensure_remote_runtime_reachable(
+                                        &target.storage_runtime,
+                                        &target.segment_name.0,
+                                    )
+                                    .map_err(|error| fail(error, &completed))?;
+                                }
+                                let (handle, info) = {
+                                    let mut state = self.state.lock();
+                                    state
+                                        .open_segment_with_info(transport, &target.segment_name.0)
+                                        .map_err(|error| fail(error, &completed))?
+                                };
+                                let target_offset = Self::storage_target_offset(
+                                    &target.target_chunks,
+                                    &target.segment_name,
+                                    reservation.offset_bytes,
+                                    entry.value.len() as u64,
+                                )
+                                .map_err(|error| fail(error, &completed))?;
+                                remote_requests.push(RemoteBatchTarget {
+                                    owner: target.storage_runtime.clone(),
+                                    segment_name: target.segment_name.clone(),
+                                    segment: handle,
+                                    offset: target_offset,
+                                    length: entry.value.len() as u64,
+                                    info,
+                                });
+                            };
+                            replicas.push(ReplicaRoute {
+                                owner: target.storage_runtime.clone(),
+                                segment_name: target.segment_name.clone(),
+                                segment_offset: reservation.offset_bytes,
+                                length: entry.value.len() as u64,
+                                checksum: Some(checksum),
+                                tier: ReplicaTier::Dram,
+                                priority: priority as u16,
+                            });
                         }
-                    }
-                    if write.registered_source.is_none() {
-                        scratch_lengths.push(write.value.len());
-                        let planned = {
-                            let state = self.state.lock();
-                            state.memory_ref()?.plan_scratch(&scratch_lengths)
+                        if remote_requests.is_empty() {
+                            local_ready.push(route_index);
+                        } else {
+                            remote_writes.push(RemoteBatchWrite {
+                                route_index,
+                                tenant: entry.value_tenant(),
+                                value: entry.value,
+                                registered_source: entry.registered_source,
+                                requests: remote_requests,
+                            });
+                        }
+
+                        let expected_version = current.as_ref().map(|route| route.version);
+                        let next_version = current
+                            .as_ref()
+                            .map(|route| route.version.next())
+                            .unwrap_or(RouteVersion(1));
+                        let mut route = ObjectRoute {
+                            key: entry.scoped_key.clone(),
+                            namespace: None,
+                            logical_key: None,
+                            canonical_key: None,
+                            sharing_scope: None,
+                            qos_tier: None,
+                            version: next_version,
+                            state: RouteState::Active,
+                            compatibility: self.lease.compatibility.clone(),
+                            replicas,
                         };
-                        match planned {
-                            Ok(scratch) => drop(scratch),
-                            Err(StoreError::Allocator(_)) if !selected.is_empty() => {
-                                scratch_lengths.pop();
+                        mooncake_store_core::apply_route_identity(&mut route, &entry.object_id);
+                        route.qos_tier = Some(
+                            entry
+                                .qos_tier
+                                .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER)
+                                .to_string(),
+                        );
+                        routes.push(PendingRoutePublish {
+                            key: entry.scoped_key.clone(),
+                            expected_version,
+                            previous: current,
+                            quota_reservation: entry.quota_reservation.clone(),
+                            route,
+                        });
+                    }
+
+                    let mut returned_by_index = vec![None; prepared.len()];
+
+                    let wait_for_inflight =
+                        |chunk: InFlightRemoteChunk| -> std::result::Result<(), StoreError> {
+                            let request_timeout_ms = chunk
+                                .request_deadline
+                                .instant()
+                                .saturating_duration_since(Instant::now())
+                                .as_millis();
+                            let wait_result = wait_for_batch_completion_detailed(
+                                transport,
+                                chunk.batch_id,
+                                self.transfer_stall_timeout,
+                                chunk.request_deadline.instant(),
+                            );
+                            let free_result = transport.free_batch(chunk.batch_id);
+                            if let Err(error) = wait_result {
+                                let store_error = StoreError::from(error.clone());
+                                eprintln!(
+                                    "[mooncake-store] remote batch put wait failed runtime={} batch_id={} tenant={} items={} transfers={} bytes={} stall_timeout_ms={} request_timeout_ms={} mark_suspect={} targets={} error={}",
+                                    self.lease.runtime,
+                                    chunk.batch_id,
+                                    chunk.tenant,
+                                    chunk.item_count,
+                                    chunk.transfer_count,
+                                    chunk.remote_bytes,
+                                    self.transfer_stall_timeout.as_millis(),
+                                    request_timeout_ms,
+                                    error.marks_runtime_suspect(),
+                                    chunk.target_summary,
+                                    store_error
+                                );
+                                return Err(store_error);
+                            }
+                            free_result?;
+                            registry::record_transport_bytes(
+                                "write",
+                                "storage",
+                                chunk.remote_bytes,
+                            );
+                            Ok(())
+                        };
+
+                    let publish_ready = |route_indices: &[usize],
+                                         completed: &mut [bool],
+                                         returned_by_index: &mut [Option<ObjectRoute>]|
+                     -> std::result::Result<(), StoreError> {
+                        if route_indices.is_empty() {
+                            return Ok(());
+                        }
+                        let cas_requests = route_indices
+                            .iter()
+                            .map(|index| {
+                                let pending = &routes[*index];
+                                RouteCasRequest {
+                                    key: pending.key.clone(),
+                                    expected: pending.expected_version,
+                                    next: Some(pending.route.clone()),
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let cas_tracker = OperationTracker::new("batch_put_stage_route_cas");
+                        let publish_started = Instant::now();
+                        let cas_results_result = self
+                            .route_directory
+                            .compare_and_swap_object_routes(&self.lease, &cas_requests);
+                        registry::record_replication_publish(
+                            match &cas_results_result {
+                                Ok(results) if results.iter().any(|result| result.is_err()) => {
+                                    "error"
+                                }
+                                Ok(results)
+                                    if results.iter().any(|result| {
+                                        result
+                                            .as_ref()
+                                            .ok()
+                                            .is_some_and(|cas| !cas.applied)
+                                    }) =>
+                                {
+                                    "conflict"
+                                }
+                                Ok(_) => "ok",
+                                Err(StoreError::Conflict(_)) => "conflict",
+                                Err(_) => "error",
+                            },
+                            publish_started.elapsed(),
+                        );
+                        cas_tracker.finish(&cas_results_result, 0);
+                        let cas_results = match cas_results_result {
+                            Ok(results) => results,
+                            Err(error) => {
+                                for index in route_indices {
+                                    if completed[*index] {
+                                        continue;
+                                    }
+                                    let entry = &prepared[*index];
+                                    let _ = self.release_reserved_allocations(
+                                        &entry.targets,
+                                        &entry.reservations,
+                                    );
+                                    let _ = self.abort_tenant_quota_reservation(
+                                        entry.quota_reservation.as_ref(),
+                                        "batch_put_route_compare_and_swap_error",
+                                    );
+                                    completed[*index] = true;
+                                }
+                                return Err(error);
+                            }
+                        };
+                        if cas_results.len() != route_indices.len() {
+                            return Err(StoreError::InvalidState(format!(
+                                "batch put route CAS result count mismatch: got={} expected={}",
+                                cas_results.len(),
+                                route_indices.len()
+                            )));
+                        }
+
+                        let mut first_error = None;
+                        let mut published = Vec::new();
+                        for (route_index, cas_result) in
+                            route_indices.iter().copied().zip(cas_results)
+                        {
+                            let pending = &routes[route_index];
+                            let entry = &prepared[route_index];
+                            match cas_result {
+                                Ok(cas) if cas.applied => {
+                                    if let Err(error) = self.finalize_tenant_quota_put(
+                                        pending.quota_reservation.as_ref(),
+                                        &pending.route,
+                                        entry.value.len(),
+                                    ) {
+                                        completed[route_index] = true;
+                                        first_error.get_or_insert(error);
+                                        continue;
+                                    }
+                                    log_route_publish_sample(
+                                        &self.lease.runtime,
+                                        &pending.route,
+                                        entry.value.len(),
+                                        "batch_put",
+                                    );
+                                    self.storage_owner.track_route(&pending.route);
+                                    if let Some(previous) = pending.previous.as_ref() {
+                                        if let Err(error) = self.schedule_route_reclaim(previous) {
+                                            warn!(
+                                                runtime = %self.lease.runtime,
+                                                key = %pending.key.0,
+                                                error = %error,
+                                                "batch route overwrite reclaim scheduling failed after authoritative publish"
+                                            );
+                                        }
+                                    }
+                                    returned_by_index[route_index] = Some(pending.route.clone());
+                                    completed[route_index] = true;
+                                    published.push(pending.route.clone());
+                                }
+                                Ok(cas) => {
+                                    let _ = self.release_reserved_allocations(
+                                        &entry.targets,
+                                        &entry.reservations,
+                                    );
+                                    let _ = self.abort_tenant_quota_reservation(
+                                        entry.quota_reservation.as_ref(),
+                                        "batch_put_route_compare_and_swap_conflict",
+                                    );
+                                    completed[route_index] = true;
+                                    match conflict_policy {
+                                        BatchPutRouteConflictPolicy::AcceptConflictAsSuccess => {
+                                            if let Some(route) = self
+                                                .active_route_after_batch_put_conflict(
+                                                    &pending.key,
+                                                    cas.current,
+                                                )?
+                                            {
+                                                debug!(
+                                                    runtime = %self.lease.runtime,
+                                                    key = %pending.key.0,
+                                                    route_version = route.version.0,
+                                                    "batch put route conflict accepted as cache insert success"
+                                                );
+                                                returned_by_index[route_index] = Some(route);
+                                            } else {
+                                                first_error.get_or_insert_with(|| {
+                                                    StoreError::Conflict(format!(
+                                                        "route update lost race for key {} without active current route",
+                                                        pending.key.0
+                                                    ))
+                                                });
+                                            }
+                                        }
+                                        BatchPutRouteConflictPolicy::Strict => {
+                                            first_error.get_or_insert_with(|| {
+                                                StoreError::Conflict(format!(
+                                                    "route update lost race for key {}",
+                                                    pending.key.0
+                                                ))
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = self.release_reserved_allocations(
+                                        &entry.targets,
+                                        &entry.reservations,
+                                    );
+                                    let _ = self.abort_tenant_quota_reservation(
+                                        entry.quota_reservation.as_ref(),
+                                        "batch_put_route_compare_and_swap_error",
+                                    );
+                                    completed[route_index] = true;
+                                    first_error.get_or_insert(error);
+                                }
+                            }
+                        }
+                        if !published.is_empty() {
+                            self.track_remote_storage_owners_best_effort(&published);
+                        }
+                        if let Some(error) = first_error {
+                            return Err(error);
+                        }
+                        Ok(())
+                    };
+
+                    let mut remote_order = (0..remote_writes.len()).collect::<Vec<_>>();
+                    remote_order.sort_by(|left, right| {
+                        remote_writes[*left].tenant.cmp(remote_writes[*right].tenant)
+                    });
+
+                    let submit_chunk = |cursor: usize|
+                     -> std::result::Result<Option<(InFlightRemoteChunk, usize)>, StoreError> {
+                        if cursor >= remote_order.len() {
+                            return Ok(None);
+                        }
+                        let tenant = remote_writes[remote_order[cursor]].tenant;
+                        let same_tenant_end = remote_order[cursor..]
+                            .iter()
+                            .position(|index| remote_writes[*index].tenant != tenant)
+                            .map(|offset| cursor + offset)
+                            .unwrap_or(remote_order.len());
+                        let remaining_items = same_tenant_end - cursor;
+                        let item_limit = self
+                            .fairness_max_remote_batch_items_per_tenant()
+                            .unwrap_or(remaining_items)
+                            .min(
+                                self.shaping_max_remote_batch_burst_items()
+                                    .unwrap_or(remaining_items),
+                            )
+                            .max(1)
+                            .min(remaining_items);
+                        let byte_limit = self.shaping_max_remote_batch_bytes();
+                        let mut selected = Vec::new();
+                        let mut scratch_lengths = Vec::new();
+                        let mut remote_bytes = 0u64;
+                        for index in &remote_order[cursor..same_tenant_end] {
+                            if selected.len() >= item_limit {
                                 break;
                             }
-                            Err(error) => return Err(error),
+                            let write = &remote_writes[*index];
+                            let write_remote_bytes =
+                                write.requests.iter().map(|request| request.length).sum::<u64>();
+                            if let Some(max_bytes) = byte_limit {
+                                if !selected.is_empty()
+                                    && remote_bytes.saturating_add(write_remote_bytes)
+                                        > max_bytes as u64
+                                {
+                                    break;
+                                }
+                            }
+                            if write.registered_source.is_none() {
+                                scratch_lengths.push(write.value.len());
+                                let planned = {
+                                    let state = self.state.lock();
+                                    state.memory_ref()?.plan_scratch(&scratch_lengths)
+                                };
+                                match planned {
+                                    Ok(scratch) => drop(scratch),
+                                    Err(StoreError::Allocator(_)) if !selected.is_empty() => {
+                                        scratch_lengths.pop();
+                                        break;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            selected.push(*index);
+                            remote_bytes = remote_bytes.saturating_add(write_remote_bytes);
+                        }
+                        let scratch = if scratch_lengths.is_empty() {
+                            None
+                        } else {
+                            let state = self.state.lock();
+                            Some(state.memory_ref()?.plan_scratch(&scratch_lengths)?)
+                        };
+                        let mut transfer_requests = Vec::new();
+                        let mut scratch_position = 0usize;
+                        for index in &selected {
+                            let write = &remote_writes[*index];
+                            if let Some(source) = write.registered_source {
+                                for request in &write.requests {
+                                    transfer_requests.extend(Self::target_buffer_transfer_requests(
+                                        Opcode::Write,
+                                        request.segment,
+                                        request.offset,
+                                        source,
+                                        request.length,
+                                        &request.info,
+                                        transport.max_registration_bytes(),
+                                    )?);
+                                }
+                            } else {
+                                let allocation = scratch
+                                    .as_ref()
+                                    .expect("scratch reservation should exist for staged writes")
+                                    [scratch_position];
+                                copy_into_region(allocation, write.value);
+                                for request in &write.requests {
+                                    transfer_requests.extend(Self::target_buffer_transfer_requests(
+                                        Opcode::Write,
+                                        request.segment,
+                                        request.offset,
+                                        allocation.addr,
+                                        request.length,
+                                        &request.info,
+                                        transport.max_registration_bytes(),
+                                    )?);
+                                }
+                                scratch_position += 1;
+                            }
+                        }
+                        let mut target_parts = selected
+                            .iter()
+                            .flat_map(|index| {
+                                remote_writes[*index].requests.iter().map(|request| {
+                                    format!("{}:{}", request.owner, request.segment_name.0)
+                                })
+                            })
+                            .take(8)
+                            .collect::<Vec<_>>();
+                        let target_count = selected
+                            .iter()
+                            .map(|index| remote_writes[*index].requests.len())
+                            .sum::<usize>();
+                        if target_count > target_parts.len() {
+                            target_parts.push(format!("+{} more", target_count - target_parts.len()));
+                        }
+                        let target_summary = target_parts.join(",");
+                        let batch_id = transport.allocate_batch(transfer_requests.len())?;
+                        let request_deadline = self.request_deadline_for_transfer(
+                            remote_bytes,
+                            transfer_requests.len(),
+                        );
+                        let hints = self.remote_batch_hints(
+                            tenant,
+                            remote_bytes,
+                            TransferPacingMode::ThroughputOptimized,
+                        );
+                        let submit_result =
+                            transport.submit_with_hints(batch_id, &transfer_requests, &hints);
+                        if let Err(error) = submit_result {
+                            eprintln!(
+                                "[mooncake-store] remote batch put submit failed runtime={} batch_id={} tenant={} items={} transfers={} bytes={} targets={} error={}",
+                                self.lease.runtime,
+                                batch_id,
+                                tenant,
+                                selected.len(),
+                                transfer_requests.len(),
+                                remote_bytes,
+                                target_summary,
+                                error
+                            );
+                            let _ = transport.free_batch(batch_id);
+                            return Err(error);
+                        }
+                        let route_indices = selected
+                            .iter()
+                            .map(|index| remote_writes[*index].route_index)
+                            .collect::<Vec<_>>();
+                        Ok(Some((
+                            InFlightRemoteChunk {
+                                batch_id,
+                                route_indices,
+                                tenant: tenant.to_string(),
+                                item_count: selected.len(),
+                                transfer_count: transfer_requests.len(),
+                                remote_bytes,
+                                target_summary,
+                                request_deadline,
+                                _scratch: scratch,
+                            },
+                            cursor + selected.len(),
+                        )))
+                    };
+
+                    let mut cursor = 0usize;
+                    let mut in_flight = match submit_chunk(cursor) {
+                        Ok(Some((chunk, next_cursor))) => {
+                            cursor = next_cursor;
+                            Some(chunk)
+                        }
+                        Ok(None) => None,
+                        Err(error) => return Err(fail(error, &completed)),
+                    };
+                    if let Err(error) =
+                        publish_ready(&local_ready, &mut completed, &mut returned_by_index)
+                    {
+                        if let Some(chunk) = in_flight.take() {
+                            let _ = wait_for_inflight(chunk);
+                        }
+                        return Err(fail(error, &completed));
+                    }
+
+                    let mut ready_to_publish: Option<Vec<usize>> = None;
+                    while let Some(chunk) = in_flight.take() {
+                        let route_indices = chunk.route_indices.clone();
+                        if let Err(error) = wait_for_inflight(chunk) {
+                            return Err(fail(error, &completed));
+                        }
+                        in_flight = match submit_chunk(cursor) {
+                            Ok(Some((next_chunk, next_cursor))) => {
+                                cursor = next_cursor;
+                                Some(next_chunk)
+                            }
+                            Ok(None) => None,
+                            Err(error) => return Err(fail(error, &completed)),
+                        };
+                        if let Some(indices) = ready_to_publish.take() {
+                            if let Err(error) =
+                                publish_ready(&indices, &mut completed, &mut returned_by_index)
+                            {
+                                if let Some(chunk) = in_flight.take() {
+                                    let _ = wait_for_inflight(chunk);
+                                }
+                                return Err(fail(error, &completed));
+                            }
+                        }
+                        ready_to_publish = Some(route_indices);
+                    }
+                    if let Some(indices) = ready_to_publish.take() {
+                        if let Err(error) =
+                            publish_ready(&indices, &mut completed, &mut returned_by_index)
+                        {
+                            return Err(fail(error, &completed));
                         }
                     }
-                    selected.push(*index);
-                    remote_bytes = remote_bytes.saturating_add(write_remote_bytes);
-                }
-                let scratch = if scratch_lengths.is_empty() {
-                    None
-                } else {
-                    let state = self.state.lock();
-                    Some(state.memory_ref()?.plan_scratch(&scratch_lengths)?)
-                };
-                let mut transfer_requests = Vec::new();
-                let mut scratch_position = 0usize;
-                for index in &selected {
-                    let write = &remote_writes[*index];
-                    if let Some(source) = write.registered_source {
-                        for request in &write.requests {
-                            transfer_requests.extend(Self::target_buffer_transfer_requests(
-                                Opcode::Write,
-                                request.segment,
-                                request.offset,
-                                source,
-                                request.length,
-                                &request.info,
-                                transport.max_registration_bytes(),
-                            )?);
-                        }
-                    } else {
-                        let allocation = scratch
-                            .as_ref()
-                            .expect("scratch reservation should exist for staged writes")
-                            [scratch_position];
-                        copy_into_region(allocation, write.value);
-                        for request in &write.requests {
-                            transfer_requests.extend(Self::target_buffer_transfer_requests(
-                                Opcode::Write,
-                                request.segment,
-                                request.offset,
-                                allocation.addr,
-                                request.length,
-                                &request.info,
-                                transport.max_registration_bytes(),
-                            )?);
-                        }
-                        scratch_position += 1;
-                    }
-                }
-                let mut target_parts = selected
-                    .iter()
-                    .flat_map(|index| {
-                        remote_writes[*index].requests.iter().map(|request| {
-                            format!("{}:{}", request.owner, request.segment_name.0)
+
+                    let returned = returned_by_index
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, route)| {
+                            route.ok_or_else(|| {
+                                StoreError::InvalidState(format!(
+                                    "batch put did not publish route for key {}",
+                                    prepared[index].scoped_key.0
+                                ))
+                            })
                         })
-                    })
-                    .take(8)
-                    .collect::<Vec<_>>();
-                let target_count = selected
-                    .iter()
-                    .map(|index| remote_writes[*index].requests.len())
-                    .sum::<usize>();
-                if target_count > target_parts.len() {
-                    target_parts.push(format!("+{} more", target_count - target_parts.len()));
-                }
-                let target_summary = target_parts.join(",");
-                let batch_id = transport.allocate_batch(transfer_requests.len())?;
-                let request_deadline =
-                    self.request_deadline_for_transfer(remote_bytes, transfer_requests.len());
-                let hints = self.remote_batch_hints(
-                    tenant,
-                    remote_bytes,
-                    TransferPacingMode::ThroughputOptimized,
-                );
-                let submit_result =
-                    transport.submit_with_hints(batch_id, &transfer_requests, &hints);
-                if let Err(error) = submit_result {
-                    eprintln!(
-                        "[mooncake-store] remote batch put submit failed runtime={} batch_id={} tenant={} items={} transfers={} bytes={} targets={} error={}",
-                        self.lease.runtime,
-                        batch_id,
-                        tenant,
-                        selected.len(),
-                        transfer_requests.len(),
-                        remote_bytes,
-                        target_summary,
-                        error
-                    );
-                    let _ = transport.free_batch(batch_id);
-                    return Err(error);
-                }
-                let request_timeout_ms = request_deadline
-                    .instant()
-                    .saturating_duration_since(Instant::now())
-                    .as_millis();
-                let wait_result = wait_for_batch_completion_detailed(
-                    transport,
-                    batch_id,
-                    self.transfer_stall_timeout,
-                    request_deadline.instant(),
-                );
-                let free_result = transport.free_batch(batch_id);
-                if let Err(error) = wait_result {
-                    let store_error = StoreError::from(error.clone());
-                    eprintln!(
-                        "[mooncake-store] remote batch put wait failed runtime={} batch_id={} tenant={} items={} transfers={} bytes={} stall_timeout_ms={} request_timeout_ms={} mark_suspect={} targets={} error={}",
-                        self.lease.runtime,
-                        batch_id,
-                        tenant,
-                        selected.len(),
-                        transfer_requests.len(),
-                        remote_bytes,
-                        self.transfer_stall_timeout.as_millis(),
-                        request_timeout_ms,
-                        error.marks_runtime_suspect(),
-                        target_summary,
-                        store_error
-                    );
-                    return Err(store_error);
-                }
-                free_result?;
-                registry::record_transport_bytes("write", "storage", remote_bytes);
-                cursor += selected.len();
-            }
-                    Ok(routes)
+                        .collect::<Result<Vec<_>>>()
+                        .map_err(|error| fail(error, &completed))?;
+                    Ok(BatchWriteOutcome { returned })
                 })();
                 match attempt_result {
-                    Ok(routes) => break Ok(routes),
-                    Err(error) if !refreshed && remote_segment_cache_stale(&error) => {
+                    Ok(outcome) => break Ok(outcome.returned),
+                    Err((error, published_any))
+                        if !published_any && !refreshed && remote_segment_cache_stale(&error) =>
+                    {
                         for entry in &prepared {
                             self.invalidate_remote_write_segments(&entry.targets);
                         }
@@ -1118,7 +1445,7 @@ impl StoreClient {
                             "retrying batch put after refreshing cached remote segment handles"
                         );
                     }
-                    Err(error) => break Err(error),
+                    Err((error, _published_any)) => break Err(error),
                 }
             }
         };
@@ -1133,7 +1460,6 @@ impl StoreClient {
         match write_result {
             Ok(routes) => break (routes, prepared),
             Err(error) => {
-                release_prepared(&prepared, "batch_put_failed_before_publish");
                 let failed_targets = prepared
                     .iter()
                     .flat_map(|entry| entry.targets.iter().cloned())
@@ -1166,145 +1492,7 @@ impl StoreClient {
             }
         };
         };
-
-        let cas_requests = routes
-            .iter()
-            .map(|pending| RouteCasRequest {
-                key: pending.key.clone(),
-                expected: pending.expected_version,
-                next: Some(pending.route.clone()),
-            })
-            .collect::<Vec<_>>();
-        let cas_tracker = OperationTracker::new("batch_put_stage_route_cas");
-        let publish_started = Instant::now();
-        let cas_results_result = self
-            .route_directory
-            .compare_and_swap_object_routes(&self.lease, &cas_requests);
-        registry::record_replication_publish(
-            match &cas_results_result {
-                Ok(results) if results.iter().any(|result| result.is_err()) => "error",
-                Ok(results) if results.iter().any(|result| {
-                    result
-                        .as_ref()
-                        .ok()
-                        .is_some_and(|cas| !cas.applied)
-                }) =>
-                {
-                    "conflict"
-                }
-                Ok(_) => "ok",
-                Err(StoreError::Conflict(_)) => "conflict",
-                Err(_) => "error",
-            },
-            publish_started.elapsed(),
-        );
-        cas_tracker.finish(&cas_results_result, 0);
-        let cas_results = match cas_results_result {
-            Ok(results) => results,
-            Err(error) => {
-                release_prepared(&prepared, "batch_put_failed_before_publish");
-                return Err(error);
-            }
-        };
-
-        let mut returned = Vec::with_capacity(routes.len());
-        let mut published = Vec::with_capacity(routes.len());
-        let mut first_error = None;
-        for ((index, pending), cas_result) in
-            routes.into_iter().enumerate().zip(cas_results)
-        {
-            match cas_result {
-                Ok(cas) if cas.applied => {
-                    if let Err(error) = self.finalize_tenant_quota_put(
-                        pending.quota_reservation.as_ref(),
-                        &pending.route,
-                        prepared[index].value.len(),
-                    ) {
-                        first_error.get_or_insert(error);
-                        continue;
-                    }
-                    log_route_publish_sample(
-                        &self.lease.runtime,
-                        &pending.route,
-                        prepared[index].value.len(),
-                        "batch_put",
-                    );
-                    self.storage_owner.track_route(&pending.route);
-                    if let Some(previous) = pending.previous.as_ref() {
-                        if let Err(error) = self.schedule_route_reclaim(previous) {
-                            warn!(
-                                runtime = %self.lease.runtime,
-                                key = %pending.key.0,
-                                error = %error,
-                                "batch route overwrite reclaim scheduling failed after authoritative publish"
-                            );
-                        }
-                    }
-                    returned.push(pending.route.clone());
-                    published.push(pending.route);
-                }
-                Ok(cas) => {
-                    let _ = self.release_reserved_allocations(
-                        &prepared[index].targets,
-                        &prepared[index].reservations,
-                    );
-                    let _ = self.abort_tenant_quota_reservation(
-                        prepared[index].quota_reservation.as_ref(),
-                        "batch_put_route_compare_and_swap_conflict",
-                    );
-                    match conflict_policy {
-                        BatchPutRouteConflictPolicy::AcceptConflictAsSuccess => {
-                            if let Some(route) = self.active_route_after_batch_put_conflict(
-                                &pending.key,
-                                cas.current,
-                            )? {
-                                debug!(
-                                    runtime = %self.lease.runtime,
-                                    key = %pending.key.0,
-                                    route_version = route.version.0,
-                                    "batch put route conflict accepted as cache insert success"
-                                );
-                                returned.push(route);
-                            } else {
-                                first_error.get_or_insert_with(|| {
-                                    StoreError::Conflict(format!(
-                                        "route update lost race for key {} without active current route",
-                                        pending.key.0
-                                    ))
-                                });
-                            }
-                        }
-                        BatchPutRouteConflictPolicy::Strict => {
-                            first_error.get_or_insert_with(|| {
-                                StoreError::Conflict(format!(
-                                    "route update lost race for key {}",
-                                    pending.key.0
-                                ))
-                            });
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = self.release_reserved_allocations(
-                        &prepared[index].targets,
-                        &prepared[index].reservations,
-                    );
-                    let _ = self.abort_tenant_quota_reservation(
-                        prepared[index].quota_reservation.as_ref(),
-                        "batch_put_route_compare_and_swap_error",
-                    );
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        if first_error.is_some() {
-            abort_prepared_quota(&prepared, "batch_put_partial_publish_cleanup");
-        }
-        self.track_remote_storage_owners_best_effort(&published);
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(returned)
+        Ok(routes)
     }
 
     fn validate_unique_requests(&self, requests: &[PutRequest<'_>]) -> Result<()> {

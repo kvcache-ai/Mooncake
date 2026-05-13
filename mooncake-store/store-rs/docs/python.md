@@ -81,6 +81,16 @@ the dispatcher retries the missed entries one by one and returns a per-key statu
 counts for restored entries and negative soft-miss codes for the entries that still failed. A dead
 cache replica therefore does not turn healthy keys in the same HiCache batch into misses.
 
+Real-mode Python `batch_put_from(...)` automatically fans registered-buffer writes out across
+multiple native worker calls while the GIL is released. The wrapper splits inputs into ordered
+contiguous shards up to `MC_STORE_RS_PY_BATCH_PUT_FROM_FANOUT`, which defaults to `8`, including
+small batches that have more than one item, and merges the per-key status list back into the
+original input order. Invalid or zero fanout values fall back to the default. Each shard calls the
+Rust batch writer's per-key status API directly, so true write failures stay isolated without a
+Python-side per-key replay loop. This keeps SGLang-style backup queues from being gated behind one
+synchronous native batch call when many tensor-parallel ranks write their backup pages at the same
+time, without changing the Store transfer-batch shape inside each shard.
+
 `setup(...)` accepts `eviction_high_watermark_percent=` and
 `eviction_low_watermark_percent=` for storage-role runtimes. The same values can come from
 `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` and
