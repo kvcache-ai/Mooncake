@@ -245,6 +245,10 @@ Status Platform::loadBackend() {
                             << " from " << full_path;
                         return Status::OK();
                     }
+                    // Reset backend before closing the library to ensure
+                    // the object is destroyed while library code is still
+                    // mapped
+                    backend_.reset();
                 }
                 dlclose(handle);
             }
