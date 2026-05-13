@@ -1129,6 +1129,71 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
 }
 
 #[test]
+fn control_plane_client_reopens_closed_cached_stream_session() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("alpha", 1, &owner));
+
+    let mut handle = ControlPlaneHandle::spawn("127.0.0.1", authority.clone(), allocator, eviction)
+        .expect("control plane server should start");
+    let lease = sample_lease(handle.address());
+    let client = Arc::new(ControlPlaneClient::new().expect("control plane client should start"));
+    let authority_id = ClientStableId::new("authority");
+
+    let warmup = client
+        .batch_get_routes(&lease, "ns-a", &authority_id, &[ObjectKey::new("alpha")])
+        .expect("warmup route lookup should succeed");
+    assert_eq!(warmup.len(), 1);
+    assert_eq!(client.active_stream_sessions(), 1);
+
+    let cached = client
+        .streams
+        .lock()
+        .get(handle.address())
+        .cloned()
+        .expect("warmup lookup should cache a control stream session");
+    fail_stream_session(&cached, "forced closed cached session".to_string());
+    assert!(
+        cached.closed.load(Ordering::Relaxed),
+        "test should force the cached session closed before reopening"
+    );
+
+    let replay_client = client.clone();
+    let replay_lease = lease.clone();
+    let replay_authority = authority_id.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let result = replay_client.batch_get_routes(
+            &replay_lease,
+            "ns-a",
+            &replay_authority,
+            &[ObjectKey::new("alpha")],
+        );
+        let _ = done_tx.send(result);
+    });
+
+    let replay = done_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("closed cached session reopen should not deadlock");
+    let routes = replay.expect("replayed route lookup should succeed");
+    assert_eq!(routes.len(), 1);
+    assert_eq!(
+        routes[0]
+            .as_ref()
+            .expect("replayed route should decode")
+            .as_ref()
+            .map(|route| route.key.0.as_str()),
+        Some("alpha")
+    );
+    assert_eq!(client.active_stream_sessions(), 1);
+
+    drop(client);
+    handle.shutdown();
+}
+
+#[test]
 fn control_plane_migration_entrypoints_reject_invalid_requests() {
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
