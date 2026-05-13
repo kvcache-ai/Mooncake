@@ -22,8 +22,11 @@
 namespace mooncake {
 namespace tent {
 ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
-                           size_t chunk_count)
-    : chunk_size_(chunk_size), chunk_count_(chunk_count), impl_(impl) {
+                           size_t chunk_count, int max_retries)
+    : chunk_size_(chunk_size),
+      chunk_count_(chunk_count),
+      max_retries_(max_retries),
+      impl_(impl) {
     running_ = true;
     for (size_t i = 0; i < kShards; ++i) {
         shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
@@ -241,6 +244,10 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     const static size_t kStageBuffers = 4;
     uint64_t local_stage_buffer[kStageBuffers],
         remote_stage_buffer[kStageBuffers];
+
+    auto start_time = std::chrono::steady_clock::now();
+    metrics_.total_transfers.fetch_add(1, std::memory_order_relaxed);
+    metrics_.total_bytes_transferred.fetch_add(request.length, std::memory_order_relaxed);
     if (local_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
             local_stage_buffer[i] =
@@ -278,6 +285,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
         StageState prev_state;
         StageState state;
         BatchID batch;
+        int retry_count = 0;
     };
 
     std::queue<size_t> event_queue;
@@ -329,6 +337,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                       remote_futures[id]);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT_REMOTE;
+                    metrics_.remote_staging_count.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     chunk.state = StageState::CROSS;
                 }
@@ -366,6 +375,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                       remote_futures[id]);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT_REMOTE;
+                    metrics_.remote_staging_count.fetch_add(1, std::memory_order_relaxed);
                 } else if (request.opcode == Request::READ && local_staging) {
                     chunk.batch = submitLocalStage(request, chunk.local_buf,
                                                    chunk.length, chunk.offset);
@@ -424,14 +434,32 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                 auto& fut = remote_futures[id];
                 if (!fut.valid()) {
                     chunk.state = StageState::FAILED;
+                    event_queue.push(id);
                     break;
                 }
                 if (fut.wait_for(std::chrono::seconds(0)) ==
                     std::future_status::ready) {
                     Status rs = fut.get();
                     if (!rs.ok()) {
-                        chunk.state = StageState::FAILED;
-                        break;
+                        if (chunk.retry_count < max_retries_) {
+                            chunk.retry_count++;
+                            metrics_.retry_count.fetch_add(1, std::memory_order_relaxed);
+                            LOG(WARNING) << "Remote staging failed for chunk " << id
+                                         << ", retrying (attempt " << chunk.retry_count
+                                         << "/" << max_retries_ << "): " << rs.ToString();
+                            submitRemoteStage(server_addr, request, chunk.remote_buf,
+                                              chunk.length, chunk.offset,
+                                              remote_futures[id]);
+                            event_queue.push(id);
+                            break;
+                        } else {
+                            LOG(ERROR) << "Remote staging failed for chunk " << id
+                                      << " after " << max_retries_ << " retries: "
+                                      << rs.ToString();
+                            chunk.state = StageState::FAILED;
+                            event_queue.push(id);
+                            break;
+                        }
                     }
                     if (chunk.prev_state == StageState::PRE) {
                         chunk.state = StageState::CROSS;
@@ -450,6 +478,13 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
             }
         }
     }
+
+    auto end_time = std::chrono::steady_clock::now();
+    auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          end_time - start_time)
+                          .count();
+    metrics_.total_latency_us.fetch_add(latency_us, std::memory_order_relaxed);
+    metrics_.pipeline_parallel_chunks.fetch_add(kStageBuffers, std::memory_order_relaxed);
 
     return Status::OK();
 }

@@ -29,6 +29,34 @@ class TransferEngineImpl;
 class TaskInfo;
 struct StageBufferCache;
 
+struct ProxyManagerMetrics {
+    std::atomic<uint64_t> total_transfers{0};
+    std::atomic<uint64_t> total_bytes_transferred{0};
+    std::atomic<uint64_t> total_latency_us{0};
+    std::atomic<uint64_t> remote_staging_count{0};
+    std::atomic<uint64_t> pipeline_parallel_chunks{0};
+    std::atomic<uint64_t> retry_count{0};
+
+    void reset() {
+        total_transfers = 0;
+        total_bytes_transferred = 0;
+        total_latency_us = 0;
+        remote_staging_count = 0;
+        pipeline_parallel_chunks = 0;
+        retry_count = 0;
+    }
+
+    double getAvgLatencyMs() const {
+        uint64_t count = total_transfers.load();
+        return count > 0 ? (total_latency_us.load() / 1000.0) / count : 0.0;
+    }
+
+    double getThroughputGBps() const {
+        uint64_t us = total_latency_us.load();
+        return us > 0 ? (total_bytes_transferred.load() / 1e9) / (us / 1e6) : 0.0;
+    }
+};
+
 struct StagingTask {
     TaskInfo* native{nullptr};
     std::vector<std::string> params;
@@ -44,8 +72,9 @@ class ProxyManager {
 
    public:
     explicit ProxyManager(TransferEngineImpl* impl,
-                          size_t chunk_size = 8 * 1024 * 1024,
-                          size_t chunk_count = 32);
+                          size_t chunk_size = 4 * 1024 * 1024,
+                          size_t chunk_count = 64,
+                          int max_retries = 3);
 
     ~ProxyManager();
 
@@ -58,6 +87,10 @@ class ProxyManager {
     Status pinStageBuffer(const std::string& location, uint64_t& addr);
 
     Status unpinStageBuffer(uint64_t addr);
+
+    ProxyManagerMetrics getMetrics() const { return metrics_; }
+
+    void resetMetrics() { metrics_.reset(); }
 
    private:
     void runner(size_t id);
@@ -97,9 +130,11 @@ class ProxyManager {
    private:
     const size_t chunk_size_;
     const size_t chunk_count_;
+    const int max_retries_;
     TransferEngineImpl* impl_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
     std::atomic<bool> running_;
+    ProxyManagerMetrics metrics_;
     struct WorkerShard {
         std::thread thread;
         std::mutex mu;
