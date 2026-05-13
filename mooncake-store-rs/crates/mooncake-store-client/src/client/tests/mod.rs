@@ -8928,15 +8928,15 @@ fn batch_is_exist_marks_remote_replicas_hot_for_eviction() {
     router
         .put("remote-exists-hot", hot)
         .expect("hot put should succeed");
-    router
-        .put("remote-exists-cold", cold)
-        .expect("cold put should succeed");
     assert_eq!(
         router
             .batch_is_exist(&[ObjectRef::new("remote-exists-hot")])
             .expect("batch_is_exist should succeed"),
         vec![true]
     );
+    router
+        .put("remote-exists-cold", cold)
+        .expect("cold put should succeed");
 
     let fresh_route = router
         .put("remote-exists-fresh", fresh)
