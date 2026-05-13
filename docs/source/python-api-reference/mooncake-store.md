@@ -277,6 +277,46 @@ store.unregister_buffer(buffer_ptr)
 
 </details>
 
+### RegisteredBufferPool
+
+`RegisteredBufferPool` keeps a bounded set of registered scratch buffers for repeated zero-copy operations. It is useful when a caller repeatedly needs temporary registered memory, for example as the destination buffer for `get_into()` or `get_into_ranges()`.
+
+```python
+from mooncake.store import RegisteredBufferPool
+
+pool = RegisteredBufferPool(
+    store,
+    max_bytes=256 * 1024 * 1024,
+    min_size_class=64 * 1024,
+    max_size_class=16 * 1024 * 1024,
+    alignment=8 * 1024 * 1024,
+)
+
+with pool.buffer(1024 * 1024) as lease:
+    n = store.get_into("my_key", lease.ptr, lease.size)
+    data = bytes(lease.buffer[:n])
+
+pool.close()
+```
+
+`acquire(size)` and `buffer(size)` return a `RegisteredBufferLease`. A lease exposes:
+
+- `ptr`: the registered memory address to pass to zero-copy APIs.
+- `size`: the requested logical size.
+- `buffer`: a Python `memoryview` over the logical requested size.
+- `view(size)`: a shorter view object; use `view(size).buffer` for memoryview operations.
+- `release()`: returns the region to the pool, or unregisters it if it is oversized or the pool is closing.
+
+Behavior and lifecycle rules:
+
+- Requested sizes are rounded into reusable size classes up to `max_size_class`; larger requests are supported but are not reused.
+- `max_bytes` bounds the total registered memory owned by the pool.
+- `try_acquire(size)` returns `None` instead of raising when the pool is exhausted.
+- `acquire(size, timeout=...)` can wait for another lease to be released.
+- Do not keep `lease.ptr` or a `memoryview` after releasing the lease.
+- `release()` fails while exported views are alive. Delete those views first, then release.
+- `close()` fails if leases are still active. Release all leases before closing the pool.
+
 ---
 
 ### Zero-Copy Operations
