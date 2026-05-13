@@ -854,7 +854,11 @@ impl ControlPlaneClient {
         lease: &ClientLease,
         address: &str,
     ) -> Result<Arc<ControlStreamSession>> {
-        if let Some(session) = self.streams.lock().get(address).cloned() {
+        let cached_session = {
+            let streams = self.streams.lock();
+            streams.get(address).cloned()
+        };
+        if let Some(session) = cached_session {
             if !session.closed.load(Ordering::Relaxed) {
                 return Ok(session);
             }
