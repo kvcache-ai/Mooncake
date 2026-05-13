@@ -533,6 +533,9 @@ impl MooncakeStore {
         keys: &[&str],
     ) -> Result<Vec<bool>, StoreError> {
         let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let key_strings: Vec<CString> = keys
             .iter()
             .map(|k| CString::new(*k))

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <string>
 #include <vector>
 #include "gpu_staging_utils.h"
 #include "replica.h"
@@ -448,10 +449,12 @@ TransferStrategy TransferFuture::strategy() const {
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      std::shared_ptr<StorageBackend>& backend,
+                                     const std::string& local_hostname,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
+      local_hostname_(local_hostname),
       transfer_metric_(transfer_metric) {
     // Read MC_STORE_MEMCPY environment variable.
     // When not set, auto-detect based on transport type:
@@ -600,25 +603,38 @@ std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+    // Open the segment once — all keys share the same transfer_engine_addr.
+    SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+        // nullopt = failure (caller checks !future).  The function returns
+        // std::optional so tl::unexpected is not available here.
+        return std::nullopt;
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = keys[i];
-        auto pointer = pointers[i];
-        SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
-            return std::nullopt;
+        const auto& key = keys[i];
+        const uint64_t pointer = pointers[i];
+        auto it = batched_slices.find(key);
+        if (it == batched_slices.end()) {
+            LOG(ERROR) << "Key not found in batched_slices: " << key;
+            return std::nullopt;  // fail closed
         }
-        const auto& slice = batched_slices.find(key)->second;
-        TransferRequest request;
-        request.opcode = TransferRequest::READ;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = pointer;
-        request.length = slice.size;
-        requests.emplace_back(request);
+        // Emit one TransferRequest per slice: the on-disk blob is read
+        // sequentially while slices may point to non-contiguous GPU memory.
+        uint64_t offset = 0;
+        for (const auto& slice : it->second) {
+            TransferRequest request;
+            request.opcode = TransferRequest::READ;
+            request.source = static_cast<char*>(slice.ptr);
+            request.target_id = seg;
+            request.target_offset = pointer + offset;
+            request.length = slice.size;
+            requests.emplace_back(request);
+            offset += slice.size;
+        }
     }
 #ifdef ENABLE_MULTI_PROTOCOL
     if (level_protocols_.size() > 1) {
@@ -913,11 +929,20 @@ TransferStrategy TransferSubmitter::selectStrategy(
 
 bool TransferSubmitter::isLocalTransfer(
     const AllocatedBuffer::Descriptor& handle) const {
-    std::string local_ep = engine_.getLocalIpAndPort();
+    if (handle.transport_endpoint_.empty()) return false;
 
-    if (!local_ep.empty()) {
-        return !handle.transport_endpoint_.empty() &&
-               handle.transport_endpoint_ == local_ep;
+    // Metadata-service descriptors use the client hostname as the segment ID.
+    // If it matches this client's hostname, the buffer address is local.
+    if (!local_hostname_.empty() &&
+        local_hostname_ == handle.transport_endpoint_) {
+        return true;
+    }
+
+    // P2P descriptors use the transfer engine endpoint as the segment ID.
+    // If it matches this engine's endpoint, the buffer address is local.
+    std::string local_ep = engine_.getLocalIpAndPort();
+    if (!local_ep.empty() && handle.transport_endpoint_ == local_ep) {
+        return true;
     }
 
     // Without a local endpoint we cannot prove locality; disable memcpy.

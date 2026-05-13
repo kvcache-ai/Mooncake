@@ -94,6 +94,7 @@ struct ReplicateConfig {
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
     StorageLevel preferred_storage_level{StorageLevel::RAM};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -113,7 +114,8 @@ struct ReplicateConfig {
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node;
         os << ", preferred_storage_level: "
-           << static_cast<int>(config.preferred_storage_level) << " }";
+           << static_cast<int>(config.preferred_storage_level)
+           << ", data_type: " << config.data_type << " }";
         return os;
     }
 };
