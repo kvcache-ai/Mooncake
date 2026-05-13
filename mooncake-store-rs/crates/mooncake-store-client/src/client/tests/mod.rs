@@ -215,6 +215,11 @@ struct EmptyConflictRouteDirectory {
     conflicted: Arc<AtomicBool>,
 }
 
+struct RecordingCasRouteDirectory {
+    inner: Arc<dyn RouteDirectory>,
+    cas_batch_sizes: StdMutex<Vec<usize>>,
+}
+
 struct RecoverableMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     state: StdMutex<RecoverableMetadataState>,
@@ -338,6 +343,22 @@ impl RecoverableMetadataBackend {
 
     fn segment_key(owner: &ClientRuntimeId, segment: &SegmentName) -> String {
         format!("{}:{}", owner.storage_key(), segment.0)
+    }
+}
+
+impl RecordingCasRouteDirectory {
+    fn new(inner: Arc<dyn RouteDirectory>) -> Self {
+        Self {
+            inner,
+            cas_batch_sizes: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn cas_batch_sizes(&self) -> Vec<usize> {
+        self.cas_batch_sizes
+            .lock()
+            .expect("recording route directory lock should succeed")
+            .clone()
     }
 }
 
@@ -480,6 +501,56 @@ impl RouteDirectory for EmptyConflictRouteDirectory {
         }
         self.inner
             .compare_and_swap_object_route(observer, key, expected, next)
+    }
+}
+
+impl RouteDirectory for RecordingCasRouteDirectory {
+    fn get_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        self.inner.get_object_route(observer, key)
+    }
+
+    fn get_object_routes(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.inner.get_object_routes(observer, keys)
+    }
+
+    fn get_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.inner.get_object_routes_bounded(observer, keys)
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<CasResult> {
+        self.inner
+            .compare_and_swap_object_route(observer, key, expected, next)
+    }
+
+    fn compare_and_swap_object_routes(
+        &self,
+        observer: &ClientLease,
+        requests: &[RouteCasRequest],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::Result<CasResult>>> {
+        self.cas_batch_sizes
+            .lock()
+            .expect("recording route directory lock should succeed")
+            .push(requests.len());
+        self.inner
+            .compare_and_swap_object_routes(observer, requests)
     }
 }
 
@@ -7179,6 +7250,53 @@ fn routed_put_fairness_limits_remote_replica_writes_per_batch() {
 
     let submitted = transport.submitted_batch_sizes();
     assert_eq!(submitted, vec![1, 1]);
+}
+
+#[test]
+fn routed_batch_put_publishes_routes_after_each_remote_write_chunk() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-chunk-publish-segment"));
+    let remote = publish_storage_node_with_capacity(
+        &metadata,
+        &transport,
+        "storage-chunk-publish",
+        "seg-chunk-publish",
+        "pool-a",
+        1024,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let mut writer = StoreClientBuilder::new(metadata, "writer-chunk-publish")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .execution_fairness(ExecutionFairness::new().max_remote_batch_items_per_tenant(1))
+        .build(10_000)
+        .expect("writer build should succeed");
+    let route_directory = Arc::new(RecordingCasRouteDirectory::new(
+        writer.route_directory.clone(),
+    ));
+    writer.route_directory = route_directory.clone();
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(remote.storage_key());
+    writer
+        .batch_put(&[
+            PutRequest::new("chunk-publish-a", b"aaaa").replication(policy.clone()),
+            PutRequest::new("chunk-publish-b", b"bbbb").replication(policy),
+        ])
+        .expect("chunked remote batch put should succeed");
+
+    assert_eq!(transport.submitted_batch_sizes(), vec![1, 1]);
+    assert_eq!(
+        route_directory.cas_batch_sizes(),
+        vec![1, 1],
+        "routes should be published per completed remote write chunk"
+    );
 }
 
 #[test]
