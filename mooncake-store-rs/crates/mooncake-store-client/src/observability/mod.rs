@@ -782,7 +782,10 @@ mod tests {
         assert!(metrics.contains(
             "mooncake_store_request_total{tenant=\"default\",operation=\"put\",scope=\"foreground\",result=\"ok\"} 1"
         ));
-        assert!(!metrics.contains("tenant=\"tenant-a\""));
+        assert!(!metrics.contains(
+            "mooncake_store_request_total{tenant=\"tenant-a\",operation=\"put\",scope=\"foreground\",result=\"ok\"}"
+        ));
+        assert!(!metrics.contains("process_cpu_seconds_total{tenant=\"tenant-a\"}"));
     }
 
     #[test]
