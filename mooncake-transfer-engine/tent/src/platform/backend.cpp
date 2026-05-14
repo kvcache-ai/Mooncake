@@ -68,7 +68,7 @@ class PlatformBackend : public IPlatformBackend {
 #if defined(HAS_DEVICE_SUPPORT)
         int count = 0;
         auto ret = cudaGetDeviceCount(&count);
-        if (ret != CUDA_SUCCESS || count == 0) {
+        if (ret != cudaSuccess || count == 0) {
             LOG(WARNING) << name() << " not available";
             return Status::InternalError(name() + " not available");
         }
@@ -85,7 +85,7 @@ class PlatformBackend : public IPlatformBackend {
 #if defined(HAS_DEVICE_SUPPORT)
         int device_count = 0;
         auto ret = cudaGetDeviceCount(&device_count);
-        if (ret != CUDA_SUCCESS || device_count == 0) {
+        if (ret != cudaSuccess || device_count == 0) {
             return Status::OK();
         }
         LOG(INFO) << "Found " << device_count << " " << name() << " device(s)";
@@ -121,13 +121,13 @@ class PlatformBackend : public IPlatformBackend {
             gpu_prefix.find(location.type() + ":") == 0) {
             int device = 0;
             auto err = cudaGetDevice(&device);
-            if (err != CUDA_SUCCESS)
+            if (err != cudaSuccess)
                 return Status::InternalError("cudaGetDevice failed");
             err = cudaSetDevice(location.index());
-            if (err != CUDA_SUCCESS)
+            if (err != cudaSuccess)
                 return Status::InternalError("cudaSetDevice failed");
             err = cudaMalloc(pptr, size);
-            if (err != CUDA_SUCCESS)
+            if (err != cudaSuccess)
                 return Status::InternalError("cudaMalloc failed");
             cudaSetDevice(device);
             return Status::OK();
@@ -145,9 +145,9 @@ class PlatformBackend : public IPlatformBackend {
 #if defined(HAS_DEVICE_SUPPORT)
         cudaPointerAttributes attr;
         auto ret = cudaPointerGetAttributes(&attr, ptr);
-        if (ret == CUDA_SUCCESS && attr.type == cudaMemoryTypeDevice) {
+        if (ret == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
             auto err = cudaFree(ptr);
-            return (err == CUDA_SUCCESS)
+            return (err == cudaSuccess)
                        ? Status::OK()
                        : Status::InternalError("cudaFree failed");
         }
@@ -159,7 +159,7 @@ class PlatformBackend : public IPlatformBackend {
     Status copy(void* dst, void* src, size_t length) override {
 #if defined(HAS_DEVICE_SUPPORT)
         auto err = cudaMemcpy(dst, src, length, cudaMemcpyDefault);
-        return (err == CUDA_SUCCESS)
+        return (err == cudaSuccess)
                    ? Status::OK()
                    : Status::InternalError("cudaMemcpy failed");
 #else
@@ -172,7 +172,7 @@ class PlatformBackend : public IPlatformBackend {
 #if defined(HAS_DEVICE_SUPPORT)
         cudaPointerAttributes attr;
         auto ret = cudaPointerGetAttributes(&attr, addr);
-        if (ret == CUDA_SUCCESS && attr.type == cudaMemoryTypeDevice) {
+        if (ret == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
 #if defined(USE_CUDA)
             return MTYPE_CUDA;
 #elif defined(USE_ASCEND)
@@ -199,7 +199,7 @@ class PlatformBackend : public IPlatformBackend {
         cudaPointerAttributes attr;
         auto ret = cudaPointerGetAttributes(&attr, start);
 
-        if (ret == CUDA_SUCCESS && attr.type == cudaMemoryTypeDevice) {
+        if (ret == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
             RangeLocation rl;
             rl.start = reinterpret_cast<uint64_t>(start);
             rl.len = len;
@@ -255,7 +255,7 @@ class PlatformBackend : public IPlatformBackend {
         char pci_bus_id[20];
         auto err =
             cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), device);
-        if (err == CUDA_SUCCESS) {
+        if (err == cudaSuccess) {
             // Convert to lowercase for consistency
             for (char* ch = pci_bus_id; *ch; ++ch) *ch = tolower(*ch);
             return std::string(pci_bus_id);
