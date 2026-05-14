@@ -246,9 +246,6 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
         remote_stage_buffer[kStageBuffers];
 
     auto start_time = std::chrono::steady_clock::now();
-    metrics_.total_transfers.fetch_add(1, std::memory_order_relaxed);
-    metrics_.total_bytes_transferred.fetch_add(request.length,
-                                               std::memory_order_relaxed);
     if (local_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
             local_stage_buffer[i] =
@@ -429,6 +426,13 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
             }
 
             case StageState::FAILED: {
+                // Free all in-flight batches before returning
+                for (auto& chunk : chunks) {
+                    if (chunk.batch != 0) {
+                        impl_->freeBatch(chunk.batch);
+                        chunk.batch = 0;
+                    }
+                }
                 return Status::InternalError(
                     "Proxy event loop in failed state");
             }
@@ -489,9 +493,15 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
                           end_time - start_time)
                           .count();
+
+    // Update metrics only after successful completion
+    metrics_.total_transfers.fetch_add(1, std::memory_order_relaxed);
+    metrics_.total_bytes_transferred.fetch_add(request.length,
+                                               std::memory_order_relaxed);
     metrics_.total_latency_us.fetch_add(latency_us, std::memory_order_relaxed);
-    metrics_.pipeline_parallel_chunks.fetch_add(kStageBuffers,
+    metrics_.pipeline_parallel_chunks.fetch_add(chunks.size(),
                                                 std::memory_order_relaxed);
+    metrics_.markEndTime();
 
     return Status::OK();
 }

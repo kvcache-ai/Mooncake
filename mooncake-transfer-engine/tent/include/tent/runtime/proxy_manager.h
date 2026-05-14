@@ -20,6 +20,7 @@
 #include "tent/common/concurrent/thread_pool.h"
 
 #include "tent/runtime/transport.h"
+#include <chrono>
 
 // Beta version -- use with own risk
 
@@ -36,6 +37,8 @@ struct ProxyManagerMetrics {
     std::atomic<uint64_t> remote_staging_count{0};
     std::atomic<uint64_t> pipeline_parallel_chunks{0};
     std::atomic<uint64_t> retry_count{0};
+    std::atomic<int64_t> start_time{0};
+    std::atomic<int64_t> end_time{0};
 
     void reset() {
         total_transfers = 0;
@@ -44,6 +47,18 @@ struct ProxyManagerMetrics {
         remote_staging_count = 0;
         pipeline_parallel_chunks = 0;
         retry_count = 0;
+        start_time = 0;
+        end_time = 0;
+    }
+
+    void markStartTime() {
+        start_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                        std::memory_order_relaxed);
+    }
+
+    void markEndTime() {
+        end_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                      std::memory_order_relaxed);
     }
 
     double getAvgLatencyMs() const {
@@ -52,9 +67,16 @@ struct ProxyManagerMetrics {
     }
 
     double getThroughputGBps() const {
-        uint64_t us = total_latency_us.load();
-        return us > 0 ? (total_bytes_transferred.load() / 1e9) / (us / 1e6)
-                      : 0.0;
+        auto start = start_time.load();
+        auto end = end_time.load();
+        if (start == 0 || end == 0) return 0.0;
+
+        auto duration_us = end - start;
+        if (duration_us <= 0) return 0.0;
+
+        double duration_s = duration_us / 1e6;
+        double bytes_gb = total_bytes_transferred.load() / 1e9;
+        return bytes_gb / duration_s;
     }
 };
 
@@ -90,7 +112,10 @@ class ProxyManager {
 
     const ProxyManagerMetrics& getMetrics() const { return metrics_; }
 
-    void resetMetrics() { metrics_.reset(); }
+    void resetMetrics() {
+        metrics_.reset();
+        metrics_.markStartTime();
+    }
 
    private:
     void runner(size_t id);
