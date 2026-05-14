@@ -698,6 +698,8 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |
 | `MC_STORE_RS_TRACE_SPAN_EVENTS` | standalone client, Python real mode, e2e, and applications | tracing span lifecycle events; unset suppresses synthetic span close lines, `close` enables operation close timing logs |
 | `MC_STORE_RS_TRACE_JSONL_FILE` | standalone client, Python real mode, bench, and applications | local profiling sink; appends one JSON object per completed operation span and can be changed through `/tracing?file=...` before enabling |
+| `MC_STORE_RS_TRACE_ITEM_METADATA` | standalone client, Python real mode, bench, and applications | set to `1` to add local JSONL `store.api_items.v1` records for `batch_put_from` and `batch_get_into`; records include per-item namespace, key hash/prefix, TP rank, KV kind, byte size, and status |
+| `MC_STORE_RS_TRACE_KEY_MODE` | standalone client, Python real mode, bench, and applications | key representation for item metadata; default `hash` writes a truncated SHA-256 hash, `full` writes full keys for local debug only |
 | `MC_STORE_RS_OTLP_ENDPOINT` | standalone client, Python real mode, bench, and applications | OTLP HTTP endpoint for Jaeger profiling; `http://host:4318` is normalized to `/v1/traces` |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | standalone client, Python real mode, bench, and applications | standard OTLP traces endpoint; used as-is and takes precedence over `MC_STORE_RS_OTLP_ENDPOINT` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | standalone client, Python real mode, bench, and applications | standard base OTLP endpoint; normalized to `/v1/traces` |
@@ -773,6 +775,15 @@ processors are running would make trace ownership ambiguous. The same lock
 applies to `service_name`, `service_instance_id`, and `sample_ratio`; set them
 before enabling export. The local JSONL file can be set with `file=...` and
 cleared with `clear_file=true` while profiling is disabled.
+
+Set `MC_STORE_RS_TRACE_ITEM_METADATA=1` with a local JSONL file to append
+`store.api_items.v1` records next to the span records for successful
+`batch_put_from` / `batch_get_into` paths. These records are for offline
+per-key analysis and include `trace_request_id`, operation, tenant/domain/object
+set, runtime id, batch bytes, per-item key hash, readable key prefix, parsed
+SGLang TP rank and `k`/`v` suffix, size/read length, and status. The default
+`MC_STORE_RS_TRACE_KEY_MODE=hash` never writes full keys; use `full` only for
+local debug captures.
 
 `/breakdown` returns JSON for SGLang/HiCache performance diagnosis. It includes
 API, phase, metadata-backend, transport, runtime, segment, and

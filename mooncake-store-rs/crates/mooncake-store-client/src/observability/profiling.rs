@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use opentelemetry_sdk::Resource;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 const DEFAULT_SERVICE_NAME: &str = "mooncake-store-rs";
 const DEFAULT_TRACER_NAME: &str = "mooncake-store-rs";
@@ -29,6 +31,8 @@ const SERVICE_INSTANCE_ENV: &str = "MC_STORE_RS_OTLP_SERVICE_INSTANCE_ID";
 const EXPORT_TIMEOUT_ENV: &str = "MC_STORE_RS_OTLP_TIMEOUT_MS";
 const SAMPLE_RATIO_ENV: &str = "MC_STORE_RS_OTLP_SAMPLE_RATIO";
 const JSONL_FILE_ENV: &str = "MC_STORE_RS_TRACE_JSONL_FILE";
+const ITEM_METADATA_ENV: &str = "MC_STORE_RS_TRACE_ITEM_METADATA";
+const KEY_MODE_ENV: &str = "MC_STORE_RS_TRACE_KEY_MODE";
 const DEFAULT_EXPORT_TIMEOUT: Duration = Duration::from_secs(3);
 
 static PROFILING_CONTROL: OnceLock<ProfilingControl> = OnceLock::new();
@@ -44,6 +48,7 @@ pub(crate) struct ProfilingSpan {
     context: Option<Context>,
     stack_depth: Option<usize>,
     local: Option<LocalProfilingSpan>,
+    request_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -82,6 +87,8 @@ struct ProfilingConfig {
     service_name: String,
     service_instance_id: Option<String>,
     sample_ratio: f64,
+    item_metadata: bool,
+    key_mode: TraceKeyMode,
     export_timeout: Duration,
     last_error: Option<String>,
 }
@@ -108,6 +115,65 @@ struct LocalProfilingSpan {
     started: Instant,
     started_unix_ms: u128,
     attributes: BTreeMap<&'static str, serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TraceKeyMode {
+    Hash,
+    Full,
+}
+
+pub(crate) struct ApiItemsTraceRecord<'a> {
+    pub trace_request_id: u64,
+    pub operation: &'static str,
+    pub tenant: &'a str,
+    pub domain: &'a str,
+    pub object_set: &'a str,
+    pub runtime_id: &'a str,
+    pub batch_bytes: u64,
+    pub items: Vec<ApiItemTrace<'a>>,
+}
+
+pub(crate) struct ApiItemTrace<'a> {
+    pub index: usize,
+    pub key: &'a str,
+    pub tenant: &'a str,
+    pub domain: &'a str,
+    pub object_set: &'a str,
+    pub size: Option<u64>,
+    pub read_len: Option<u64>,
+    pub status: &'static str,
+}
+
+#[derive(Serialize)]
+struct LocalApiItemsRecord<'a> {
+    record_type: &'static str,
+    timestamp_unix_ms: u128,
+    trace_request_id: u64,
+    operation: &'static str,
+    tenant: &'a str,
+    domain: &'a str,
+    object_set: &'a str,
+    runtime_id: &'a str,
+    item_count: u64,
+    batch_bytes: u64,
+    items: Vec<LocalApiItemRecord<'a>>,
+}
+
+#[derive(Serialize)]
+struct LocalApiItemRecord<'a> {
+    index: usize,
+    key_hash: String,
+    key_prefix: String,
+    key: Option<&'a str>,
+    tenant: &'a str,
+    domain: &'a str,
+    object_set: &'a str,
+    tp_rank: Option<u64>,
+    kv_kind: Option<&'static str>,
+    size: Option<u64>,
+    read_len: Option<u64>,
+    status: &'static str,
 }
 
 #[derive(Serialize)]
@@ -166,6 +232,10 @@ impl ProfilingSpan {
                 serde_json::Value::Number(serde_json::Number::from(value)),
             );
         }
+    }
+
+    pub(crate) fn request_id(&self) -> Option<u64> {
+        self.request_id
     }
 
     pub(crate) fn finish(mut self, result: &'static str, bytes_out: u64) {
@@ -250,6 +320,7 @@ impl ProfilingSpan {
             context,
             stack_depth,
             local,
+            request_id: Some(request_id),
         }
     }
 
@@ -258,6 +329,7 @@ impl ProfilingSpan {
             context: None,
             stack_depth: None,
             local: None,
+            request_id: None,
         }
     }
 
@@ -522,6 +594,57 @@ impl ProfilingControl {
             let _ = writeln!(file, "{line}");
         }
     }
+
+    fn write_api_items(&self, record: ApiItemsTraceRecord<'_>) {
+        let mut inner = self.inner.lock().expect("profiling control lock poisoned");
+        if !inner.config.item_metadata {
+            return;
+        }
+        let key_mode = inner.config.key_mode;
+        if inner.file.is_none() {
+            return;
+        }
+        let items = record
+            .items
+            .into_iter()
+            .map(|item| {
+                let (tp_rank, kv_kind) = parse_sglang_key_suffix(item.key);
+                LocalApiItemRecord {
+                    index: item.index,
+                    key_hash: hash_key(item.key),
+                    key_prefix: key_prefix(item.key),
+                    key: (key_mode == TraceKeyMode::Full).then_some(item.key),
+                    tenant: item.tenant,
+                    domain: item.domain,
+                    object_set: item.object_set,
+                    tp_rank,
+                    kv_kind,
+                    size: item.size,
+                    read_len: item.read_len,
+                    status: item.status,
+                }
+            })
+            .collect::<Vec<_>>();
+        let local = LocalApiItemsRecord {
+            record_type: "store.api_items.v1",
+            timestamp_unix_ms: unix_now_ms(),
+            trace_request_id: record.trace_request_id,
+            operation: record.operation,
+            tenant: record.tenant,
+            domain: record.domain,
+            object_set: record.object_set,
+            runtime_id: record.runtime_id,
+            item_count: items.len() as u64,
+            batch_bytes: record.batch_bytes,
+            items,
+        };
+        let Ok(line) = serde_json::to_string(&local) else {
+            return;
+        };
+        if let Some(file) = &mut inner.file {
+            let _ = writeln!(file, "{line}");
+        }
+    }
 }
 
 impl ProfilingConfig {
@@ -532,10 +655,20 @@ impl ProfilingConfig {
             service_name: service_name_from_env(),
             service_instance_id: service_instance_from_env(),
             sample_ratio: sample_ratio_from_env(),
+            item_metadata: env_truthy(ITEM_METADATA_ENV),
+            key_mode: key_mode_from_env(),
             export_timeout: export_timeout_from_env(),
             last_error: None,
         }
     }
+}
+
+pub(crate) fn record_api_items(record: ApiItemsTraceRecord<'_>) {
+    let control = profiling_control();
+    if !control.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    control.write_api_items(record);
 }
 
 pub(crate) fn handle_tracing_http_path(path: &str) -> Result<String> {
@@ -705,6 +838,52 @@ fn sample_ratio_from_env() -> f64 {
     env_value(SAMPLE_RATIO_ENV)
         .and_then(|value| parse_ratio(&value).ok())
         .unwrap_or(1.0)
+}
+
+fn key_mode_from_env() -> TraceKeyMode {
+    match env_value(KEY_MODE_ENV)
+        .unwrap_or_else(|| "hash".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "full" => TraceKeyMode::Full,
+        _ => TraceKeyMode::Hash,
+    }
+}
+
+fn hash_key(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    let mut output = String::with_capacity("sha256:".len() + 32);
+    output.push_str("sha256:");
+    for byte in digest.iter().take(16) {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn key_prefix(key: &str) -> String {
+    key.chars().take(16).collect()
+}
+
+fn parse_sglang_key_suffix(key: &str) -> (Option<u64>, Option<&'static str>) {
+    let mut parts = key.rsplitn(3, '_');
+    let Some(kv_kind) = parts.next() else {
+        return (None, None);
+    };
+    let Some(tp_rank) = parts.next() else {
+        return (None, None);
+    };
+    let Some(_) = parts.next() else {
+        return (None, None);
+    };
+    let kv_kind = match kv_kind {
+        "k" => Some("k"),
+        "v" => Some("v"),
+        _ => None,
+    };
+    let tp_rank = tp_rank.parse::<u64>().ok();
+    (tp_rank, kv_kind)
 }
 
 fn sampler(sample_ratio: f64) -> Sampler {
@@ -1028,6 +1207,8 @@ mod tests {
                     service_name: DEFAULT_SERVICE_NAME.to_string(),
                     service_instance_id: None,
                     sample_ratio: 1.0,
+                    item_metadata: false,
+                    key_mode: TraceKeyMode::Hash,
                     export_timeout: DEFAULT_EXPORT_TIMEOUT,
                     last_error: None,
                 },
@@ -1065,6 +1246,84 @@ mod tests {
         assert_eq!(value["phase"], "api");
         assert_eq!(value["result"], "ok");
         assert_eq!(value["bytes_out"], 128_u64);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn local_jsonl_sink_writes_api_item_metadata_when_enabled() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mooncake-store-items-jsonl-{}-{}",
+            std::process::id(),
+            next_request_id()
+        ));
+        let path = temp_dir.join("trace.jsonl");
+        let control = ProfilingControl {
+            enabled: AtomicBool::new(true),
+            provider_ready: AtomicBool::new(false),
+            inner: Mutex::new(ProfilingInner {
+                config: ProfilingConfig {
+                    endpoint: None,
+                    file: Some(path.clone()),
+                    service_name: DEFAULT_SERVICE_NAME.to_string(),
+                    service_instance_id: None,
+                    sample_ratio: 1.0,
+                    item_metadata: true,
+                    key_mode: TraceKeyMode::Hash,
+                    export_timeout: DEFAULT_EXPORT_TIMEOUT,
+                    last_error: None,
+                },
+                provider: None,
+                file: None,
+            }),
+        };
+        control
+            .ensure_sinks()
+            .expect("file-only tracing sink should initialize");
+
+        control.write_api_items(ApiItemsTraceRecord {
+            trace_request_id: 32574,
+            operation: "batch_put_from",
+            tenant: "tenant-a",
+            domain: "domain-a",
+            object_set: "set-a",
+            runtime_id: "py-store-1:2",
+            batch_bytes: 1540096,
+            items: vec![ApiItemTrace {
+                index: 0,
+                key: "8544a78269348681_2_k",
+                tenant: "tenant-a",
+                domain: "domain-a",
+                object_set: "set-a",
+                size: Some(1540096),
+                read_len: None,
+                status: "ok",
+            }],
+        });
+        control.force_flush().expect("file flush should succeed");
+
+        let contents = std::fs::read_to_string(&path).expect("jsonl file should be readable");
+        let value: serde_json::Value =
+            serde_json::from_str(contents.trim()).expect("jsonl record should be valid json");
+        assert_eq!(value["record_type"], "store.api_items.v1");
+        assert_eq!(value["trace_request_id"], 32574_u64);
+        assert_eq!(value["operation"], "batch_put_from");
+        assert_eq!(value["tenant"], "tenant-a");
+        assert_eq!(value["domain"], "domain-a");
+        assert_eq!(value["object_set"], "set-a");
+        assert_eq!(value["runtime_id"], "py-store-1:2");
+        assert_eq!(value["item_count"], 1_u64);
+        assert_eq!(value["batch_bytes"], 1540096_u64);
+        assert_eq!(value["items"][0]["key_prefix"], "8544a78269348681");
+        assert_eq!(value["items"][0]["tp_rank"], 2_u64);
+        assert_eq!(value["items"][0]["kv_kind"], "k");
+        assert_eq!(value["items"][0]["size"], 1540096_u64);
+        assert_eq!(value["items"][0]["status"], "ok");
+        assert!(value["items"][0]["key"].is_null());
+        assert!(value["items"][0]["key_hash"]
+            .as_str()
+            .expect("key hash should be a string")
+            .starts_with("sha256:"));
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
