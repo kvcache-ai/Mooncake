@@ -538,7 +538,7 @@ void Client::InitTransferSubmitter() {
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        *transfer_engine_, storage_backend_,
+        *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 }
 
@@ -2295,11 +2295,23 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
+    int64_t ssd_total_capacity_bytes) {
+    auto response =
+        master_client_.ReportSsdCapacity(client_id_, ssd_total_capacity_bytes);
+    if (!response) {
+        LOG(ERROR) << "ReportSsdCapacity failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batch_slices) {
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_slices) {
     auto future = transfer_submitter_->submit_batch_get_offload_object(
         transfer_engine_addr, keys, pointers, batch_slices);
     if (!future) {

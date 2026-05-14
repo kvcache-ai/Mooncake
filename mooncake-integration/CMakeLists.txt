@@ -13,6 +13,7 @@ endif()
 if(WITH_STORE)
   include_directories("../mooncake-store/include")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
+  include_directories("../mooncake-store/include/engram")
 
   include_directories(
     "../mooncake-store/include/cachelib_memory_allocator/include")
@@ -97,7 +98,7 @@ endif()
 
 if(WITH_STORE)
   pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-                      store/store_py.cpp integration_utils.h)
+                      store/store_py.cpp store/engram_store_py.cpp integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
   if(USE_ASCEND_DIRECT)
     target_link_libraries(

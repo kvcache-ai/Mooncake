@@ -13,8 +13,18 @@
 #include "types.h"
 
 #include <cstdlib>  // for atexit
+#include <memory>
 
 #include "integration_utils.h"
+
+// Forward declaration for EngramStore bindings
+namespace mooncake {
+namespace engram {
+void bind_engram_store(py::module &m);
+}
+}  // namespace mooncake
+#include "engram/engram_store.h"
+#include "engram/engram_store_config.h"
 
 namespace py = pybind11;
 
@@ -338,6 +348,43 @@ class MooncakeStorePyWrapper {
         }
         py::gil_scoped_release release;
         return real_client->unmountSegment(segment_ids);
+    }
+
+    py::dict allocate_and_mount_segment(size_t size,
+                                        const std::string &protocol,
+                                        const std::string &location) {
+        py::dict result;
+        result["ret"] = -1;
+        result["segment_ids"] = py::list();
+        result["allocated_size"] = 0;
+
+        auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
+        if (!real_client) {
+            LOG(ERROR) << "allocate_and_mount_segment requires RealClient";
+            return result;
+        }
+        std::vector<std::string> segment_ids;
+        size_t allocated_size = 0;
+        int ret;
+        {
+            py::gil_scoped_release release;
+            ret = real_client->allocateAndMountSegment(
+                size, protocol, location, segment_ids, &allocated_size);
+        }
+        result["ret"] = ret;
+        result["segment_ids"] = py::cast(segment_ids);
+        result["allocated_size"] = allocated_size;
+        return result;
+    }
+
+    int unmount_and_free_segment(const std::vector<std::string> &segment_ids) {
+        auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
+        if (!real_client) {
+            LOG(ERROR) << "unmount_and_free_segment requires RealClient";
+            return -1;
+        }
+        py::gil_scoped_release release;
+        return real_client->unmountAndFreeSegment(segment_ids);
     }
 
     std::string get_tp_key_name(const std::string &base_key, int rank) const {
@@ -1527,6 +1574,20 @@ class MooncakeHostMemAllocatorPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    // Object data type classification
+    py::enum_<ObjectDataType>(m, "ObjectDataType")
+        .value("UNKNOWN", ObjectDataType::UNKNOWN)
+        .value("KVCACHE", ObjectDataType::KVCACHE)
+        .value("TENSOR", ObjectDataType::TENSOR)
+        .value("WEIGHT", ObjectDataType::WEIGHT)
+        .value("SAMPLE", ObjectDataType::SAMPLE)
+        .value("ACTIVATION", ObjectDataType::ACTIVATION)
+        .value("GRADIENT", ObjectDataType::GRADIENT)
+        .value("OPTIMIZER_STATE", ObjectDataType::OPTIMIZER_STATE)
+        .value("METADATA", ObjectDataType::METADATA)
+        .value("GENERAL", ObjectDataType::GENERAL)
+        .export_values();
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -1538,6 +1599,7 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
@@ -1569,6 +1631,9 @@ PYBIND11_MODULE(store, m) {
         .def("is_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_disk_replica))
+        .def("is_local_disk_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_local_disk_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
@@ -1693,6 +1758,21 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("expert_id", &ParallelAxisSpec::expert_id)
         .def_readwrite("stage_id", &ParallelAxisSpec::stage_id);
 
+    auto make_pyclient_capsule =
+        [](const std::shared_ptr<PyClient> &store) -> py::object {
+        if (!store) {
+            return py::none();
+        }
+        auto ptr = std::make_unique<std::shared_ptr<PyClient>>(store);
+        std::shared_ptr<PyClient> *raw_ptr = ptr.get();
+        py::object cap =
+            py::capsule(raw_ptr, "mooncake.PyClient.shared_ptr", [](void *p) {
+                delete static_cast<std::shared_ptr<PyClient> *>(p);
+            });
+        (void)ptr.release();  // Transfer ownership to capsule
+        return cap;
+    };
+
     py::class_<TensorParallelismSpec>(m, "TensorParallelism")
         .def(py::init<>())
         .def_readwrite("axes", &TensorParallelismSpec::axes);
@@ -1723,8 +1803,41 @@ PYBIND11_MODULE(store, m) {
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
+    // Helper function to extract PyClient shared_ptr from
+    // MooncakeStorePyWrapper This is used by EngramStore to get the underlying
+    // PyClient We return it as a Python capsule to avoid type registration
+    // issues
+    m.def(
+        "_get_pyclient_from_wrapper",
+        [](MooncakeStorePyWrapper &wrapper) -> py::object {
+            if (!wrapper.store_) {
+                return py::none();
+            }
+            // Return as a capsule containing the shared_ptr
+            // The caller (engram_store_py.cpp) will extract it
+            // Use unique_ptr for RAII: if py::capsule throws, the pointer is
+            // freed; otherwise release() transfers ownership to the capsule.
+            auto ptr =
+                std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
+            std::shared_ptr<PyClient> *raw_ptr = ptr.get();
+            py::object cap = py::capsule(raw_ptr, [](void *p) {
+                delete static_cast<std::shared_ptr<PyClient> *>(p);
+            });
+            (void)ptr.release();  // Transfer ownership to capsule
+            return cap;
+        },
+        py::arg("wrapper"),
+        "Get PyClient from MooncakeDistributedStore (internal use, returns "
+        "capsule)");
+
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
+        .def(
+            "_get_pyclient_capsule",
+            [make_pyclient_capsule](MooncakeStorePyWrapper &self)
+                -> py::object { return make_pyclient_capsule(self.store_); },
+            "Internal use: expose the underlying PyClient handle as a typed "
+            "capsule")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
@@ -1814,6 +1927,13 @@ PYBIND11_MODULE(store, m) {
              py::arg("path"), py::arg("size"), py::arg("offset") = 0,
              py::arg("protocol") = "tcp", py::arg("location") = "")
         .def("unmount_segment", &MooncakeStorePyWrapper::unmount_segment,
+             py::arg("segment_ids"))
+        .def("allocate_and_mount_segment",
+             &MooncakeStorePyWrapper::allocate_and_mount_segment,
+             py::arg("size"), py::arg("protocol") = "tcp",
+             py::arg("location") = "")
+        .def("unmount_and_free_segment",
+             &MooncakeStorePyWrapper::unmount_and_free_segment,
              py::arg("segment_ids"))
         .def("alloc_from_mem_pool",
              [](MooncakeStorePyWrapper &self, size_t size) {
@@ -2646,6 +2766,9 @@ PYBIND11_MODULE(store, m) {
         py::arg("node"),
         "Bind the current thread and memory allocation preference to the "
         "specified NUMA node");
+
+    // Add EngramStore bindings
+    mooncake::engram::bind_engram_store(m);
 }
 
 }  // namespace mooncake
