@@ -458,8 +458,15 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocPicksAvailableSegment) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder_client_id, "k_cold",
                                        1024, "segment_a_endpoint"));
 
-    // Direct PromotionAllocStart — bypass the gate to test the allocation
-    // path in isolation.
+    // Seed the PromotionTask through the gate — PromotionAllocStart now
+    // requires an in-flight task to exist (rejects orphaned-stage path).
+    {
+        auto r = service->GetReplicaList("k_cold");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // PromotionAllocStart — test the segment-selection logic on top of
+    // the gate-seeded task.
     auto resp = service->PromotionAllocStart("k_cold", 1024, {});
     ASSERT_TRUE(resp.has_value())
         << "PromotionAllocStart should succeed when any DRAM segment has "
@@ -499,6 +506,13 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocRespectsPreferred) {
 
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg_a.client_id, "k_cold",
                                        1024, seg_a.segment_name));
+
+    // Seed the PromotionTask through the gate so AllocStart's
+    // task-existence check passes.
+    {
+        auto r = service->GetReplicaList("k_cold");
+        ASSERT_TRUE(r.has_value());
+    }
 
     auto resp =
         service->PromotionAllocStart("k_cold", 1024, {seg_b.segment_name});
@@ -977,6 +991,140 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
         << "success path. Without fetch_sub, the cap stays saturated and "
         << "k_second is silently dropped.";
     EXPECT_EQ(pending->count("k_second"), 1u);
+
+    service->RemoveAll();
+}
+
+// Bug 1 regression — PromotionAllocStart must reject when the in-flight
+// task has been reaped between heartbeat and AllocStart. Without this
+// check, AllocStart would allocate and AddReplicas a PROCESSING MEMORY
+// replica and then silently fail to record alloc_id; the staged replica
+// would then be invisible to both DiscardExpiredProcessingReplicas
+// (which iterates shard->processing_keys, never populated for promotion)
+// and the promotion-task reaper (the task entry it iterates is gone),
+// leaking the allocator buffer until the object itself is removed or
+// evicted.
+TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.put_start_discard_timeout_sec = 0;
+    config.put_start_release_timeout_sec = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
+                                       ctx.segment_name));
+
+    // Baseline allocator usage.
+    auto seg_baseline = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_baseline.has_value());
+    const size_t used_baseline = seg_baseline->first;
+
+    // Admit the task.
+    {
+        auto r = service->GetReplicaList("k_cold");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // Wait past the TTL so the reaper sweeps the task. AllocStart has
+    // not yet been called, so alloc_id is 0; the reaper's
+    // EraseReplicaByID branch is a no-op and only the task entry is
+    // removed. We can't easily poll for reap externally (the only
+    // user-facing observable would be re-admitting through the gate,
+    // which would create a fresh task and defeat the test), so use a
+    // fixed sleep with margin. Matches the StalePromotionReaper test
+    // pattern (TTL=1s, sleep=2s) which has held 17/17 in CI.
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Now call AllocStart on the reaped task. Pre-fix this would allocate
+    // a buffer, AddReplicas a PROCESSING MEMORY replica, and return
+    // success with an orphaned replica attached to the object. Post-fix
+    // it must reject without allocating anything.
+    auto alloc = service->PromotionAllocStart("k_cold", 1024, {});
+    ASSERT_FALSE(alloc.has_value())
+        << "AllocStart must reject when the task has been reaped — "
+        << "otherwise the staged PROCESSING MEMORY replica is orphaned";
+    EXPECT_EQ(alloc.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    // The DRAM allocator must be at baseline: no buffer was staged.
+    auto seg_after = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_after.has_value());
+    EXPECT_EQ(seg_after->first, used_baseline)
+        << "AllocStart on a reaped task must not allocate. If used bytes "
+        << "grew here, AllocStart got to AddReplicas before the task-"
+        << "existence check and the staged buffer is now orphaned (no "
+        << "reaper iterates it).";
+
+    service->RemoveAll();
+}
+
+// Bug 2 regression — NotifyPromotionSuccess must reject calls from a
+// client that is not the holder of the source LOCAL_DISK replica.
+// Without this check, any client knowing the key could flip the staged
+// PROCESSING MEMORY replica to COMPLETE before the holder's RDMA write
+// has landed, exposing torn data to readers.
+TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto holder =
+        PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_cold",
+                                       1024, holder.segment_name));
+
+    // Admit + stage.
+    {
+        auto r = service->GetReplicaList("k_cold");
+        ASSERT_TRUE(r.has_value());
+    }
+    auto alloc = service->PromotionAllocStart("k_cold", 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+
+    // An unrelated client tries to Notify. Pre-fix this would flip the
+    // staged replica to COMPLETE; post-fix it must be rejected as
+    // INVALID_PARAMS.
+    UUID intruder_id = generate_uuid();
+    ASSERT_NE(intruder_id, holder.client_id);
+    auto bad_notify = service->NotifyPromotionSuccess(intruder_id, "k_cold");
+    ASSERT_FALSE(bad_notify.has_value())
+        << "Notify from a non-holder client must be rejected — otherwise "
+        << "any client knowing the key can commit someone else's "
+        << "still-being-written replica";
+    EXPECT_EQ(bad_notify.error(), ErrorCode::INVALID_PARAMS);
+
+    // The staged replica must still be PROCESSING (not committed by the
+    // rejected call). Readers must not see it via GetReplicaList yet —
+    // GetReplicaList filters PROCESSING replicas, and pre-AllocStart
+    // there are no COMPLETE replicas to read for a LOCAL_DISK-only key
+    // (only the LOCAL_DISK descriptor itself).
+    auto r_check = service->GetReplicaList("k_cold");
+    ASSERT_TRUE(r_check.has_value());
+    bool saw_complete_memory = false;
+    for (const auto& d : r_check.value().replicas) {
+        if (d.is_memory_replica() && d.status == ReplicaStatus::COMPLETE) {
+            saw_complete_memory = true;
+            break;
+        }
+    }
+    EXPECT_FALSE(saw_complete_memory)
+        << "Rejected Notify must not have committed the staged replica";
+
+    // The legitimate holder must still be able to Notify successfully.
+    auto good_notify =
+        service->NotifyPromotionSuccess(holder.client_id, "k_cold");
+    ASSERT_TRUE(good_notify.has_value())
+        << "Holder Notify on the same task must succeed after a rejected "
+        << "intruder Notify — the task entry should be untouched by the "
+        << "rejection path; error=" << good_notify.error();
 
     service->RemoveAll();
 }

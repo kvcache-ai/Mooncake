@@ -1000,11 +1000,20 @@ class MasterService {
     // enter active transfer with little remaining TTL and the reaper
     // could free the staged MEMORY replica via EraseReplicaByID while
     // the client's RDMA write is still landing into it.
+    //
+    // holder_id is the client that owns the source LOCAL_DISK segment and
+    // is the *only* client authorized to call NotifyPromotionSuccess for
+    // this task. Captured at admission so the Notify path can reject
+    // calls from other clients that happen to know the key — without
+    // this check, any client could flip the staged PROCESSING replica
+    // to COMPLETE before the holder's RDMA write has landed, exposing
+    // torn data to readers.
     struct PromotionTask {
         ReplicaID source_id;    // the LOCAL_DISK replica being promoted
         ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
         uint64_t object_size;
         std::chrono::system_clock::time_point start_time;
+        UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards

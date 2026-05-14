@@ -2873,13 +2873,19 @@ void MasterService::TryPushPromotionQueue(const std::string& key) {
         return;
     }
 
+    // Capture the holder client_id so NotifyPromotionSuccess can reject
+    // calls from other clients. PushPromotionQueue already validated
+    // get_local_disk_client_id() returns a value, so .value() is safe.
+    const UUID holder_id = source->get_local_disk_client_id().value();
+
     // Record the in-flight task. alloc_id is filled in by
     // PromotionAllocStart once the new MEMORY replica is staged.
     shard->promotion_tasks.emplace(
         key, PromotionTask{.source_id = source->id(),
                            .alloc_id = 0,
                            .object_size = object_size,
-                           .start_time = std::chrono::system_clock::now()});
+                           .start_time = std::chrono::system_clock::now(),
+                           .holder_id = holder_id});
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     VLOG(1) << "promotion_queued key=" << key << " size=" << object_size;
 }
@@ -2925,6 +2931,26 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
+
+    // Verify the in-flight task still exists before allocating. The reaper
+    // can sweep a task between the holder's heartbeat and this AllocStart
+    // call (a hung client, GC pause, or HA failover can stall AllocStart
+    // for longer than put_start_release_timeout_sec_). If we allocated
+    // and AddReplicas'd unconditionally, the staged PROCESSING MEMORY
+    // replica would have no PromotionTask pointing at it: the generic
+    // PROCESSING reaper (DiscardExpiredProcessingReplicas) only iterates
+    // shard->processing_keys, which AllocStart never populates, and the
+    // promotion-task reaper has nothing left to iterate. The buffer would
+    // sit attached to the object until the object itself is removed or
+    // evicted — the same orphaned-staged-replica shape Issue 1's fix
+    // closed on the symmetric (task-still-exists-but-reaper-fires-first)
+    // path. The shard mutex is held through the rest of this function,
+    // so the iterator stays valid across the allocation step.
+    auto& shard = accessor.GetShard();
+    auto task_it = shard->promotion_tasks.find(key);
+    if (task_it == shard->promotion_tasks.end()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
 
     // Allocate a single MEMORY replica via the existing strategy, biased to
     // the holder's mem segment when possible.
@@ -2979,12 +3005,8 @@ auto MasterService::PromotionAllocStart(
     // (alloc_id still 0) is bounded by its own original-start_time
     // window during which the reaper's EraseReplicaByID branch is a
     // no-op.
-    auto& shard = accessor.GetShard();
-    auto task_it = shard->promotion_tasks.find(key);
-    if (task_it != shard->promotion_tasks.end()) {
-        task_it->second.alloc_id = new_id;
-        task_it->second.start_time = std::chrono::system_clock::now();
-    }
+    task_it->second.alloc_id = new_id;
+    task_it->second.start_time = std::chrono::system_clock::now();
     return PromotionAllocStartResponse{std::move(desc)};
 }
 
@@ -3008,6 +3030,15 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (task_it == shard->promotion_tasks.end() ||
         task_it->second.alloc_id == 0) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Only the holder client (the one owning the source LOCAL_DISK
+    // segment) is authorized to commit. Without this check any client
+    // knowing the key could flip the staged PROCESSING replica to
+    // COMPLETE before the holder's RDMA write has landed, exposing torn
+    // data to readers.
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     bool committed = false;
