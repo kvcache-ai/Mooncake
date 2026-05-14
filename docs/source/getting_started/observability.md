@@ -103,7 +103,7 @@ Eviction counters are **deltas** between two consecutive log outputs — they sh
 | Field | Description |
 |-------|-------------|
 | `Eviction: Success/Attempts` | Eviction rounds that succeeded at least partially vs. total attempts in this window |
-| `AllocFail` | Number of PutStart failures caused by replica allocation failure (triggers eviction) in this window |
+| `AllocFail` | Number of PutStart/UpsertStart failures caused by replica allocation failure (triggers eviction) in this window |
 | `keys` | Number of keys evicted in this window |
 | `size` | Total size of evicted data in this window |
 | `Discard: Released/Total` | Released (cleaned up) vs. total discarded PutStart staging replicas (live values) |
