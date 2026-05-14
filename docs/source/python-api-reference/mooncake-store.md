@@ -304,14 +304,13 @@ pool.close()
 - `ptr`: the registered memory address to pass to zero-copy APIs.
 - `size`: the requested logical size.
 - `buffer`: a Python `memoryview` over the logical requested size.
-- `view(size)`: a shorter view object; use `view(size).buffer` for memoryview operations.
 - `release()`: returns the region to the pool, or unregisters it if it is oversized or the pool is closing.
 
 Behavior and lifecycle rules:
 
 - Requested sizes are rounded into reusable size classes up to `max_size_class`; larger requests are supported but are not reused.
 - `max_bytes` bounds the total registered memory owned by the pool.
-- `try_acquire(size)` returns `None` instead of raising when the pool is exhausted.
+- `acquire(size, block=False)` raises when the pool is exhausted instead of waiting.
 - `acquire(size, timeout=...)` can wait for another lease to be released.
 - Do not keep `lease.ptr` or a `memoryview` after releasing the lease.
 - `release()` fails while exported views are alive. Delete those views first, then release.

@@ -30,19 +30,13 @@ def test_registered_buffer_pool_reuses_released_buffer() -> None:
 
     lease = pool.acquire(1234)
     ptr = lease.ptr
-    lease.view(4).buffer[:] = b"abcd"
+    lease.buffer[:4] = b"abcd"
     assert bytes(lease.buffer[:4]) == b"abcd"
     lease.release()
 
     reused = pool.acquire(2048)
     assert reused.ptr == ptr
     reused.release()
-
-    stats = pool.stats()
-    assert stats["acquire_count"] == 2
-    assert stats["reuse_count"] == 1
-    assert stats["release_count"] == 2
-    assert stats["free_regions"] == 1
     pool.close()
 
 
@@ -56,9 +50,11 @@ def test_registered_buffer_pool_prewarm_and_close() -> None:
         prewarm_size=1024,
         prewarm_count=2,
     )
-    assert pool.stats()["free_regions"] == 2
+    lease1 = pool.acquire(1024)
+    lease2 = pool.acquire(1024)
+    lease1.release()
+    lease2.release()
     pool.close()
-    assert pool.stats()["free_regions"] == 0
 
 
 @pytest.mark.parametrize("size", [0, 1, 128 * 1024 + 1])
@@ -89,7 +85,6 @@ def test_registered_buffer_pool_nonblocking_exhaustion() -> None:
     lease = pool.acquire(1)
     with pytest.raises(RuntimeError, match="exhausted"):
         pool.acquire(1)
-    assert pool.try_acquire(1) is None
     lease.release()
     pool.close()
 
@@ -163,17 +158,6 @@ def test_registered_buffer_pool_memoryview_keeps_lease_alive() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_view_cannot_exceed_requested_size() -> None:
-    store = create_store()
-    pool = RegisteredBufferPool(store, 4096, min_size_class=4096, alignment=4096)
-
-    lease = pool.acquire(4)
-    with pytest.raises(RuntimeError, match="lease size"):
-        lease.view(5)
-    lease.release()
-    pool.close()
-
-
 def test_registered_buffer_pool_releases_from_destructor() -> None:
     store = create_store()
     pool = RegisteredBufferPool(store, 4096, min_size_class=4096, alignment=4096)
@@ -182,7 +166,6 @@ def test_registered_buffer_pool_releases_from_destructor() -> None:
     del lease
     gc.collect()
 
-    assert pool.stats()["in_use_regions"] == 0
     pool.close()
 
 
@@ -194,14 +177,6 @@ def test_registered_buffer_pool_rejects_close_with_active_lease() -> None:
     with pytest.raises(RuntimeError, match="active leases"):
         pool.close()
     lease.release()
-    pool.close()
-
-
-def test_registered_buffer_pool_transfer_groups_are_indices() -> None:
-    store = create_store()
-    pool = RegisteredBufferPool(store, 1024 * 1024, max_size_class=10, alignment=4096)
-
-    assert pool.iter_transfer_groups([0, 4, 6, 1, 10, 11]) == [[1, 2], [3], [4], [5]]
     pool.close()
 
 

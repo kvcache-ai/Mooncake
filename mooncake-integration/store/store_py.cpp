@@ -308,7 +308,6 @@ class RegisteredBufferLeaseViewNative {
     RegisteredBufferLeaseViewNative &operator=(
         const RegisteredBufferLeaseViewNative &) = delete;
 
-    uintptr_t ptr() const;
     py::buffer_info buffer_info();
 
    private:
@@ -331,11 +330,9 @@ class RegisteredBufferLeaseNative
     uintptr_t ptr() const;
     size_t size() const { return requested_size_; }
     py::object buffer();
-    std::shared_ptr<RegisteredBufferLeaseViewNative> view(size_t size);
     py::buffer_info buffer_info(size_t size);
     void add_export();
     void release_export();
-    RegisteredBufferLeaseNative &view_region() { return *this; }
     RegisteredBufferLeaseNative &enter() { return *this; }
     void exit(const py::object &, const py::object &, const py::object &) {
         release();
@@ -370,17 +367,12 @@ class RegisteredBufferPoolNative
 
     std::shared_ptr<RegisteredBufferLeaseNative> acquire(
         size_t size, py::object block, py::object timeout);
-    std::shared_ptr<RegisteredBufferLeaseNative> try_acquire(size_t size);
     std::shared_ptr<RegisteredBufferLeaseNative> buffer(size_t size,
                                                         py::object block,
                                                         py::object timeout) {
         return acquire(size, block, timeout);
     }
-    std::vector<std::vector<size_t>> iter_transfer_groups(
-        const std::vector<size_t> &sizes) const;
     void prewarm(size_t size, size_t count);
-    void ensure_prewarmed(size_t size, size_t count);
-    py::dict stats() const;
     void close();
 
    private:
@@ -1803,8 +1795,6 @@ RegisteredBufferLeaseViewNative::~RegisteredBufferLeaseViewNative() {
     lease_->release_export();
 }
 
-uintptr_t RegisteredBufferLeaseViewNative::ptr() const { return lease_->ptr(); }
-
 py::buffer_info RegisteredBufferLeaseViewNative::buffer_info() {
     return lease_->buffer_info(size_);
 }
@@ -1827,17 +1817,9 @@ uintptr_t RegisteredBufferLeaseNative::ptr() const {
 }
 
 py::object RegisteredBufferLeaseNative::buffer() {
-    return py::memoryview(py::cast(view(requested_size_)));
-}
-
-std::shared_ptr<RegisteredBufferLeaseViewNative> RegisteredBufferLeaseNative::view(
-    size_t size) {
-    if (!handle_) throw std::runtime_error("registered buffer lease is closed");
-    if (size > requested_size_) {
-        throw std::runtime_error("buffer view exceeds lease size");
-    }
-    return std::make_shared<RegisteredBufferLeaseViewNative>(shared_from_this(),
-                                                             size);
+    auto view = std::make_shared<RegisteredBufferLeaseViewNative>(
+        shared_from_this(), requested_size_);
+    return py::memoryview(py::cast(view));
 }
 
 py::buffer_info RegisteredBufferLeaseNative::buffer_info(size_t size) {
@@ -1941,47 +1923,6 @@ std::shared_ptr<RegisteredBufferLeaseNative> RegisteredBufferPoolNative::acquire
     }
 }
 
-std::shared_ptr<RegisteredBufferLeaseNative> RegisteredBufferPoolNative::try_acquire(
-    size_t size) {
-    try {
-        return acquire(size, py::bool_(false), py::none());
-    } catch (const std::runtime_error &error) {
-        if (std::string(error.what()) == "registered buffer pool is exhausted") {
-            return nullptr;
-        }
-        throw;
-    }
-}
-
-std::vector<std::vector<size_t>> RegisteredBufferPoolNative::iter_transfer_groups(
-    const std::vector<size_t> &sizes) const {
-    std::vector<std::vector<size_t>> groups;
-    std::vector<size_t> current;
-    size_t current_bytes = 0;
-    for (size_t i = 0; i < sizes.size(); ++i) {
-        size_t size = sizes[i];
-        if (size == 0) continue;
-        if (size > max_size_class_) {
-            if (!current.empty()) {
-                groups.push_back(current);
-                current.clear();
-                current_bytes = 0;
-            }
-            groups.push_back({i});
-            continue;
-        }
-        if (!current.empty() && current_bytes > max_size_class_ - size) {
-            groups.push_back(current);
-            current.clear();
-            current_bytes = 0;
-        }
-        current.push_back(i);
-        current_bytes += size;
-    }
-    if (!current.empty()) groups.push_back(current);
-    return groups;
-}
-
 void RegisteredBufferPoolNative::prewarm(size_t size, size_t count) {
     auto [size_class, oversize] = allocation_size(size);
     if (oversize) {
@@ -2009,75 +1950,6 @@ void RegisteredBufferPoolNative::prewarm(size_t size, size_t count) {
         }
         condition_.notify_all();
     }
-}
-
-void RegisteredBufferPoolNative::ensure_prewarmed(size_t size, size_t count) {
-    auto [size_class, oversize] = allocation_size(size);
-    if (oversize) {
-        throw std::runtime_error("cannot prewarm oversize buffers");
-    }
-    while (true) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        raise_if_open_locked();
-        if (free_[size_class].size() >= count) {
-            return;
-        }
-        if (!has_capacity_for_locked(size_class)) {
-            throw std::runtime_error("registered buffer pool capacity exceeded");
-        }
-        Region region = allocate_region_locked(lock, size_class);
-        if (closed_ || closing_) {
-            lock.unlock();
-            unregister_region_unlocked(region);
-            lock.lock();
-            throw std::runtime_error("registered buffer pool is closing");
-        }
-        try {
-            free_[size_class].push_back(std::move(region));
-        } catch (...) {
-            lock.unlock();
-            unregister_region_unlocked(region);
-            throw;
-        }
-        condition_.notify_all();
-    }
-}
-
-py::dict RegisteredBufferPoolNative::stats() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    py::dict result;
-    py::dict size_classes;
-    size_t free_regions = 0;
-    size_t free_bytes = 0;
-    for (const auto &entry : free_) {
-        if (entry.second.empty()) continue;
-        size_classes[py::int_(entry.first)] = py::int_(entry.second.size());
-        free_regions += entry.second.size();
-        free_bytes += entry.first * entry.second.size();
-    }
-    size_t in_use_bytes = 0;
-    for (uintptr_t ptr : in_use_) {
-        auto region_iter = regions_.find(ptr);
-        if (region_iter != regions_.end()) {
-            in_use_bytes += region_iter->second.size;
-        }
-    }
-    result["size_classes"] = size_classes;
-    result["free_regions"] = free_regions;
-    result["in_use_regions"] = in_use_.size();
-    result["total_regions"] = regions_.size();
-    result["total_bytes"] = total_bytes_;
-    result["free_bytes"] = free_bytes;
-    result["in_use_bytes"] = in_use_bytes;
-    result["acquire_count"] = acquire_count_;
-    result["reuse_count"] = reuse_count_;
-    result["allocate_count"] = allocate_count_;
-    result["oversize_allocate_count"] = oversize_allocate_count_;
-    result["wait_count"] = wait_count_;
-    result["release_count"] = release_count_;
-    result["register_s"] = register_s_;
-    result["unregister_s"] = unregister_s_;
-    return result;
 }
 
 void RegisteredBufferPoolNative::close() {
@@ -2502,7 +2374,6 @@ PYBIND11_MODULE(store, m) {
     py::class_<RegisteredBufferLeaseViewNative,
                std::shared_ptr<RegisteredBufferLeaseViewNative>>(
         m, "RegisteredBufferLeaseView", py::buffer_protocol())
-        .def_property_readonly("ptr", &RegisteredBufferLeaseViewNative::ptr)
         .def_property_readonly(
             "buffer", [](const py::object &self) { return py::memoryview(self); })
         .def_buffer(&RegisteredBufferLeaseViewNative::buffer_info);
@@ -2513,8 +2384,6 @@ PYBIND11_MODULE(store, m) {
         .def_property_readonly("ptr", &RegisteredBufferLeaseNative::ptr)
         .def_property_readonly("size", &RegisteredBufferLeaseNative::size)
         .def_property_readonly("buffer", &RegisteredBufferLeaseNative::buffer)
-        .def("view", &RegisteredBufferLeaseNative::view, py::arg("size"))
-        .def("view_region", &RegisteredBufferLeaseNative::view_region)
         .def("release", &RegisteredBufferLeaseNative::release)
         .def("__enter__", &RegisteredBufferLeaseNative::enter,
              py::return_value_policy::reference_internal)
@@ -2550,17 +2419,10 @@ PYBIND11_MODULE(store, m) {
         .def("acquire", &RegisteredBufferPoolNative::acquire,
              py::arg("size"), py::arg("block") = py::none(),
              py::arg("timeout") = py::none())
-        .def("try_acquire", &RegisteredBufferPoolNative::try_acquire,
-             py::arg("size"))
         .def("buffer", &RegisteredBufferPoolNative::buffer, py::arg("size"),
              py::arg("block") = py::none(), py::arg("timeout") = py::none())
-        .def("iter_transfer_groups",
-             &RegisteredBufferPoolNative::iter_transfer_groups, py::arg("sizes"))
         .def("prewarm", &RegisteredBufferPoolNative::prewarm, py::arg("size"),
              py::arg("count"))
-        .def("ensure_prewarmed", &RegisteredBufferPoolNative::ensure_prewarmed,
-             py::arg("size"), py::arg("count"))
-        .def("stats", &RegisteredBufferPoolNative::stats)
         .def("close", &RegisteredBufferPoolNative::close);
 
     py::class_<MooncakeHostMemAllocatorPyWrapper>(m, "MooncakeHostMemAllocator")
