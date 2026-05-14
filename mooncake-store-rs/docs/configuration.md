@@ -697,6 +697,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_TRACE_FILTER` | standalone client, Python wrapper setup fallback, e2e, and applications | `tracing_subscriber` filter string; `--trace-filter` overrides it for the standalone client |
 | `MC_STORE_RS_TRACE_FILE` | Python real mode, standalone client, e2e, and applications | append Rust tracing logs to this file; also auto-enables Python real-client tracing |
 | `MC_STORE_RS_TRACE_SPAN_EVENTS` | standalone client, Python real mode, e2e, and applications | tracing span lifecycle events; unset suppresses synthetic span close lines, `close` enables operation close timing logs |
+| `MC_STORE_RS_TRACE_JSONL_FILE` | standalone client, Python real mode, bench, and applications | local profiling sink; appends one JSON object per completed operation span and can be changed through `/tracing?file=...` before enabling |
 | `MC_STORE_RS_OTLP_ENDPOINT` | standalone client, Python real mode, bench, and applications | OTLP HTTP endpoint for Jaeger profiling; `http://host:4318` is normalized to `/v1/traces` |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | standalone client, Python real mode, bench, and applications | standard OTLP traces endpoint; used as-is and takes precedence over `MC_STORE_RS_OTLP_ENDPOINT` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | standalone client, Python real mode, bench, and applications | standard base OTLP endpoint; normalized to `/v1/traces` |
@@ -755,19 +756,29 @@ The Rust client exposes:
 The metrics HTTP server exposes:
 
 - `GET /metrics`
+- `GET /stats`
+- `GET /breakdown`
 - `GET /healthz`
 - `GET /tracing`
 - `GET /tracing/on`
 - `GET /tracing/off`
 - `GET /tracing?enabled=on&endpoint=http%3A%2F%2Fjaeger.observability.svc.cluster.local%3A4318&sample_ratio=0.05`
+- `GET /tracing?enabled=on&file=%2Ftmp%2Fstore-rs.trace.jsonl`
 - `GET /tracing/flush`
 
-`/tracing` returns JSON status for the OTLP profiler. Enabling requires an
-endpoint from either environment variables or the request query. The endpoint is
-locked after the exporter is initialized, because changing Jaeger backends while
-batch processors are running would make trace ownership ambiguous.
-The same lock applies to `service_name`, `service_instance_id`, and
-`sample_ratio`; set them before enabling export.
+`/tracing` returns JSON status for the profiler. Enabling requires at least one
+sink: an OTLP endpoint for Jaeger or a local JSONL file. The endpoint is locked
+after the exporter is initialized, because changing Jaeger backends while batch
+processors are running would make trace ownership ambiguous. The same lock
+applies to `service_name`, `service_instance_id`, and `sample_ratio`; set them
+before enabling export. The local JSONL file can be set with `file=...` and
+cleared with `clear_file=true` while profiling is disabled.
+
+`/breakdown` returns JSON for SGLang/HiCache performance diagnosis. It includes
+API, phase, metadata-backend, transport, runtime, segment, and
+bottleneck-candidate sections. Use `mooncake-store-client stats --breakdown
+--server <host:port>` for a compact human-readable summary, or add `--json` to
+print the raw JSON.
 
 When OTLP profiling is enabled, Jaeger span names describe the performance
 surface instead of raw code hooks. API roots are named `store.*`; control-plane

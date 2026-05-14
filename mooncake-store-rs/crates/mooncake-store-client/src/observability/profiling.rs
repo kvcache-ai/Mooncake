@@ -1,9 +1,13 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::env;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{Result, StoreError};
 use opentelemetry::trace::{Span as _, Status, TraceContextExt, Tracer};
@@ -24,6 +28,7 @@ const STANDARD_SERVICE_NAME_ENV: &str = "OTEL_SERVICE_NAME";
 const SERVICE_INSTANCE_ENV: &str = "MC_STORE_RS_OTLP_SERVICE_INSTANCE_ID";
 const EXPORT_TIMEOUT_ENV: &str = "MC_STORE_RS_OTLP_TIMEOUT_MS";
 const SAMPLE_RATIO_ENV: &str = "MC_STORE_RS_OTLP_SAMPLE_RATIO";
+const JSONL_FILE_ENV: &str = "MC_STORE_RS_TRACE_JSONL_FILE";
 const DEFAULT_EXPORT_TIMEOUT: Duration = Duration::from_secs(3);
 
 static PROFILING_CONTROL: OnceLock<ProfilingControl> = OnceLock::new();
@@ -38,6 +43,7 @@ thread_local! {
 pub(crate) struct ProfilingSpan {
     context: Option<Context>,
     stack_depth: Option<usize>,
+    local: Option<LocalProfilingSpan>,
 }
 
 #[derive(Clone)]
@@ -62,6 +68,7 @@ pub(crate) struct ProfilingSnapshot {
     pub configured: bool,
     pub provider_ready: bool,
     pub endpoint: Option<String>,
+    pub file: Option<String>,
     pub service_name: String,
     pub service_instance_id: Option<String>,
     pub sample_ratio: f64,
@@ -71,6 +78,7 @@ pub(crate) struct ProfilingSnapshot {
 #[derive(Clone, Debug)]
 struct ProfilingConfig {
     endpoint: Option<String>,
+    file: Option<PathBuf>,
     service_name: String,
     service_instance_id: Option<String>,
     sample_ratio: f64,
@@ -81,12 +89,40 @@ struct ProfilingConfig {
 struct ProfilingInner {
     config: ProfilingConfig,
     provider: Option<SdkTracerProvider>,
+    file: Option<File>,
 }
 
 struct ProfilingControl {
     enabled: AtomicBool,
     provider_ready: AtomicBool,
     inner: Mutex<ProfilingInner>,
+}
+
+struct LocalProfilingSpan {
+    span_name: String,
+    phase: &'static str,
+    flow: &'static str,
+    role: &'static str,
+    request_id: u64,
+    root_operation: &'static str,
+    started: Instant,
+    started_unix_ms: u128,
+    attributes: BTreeMap<&'static str, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct LocalSpanRecord<'a> {
+    timestamp_unix_ms: u128,
+    duration_us: u64,
+    span_name: &'a str,
+    phase: &'static str,
+    flow: &'static str,
+    role: &'static str,
+    request_id: u64,
+    root_operation: &'static str,
+    result: &'static str,
+    bytes_out: u64,
+    attributes: &'a BTreeMap<&'static str, serde_json::Value>,
 }
 
 impl ProfilingSpan {
@@ -111,6 +147,11 @@ impl ProfilingSpan {
                 .span()
                 .set_attribute(KeyValue::new(key, value.to_string()));
         }
+        if let Some(local) = &mut self.local {
+            local
+                .attributes
+                .insert(key, serde_json::Value::String(value.to_string()));
+        }
     }
 
     pub(crate) fn set_u64(&mut self, key: &'static str, value: u64) {
@@ -118,6 +159,12 @@ impl ProfilingSpan {
             context
                 .span()
                 .set_attribute(KeyValue::new(key, clamp_u64_to_i64(value)));
+        }
+        if let Some(local) = &mut self.local {
+            local.attributes.insert(
+                key,
+                serde_json::Value::Number(serde_json::Number::from(value)),
+            );
         }
     }
 
@@ -130,6 +177,9 @@ impl ProfilingSpan {
             }
             context.span().end();
         }
+        if let Some(local) = self.local.take() {
+            profiling_control().write_local_span(local, result, bytes_out);
+        }
         self.pop_stack_frame();
     }
 
@@ -141,12 +191,12 @@ impl ProfilingSpan {
         if !control.enabled.load(Ordering::Relaxed) {
             return Self::disabled();
         }
-        if let Err(error) = control.ensure_provider() {
+        if let Err(error) = control.ensure_sinks() {
             control.disable_after_error(error.to_string());
             return Self::disabled();
         }
 
-        let tracer = global::tracer(DEFAULT_TRACER_NAME);
+        let span_name = name();
         let parent = current_profiling_frame();
         let request_id = parent
             .as_ref()
@@ -157,34 +207,49 @@ impl ProfilingSpan {
             .map(|frame| frame.root_operation)
             .unwrap_or(semantics.span_name);
         let flow = effective_flow(semantics.flow, parent.as_ref());
-        let mut span = if let Some(parent) = parent.as_ref() {
-            tracer.start_with_context(name(), &parent.context)
-        } else {
-            tracer.start(name())
-        };
-        span.set_attribute(KeyValue::new("mooncake.component", "store-rs"));
-        span.set_attribute(KeyValue::new("mooncake.phase", semantics.phase));
-        span.set_attribute(KeyValue::new("mooncake.flow", flow));
-        span.set_attribute(KeyValue::new("mooncake.span_role", semantics.role));
-        span.set_attribute(KeyValue::new(
-            "mooncake.request_id",
-            clamp_u64_to_i64(request_id),
-        ));
-        span.set_attribute(KeyValue::new("mooncake.root_operation", root_operation));
-        let context = if let Some(parent) = parent.as_ref() {
-            parent.context.with_span(span)
-        } else {
-            Context::current_with_span(span)
-        };
-        let stack_depth = Some(push_profiling_frame(ProfilingFrame {
-            context: context.clone(),
+        let local = control.local_span(
+            span_name.as_ref(),
+            semantics,
             request_id,
             root_operation,
             flow,
-        }));
+        );
+        let context = if control.provider_ready.load(Ordering::Acquire) {
+            let tracer = global::tracer(DEFAULT_TRACER_NAME);
+            let mut span = if let Some(parent) = parent.as_ref() {
+                tracer.start_with_context(span_name.clone(), &parent.context)
+            } else {
+                tracer.start(span_name.clone())
+            };
+            span.set_attribute(KeyValue::new("mooncake.component", "store-rs"));
+            span.set_attribute(KeyValue::new("mooncake.phase", semantics.phase));
+            span.set_attribute(KeyValue::new("mooncake.flow", flow));
+            span.set_attribute(KeyValue::new("mooncake.span_role", semantics.role));
+            span.set_attribute(KeyValue::new(
+                "mooncake.request_id",
+                clamp_u64_to_i64(request_id),
+            ));
+            span.set_attribute(KeyValue::new("mooncake.root_operation", root_operation));
+            Some(if let Some(parent) = parent.as_ref() {
+                parent.context.with_span(span)
+            } else {
+                Context::current_with_span(span)
+            })
+        } else {
+            local.as_ref().map(|_| Context::new())
+        };
+        let stack_depth = context.as_ref().map(|context| {
+            push_profiling_frame(ProfilingFrame {
+                context: context.clone(),
+                request_id,
+                root_operation,
+                flow,
+            })
+        });
         Self {
-            context: Some(context),
+            context,
             stack_depth,
+            local,
         }
     }
 
@@ -192,6 +257,7 @@ impl ProfilingSpan {
         Self {
             context: None,
             stack_depth: None,
+            local: None,
         }
     }
 
@@ -215,6 +281,9 @@ impl Drop for ProfilingSpan {
         if let Some(context) = self.context.take() {
             context.span().end();
         }
+        if let Some(local) = self.local.take() {
+            profiling_control().write_local_span(local, "dropped", 0);
+        }
         self.pop_stack_frame();
     }
 }
@@ -229,31 +298,40 @@ impl ProfilingControl {
             inner: Mutex::new(ProfilingInner {
                 config,
                 provider: None,
+                file: None,
             }),
         }
     }
 
-    fn ensure_provider(&self) -> Result<()> {
-        if self.provider_ready.load(Ordering::Acquire) {
-            return Ok(());
+    fn ensure_sinks(&self) -> Result<()> {
+        let mut inner = self.inner.lock().expect("profiling control lock poisoned");
+        if inner.config.endpoint.is_none() && inner.config.file.is_none() {
+            return Err(StoreError::InvalidState(format!(
+                "tracing sink is not configured; set {ENDPOINT_ENV}, \
+                 {STANDARD_TRACES_ENDPOINT_ENV}, or {JSONL_FILE_ENV}"
+            )));
         }
 
-        let mut inner = self.inner.lock().expect("profiling control lock poisoned");
-        if inner.provider.is_some() {
-            self.provider_ready.store(true, Ordering::Release);
-            return Ok(());
+        if inner.config.file.is_some() && inner.file.is_none() {
+            let path = inner.config.file.clone().expect("file path checked above");
+            inner.file = Some(open_jsonl_file(&path)?);
         }
-        let endpoint = inner.config.endpoint.clone().ok_or_else(|| {
-            StoreError::InvalidState(format!(
-                "OTLP tracing endpoint is not configured; set {ENDPOINT_ENV} \
-                 or {STANDARD_TRACES_ENDPOINT_ENV}"
-            ))
-        })?;
-        let provider = build_provider(&inner.config, &endpoint)?;
-        global::set_tracer_provider(provider.clone());
-        inner.provider = Some(provider);
+
+        if inner.config.endpoint.is_some()
+            && inner.provider.is_none()
+            && !self.provider_ready.load(Ordering::Acquire)
+        {
+            let endpoint = inner
+                .config
+                .endpoint
+                .clone()
+                .expect("endpoint checked above");
+            let provider = build_provider(&inner.config, &endpoint)?;
+            global::set_tracer_provider(provider.clone());
+            inner.provider = Some(provider);
+            self.provider_ready.store(true, Ordering::Release);
+        }
         inner.config.last_error = None;
-        self.provider_ready.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -267,9 +345,14 @@ impl ProfilingControl {
         let inner = self.inner.lock().expect("profiling control lock poisoned");
         ProfilingSnapshot {
             enabled: self.enabled.load(Ordering::Acquire),
-            configured: inner.config.endpoint.is_some(),
+            configured: inner.config.endpoint.is_some() || inner.config.file.is_some(),
             provider_ready: self.provider_ready.load(Ordering::Acquire),
             endpoint: inner.config.endpoint.clone(),
+            file: inner
+                .config
+                .file
+                .as_ref()
+                .map(|path| path.display().to_string()),
             service_name: inner.config.service_name.clone(),
             service_instance_id: inner.config.service_instance_id.clone(),
             sample_ratio: inner.config.sample_ratio,
@@ -283,6 +366,7 @@ impl ProfilingControl {
         service_name: Option<String>,
         service_instance_id: Option<String>,
         sample_ratio: Option<f64>,
+        file: Option<Option<String>>,
         enabled: Option<bool>,
     ) -> Result<ProfilingSnapshot> {
         {
@@ -327,11 +411,19 @@ impl ProfilingControl {
                 }
                 inner.config.sample_ratio = sample_ratio;
             }
+            if let Some(file) = file {
+                let next_file = file.and_then(|value| non_empty(Some(&value)).map(PathBuf::from));
+                if inner.config.file != next_file {
+                    inner.file = None;
+                    inner.config.file = next_file;
+                    inner.config.last_error = None;
+                }
+            }
         }
 
         if let Some(enabled) = enabled {
             if enabled {
-                self.ensure_provider()?;
+                self.ensure_sinks()?;
             }
             self.enabled.store(enabled, Ordering::Release);
         }
@@ -339,12 +431,15 @@ impl ProfilingControl {
     }
 
     fn force_flush(&self) -> Result<()> {
-        let provider = self
-            .inner
-            .lock()
-            .expect("profiling control lock poisoned")
-            .provider
-            .clone();
+        let provider = {
+            let mut inner = self.inner.lock().expect("profiling control lock poisoned");
+            if let Some(file) = &mut inner.file {
+                file.flush().map_err(|error| {
+                    StoreError::InvalidState(format!("local tracing flush failed: {error}"))
+                })?;
+            }
+            inner.provider.clone()
+        };
         if let Some(provider) = provider {
             provider.force_flush().map_err(|error| {
                 StoreError::InvalidState(format!("OTLP tracing flush failed: {error}"))
@@ -352,12 +447,88 @@ impl ProfilingControl {
         }
         Ok(())
     }
+
+    fn local_span(
+        &self,
+        span_name: &str,
+        semantics: OperationSemantics,
+        request_id: u64,
+        root_operation: &'static str,
+        flow: &'static str,
+    ) -> Option<LocalProfilingSpan> {
+        let has_file = self
+            .inner
+            .lock()
+            .expect("profiling control lock poisoned")
+            .file
+            .is_some();
+        if !has_file {
+            return None;
+        }
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "mooncake.component",
+            serde_json::Value::String("store-rs".to_string()),
+        );
+        attributes.insert(
+            "mooncake.phase",
+            serde_json::Value::String(semantics.phase.to_string()),
+        );
+        attributes.insert("mooncake.flow", serde_json::Value::String(flow.to_string()));
+        attributes.insert(
+            "mooncake.span_role",
+            serde_json::Value::String(semantics.role.to_string()),
+        );
+        attributes.insert(
+            "mooncake.request_id",
+            serde_json::Value::Number(serde_json::Number::from(request_id)),
+        );
+        attributes.insert(
+            "mooncake.root_operation",
+            serde_json::Value::String(root_operation.to_string()),
+        );
+        Some(LocalProfilingSpan {
+            span_name: span_name.to_string(),
+            phase: semantics.phase,
+            flow,
+            role: semantics.role,
+            request_id,
+            root_operation,
+            started: Instant::now(),
+            started_unix_ms: unix_now_ms(),
+            attributes,
+        })
+    }
+
+    fn write_local_span(&self, span: LocalProfilingSpan, result: &'static str, bytes_out: u64) {
+        let record = LocalSpanRecord {
+            timestamp_unix_ms: span.started_unix_ms,
+            duration_us: span.started.elapsed().as_micros() as u64,
+            span_name: &span.span_name,
+            phase: span.phase,
+            flow: span.flow,
+            role: span.role,
+            request_id: span.request_id,
+            root_operation: span.root_operation,
+            result,
+            bytes_out,
+            attributes: &span.attributes,
+        };
+        let Ok(line) = serde_json::to_string(&record) else {
+            return;
+        };
+        let mut inner = self.inner.lock().expect("profiling control lock poisoned");
+        if let Some(file) = &mut inner.file {
+            let _ = writeln!(file, "{line}");
+        }
+    }
 }
 
 impl ProfilingConfig {
     fn from_env() -> Self {
         Self {
             endpoint: endpoint_from_env(),
+            file: env_value(JSONL_FILE_ENV).map(PathBuf::from),
             service_name: service_name_from_env(),
             service_instance_id: service_instance_from_env(),
             sample_ratio: sample_ratio_from_env(),
@@ -394,6 +565,7 @@ pub(crate) fn handle_tracing_http_path(path: &str) -> Result<String> {
         update.service_name,
         update.service_instance_id,
         update.sample_ratio,
+        update.file,
         update.enabled,
     )?;
     serde_json::to_string(&snapshot)
@@ -437,6 +609,7 @@ struct ProfilingUpdate {
     service_name: Option<String>,
     service_instance_id: Option<String>,
     sample_ratio: Option<f64>,
+    file: Option<Option<String>>,
     enabled: Option<bool>,
 }
 
@@ -455,6 +628,12 @@ fn parse_update_query(query: Option<&str>) -> Result<ProfilingUpdate> {
             "service_name" => update.service_name = Some(value),
             "service_instance_id" => update.service_instance_id = Some(value),
             "sample_ratio" | "sampling_ratio" => update.sample_ratio = Some(parse_ratio(&value)?),
+            "file" | "jsonl_file" => update.file = Some(Some(value)),
+            "clear_file" => {
+                if parse_bool(&value)? {
+                    update.file = Some(None);
+                }
+            }
             unknown => {
                 return Err(StoreError::InvalidState(format!(
                     "unknown tracing control query key {unknown:?}"
@@ -542,6 +721,9 @@ fn operation_semantics(operation: &'static str) -> OperationSemantics {
         "put_from" => api_semantics("store.put_from", "put"),
         "batch_put" => api_semantics("store.batch_put", "put"),
         "batch_put_from" => api_semantics("store.batch_put_from", "put"),
+        "batch_is_exist" => api_semantics("store.batch_is_exist", "get"),
+        "get_size" => api_semantics("store.get_size", "get"),
+        "query_route" => api_semantics("store.query_route", "control"),
         "batch_put_from_multi_buffers" => {
             api_semantics("store.batch_put_from_multi_buffers", "put")
         }
@@ -554,6 +736,13 @@ fn operation_semantics(operation: &'static str) -> OperationSemantics {
         }
         "route_lookup_many" | "put_stage_load_route" | "batch_put_stage_load_routes" => {
             stage_semantics("control.route_lookup", "control", infer_flow(operation))
+        }
+        "readable_replica_select" => {
+            stage_semantics("control.readable_replica_select", "control", "get")
+        }
+        "compat_dispatcher_bridge" => stage_semantics("python.bridge", "python", "inherit"),
+        "py_batch_put_from_fanout" => {
+            stage_semantics("python.batch_put_from_fanout", "python", "put")
         }
         "batch_put_stage_rank" => stage_semantics("control.placement_rank", "control", "put"),
         "put_stage_reserve" | "batch_put_stage_reserve" => {
@@ -709,6 +898,37 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn open_jsonl_file(path: &Path) -> Result<File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            StoreError::InvalidState(format!(
+                "failed to create tracing jsonl directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            StoreError::InvalidState(format!(
+                "failed to open tracing jsonl file {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+fn unix_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
 fn percent_decode(value: &str) -> Result<String> {
     let bytes = value.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
@@ -759,6 +979,8 @@ fn clamp_u64_to_i64(value: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
 
     #[test]
     fn normalizes_http_trace_endpoint() {
@@ -775,13 +997,76 @@ mod tests {
     #[test]
     fn parse_update_query_decodes_values() {
         let update = parse_update_query(Some(
-            "enabled=on&endpoint=http%3A%2F%2Fjaeger%3A4318&service_name=store+rs&sample_ratio=0.125",
+            "enabled=on&endpoint=http%3A%2F%2Fjaeger%3A4318&service_name=store+rs&sample_ratio=0.125&file=%2Ftmp%2Fstore.jsonl",
         ))
         .expect("query should parse");
         assert_eq!(update.enabled, Some(true));
         assert_eq!(update.endpoint.as_deref(), Some("http://jaeger:4318"));
         assert_eq!(update.service_name.as_deref(), Some("store rs"));
         assert_eq!(update.sample_ratio, Some(0.125));
+        assert_eq!(
+            update.file.as_ref().and_then(|file| file.as_deref()),
+            Some("/tmp/store.jsonl")
+        );
+    }
+
+    #[test]
+    fn local_jsonl_sink_writes_span_records() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mooncake-store-jsonl-{}-{}",
+            std::process::id(),
+            next_request_id()
+        ));
+        let path = temp_dir.join("trace.jsonl");
+        let control = ProfilingControl {
+            enabled: AtomicBool::new(true),
+            provider_ready: AtomicBool::new(false),
+            inner: Mutex::new(ProfilingInner {
+                config: ProfilingConfig {
+                    endpoint: None,
+                    file: Some(path.clone()),
+                    service_name: DEFAULT_SERVICE_NAME.to_string(),
+                    service_instance_id: None,
+                    sample_ratio: 1.0,
+                    export_timeout: DEFAULT_EXPORT_TIMEOUT,
+                    last_error: None,
+                },
+                provider: None,
+                file: None,
+            }),
+        };
+        control
+            .ensure_sinks()
+            .expect("file-only tracing sink should initialize");
+        let mut span = control
+            .local_span(
+                "store.batch_put_from",
+                api_semantics("store.batch_put_from", "put"),
+                42,
+                "store.batch_put_from",
+                "put",
+            )
+            .expect("local span should be created");
+        span.attributes.insert(
+            "mooncake.operation",
+            serde_json::Value::String("batch_put_from".to_string()),
+        );
+        control.write_local_span(span, "ok", 128);
+        control.force_flush().expect("file flush should succeed");
+
+        let contents = std::fs::read_to_string(&path).expect("jsonl file should be readable");
+        let line = contents
+            .lines()
+            .next()
+            .expect("jsonl should have one record");
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("jsonl record should be valid json");
+        assert_eq!(value["span_name"], "store.batch_put_from");
+        assert_eq!(value["phase"], "api");
+        assert_eq!(value["result"], "ok");
+        assert_eq!(value["bytes_out"], 128_u64);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]

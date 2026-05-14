@@ -130,14 +130,58 @@ impl StoreClient {
         &self,
         keys: &[ObjectKey],
     ) -> Result<Vec<Option<ObjectRoute>>> {
-        let routes = self
+        let tracker = OperationTracker::new("route_lookup_many")
+            .scope("route_lookup")
+            .attribute_u64("mooncake.item_count", keys.len() as u64);
+        let result: Result<Vec<Option<ObjectRoute>>> = (|| {
+            let routes = self
+                .route_directory
+                .get_object_routes_bounded(&self.lease, keys)?;
+            self.filter_routes_to_readable(routes)
+        })();
+        tracker.finish(&result, result.as_ref().map(|routes| routes.len()).unwrap_or(0) as u64);
+        result
+    }
+
+    pub fn batch_is_readable(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
+        let tracker = OperationTracker::new("batch_is_exist")
+            .attribute_u64("mooncake.item_count", objects.len() as u64);
+        let result: Result<Vec<bool>> = (|| {
+            let keys = objects
+                .iter()
+                .map(|object| {
+                    let tenant = object.tenant.unwrap_or(self.default_tenant());
+                    let scope =
+                        NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
+                    ObjectKey::from_scope(&scope, object.key)
+                })
+                .collect::<Vec<_>>();
+            let readable_runtimes = self.readable_runtime_set(false)?;
+            let result = self
+                .query_routes_by_object_keys_bounded(&keys)?
+                .into_iter()
+                .map(|route| {
+                    route.is_some_and(|route| {
+                        self.route_has_readable_replica(&route, &readable_runtimes)
+                    })
+                })
+                .collect();
+            Ok(result)
+        })();
+        tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
+        result
+    }
+
+    fn query_route_by_object_id_inner(
+        &self,
+        object_id: &LogicalObjectId,
+    ) -> Result<Option<ObjectRoute>> {
+        let route = self
             .route_directory
-            .get_object_routes_bounded(&self.lease, keys)?
-            .into_iter()
-            .map(|route| route.filter(|route| route.state == RouteState::Active))
-            .collect::<Vec<_>>();
-        self.report_route_hits_best_effort(routes.iter().filter_map(Option::as_ref));
-        Ok(routes)
+            .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(object_id))?
+            .filter(|route| route.state == RouteState::Active);
+        self.report_route_hits_best_effort(route.iter());
+        Ok(route)
     }
 
     fn shared_batch_replication_policy(
@@ -479,7 +523,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("evacuate_owned_replicas");
-        let result = (|| {
+        let result: Result<usize> = (|| {
             self.ensure_local_memory()?;
             if self.lifecycle_state() != ClientLifecycleState::Draining {
                 self.enter_draining()?;
@@ -507,12 +551,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
-        let route = self
-            .route_directory
-            .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(object_id))?
-            .filter(|route| route.state == RouteState::Active);
-        self.report_route_hits_best_effort(route.iter());
-        Ok(route)
+        let tracker = OperationTracker::new("query_route");
+        let result = self.query_route_by_object_id_inner(object_id);
+        tracker.finish(&result, result.as_ref().map(|route| route.is_some() as u64).unwrap_or(0));
+        result
     }
 
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
@@ -553,7 +595,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let _span =
             info_span!("store.register_local_memory", runtime = %self.lease.runtime).entered();
         let tracker = OperationTracker::new("register_local_memory");
-        let result = (|| {
+        let result: Result<()> = (|| {
             self.ensure_local_memory()?;
             self.complete_startup_activation_after_local_memory_registration()
         })();
@@ -607,16 +649,19 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn get_size_in_tenant(&self, tenant: &str, key: &str) -> Result<usize> {
-        Ok(self
-            .query_route_in_tenant(tenant, key)?
-            .and_then(|route| {
-                route
-                    .replicas
-                    .iter()
-                    .min_by_key(|replica| replica.priority)
-                    .map(|replica| replica.length as usize)
-            })
-            .unwrap_or(0))
+        let tracker = OperationTracker::new("get_size");
+        let result = (|| {
+            let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
+            let Some(route) = self.query_route_by_object_id_inner(&object_id)? else {
+                return Ok(0);
+            };
+            Ok(self
+                .select_readable_replica_with_refresh(&route)?
+                .map(|replica| replica.length as usize)
+                .unwrap_or(0))
+        })();
+        tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
+        result
     }
 
     fn is_exist(&self, key: &str) -> Result<bool> {
@@ -628,20 +673,26 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
-        let keys = objects
-            .iter()
-            .map(|object| {
-                let tenant = object.tenant.unwrap_or(self.default_tenant());
-                let scope =
-                    NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
-                ObjectKey::from_scope(&scope, object.key)
-            })
-            .collect::<Vec<_>>();
-        Ok(self
-            .query_routes_by_object_keys_bounded(&keys)?
-            .into_iter()
-            .map(|route| route.is_some())
-            .collect())
+        let tracker = OperationTracker::new("batch_is_exist")
+            .attribute_u64("mooncake.item_count", objects.len() as u64);
+        let result: Result<Vec<bool>> = (|| {
+            let keys = objects
+                .iter()
+                .map(|object| {
+                    let tenant = object.tenant.unwrap_or(self.default_tenant());
+                    let scope =
+                        NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
+                    ObjectKey::from_scope(&scope, object.key)
+                })
+                .collect::<Vec<_>>();
+            Ok(self
+                .query_routes_by_object_keys_bounded(&keys)?
+                .into_iter()
+                .map(|route| route.is_some())
+                .collect())
+        })();
+        tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
+        result
     }
 
     fn remove(&self, key: &str, force: bool) -> Result<()> {

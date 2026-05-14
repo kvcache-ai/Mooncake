@@ -1853,6 +1853,99 @@ impl StoreClient {
             .cloned()
     }
 
+    fn replica_is_readable(
+        replica: &ReplicaRoute,
+        local_runtime: &ClientRuntimeId,
+        local_segments: &BTreeSet<SegmentName>,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) -> bool {
+        if replica.owner == *local_runtime {
+            return local_segments.contains(&replica.segment_name);
+        }
+        readable_runtimes.contains(&replica.owner)
+    }
+
+    fn route_has_readable_replica(
+        &self,
+        route: &ObjectRoute,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) -> bool {
+        route.state == RouteState::Active
+            && self
+                .select_readable_replica(route, readable_runtimes)
+                .is_some()
+    }
+
+    fn filter_routes_to_readable(
+        &self,
+        routes: Vec<Option<ObjectRoute>>,
+    ) -> Result<Vec<Option<ObjectRoute>>> {
+        let mut routes = routes
+            .into_iter()
+            .map(|route| route.filter(|route| route.state == RouteState::Active))
+            .collect::<Vec<_>>();
+        let readable_runtimes = self.readable_runtime_set(false)?;
+        let needs_refresh = routes
+            .iter()
+            .filter_map(Option::as_ref)
+            .any(|route| !self.route_has_readable_replica(route, &readable_runtimes));
+        let readable_runtimes = if needs_refresh {
+            self.readable_runtime_set(true)?
+        } else {
+            readable_runtimes
+        };
+
+        for route in &mut routes {
+            let Some(candidate) = route.as_ref() else {
+                continue;
+            };
+            if let Some(replica) = self.select_readable_replica(candidate, &readable_runtimes) {
+                if candidate
+                    .replicas
+                    .iter()
+                    .min_by_key(|candidate| candidate.priority)
+                    .is_some_and(|primary| primary.owner != replica.owner)
+                {
+                    self.prune_unreadable_replicas_best_effort(candidate, &readable_runtimes);
+                }
+                continue;
+            }
+            *route = None;
+        }
+
+        self.report_route_hits_best_effort(routes.iter().filter_map(Option::as_ref));
+        Ok(routes)
+    }
+
+    fn select_readable_replica_with_refresh(
+        &self,
+        route: &ObjectRoute,
+    ) -> Result<Option<ReplicaRoute>> {
+        let tracker =
+            OperationTracker::new("readable_replica_select").scope("readable_replica_select");
+        let result = (|| {
+            if route.state != RouteState::Active {
+                return Ok(None);
+            }
+            let readable_runtimes = self.readable_runtime_set(false)?;
+            if let Some(replica) = self.select_readable_replica(route, &readable_runtimes) {
+                return Ok(Some(replica));
+            }
+            let refreshed_readable = self.readable_runtime_set(true)?;
+            Ok(self.select_readable_replica(route, &refreshed_readable))
+        })();
+        tracker.finish(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|replica| replica.as_ref())
+                .map(|replica| replica.length)
+                .unwrap_or(0),
+        );
+        result
+    }
+
     fn local_readable_segments_for_route(&self, route: &ObjectRoute) -> BTreeSet<SegmentName> {
         let state = self.state.lock();
         state

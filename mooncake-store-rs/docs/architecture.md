@@ -428,14 +428,14 @@ Log-oriented tracing is built on `tracing` + `tracing-subscriber` and can be ena
 
 Jaeger profiling uses the same operation boundaries as the metrics registry:
 
-- `OperationTracker` creates semantic OTLP spans for request APIs and internal stages when profiling is enabled
+- `OperationTracker` creates semantic profiling spans for request APIs and internal stages when profiling is enabled; spans can go to OTLP/Jaeger, a local JSONL file, or both
 - request API spans such as `store.put`, `store.batch_put_from`, `store.get`, and `store.batch_get_into` become the root of the in-process waterfall
 - control-plane stages use names such as `control.route_lookup`, `control.allocate`, `control.route_publish`, and `control.replica_track`
 - data-plane stages use names such as `data.transfer_write`, `data.transfer_read`, `data.local_write`, and `data.local_read`
 - the metadata backend wrapper creates child spans for Redis, etcd, or another `MetadataBackend`
 - spans carry `mooncake.phase`, `mooncake.flow`, `mooncake.request_id`, `mooncake.item_count`, byte counts, and target-count attributes so Jaeger traces can be correlated with metrics time series
 - disabled profiling is an atomic fast path and does not build spans or touch the exporter
-- `/tracing` on the metrics HTTP server can turn OTLP export on or off dynamically after an endpoint is configured
+- `/tracing` on the metrics HTTP server can turn profiling on or off dynamically after an OTLP endpoint or JSONL file is configured
 - high-throughput profiling can set a sample ratio before exporter initialization to keep the collector from becoming the bottleneck
 
 ## Python Compatibility Architecture

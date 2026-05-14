@@ -217,6 +217,7 @@ What the script does:
 - hard-kills one storage node and retries completions until recovery, validating that requests do not stay broken after forced shrink
 - gracefully drains one storage node and retries completions until recovery, validating that requests do not stay broken after shrink
 - prints per-phase completion wall time and gateway latency breakdowns so TTFT regressions can be attributed to put/get, hot-cache probe, or compat bridge overhead
+- writes `sglang-true-e2e-breakdown-<stamp>.json` with Store-RS API, phase, metadata, transport, runtime, segment, and bottleneck-candidate data from the gateway `/breakdown` endpoint
 
 Important inputs:
 

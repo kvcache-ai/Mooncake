@@ -130,6 +130,8 @@ pub struct ErrorResponse {
 #[serde(deny_unknown_fields)]
 pub struct TracingUpdateRequest {
     pub endpoint: Option<String>,
+    pub file: Option<String>,
+    pub clear_file: Option<bool>,
     pub sample_ratio: Option<f64>,
     pub timeout_ms: Option<u64>,
     pub max_targets: Option<usize>,

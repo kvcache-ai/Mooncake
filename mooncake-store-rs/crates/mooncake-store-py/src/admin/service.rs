@@ -1112,13 +1112,23 @@ fn tracing_action_path(
         TracingAction::Off => Ok("/tracing/off".to_string()),
         TracingAction::Flush => Ok("/tracing/flush".to_string()),
         TracingAction::On => {
-            if request.endpoint.is_none() && request.sample_ratio.is_none() {
+            if request.endpoint.is_none()
+                && request.file.is_none()
+                && request.clear_file != Some(true)
+                && request.sample_ratio.is_none()
+            {
                 return Ok("/tracing/on".to_string());
             }
             let mut query = url::form_urlencoded::Serializer::new(String::new());
             query.append_pair("enabled", "on");
             if let Some(endpoint) = request.endpoint.as_deref() {
                 query.append_pair("endpoint", endpoint);
+            }
+            if let Some(file) = request.file.as_deref() {
+                query.append_pair("file", file);
+            }
+            if request.clear_file == Some(true) {
+                query.append_pair("clear_file", "true");
             }
             if let Some(sample_ratio) = request.sample_ratio {
                 if !sample_ratio.is_finite() || !(0.0..=1.0).contains(&sample_ratio) {

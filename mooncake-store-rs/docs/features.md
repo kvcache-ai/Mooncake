@@ -389,8 +389,9 @@ implementation hook: API roots use `store.*`, control-plane stages use
 waterfall with `mooncake.phase`, `mooncake.flow`, request id, item count, byte
 count, replica count, and local/remote target-count attributes.
 
-The in-process metrics HTTP server exposes `/tracing` to turn OTLP profiling on
-or off dynamically when an endpoint is configured. Set
+The in-process metrics HTTP server exposes `/tracing` to turn profiling on or
+off dynamically when a sink is configured. Use `endpoint=...` for OTLP/Jaeger
+or `file=/tmp/store-rs.trace.jsonl` for a local JSONL artifact. Set
 `MC_STORE_RS_OTLP_SAMPLE_RATIO` or the `/tracing?sample_ratio=...` query before
 enabling export when profiling a high-throughput workload against a
 memory-backed Jaeger collector.
@@ -403,6 +404,15 @@ The runtime records:
 - input and output bytes
 - total latency
 - max latency
+- histogram percentiles for request APIs and internal stages
+- metadata backend operation counts and latency
+- transport operation counts and bytes
+
+The metrics HTTP server also exposes `GET /breakdown`, a structured diagnostic
+snapshot for SGLang/HiCache runs. It groups API calls, internal phases, metadata
+backend work, transport volume, runtime state, and segment usage, then ranks
+bottleneck candidates by observed total latency and p99 latency. The ranking is
+evidence for where time was spent, not proof of root cause.
 - status labels such as `ok` and `error`
 - strict tenant quota counters for reservation, finalize, abort, and reconcile outcomes
 
