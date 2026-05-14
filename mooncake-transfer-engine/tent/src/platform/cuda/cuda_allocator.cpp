@@ -57,7 +57,7 @@ Status CudaPlatform::free(void* ptr, size_t size) {
 }
 
 Status CudaPlatform::copy(void* dst, void* src, size_t length) {
-    // Use a non-blocking stream to avoid unintended synchronization 
+    // Use a non-blocking stream to avoid unintended synchronization
     // or even deadlocks in downstream components (e.g. mooncake-pg).
     CUDAStreamHandle stream;
     CHECK_STATUS(getStreamFromPool(stream));
