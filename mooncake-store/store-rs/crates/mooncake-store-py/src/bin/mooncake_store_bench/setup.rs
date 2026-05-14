@@ -651,7 +651,9 @@ impl BenchCluster {
         };
         let keyspace_prefix = keyspace.prefix().to_string();
         let metadata = Arc::new(RedisMetadataBackend::new(
-            RedisMetadataConfig::new(global.metadata_url.clone()).keyspace(keyspace),
+            RedisMetadataConfig::new(global.metadata_url.clone())
+                .keyspace(keyspace)
+                .tenant(&global.tenant),
         )?);
         log_bench_startup_context(global, &keyspace_prefix, writer_count, reader_count);
         validate_storage_segment_naming_consistency(
