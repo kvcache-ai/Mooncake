@@ -396,6 +396,14 @@ or `file=/tmp/store-rs.trace.jsonl` for a local JSONL artifact. Set
 enabling export when profiling a high-throughput workload against a
 memory-backed Jaeger collector.
 
+When local JSONL profiling is enabled, `MC_STORE_RS_TRACE_ITEM_METADATA=1`
+adds `store.api_items.v1` records for `batch_put_from` and `batch_get_into`.
+These records keep per-item namespace, runtime id, key hash/prefix, parsed
+SGLang TP rank and `k`/`v` suffix, object size or read length, and item status
+out of Prometheus labels while still making offline per-key put/get counts
+possible. `MC_STORE_RS_TRACE_KEY_MODE` defaults to `hash`; `full` is only for
+local debug captures.
+
 ### Metrics
 
 The runtime records:

@@ -430,6 +430,7 @@ Jaeger profiling uses the same operation boundaries as the metrics registry:
 
 - `OperationTracker` creates semantic profiling spans for request APIs and internal stages when profiling is enabled; spans can go to OTLP/Jaeger, a local JSONL file, or both
 - request API spans such as `store.put`, `store.batch_put_from`, `store.get`, and `store.batch_get_into` become the root of the in-process waterfall
+- local JSONL profiling can also emit `store.api_items.v1` records for `batch_put_from` and `batch_get_into` when `MC_STORE_RS_TRACE_ITEM_METADATA=1`; these records keep per-item key hash/prefix, namespace, runtime id, SGLang TP rank, KV kind, byte count, and status in the offline artifact instead of high-cardinality metrics labels
 - control-plane stages use names such as `control.route_lookup`, `control.allocate`, `control.route_publish`, and `control.replica_track`
 - data-plane stages use names such as `data.transfer_write`, `data.transfer_read`, `data.local_write`, and `data.local_read`
 - the metadata backend wrapper creates child spans for Redis, etcd, or another `MetadataBackend`

@@ -34,7 +34,9 @@ use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, ScratchReservation, StorageExtentInfo,
     StorageSegmentSpec,
 };
-use crate::observability::{registry, OperationTracker};
+use crate::observability::{
+    record_api_items, registry, ApiItemTrace, ApiItemsTraceRecord, OperationTracker,
+};
 use crate::placement::PlacementPlanner;
 use crate::route_directory::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,

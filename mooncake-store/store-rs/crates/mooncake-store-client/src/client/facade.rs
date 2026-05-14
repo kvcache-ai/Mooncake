@@ -113,6 +113,17 @@ pub trait MooncakeCompatibilityFacade {
     ) -> Result<Vec<usize>>;
 }
 
+fn common_value<'a>(mut values: impl Iterator<Item = &'a str>) -> String {
+    let Some(first) = values.next() else {
+        return "mixed".to_string();
+    };
+    if values.all(|value| value == first) {
+        first.to_string()
+    } else {
+        "mixed".to_string()
+    }
+}
+
 impl StoreClient {
     fn expect_exactly_one<T>(mut items: Vec<T>, operation: &str) -> Result<T> {
         match items.len() {
@@ -214,6 +225,298 @@ impl StoreClient {
             .iter()
             .all(|request| request.policy.clone().unwrap_or_default() == shared)
             .then_some(Some(shared))
+    }
+
+    fn record_batch_put_from_items(
+        &self,
+        tracker: &OperationTracker,
+        requests: &[PutFromRequest<'_>],
+        statuses: &[Result<ObjectRoute>],
+        batch_bytes: u64,
+    ) {
+        let Some(trace_request_id) = tracker.trace_request_id() else {
+            return;
+        };
+        let (tenant, domain, object_set) = self.put_from_batch_namespace(requests);
+        let runtime_id = self.lease.runtime.to_string();
+        let items = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| ApiItemTrace {
+                index,
+                key: request.key,
+                tenant: request.tenant.unwrap_or(self.default_tenant()),
+                domain: request.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN),
+                object_set: request
+                    .object_set
+                    .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET),
+                size: Some(request.size as u64),
+                read_len: None,
+                status: if statuses.get(index).is_some_and(|status| status.is_ok()) {
+                    "ok"
+                } else {
+                    "error"
+                },
+            })
+            .collect::<Vec<_>>();
+        record_api_items(ApiItemsTraceRecord {
+            trace_request_id,
+            operation: "batch_put_from",
+            tenant: &tenant,
+            domain: &domain,
+            object_set: &object_set,
+            runtime_id: &runtime_id,
+            batch_bytes,
+            items,
+        });
+    }
+
+    fn record_batch_get_into_items(
+        &self,
+        tracker: &OperationTracker,
+        requests: &[GetRequest<'_>],
+        sizes: &[usize],
+        batch_bytes: u64,
+    ) {
+        let Some(trace_request_id) = tracker.trace_request_id() else {
+            return;
+        };
+        let (tenant, domain, object_set) = self.get_batch_namespace(requests);
+        let runtime_id = self.lease.runtime.to_string();
+        let items = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let read_len = sizes.get(index).copied().unwrap_or_default() as u64;
+                ApiItemTrace {
+                    index,
+                    key: request.key,
+                    tenant: request.tenant.unwrap_or(self.default_tenant()),
+                    domain: request.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN),
+                    object_set: request
+                        .object_set
+                        .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET),
+                    size: None,
+                    read_len: Some(read_len),
+                    status: if read_len == 0 { "soft_miss" } else { "ok" },
+                }
+            })
+            .collect::<Vec<_>>();
+        record_api_items(ApiItemsTraceRecord {
+            trace_request_id,
+            operation: "batch_get_into",
+            tenant: &tenant,
+            domain: &domain,
+            object_set: &object_set,
+            runtime_id: &runtime_id,
+            batch_bytes,
+            items,
+        });
+    }
+
+    fn put_from_batch_namespace(&self, requests: &[PutFromRequest<'_>]) -> (String, String, String) {
+        let tenant = common_value(
+            requests
+                .iter()
+                .map(|request| request.tenant.unwrap_or(self.default_tenant())),
+        );
+        let domain = common_value(
+            requests
+                .iter()
+                .map(|request| request.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)),
+        );
+        let object_set = common_value(requests.iter().map(|request| {
+            request
+                .object_set
+                .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET)
+        }));
+        (tenant, domain, object_set)
+    }
+
+    fn get_batch_namespace(&self, requests: &[GetRequest<'_>]) -> (String, String, String) {
+        let tenant = common_value(
+            requests
+                .iter()
+                .map(|request| request.tenant.unwrap_or(self.default_tenant())),
+        );
+        let domain = common_value(
+            requests
+                .iter()
+                .map(|request| request.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)),
+        );
+        let object_set = common_value(requests.iter().map(|request| {
+            request
+                .object_set
+                .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET)
+        }));
+        (tenant, domain, object_set)
+    }
+
+    pub fn batch_put_from_statuses(
+        &self,
+        requests: &[PutFromRequest<'_>],
+    ) -> Vec<Result<ObjectRoute>> {
+        let bytes_in = requests
+            .iter()
+            .map(|request| request.size as u64)
+            .sum::<u64>();
+        let _span = info_span!(
+            "store.batch_put_from",
+            runtime = %self.lease.runtime,
+            items = requests.len(),
+            bytes_in
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_put_from").input_bytes(bytes_in);
+        let statuses = self.batch_put_from_statuses_inner(requests);
+        let aggregate = Self::aggregate_batch_put_statuses(&statuses);
+        self.record_batch_put_from_items(&tracker, requests, &statuses, bytes_in);
+        tracker.finish(&aggregate, bytes_in);
+        statuses
+    }
+
+    fn aggregate_batch_put_statuses(statuses: &[Result<ObjectRoute>]) -> Result<Vec<ObjectRoute>> {
+        let mut routes = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            match status {
+                Ok(route) => routes.push(route.clone()),
+                Err(error) => return Err(error.clone()),
+            }
+        }
+        Ok(routes)
+    }
+
+    fn batch_put_from_statuses_inner(
+        &self,
+        requests: &[PutFromRequest<'_>],
+    ) -> Vec<Result<ObjectRoute>> {
+        let mut statuses = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<_>>();
+        let mut routed_indices = Vec::with_capacity(requests.len());
+        let mut routed_requests = Vec::with_capacity(requests.len());
+        let mut routed_sources = Vec::with_capacity(requests.len());
+        let mut routed_originals = Vec::with_capacity(requests.len());
+
+        for (index, request) in requests.iter().enumerate() {
+            if request.buffer.is_null() {
+                statuses[index] = Some(Err(StoreError::Allocator(
+                    "put_from buffer must not be null".to_string(),
+                )));
+                continue;
+            }
+            {
+                let state = self.state.lock();
+                if !state.buffer_is_registered(request.buffer.cast_mut(), request.size) {
+                    let tenant = request.tenant.unwrap_or(self.default_tenant());
+                    statuses[index] = Some(Err(StoreError::Allocator(format!(
+                        "put_from buffer is not registered for tenant={tenant} key={}",
+                        request.key
+                    ))));
+                    continue;
+                }
+            }
+
+            if matches!(self.write_mode, WriteMode::Routed { .. }) {
+                let value =
+                    unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
+                let mut routed = PutRequest::new(request.key, value);
+                if let Some(tenant) = request.tenant {
+                    routed = routed.tenant(tenant);
+                }
+                if let Some(domain) = request.domain {
+                    routed = routed.domain(domain);
+                }
+                if let Some(object_set) = request.object_set {
+                    routed = routed.object_set(object_set);
+                }
+                if let Some(qos_tier) = request.qos_tier {
+                    routed = routed.qos_tier(qos_tier);
+                }
+                if let Some(policy) = request.policy.clone() {
+                    routed = routed.replication(policy);
+                }
+                routed_indices.push(index);
+                routed_requests.push(routed);
+                routed_sources.push(request.buffer.cast_mut());
+                routed_originals.push(request.clone());
+                continue;
+            }
+
+            let mut object = ObjectRef::new(request.key);
+            if let Some(tenant) = request.tenant {
+                object = object.tenant(tenant);
+            }
+            if let Some(domain) = request.domain {
+                object = object.domain(domain);
+            }
+            if let Some(object_set) = request.object_set {
+                object = object.object_set(object_set);
+            }
+            if let Some(qos_tier) = request.qos_tier {
+                object = object.qos_tier(qos_tier);
+            }
+            statuses[index] = Some(self.put_object_from_registered(
+                &object,
+                request.buffer.cast_mut(),
+                request.size,
+                request.policy.as_ref(),
+            ));
+        }
+
+        if !routed_requests.is_empty() {
+            let routed_statuses =
+                if let Some(shared_policy) =
+                    Self::shared_batch_put_from_replication_policy(&routed_originals)
+                {
+                    self.batch_put_scoped_routed_accept_existing_statuses(
+                        &routed_requests,
+                        &routed_sources,
+                        shared_policy.as_ref(),
+                    )
+                } else {
+                    routed_requests
+                        .iter()
+                        .zip(routed_sources.iter())
+                        .map(|(request, source)| {
+                            let mut object = ObjectRef::new(request.key);
+                            if let Some(tenant) = request.tenant {
+                                object = object.tenant(tenant);
+                            }
+                            if let Some(domain) = request.domain {
+                                object = object.domain(domain);
+                            }
+                            if let Some(object_set) = request.object_set {
+                                object = object.object_set(object_set);
+                            }
+                            if let Some(qos_tier) = request.qos_tier {
+                                object = object.qos_tier(qos_tier);
+                            }
+                            self.put_object_from_registered(
+                                &object,
+                                *source,
+                                request.value.len(),
+                                request.policy.as_ref(),
+                            )
+                        })
+                        .collect()
+                };
+
+            for (index, status) in routed_indices.into_iter().zip(routed_statuses) {
+                statuses[index] = Some(status);
+            }
+        }
+
+        statuses
+            .into_iter()
+            .map(|status| {
+                status.unwrap_or_else(|| {
+                    Err(StoreError::InvalidState(
+                        "batch_put_from status was not recorded".to_string(),
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
@@ -1049,119 +1352,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn batch_put_from(&self, requests: &[PutFromRequest<'_>]) -> Result<Vec<ObjectRoute>> {
-        let bytes_in = requests
-            .iter()
-            .map(|request| request.size as u64)
-            .sum::<u64>();
-        let _span = info_span!(
-            "store.batch_put_from",
-            runtime = %self.lease.runtime,
-            items = requests.len(),
-            bytes_in
-        )
-        .entered();
-        let tracker = OperationTracker::new("batch_put_from").input_bytes(bytes_in);
-        let mut routed_requests = Vec::with_capacity(requests.len());
-        let mut registered_sources = Vec::with_capacity(requests.len());
-        let mut routes = Vec::with_capacity(requests.len());
-        for request in requests {
-            if request.buffer.is_null() {
-                let result = Err(StoreError::Allocator(
-                    "put_from buffer must not be null".to_string(),
-                ));
-                tracker.finish(&result, 0);
-                return result;
-            }
-            {
-                let state = self.state.lock();
-                if !state.buffer_is_registered(request.buffer.cast_mut(), request.size) {
-                    let tenant = request.tenant.unwrap_or(self.default_tenant());
-                    let result = Err(StoreError::Allocator(format!(
-                        "put_from buffer is not registered for tenant={tenant} key={}",
-                        request.key
-                    )));
-                    tracker.finish(&result, 0);
-                    return result;
-                }
-            }
-            if matches!(self.write_mode, WriteMode::Routed { .. }) {
-                let value =
-                    unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
-                let mut routed = PutRequest::new(request.key, value);
-                if let Some(tenant) = request.tenant {
-                    routed = routed.tenant(tenant);
-                }
-                if let Some(domain) = request.domain {
-                    routed = routed.domain(domain);
-                }
-                if let Some(object_set) = request.object_set {
-                    routed = routed.object_set(object_set);
-                }
-                if let Some(qos_tier) = request.qos_tier {
-                    routed = routed.qos_tier(qos_tier);
-                }
-                if let Some(policy) = request.policy.clone() {
-                    routed = routed.replication(policy);
-                }
-                routed_requests.push(routed);
-                registered_sources.push(request.buffer.cast_mut());
-                continue;
-            }
-            let mut object = ObjectRef::new(request.key);
-            if let Some(tenant) = request.tenant {
-                object = object.tenant(tenant);
-            }
-            if let Some(domain) = request.domain {
-                object = object.domain(domain);
-            }
-            if let Some(object_set) = request.object_set {
-                object = object.object_set(object_set);
-            }
-            if let Some(qos_tier) = request.qos_tier {
-                object = object.qos_tier(qos_tier);
-            }
-            routes.push(self.put_object_from_registered(
-                &object,
-                request.buffer.cast_mut(),
-                request.size,
-                request.policy.as_ref(),
-            )?);
-        }
-        if !routed_requests.is_empty() {
-            if let Some(shared_policy) = Self::shared_batch_put_from_replication_policy(requests) {
-                let result = self.batch_put_scoped_routed_accept_existing(
-                    &routed_requests,
-                    Some(&registered_sources),
-                    shared_policy.as_ref(),
-                );
-                tracker.finish(&result, bytes_in);
-                return result;
-            }
-            for (request, source) in routed_requests.iter().zip(registered_sources.iter()) {
-                let mut object = ObjectRef::new(request.key);
-                if let Some(tenant) = request.tenant {
-                    object = object.tenant(tenant);
-                }
-                if let Some(domain) = request.domain {
-                    object = object.domain(domain);
-                }
-                if let Some(object_set) = request.object_set {
-                    object = object.object_set(object_set);
-                }
-                if let Some(qos_tier) = request.qos_tier {
-                    object = object.qos_tier(qos_tier);
-                }
-                routes.push(self.put_object_from_registered(
-                    &object,
-                    *source,
-                    request.value.len(),
-                    request.policy.as_ref(),
-                )?);
-            }
-        }
-        let result = Ok(routes);
-        tracker.finish(&result, bytes_in);
-        result
+        let statuses = self.batch_put_from_statuses(requests);
+        Self::aggregate_batch_put_statuses(&statuses)
     }
 
     fn batch_put_from_multi_buffers(
@@ -1318,7 +1510,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .map(|request| &mut *request.buffer)
             .collect::<Vec<_>>();
         let sizes = self.execute_batch_get_into(&mut resolved, &mut buffers)?;
+        drop(buffers);
         let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
+        self.record_batch_get_into_items(&tracker, requests, &sizes, bytes_out);
         let result = Ok(sizes);
         tracker.finish(&result, bytes_out);
         result

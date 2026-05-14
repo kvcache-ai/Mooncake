@@ -23,7 +23,7 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub(crate) use metadata::observe_metadata_backend;
-pub(crate) use profiling::ProfilingSpan;
+pub(crate) use profiling::{record_api_items, ApiItemTrace, ApiItemsTraceRecord, ProfilingSpan};
 pub use registry::{MetricsSnapshot, OperationMetricSnapshot};
 
 static TRACING_STATE: OnceLock<()> = OnceLock::new();
@@ -122,6 +122,10 @@ impl OperationTracker {
     pub fn attribute_u64(mut self, key: &'static str, value: u64) -> Self {
         self.profiling_span.set_u64(key, value);
         self
+    }
+
+    pub(crate) fn trace_request_id(&self) -> Option<u64> {
+        self.profiling_span.request_id()
     }
 
     pub fn finish<T>(self, result: &Result<T>, bytes_out: u64) {

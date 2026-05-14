@@ -735,7 +735,12 @@ When `MC_STORE_RS_TRACE_FILE=/path/to/real-client.log` is set, Rust tracing appe
 For short profiling windows, set `MC_STORE_RS_TRACE_JSONL_FILE=/path/to/store-rs.trace.jsonl`
 or use the metrics server `/tracing?enabled=on&file=...` control endpoint. The
 JSONL sink records one structured span per Store-RS API or phase and can be
-used alongside Jaeger OTLP export.
+used alongside Jaeger OTLP export. Set `MC_STORE_RS_TRACE_ITEM_METADATA=1` to
+also write `store.api_items.v1` records for `batch_put_from` and
+`batch_get_into`, including per-item namespace, runtime id, hashed key,
+readable key prefix, parsed SGLang TP rank and `k`/`v` suffix, size/read
+length, and status. `MC_STORE_RS_TRACE_KEY_MODE=hash` is the default; use
+`full` only for local debug captures.
 
 The same metrics HTTP server also exposes `/breakdown` for SGLang/HiCache
 diagnosis. Use `mooncake-store-client stats --breakdown --server <host:port>`
