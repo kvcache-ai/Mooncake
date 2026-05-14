@@ -232,6 +232,23 @@ class PlatformBackend : public IPlatformBackend {
    private:
     std::shared_ptr<Config> config_;
 
+    // Get GPU prefix for this platform
+    static std::string getGpuPrefix() {
+#if defined(USE_CUDA)
+        return "cuda:";
+#elif defined(USE_MUSA)
+        return "musa:";
+#elif defined(USE_HIP)
+        return "hip:";
+#elif defined(USE_MACA)
+        return "maca:";
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+        return "ascend:";
+#else
+        return "cpu:";
+#endif
+    }
+
     // Get memory type for this platform
     static Topology::MemType getMemType() {
 #if defined(USE_CUDA)
