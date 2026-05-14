@@ -102,7 +102,7 @@ class CUDAStreamPool {
 
 class CudaPlatform : public Platform {
    public:
-    CudaPlatform(std::shared_ptr<Config> config) : conf(std::move(config)) {}
+    CudaPlatform(std::shared_ptr<Config> config) : Platform(config), conf(std::move(config)) {}
 
     virtual ~CudaPlatform() {}
 

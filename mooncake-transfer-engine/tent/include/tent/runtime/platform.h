@@ -96,7 +96,7 @@ class Platform {
     }
 
     Platform(std::shared_ptr<Config> config);
-    ~Platform();
+    virtual ~Platform();
 
     // Forward all operations to the backend plugin
     Status probe(std::vector<Topology::NicEntry>& nic_list,

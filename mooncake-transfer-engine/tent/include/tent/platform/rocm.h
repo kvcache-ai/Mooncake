@@ -97,7 +97,7 @@ class HIPStreamPool {
 
 class RocmPlatform : public Platform {
    public:
-    RocmPlatform(std::shared_ptr<Config> config) : conf(std::move(config)) {}
+    RocmPlatform(std::shared_ptr<Config> config) : Platform(config), conf(std::move(config)) {}
 
     virtual ~RocmPlatform() {}
 
