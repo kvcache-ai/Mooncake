@@ -1356,6 +1356,325 @@ TEST_F(RealClientTest, UpsertBatch) {
     }
 }
 
+// ===================== Batch Existence Tests =====================
+
+TEST_F(RealClientTest, BatchIsExistMixed) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::string data = "batch_exist_data";
+    std::span<const char> data_span(data.data(), data.size());
+    ASSERT_EQ(py_client_->put("exist_key_1", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("exist_key_2", data_span, config), 0);
+
+    std::vector<std::string> keys = {"exist_key_1", "missing_key",
+                                     "exist_key_2", "also_missing"};
+    auto results = py_client_->batchIsExist(keys);
+    ASSERT_EQ(results.size(), 4u);
+    EXPECT_EQ(results[0], 1) << "exist_key_1 should exist";
+    EXPECT_EQ(results[1], 0) << "missing_key should not exist";
+    EXPECT_EQ(results[2], 1) << "exist_key_2 should exist";
+    EXPECT_EQ(results[3], 0) << "also_missing should not exist";
+}
+
+TEST_F(RealClientTest, ErrBatchIsExistBeforeSetup) {
+    GLogMuter muter;
+    std::vector<std::string> keys = {"k1", "k2"};
+    auto results = py_client_->batchIsExist(keys);
+    ASSERT_EQ(results.size(), 2u);
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_LT(results[i], 0)
+            << "batchIsExist[" << i << "] before setup should return negative";
+    }
+}
+
+// ===================== GetSize Tests =====================
+
+TEST_F(RealClientTest, GetSizeBasic) {
+    StartMasterAndSetupClient();
+
+    const std::string data = "getsize_payload_123";
+    const std::string key = "getsize_key";
+    std::span<const char> data_span(data.data(), data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+    int64_t size = py_client_->getSize(key);
+    EXPECT_EQ(size, static_cast<int64_t>(data.size()))
+        << "getSize should return exact data length";
+}
+
+TEST_F(RealClientTest, ErrGetSizeBeforeSetup) {
+    GLogMuter muter;
+    EXPECT_LT(py_client_->getSize("any_key"), 0)
+        << "getSize before setup should return negative";
+}
+
+// ===================== RemoveByRegex Tests =====================
+
+TEST_F(RealClientTest, RemoveByRegexBasic) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string data = "regex_data";
+    std::span<const char> data_span(data.data(), data.size());
+
+    ASSERT_EQ(py_client_->put("prefix_alpha", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("prefix_beta", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("other_key", data_span, config), 0);
+
+    long removed = py_client_->removeByRegex("^prefix_.*");
+    EXPECT_EQ(removed, 2) << "Should remove exactly the two prefix_ keys";
+
+    EXPECT_EQ(py_client_->isExist("prefix_alpha"), 0);
+    EXPECT_EQ(py_client_->isExist("prefix_beta"), 0);
+    EXPECT_EQ(py_client_->isExist("other_key"), 1)
+        << "Non-matching key should survive";
+}
+
+TEST_F(RealClientTest, RemoveByRegexNoMatch) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string data = "no_match_data";
+    std::span<const char> data_span(data.data(), data.size());
+    ASSERT_EQ(py_client_->put("some_key", data_span, config), 0);
+
+    long removed = py_client_->removeByRegex("^nonexistent_pattern_.*");
+    EXPECT_EQ(removed, 0) << "No keys should match";
+    EXPECT_EQ(py_client_->isExist("some_key"), 1)
+        << "Existing key should remain";
+}
+
+TEST_F(RealClientTest, ErrRemoveByRegexBeforeSetup) {
+    GLogMuter muter;
+    long result = py_client_->removeByRegex(".*");
+    EXPECT_LT(result, 0) << "removeByRegex before setup should return negative";
+}
+
+// ===================== RemoveAll Edge Cases =====================
+
+TEST_F(RealClientTest, RemoveAllOnEmptyStore) {
+    StartMasterAndSetupClient();
+    long removed = py_client_->removeAll();
+    EXPECT_EQ(removed, 0) << "removeAll on empty store should return 0";
+}
+
+// ===================== BatchRemove Tests =====================
+
+TEST_F(RealClientTest, BatchRemoveBasic) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string data = "batch_rm_data";
+    std::span<const char> data_span(data.data(), data.size());
+
+    ASSERT_EQ(py_client_->put("brm_1", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("brm_2", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("brm_3", data_span, config), 0);
+
+    std::vector<std::string> keys_to_remove = {"brm_1", "brm_3"};
+    auto results = py_client_->batchRemove(keys_to_remove);
+    ASSERT_EQ(results.size(), 2u);
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_EQ(results[i], 0) << "batchRemove[" << i << "] should succeed";
+    }
+
+    EXPECT_EQ(py_client_->isExist("brm_1"), 0);
+    EXPECT_EQ(py_client_->isExist("brm_2"), 1) << "brm_2 should survive";
+    EXPECT_EQ(py_client_->isExist("brm_3"), 0);
+}
+
+TEST_F(RealClientTest, BatchRemoveNonExistentKeys) {
+    StartMasterAndSetupClient();
+
+    GLogMuter muter;
+    std::vector<std::string> keys = {"never_existed_1", "never_existed_2"};
+    auto results = py_client_->batchRemove(keys);
+    ASSERT_EQ(results.size(), 2u);
+}
+
+TEST_F(RealClientTest, ErrBatchRemoveBeforeSetup) {
+    GLogMuter muter;
+    std::vector<std::string> keys = {"k1", "k2"};
+    auto results = py_client_->batchRemove(keys);
+    ASSERT_EQ(results.size(), 2u);
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_NE(results[i], 0)
+            << "batchRemove[" << i << "] before setup should fail";
+    }
+}
+
+// ===================== PutParts Tests =====================
+
+TEST_F(RealClientTest, PutPartsBasic) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "put_parts_key";
+
+    const std::string part1 = "Hello, ";
+    const std::string part2 = "Parts!";
+    const std::string expected = part1 + part2;
+    std::vector<std::span<const char>> parts;
+    parts.emplace_back(part1.data(), part1.size());
+    parts.emplace_back(part2.data(), part2.size());
+
+    EXPECT_EQ(py_client_->put_parts(key, parts, config), 0);
+
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(buf->size(), expected.size());
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              expected);
+}
+
+TEST_F(RealClientTest, ErrPutPartsBeforeSetup) {
+    GLogMuter muter;
+    const std::string part = "data";
+    std::vector<std::span<const char>> parts;
+    parts.emplace_back(part.data(), part.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    EXPECT_NE(py_client_->put_parts("key", parts, config), 0)
+        << "put_parts before setup should fail";
+}
+
+// ===================== PutBatch and GetBatch Tests =====================
+
+TEST_F(RealClientTest, PutBatchThenBatchGetBuffer) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::vector<std::string> keys = {"batch_kv_0", "batch_kv_1", "batch_kv_2"};
+    std::string val0 = "value_zero";
+    std::string val1 = "value_one!";
+    std::string val2 = "value_two!";
+    std::vector<std::span<const char>> values;
+    values.emplace_back(val0.data(), val0.size());
+    values.emplace_back(val1.data(), val1.size());
+    values.emplace_back(val2.data(), val2.size());
+
+    ASSERT_EQ(py_client_->put_batch(keys, values, config), 0);
+
+    auto handles = py_client_->batch_get_buffer(keys);
+    ASSERT_EQ(handles.size(), 3u);
+
+    std::vector<std::string*> expected = {&val0, &val1, &val2};
+    for (size_t i = 0; i < handles.size(); ++i) {
+        ASSERT_NE(handles[i], nullptr)
+            << "Handle " << i << " should not be null";
+        EXPECT_EQ(std::string(static_cast<const char*>(handles[i]->ptr()),
+                              handles[i]->size()),
+                  *expected[i])
+            << "Data mismatch for key " << keys[i];
+    }
+}
+
+// ===================== HealthCheck Tests =====================
+
+TEST_F(RealClientTest, HealthCheckAfterSetup) {
+    StartMasterAndSetupClient();
+    EXPECT_EQ(py_client_->health_check(), HC_HEALTHY)
+        << "health_check should return HEALTHY after setup";
+}
+
+TEST_F(RealClientTest, HealthCheckBeforeSetup) {
+    int result = py_client_->health_check();
+    EXPECT_EQ(result, HC_NOT_INITIALIZED)
+        << "health_check before setup should return NOT_INITIALIZED";
+}
+
+// ===================== GetHostname Tests =====================
+
+TEST_F(RealClientTest, GetHostnameAfterSetup) {
+    StartMasterAndSetupClient();
+    std::string hostname = py_client_->get_hostname();
+    EXPECT_FALSE(hostname.empty()) << "get_hostname should return non-empty";
+    EXPECT_EQ(hostname, "localhost:17813")
+        << "get_hostname should match the configured hostname";
+}
+
+// ===================== Double TearDown Tests =====================
+
+TEST_F(RealClientTest, DoubleTearDownIsIdempotent) {
+    StartMasterAndSetupClient();
+
+    EXPECT_EQ(py_client_->tearDownAll(), 0) << "First teardown should succeed";
+    EXPECT_EQ(py_client_->tearDownAll(), 0)
+        << "Second teardown should also succeed (idempotent)";
+}
+
+// ===================== Empty Batch Operations =====================
+
+TEST_F(RealClientTest, EmptyBatchOperations) {
+    StartMasterAndSetupClient();
+
+    std::vector<std::string> empty_keys;
+    std::vector<std::span<const char>> empty_values;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    EXPECT_EQ(py_client_->put_batch(empty_keys, empty_values, config), 0)
+        << "put_batch with empty input should succeed";
+
+    auto handles = py_client_->batch_get_buffer(empty_keys);
+    EXPECT_TRUE(handles.empty())
+        << "batch_get_buffer with empty input should return empty";
+
+    auto exist_results = py_client_->batchIsExist(empty_keys);
+    EXPECT_TRUE(exist_results.empty())
+        << "batchIsExist with empty input should return empty";
+
+    auto remove_results = py_client_->batchRemove(empty_keys);
+    EXPECT_TRUE(remove_results.empty())
+        << "batchRemove with empty input should return empty";
+}
+
+// ===================== Mount Segment Edge Cases =====================
+
+TEST_F(RealClientTest, ErrMountNonExistentFile) {
+    StartMasterAndSetupClient();
+
+    GLogMuter muter;
+    std::vector<std::string> segment_ids;
+    int ret =
+        py_client_->mountSegment("/tmp/mooncake_nonexistent_file_12345", 0,
+                                 4096, FLAGS_protocol, "", segment_ids);
+    EXPECT_NE(ret, 0) << "Mounting non-existent file should fail";
+    EXPECT_TRUE(segment_ids.empty());
+}
+
+TEST_F(RealClientTest, ErrUnmountInvalidSegmentIds) {
+    StartMasterAndSetupClient();
+
+    GLogMuter muter;
+    std::vector<std::string> bogus_ids = {
+        "00000000-0000-0000-0000-000000000000"};
+    int ret = py_client_->unmountSegment(bogus_ids);
+    EXPECT_NE(ret, 0) << "Unmounting non-existent segment ids should fail";
+}
+
+TEST_F(RealClientTest, ErrUnmountAndFreeInvalidSegmentIds) {
+    StartMasterAndSetupClient();
+
+    GLogMuter muter;
+    std::vector<std::string> bogus_ids = {
+        "00000000-0000-0000-0000-000000000000"};
+    int ret = py_client_->unmountAndFreeSegment(bogus_ids);
+    EXPECT_NE(ret, 0)
+        << "Unmount-and-free of non-existent segment ids should fail";
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
