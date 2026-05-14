@@ -874,8 +874,7 @@ bool TransferSubmitter::isSameProcessEndpoint(
 
 bool TransferSubmitter::isLocalTransfer(
     const AllocatedBuffer::Descriptor& handle) const {
-    return isSameProcessEndpoint(handle.transport_endpoint_,
-                                 local_hostname_) ||
+    return isSameProcessEndpoint(handle.transport_endpoint_, local_hostname_) ||
            isSameProcessEndpoint(handle.transport_endpoint_, local_endpoint_);
 }
 
