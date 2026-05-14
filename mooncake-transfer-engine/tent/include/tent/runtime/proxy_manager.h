@@ -52,13 +52,15 @@ struct ProxyManagerMetrics {
     }
 
     void markStartTime() {
-        start_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                        std::memory_order_relaxed);
+        start_time.store(
+            std::chrono::steady_clock::now().time_since_epoch().count(),
+            std::memory_order_relaxed);
     }
 
     void markEndTime() {
-        end_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                      std::memory_order_relaxed);
+        end_time.store(
+            std::chrono::steady_clock::now().time_since_epoch().count(),
+            std::memory_order_relaxed);
     }
 
     double getAvgLatencyMs() const {
