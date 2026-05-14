@@ -139,6 +139,11 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         build_dir.join("mooncake-common").display()
     );
+    // mooncake_common static library is built in mooncake-common/src.
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("mooncake-common/src").display()
+    );
 
     // transfer_engine is built in a sibling directory.
     println!(
@@ -169,6 +174,7 @@ fn main() {
     // Dependencies of mooncake_store that must be satisfied at link time.
     // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
     println!("cargo:rustc-link-lib=transfer_engine");
+    println!("cargo:rustc-link-lib=mooncake_common"); // Environ singleton
     println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
     println!("cargo:rustc-link-lib=asio"); // shared library built by mooncake-common
     println!("cargo:rustc-link-lib=jsoncpp"); // transfer_engine dependency
@@ -201,6 +207,8 @@ fn main() {
             build_dir.join("mooncake-transfer-engine/src"),
             build_dir.join("mooncake-transfer-engine/src/common/base"),
             build_dir.join("mooncake-asio"),
+            build_dir.join("mooncake-common"),
+            build_dir.join("mooncake-common/src"),
             build_dir.join("mooncake-common/etcd"),
         ] {
             push_existing_dir(&mut search_dirs, dir);
@@ -215,6 +223,7 @@ fn main() {
         default_build_dir.join("mooncake-transfer-engine/src/common/base"),
         default_build_dir.join("mooncake-asio"),
         default_build_dir.join("mooncake-common"),
+        default_build_dir.join("mooncake-common/src"),
         default_build_dir.join("mooncake-common/etcd"),
         PathBuf::from("/usr/local/lib"),
         PathBuf::from("/usr/lib/x86_64-linux-gnu"),
@@ -248,6 +257,7 @@ fn main() {
         "mooncake_store",
         "cachelib_memory_allocator",
         "transfer_engine",
+        "mooncake_common",
         "base",
         "asio",
         "stdc++",
