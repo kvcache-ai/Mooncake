@@ -716,13 +716,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    // Determine NUMA node for UB protocol
+    int ub_numa_node = -1;
+    if (protocol == "ub") {
+        auto nic_numa_nodes = client_->GetNicNumaNodes();
+        if (!nic_numa_nodes.empty()) {
+            ub_numa_node = nic_numa_nodes[0];
+            LOG(INFO) << "UB: using NUMA node " << ub_numa_node << " for memory allocation";
+        } else {
+            LOG(WARNING) << "UB: cannot detect NIC NUMA node, defaulting to 0";
+        }
+    }
+
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
     client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage);
+        local_buffer_size, this->protocol, should_use_hugepage, ub_numa_node);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -1080,7 +1092,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     for (const auto &entry : records_to_free) {
         if (entry.second.base) {
-            free_memory(entry.second.protocol, entry.second.base);
+            free_memory(entry.second.protocol, entry.second.base, entry.second.size);
         }
     }
 
@@ -1089,6 +1101,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     client_buffer_allocator_.reset();
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
+    numa_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
@@ -1343,7 +1356,7 @@ int RealClient::allocateAndMountSegment(
             client_->MountSegmentAndGetId(ptr, chunk_size, protocol, location);
         if (!result.has_value()) {
             LOG(ERROR) << "MountSegmentAndGetId failed";
-            free_memory(protocol, ptr);
+            free_memory(protocol, ptr, chunk_size);
             break;
         }
 
@@ -1362,7 +1375,8 @@ int RealClient::allocateAndMountSegment(
             }
             if (allocated_records[i].base) {
                 free_memory(allocated_records[i].protocol,
-                            allocated_records[i].base);
+                            allocated_records[i].base,
+                            allocated_records[i].size);
             }
         }
         out_segment_ids.clear();

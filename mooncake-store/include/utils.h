@@ -294,7 +294,7 @@ constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
  */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+    size_t alignment = facebook::cachelib::Slab::kSize, int numa_node=-1);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
@@ -408,7 +408,7 @@ void* allocate_buffer_numa_segments(size_t total_size,
                                     size_t page_size = 0);
 
 void free_memory(const std::string& protocol, void* ptr);
-
+void free_memory(const std::string& protocol, void* ptr, size_t size);
 // Network utility functions
 
 /**

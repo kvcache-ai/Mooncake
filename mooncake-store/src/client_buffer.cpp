@@ -19,11 +19,41 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
+    size_t size, const std::string& protocol, bool use_hugepage, int numa_node) {
+    return std::shared_ptr<ClientBufferAllocator>(
+        new ClientBufferAllocator(size, protocol, use_hugepage, numa_node));
+}
+
+std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
     void* addr, size_t size, const std::string& protocol) {
     return std::shared_ptr<ClientBufferAllocator>(
         new ClientBufferAllocator(addr, size, protocol));
 }
 
+ClientBufferAllocator::ClientBufferAllocator(size_t size,
+                                             const std::string& protocol,
+                                             bool use_hugepage,
+                                             int numa_node)
+    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage) {
+    if (size == 0) {
+        buffer_ = nullptr;
+        allocator_ = nullptr;
+        return;
+    }
+    // Align to 64 bytes(cache line size) for better cache performance
+    constexpr size_t alignment = 4096;
+    if (use_hugepage_) {
+        buffer_ = allocate_buffer_mmap_memory(size, alignment);
+    } else {
+        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment, numa_node);
+    }
+    if (!buffer_) {
+        throw std::bad_alloc();
+    }
+
+    allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
+                reinterpret_cast<uint64_t>(buffer_), size);
+}
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
                                              const std::string& protocol,
                                              bool use_hugepage)

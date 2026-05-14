@@ -246,6 +246,12 @@ int UbWorkerPool::submitPostSend(
         auto targetSegment =
             peer_segment_desc->buffers[buffer_id].tseg[device_id];
         slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+        if (!slice->ub.r_seg) {
+            LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
+                       << slice->target_id << " buffer_id=" << buffer_id
+                       << " device_id" << device_id
+                       << " dest_addr=" << slice->ub.dest_addr;
+        }
         auto peer_nic_path =
             MakeNicPath(peer_segment_desc->name,
                         peer_segment_desc->devices[device_id].name);

@@ -32,6 +32,11 @@ class ClientBufferAllocator
         size_t size, const std::string& protocol = "",
         bool use_hugepage = false);
 
+    // Create with explicit NUMA node (for UB protocol)
+    static std::shared_ptr<ClientBufferAllocator> create(
+        size_t size, const std::string& protocol,
+        bool use_hugepage, int numa_node);
+
     // Create for shared memory
     static std::shared_ptr<ClientBufferAllocator> create(
         void* addr, size_t size, const std::string& protocol = "");
@@ -62,6 +67,8 @@ class ClientBufferAllocator
    private:
     ClientBufferAllocator(size_t size, const std::string& protocol,
                           bool use_hugepage);
+    ClientBufferAllocator(size_t size, const std::string& protocol,
+                            bool use_hugepage, int numa_node);
 
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 

@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <boost/algorithm/string.hpp>
+#include <numa.h>
+#include <numaif.h>
 
 #include <algorithm>
 #include <atomic>
@@ -101,7 +103,8 @@ AutoPortBinder::~AutoPortBinder() {
 
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
-                                       size_t alignment) {
+                                       size_t alignment,
+                                       int numa_node) {
     const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
     if (alignment == default_alignment && total_size < alignment) {
@@ -113,7 +116,20 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return ascend_allocate_memory(total_size, protocol);
     }
 #endif
-
+#if defined(USE_UB)
+    if (protocol == "ub") {
+        int node = (numa_node >= 0) ? numa_node: 0;
+        void *ptr = numa_alloc_onnode(total_size, node);
+        if (!ptr) {
+            LOG(ERROR) << "numa_alloc_onnode failed for UB protocal, size="
+                       << total_size;
+        } else {
+            LOG(INFO) << "UB: numa_alloc_onnode allocated " << total_size
+                      << " bytes at " << ptr;
+        }
+        return ptr;
+    }
+#endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }
@@ -357,12 +373,22 @@ void *allocate_buffer_numa_segments(size_t total_size,
 }
 
 void free_memory(const std::string &protocol, void *ptr) {
+    free_memory(protocol, ptr, 0);
+}
+
+void free_memory(const std::string &protocol, void *ptr, size_t size) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
     }
 #endif
-
+#if defined(USE_UB)
+    if (protocol == "ub") {
+        munmap(ptr, size);  // for urma
+        numa_free(ptr, size);
+        return;
+    }
+#endif
     free(ptr);
 }
 
