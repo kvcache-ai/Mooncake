@@ -187,3 +187,7 @@ def test_registered_buffer_pool_rejects_huge_size_overflow() -> None:
     with pytest.raises(RuntimeError, match="overflow|capacity"):
         pool.acquire((1 << 64) - 1)
     pool.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
