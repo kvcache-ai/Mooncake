@@ -15,7 +15,7 @@
 #include "tent/platform/cuda.h"
 #include "tent/common/status.h"
 
-#include <bits/stduint-uintn.h>
+#include <bits/stdint-uintn.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <numa.h>
