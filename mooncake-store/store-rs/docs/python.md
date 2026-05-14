@@ -732,6 +732,18 @@ Python real clients also auto-initialize Rust tracing before `setup(...)` when `
 
 When `MC_STORE_RS_TRACE_FILE=/path/to/real-client.log` is set, Rust tracing appends to that file instead of writing to the process stdout/stderr stream. This is the recommended way to keep SGLang real-client logs separate from SGLang server logs.
 
+For short profiling windows, set `MC_STORE_RS_TRACE_JSONL_FILE=/path/to/store-rs.trace.jsonl`
+or use the metrics server `/tracing?enabled=on&file=...` control endpoint. The
+JSONL sink records one structured span per Store-RS API or phase and can be
+used alongside Jaeger OTLP export.
+
+The same metrics HTTP server also exposes `/breakdown` for SGLang/HiCache
+diagnosis. Use `mooncake-store-client stats --breakdown --server <host:port>`
+for a readable summary, or add `--json` to keep the machine-readable API,
+phase, metadata, transport, runtime, and segment snapshot. The
+`scripts/sglang/sglang_true_e2e.py` workflow saves that endpoint as
+`sglang-true-e2e-breakdown-<stamp>.json` after the real SGLang run.
+
 ## Metadata URLs
 
 The compatibility layer accepts these metadata URL forms:

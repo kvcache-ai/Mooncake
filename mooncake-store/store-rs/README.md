@@ -996,6 +996,7 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 - use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for bench logs; keep `MC_STORE_RS_TRACE_FILE` for standalone-client and Python real-client logging
 - bench disables tracing span-close events so hot-path `close time.busy=...` noise does not flood benchmark output
 - Jaeger profiling uses OTLP HTTP: set `MC_STORE_RS_OTLP_ENDPOINT=http://jaeger.observability.svc.cluster.local:4318`; keep `MC_STORE_RS_OTLP_TRACE` unset or `0` for a disabled startup
+- local profiling can write JSONL spans with `MC_STORE_RS_TRACE_JSONL_FILE=/tmp/store-rs.trace.jsonl` or `/tracing?file=...`
 - set `MC_STORE_RS_OTLP_SAMPLE_RATIO=0.05`, or pass `sample_ratio=0.05` before enabling, when profiling high-throughput bench traffic through memory-backed Jaeger
 - when `/metrics` is enabled, use `/tracing`, `/tracing/on`, `/tracing/off`, and `/tracing/flush` on that same HTTP server to inspect and dynamically switch OTLP profiling
 

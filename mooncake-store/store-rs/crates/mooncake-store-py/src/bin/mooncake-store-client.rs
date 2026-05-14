@@ -203,6 +203,8 @@ struct StatsArgs {
     server: String,
     #[arg(long, value_parser = FalseyValueParser::new(), env = "MC_STORE_RS_STATS_JSON", help = "Emit compact JSON instead of pretty JSON")]
     json: bool,
+    #[arg(long, value_parser = FalseyValueParser::new(), help = "Fetch Store-RS performance breakdown instead of raw stats")]
+    breakdown: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -425,9 +427,18 @@ fn should_insert_legacy_run_subcommand(arg: &str) -> bool {
 }
 
 fn run_stats_command(args: StatsArgs) -> Result<(), Box<dyn Error>> {
-    let body = fetch_stats_body(&args.server)?;
+    let path = if args.breakdown {
+        "/breakdown"
+    } else {
+        "/stats"
+    };
+    let body = fetch_http_body(&args.server, path)?;
     if args.json {
         println!("{body}");
+    } else if args.breakdown {
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|error| format!("invalid breakdown json: {error}"))?;
+        print_breakdown_summary(&value)?;
     } else {
         let value: serde_json::Value =
             serde_json::from_str(&body).map_err(|error| format!("invalid stats json: {error}"))?;
@@ -440,10 +451,10 @@ fn run_stats_command(args: StatsArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn fetch_stats_body(server: &str) -> Result<String, Box<dyn Error>> {
+fn fetch_http_body(server: &str, path: &str) -> Result<String, Box<dyn Error>> {
     let mut stream = TcpStream::connect(server)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let request = format!("GET /stats HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 
@@ -454,9 +465,148 @@ fn fetch_stats_body(server: &str) -> Result<String, Box<dyn Error>> {
         .ok_or("invalid stats http response")?;
     let status_line = headers.lines().next().ok_or("missing stats http status")?;
     if !status_line.contains("200 OK") {
-        return Err(format!("stats request failed: {status_line}").into());
+        return Err(format!("{path} request failed: {status_line}").into());
     }
     Ok(body.to_string())
+}
+
+fn print_breakdown_summary(value: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+    println!(
+        "Store-RS breakdown tenant={} note={}",
+        value
+            .get("tenant")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        value
+            .get("note")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("correlation only")
+    );
+    if let Some(segments) = value.get("segments") {
+        println!(
+            "segments count={} used_bytes={} capacity_bytes={}",
+            json_u64(segments, "count"),
+            json_u64(segments, "used_bytes"),
+            json_u64(segments, "capacity_bytes")
+        );
+    }
+    println!("top bottleneck candidates:");
+    for item in value
+        .get("bottlenecks")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(10)
+    {
+        println!(
+            "- source={} name={} result={} calls={} total_ms={:.3} p99_ms={:.3}",
+            item.get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            item.get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            item.get("result")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            json_u64(item, "calls_total"),
+            json_u64(item, "latency_total_us") as f64 / 1000.0,
+            json_u64(item, "latency_p99_us") as f64 / 1000.0
+        );
+    }
+    println!("sglang api focus:");
+    for item in value
+        .get("operations")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("kind").and_then(serde_json::Value::as_str) == Some("api"))
+    {
+        let name = item
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        if !matches!(
+            name,
+            "batch_put_from"
+                | "batch_get_into"
+                | "batch_is_exist"
+                | "get_size"
+                | "query_route"
+                | "register_buffer"
+                | "unregister_buffer"
+        ) {
+            continue;
+        }
+        println!(
+            "- {} result={} calls={} bytes_in={} bytes_out={} avg_ms={:.3} max_ms={:.3} p99_ms={:.3}",
+            name,
+            item.get("result")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            json_u64(item, "calls_total"),
+            json_u64(item, "bytes_in_total"),
+            json_u64(item, "bytes_out_total"),
+            json_u64(item, "latency_avg_us") as f64 / 1000.0,
+            json_u64(item, "latency_max_us") as f64 / 1000.0,
+            json_u64(item, "latency_p99_us") as f64 / 1000.0
+        );
+    }
+    println!("metadata operations:");
+    for item in value
+        .get("metadata_operations")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(12)
+    {
+        println!(
+            "- backend={} operation={} result={} calls={} avg_ms={:.3} p99_ms={:.3}",
+            item.get("backend")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            item.get("operation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            item.get("result")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            json_u64(item, "calls_total"),
+            json_u64(item, "latency_avg_us") as f64 / 1000.0,
+            json_u64(item, "latency_p99_us") as f64 / 1000.0
+        );
+    }
+    println!("transport:");
+    for item in value
+        .get("transport")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(12)
+    {
+        println!(
+            "- direction={} peer={} result={} operations={} bytes={}",
+            item.get("direction")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            item.get("peer_kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            item.get("result")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-"),
+            json_u64(item, "operations_total"),
+            json_u64(item, "bytes_total")
+        );
+    }
+    Ok(())
+}
+
+fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
 }
 
 fn graceful_shutdown(
@@ -925,7 +1075,7 @@ mod tests {
 
     use super::{
         build_runtime_args, compat_warnings, drained_message, dummy_worker_scope,
-        effective_heartbeat_interval, emit_compat_warnings, fetch_stats_body,
+        effective_heartbeat_interval, emit_compat_warnings, fetch_http_body,
         heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, normalize_trace_filter, now_ms,
         parse_cli_from, parse_falsey_env_bool, parse_hugepage_size_arg, parse_label,
         parse_route_control_arg, parse_transport_backend_arg, requested_initial_state,
@@ -1646,7 +1796,7 @@ mod tests {
 
         let address = start_metrics_http_server("127.0.0.1:0")
             .expect("metrics server should start on an ephemeral port");
-        let body = fetch_stats_body(&address).expect("stats body should fetch");
+        let body = fetch_http_body(&address, "/stats").expect("stats body should fetch");
         let value: serde_json::Value =
             serde_json::from_str(&body).expect("stats body should be valid json");
         assert_eq!(

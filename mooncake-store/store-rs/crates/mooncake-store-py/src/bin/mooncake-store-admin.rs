@@ -186,6 +186,10 @@ struct TracingFanoutArgs {
 struct TracingOnArgs {
     #[arg(long, env = "MC_STORE_ADMIN_TRACING_ENDPOINT")]
     endpoint: Option<String>,
+    #[arg(long, env = "MC_STORE_ADMIN_TRACING_FILE")]
+    file: Option<String>,
+    #[arg(long, value_parser = FalseyValueParser::new(), env = "MC_STORE_ADMIN_TRACING_CLEAR_FILE")]
+    clear_file: bool,
     #[arg(long, env = "MC_STORE_ADMIN_TRACING_SAMPLE_RATIO")]
     sample_ratio: Option<f64>,
     #[command(flatten)]
@@ -399,6 +403,8 @@ fn run_tracing_command(args: &Args, command: &TracingCommand) -> Result<(), Box<
             "/v1/tracing/on",
             &TracingUpdateRequest {
                 endpoint: on_args.endpoint.clone(),
+                file: on_args.file.clone(),
+                clear_file: Some(on_args.clear_file).filter(|enabled| *enabled),
                 sample_ratio: on_args.sample_ratio,
                 timeout_ms: on_args.fanout.timeout_ms,
                 max_targets: on_args.fanout.max_targets,

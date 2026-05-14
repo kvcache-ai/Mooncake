@@ -11,16 +11,19 @@ mod test_support;
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::ops::Range;
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Instant;
 
-use dispatcher::{CompatNamespaceScope, StoreDispatcher};
+use dispatcher::{CompatNamespaceScope, CompatObjectScope, StoreDispatcher};
 use dummy_client::DummySession;
 use mooncake_store_client::{
     init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
     start_metrics_http_server, stop_metrics_http_server, MooncakeCompatibilityFacade,
-    MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest, ReplicationPolicy,
-    RouteControlMode,
+    MultiBufferPutRequest, ObjectRef, OperationTracker, PutFromRequest, PutRequest,
+    ReplicationPolicy, RouteControlMode,
 };
 use mooncake_store_core::{
     ClientLifecycleState, NamespaceScope, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
@@ -49,6 +52,8 @@ fn finalize_real_dispatcher_setup(
 }
 
 pub const DEFAULT_COMPAT_WORKER_SCOPE: &str = "worker-1";
+const BATCH_PUT_FROM_FANOUT_ENV: &str = "MC_STORE_RS_PY_BATCH_PUT_FROM_FANOUT";
+const DEFAULT_BATCH_PUT_FROM_FANOUT_WIDTH: usize = 8;
 
 fn resolve_real_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
     if let Some(scope) = worker_scope
@@ -1679,6 +1684,169 @@ fn pointer_from_usize(pointer: usize) -> PyResult<*mut c_void> {
         return Err(PyValueError::new_err("buffer pointer must not be null"));
     }
     Ok(pointer as *mut c_void)
+}
+
+fn batch_put_from_fanout_width(item_count: usize) -> usize {
+    if item_count <= 1 {
+        return 1;
+    }
+    let fanout = std::env::var(BATCH_PUT_FROM_FANOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BATCH_PUT_FROM_FANOUT_WIDTH);
+    item_count.min(fanout)
+}
+
+fn batch_put_from_fanout_ranges(item_count: usize, width: usize) -> Vec<Range<usize>> {
+    if item_count == 0 {
+        return Vec::new();
+    }
+    let width = width.max(1).min(item_count);
+    let chunk_size = item_count.div_ceil(width);
+    (0..item_count)
+        .step_by(chunk_size)
+        .map(|start| start..(start + chunk_size).min(item_count))
+        .collect()
+}
+
+fn execute_real_batch_put_from_shard(
+    dispatcher: &StoreDispatcher,
+    items: Vec<(String, usize, usize)>,
+    scope: CompatObjectScope,
+    policy: Option<ReplicationPolicy>,
+) -> Result<Vec<i32>, StoreError> {
+    let item_count = items.len();
+    dispatcher.run(move |client| {
+        let total_bytes = items.iter().map(|(_, _, size)| *size).sum::<usize>();
+        let requests = items
+            .iter()
+            .map(|(key, buffer_ptr, size)| {
+                let mut request = PutFromRequest::new(
+                    key,
+                    (*buffer_ptr as *mut c_void).cast_const(),
+                    *size,
+                )
+                .tenant(scope.tenant.as_str());
+                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                    request = request.domain(scope.domain.as_str());
+                }
+                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                    request = request.object_set(scope.object_set.as_str());
+                }
+                if let Some(policy) = policy.clone() {
+                    request = request.replication(policy);
+                }
+                request
+            })
+            .collect::<Vec<_>>();
+        let batch_started = Instant::now();
+        let results = client.batch_put_from_statuses(&requests);
+        let elapsed_ms = batch_started.elapsed().as_millis();
+        let mut failed = 0usize;
+        let statuses = items
+            .iter()
+            .zip(results)
+            .map(|((key, _, size), result)| match result {
+                Ok(_) => 0,
+                Err(error) => {
+                    failed += 1;
+                    eprintln!(
+                        "[mooncake-store] batch_put_from per-key failed runtime={} key={} bytes={} batch_items={} batch_bytes={} elapsed_ms={} error={}",
+                        client.runtime_id(),
+                        key,
+                        size,
+                        item_count,
+                        total_bytes,
+                        elapsed_ms,
+                        error
+                    );
+                    tracing::debug!(
+                        key = %key,
+                        error = %error,
+                        "batch_put_from per-key write failed"
+                    );
+                    -1
+                }
+            })
+            .collect::<Vec<_>>();
+        if failed > 0 {
+            tracing::debug!(
+                failed,
+                items = item_count,
+                bytes = total_bytes,
+                elapsed_ms,
+                "batch_put_from completed with per-key failures"
+            );
+        }
+        Ok(statuses)
+    })
+}
+
+fn execute_real_batch_put_from(
+    dispatcher: &StoreDispatcher,
+    items: Vec<(String, usize, usize)>,
+    scope: CompatObjectScope,
+    policy: Option<ReplicationPolicy>,
+) -> Result<Vec<i32>, StoreError> {
+    let item_count = items.len();
+    let total_bytes = items.iter().map(|(_, _, size)| *size as u64).sum::<u64>();
+    let fanout_width = batch_put_from_fanout_width(item_count);
+    let tracker = OperationTracker::new("py_batch_put_from_fanout")
+        .scope("python_bridge")
+        .input_bytes(total_bytes)
+        .attribute_u64("mooncake.item_count", item_count as u64)
+        .attribute_u64("mooncake.fanout_width", fanout_width as u64);
+    if fanout_width <= 1 {
+        let result = execute_real_batch_put_from_shard(dispatcher, items, scope, policy);
+        tracker.finish(
+            &result,
+            result.as_ref().map(|items| items.len()).unwrap_or(0) as u64,
+        );
+        return result;
+    }
+    let result = (|| {
+        let ranges = batch_put_from_fanout_ranges(item_count, fanout_width);
+        let mut statuses = vec![-1; item_count];
+        let results = thread::scope(|thread_scope| {
+            let mut handles = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let shard_items = items[range.clone()].to_vec();
+                let shard_scope = scope.clone();
+                let shard_policy = policy.clone();
+                handles.push((
+                    range.start,
+                    thread_scope.spawn(move || {
+                        execute_real_batch_put_from_shard(
+                            dispatcher,
+                            shard_items,
+                            shard_scope,
+                            shard_policy,
+                        )
+                    }),
+                ));
+            }
+            handles
+                .into_iter()
+                .map(|(start, handle)| {
+                    handle.join().map(|result| (start, result)).map_err(|_| {
+                        StoreError::Transport("batch_put_from fanout worker panicked".to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()
+        })?;
+        for (start, shard_result) in results {
+            let shard_statuses = shard_result?;
+            let end = start + shard_statuses.len();
+            statuses[start..end].copy_from_slice(&shard_statuses);
+        }
+        Ok(statuses)
+    })();
+    tracker.finish(
+        &result,
+        result.as_ref().map(|items| items.len()).unwrap_or(0) as u64,
+    );
+    result
 }
 
 fn run_without_gil<T, F>(f: F) -> Result<T, StoreError>

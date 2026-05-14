@@ -424,6 +424,10 @@ pub fn render_stats_json() -> String {
     render_stats_json_with_registry(registry::global_metrics_registry())
 }
 
+pub fn render_breakdown_json() -> String {
+    render_breakdown_json_with_registry(registry::global_metrics_registry())
+}
+
 fn render_prometheus_metrics_with_registry(registry: &registry::SharedMetricsRegistry) -> String {
     exporter::render_prometheus_metrics(&snapshot_metrics_with_registry(registry))
 }
@@ -432,6 +436,12 @@ fn render_stats_json_with_registry(registry: &registry::SharedMetricsRegistry) -
     let snapshot = snapshot_metrics_with_registry(registry);
     serde_json::to_string(&StatsSnapshot::from_metrics(snapshot))
         .expect("stats snapshot serialization should succeed")
+}
+
+fn render_breakdown_json_with_registry(registry: &registry::SharedMetricsRegistry) -> String {
+    let snapshot = snapshot_metrics_with_registry(registry);
+    serde_json::to_string(&BreakdownSnapshot::from_metrics(snapshot))
+        .expect("breakdown snapshot serialization should succeed")
 }
 
 pub fn snapshot_metrics() -> MetricsSnapshot {
@@ -512,6 +522,11 @@ fn handle_metrics_http_connection(
             "200 OK",
             "application/json; charset=utf-8",
             render_stats_json_with_registry(registry),
+        ),
+        "/breakdown" => (
+            "200 OK",
+            "application/json; charset=utf-8",
+            render_breakdown_json_with_registry(registry),
         ),
         "/healthz" | "/livez" => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
         path if path.starts_with("/tracing") || path.starts_with("/trace") => {
@@ -711,6 +726,419 @@ struct StatsSegmentSnapshot {
     used_bytes: u64,
 }
 
+#[derive(Serialize)]
+struct BreakdownSnapshot {
+    tenant: String,
+    process: StatsProcessSnapshot,
+    operations: Vec<BreakdownOperationSnapshot>,
+    metadata_operations: Vec<BreakdownMetadataSnapshot>,
+    transport: Vec<BreakdownTransportSnapshot>,
+    runtimes: Vec<StatsRuntimeSnapshot>,
+    segments: BreakdownSegmentSummary,
+    bottlenecks: Vec<BreakdownBottleneckSnapshot>,
+    note: &'static str,
+}
+
+#[derive(Serialize)]
+struct BreakdownOperationSnapshot {
+    operation: String,
+    kind: &'static str,
+    scope: &'static str,
+    result: &'static str,
+    calls_total: u64,
+    bytes_in_total: u64,
+    bytes_out_total: u64,
+    latency_total_us: u64,
+    latency_avg_us: u64,
+    latency_max_us: u64,
+    latency_p50_us: u64,
+    latency_p90_us: u64,
+    latency_p99_us: u64,
+    inflight: u64,
+}
+
+#[derive(Serialize)]
+struct BreakdownMetadataSnapshot {
+    backend: &'static str,
+    operation: &'static str,
+    result: &'static str,
+    calls_total: u64,
+    latency_total_us: u64,
+    latency_avg_us: u64,
+    latency_p50_us: u64,
+    latency_p90_us: u64,
+    latency_p99_us: u64,
+    inflight: u64,
+}
+
+#[derive(Serialize)]
+struct BreakdownTransportSnapshot {
+    direction: &'static str,
+    peer_kind: &'static str,
+    result: Option<&'static str>,
+    operations_total: u64,
+    bytes_total: u64,
+}
+
+#[derive(Serialize)]
+struct BreakdownSegmentSummary {
+    count: usize,
+    capacity_bytes: u64,
+    used_bytes: u64,
+    by_runtime: Vec<StatsSegmentSnapshot>,
+}
+
+#[derive(Serialize)]
+struct BreakdownBottleneckSnapshot {
+    source: &'static str,
+    name: String,
+    result: &'static str,
+    calls_total: u64,
+    latency_total_us: u64,
+    latency_p99_us: u64,
+    reason: &'static str,
+}
+
+impl BreakdownSnapshot {
+    fn from_metrics(snapshot: MetricsSnapshot) -> Self {
+        let process = StatsProcessSnapshot {
+            cpu_seconds_total: snapshot.process.cpu_seconds_total,
+            resident_memory_bytes: snapshot.process.resident_memory_bytes,
+            open_fds: snapshot.process.open_fds,
+        };
+        let runtimes = stats_runtimes(
+            snapshot.runtime_status,
+            snapshot.runtime_lease_expires_at_ms,
+            snapshot.heartbeat_consecutive_failures,
+            snapshot.heartbeat_last_success_ms,
+        );
+        let segment_rows = snapshot
+            .segments
+            .into_iter()
+            .map(|segment| StatsSegmentSnapshot {
+                runtime: segment.runtime,
+                segment: segment.segment,
+                state: segment.state,
+                tier: segment.tier,
+                capacity_bytes: segment.capacity_bytes,
+                used_bytes: segment.used_bytes,
+            })
+            .collect::<Vec<_>>();
+        let segment_count = segment_rows.len();
+        let segment_capacity = segment_rows
+            .iter()
+            .map(|segment| segment.capacity_bytes)
+            .sum();
+        let segment_used = segment_rows.iter().map(|segment| segment.used_bytes).sum();
+        let operations = build_breakdown_operations(
+            snapshot.operations,
+            snapshot.request_duration,
+            snapshot.request_bytes,
+            snapshot.request_inflight,
+        );
+        let metadata_operations = build_breakdown_metadata(
+            snapshot.metadata_operations,
+            snapshot.metadata_duration,
+            snapshot.metadata_inflight,
+        );
+        let transport =
+            build_breakdown_transport(snapshot.transport_operations, snapshot.transport_bytes);
+        let bottlenecks = build_bottlenecks(&operations, &metadata_operations);
+        Self {
+            tenant: snapshot.tenant,
+            process,
+            operations,
+            metadata_operations,
+            transport,
+            runtimes,
+            segments: BreakdownSegmentSummary {
+                count: segment_count,
+                capacity_bytes: segment_capacity,
+                used_bytes: segment_used,
+                by_runtime: segment_rows,
+            },
+            bottlenecks,
+            note: "Bottleneck candidates are ranked observations from Store-RS metrics; they are not root-cause proof.",
+        }
+    }
+}
+
+fn stats_runtimes(
+    runtime_status: Vec<registry::GaugeSample<registry::RuntimeStatusKey>>,
+    runtime_lease_expires_at_ms: Vec<registry::GaugeSample<registry::RuntimeKey>>,
+    heartbeat_consecutive_failures: Vec<registry::GaugeSample<registry::RuntimeKey>>,
+    heartbeat_last_success_ms: Vec<registry::GaugeSample<registry::RuntimeKey>>,
+) -> Vec<StatsRuntimeSnapshot> {
+    let mut runtimes = std::collections::BTreeMap::<String, StatsRuntimeSnapshot>::new();
+    for sample in runtime_status {
+        let runtime = sample.key.runtime;
+        let entry = runtimes
+            .entry(runtime.clone())
+            .or_insert_with(|| StatsRuntimeSnapshot::new(runtime));
+        if sample.value >= 0.5 {
+            entry.state = Some(sample.key.state.to_string());
+        }
+    }
+    for sample in runtime_lease_expires_at_ms {
+        let runtime = sample.key.runtime;
+        let entry = runtimes
+            .entry(runtime.clone())
+            .or_insert_with(|| StatsRuntimeSnapshot::new(runtime));
+        entry.lease_expires_at_ms = Some(sample.value.max(0.0) as u64);
+    }
+    for sample in heartbeat_consecutive_failures {
+        let runtime = sample.key.runtime;
+        let entry = runtimes
+            .entry(runtime.clone())
+            .or_insert_with(|| StatsRuntimeSnapshot::new(runtime));
+        entry.heartbeat_consecutive_failures = Some(sample.value.max(0.0) as u64);
+    }
+    for sample in heartbeat_last_success_ms {
+        let runtime = sample.key.runtime;
+        let entry = runtimes
+            .entry(runtime.clone())
+            .or_insert_with(|| StatsRuntimeSnapshot::new(runtime));
+        entry.heartbeat_last_success_ms = Some(sample.value.max(0.0) as u64);
+    }
+    runtimes.into_values().collect()
+}
+
+fn build_breakdown_operations(
+    operations: Vec<OperationMetricSnapshot>,
+    durations: Vec<registry::HistogramSample<registry::RequestKey>>,
+    bytes: Vec<registry::CounterSample<registry::RequestBytesKey>>,
+    inflight: Vec<registry::GaugeSample<registry::RequestInflightKey>>,
+) -> Vec<BreakdownOperationSnapshot> {
+    let mut by_key = std::collections::BTreeMap::<
+        (&'static str, &'static str, &'static str),
+        BreakdownOperationSnapshot,
+    >::new();
+    let mut bytes_by_key =
+        std::collections::BTreeMap::<(&'static str, &'static str, &'static str), (u64, u64)>::new();
+    for sample in bytes {
+        let entry = bytes_by_key
+            .entry((sample.key.operation, sample.key.scope, "ok"))
+            .or_default();
+        match sample.key.direction {
+            "in" => entry.0 = entry.0.saturating_add(sample.value),
+            "out" => entry.1 = entry.1.saturating_add(sample.value),
+            _ => {}
+        }
+    }
+    let mut inflight_by_key =
+        std::collections::BTreeMap::<(&'static str, &'static str), u64>::new();
+    for sample in inflight {
+        inflight_by_key.insert(
+            (sample.key.operation, sample.key.scope),
+            sample.value.max(0.0) as u64,
+        );
+    }
+    for sample in durations {
+        let (bytes_in, bytes_out) = bytes_by_key
+            .get(&(sample.key.operation, sample.key.scope, sample.key.result))
+            .copied()
+            .unwrap_or_default();
+        let calls_total = sample.count;
+        let total_us = seconds_to_us(sample.sum);
+        by_key.insert(
+            (sample.key.operation, sample.key.scope, sample.key.result),
+            BreakdownOperationSnapshot {
+                operation: sample.key.operation.to_string(),
+                kind: operation_kind(sample.key.operation),
+                scope: sample.key.scope,
+                result: sample.key.result,
+                calls_total,
+                bytes_in_total: bytes_in,
+                bytes_out_total: bytes_out,
+                latency_total_us: total_us,
+                latency_avg_us: avg_us(total_us, calls_total),
+                latency_max_us: 0,
+                latency_p50_us: histogram_quantile_us(&sample.buckets, sample.count, 0.50),
+                latency_p90_us: histogram_quantile_us(&sample.buckets, sample.count, 0.90),
+                latency_p99_us: histogram_quantile_us(&sample.buckets, sample.count, 0.99),
+                inflight: inflight_by_key
+                    .get(&(sample.key.operation, sample.key.scope))
+                    .copied()
+                    .unwrap_or_default(),
+            },
+        );
+    }
+    for operation in operations {
+        for ((name, _, result), row) in &mut by_key {
+            if *name == operation.operation && *result == operation.status {
+                row.bytes_in_total = row.bytes_in_total.max(operation.bytes_in_total);
+                row.bytes_out_total = row.bytes_out_total.max(operation.bytes_out_total);
+                row.latency_max_us = row.latency_max_us.max(operation.latency_max_us);
+            }
+        }
+    }
+    by_key.into_values().collect()
+}
+
+fn build_breakdown_metadata(
+    operations: Vec<registry::CounterSample<registry::MetadataOperationKey>>,
+    durations: Vec<registry::HistogramSample<registry::MetadataOperationKey>>,
+    inflight: Vec<registry::GaugeSample<registry::MetadataInflightKey>>,
+) -> Vec<BreakdownMetadataSnapshot> {
+    let mut calls =
+        std::collections::BTreeMap::<(&'static str, &'static str, &'static str), u64>::new();
+    for sample in operations {
+        calls.insert(
+            (sample.key.backend, sample.key.operation, sample.key.result),
+            sample.value,
+        );
+    }
+    let mut inflight_by_key =
+        std::collections::BTreeMap::<(&'static str, &'static str), u64>::new();
+    for sample in inflight {
+        inflight_by_key.insert(
+            (sample.key.backend, sample.key.operation),
+            sample.value.max(0.0) as u64,
+        );
+    }
+    durations
+        .into_iter()
+        .map(|sample| {
+            let total_us = seconds_to_us(sample.sum);
+            let calls_total = calls
+                .get(&(sample.key.backend, sample.key.operation, sample.key.result))
+                .copied()
+                .unwrap_or(sample.count);
+            BreakdownMetadataSnapshot {
+                backend: sample.key.backend,
+                operation: sample.key.operation,
+                result: sample.key.result,
+                calls_total,
+                latency_total_us: total_us,
+                latency_avg_us: avg_us(total_us, calls_total),
+                latency_p50_us: histogram_quantile_us(&sample.buckets, sample.count, 0.50),
+                latency_p90_us: histogram_quantile_us(&sample.buckets, sample.count, 0.90),
+                latency_p99_us: histogram_quantile_us(&sample.buckets, sample.count, 0.99),
+                inflight: inflight_by_key
+                    .get(&(sample.key.backend, sample.key.operation))
+                    .copied()
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+fn build_breakdown_transport(
+    operations: Vec<registry::CounterSample<registry::TransportOperationKey>>,
+    bytes: Vec<registry::CounterSample<registry::TransportBytesKey>>,
+) -> Vec<BreakdownTransportSnapshot> {
+    let mut rows = Vec::new();
+    for sample in operations {
+        rows.push(BreakdownTransportSnapshot {
+            direction: sample.key.direction,
+            peer_kind: sample.key.peer_kind,
+            result: Some(sample.key.result),
+            operations_total: sample.value,
+            bytes_total: 0,
+        });
+    }
+    for sample in bytes {
+        rows.push(BreakdownTransportSnapshot {
+            direction: sample.key.direction,
+            peer_kind: sample.key.peer_kind,
+            result: None,
+            operations_total: 0,
+            bytes_total: sample.value,
+        });
+    }
+    rows
+}
+
+fn build_bottlenecks(
+    operations: &[BreakdownOperationSnapshot],
+    metadata: &[BreakdownMetadataSnapshot],
+) -> Vec<BreakdownBottleneckSnapshot> {
+    let mut rows = operations
+        .iter()
+        .filter(|row| row.calls_total > 0)
+        .map(|row| BreakdownBottleneckSnapshot {
+            source: row.kind,
+            name: row.operation.clone(),
+            result: row.result,
+            calls_total: row.calls_total,
+            latency_total_us: row.latency_total_us,
+            latency_p99_us: row.latency_p99_us,
+            reason: "ranked by observed total latency and p99 latency; correlation only",
+        })
+        .chain(
+            metadata
+                .iter()
+                .filter(|row| row.calls_total > 0)
+                .map(|row| BreakdownBottleneckSnapshot {
+                    source: "metadata",
+                    name: format!("{}:{}", row.backend, row.operation),
+                    result: row.result,
+                    calls_total: row.calls_total,
+                    latency_total_us: row.latency_total_us,
+                    latency_p99_us: row.latency_p99_us,
+                    reason: "ranked by observed total latency and p99 latency; correlation only",
+                }),
+        )
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .latency_total_us
+            .cmp(&left.latency_total_us)
+            .then_with(|| right.latency_p99_us.cmp(&left.latency_p99_us))
+    });
+    rows.truncate(10);
+    rows
+}
+
+fn operation_kind(operation: &str) -> &'static str {
+    match operation {
+        "batch_put_from" | "batch_get_into" | "batch_is_exist" | "get_size" | "query_route"
+        | "register_buffer" | "unregister_buffer" | "put" | "put_from" | "batch_put"
+        | "batch_get" | "get" | "get_into" => "api",
+        op if op.contains("stage")
+            || op.starts_with("route_lookup")
+            || op.starts_with("readable_replica_select")
+            || op.starts_with("get_remote")
+            || op.starts_with("put_remote")
+            || op.contains("local_copy")
+            || op.contains("checksum")
+            || op.starts_with("compat_dispatcher")
+            || op.starts_with("py_") =>
+        {
+            "phase"
+        }
+        op if op.starts_with("control_") => "control",
+        _ => "internal",
+    }
+}
+
+fn histogram_quantile_us(buckets: &[u64], count: u64, quantile: f64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let target = ((count as f64) * quantile).ceil().max(1.0) as u64;
+    let mut fallback = 0;
+    for (bucket, upper_bound) in buckets.iter().zip(registry::REQUEST_DURATION_BUCKETS) {
+        fallback = seconds_to_us(*upper_bound);
+        if *bucket >= target {
+            return seconds_to_us(*upper_bound);
+        }
+    }
+    fallback
+}
+
+fn seconds_to_us(value: f64) -> u64 {
+    (value.max(0.0) * 1_000_000.0).round() as u64
+}
+
+fn avg_us(total_us: u64, count: u64) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        total_us / count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,22 +1182,23 @@ mod tests {
             let tracker = OperationTracker::with_registry("put", registry.clone())
                 .scope("foreground")
                 .input_bytes(16);
-            tracker.finish(&result, 8);
-
             let active = render_prometheus_metrics_with_registry(&registry);
             assert!(active.contains(
                 "mooncake_store_request_inflight{tenant=\"default\",operation=\"put\",scope=\"foreground\"} 1"
             ));
-            assert!(active.contains(
+            tracker.finish(&result, 8);
+
+            let finished = render_prometheus_metrics_with_registry(&registry);
+            assert!(finished.contains(
                 "mooncake_store_request_total{tenant=\"default\",operation=\"put\",scope=\"foreground\",result=\"ok\"} 1"
             ));
-            assert!(active.contains(
+            assert!(finished.contains(
                 "mooncake_store_request_duration_seconds_bucket{tenant=\"default\",operation=\"put\",scope=\"foreground\",result=\"ok\",le=\"+Inf\"} 1"
             ));
-            assert!(active.contains(
+            assert!(finished.contains(
                 "mooncake_store_request_bytes_total{tenant=\"default\",operation=\"put\",direction=\"in\",scope=\"foreground\"} 16"
             ));
-            assert!(active.contains(
+            assert!(finished.contains(
                 "mooncake_store_request_bytes_total{tenant=\"default\",operation=\"put\",direction=\"out\",scope=\"foreground\"} 8"
             ));
         }
@@ -1012,6 +1441,71 @@ mod tests {
         server
             .shutdown()
             .expect("metrics server should stop cleanly");
+    }
+
+    #[test]
+    fn breakdown_json_exposes_api_phase_metadata_and_transport() {
+        let _guard = metrics_test_lock().lock();
+        reset_metrics();
+        registry::set_process_tenant("tenant-breakdown");
+
+        let result = Ok(());
+        OperationTracker::new("batch_put_from")
+            .input_bytes(1024)
+            .finish(&result, 512);
+        OperationTracker::new("route_lookup_many")
+            .scope("route_lookup")
+            .finish(&result, 0);
+        registry::record_metadata_operation_with_registry(
+            registry::global_metrics_registry(),
+            "redis",
+            "get_object_route",
+            "ok",
+            std::time::Duration::from_millis(4),
+        );
+        registry::record_transport_operation("write", "storage", "ok");
+        registry::record_transport_bytes("write", "storage", 512);
+
+        let body = render_breakdown_json();
+        let value: serde_json::Value =
+            serde_json::from_str(&body).expect("breakdown endpoint should return valid json");
+        assert_eq!(value["tenant"], "tenant-breakdown");
+        assert!(value["note"]
+            .as_str()
+            .expect("breakdown should explain ranking semantics")
+            .contains("not root-cause proof"));
+        assert!(value["operations"]
+            .as_array()
+            .expect("operations should be an array")
+            .iter()
+            .any(|entry| entry["operation"] == "batch_put_from"
+                && entry["kind"] == "api"
+                && entry["bytes_in_total"] == 1024_u64));
+        assert!(value["operations"]
+            .as_array()
+            .expect("operations should be an array")
+            .iter()
+            .any(|entry| entry["operation"] == "route_lookup_many" && entry["kind"] == "phase"));
+        assert!(value["metadata_operations"]
+            .as_array()
+            .expect("metadata operations should be an array")
+            .iter()
+            .any(|entry| entry["backend"] == "redis"
+                && entry["operation"] == "get_object_route"
+                && entry["calls_total"] == 1_u64));
+        assert!(value["transport"]
+            .as_array()
+            .expect("transport rows should be an array")
+            .iter()
+            .any(|entry| entry["direction"] == "write"
+                && entry["peer_kind"] == "storage"
+                && entry["bytes_total"] == 512_u64));
+        assert!(!value["bottlenecks"]
+            .as_array()
+            .expect("bottlenecks should be an array")
+            .is_empty());
+
+        reset_metrics();
     }
 
     #[test]
