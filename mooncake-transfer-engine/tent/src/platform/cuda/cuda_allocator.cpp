@@ -81,6 +81,5 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
     return Status::OK();
 }
-}
 }  // namespace tent
 }  // namespace mooncake
