@@ -28,6 +28,7 @@ ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
       max_retries_(max_retries),
       impl_(impl) {
     running_ = true;
+
     for (size_t i = 0; i < kShards; ++i) {
         shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
     }
