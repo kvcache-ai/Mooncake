@@ -294,7 +294,9 @@ pool = RegisteredBufferPool(
 
 with pool.buffer(1024 * 1024) as lease:
     n = store.get_into("my_key", lease.ptr, lease.size)
-    data = bytes(lease.buffer[:n])
+    view = lease.buffer[:n]
+    # Consume view directly, or wrap it with np.frombuffer(view, dtype=...).
+    # Copy only if the data must outlive the lease: data = bytes(view)
 
 pool.close()
 ```
