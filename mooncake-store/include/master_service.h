@@ -439,6 +439,10 @@ class MasterService {
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
 
+    auto ReportSsdCapacity(const UUID& client_id,
+                           int64_t ssd_total_capacity_bytes)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Notifies the master that offloading of specified objects has
      * succeeded.
@@ -562,8 +566,14 @@ class MasterService {
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
+    // Helper to get a snapshot of alive clients (under client_mutex_ shared
+    // lock)
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    void ClearInvalidHandles(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -588,10 +598,12 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin, bool enable_hard_pin = false)
+            bool enable_soft_pin, bool enable_hard_pin = false,
+            ObjectDataType data_type_ = ObjectDataType::UNKNOWN)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
+              data_type(data_type_),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -614,6 +626,7 @@ class MasterService {
         // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+        const ObjectDataType data_type{ObjectDataType::UNKNOWN};
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -891,7 +904,10 @@ class MasterService {
     }
 
     // Helper to clean up stale handles pointing to unmounted segments
-    bool CleanupStaleHandles(ObjectMetadata& metadata);
+    // or local_disk replicas whose owner client is no longer alive.
+    bool CleanupStaleHandles(
+        ObjectMetadata& metadata,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -962,11 +978,21 @@ class MasterService {
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)),
               replication_task_it_(shard_guard_->replication_tasks.find(key)) {
-            // Automatically clean up invalid handles
+            // Automatically clean up invalid handles (memory replicas only).
+            // Note: We only check memory replicas here to avoid lock order
+            // violation (client_mutex_ must be acquired before metadata shard).
+            // local_disk replicas are cleaned up by ClearInvalidHandles() in
+            // ClientMonitorFunc.
             if (it_ != shard_guard_->metadata.end()) {
-                if (service_->CleanupStaleHandles(it_->second)) {
+                // Erase invalid memory replicas (those with unmounted
+                // segments). No client_mutex_ needed since we only check memory
+                // replicas.
+                it_->second.EraseReplicas([](const Replica& replica) {
+                    return replica.has_invalid_mem_handle();
+                });
+                // If no valid replicas remain, delete the whole object.
+                if (!it_->second.IsValid()) {
                     this->Erase();
-
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
@@ -1017,7 +1043,8 @@ class MasterService {
 
         void Create(const UUID& client_id, uint64_t total_length,
                     std::vector<Replica> replicas, bool enable_soft_pin,
-                    bool enable_hard_pin = false) {
+                    bool enable_hard_pin = false,
+                    ObjectDataType data_type = ObjectDataType::UNKNOWN) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -1026,7 +1053,7 @@ class MasterService {
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
                                       std::move(replicas), enable_soft_pin,
-                                      enable_hard_pin));
+                                      enable_hard_pin, data_type));
             it_ = result.first;
         }
 
@@ -1148,6 +1175,14 @@ class MasterService {
     const bool enable_ha_;
 
     const bool enable_offload_;
+
+    // Offload-on-evict: defer disk offload to eviction time
+    // (config: offload_on_evict)
+    bool offload_on_evict_{false};
+    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
+    // exceeded (config: offload_force_evict, only effective when
+    // offload_on_evict_=true)
+    bool offload_force_evict_{false};
 
     const std::string ha_backend_type_;
 

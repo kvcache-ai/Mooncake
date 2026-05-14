@@ -174,7 +174,10 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
+        : engine_(engine),
+          batch_id_(batch_id),
+          batch_size_(batch_size),
+          start_ts_(getCurrentTimeInMilli()) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -199,6 +202,7 @@ class TransferEngineOperationState : public OperationState {
     TransferEngine& engine_;
     BatchID batch_id_;
     size_t batch_size_;
+    const int64_t start_ts_;
 };
 
 /**
@@ -366,6 +370,7 @@ class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
+                               const std::string& local_hostname,
                                TransferMetric* transfer_metric = nullptr);
 
     /**
@@ -402,13 +407,15 @@ class TransferSubmitter {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batched_slices);
 
    private:
     TransferEngine& engine_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    const std::string local_hostname_;
     TransferMetric* transfer_metric_;
 
     /**

@@ -50,6 +50,7 @@ struct MountedSegment {
 struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
+    int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         offloading_objects;
     explicit LocalDiskSegment(bool enable_offloading)
@@ -169,6 +170,12 @@ class ScopedSegmentAccess {
      */
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
+
+    /**
+     * @brief Remove the local disk segment entry for a client.
+     * Called when a client expires to clean up its local disk segment.
+     */
+    void UnmountLocalDiskSegment(const UUID& client_id);
 
    private:
     SegmentManager* segment_manager_;

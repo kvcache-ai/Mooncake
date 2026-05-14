@@ -48,6 +48,13 @@ namespace {
 
 constexpr size_t kUnlimitedSnapshotList = 0;
 
+// Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
+// when offload-on-evict mode is active. Defers memory eviction for at most
+// this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
+// falls back according to `offload_force_evict_`. A future change may expose
+// this as a configurable parameter if workloads demand tuning.
+constexpr double kOffloadCapRatio = 0.5;
+
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
     kRedis,
@@ -157,6 +164,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument(
             "put_start_release_timeout must be larger than "
             "put_start_discard_timeout_sec");
+    }
+
+    // Offload-on-evict: defer LOCAL_DISK offload to eviction time
+    offload_on_evict_ = enable_offload_ && config.offload_on_evict;
+    if (offload_on_evict_) {
+        LOG(INFO) << "Offload-on-evict mode enabled: DRAM offload to "
+                     "LOCAL_DISK will occur at eviction time instead of "
+                     "PutEnd";
+        offload_force_evict_ = config.offload_force_evict;
+        if (offload_force_evict_) {
+            LOG(INFO) << "Force-evict enabled: objects exceeding offload "
+                         "cap will be evicted without disk offload";
+        }
     }
 
     eviction_running_ = true;
@@ -351,12 +371,23 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     return {};
 }
 
+std::unordered_set<UUID, boost::hash<UUID>>
+MasterService::getAliveClientsSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    return ok_client_;
+}
+
 void MasterService::ClearInvalidHandles() {
+    ClearInvalidHandles(getAliveClientsSnapshot());
+}
+
+void MasterService::ClearInvalidHandles(
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
                 // replication_tasks, and offloading_tasks.
@@ -814,7 +845,8 @@ auto MasterService::AllocateAndInsertMetadata(
     shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin));
+                              config.with_soft_pin, config.with_hard_pin,
+                              config.data_type));
     shard->processing_keys.insert(key);
 
     return replica_list;
@@ -842,13 +874,15 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=put_start_begin";
 
+    auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
     const auto now = std::chrono::system_clock::now();
     auto it = shard->metadata.find(key);
-    if (it != shard->metadata.end() && !CleanupStaleHandles(it->second)) {
+    if (it != shard->metadata.end() &&
+        !CleanupStaleHandles(it->second, alive_clients)) {
         auto& metadata = it->second;
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
@@ -897,7 +931,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    if (enable_offload_) {
+    if (enable_offload_ && !offload_on_evict_) {
         auto& shard = accessor.GetShard();
         metadata.VisitReplicas(
             &Replica::fn_is_completed, [this, &key, &shard](Replica& replica) {
@@ -1085,6 +1119,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     //   during full metadata snapshots.
     // shard lock (exclusive via MetadataShardAccessorRW): serializes all
     //   operations on keys that hash to the same shard.
+    auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
@@ -1094,7 +1129,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // --- Step 0: stale handle cleanup ---
     // If all memory replicas point to unmounted segments (node crashed and
     // restarted), the metadata is useless — erase it and treat as new key.
-    if (it != shard->metadata.end() && CleanupStaleHandles(it->second)) {
+    // Also clean up local_disk replicas whose owner client has expired.
+    if (it != shard->metadata.end() &&
+        CleanupStaleHandles(it->second, alive_clients)) {
         shard->processing_keys.erase(key);
         shard->metadata.erase(it);
         it = shard->metadata.end();
@@ -1931,6 +1968,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
 
+    auto alive_clients = getAliveClientsSnapshot();
+
     // Process each shard once, acquiring lock per shard
     for (auto& [shard_idx, key_group] : keys_by_shard) {
         MetadataShardAccessorRW shard(this, shard_idx);
@@ -1948,7 +1987,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Clean up stale replica handles (consistent with single Remove)
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
                 shard->processing_keys.erase(key);
                 shard->replication_tasks.erase(key);
                 shard->offloading_tasks.erase(key);
@@ -1996,10 +2035,14 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     return results;
 }
 
-bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
-    // Remove those with invalid allocators
-    metadata.EraseReplicas([](const Replica& replica) {
-        return replica.has_invalid_mem_handle();
+bool MasterService::CleanupStaleHandles(
+    ObjectMetadata& metadata,
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+    // Remove those with invalid allocators (memory replicas on unmounted
+    // segments) and local_disk replicas whose owner client is no longer alive.
+    metadata.EraseReplicas([&alive_clients](const Replica& replica) {
+        return replica.has_invalid_mem_handle() ||
+               replica.has_stale_local_disk_client(alive_clients);
     });
 
     // Return true if no valid replicas remain after cleanup
@@ -2093,10 +2136,75 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                    << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
+    std::unordered_map<std::string, int64_t> offloading_objects_copy;
+    {
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        local_disk_segment_it->second->enable_offloading = enable_offloading;
+        if (enable_offloading) {
+            return std::move(local_disk_segment_it->second->offloading_objects);
+        }
+        // Offloading is disabled: clear the pending queue to prevent
+        // unbounded growth that would trigger KEYS_ULTRA_LIMIT in
+        // PushOffloadingQueue. We must also clean up corresponding
+        // offloading_tasks and decrement source replica refcounts to avoid
+        // resource leaks and blocked writes (OBJECT_HAS_REPLICATION_TASK).
+        // Copy keys out before releasing the mutex to avoid lock order
+        // violation: the lock order is Shard Lock -> offloading_mutex_, so we
+        // must release offloading_mutex_ before taking shard locks via
+        // MetadataAccessorRW.
+        offloading_objects_copy =
+            std::move(local_disk_segment_it->second->offloading_objects);
+    }
+
+    for (auto& [key, size] : offloading_objects_copy) {
+        MetadataAccessorRW accessor(this, key);
+        if (accessor.Exists()) {
+            auto& shard = accessor.GetShard();
+            auto task_it = shard->offloading_tasks.find(key);
+            if (task_it != shard->offloading_tasks.end()) {
+                auto source =
+                    accessor.Get().GetReplicaByID(task_it->second.source_id);
+                if (source) {
+                    source->dec_refcnt();
+                }
+                shard->offloading_tasks.erase(task_it);
+            }
+        }
+    }
+    return {};
+}
+
+auto MasterService::ReportSsdCapacity(const UUID& client_id,
+                                      int64_t ssd_total_capacity_bytes)
+    -> tl::expected<void, ErrorCode> {
+    if (ssd_total_capacity_bytes < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        LOG(ERROR) << "Local disk segment not found with client id = "
+                   << client_id;
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    local_disk_segment_it->second->enable_offloading = enable_offloading;
-    if (enable_offloading) {
-        return std::move(local_disk_segment_it->second->offloading_objects);
+    int64_t old_capacity =
+        local_disk_segment_it->second->ssd_total_capacity_bytes;
+    if (ssd_total_capacity_bytes != old_capacity) {
+        local_disk_segment_it->second->ssd_total_capacity_bytes =
+            ssd_total_capacity_bytes;
+        if (old_capacity > 0) {
+            MasterMetricManager::instance().dec_total_file_capacity(
+                old_capacity);
+        }
+        if (ssd_total_capacity_bytes > 0) {
+            MasterMetricManager::instance().inc_total_file_capacity(
+                ssd_total_capacity_bytes);
+        }
     }
     return {};
 }
@@ -2174,10 +2282,13 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             offloading_queue_limit_) {
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
         }
-        local_disk_segment_it->second->offloading_objects.emplace(
+        auto res = local_disk_segment_it->second->offloading_objects.emplace(
             key, replica.get_descriptor()
                      .get_memory_descriptor()
                      .buffer_descriptor.size_);
+        if (!res.second) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
     }
     return {};
 }
@@ -3466,6 +3577,81 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
+    // --- Offload-on-evict support ---
+    long offload_queued_this_cycle = 0;
+    long offload_deferred_count = 0;
+    long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
+    long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
+    const long offload_cap =
+        offload_on_evict_
+            ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
+            : 0;
+
+    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
+        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    };
+
+    // Returns freed bytes. Returns 0 if offload-queued and no additional
+    // replicas were evicted (all MEMORY replicas of the key are now pinned).
+    auto try_evict_or_offload =
+        [&, this](const std::string& key, ObjectMetadata& metadata,
+                  MetadataShardAccessorRW& shard) -> uint64_t {
+        if (!offload_on_evict_) {
+            // Original behavior
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
+        if (has_local_disk_replica(metadata)) {
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // Force-evict cap: if force_evict enabled and cap reached, force
+        // delete. Warning is aggregated at the end of the cycle to avoid log
+        // flooding.
+        if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
+            offload_cap_forced_count++;
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // Queue one MEMORY replica for offload; others will be evicted below.
+        bool queued = false;
+        metadata.VisitReplicas(
+            [](const Replica& r) {
+                return r.is_memory_replica() && r.is_completed() &&
+                       r.get_refcnt() == 0;
+            },
+            [this, &key, &shard, &queued, &now](Replica& replica) {
+                if (queued) return;  // only need to pin one replica for offload
+                auto result = PushOffloadingQueue(key, replica);
+                if (result) {
+                    replica.inc_refcnt();
+                    shard->offloading_tasks.emplace(
+                        key, OffloadingTask{replica.id(), now});
+                    queued = true;
+                }
+            });
+
+        if (queued) {
+            offload_queued_this_cycle++;
+            offload_deferred_count++;
+            // Any remaining MEMORY replicas with refcnt==0 are redundant copies
+            // (data survives via the pinned replica → disk). Evict them now to
+            // reclaim memory immediately rather than waiting another cycle.
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // PushOffloadingQueue failed. Default (data-preserving) behavior is to
+        // skip this cycle — the outer eviction loop will retry after the
+        // offload queue drains. Only force-evict when explicitly opted in, to
+        // prevent silent data loss when the queue is unavailable.
+        if (offload_force_evict_) {
+            offload_push_failed_forced++;
+            return metadata.size * evict_replicas(metadata);
+        }
+        return 0;
+    };
+
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % kNumShards;
@@ -3538,16 +3724,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 if (it->second.lease_timeout <= target_timeout) {
-                    // Evict this object
-                    total_freed_size +=
-                        it->second.size *
-                        evict_replicas(it->second);  // Erase memory replicas
+                    // Evict this object (or defer for offload)
+                    uint64_t freed =
+                        try_evict_or_offload(it->first, it->second, shard);
+                    total_freed_size += freed;
                     if (it->second.IsValid() == false) {
                         it = shard->metadata.erase(it);
                     } else {
                         ++it;
                     }
-                    shard_evicted_count++;
+                    if (freed > 0) {
+                        shard_evicted_count++;
+                    }
                 } else {
                     // second pass candidates
                     no_pin_objects.push_back(it->second.lease_timeout);
@@ -3595,20 +3783,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 auto it = shard->metadata.begin();
                 while (it != shard->metadata.end() && target_evict_num > 0) {
                     if (!it->second.IsHardPinned() &&
+                        it->second.IsLeaseExpired(now) &&
                         it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
                         can_evict_replicas(it->second)) {
-                        // Evict this object
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
+                        // Evict this object (or defer for offload)
+                        uint64_t freed =
+                            try_evict_or_offload(it->first, it->second, shard);
+                        total_freed_size += freed;
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
-                        evicted_count++;
+                        if (freed > 0) {
+                            evicted_count++;
+                        }
                         target_evict_num--;
                     } else {
                         ++it;
@@ -3648,16 +3838,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // and lease timeout less than or equal to target.
                     if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
+                        // Evict this object (or defer for offload)
+                        uint64_t freed =
+                            try_evict_or_offload(it->first, it->second, shard);
+                        total_freed_size += freed;
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
-                        evicted_count++;
+                        if (freed > 0) {
+                            evicted_count++;
+                        }
                         target_evict_num--;
                     } else {
                         ++it;
@@ -3678,7 +3870,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    if (evicted_count > 0 || released_discarded_cnt > 0) {
+    if (evicted_count > 0 || released_discarded_cnt > 0 ||
+        offload_deferred_count > 0) {
+        // Offload-deferred counts as partial success: work was done (objects
+        // queued for disk offload), so suppress re-triggering until the next
+        // watermark breach or explicit need_eviction_ signal.
         need_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
@@ -3690,7 +3886,27 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_eviction_fail();
     }
     VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+            << ", offload_deferred=" << offload_deferred_count
+            << ", offload_cap_forced=" << offload_cap_forced_count
+            << ", offload_push_failed_forced=" << offload_push_failed_forced
             << ", total_freed_size=" << total_freed_size;
+    if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
+        LOG(WARNING) << "[EVICT] No memory freed this cycle; "
+                     << offload_deferred_count
+                     << " objects deferred for disk offload. "
+                        "Consider lowering eviction_high_watermark_ratio.";
+    }
+    if (offload_cap_forced_count > 0) {
+        LOG(WARNING) << "[EVICT] Offload cap (" << offload_cap
+                     << ") reached; force-evicted " << offload_cap_forced_count
+                     << " object(s) without disk offload this cycle.";
+    }
+    if (offload_push_failed_forced > 0) {
+        LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
+                     << offload_push_failed_forced
+                     << " object(s); force-evicted without disk offload "
+                        "(offload_force_evict=true).";
+    }
 }
 
 void MasterService::ClientMonitorFunc() {
@@ -3767,9 +3983,15 @@ void MasterService::ClientMonitorFunc() {
             }  // Release the mutex before long-running ClearInvalidHandles and
                // avoid deadlocks
 
-            if (!unmount_segments.empty()) {
-                ClearInvalidHandles();
+            // Always clean up invalid handles when there are expired clients,
+            // even if no memory segments were unmounted. This is necessary
+            // to clean up local_disk replicas whose owner client has expired.
+            ClearInvalidHandles();
 
+            // Commit unmount of memory segments and clean up local_disk
+            // segments for expired clients. Both require the exclusive
+            // segment lock.
+            {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
@@ -3778,6 +4000,9 @@ void MasterService::ClientMonitorFunc() {
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_segment";
+                }
+                for (auto& client_id : expired_clients) {
+                    segment_access.UnmountLocalDiskSegment(client_id);
                 }
             }
         }
@@ -4098,7 +4323,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned()));
+                metadata_ptr->IsHardPinned(), metadata_ptr->data_type));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -4113,12 +4338,12 @@ MasterService::MetadataSerializer::SerializeMetadata(
     MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, replicas...,
-    // hard_pinned]
+    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
+    // replicas..., hard_pinned]
 
-    size_t array_size = 8;  // client_id, put_start_time, size, lease_timeout,
+    size_t array_size = 9;  // client_id, put_start_time, size, lease_timeout,
                             // has_soft_pin_timeout, soft_pin_timeout,
-                            // replicas_count + hard_pinned
+                            // replicas_count, data_type, hard_pinned
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -4158,6 +4383,9 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
 
+    // Serialize data_type
+    packer.pack(static_cast<uint8_t>(metadata.data_type));
+
     // Serialize replicas
     for (const auto& replica : metadata.GetAllReplicas()) {
         auto result = Serializer<Replica>::serialize(
@@ -4184,7 +4412,6 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
     // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count
-    // (8th element = hard_pinned is optional for backward compat)
     if (obj.via.array.size < 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -4217,13 +4444,33 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // Array size: 7 + replicas_count (old format) or 8 + replicas_count (new
-    // format with hard_pinned)
-    if (obj.via.array.size != 7 + replicas_count &&
-        obj.via.array.size != 8 + replicas_count) {
+    // Format detection:
+    //   v1: 7 + replicas_count, no data_type or hard_pinned
+    //   v2: 8 + replicas_count, either data_type or trailing hard_pinned
+    //   v3: 9 + replicas_count, data_type plus trailing hard_pinned
+    constexpr uint32_t kOldFieldCount = 7;
+    constexpr uint32_t kOneExtraFieldCount = 8;
+    constexpr uint32_t kCurrentFieldCount = 9;
+    const uint32_t total_elements = obj.via.array.size;
+    const bool is_old_format =
+        (total_elements == kOldFieldCount + replicas_count);
+    const bool is_one_extra_format =
+        (total_elements == kOneExtraFieldCount + replicas_count);
+    const bool is_current_format =
+        (total_elements == kCurrentFieldCount + replicas_count);
+
+    if (!is_current_format && !is_one_extra_format && !is_old_format) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size mismatch"));
+    }
+
+    ObjectDataType data_type = ObjectDataType::UNKNOWN;
+    if (is_current_format) {
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+    } else if (is_one_extra_format &&
+               array[index].type == msgpack::type::POSITIVE_INTEGER) {
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     }
 
     // Deserialize replicas
@@ -4251,7 +4498,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned);
+        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 

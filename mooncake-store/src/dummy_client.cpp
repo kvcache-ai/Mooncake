@@ -7,6 +7,7 @@
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
+#include <chrono>
 #include <cstdlib>
 
 #include "real_client.h"
@@ -23,6 +24,75 @@
 #endif
 
 namespace {
+size_t sum_value_sizes(const std::vector<std::span<const char>>& values) {
+    size_t total = 0;
+    for (const auto& value : values) {
+        total += value.size_bytes();
+    }
+    return total;
+}
+
+size_t sum_sizes(const std::vector<size_t>& sizes) {
+    size_t total = 0;
+    for (size_t size : sizes) {
+        total += size;
+    }
+    return total;
+}
+
+size_t sum_successful_sizes(const std::vector<int>& results,
+                            const std::vector<size_t>& sizes) {
+    size_t total = 0;
+    for (size_t i = 0; i < results.size() && i < sizes.size(); ++i) {
+        if (results[i] == 0) {
+            total += sizes[i];
+        }
+    }
+    return total;
+}
+
+size_t sum_successful_nested_sizes(
+    const std::vector<int>& results,
+    const std::vector<std::vector<size_t>>& nested_sizes) {
+    size_t total = 0;
+    for (size_t i = 0; i < results.size() && i < nested_sizes.size(); ++i) {
+        if (results[i] == 0) {
+            total += sum_sizes(nested_sizes[i]);
+        }
+    }
+    return total;
+}
+
+size_t sum_positive_results(const std::vector<int64_t>& results) {
+    size_t total = 0;
+    for (int64_t result : results) {
+        if (result > 0) {
+            total += static_cast<size_t>(result);
+        }
+    }
+    return total;
+}
+
+size_t sum_positive_results(const std::vector<int>& results) {
+    size_t total = 0;
+    for (int result : results) {
+        if (result > 0) {
+            total += static_cast<size_t>(result);
+        }
+    }
+    return total;
+}
+
+size_t sum_positive_ranges(
+    const std::vector<std::vector<std::vector<int64_t>>>& results) {
+    size_t total = 0;
+    for (const auto& key_rows : results) {
+        for (const auto& row : key_rows) {
+            total += sum_positive_results(row);
+        }
+    }
+    return total;
+}
 
 std::vector<uint64_t> void_ptrs_to_u64(const std::vector<void*>& ptrs) {
     std::vector<uint64_t> out;
@@ -129,7 +199,10 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
         }());
 }
 
-DummyClient::DummyClient() : client_id_(generate_uuid()) {
+DummyClient::DummyClient()
+    : client_id_(generate_uuid()),
+      metrics_(ClientMetric::Create(merge_labels({{"client_mode", "dummy"}}),
+                                    false)) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     // Initialize client pools
@@ -140,6 +213,30 @@ DummyClient::DummyClient() : client_id_(generate_uuid()) {
 }
 
 DummyClient::~DummyClient() { tearDownAll(); }
+
+void DummyClient::ObserveTransferMetric(TransferOperationKind kind,
+                                        const char* op_name, size_t bytes,
+                                        uint64_t latency_us, bool batch) {
+    if (!metrics_) {
+        return;
+    }
+    metrics_->ObserveTransferOperation(kind, op_name, bytes, latency_us);
+    if (kind == TransferOperationKind::kRead) {
+        metrics_->transfer_metric.total_read_bytes.inc(bytes);
+        if (batch) {
+            metrics_->transfer_metric.batch_get_latency_us.observe(latency_us);
+        } else {
+            metrics_->transfer_metric.get_latency_us.observe(latency_us);
+        }
+    } else {
+        metrics_->transfer_metric.total_write_bytes.inc(bytes);
+        if (batch) {
+            metrics_->transfer_metric.batch_put_latency_us.observe(latency_us);
+        } else {
+            metrics_->transfer_metric.put_latency_us.observe(latency_us);
+        }
+    }
+}
 
 ErrorCode DummyClient::connect(const std::string& server_address) {
     ScopedVLogTimer timer(1, "DummyClient::Connect");
@@ -202,8 +299,15 @@ int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
         return 0;
     }
     if (!globalConfig().ascend_use_fabric_mem) {
-        LOG(ERROR) << "Host mem is only supported in fabric mem mode.";
-        return -1;
+        // Host: memfd + mmap (ShmHelper); register with Real like non-agent GPU
+        // path.
+        if (shm->fd < 0) {
+            LOG(ERROR)
+                << "Host POSIX shared memory requires memfd-backed allocation "
+                   "(use ShmHelper::allocate / alloc_from_mem_pool)";
+            return -1;
+        }
+        return register_shm_via_ipc(shm, is_local);
     }
 
     // Fabric host mem shared by vmm
@@ -288,6 +392,8 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
     req.client_id_second = client_id_.second;
     req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm->base_addr);
     req.shm_size = shm->size;
+    req.device_id = globalConfig().ascend_agent_mode ? device_id_
+                                                     : kInvalidPhysicalDeviceId;
     req.is_local_buffer = is_local;
 
     if (ipc_send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
@@ -385,16 +491,16 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         }
         local_buffer_shm->registered = true;
         local_buffer_shm->is_local = true;
+
+        // Best-effort: request hot cache shm from real client
+        if (request_hot_cache_fd() != 0) {
+            LOG(INFO)
+                << "Hot cache shm not available (real client may not have it)";
+        }
     }
 
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
-
-    // Best-effort: request hot cache shm from real client
-    if (request_hot_cache_fd() != 0) {
-        LOG(INFO)
-            << "Hot cache shm not available (real client may not have it)";
-    }
     return 0;
 }
 
@@ -420,6 +526,12 @@ int DummyClient::tearDownAll() {
     }
     connected_.store(false);
     last_ping_healthy_.store(false);
+#if defined(USE_ASCEND_DIRECT)
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_.clear();
+    }
+#endif
     return 0;
 }
 
@@ -436,22 +548,103 @@ int64_t DummyClient::unregister_shm() {
         invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_));
 }
 
+#if defined(USE_ASCEND_DIRECT)
+int DummyClient::register_device_buffer_for_reconnect(void* buffer,
+                                                      size_t size) {
+    const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        auto it = registered_device_buffers_.find(buffer_addr);
+        if (it != registered_device_buffers_.end() && it->second != size) {
+            LOG(ERROR) << "Device buffer size mismatch for tracked buffer, "
+                       << "buffer=" << buffer << ", size=" << size
+                       << ", tracked_size=" << it->second;
+            return -1;
+        }
+    }
+
+    ShmHelper::ShmSegment shm{};
+    shm.base_addr = buffer;
+    shm.size = size;
+    if (register_ascend_shm(&shm, false) != 0) {
+        LOG(ERROR) << "Failed to register device buffer, buffer=" << buffer
+                   << ", size=" << size;
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_[buffer_addr] = size;
+    }
+    return 0;
+}
+
+int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
+    const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        if (registered_device_buffers_.find(buffer_addr) ==
+            registered_device_buffers_.end()) {
+            LOG(ERROR) << "Device buffer is not registered with RealClient";
+            return -1;
+        }
+    }
+
+    auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
+        buffer_addr, client_id_);
+    if (ret.has_value()) {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_.erase(buffer_addr);
+    }
+    return to_py_ret(ret);
+}
+
+std::vector<ShmHelper::ShmSegment> DummyClient::get_registered_device_buffers()
+    const {
+    std::vector<ShmHelper::ShmSegment> device_buffers;
+    std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+    device_buffers.reserve(registered_device_buffers_.size());
+    for (const auto& [buffer_addr, size] : registered_device_buffers_) {
+        ShmHelper::ShmSegment shm{};
+        shm.base_addr = reinterpret_cast<void*>(buffer_addr);
+        shm.size = size;
+        device_buffers.push_back(std::move(shm));
+    }
+    return device_buffers;
+}
+#endif
+
 // Dummy only register buffer within the shared memory region
 int DummyClient::register_buffer(void* buffer, size_t size) {
     if (buffer == nullptr) {
         LOG(ERROR) << "Invalid buffer pointer";
         return -1;
     }
+#if defined(USE_ASCEND_DIRECT)
     if (globalConfig().ascend_agent_mode) {
-        auto shm = std::make_shared<ShmHelper::ShmSegment>();
-        shm->base_addr = buffer;
-        shm->size = size;
-        if (register_ascend_shm(shm.get(), false) != 0) {
-            LOG(ERROR) << "Failed to implicitly register new ascend shm.";
+        aclrtPtrAttributes attributes{};
+        auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
+        if (acl_ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Failed to get pointer attributes, ret=" << acl_ret;
             return -1;
         }
-        return 0;
+        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            return register_device_buffer_for_reconnect(buffer, size);
+        }
+        if (globalConfig().ascend_use_fabric_mem) {
+            auto shm = std::make_shared<ShmHelper::ShmSegment>();
+            shm->base_addr = buffer;
+            shm->size = size;
+            if (register_ascend_shm(shm.get(), false) != 0) {
+                LOG(ERROR) << "Failed to register buffer, buffer=" << buffer
+                           << ", size=" << size;
+                return -1;
+            }
+            return 0;
+        }
+        // non-Fabric Host: same rules as shm
     }
+#endif
     // Find which shm this buffer belongs to
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) {
@@ -490,6 +683,17 @@ int DummyClient::unregister_buffer(void* buffer) {
         return -1;
     }
 
+#if defined(USE_ASCEND_DIRECT)
+    if (globalConfig().ascend_agent_mode) {
+        aclrtPtrAttributes attributes{};
+        auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
+        if (acl_ret == ACL_ERROR_NONE &&
+            attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            return unregister_device_buffer_for_reconnect(buffer);
+        }
+    }
+#endif
+
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) {
         LOG(ERROR) << "Buffer is not in any registered shared memory";
@@ -524,35 +728,40 @@ uint64_t DummyClient::alloc_from_mem_pool(size_t size) {
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
                      const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_dummy_helper, void>(
-        key, value, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::put_dummy_helper>(
+        TransferOperationKind::kWrite, "put", value.size_bytes(), false, key,
+        value, config, client_id_);
 }
 
 int DummyClient::put_batch(const std::vector<std::string>& keys,
                            const std::vector<std::span<const char>>& values,
                            const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_batch_dummy_helper, void>(
-        keys, values, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::put_batch_dummy_helper>(
+        TransferOperationKind::kWrite, "put_batch", sum_value_sizes(values),
+        true, keys, values, config, client_id_);
 }
 
 int DummyClient::put_parts(const std::string& key,
                            std::vector<std::span<const char>> values,
                            const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_parts_dummy_helper, void>(
-        key, values, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::put_parts_dummy_helper>(
+        TransferOperationKind::kWrite, "put_parts", sum_value_sizes(values),
+        false, key, values, config, client_id_);
 }
 
 int DummyClient::upsert(const std::string& key, std::span<const char> value,
                         const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::upsert_dummy_helper, void>(
-        key, value, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::upsert_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert", value.size_bytes(), false, key,
+        value, config, client_id_);
 }
 
 int DummyClient::upsert_from(const std::string& key, void* buffer, size_t size,
                              const ReplicateConfig& config) {
     uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
-    return to_py_ret(invoke_rpc<&RealClient::upsert_from_dummy_helper, void>(
-        key, dummy_addr, size, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::upsert_from_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert_from", size, false, key,
+        dummy_addr, size, config, client_id_);
 }
 
 std::vector<int> DummyClient::batch_upsert_from(
@@ -562,6 +771,7 @@ std::vector<int> DummyClient::batch_upsert_from(
     for (auto ptr : buffer_ptrs) {
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));
     }
+    const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_upsert_from_dummy_helper, void>(
             keys.size(), keys, buffers, sizes, config, client_id_);
@@ -570,21 +780,29 @@ std::vector<int> DummyClient::batch_upsert_from(
     for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
     }
+    const size_t successful_bytes = sum_successful_sizes(results, sizes);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite,
+                              "batch_upsert_from", successful_bytes,
+                              elapsed_us_since(start_time), true);
+    }
     return results;
 }
 
 int DummyClient::upsert_parts(const std::string& key,
                               std::vector<std::span<const char>> values,
                               const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::upsert_parts_dummy_helper, void>(
-        key, values, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::upsert_parts_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert_parts", sum_value_sizes(values),
+        false, key, values, config, client_id_);
 }
 
 int DummyClient::upsert_batch(const std::vector<std::string>& keys,
                               const std::vector<std::span<const char>>& values,
                               const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::upsert_batch_dummy_helper, void>(
-        keys, values, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::upsert_batch_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert_batch", sum_value_sizes(values),
+        true, keys, values, config, client_id_);
 }
 
 int DummyClient::remove(const std::string& key, bool force) {
@@ -650,6 +868,7 @@ int64_t DummyClient::getSize(const std::string& key) {
 }
 
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
+    const auto start_time = std::chrono::steady_clock::now();
     // Try hot cache path if shm is mapped
     if (hot_cache_base_) {
         auto result = invoke_rpc<&RealClient::acquire_hot_cache,
@@ -668,6 +887,8 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
                 (void)invoke_rpc<&RealClient::release_hot_cache, void>(
                     key_copy);
             };
+            ObserveTransferMetric(TransferOperationKind::kRead, "get_buffer",
+                                  size, elapsed_us_since(start_time), false);
             return std::make_shared<BufferHandle>(local_ptr, size,
                                                   std::move(release));
         }
@@ -686,11 +907,14 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
         (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(dummy_addr,
                                                                   client_id_);
     };
+    ObserveTransferMetric(TransferOperationKind::kRead, "get_buffer", size,
+                          elapsed_us_since(start_time), false);
     return std::make_shared<BufferHandle>(local_ptr, size, std::move(release));
 }
 
 std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     const std::vector<std::string>& keys) {
+    const auto start_time = std::chrono::steady_clock::now();
     std::vector<std::shared_ptr<BufferHandle>> results(keys.size(), nullptr);
     if (keys.empty()) return results;
 
@@ -751,19 +975,37 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
             std::make_shared<BufferHandle>(ptr, size, std::move(release));
     }
 
+    size_t total_bytes = 0;
+    for (const auto& result : results) {
+        if (result != nullptr) {
+            total_bytes += result->size();
+        }
+    }
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead, "batch_get_buffer",
+                              total_bytes, elapsed_us_since(start_time), true);
+    }
+
     return results;
 }
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
     uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
+    const auto start_time = std::chrono::steady_clock::now();
     auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
                              tl::expected<int64_t, ErrorCode>>(
         key, buf_addr, 0, 0, size, client_id_);
     if (!result) {
         return static_cast<int64_t>(toInt(result.error()));
     }
-    return to_py_ret(*result);
+    const int64_t bytes_read = to_py_ret(*result);
+    if (bytes_read >= 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead, "get_into",
+                              static_cast<size_t>(bytes_read),
+                              elapsed_us_since(start_time), false);
+    }
+    return bytes_read;
 }
 
 std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
@@ -773,6 +1015,7 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>>& all_sizes) {
     std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
+    const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_rpc<&RealClient::get_into_ranges_shm_helper,
                    std::vector<std::vector<
@@ -786,8 +1029,13 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                                                all_dst_offsets,
                                                internal_results.error());
     }
-
-    return convert_ranged_read_results(internal_results.value());
+    auto results = convert_ranged_read_results(internal_results.value());
+    const size_t total_bytes = sum_positive_ranges(results);
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead, "get_into_ranges",
+                              total_bytes, elapsed_us_since(start_time), true);
+    }
+    return results;
 }
 
 std::string DummyClient::get_hostname() const {
@@ -799,6 +1047,7 @@ std::vector<int> DummyClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
     std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_put_from_dummy_helper, void>(
             keys.size(), keys, buffers, sizes, config, device_id_, client_id_);
@@ -807,6 +1056,13 @@ std::vector<int> DummyClient::batch_put_from(
 
     for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+
+    const size_t successful_bytes = sum_successful_sizes(results, sizes);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite, "batch_put_from",
+                              successful_bytes, elapsed_us_since(start_time),
+                              true);
     }
 
     return results;
@@ -822,6 +1078,7 @@ std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes) {
     std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
             keys.size(), keys, buffers, sizes, device_id_, client_id_);
@@ -830,6 +1087,12 @@ std::vector<int64_t> DummyClient::batch_get_into(
 
     for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+
+    const size_t total_bytes = sum_positive_results(results);
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead, "batch_get_into",
+                              total_bytes, elapsed_us_since(start_time), true);
     }
 
     return results;
@@ -850,6 +1113,7 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const ReplicateConfig& config) {
     std::vector<std::vector<uint64_t>> dummy_nested =
         void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_put_from_multi_buffers_dummy_helper,
                          void>(keys.size(), keys, dummy_nested, all_sizes,
@@ -858,6 +1122,13 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+    const size_t successful_bytes =
+        sum_successful_nested_sizes(results, all_sizes);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite,
+                              "batch_put_from_multi_buffers", successful_bytes,
+                              elapsed_us_since(start_time), true);
     }
     return results;
 }
@@ -869,6 +1140,7 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     bool prefer_alloc_in_same_node) {
     std::vector<std::vector<uint64_t>> dummy_nested =
         void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_multi_buffers_dummy_helper,
                          int64_t>(keys.size(), keys, dummy_nested, all_sizes,
@@ -878,6 +1150,12 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+    const size_t total_bytes = sum_positive_results(results);
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead,
+                              "batch_get_into_multi_buffers", total_bytes,
+                              elapsed_us_since(start_time), true);
     }
     return results;
 }
@@ -970,23 +1248,39 @@ void DummyClient::ping_thread_main() {
                         if (globalConfig().ascend_agent_mode) {
                             if (register_ascend_shm(shm_ptr.get(),
                                                     shm_ptr->is_local) != 0) {
-                                LOG(WARNING) << "Failed to re-register VMM "
-                                                "during reconnection";
-                                all_registered = false;
-                                break;
-                            }
-                        } else {
-                            if (register_shm_via_ipc(shm_ptr.get(),
-                                                     shm_ptr->is_local) != 0) {
                                 LOG(WARNING)
-                                    << "Failed to re-register shared memory "
-                                       "during reconnection";
+                                    << "Failed to re-register Ascend shared "
+                                       "memory during reconnection";
                                 all_registered = false;
                                 break;
                             }
+                        } else if (register_shm_via_ipc(
+                                       shm_ptr.get(), shm_ptr->is_local) != 0) {
+                            LOG(WARNING)
+                                << "Failed to re-register shared memory "
+                                   "during reconnection";
+                            all_registered = false;
+                            break;
                         }
                     }
                 }
+
+#if defined(USE_ASCEND_DIRECT)
+                if (all_registered && globalConfig().ascend_agent_mode) {
+                    auto device_buffers = get_registered_device_buffers();
+                    for (const auto& device_buffer : device_buffers) {
+                        if (register_ascend_shm(&device_buffer, false) != 0) {
+                            LOG(WARNING)
+                                << "Failed to re-register device buffer "
+                                   "during reconnection, buffer="
+                                << device_buffer.base_addr
+                                << ", size=" << device_buffer.size;
+                            all_registered = false;
+                            break;
+                        }
+                    }
+                }
+#endif
 
                 if (all_registered) {
                     LOG(INFO)

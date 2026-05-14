@@ -31,7 +31,7 @@ class UbEndPoint {
 
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
-    UbEndPoint() : status_(INITIALIZING), active_(true) {}
+    UbEndPoint() : inactive_time_(0), active_(true), status_(INITIALIZING) {}
 
     virtual int construct(GlobalConfig& config) = 0;
 

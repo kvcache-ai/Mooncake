@@ -140,6 +140,9 @@ func (s *Store) toCConfig(cfg *ReplicateConfig) (C.mooncake_replicate_config_t, 
 	if cfg.WithSoftPin {
 		cc.with_soft_pin = 1
 	}
+	if cfg.WithHardPin {
+		cc.with_hard_pin = 1
+	}
 
 	if len(cfg.PreferredSegments) > 0 {
 		cSegs = make([]*C.char, len(cfg.PreferredSegments))

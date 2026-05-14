@@ -137,13 +137,17 @@ pip install mooncake-transfer-engine-non-cuda
     make -j
     ```
 
-5. If you want to compile MetaX (Muxi) MACA support (e.g. C500), install the MACA SDK so headers and libraries are available under `MACA_HOME` (default `/opt/maca` if unset). SDK layouts vary; CMake adds both `${MACA_HOME}/lib` and `${MACA_HOME}/lib64` to the link search path, so include both in the environment when linking or running binaries:
+5. If you want to compile MetaX (Muxi) MACA support (e.g. C500), install the MACA SDK so headers and libraries are available under `MACA_ROOT` (defaults to `MACA_HOME` env var if set, otherwise `/opt/maca`). SDK layouts vary; include both `lib` and `lib64` in runtime paths when needed:
     ```bash
     export MACA_HOME=/opt/maca
     export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     ```
-    Build with `-DUSE_MACA=ON`. To override which libraries are linked to `transfer_engine`, pass a CMake list at configure time, e.g. `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated). This variable is read in `mooncake-transfer-engine/src/CMakeLists.txt` under `if(USE_MACA)`, not in `mooncake-common/common.cmake`.
+    Build with `-DUSE_MACA=ON`. Optional overrides:
+    - `-DMACA_ROOT=/path/to/maca`
+    - `-DMACA_INCLUDE_DIR=/path/to/maca/include`
+    - `-DMACA_LIB_DIR=/path/to/maca/lib64`
+    - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated CMake list)
 
 6. Install yalantinglibs
     ```bash
@@ -169,23 +173,60 @@ pip install mooncake-transfer-engine-non-cuda
    ```
 
 ## Use Mooncake in Docker Containers
-Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
+Mooncake supports Docker-based deployment. You can either build the image from
+this repository with `docker/mooncake.Dockerfile` or substitute a published
+tag that matches the release you want to run.
 For the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
 
 ```
 # In host
-sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:v0.9.0 /bin/bash
+sudo docker build -f docker/mooncake.Dockerfile -t mooncake:from-source .
+sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:from-source /bin/bash
 # Run transfer engine in container
 cd /Mooncake-main/build/mooncake-transfer-engine/example
 ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
 ```
+
+For SGLang HiCache deployments inside Docker, reserve HugeTLB pages on the host before starting the container and pass the allocator settings through the container environment:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+
+sudo docker run --gpus all \
+  --net=host \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --shm-size=128g \
+  --device=/dev/infiniband/uverbs0 \
+  --device=/dev/infiniband/rdma_cm \
+  -e MC_STORE_USE_HUGEPAGE=1 \
+  -e MC_STORE_HUGEPAGE_SIZE=2MB \
+  -e MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb \
+  -e MC_MMAP_ARENA_POOL_SIZE=56gb \
+  -t -i mooncake:from-source /bin/bash
+```
+
+The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not defaults. The arena remains disabled unless you explicitly enable it, and if you enable it via gflag without an env override the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. When you want the baseline direct-`mmap()` path instead of the arena, set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) and omit `MC_MMAP_ARENA_POOL_SIZE`. Set it before the first Mooncake mmap-buffer allocation in the process. If you build the image from source with `docker/mooncake.Dockerfile`, that source-built image also installs the helper as `mooncake-hicache-sizing`.
+Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is set, both the arena path and the direct-`mmap()` fallback path require HugeTLB pages. Mooncake will not silently degrade that explicit hugepage request to regular pages.
 
 ## Advanced Compile Options
 The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU memory support (GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport). **Default: OFF.** Required when transferring GPU memory (e.g., KV cache in vLLM disaggregated serving), even when using TCP protocol.
 - `-DUSE_MNNVL=[ON|OFF]`: Enable Multi-Node NVLink transport support, default is OFF. **Note:** `-DUSE_CUDA` is required when `-DUSE_MNNVL` is on (not used when building with `-DUSE_MUSA=ON`, `-DUSE_HIP=ON`, or `-DUSE_MACA=ON`).
 - `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
-- `-DUSE_MACA=[ON|OFF]`: Enable MetaX (Muxi) GPU support via MACA. Use `MACA_HOME` for the SDK root (default `/opt/maca`). Optional: `-DMACA_RUNTIME_LIBS` (CMake list) overrides default `mcruntime;mxc-runtime64;rt` for `transfer_engine` in `mooncake-transfer-engine/src/CMakeLists.txt`.
+- `-DUSE_MACA=[ON|OFF]`: Enable MetaX (Muxi) GPU support via MACA.
+- `-DMACA_ROOT=/path/to/maca`: Override the MACA SDK root (`MACA_HOME` env var is also honored; default `/opt/maca`).
+- `-DMACA_INCLUDE_DIR=/path/to/include`: Override MACA include directory when `-DUSE_MACA=ON`.
+- `-DMACA_LIB_DIR=/path/to/lib64`: Override MACA library directory when `-DUSE_MACA=ON`.
+- `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`: Override MACA runtime libraries linked by `transfer_engine`.
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
 - `-DUSE_MLU=[ON|OFF]`: Enable Cambricon MLU memory support via Neuware. **Default: OFF.** Supports MLU memory detection, topology discovery, and RDMA registration for Transfer Engine.
 - `-DNEUWARE_ROOT=/path/to/neuware`: Override the default Neuware SDK root used when `-DUSE_MLU=ON`. If unset, Mooncake uses `NEUWARE_HOME` or `/usr/local/neuware`.

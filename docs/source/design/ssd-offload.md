@@ -154,7 +154,7 @@ A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space wi
 
 ## Eviction (BucketStorageBackend)
 
-When `MOONCAKE_BUCKET_MAX_TOTAL_SIZE` is set, the backend evicts existing buckets to make room before writing a new one. Eviction is disabled by default (`BucketEvictionPolicy::NONE`).
+When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend evicts existing buckets to make room before writing a new one. Eviction is disabled by default (`BucketEvictionPolicy::NONE`).
 
 ### Policies
 
@@ -195,7 +195,7 @@ This ordering guarantees:
 
 ## io_uring File I/O
 
-When `MOONCAKE_USE_URING=true`, the storage backends replace POSIX `pread`/`pwrite` calls with an io_uring-based implementation (`UringFile`). The design prioritizes eliminating inter-thread lock contention, which was the dominant latency source in the previous global-ring approach.
+When `MOONCAKE_OFFLOAD_USE_URING=true`, the storage backends replace POSIX `pread`/`pwrite` calls with an io_uring-based implementation (`UringFile`). The design prioritizes eliminating inter-thread lock contention, which was the dominant latency source in the previous global-ring approach.
 
 ### Thread-local rings (`SharedUringRing`)
 

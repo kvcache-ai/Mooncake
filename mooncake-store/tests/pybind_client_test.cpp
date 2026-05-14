@@ -2,10 +2,16 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <memory>
-#include <string>
-#include <random>
 #include <barrier>
+#include <chrono>
+#include <cstdio>
+#include <fcntl.h>
+#include <limits>
+#include <memory>
+#include <random>
+#include <string>
+#include <thread>
+#include <unistd.h>
 
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -63,7 +69,120 @@ class RealClientTest : public ::testing::Test {
     // In-proc master for tests
     mooncake::testing::InProcMaster master_;
     std::string master_address_;
+
+    void StartMasterAndSetupClient() {
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+            << "Failed to start in-proc master";
+        master_address_ = master_.master_address();
+
+        const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                             ? FLAGS_device_name
+                                             : std::string("");
+        ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                         16 * 1024 * 1024, 16 * 1024 * 1024,
+                                         FLAGS_protocol, rdma_devices,
+                                         master_address_),
+                  0);
+    }
+
+    std::string CreateTempSegmentFile(size_t size) {
+        std::string path = "/tmp/mooncake_real_client_segment_XXXXXX";
+        int fd = mkstemp(path.data());
+        EXPECT_GE(fd, 0) << "Failed to create temp segment file";
+        if (fd < 0) {
+            return "";
+        }
+        EXPECT_EQ(ftruncate(fd, size), 0)
+            << "Failed to resize temp segment file";
+        close(fd);
+        return path;
+    }
 };
+
+TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
+    StartMasterAndSetupClient();
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+
+    ASSERT_EQ(py_client_->allocateAndMountSegment(1, FLAGS_protocol, "",
+                                                  segment_ids, &allocated_size),
+              0);
+    EXPECT_EQ(allocated_size, slab_size);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+
+    segment_ids.clear();
+    allocated_size = 0;
+    ASSERT_EQ(
+        py_client_->allocateAndMountSegment(slab_size + 1, FLAGS_protocol, "",
+                                            segment_ids, &allocated_size),
+        0);
+    EXPECT_EQ(allocated_size, slab_size * 2);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
+    StartMasterAndSetupClient();
+
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+
+    EXPECT_NE(py_client_->allocateAndMountSegment(
+                  std::numeric_limits<size_t>::max(), FLAGS_protocol, "",
+                  segment_ids, &allocated_size),
+              0);
+    EXPECT_TRUE(segment_ids.empty());
+    EXPECT_EQ(allocated_size, 0);
+}
+
+TEST_F(RealClientTest, AllocateAndMountSegmentFreesOnTearDown) {
+    StartMasterAndSetupClient();
+
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(1, FLAGS_protocol, "",
+                                                  segment_ids, &allocated_size),
+              0);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_GT(allocated_size, 0);
+
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+
+    GLogMuter muter;
+    EXPECT_NE(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, MountAndAllocateUnmountApisRejectForeignSegments) {
+    StartMasterAndSetupClient();
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    std::vector<std::string> allocated_segment_ids;
+    size_t allocated_size = 0;
+
+    ASSERT_EQ(
+        py_client_->allocateAndMountSegment(
+            1, FLAGS_protocol, "", allocated_segment_ids, &allocated_size),
+        0);
+    ASSERT_FALSE(allocated_segment_ids.empty());
+    EXPECT_NE(py_client_->unmountSegment(allocated_segment_ids), 0);
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_segment_ids), 0);
+
+    std::string path = CreateTempSegmentFile(slab_size);
+    ASSERT_FALSE(path.empty());
+
+    std::vector<std::string> mounted_segment_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, slab_size, FLAGS_protocol, "",
+                                       mounted_segment_ids),
+              0);
+    ASSERT_FALSE(mounted_segment_ids.empty());
+    EXPECT_NE(py_client_->unmountAndFreeSegment(mounted_segment_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_segment_ids), 0);
+
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
 
 // Test basic Put and Get operations
 TEST_F(RealClientTest, BasicPutGetOperations) {
@@ -694,16 +813,31 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     config.preferred_segment = client1_addr;
     ASSERT_EQ(py_client_->put(key, data_span, config), 0);
 
+    auto wait_for_task = [this](const UUID& task_id) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto query_res = py_client_->query_task(task_id);
+            if (query_res.has_value() &&
+                is_finished_status(query_res->status)) {
+                return query_res;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return py_client_->query_task(task_id);
+    };
+
     // Test create copy task from client 1 to client 2
     auto copy_res = py_client_->create_copy_task(key, {client2_addr});
     ASSERT_TRUE(copy_res.has_value()) << "Copy should return a task ID";
     UUID copy_task_id = copy_res.value();
 
-    // Query Copy Task
-    auto query_copy_res = py_client_->query_task(copy_task_id);
+    auto query_copy_res = wait_for_task(copy_task_id);
     ASSERT_TRUE(query_copy_res.has_value()) << "QueryTask should succeed";
     EXPECT_EQ(query_copy_res->id, copy_task_id);
     EXPECT_EQ(query_copy_res->type, TaskType::REPLICA_COPY);
+    EXPECT_EQ(query_copy_res->status, TaskStatus::SUCCESS)
+        << query_copy_res->message;
 
     // Test create move task from client 1 to client 2
     auto move_res =
@@ -711,11 +845,12 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     ASSERT_TRUE(move_res.has_value()) << "Move should return a task ID";
     UUID move_task_id = move_res.value();
 
-    // Query Move Task
-    auto query_move_res = py_client_->query_task(move_task_id);
+    auto query_move_res = wait_for_task(move_task_id);
     ASSERT_TRUE(query_move_res.has_value()) << "QueryTask should succeed";
     EXPECT_EQ(query_move_res->id, move_task_id);
     EXPECT_EQ(query_move_res->type, TaskType::REPLICA_MOVE);
+    EXPECT_EQ(query_move_res->status, TaskStatus::SUCCESS)
+        << query_move_res->message;
 
     py_client2->tearDownAll();
 }

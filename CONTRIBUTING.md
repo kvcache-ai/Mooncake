@@ -41,6 +41,7 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 | Type | Tool | Purpose |
 |------|------|---------|
 | Generic | trailing-whitespace / end-of-file-fixer | Basic hygiene |
+| Project | `./scripts/code_format.sh` | Enforce Mooncake C/C++ formatting script before commit |
 | Python | ruff / ruff-format | Lint + format (includes import sorting) |
 | Spelling | codespell | Catch common typos (ignores domain-specific words) |
 | C/C++ | clang-format | Apply style from the repository's `.clang-format` |
@@ -52,6 +53,8 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 pip install -r requirements-dev.txt
 pre-commit install
 ```
+
+After installation, every commit will run `./scripts/code_format.sh` automatically. If it rewrites files, re-stage the changes and commit again.
 
 #### Usage
 Run on all files (first run will install hook environments):

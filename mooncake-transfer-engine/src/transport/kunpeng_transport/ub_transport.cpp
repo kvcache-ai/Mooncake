@@ -19,7 +19,7 @@
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_transport.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
-#include "transport/kunpeng_transport/urma_endpoint.h"
+#include "transport/kunpeng_transport/urma/urma_endpoint.h"
 
 namespace mooncake {
 UbTransport::UbTransport(UB_ENDPOINT_TYPE endpoint_type)
@@ -431,24 +431,40 @@ int UbTransport::initializeUbResources(UbTransport* t) {
         LOG(ERROR) << "Failed to init, ret = " << ret;
         return -1;
     }
-    auto hca_list = t->local_topology_->getHcaList();
+
+    std::vector<std::string> hca_list;
+    // Try to get device list from topology
+    if (t->local_topology_) {
+        hca_list = t->local_topology_->getHcaList();
+    }
+
+    // If no devices from topology, use mock device
+    if (hca_list.empty()) {
+        hca_list.push_back("mock_urma_device");
+        LOG(INFO) << "Using mock_urma_device for testing";
+    }
+
     for (auto& device_name : hca_list) {
         auto& config = globalConfig();
         auto max_endpoints = config.max_ep_per_ctx;
         auto context = buildContext(t, device_name, max_endpoints);
         ret = context->doConstruct(config);
         if (ret) {
-            t->local_topology_->disableDevice(device_name);
+            if (t->local_topology_) {
+                t->local_topology_->disableDevice(device_name);
+            }
             LOG(WARNING) << "Disable device " << device_name;
         } else {
             t->context_list_.push_back(context);
             LOG(INFO) << "device " << context->deviceName() << " add to list";
         }
     }
-    if (t->local_topology_->empty()) {
+
+    if (t->context_list_.empty()) {
         LOG(ERROR) << "UbTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
+
     LOG(INFO) << "ub resources init success";
     return 0;
 }

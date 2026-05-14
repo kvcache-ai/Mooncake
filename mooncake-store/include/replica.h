@@ -2,9 +2,12 @@
 
 #include <glog/logging.h>
 
+#include <boost/functional/hash.hpp>
+
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 #include <unordered_map>
@@ -90,6 +93,7 @@ struct ReplicateConfig {
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -107,7 +111,8 @@ struct ReplicateConfig {
                << config.preferred_segment;
         }
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node << " }";
+           << config.prefer_alloc_in_same_node
+           << ", data_type: " << config.data_type << " }";
         return os;
     }
 };
@@ -166,17 +171,25 @@ class Replica {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
+    // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
             std::string transport_endpoint, ReplicaStatus status)
-        : data_(LocalDiskReplicaData{client_id, object_size,
+        : id_(next_id_.fetch_add(1)),
+          data_(LocalDiskReplicaData{client_id, object_size,
                                      std::move(transport_endpoint)}),
-          status_(status) {}
+          status_(status),
+          refcnt_(0) {
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
 
     ~Replica() {
-        if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
-            const auto& disk_data = std::get<DiskReplicaData>(data_);
+        if (status_ == ReplicaStatus::UNDEFINED) return;
+        if (is_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
-                disk_data.object_size);
+                std::get<DiskReplicaData>(data_).object_size);
+        } else if (is_local_disk_replica()) {
+            MasterMetricManager::instance().dec_allocated_file_size(
+                std::get<LocalDiskReplicaData>(data_).object_size);
         }
     }
 
@@ -202,10 +215,14 @@ class Replica {
         }
 
         // Decrement metric for the current object before overwriting.
-        if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
-            const auto& disk_data = std::get<DiskReplicaData>(data_);
-            MasterMetricManager::instance().dec_allocated_file_size(
-                disk_data.object_size);
+        if (status_ != ReplicaStatus::UNDEFINED) {
+            if (is_disk_replica()) {
+                MasterMetricManager::instance().dec_allocated_file_size(
+                    std::get<DiskReplicaData>(data_).object_size);
+            } else if (is_local_disk_replica()) {
+                MasterMetricManager::instance().dec_allocated_file_size(
+                    std::get<LocalDiskReplicaData>(data_).object_size);
+            }
         }
 
         id_ = src.id_;
@@ -280,6 +297,36 @@ class Replica {
             return !mem_data.buffer->isAllocatorValid();
         }
         return false;  // DiskReplicaData does not have handles
+    }
+
+    /**
+     * @brief Check if a local_disk replica's owner client is still alive.
+     * Used by CleanupStaleHandles to remove replicas belonging to expired
+     * clients. For non-local_disk replicas, always returns false.
+     * @param alive_clients Set of currently alive client IDs.
+     * @return true if this is a local_disk replica whose client is not alive.
+     */
+    [[nodiscard]] bool has_stale_local_disk_client(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients)
+        const {
+        auto client_id = get_local_disk_client_id();
+        if (client_id.has_value()) {
+            return alive_clients.find(client_id.value()) == alive_clients.end();
+        }
+        return false;
+    }
+
+    /**
+     * @brief Get the client_id for local_disk replicas.
+     * @return The client_id if this is a local_disk replica, std::nullopt
+     * otherwise.
+     */
+    [[nodiscard]] std::optional<UUID> get_local_disk_client_id() const {
+        if (is_local_disk_replica()) {
+            const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+            return disk_data.client_id;
+        }
+        return std::nullopt;
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {

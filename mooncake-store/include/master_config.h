@@ -81,6 +81,10 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+
+    // Offload-on-evict: defer LOCAL_DISK offload to eviction time
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
 };
 
 class MasterServiceSupervisorConfig {
@@ -140,6 +144,8 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -155,6 +161,8 @@ class MasterServiceSupervisorConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -267,6 +275,8 @@ class WrappedMasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -322,6 +332,8 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         if (ha_backend_connstring.empty()) {
@@ -400,6 +412,8 @@ class WrappedMasterServiceConfig {
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         if (ha_backend_connstring.empty()) {
@@ -736,6 +750,8 @@ class MasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -787,6 +803,8 @@ class MasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;

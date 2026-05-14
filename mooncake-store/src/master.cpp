@@ -109,6 +109,10 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
 DEFINE_bool(enable_ha, false,
             "Enable high availability, which depends on etcd");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DEFINE_bool(offload_on_evict, false,
+            "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
+DEFINE_bool(offload_force_evict, false,
+            "Force-evict objects exceeding offload cap without disk offload");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -293,6 +297,11 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_ha);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
+    default_config.GetBool("offload_on_evict", &master_config.offload_on_evict,
+                           FLAGS_offload_on_evict);
+    default_config.GetBool("offload_force_evict",
+                           &master_config.offload_force_evict,
+                           FLAGS_offload_force_evict);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",
@@ -867,6 +876,8 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_offload=" << master_config.enable_offload
+        << ", offload_on_evict=" << master_config.offload_on_evict
+        << ", offload_force_evict=" << master_config.offload_force_evict
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints

@@ -54,7 +54,8 @@ bool ShmHelper::cleanup() {
         }
         if (shm->base_addr) {
 #if defined(USE_ASCEND_DIRECT)
-            if (globalConfig().ascend_agent_mode) {
+            if (globalConfig().ascend_agent_mode &&
+                globalConfig().ascend_use_fabric_mem) {
                 free_memory("ascend", shm->base_addr);
                 continue;
             }
@@ -73,22 +74,28 @@ bool ShmHelper::cleanup() {
 
 void* ShmHelper::allocate(size_t size) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
+    // Dummy-real: FabricMem host uses VMM; non-Fabric host uses memfd+mmap like
+    // non-agent / GPU shm path.
 #ifdef USE_ASCEND_DIRECT
     if (globalConfig().ascend_agent_mode) {
-        void* base_addr = nullptr;
-        size_t alloc_size = size;
-        base_addr = ascend_allocate_vmm_memory_direct(alloc_size);
-        if (base_addr == nullptr) {
-            throw std::runtime_error("Failed to allocate VMM shared memory");
+        if (globalConfig().ascend_use_fabric_mem) {
+            void* base_addr = nullptr;
+            size_t alloc_size = size;
+            base_addr = ascend_allocate_vmm_memory_direct(alloc_size);
+            if (base_addr == nullptr) {
+                throw std::runtime_error(
+                    "Failed to allocate VMM shared memory");
+            }
+            auto shm = std::make_shared<ShmSegment>();
+            shm->fd = -1;
+            shm->base_addr = base_addr;
+            shm->size = alloc_size;
+            shm->name = MOONCAKE_SHM_NAME;
+            shm->registered = false;
+            shms_.push_back(shm);
+            return base_addr;
         }
-        auto shm = std::make_shared<ShmSegment>();
-        shm->fd = -1;
-        shm->base_addr = base_addr;
-        shm->size = alloc_size;
-        shm->name = MOONCAKE_SHM_NAME;
-        shm->registered = false;
-        shms_.push_back(shm);
-        return base_addr;
+        // ascend_agent_mode && !ascend_use_fabric_mem: fall through to memfd
     }
 #endif
 
@@ -142,7 +149,8 @@ int ShmHelper::free(void* addr) {
             }
             if ((*it)->base_addr) {
 #if defined(USE_ASCEND_DIRECT)
-                if (globalConfig().ascend_agent_mode) {
+                if (globalConfig().ascend_agent_mode &&
+                    globalConfig().ascend_use_fabric_mem) {
                     free_memory("ascend", (*it)->base_addr);
                 } else
 #endif
