@@ -34,6 +34,7 @@ fi
 EXT_LDFLAGS="-L$BUILD_DIR/mooncake-transfer-engine/src"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/common/base"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common"
+EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/src"
 EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -lmooncake_common"
 
 if [ -d "/usr/local/cuda/lib64/stubs" ]; then
