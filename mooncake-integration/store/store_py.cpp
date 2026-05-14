@@ -1878,6 +1878,10 @@ RegisteredBufferPoolNative::RegisteredBufferPoolNative(
         throw std::runtime_error(
             "min_size_class and alignment must be positive");
     }
+    if (alignment_ < sizeof(void *) || (alignment_ & (alignment_ - 1)) != 0) {
+        throw std::runtime_error(
+            "alignment must be a power of two and at least sizeof(void*)");
+    }
     max_size_class_ = std::min(max_size_class_, max_bytes_);
     if (!default_timeout.is_none()) {
         default_timeout_ = default_timeout.cast<double>();
@@ -1933,6 +1937,7 @@ void RegisteredBufferPoolNative::prewarm(size_t size, size_t count) {
     if (oversize) {
         throw std::runtime_error("cannot prewarm oversize buffers");
     }
+    py::gil_scoped_release release_gil;
     for (size_t i = 0; i < count; ++i) {
         std::unique_lock<std::mutex> lock(mutex_);
         raise_if_open_locked();
@@ -2065,9 +2070,10 @@ RegisteredBufferPoolNative::allocate_region_locked(
     int ret = 0;
     auto start = std::chrono::steady_clock::now();
     try {
-        auto data = std::shared_ptr<char[]>(new char[size_class],
-                                            std::default_delete<char[]>());
-        ptr = data.get();
+        if (posix_memalign(&ptr, alignment_, size_class) != 0) {
+            throw std::bad_alloc();
+        }
+        auto data = std::shared_ptr<void>(ptr, std::free);
         handle = std::make_shared<BufferHandle>(
             ptr, size_class,
             [data = std::move(data)]() mutable { data.reset(); });

@@ -57,6 +57,24 @@ def test_registered_buffer_pool_prewarm_and_close() -> None:
     pool.close()
 
 
+def test_registered_buffer_pool_returns_aligned_buffers() -> None:
+    store = create_store()
+    pool = RegisteredBufferPool(
+        store, 1024 * 1024, min_size_class=4096, alignment=65536
+    )
+
+    lease = pool.acquire(1024)
+    assert lease.ptr % 65536 == 0
+    lease.release()
+    pool.close()
+
+
+def test_registered_buffer_pool_rejects_invalid_alignment() -> None:
+    store = create_store()
+    with pytest.raises(RuntimeError, match="alignment"):
+        RegisteredBufferPool(store, 1024 * 1024, alignment=12345)
+
+
 @pytest.mark.parametrize("size", [0, 1, 128 * 1024 + 1])
 def test_registered_buffer_pool_supports_arbitrary_sizes(size: int) -> None:
     store = create_store()
