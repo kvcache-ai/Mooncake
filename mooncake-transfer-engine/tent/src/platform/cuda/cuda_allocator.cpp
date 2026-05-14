@@ -56,13 +56,24 @@ Status CudaPlatform::free(void* ptr, size_t size) {
     return Status::OK();
 }
 
+// Define USE_CU_MEMCPY to use direction-aware CUDA Driver API functions
+// (supports all directions: H2D, D2H, D2D, H2H, avoids stream deadlocks)
+// If not defined, uses the original cudaMemcpyAsync + stream approach
+#define USE_CU_MEMCPY
+
 Status CudaPlatform::copy(void* dst, void* src, size_t length) {
-    // Use cuMemcpy from CUDA Driver API instead of Runtime API.
-    // This avoids synchronization issues with the legacy default stream
-    // that can cause deadlocks in downstream components (e.g. mooncake-pg).
-    // cuMemcpy is synchronous but doesn't rely on the default stream,
-    // providing better performance than cudaMemcpy and avoiding the
-    // cudaStreamSynchronize deadlocks of cudaMemcpyAsync.
+#ifdef USE_CU_MEMCPY
+    // Use direction-aware CUDA Driver API functions to support all transfer
+    // directions (H2D, D2H, D2D, H2H) while avoiding deadlock issues.
+    // These synchronous functions avoid both:
+    // - cudaMemcpy() deadlock (legacy default stream dependency)
+    // - cudaMemcpyAsync + cudaStreamSynchronize deadlock
+    //
+    // Direction-aware functions:
+    // - cuMemcpyHtoD: Host to Device (synchronous, no stream dependency)
+    // - cuMemcpyDtoH: Device to Host (synchronous, no stream dependency)
+    // - cuMemcpyDtoD: Device to Device (synchronous, no stream dependency)
+    // - memcpy: Host to Host (standard CPU copy)
 
     // Ensure CUDA Driver API is initialized (idempotent)
     static CUresult init_result = cuInit(0);
@@ -73,14 +84,58 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
             std::string("CUDA Driver API init failed: ") + error_str);
     }
 
-    CUresult result = cuMemcpy((CUdeviceptr)dst, (CUdeviceptr)src, length);
+    // Detect pointer types to determine transfer direction
+    cudaPointerAttributes src_attr, dst_attr;
+    CUresult result;
+
+    // Get source pointer attributes
+    cudaError_t cuda_err = cudaPointerGetAttributes(&src_attr, src);
+    bool src_is_device =
+        (cuda_err == cudaSuccess) && (src_attr.type == cudaMemoryTypeDevice);
+
+    // Get destination pointer attributes
+    cuda_err = cudaPointerGetAttributes(&dst_attr, dst);
+    bool dst_is_device =
+        (cuda_err == cudaSuccess) && (dst_attr.type == cudaMemoryTypeDevice);
+
+    // Select appropriate transfer function based on direction
+    if (src_is_device && dst_is_device) {
+        // Device to Device
+        result = cuMemcpyDtoD((CUdeviceptr)dst, (CUdeviceptr)src, length);
+    } else if (src_is_device && !dst_is_device) {
+        // Device to Host
+        result = cuMemcpyDtoH(dst, (CUdeviceptr)src, length);
+    } else if (!src_is_device && dst_is_device) {
+        // Host to Device
+        result = cuMemcpyHtoD((CUdeviceptr)dst, src, length);
+    } else {
+        // Host to Host - use standard CPU memcpy
+        memcpy(dst, src, length);
+        return Status::OK();
+    }
+
     if (result != CUDA_SUCCESS) {
         const char* error_str = nullptr;
         cuGetErrorString(result, &error_str);
-        return Status::InternalError(
-            std::string("cuMemcpy failed: ") + error_str);
+        return Status::InternalError(std::string("CUDA memcpy failed: ") +
+                                     error_str);
     }
+
     return Status::OK();
+
+#else  // Original implementation using cudaMemcpyAsync
+    // Use cudaMemcpyAsync with a non-blocking stream instead of cudaMemcpy(),
+    // as the latter relies on the legacy default stream and can introduce
+    // unintended synchronization or even deadlocks in downstream
+    // components (e.g. mooncake-pg).
+
+    CUDAStreamHandle stream;
+    CHECK_STATUS(getStreamFromPool(stream));
+    CHECK_CUDA(
+        cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
+    CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+    return Status::OK();
+#endif
 }
 }  // namespace tent
 }  // namespace mooncake
