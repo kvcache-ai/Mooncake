@@ -318,14 +318,14 @@ class RegisteredBufferLeaseViewNative {
 class RegisteredBufferLeaseNative
     : public std::enable_shared_from_this<RegisteredBufferLeaseNative> {
    public:
-    RegisteredBufferLeaseNative(std::shared_ptr<RegisteredBufferPoolNative> pool,
-                                std::shared_ptr<BufferHandle> handle,
-                                size_t requested_size);
+    RegisteredBufferLeaseNative(
+        std::shared_ptr<RegisteredBufferPoolNative> pool,
+        std::shared_ptr<BufferHandle> handle, size_t requested_size);
     ~RegisteredBufferLeaseNative();
 
     RegisteredBufferLeaseNative(const RegisteredBufferLeaseNative &) = delete;
-    RegisteredBufferLeaseNative &operator=(const RegisteredBufferLeaseNative &) =
-        delete;
+    RegisteredBufferLeaseNative &operator=(
+        const RegisteredBufferLeaseNative &) = delete;
 
     uintptr_t ptr() const;
     size_t size() const { return requested_size_; }
@@ -353,8 +353,7 @@ class RegisteredBufferPoolNative
     : public std::enable_shared_from_this<RegisteredBufferPoolNative> {
    public:
     RegisteredBufferPoolNative(MooncakeStorePyWrapper &store, size_t max_bytes,
-                               size_t min_size_class,
-                               py::object max_size_class,
+                               size_t min_size_class, py::object max_size_class,
                                size_t alignment, bool block_on_exhaustion,
                                py::object default_timeout,
                                py::object max_regions);
@@ -365,8 +364,9 @@ class RegisteredBufferPoolNative
         }
     }
 
-    std::shared_ptr<RegisteredBufferLeaseNative> acquire(
-        size_t size, py::object block, py::object timeout);
+    std::shared_ptr<RegisteredBufferLeaseNative> acquire(size_t size,
+                                                         py::object block,
+                                                         py::object timeout);
     std::shared_ptr<RegisteredBufferLeaseNative> buffer(size_t size,
                                                         py::object block,
                                                         py::object timeout) {
@@ -385,8 +385,8 @@ class RegisteredBufferPoolNative
 
     std::shared_ptr<RegisteredBufferLeaseNative> make_lease_locked(
         Region region, size_t requested_size);
-    std::optional<Region> try_acquire_locked(
-        std::unique_lock<std::mutex> &lock, size_t requested_size);
+    std::optional<Region> try_acquire_locked(std::unique_lock<std::mutex> &lock,
+                                             size_t requested_size);
     Region allocate_region_locked(std::unique_lock<std::mutex> &lock,
                                   size_t size_class);
     void release_internal(const std::shared_ptr<BufferHandle> &handle);
@@ -1802,7 +1802,9 @@ py::buffer_info RegisteredBufferLeaseViewNative::buffer_info() {
 RegisteredBufferLeaseNative::RegisteredBufferLeaseNative(
     std::shared_ptr<RegisteredBufferPoolNative> pool,
     std::shared_ptr<BufferHandle> handle, size_t requested_size)
-    : pool_(pool), handle_(std::move(handle)), requested_size_(requested_size) {}
+    : pool_(pool),
+      handle_(std::move(handle)),
+      requested_size_(requested_size) {}
 
 RegisteredBufferLeaseNative::~RegisteredBufferLeaseNative() {
     try {
@@ -1837,15 +1839,13 @@ void RegisteredBufferLeaseNative::release_export() {
     exports_.fetch_sub(1, std::memory_order_relaxed);
 }
 
-void RegisteredBufferLeaseNative::release() {
-    release_lease(true);
-}
+void RegisteredBufferLeaseNative::release() { release_lease(true); }
 
 void RegisteredBufferLeaseNative::release_lease(bool check_exported_views) {
     if (closed_) return;
-    if (check_exported_views &&
-        exports_.load(std::memory_order_acquire) != 0) {
-        throw std::runtime_error("cannot release registered buffer while exported views exist");
+    if (check_exported_views && exports_.load(std::memory_order_acquire) != 0) {
+        throw std::runtime_error(
+            "cannot release registered buffer while exported views exist");
     }
     auto handle = handle_;
     auto pool = pool_;
@@ -1864,9 +1864,8 @@ RegisteredBufferPoolNative::RegisteredBufferPoolNative(
     : store_(store.store_),
       max_bytes_(max_bytes),
       min_size_class_(min_size_class),
-      max_size_class_(max_size_class.is_none()
-                          ? max_bytes
-                          : max_size_class.cast<size_t>()),
+      max_size_class_(max_size_class.is_none() ? max_bytes
+                                               : max_size_class.cast<size_t>()),
       alignment_(alignment),
       block_on_exhaustion_(block_on_exhaustion) {
     if (!store_) {
@@ -1876,7 +1875,8 @@ RegisteredBufferPoolNative::RegisteredBufferPoolNative(
         throw std::runtime_error("max_bytes must be positive");
     }
     if (min_size_class_ == 0 || alignment_ == 0) {
-        throw std::runtime_error("min_size_class and alignment must be positive");
+        throw std::runtime_error(
+            "min_size_class and alignment must be positive");
     }
     max_size_class_ = std::min(max_size_class_, max_bytes_);
     if (!default_timeout.is_none()) {
@@ -1887,9 +1887,11 @@ RegisteredBufferPoolNative::RegisteredBufferPoolNative(
     }
 }
 
-std::shared_ptr<RegisteredBufferLeaseNative> RegisteredBufferPoolNative::acquire(
-    size_t size, py::object block, py::object timeout) {
-    bool should_block = block.is_none() ? block_on_exhaustion_ : block.cast<bool>();
+std::shared_ptr<RegisteredBufferLeaseNative>
+RegisteredBufferPoolNative::acquire(size_t size, py::object block,
+                                    py::object timeout) {
+    bool should_block =
+        block.is_none() ? block_on_exhaustion_ : block.cast<bool>();
     std::optional<double> timeout_s = default_timeout_;
     if (!timeout.is_none()) timeout_s = timeout.cast<double>();
     if (timeout_s.has_value() && *timeout_s < 0) {
@@ -1909,12 +1911,15 @@ std::shared_ptr<RegisteredBufferLeaseNative> RegisteredBufferPoolNative::acquire
     while (true) {
         raise_if_open_locked();
         auto region = try_acquire_locked(lock, size);
-        if (region.has_value()) return make_lease_locked(std::move(*region), size);
-        if (!should_block) throw std::runtime_error("registered buffer pool is exhausted");
+        if (region.has_value())
+            return make_lease_locked(std::move(*region), size);
+        if (!should_block)
+            throw std::runtime_error("registered buffer pool is exhausted");
         ++wait_count_;
         if (timeout_s.has_value()) {
             if (std::chrono::steady_clock::now() >= deadline) {
-                throw std::runtime_error("timed out waiting for registered buffer");
+                throw std::runtime_error(
+                    "timed out waiting for registered buffer");
             }
             condition_.wait_until(lock, deadline);
         } else {
@@ -1932,7 +1937,8 @@ void RegisteredBufferPoolNative::prewarm(size_t size, size_t count) {
         std::unique_lock<std::mutex> lock(mutex_);
         raise_if_open_locked();
         if (!has_capacity_for_locked(size_class)) {
-            throw std::runtime_error("registered buffer pool capacity exceeded");
+            throw std::runtime_error(
+                "registered buffer pool capacity exceeded");
         }
         Region region = allocate_region_locked(lock, size_class);
         if (closed_ || closing_) {
@@ -1970,7 +1976,8 @@ void RegisteredBufferPoolNative::close() {
         if (active_count) {
             closing_ = false;
             condition_.notify_all();
-            throw std::runtime_error("cannot close registered buffer pool with active leases");
+            throw std::runtime_error(
+                "cannot close registered buffer pool with active leases");
         }
         for (auto &entry : free_) {
             while (!entry.second.empty()) {
@@ -1989,7 +1996,8 @@ void RegisteredBufferPoolNative::close() {
             std::lock_guard<std::mutex> lock(mutex_);
             free_[region.size].push_back(region);
             while (!to_unregister.empty()) {
-                free_[to_unregister.front().size].push_back(to_unregister.front());
+                free_[to_unregister.front().size].push_back(
+                    to_unregister.front());
                 to_unregister.pop_front();
             }
             closing_ = false;
@@ -2017,8 +2025,8 @@ RegisteredBufferPoolNative::make_lease_locked(Region region,
 }
 
 std::optional<RegisteredBufferPoolNative::Region>
-RegisteredBufferPoolNative::try_acquire_locked(std::unique_lock<std::mutex> &lock,
-                                               size_t requested_size) {
+RegisteredBufferPoolNative::try_acquire_locked(
+    std::unique_lock<std::mutex> &lock, size_t requested_size) {
     auto [size_class, oversize] = allocation_size(requested_size);
     if (!oversize) {
         auto free_iter = free_.find(size_class);
@@ -2047,7 +2055,8 @@ RegisteredBufferPoolNative::try_acquire_locked(std::unique_lock<std::mutex> &loc
     return region;
 }
 
-RegisteredBufferPoolNative::Region RegisteredBufferPoolNative::allocate_region_locked(
+RegisteredBufferPoolNative::Region
+RegisteredBufferPoolNative::allocate_region_locked(
     std::unique_lock<std::mutex> &lock, size_t size_class) {
     reserve_locked(size_class);
     lock.unlock();
@@ -2056,17 +2065,21 @@ RegisteredBufferPoolNative::Region RegisteredBufferPoolNative::allocate_region_l
     int ret = 0;
     auto start = std::chrono::steady_clock::now();
     try {
-        auto data = std::shared_ptr<char[]>(new char[size_class], std::default_delete<char[]>());
+        auto data = std::shared_ptr<char[]>(new char[size_class],
+                                            std::default_delete<char[]>());
         ptr = data.get();
         handle = std::make_shared<BufferHandle>(
-            ptr, size_class, [data = std::move(data)]() mutable { data.reset(); });
+            ptr, size_class,
+            [data = std::move(data)]() mutable { data.reset(); });
         ret = store_->register_buffer(ptr, size_class);
     } catch (...) {
         lock.lock();
         unreserve_locked(size_class);
         throw;
     }
-    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
     if (ret != 0) {
         lock.lock();
         register_s_ += elapsed;
@@ -2089,7 +2102,8 @@ RegisteredBufferPoolNative::Region RegisteredBufferPoolNative::allocate_region_l
         }
         int unregister_ret = store_->unregister_buffer(ptr);
         if (unregister_ret != 0) {
-            LOG(ERROR) << "unregister_buffer failed while rolling back allocation";
+            LOG(ERROR)
+                << "unregister_buffer failed while rolling back allocation";
         }
         throw;
     }
@@ -2107,7 +2121,8 @@ void RegisteredBufferPoolNative::release_internal(
             throw std::runtime_error("registered buffer lease is not active");
         }
         region = regions_.at(ptr);
-        should_unregister = closed_ || closing_ || region.size > max_size_class_;
+        should_unregister =
+            closed_ || closing_ || region.size > max_size_class_;
         if (!should_unregister) {
             try {
                 free_[region.size].push_back(region);
@@ -2145,7 +2160,8 @@ void RegisteredBufferPoolNative::unreserve_locked(size_t size_class) {
     condition_.notify_all();
 }
 
-std::pair<size_t, bool> RegisteredBufferPoolNative::allocation_size(size_t size) const {
+std::pair<size_t, bool> RegisteredBufferPoolNative::allocation_size(
+    size_t size) const {
     size = std::max<size_t>(size, 1);
     if (size > max_size_class_) {
         return {align_size(size), true};
@@ -2166,7 +2182,8 @@ size_t RegisteredBufferPoolNative::align_size(size_t size) const {
     return ((size + alignment_ - 1) / alignment_) * alignment_;
 }
 
-bool RegisteredBufferPoolNative::has_capacity_for_locked(size_t size_class) const {
+bool RegisteredBufferPoolNative::has_capacity_for_locked(
+    size_t size_class) const {
     if (size_class > max_bytes_) {
         return false;
     }
@@ -2176,7 +2193,8 @@ bool RegisteredBufferPoolNative::has_capacity_for_locked(size_t size_class) cons
     if (size_class > max_bytes_ - total_bytes_ - reserved_bytes_) {
         return false;
     }
-    return !max_regions_.has_value() || regions_.size() + reserved_regions_ < *max_regions_;
+    return !max_regions_.has_value() ||
+           regions_.size() + reserved_regions_ < *max_regions_;
 }
 
 void RegisteredBufferPoolNative::raise_if_open_locked() const {
@@ -2188,7 +2206,8 @@ void RegisteredBufferPoolNative::raise_if_open_locked() const {
     }
 }
 
-void RegisteredBufferPoolNative::unregister_region_unlocked(const Region &region) {
+void RegisteredBufferPoolNative::unregister_region_unlocked(
+    const Region &region) {
     auto start = std::chrono::steady_clock::now();
     int ret;
     if (PyGILState_Check()) {
@@ -2197,7 +2216,9 @@ void RegisteredBufferPoolNative::unregister_region_unlocked(const Region &region
     } else {
         ret = store_->unregister_buffer(region.handle->ptr());
     }
-    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
     std::lock_guard<std::mutex> lock(mutex_);
     unregister_s_ += elapsed;
     if (ret != 0) {
@@ -2375,7 +2396,8 @@ PYBIND11_MODULE(store, m) {
                std::shared_ptr<RegisteredBufferLeaseViewNative>>(
         m, "RegisteredBufferLeaseView", py::buffer_protocol())
         .def_property_readonly(
-            "buffer", [](const py::object &self) { return py::memoryview(self); })
+            "buffer",
+            [](const py::object &self) { return py::memoryview(self); })
         .def_buffer(&RegisteredBufferLeaseViewNative::buffer_info);
 
     py::class_<RegisteredBufferLeaseNative,
@@ -2392,21 +2414,20 @@ PYBIND11_MODULE(store, m) {
     py::class_<RegisteredBufferPoolNative,
                std::shared_ptr<RegisteredBufferPoolNative>>(
         m, "RegisteredBufferPool")
-        .def(py::init(
-                 [](MooncakeStorePyWrapper &store, size_t max_bytes,
-                    size_t min_size_class, py::object max_size_class,
-                    size_t alignment, bool block_on_exhaustion,
-                    py::object default_timeout, py::object max_regions,
-                    py::object prewarm_size, size_t prewarm_count) {
-                     auto pool = std::make_shared<RegisteredBufferPoolNative>(
-                         store, max_bytes, min_size_class, max_size_class,
-                         alignment, block_on_exhaustion, default_timeout,
-                         max_regions);
-                     if (!prewarm_size.is_none() && prewarm_count > 0) {
-                         pool->prewarm(prewarm_size.cast<size_t>(), prewarm_count);
-                     }
-                     return pool;
-                 }),
+        .def(py::init([](MooncakeStorePyWrapper &store, size_t max_bytes,
+                         size_t min_size_class, py::object max_size_class,
+                         size_t alignment, bool block_on_exhaustion,
+                         py::object default_timeout, py::object max_regions,
+                         py::object prewarm_size, size_t prewarm_count) {
+                 auto pool = std::make_shared<RegisteredBufferPoolNative>(
+                     store, max_bytes, min_size_class, max_size_class,
+                     alignment, block_on_exhaustion, default_timeout,
+                     max_regions);
+                 if (!prewarm_size.is_none() && prewarm_count > 0) {
+                     pool->prewarm(prewarm_size.cast<size_t>(), prewarm_count);
+                 }
+                 return pool;
+             }),
              py::arg("store"), py::arg("max_bytes"),
              py::arg("min_size_class") = 64 * 1024,
              py::arg("max_size_class") = py::none(),
@@ -2414,11 +2435,9 @@ PYBIND11_MODULE(store, m) {
              py::arg("block_on_exhaustion") = true,
              py::arg("default_timeout") = py::none(),
              py::arg("max_regions") = py::none(),
-             py::arg("prewarm_size") = py::none(),
-             py::arg("prewarm_count") = 0)
-        .def("acquire", &RegisteredBufferPoolNative::acquire,
-             py::arg("size"), py::arg("block") = py::none(),
-             py::arg("timeout") = py::none())
+             py::arg("prewarm_size") = py::none(), py::arg("prewarm_count") = 0)
+        .def("acquire", &RegisteredBufferPoolNative::acquire, py::arg("size"),
+             py::arg("block") = py::none(), py::arg("timeout") = py::none())
         .def("buffer", &RegisteredBufferPoolNative::buffer, py::arg("size"),
              py::arg("block") = py::none(), py::arg("timeout") = py::none())
         .def("prewarm", &RegisteredBufferPoolNative::prewarm, py::arg("size"),
