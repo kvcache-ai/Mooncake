@@ -243,7 +243,7 @@ For maximum performance, especially with RDMA networks, use the zero-copy API. T
 
 ⚠️ **Important**: `register_buffer` is required for zero-copy RDMA operations. Without proper buffer registration, undefined behavior and memory corruption may occur.
 
-Zero-copy operations require registering memory buffers with the store:
+Zero-copy operations require registering memory buffers with the store. For repeated reads and writes, prefer the Python `BufferPool` helper described below so you can reuse registered buffers instead of registering and unregistering on every operation.
 
 #### register_buffer()
 Register a memory buffer for direct RDMA access.
@@ -277,14 +277,14 @@ store.unregister_buffer(buffer_ptr)
 
 </details>
 
-### RegisteredBufferPool
+#### Registered Buffer Pool Helper
 
-`RegisteredBufferPool` keeps a bounded set of registered scratch buffers for repeated zero-copy operations. It is useful when a caller repeatedly needs temporary registered memory, for example as the destination buffer for `get_into()` or `get_into_ranges()`.
+`BufferPool` keeps a bounded set of registered scratch buffers for repeated zero-copy operations. It is useful when a caller repeatedly needs temporary registered memory, for example as the destination buffer for `get_into()` or `get_into_ranges()`.
 
 ```python
-from mooncake.store import RegisteredBufferPool
+from mooncake.buffer_pool import BufferPool
 
-pool = RegisteredBufferPool(
+pool = BufferPool(
     store,
     max_bytes=256 * 1024 * 1024,
     min_size_class=64 * 1024,
@@ -301,7 +301,7 @@ with pool.buffer(1024 * 1024) as lease:
 pool.close()
 ```
 
-`acquire(size)` and `buffer(size)` return a `RegisteredBufferLease`. A lease exposes:
+`acquire(size)` and `buffer(size)` return a lease object. A lease exposes:
 
 - `ptr`: the registered memory address to pass to zero-copy APIs.
 - `size`: the requested logical size.
@@ -317,6 +317,8 @@ Behavior and lifecycle rules:
 - Do not keep `lease.ptr` or a `memoryview` after releasing the lease.
 - `release()` fails while exported views are alive. Delete those views first, then release.
 - `close()` fails if leases are still active. Release all leases before closing the pool.
+
+Legacy code may still import `RegisteredBufferPool`, but new examples should prefer `mooncake.buffer_pool.BufferPool`.
 
 ---
 
