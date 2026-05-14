@@ -88,7 +88,7 @@ class ProxyManager {
 
     Status unpinStageBuffer(uint64_t addr);
 
-    ProxyManagerMetrics getMetrics() const { return metrics_; }
+    const ProxyManagerMetrics& getMetrics() const { return metrics_; }
 
     void resetMetrics() { metrics_.reset(); }
 
