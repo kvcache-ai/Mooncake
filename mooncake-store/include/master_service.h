@@ -990,6 +990,16 @@ class MasterService {
     // NotifyPromotionSuccess should commit, so a concurrent Put creating
     // another PROCESSING MEMORY replica cannot be confused with ours.
     // alloc_id is 0 until PromotionAllocStart records the new replica.
+    //
+    // start_time is the reaper deadline anchor. It is set at task
+    // admission (TryPushPromotionQueue) and reset at PromotionAllocStart
+    // so the reaper TTL covers the active-transfer phase
+    // (AllocStart -> SSD read -> RDMA write -> Notify) measured from
+    // when a master-allocated buffer becomes vulnerable, not consumed
+    // by queue waiting. Without the reset, a backlogged task could
+    // enter active transfer with little remaining TTL and the reaper
+    // could free the staged MEMORY replica via EraseReplicaByID while
+    // the client's RDMA write is still landing into it.
     struct PromotionTask {
         ReplicaID source_id;    // the LOCAL_DISK replica being promoted
         ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart

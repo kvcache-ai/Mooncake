@@ -513,12 +513,13 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocRespectsPreferred) {
     service->RemoveAll();
 }
 
-// promotion_queue_limit caps how many in-flight tasks can sit in a
-// single shard (gate: shard_size * kNumShards >= limit). With limit=1
-// the very first queued task in a shard saturates that shard, so a
-// second LOCAL_DISK-only read on a key hashing to the same shard must
-// be silently dropped by the cap gate (reads still succeed; just no
-// new task is enqueued).
+// promotion_queue_limit caps total in-flight tasks cluster-wide
+// (gate: promotion_in_flight_ >= limit). With limit=1 the very first
+// queued task saturates the cap, so a second LOCAL_DISK-only read —
+// even on a key in the same shard — must be silently dropped by the
+// cap gate (reads still succeed; just no new task is enqueued).
+// QueueLimitRejectsCrossShard covers the same-cap-across-different-
+// shards case.
 TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -651,13 +652,13 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     service->RemoveAll();
 }
 
-// Issue 1 regression: the promotion task reaper must pop the staged
-// PROCESSING MEMORY replica added by PromotionAllocStart. Without it,
-// the staged replica was orphaned forever: it's not in
-// shard->processing_keys (so DiscardExpiredProcessingReplicas can't see
-// it) and the previous reaper code only touched the source LOCAL_DISK
-// refcnt and the task entry. The orphan held its allocator buffer
-// indefinitely.
+// The promotion task reaper must pop the staged PROCESSING MEMORY
+// replica added by PromotionAllocStart. The staged replica is not in
+// shard->processing_keys, so DiscardExpiredProcessingReplicas's main
+// sweep can't see it, and the reaper for promotion tasks is the only
+// place that knows the replica exists. Without this path the orphan
+// holds its allocator buffer indefinitely (until the object is removed
+// or evicted).
 //
 // We can't observe the staged replica via GetReplicaList because the
 // master filters out PROCESSING entries (clients can only read COMPLETE
@@ -690,7 +691,8 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
         ASSERT_TRUE(r.has_value());
     }
     // Drive the AllocStart side so alloc_id != 0 — this is the exact
-    // setup that left an orphaned PROCESSING MEMORY replica pre-fix.
+    // setup that produces an orphaned PROCESSING MEMORY replica if the
+    // reaper does not pop it.
     auto alloc = service->PromotionAllocStart("k_cold", 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
@@ -702,18 +704,28 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
         << "PromotionAllocStart should bump segment used bytes "
         << "(allocator-tracked PROCESSING MEMORY replica)";
 
-    // Sleep past the staleness window; the eviction thread reaps the
+    // Wait past the staleness window; the eviction thread reaps the
     // task and (with the fix) pops the staged replica via
     // EraseReplicaByID, which releases the buffer back to the allocator.
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-
-    auto seg_after_reap = service->QuerySegments(ctx.segment_name);
-    ASSERT_TRUE(seg_after_reap.has_value());
-    EXPECT_EQ(seg_after_reap->first, used_baseline)
+    // Poll instead of a fixed sleep — the eviction thread cadence and
+    // the test runner's scheduling jitter (especially under suite load)
+    // both vary, so a hard 2s sleep is flaky here.
+    constexpr auto kPollDeadline = std::chrono::seconds(5);
+    constexpr auto kPollInterval = std::chrono::milliseconds(50);
+    const auto poll_start = std::chrono::steady_clock::now();
+    size_t used_after_reap = 0;
+    while (std::chrono::steady_clock::now() - poll_start < kPollDeadline) {
+        auto q = service->QuerySegments(ctx.segment_name);
+        ASSERT_TRUE(q.has_value());
+        used_after_reap = q->first;
+        if (used_after_reap == used_baseline) break;
+        std::this_thread::sleep_for(kPollInterval);
+    }
+    EXPECT_EQ(used_after_reap, used_baseline)
         << "after reap: staged PROCESSING MEMORY replica's buffer must "
-        << "be freed back to the DRAM allocator. Pre-fix the buffer "
-        << "leaked and used bytes stayed elevated until the object "
-        << "itself was removed or evicted.";
+        << "be freed back to the DRAM allocator. If this fires, the "
+        << "reaper is not popping the staged replica and the buffer "
+        << "leaks until the object itself is removed or evicted.";
 
     // NotifyPromotionSuccess for a reaped task must not commit anything
     // and must return REPLICA_IS_NOT_READY (the task entry is gone, so
@@ -726,11 +738,12 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     service->RemoveAll();
 }
 
-// Issue 2 regression: the cap gate must be cluster-wide. The old
-// implementation used `shard->size() * kNumShards >= promotion_queue_limit_`,
-// which made the cap fire ~1024x too eagerly on skewed workloads (hot
-// keys cluster in few shards). With a global atomic counter, a task in
-// shard A counts toward the cap that gates a task in shard B.
+// The cap gate must be cluster-wide, not per-shard. Promotion targets
+// skewed hot keys, which by definition cluster into a small number of
+// shards; a `shard->size() * kNumShards >= limit` heuristic fires
+// roughly kNumShards-times too eagerly on that workload. With a global
+// atomic counter, a task in shard A counts toward the cap that gates a
+// task in shard B.
 TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -779,10 +792,191 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
     EXPECT_EQ(heartbeat->size(), 1u)
         << "with global cap=1 and one task already in shard " << shard_of(k1)
         << ", a key hashing to shard " << shard_of(k2)
-        << " must be rejected by the global gate (pre-fix it would have "
-        << "been admitted since its shard's local count was 0)";
+        << " must be rejected by the global gate. A per-shard heuristic "
+        << "would admit it here since the destination shard's local "
+        << "count is 0.";
     EXPECT_EQ(heartbeat->count(k1), 1u);
     EXPECT_EQ(heartbeat->count(k2), 0u);
+
+    service->RemoveAll();
+}
+
+// PromotionAllocStart must reset PromotionTask.start_time so the reaper
+// TTL covers the active-transfer phase on its own and is not consumed by
+// the queue-wait phase. Without the reset, a task that waited in the
+// holder's promotion_objects queue for most of the original TTL could
+// enter active transfer with little budget left; if the SSD read + RDMA
+// write of a large object then ran past expiry, the reaper would
+// EraseReplicaByID on the staged MEMORY replica mid-flight and the
+// allocator could hand the freed buffer to a concurrent Put while the
+// client's RDMA write is still landing into it (use-after-free in the
+// allocator + silent data corruption for the concurrent Put).
+//
+// We can't directly observe start_time from a black-box test, so we
+// arrange the timing so the reset is the only thing that distinguishes
+// "task still alive" from "task reaped" at the assertion points:
+//
+//   T=0    : admit task   (original start_time = T=0)
+//   T=Wq   : AllocStart   (resets start_time = T=Wq)
+//   T=Wq+Wa: assertion 1  -- alive iff the reset happened
+//                            (Wq + Wa > TTL,  so without reset the
+//                             original start_time has aged past TTL)
+//                            (Wa < TTL,        so with the reset the
+//                             new start_time has NOT aged past TTL)
+//   T=Wq+Wb: assertion 2  -- reaped
+//                            (Wb > TTL, so even with the reset the
+//                             active-transfer phase has now exceeded its
+//                             own full window)
+//
+// Concretely with TTL = 2s, Wq = 1.5s, Wa = 1.5s (-> 3.0s elapsed,
+// 1.5s since AllocStart), Wb = 3.0s (-> 4.5s elapsed, 3.0s since
+// AllocStart). The "alive" assertion at Wq+Wa is the one that proves
+// the reset is wired up correctly.
+//
+// QuerySegments(seg).first (used bytes) is the observable: AllocStart
+// bumps it, the reaper's EraseReplicaByID returns it to baseline. We
+// can't use GetReplicaList because the master filters out PROCESSING
+// replicas from the response.
+TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 8000;
+    config.put_start_discard_timeout_sec = 0;
+    config.put_start_release_timeout_sec = 2;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_late", 1024,
+                                       ctx.segment_name));
+
+    auto seg_baseline = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_baseline.has_value());
+    const size_t used_baseline = seg_baseline->first;
+
+    // T=0 : admit. start_time = T=0.
+    {
+        auto r = service->GetReplicaList("k_late");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // T=Wq : simulate the holder's queue having been backlogged. With
+    // TTL = 2s and Wq = 1.5s the task is still alive at AllocStart
+    // (the queue-wait phase's own window hasn't expired yet — 1.5 < 2).
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+    auto alloc = service->PromotionAllocStart("k_late", 1024, {});
+    ASSERT_TRUE(alloc.has_value())
+        << "AllocStart must succeed before the queue-wait phase's TTL "
+        << "expires (1.5s elapsed, TTL is 2s). If this fires the test "
+        << "timing is wrong, not the feature.";
+
+    // Buffer has been staged.
+    auto seg_after_alloc = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_after_alloc.has_value());
+    EXPECT_GT(seg_after_alloc->first, used_baseline)
+        << "PromotionAllocStart should bump segment used bytes "
+        << "(allocator-tracked PROCESSING MEMORY replica)";
+
+    // T=Wq+Wa : total elapsed since admission is 3.0s > TTL=2s. If the
+    // reset is missing, the reaper sees the original start_time = 0
+    // and expires the task here, calling EraseReplicaByID which would
+    // free the staged buffer mid-RDMA-write in production. With the
+    // reset, start_time was bumped at AllocStart so age-since-reset is
+    // only 1.5s < TTL=2s and the task stays alive. This is the
+    // assertion that proves the reset is in place.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    auto seg_after_wait = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_after_wait.has_value());
+    EXPECT_GT(seg_after_wait->first, used_baseline)
+        << "post-AllocStart staged MEMORY buffer must still be alive: "
+        << "queue-wait + active-transfer wall time (3.0s) has exceeded "
+        << "the bare TTL (2s), but the start_time reset at AllocStart "
+        << "gives the active-transfer phase its own fresh TTL window. "
+        << "If this fires, the reset in PromotionAllocStart is missing "
+        << "or broken — without it the reaper frees the staged buffer "
+        << "here while a client's RDMA write could still be in flight.";
+
+    // T=Wq+Wb : sleep another 3s for a total of 4.5s since AllocStart.
+    // The active-transfer phase's own TTL has now expired regardless
+    // of the reset; the reaper must fire and free the staged buffer.
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    auto seg_after_reap = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_after_reap.has_value());
+    EXPECT_EQ(seg_after_reap->first, used_baseline)
+        << "after the active-transfer phase's own TTL expires "
+        << "(4.5s > 2s since AllocStart), the reaper must fire and "
+        << "free the staged buffer via EraseReplicaByID";
+
+    service->RemoveAll();
+}
+
+// Issue 2 regression — success-path counter decrement. NotifyPromotionSuccess
+// must fetch_sub(1) on promotion_in_flight_; otherwise the global cap stays
+// saturated and every subsequent promotion is silently dropped once
+// queue_limit tasks have ever succeeded.
+//
+// This is also the only test in the suite that exercises
+// NotifyPromotionSuccess's *success* path end-to-end (every other call site
+// asserts an error path). It therefore also covers the const-drop fix: if
+// the alloc_id assignment in PromotionAllocStart was somehow broken,
+// NotifyPromotionSuccess would see alloc_id == 0 and return
+// REPLICA_IS_NOT_READY, failing this test.
+TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;  // 1 in-flight task globally
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_first", 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_second",
+                                       1024, seg.segment_name));
+
+    // Admit task 1. promotion_in_flight_ goes from 0 -> 1.
+    {
+        auto r = service->GetReplicaList("k_first");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // Drive the full success path: AllocStart stages the PROCESSING MEMORY
+    // replica and records alloc_id; NotifyPromotionSuccess flips it
+    // COMPLETE, drops the source LOCAL_DISK refcnt, erases the task, and
+    // decrements the counter.
+    auto alloc = service->PromotionAllocStart("k_first", 1024, {});
+    ASSERT_TRUE(alloc.has_value())
+        << "AllocStart should succeed; error=" << alloc.error();
+    auto notify = service->NotifyPromotionSuccess(seg.client_id, "k_first");
+    ASSERT_TRUE(notify.has_value())
+        << "NotifyPromotionSuccess full happy path should succeed; "
+        << "if this fires, either AllocStart did not record alloc_id "
+        << "(Issue 3 regression) or the staged replica is missing/"
+        << "non-PROCESSING; error=" << notify.error();
+
+    // Counter must now be 0. A second admission on a *different* key must
+    // be allowed. If fetch_sub is missing on the success path, the cap is
+    // still saturated at 1 and TryPushPromotionQueue silently drops this
+    // attempt.
+    {
+        auto r = service->GetReplicaList("k_second");
+        ASSERT_TRUE(r.has_value());
+    }
+    auto pending = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->size(), 1u)
+        << "k_second must be admitted after k_first succeeds — the global "
+        << "in-flight counter must decrement on the NotifyPromotionSuccess "
+        << "success path. Without fetch_sub, the cap stays saturated and "
+        << "k_second is silently dropped.";
+    EXPECT_EQ(pending->count("k_second"), 1u);
 
     service->RemoveAll();
 }

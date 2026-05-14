@@ -2962,10 +2962,28 @@ auto MasterService::PromotionAllocStart(
     // NotifyPromotionSuccess knows exactly which replica to commit (a
     // concurrent Put on this key may stage other PROCESSING MEMORY
     // replicas; finding "first PROCESSING memory" would be ambiguous).
+    //
+    // Also reset start_time. The task TTL exists to bound the
+    // *active-transfer* phase (AllocStart -> client SSD read -> RDMA
+    // write -> Notify). Pre-reset, the same start_time was set at queue
+    // admission and never bumped, so a task that sat queued behind a
+    // backlog on the holder client (kMaxPerHeartbeat = 1 serializes
+    // work) could enter the active-transfer phase with only a sliver of
+    // the original TTL remaining. If the SSD read + RDMA write of a
+    // large object then ran past expiry, the reaper would call
+    // EraseReplicaByID on this staged replica mid-transfer and the
+    // allocator could hand the buffer to a concurrent Put while the
+    // RDMA write is still landing into it. By resetting here we give
+    // the active-transfer phase its own full TTL window measured from
+    // the moment a buffer becomes vulnerable; the queue-waiting phase
+    // (alloc_id still 0) is bounded by its own original-start_time
+    // window during which the reaper's EraseReplicaByID branch is a
+    // no-op.
     auto& shard = accessor.GetShard();
     auto task_it = shard->promotion_tasks.find(key);
     if (task_it != shard->promotion_tasks.end()) {
         task_it->second.alloc_id = new_id;
+        task_it->second.start_time = std::chrono::system_clock::now();
     }
     return PromotionAllocStartResponse{std::move(desc)};
 }
@@ -3229,6 +3247,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
     //     the object itself is removed or evicted.
     //   - Erase the task entry and decrement the global in-flight
     //     counter.
+    // The deadline anchor (task.start_time) is set at admission and
+    // reset at PromotionAllocStart, so the queue-wait phase
+    // (alloc_id == 0, no buffer) and the active-transfer phase
+    // (alloc_id != 0, master-allocated buffer in flight) each get a
+    // full put_start_release_timeout_sec_ window measured from when
+    // they started. The reaper does not need to distinguish the two
+    // phases here: alloc_id gates the EraseReplicaByID branch.
     // The per-client promotion_objects map is best-effort garbage
     // collected on the next heartbeat (entries for vanished tasks are
     // harmless — the client will allocate, transfer, then
