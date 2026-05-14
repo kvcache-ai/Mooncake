@@ -1088,9 +1088,12 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
         co_return;
     }
     if (!SlicesAreContiguous(*slices)) {
-        LOG(ERROR) << "Forward RDMA write requires contiguous slice buffers, key="
-                   << write_req->key;
-        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INVALID_PARAMS));
+        LOG(ERROR)
+            << "Forward RDMA write requires contiguous slice buffers, key="
+            << write_req->key;
+        tl::expected<void, ErrorCode> err =
+            tl::make_unexpected(ErrorCode::NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED);
+        promise->setValue(std::move(err));
         co_return;
     }
     PreWriteRequest pre_req;
@@ -1657,7 +1660,13 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
     if (!RemoteDestBuffersContiguous(req->dest_buffers)) {
         LOG(ERROR) << "Forward RDMA read requires contiguous dest buffers, key="
                    << req->key;
+<<<<<<< HEAD
         promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INVALID_PARAMS));
+=======
+        tl::expected<void, ErrorCode> err2 =
+            tl::make_unexpected(ErrorCode::NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED);
+        promise->setValue(std::move(err2));
+>>>>>>> 92f08293 (add errorcode NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED for non-contiguous buffers check)
         co_return true;
     }
     PinKeyRequest pin_req;
