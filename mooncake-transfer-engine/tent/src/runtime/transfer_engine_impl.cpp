@@ -286,8 +286,8 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->discover({loader}));
 
-    metadata_ = std::make_shared<ControlService>(
-        metadata_type, metadata_servers, this);
+    metadata_ =
+        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
