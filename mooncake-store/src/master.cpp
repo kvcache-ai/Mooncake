@@ -122,7 +122,7 @@ DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-             "Seconds a client stays considered alive after the last heartbeat."
+             "Seconds a client stays considered alive after the last heartbeat. "
              "If this TTL elapses without a refresh, the master treats the "
              "client as disconnected and may unmount its segments");
 
