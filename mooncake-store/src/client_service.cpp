@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "pyclient.h"
 
 #include <glog/logging.h>
 
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <ranges>
 #include <thread>
@@ -1556,6 +1558,19 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             continue;
         }
 
+        // Detect GPU source once for all replicas.
+        // Only checking the first slice is sufficient because the subsequent
+        // boundary check (slice_addr in gpu_info range) will catch any
+        // non-GPU slices and trigger RDMA fallback. Using std::all_of would
+        // add a cudaPointerGetAttributes call per slice with no correctness
+        // benefit, since mixed GPU/CPU slices within a single PutOperation
+        // should never occur.
+        bool gpu_source = false;
+        if (gpu_ipc_pull_enabled_ && client_requester_ && !op.slices.empty()) {
+            gpu_source =
+                gpu_staging::IsDevicePointer(op.slices[0].ptr, nullptr);
+        }
+
         bool all_transfers_submitted = true;
         std::string failure_context;
 
@@ -1577,6 +1592,77 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
             if (replica.is_memory_replica()) {
+                // GPU IPC pull: same-node GPU->CPU bypass RDMA
+                if (gpu_source && IsReplicaOnLocalMemory(replica)) {
+                    // B1 fix: use local_rpc_addr_ instead of
+                    // handle.rpc_endpoint_
+                    auto gpu_info = FindLocalGpuBufferInfo(op.slices[0].ptr);
+                    if (gpu_info) {
+                        // Build GPU IPC request
+                        GpuIpcTransferRequest req;
+                        req.direction = GpuIpcDirection::DEVICE_TO_HOST;
+                        req.gpu_ipc_handle = gpu_info->ipc_handle;
+                        req.gpu_device_id = gpu_info->device_id;
+                        req.keys.push_back(op.key);
+
+                        // Get replica's buffer base address (absolute addr in
+                        // owner)
+                        auto& buf_desc =
+                            replica.get_memory_descriptor().buffer_descriptor;
+                        uint64_t owner_base = buf_desc.buffer_address_;
+
+                        uint64_t dst_offset = 0;
+                        bool slices_valid = true;
+                        for (const auto& slice : op.slices) {
+                            uint64_t slice_addr =
+                                reinterpret_cast<uint64_t>(slice.ptr);
+                            if (slice_addr < gpu_info->base_addr ||
+                                slice_addr + slice.size >
+                                    gpu_info->base_addr + gpu_info->length) {
+                                slices_valid = false;
+                                break;
+                            }
+                            req.gpu_offsets.push_back(slice_addr -
+                                                      gpu_info->base_addr);
+                            req.cpu_addrs.push_back(owner_base + dst_offset);
+                            req.sizes.push_back(slice.size);
+                            dst_offset += slice.size;
+                        }
+                        if (slices_valid) {
+                            // GPU IPC handler is on offload RPC server.
+                            // Use 127.0.0.1:<port> so the connection goes
+                            // through loopback, matching IsCallerLocalhost().
+                            auto colon = local_rpc_addr_.rfind(":");
+                            if (colon == std::string::npos) {
+                                LOG(ERROR) << "Invalid local_rpc_addr format: "
+                                           << local_rpc_addr_;
+                                // Fall through to RDMA
+                            } else {
+                                std::string gpu_ipc_ep =
+                                    "127.0.0.1" + local_rpc_addr_.substr(colon);
+                                auto state =
+                                    std::make_shared<GpuIpcOperationState>();
+                                state->set_awaiter(
+                                    client_requester_->gpu_ipc_transfer_async(
+                                        gpu_ipc_ep, req));
+                                // B10 fix: record peer immediately on RPC
+                                // submission
+                                auto ipc_handle = gpu_info->ipc_handle;
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        gpu_ipc_pull_peers_mutex_);
+                                    gpu_ipc_pull_peer_map_[ipc_handle].insert(
+                                        gpu_ipc_ep);
+                                }
+                                op.pending_transfers.emplace_back(
+                                    TransferFuture(state));
+                                continue;  // skip RDMA for this replica
+                            }
+                        }
+                    }
+                    // fallthrough to RDMA if IPC pull failed
+                }
+
                 auto submit_result = transfer_submitter_->submit(
                     replica, op.slices, TransferRequest::WRITE);
 
@@ -3151,6 +3237,21 @@ void Client::ProcessSlicesAsync(const std::string& key,
     }
 }
 
+bool Client::IsAddressInMountedSegment(uint64_t addr, uint64_t size) {
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    // Overflow check: addr + size must not wrap around
+    if (size > UINT64_MAX - addr) return false;
+    uint64_t end = addr + size;
+    for (const auto& [_, seg] : mounted_segments_) {
+        // Overflow check: seg.base + seg.size must not wrap around
+        if (seg.size > UINT64_MAX - seg.base) continue;
+        if (addr >= seg.base && end <= seg.base + seg.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     if (!replica.is_memory_replica()) {
         return false;
@@ -3160,7 +3261,155 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     if (metadata_connstring_ == P2PHANDSHAKE) {
         return replica_transfer_endpoint == GetTransportEndpoint();
     }
-    return local_hostname_ == replica_transfer_endpoint;
+    // Strip port for same-node comparison (handles different ports on same
+    // host)
+    auto strip_port = [](const std::string& addr) -> std::string {
+        auto pos = addr.rfind(':');
+        return (pos != std::string::npos) ? addr.substr(0, pos) : addr;
+    };
+    return strip_port(local_hostname_) == strip_port(replica_transfer_endpoint);
+}
+
+// ============== GPU IPC Support ==============
+
+std::unordered_set<std::string> Client::getGpuIpcPullPeers(
+    const std::string& ipc_handle) const {
+    std::lock_guard<std::mutex> lock(gpu_ipc_pull_peers_mutex_);
+    auto it = gpu_ipc_pull_peer_map_.find(ipc_handle);
+    if (it != gpu_ipc_pull_peer_map_.end()) return it->second;
+    return {};
+}
+
+void Client::clearGpuIpcPullPeers(const std::string& ipc_handle) {
+    std::lock_guard<std::mutex> lock(gpu_ipc_pull_peers_mutex_);
+    gpu_ipc_pull_peer_map_.erase(ipc_handle);
+}
+
+void Client::invalidateGpuBufferCache(void* buffer) {
+    uint64_t addr = reinterpret_cast<uint64_t>(buffer);
+    std::lock_guard<std::mutex> lock(gpu_buffer_cache_mutex_);
+    for (auto it = gpu_buffer_cache_.begin(); it != gpu_buffer_cache_.end();) {
+        if (addr >= it->second.base_addr &&
+            addr < it->second.base_addr + it->second.length) {
+            it = gpu_buffer_cache_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::optional<Client::GpuBufferInfo> Client::FindLocalGpuBufferInfo(
+    const void* gpu_ptr) const {
+    uint64_t addr = reinterpret_cast<uint64_t>(gpu_ptr);
+
+    // B13: Check cache first
+    {
+        std::lock_guard<std::mutex> lock(gpu_buffer_cache_mutex_);
+        for (const auto& [base, info] : gpu_buffer_cache_) {
+            if (addr >= info.base_addr && addr < info.base_addr + info.length) {
+                return info;
+            }
+        }
+    }
+
+    // Cache miss: query TENT
+    auto result = transfer_engine_->findLocalGpuBuffer(addr);
+    if (!result) return std::nullopt;
+
+    // Get device_id via cudaPointerGetAttributes
+    int dev_id = -1;
+    gpu_staging::IsDevicePointer(gpu_ptr, &dev_id);
+
+    GpuBufferInfo info;
+    info.ipc_handle = result->ipc_handle;
+    info.base_addr = result->base_addr;
+    info.length = result->length;
+    info.device_id = dev_id;
+
+    // Write to cache
+    {
+        std::lock_guard<std::mutex> lock(gpu_buffer_cache_mutex_);
+        gpu_buffer_cache_[info.base_addr] = info;
+    }
+    return info;
+}
+
+std::optional<TransferFuture> Client::SubmitGpuIpcPull(
+    const std::string& owner_rpc_endpoint, const std::string& gpu_ipc_handle,
+    int gpu_device_id, const std::vector<uint64_t>& gpu_offsets,
+    const std::vector<uint64_t>& cpu_addrs, const std::vector<size_t>& sizes) {
+    // §5.7: null protection
+    if (!client_requester_ || local_rpc_addr_.empty()) {
+        LOG(WARNING) << "GPU IPC not initialized";
+        return std::nullopt;
+    }
+
+    GpuIpcTransferRequest req;
+    req.direction = GpuIpcDirection::DEVICE_TO_HOST;
+    req.gpu_ipc_handle = gpu_ipc_handle;
+    req.gpu_device_id = gpu_device_id;
+    req.gpu_offsets = gpu_offsets;
+    req.cpu_addrs = cpu_addrs;
+    req.sizes = sizes;
+
+    // Use 127.0.0.1:<port> so the connection goes through loopback,
+    // matching IsCallerLocalhost() on the owner side.
+    auto colon = owner_rpc_endpoint.rfind(":");
+    if (colon == std::string::npos) {
+        LOG(ERROR) << "Invalid owner_rpc_endpoint format: "
+                   << owner_rpc_endpoint;
+        return std::nullopt;
+    }
+    std::string gpu_ipc_ep = "127.0.0.1" + owner_rpc_endpoint.substr(colon);
+    auto state = std::make_shared<GpuIpcOperationState>();
+    state->set_awaiter(
+        client_requester_->gpu_ipc_transfer_async(gpu_ipc_ep, req));
+    // B10 fix: record peer immediately
+    {
+        std::lock_guard<std::mutex> lock(gpu_ipc_pull_peers_mutex_);
+        gpu_ipc_pull_peer_map_[gpu_ipc_handle].insert(gpu_ipc_ep);
+    }
+    return TransferFuture(state);
+}
+
+std::optional<TransferFuture> Client::SubmitGpuIpcPush(
+    const std::string& owner_rpc_endpoint, const std::string& gpu_ipc_handle,
+    int gpu_device_id, const std::vector<uint64_t>& gpu_offsets,
+    const std::vector<uint64_t>& cpu_addrs, const std::vector<size_t>& sizes,
+    const std::string& key) {
+    // §5.7: null protection
+    if (!client_requester_ || local_rpc_addr_.empty()) {
+        LOG(WARNING) << "GPU IPC not initialized";
+        return std::nullopt;
+    }
+
+    GpuIpcTransferRequest req;
+    req.direction = GpuIpcDirection::HOST_TO_DEVICE;
+    req.gpu_ipc_handle = gpu_ipc_handle;
+    req.gpu_device_id = gpu_device_id;
+    req.keys = {key};
+    req.gpu_offsets = gpu_offsets;
+    req.cpu_addrs = cpu_addrs;
+    req.sizes = sizes;
+
+    // Use 127.0.0.1:<port> so the connection goes through loopback,
+    // matching IsCallerLocalhost() on the owner side.
+    auto colon = owner_rpc_endpoint.rfind(":");
+    if (colon == std::string::npos) {
+        LOG(ERROR) << "Invalid owner_rpc_endpoint format: "
+                   << owner_rpc_endpoint;
+        return std::nullopt;
+    }
+    std::string gpu_ipc_ep = "127.0.0.1" + owner_rpc_endpoint.substr(colon);
+    auto state = std::make_shared<GpuIpcOperationState>();
+    state->set_awaiter(
+        client_requester_->gpu_ipc_transfer_async(gpu_ipc_ep, req));
+    // B10 fix: record peer immediately
+    {
+        std::lock_guard<std::mutex> lock(gpu_ipc_pull_peers_mutex_);
+        gpu_ipc_pull_peer_map_[gpu_ipc_handle].insert(gpu_ipc_ep);
+    }
+    return TransferFuture(state);
 }
 
 }  // namespace mooncake

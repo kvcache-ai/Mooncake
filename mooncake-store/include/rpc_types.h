@@ -239,4 +239,31 @@ struct BatchGetOffloadObjectResponse {
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
 
+// --- GPU IPC Transfer Types ---
+
+enum class GpuIpcDirection : int32_t {
+    DEVICE_TO_HOST = 0,  // PUT path: GPU(requester) -> CPU(owner)
+    HOST_TO_DEVICE = 1,  // GET path: CPU(owner) -> GPU(requester)
+};
+
+struct GpuIpcTransferRequest {
+    GpuIpcDirection direction;
+    std::string gpu_ipc_handle;  // Requester GPU IPC handle (base64)
+    int gpu_device_id = 0;
+    std::vector<std::string> keys;  // For logging/metrics only
+    std::vector<uint64_t>
+        gpu_offsets;  // GPU-side offsets (relative to handle base)
+    std::vector<uint64_t>
+        cpu_addrs;  // CPU-side virtual addresses (in owner process)
+    std::vector<uint64_t> sizes;
+};
+YLT_REFL(GpuIpcTransferRequest, direction, gpu_ipc_handle, gpu_device_id, keys,
+         gpu_offsets, cpu_addrs, sizes);
+
+struct GpuIpcTransferResponse {
+    int32_t overall_status = 0;
+    std::vector<int32_t> per_slice_status;
+};
+YLT_REFL(GpuIpcTransferResponse, overall_status, per_slice_status);
+
 }  // namespace mooncake

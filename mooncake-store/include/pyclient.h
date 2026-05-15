@@ -160,6 +160,17 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
 
+    // Unified GPU IPC transfer (sync + async)
+    tl::expected<GpuIpcTransferResponse, ErrorCode> gpu_ipc_transfer(
+        const std::string &owner_rpc_addr, const GpuIpcTransferRequest &req);
+
+    async_simple::coro::Lazy<tl::expected<GpuIpcTransferResponse, ErrorCode>>
+    gpu_ipc_transfer_async(const std::string &owner_rpc_addr,
+                           const GpuIpcTransferRequest &req);
+
+    void release_gpu_ipc_handle(const std::string &client_addr,
+                                const std::string &gpu_ipc_handle);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and
@@ -215,7 +226,8 @@ class PyClient {
         const std::string &master_server_addr,
         const std::shared_ptr<TransferEngine> &transfer_engine,
         const std::string &ipc_socket_path, bool enable_ssd_offload = false,
-        const std::string &ssd_offload_path = "") = 0;
+        const std::string &ssd_offload_path = "",
+        bool enable_gpu_ipc_pull = false) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,

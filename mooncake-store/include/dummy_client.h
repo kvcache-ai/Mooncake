@@ -29,7 +29,8 @@ class DummyClient : public PyClient {
                    const std::shared_ptr<TransferEngine> &transfer_engine,
                    const std::string &ipc_socket_path,
                    bool enable_ssd_offload = false,
-                   const std::string &ssd_offload_path = "") {
+                   const std::string &ssd_offload_path = "",
+                   bool enable_gpu_ipc_pull = false) {
         // Dummy client does not support real setup
         return -1;
     };

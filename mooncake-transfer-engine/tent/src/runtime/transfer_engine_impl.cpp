@@ -279,12 +279,6 @@ Status TransferEngineImpl::construct() {
         redis_password = env_password;
     }
 
-    std::string redis_username;
-    const char* env_username = std::getenv("MC_REDIS_USERNAME");
-    if (env_username && *env_username) {
-        redis_username = env_username;
-    }
-
     // Get Redis DB index from environment variable or config
     int redis_db_index_config = conf_->get("redis_db_index", 0);
     const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
@@ -325,8 +319,7 @@ Status TransferEngineImpl::construct() {
     }
 
     metadata_ = std::make_shared<ControlService>(
-        metadata_type, metadata_servers, redis_username, redis_password,
-        db_index, this);
+        metadata_type, metadata_servers, redis_password, db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -729,6 +722,22 @@ Status TransferEngineImpl::unregisterLocalMemory(
     }
     if (!removed_any) return Status::OK();
     return metadata_->segmentManager().synchronizeLocal();
+}
+
+std::optional<TransferEngineImpl::LocalBufferResult>
+TransferEngineImpl::findLocalBuffer(uint64_t addr) const {
+    if (!local_segment_tracker_) return std::nullopt;
+    // Iterate all local buffers directly (avoid SegmentTracker::query
+    // which has early-break logic that skips non-contiguous buffers).
+    std::optional<LocalBufferResult> found;
+    local_segment_tracker_->forEach([&](const BufferDesc& buf) -> Status {
+        if (addr >= buf.addr && addr < buf.addr + buf.length &&
+            !buf.shm_path.empty()) {
+            found = LocalBufferResult{buf.shm_path, buf.addr, buf.length};
+        }
+        return Status::OK();
+    });
+    return found;
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {

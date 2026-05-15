@@ -7,6 +7,12 @@
 #include <numa.h>
 #include <numaif.h>
 #include <pthread.h>
+// <csignal> is needed by coro_io.hpp (std::signal); <signal.h> alone is
+// insufficient.
+#include <csignal>
+// get_context() is only declared in this internal header, not in any public
+// ylt/coro_rpc/ header.  Revisit if yalantinglibs is upgraded.
+#include <ylt/coro_rpc/impl/protocol/coro_rpc_protocol.hpp>
 #include <signal.h>
 #include <thread>
 #include <stop_token>
@@ -20,6 +26,9 @@
 #include <vector>
 
 #include "real_client.h"
+#include "gpu_ipc_utils.h"
+#include "common/serialization.h"
+#include "gpu_staging_utils.h"
 #include "client_buffer.hpp"
 #include "config.h"
 #include "mutex.h"
@@ -27,7 +36,6 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
-#include "gpu_staging_utils.h"
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
@@ -619,8 +627,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path) {
+    const std::string &ssd_offload_path, bool enable_gpu_ipc_pull) {
     this->protocol = protocol;
+    this->enable_gpu_ipc_pull_ = enable_gpu_ipc_pull;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
         use_hugepage_ && this->protocol != "ubshmem";
@@ -854,8 +863,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
     }
-    if (enable_ssd_offload && start_offload_rpc_server) {
-        // Start RPC server for offload operations (batch_get / release_buffer).
+    bool need_rpc_server = (enable_ssd_offload && start_offload_rpc_server) ||
+                           enable_gpu_ipc_pull_;
+    if (need_rpc_server) {
+        // Start RPC server for offload / GPU IPC pull operations.
         // Use port 0 to let the OS auto-allocate an available port.
         offload_rpc_server_ =
             std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
@@ -863,6 +874,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        if (enable_gpu_ipc_pull_) {
+            offload_rpc_server_
+                ->register_handler<&RealClient::gpu_ipc_transfer>(this);
+            offload_rpc_server_
+                ->register_handler<&RealClient::release_gpu_ipc_handle>(this);
+        }
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -882,6 +899,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         this->local_rpc_addr =
             rpc_host + ":" + std::to_string(offload_rpc_port_);
+    }
+    // Inject GPU IPC pull into Client layer
+    if (enable_gpu_ipc_pull_ && client_) {
+        client_->setClientRequester(client_requester_);
+        client_->setLocalRpcAddr(this->local_rpc_addr);
+        client_->enableGpuIpcPull();
     }
     if (enable_ssd_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
@@ -916,11 +939,12 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
-    const std::string &ssd_offload_path) {
+    const std::string &ssd_offload_path, bool enable_gpu_ipc_pull) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
-        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path));
+        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
+        enable_gpu_ipc_pull));
 }
 
 namespace {
@@ -989,13 +1013,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
     // Validate size parameters are within acceptable ranges
-    if (global_segment_size < MIN_SEGMENT_SIZE ||
-        global_segment_size > MAX_SEGMENT_SIZE) {
+    // global_segment_size == 0 means requester mode (skip segment mount)
+    if (global_segment_size != 0 && (global_segment_size < MIN_SEGMENT_SIZE ||
+                                     global_segment_size > MAX_SEGMENT_SIZE)) {
         LOG(ERROR) << "Invalid " << CONFIG_KEY_GLOBAL_SEGMENT_SIZE << ": "
-                   << global_segment_size << ", must be between "
+                   << global_segment_size << ", must be 0 or between "
                    << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+
     if (local_buffer_size < MIN_SEGMENT_SIZE ||
         local_buffer_size > MAX_SEGMENT_SIZE) {
         LOG(ERROR) << "Invalid " << CONFIG_KEY_LOCAL_BUFFER_SIZE << ": "
@@ -1021,10 +1047,29 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload =
         (enable_ssd_offload_str == "true" || enable_ssd_offload_str == "1");
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path);
+    std::string enable_gpu_ipc_pull_str =
+        get_config(config, "enable_gpu_ipc_pull", "");
+    // B9: env var fallback
+    if (enable_gpu_ipc_pull_str.empty()) {
+        const char *env_val = std::getenv("MOONCAKE_ENABLE_GPU_IPC_PULL");
+        if (env_val) {
+            enable_gpu_ipc_pull_str = env_val;
+        }
+    }
+    if (enable_gpu_ipc_pull_str.empty()) {
+        enable_gpu_ipc_pull_str = "false";
+    }
+    std::transform(enable_gpu_ipc_pull_str.begin(),
+                   enable_gpu_ipc_pull_str.end(),
+                   enable_gpu_ipc_pull_str.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    bool enable_gpu_ipc_pull =
+        (enable_gpu_ipc_pull_str == "true" || enable_gpu_ipc_pull_str == "1");
+
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, enable_gpu_ipc_pull);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1082,6 +1127,17 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         if (entry.second.base) {
             free_memory(entry.second.protocol, entry.second.base);
         }
+    }
+
+    // Clean up GPU IPC handle cache before resetting client.
+    // ipc_handle_cache_ holds CUDA IPC mappings that must be closed
+    // while the GPU context is still valid.
+    {
+        std::lock_guard<std::mutex> lock(ipc_cache_mutex_);
+        for (auto &[handle, gpu_va] : ipc_handle_cache_) {
+            gpu_ipc::CloseIpcHandle(gpu_va);
+        }
+        ipc_handle_cache_.clear();
     }
 
     // Reset all resources
@@ -2901,6 +2957,20 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                    << toString(unregister_result.error());
         return tl::unexpected(unregister_result.error());
     }
+    // GPU IPC pull: notify peers to close cached IPC handles
+    if (enable_gpu_ipc_pull_ && client_requester_ && client_) {
+        auto buf_info = client_->FindLocalGpuBufferInfo(buffer);
+        if (buf_info) {
+            auto peers = client_->getGpuIpcPullPeers(buf_info->ipc_handle);
+            for (const auto &peer_rpc : peers) {
+                client_requester_->release_gpu_ipc_handle(peer_rpc,
+                                                          buf_info->ipc_handle);
+            }
+            client_->clearGpuIpcPullPeers(buf_info->ipc_handle);
+        }
+        // B13: invalidate gpu_buffer_cache_ for this buffer
+        client_->invalidateGpuBufferCache(buffer);
+    }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_.erase(buffer);
@@ -4184,6 +4254,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     std::vector<ValidKeyInfo> valid_operations;
     std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
     std::vector<DiskKeyInfo> disk_operations;
+    struct GpuIpcPushInfo {
+        size_t original_index;
+        std::string key;
+        TransferFuture future;
+    };
+    std::vector<GpuIpcPushInfo> gpu_ipc_futures;
     valid_operations.reserve(num_keys);
 
     auto local_endpoints = client_->GetLocalEndpoints();
@@ -4258,6 +4334,53 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
+        // GPU IPC Push: same-node CPU->GPU bypass RDMA
+        if (enable_gpu_ipc_pull_ && client_ && replica.is_memory_replica()) {
+            // buffers[i] is void* (single GPU buffer for this key)
+            if (gpu_staging::IsDevicePointer(buffers[i]) &&
+                client_->IsReplicaOnLocalMemory(replica)) {
+                auto gpu_info = client_->FindLocalGpuBufferInfo(buffers[i]);
+                if (gpu_info) {
+                    // Boundary check: ensure copy fits within GPU buffer
+                    uint64_t target_addr =
+                        reinterpret_cast<uint64_t>(buffers[i]);
+                    uint64_t initial_offset = target_addr - gpu_info->base_addr;
+                    if (initial_offset + total_size > gpu_info->length) {
+                        LOG(WARNING)
+                            << "GPU IPC Push: key " << key << " size "
+                            << total_size << " exceeds GPU buffer remaining "
+                            << (gpu_info->length - initial_offset)
+                            << ", falling back to BatchGet";
+                    } else {
+                        auto &mem_desc = replica.get_memory_descriptor();
+                        auto &buf_desc = mem_desc.buffer_descriptor;
+                        std::string owner_endpoint = client_->getLocalRpcAddr();
+                        uint64_t owner_base = buf_desc.buffer_address_;
+
+                        std::vector<uint64_t> gpu_offsets;
+                        std::vector<uint64_t> cpu_addrs;
+                        std::vector<size_t> slice_sizes;
+                        gpu_offsets.push_back(initial_offset);
+                        cpu_addrs.push_back(owner_base);
+                        slice_sizes.push_back(total_size);
+
+                        auto future = client_->SubmitGpuIpcPush(
+                            owner_endpoint, gpu_info->ipc_handle,
+                            gpu_info->device_id, gpu_offsets, cpu_addrs,
+                            slice_sizes, key);
+                        if (future) {
+                            gpu_ipc_futures.push_back(
+                                {i, key, std::move(*future)});
+                            results[i] = static_cast<int64_t>(total_size);
+                            continue;
+                        }
+                        LOG(WARNING) << "GPU IPC Push failed for key " << key
+                                     << ", falling back to BatchGet";
+                    }
+                }
+            }
+        }
+
         // MEMORY: RDMA directly to user buffer.
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
@@ -4270,6 +4393,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
         // Set success result (actual bytes transferred)
         results[i] = static_cast<int64_t>(total_size);
+    }
+
+    // Wait for all GPU IPC Push futures to complete
+    for (auto &info : gpu_ipc_futures) {
+        auto err = info.future.wait();
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "GPU IPC Push failed for key '" << info.key
+                       << "': " << toString(err);
+            results[info.original_index] = tl::unexpected(err);
+        }
     }
 
     // Early return if no valid operations
@@ -5455,4 +5588,197 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             co_return result->result();
         }());
 }
+
+// ============== GPU IPC Transfer Handler ==============
+
+// B11: NOTE: GPU IPC handler assumes segments remain mounted during execution.
+// Unmounting a segment during active GPU IPC transfer is undefined behavior.
+// This is acceptable because unmount only happens at shutdown and handler
+// execution time is < 1ms.
+// Check that the RPC caller is on localhost (127.0.0.1 or ::1).
+// GPU IPC handlers execute cudaMemcpy on addresses provided by the requester;
+// only same-node processes should be allowed to invoke them.
+static bool IsCallerLocalhost() {
+    auto *ctx = coro_rpc::get_context();
+    if (!ctx) {
+        LOG(WARNING) << "GPU IPC: cannot determine caller identity, rejecting";
+        return false;
+    }
+    auto remote_ep = ctx->get_remote_endpoint();
+    auto addr = remote_ep.address;
+    if (addr.is_loopback()) {
+        return true;
+    }
+    LOG(WARNING) << "GPU IPC: rejected non-localhost caller "
+                 << addr.to_string();
+    return false;
+}
+
+tl::expected<GpuIpcTransferResponse, ErrorCode> RealClient::gpu_ipc_transfer(
+    const GpuIpcTransferRequest &req) {
+    // Precondition: client must be initialized for address validation
+    if (!client_) {
+        LOG(ERROR) << "gpu_ipc_transfer: client not initialized, rejecting";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Security: only accept calls from localhost
+    if (!IsCallerLocalhost()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    gpu_staging::SetDevice(req.gpu_device_id);
+
+    // 1. Open/cache IPC handle
+    void *gpu_va = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(ipc_cache_mutex_);
+        auto it = ipc_handle_cache_.find(req.gpu_ipc_handle);
+        if (it != ipc_handle_cache_.end()) {
+            gpu_va = it->second;
+        } else {
+            std::vector<uint8_t> buf;
+            deserializeBinaryData(req.gpu_ipc_handle, buf);
+            if (buf.size() != gpu_ipc::IpcHandleSize()) {
+                LOG(ERROR) << "gpu_ipc_transfer: handle size mismatch, got "
+                           << buf.size() << ", expected "
+                           << gpu_ipc::IpcHandleSize();
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            if (!gpu_ipc::OpenIpcHandle(buf.data(), buf.size(), &gpu_va)) {
+                LOG(ERROR) << "gpu_ipc_transfer: OpenIpcHandle failed";
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+            ipc_handle_cache_[req.gpu_ipc_handle] = gpu_va;
+        }
+    }
+
+    // 1b. Validate vector size consistency
+    if (req.gpu_offsets.size() != req.sizes.size() ||
+        req.cpu_addrs.size() != req.sizes.size()) {
+        LOG(ERROR) << "gpu_ipc_transfer: vector size mismatch ("
+                   << req.gpu_offsets.size() << ", " << req.cpu_addrs.size()
+                   << ", " << req.sizes.size() << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // 2. Security check: cpu_addrs must be within mounted segments
+    {
+        for (size_t i = 0; i < req.cpu_addrs.size(); ++i) {
+            if (!client_->IsAddressInMountedSegment(req.cpu_addrs[i],
+                                                    req.sizes[i])) {
+                LOG(ERROR) << "gpu_ipc_transfer: cpu_addr 0x" << std::hex
+                           << req.cpu_addrs[i] << std::dec
+                           << " not in any mounted segment";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+    }
+
+    // 3. Execute async copy with single stream
+    gpu_staging::SetDevice(req.gpu_device_id);
+    gpu_staging::ScopedGpuStream stream(req.gpu_device_id);
+
+    GpuIpcTransferResponse resp;
+    resp.per_slice_status.reserve(req.sizes.size());
+    for (size_t i = 0; i < req.sizes.size(); ++i) {
+        void *gpu_ptr = static_cast<char *>(gpu_va) + req.gpu_offsets[i];
+        void *cpu_ptr = reinterpret_cast<void *>(req.cpu_addrs[i]);
+        bool ok = false;
+
+        if (stream.valid()) {
+            if (req.direction == GpuIpcDirection::DEVICE_TO_HOST) {
+                ok = gpu_staging::CopyDeviceToHostAsync(
+                    cpu_ptr, gpu_ptr, req.sizes[i], stream.get());
+            } else {
+                ok = gpu_staging::CopyHostToDeviceAsync(
+                    gpu_ptr, cpu_ptr, req.sizes[i], stream.get());
+            }
+        } else {
+            // Stream creation failed: fallback to sync copy
+            if (req.direction == GpuIpcDirection::DEVICE_TO_HOST) {
+                ok = gpu_staging::CopyDeviceToHost(cpu_ptr, gpu_ptr,
+                                                   req.sizes[i]);
+            } else {
+                ok = gpu_staging::CopyHostToDevice(gpu_ptr, cpu_ptr,
+                                                   req.sizes[i]);
+            }
+        }
+
+        resp.per_slice_status.push_back(ok ? 0 : -1);
+        if (!ok) {
+            LOG(ERROR) << "gpu_ipc_transfer: copy submit failed for slice "
+                       << i;
+            resp.overall_status = -1;
+        }
+    }
+
+    // Sync once for all async copies
+    if (stream.valid()) {
+        if (!stream.sync()) {
+            // B4 fix: mark all per_slice_status as failed on sync failure
+            LOG(ERROR) << "gpu_ipc_transfer: stream sync failed";
+            resp.overall_status = -1;
+            for (auto &s : resp.per_slice_status) s = -1;
+        }
+    }
+
+    return resp;
+}
+
+bool RealClient::release_gpu_ipc_handle(const std::string &gpu_ipc_handle) {
+    // Security: only accept calls from localhost
+    if (!IsCallerLocalhost()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ipc_cache_mutex_);
+    auto it = ipc_handle_cache_.find(gpu_ipc_handle);
+    if (it != ipc_handle_cache_.end()) {
+        gpu_ipc::CloseIpcHandle(it->second);
+        ipc_handle_cache_.erase(it);
+        return true;
+    }
+    return false;
+}
+
+// ============== ClientRequester GPU IPC methods ==============
+
+tl::expected<GpuIpcTransferResponse, ErrorCode>
+ClientRequester::gpu_ipc_transfer(const std::string &owner_rpc_addr,
+                                  const GpuIpcTransferRequest &req) {
+    return invoke_rpc<&RealClient::gpu_ipc_transfer, GpuIpcTransferResponse>(
+        owner_rpc_addr, req);
+}
+
+async_simple::coro::Lazy<tl::expected<GpuIpcTransferResponse, ErrorCode>>
+ClientRequester::gpu_ipc_transfer_async(const std::string &owner_rpc_addr,
+                                        const GpuIpcTransferRequest &req) {
+    auto client_pool = client_pools_->at(owner_rpc_addr);
+    auto ret = co_await client_pool->send_request(
+        [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client &client) {
+            return client.send_request<&RealClient::gpu_ipc_transfer>(req);
+        });
+    if (!ret.has_value()) {
+        LOG(ERROR) << "gpu_ipc_transfer_async: connection failed to "
+                   << owner_rpc_addr;
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    auto result = co_await std::move(ret.value());
+    if (!result) {
+        LOG(ERROR) << "gpu_ipc_transfer_async RPC failed: "
+                   << result.error().msg;
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    co_return result->result();
+}
+
+void ClientRequester::release_gpu_ipc_handle(
+    const std::string &client_addr, const std::string &gpu_ipc_handle) {
+    auto result = invoke_rpc<&RealClient::release_gpu_ipc_handle, bool>(
+        client_addr, gpu_ipc_handle);
+    if (!result) {
+        VLOG(1) << "Failed to release_gpu_ipc_handle at " << client_addr
+                << " (will be cleaned on process exit): " << result.error();
+    }
+}
+
 }  // namespace mooncake

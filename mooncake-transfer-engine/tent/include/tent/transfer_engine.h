@@ -205,6 +205,7 @@ int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -306,6 +307,14 @@ class TransferEngine {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+   public:
+    struct LocalBufferResult {
+        std::string shm_path;
+        uint64_t base_addr;
+        uint64_t length;
+    };
+    std::optional<LocalBufferResult> findLocalBuffer(uint64_t addr) const;
 
    private:
     std::unique_ptr<TransferEngineImpl> impl_;
