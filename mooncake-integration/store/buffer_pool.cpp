@@ -484,8 +484,8 @@ RegisteredBufferPoolNative::allocate_region_locked(
             lock.unlock();
         }
         py::gil_scoped_acquire acquire_gil;
-        int unregister_ret = py::cast<int>(
-            store_obj_.attr("unregister_buffer")(reinterpret_cast<uintptr_t>(ptr)));
+        int unregister_ret = py::cast<int>(store_obj_.attr("unregister_buffer")(
+            reinterpret_cast<uintptr_t>(ptr)));
         if (unregister_ret != 0) {
             LOG(ERROR)
                 << "unregister_buffer failed while rolling back allocation";
