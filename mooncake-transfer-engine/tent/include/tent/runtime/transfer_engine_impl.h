@@ -25,6 +25,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <optional>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -158,16 +159,10 @@ class TransferEngineImpl {
 
     Status unlockStageBuffer(uint64_t addr);
 
-    // Test-only hook: replace the transport in a given slot after construct().
-    // Production code never calls this. Used by failover integration tests to
-    // inject a FaultProxyTransport without bypassing resubmitTransferTask,
-    // resolveTransport, or any other engine state. Not thread-safe with any
-    // in-flight transfer on that slot.
+    // Test-only: swap a transport in the transport_list_ array.
     void swapTransportForTest(TransportType type,
-                              std::shared_ptr<Transport> xport) {
-        if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
-            transport_list_[type] = std::move(xport);
-        }
+                              std::shared_ptr<Transport> t) {
+        transport_list_[static_cast<int>(type)] = std::move(t);
     }
 
    private:
@@ -222,6 +217,16 @@ class TransferEngineImpl {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
+
+   public:
+    // Find local buffer containing addr; returns (shm_path, base_addr, length)
+    // Used by GPU IPC to locate cudaIpcMemHandle for a GPU pointer.
+    struct LocalBufferResult {
+        std::string shm_path;
+        uint64_t base_addr;
+        uint64_t length;
+    };
+    std::optional<LocalBufferResult> findLocalBuffer(uint64_t addr) const;
 
     ThreadLocalStorage<BatchSet> batch_set_;
 

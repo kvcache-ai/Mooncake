@@ -147,6 +147,15 @@ target_link_libraries(
          gflags
          pthread)
 
+
+add_store_test(gpu_ipc_pull_test gpu_ipc_pull_test.cpp)
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    target_compile_definitions(gpu_ipc_pull_test PRIVATE USE_CUDA)
+    target_include_directories(gpu_ipc_pull_test PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(gpu_ipc_pull_test PRIVATE CUDA::cudart)
+endif()
+
 # HA tests
 add_ha_test(standby_state_machine_test
             ha/standby/standby_state_machine_test.cpp)

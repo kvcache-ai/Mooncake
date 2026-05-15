@@ -21,6 +21,7 @@
 #include "transfer_task.h"
 #include "types.h"
 #include "replica.h"
+#include "gpu_staging_utils.h"
 #include "master_metric_manager.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
@@ -29,6 +30,7 @@
 namespace mooncake {
 
 class PutOperation;
+class ClientRequester;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -570,7 +572,47 @@ class Client {
         return admission_sketch_->increment(key) >= admission_threshold_;
     }
 
+    struct GpuBufferInfo {
+        std::string ipc_handle;
+        uint64_t base_addr = 0;
+        uint64_t length = 0;
+        int device_id = -1;
+    };
+    std::optional<GpuBufferInfo> FindLocalGpuBufferInfo(
+        const void* gpu_ptr) const;
+
+    std::shared_ptr<TransferEngine> GetTransferEngine() const {
+        return transfer_engine_;
+    }
+
+    // GPU IPC support
+    void setClientRequester(std::shared_ptr<ClientRequester> requester) {
+        client_requester_ = std::move(requester);
+    }
+    void setLocalRpcAddr(const std::string& addr) { local_rpc_addr_ = addr; }
+    const std::string& getLocalRpcAddr() const { return local_rpc_addr_; }
+    void enableGpuIpcPull() { gpu_ipc_pull_enabled_ = true; }
+    std::unordered_set<std::string> getGpuIpcPullPeers(
+        const std::string& ipc_handle) const;
+    void clearGpuIpcPullPeers(const std::string& ipc_handle);
+    void invalidateGpuBufferCache(void* buffer);
+
+    bool IsAddressInMountedSegment(uint64_t addr, uint64_t size);
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
+    std::optional<TransferFuture> SubmitGpuIpcPull(
+        const std::string& owner_rpc_endpoint,
+        const std::string& gpu_ipc_handle, int gpu_device_id,
+        const std::vector<uint64_t>& gpu_offsets,
+        const std::vector<uint64_t>& cpu_addrs,
+        const std::vector<size_t>& sizes);
+
+    std::optional<TransferFuture> SubmitGpuIpcPush(
+        const std::string& owner_rpc_endpoint,
+        const std::string& gpu_ipc_handle, int gpu_device_id,
+        const std::vector<uint64_t>& gpu_offsets,
+        const std::vector<uint64_t>& cpu_addrs,
+        const std::vector<size_t>& sizes, const std::string& key);
 
    private:
     /**
@@ -702,6 +744,18 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+
+    // GPU IPC pull support
+    bool gpu_ipc_pull_enabled_ = false;
+    std::shared_ptr<ClientRequester> client_requester_;
+    std::string local_rpc_addr_;
+    // Maps IPC handle -> set of peer RPC addrs that have cached it
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        gpu_ipc_pull_peer_map_;
+    mutable std::mutex gpu_ipc_pull_peers_mutex_;
+    // GpuBufferInfo cache (B13)
+    mutable std::mutex gpu_buffer_cache_mutex_;
+    mutable std::unordered_map<uintptr_t, GpuBufferInfo> gpu_buffer_cache_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

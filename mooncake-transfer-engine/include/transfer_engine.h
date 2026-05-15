@@ -162,6 +162,20 @@ class TransferEngine {
 
     std::shared_ptr<TransferMetadata> getMetadata();
 
+    // GPU IPC: find local buffer containing addr, return IPC handle info.
+    // Works in both TENT and non-TENT modes.
+    struct LocalGpuBufferInfo {
+        std::string
+            ipc_handle;  // serialized cudaIpcMemHandle (shm_name/shm_path)
+        uint64_t base_addr;
+        uint64_t length;
+    };
+    std::optional<LocalGpuBufferInfo> findLocalGpuBuffer(uint64_t addr);
+
+    // Register GPU memory with NVLink transport only (skip RDMA).
+    // Returns 0 on success.
+    int registerLocalMemoryNvlinkOnly(void* addr, size_t length);
+
     bool checkOverlap(void* addr, uint64_t length);
 
     void setAutoDiscover(bool auto_discover);

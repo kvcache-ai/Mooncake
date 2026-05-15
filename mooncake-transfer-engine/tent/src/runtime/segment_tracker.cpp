@@ -158,5 +158,17 @@ Status SegmentTracker::forEach(std::function<Status(BufferDesc&)> callback) {
     return Status::OK();
 }
 
+Status SegmentTracker::forEach(
+    std::function<Status(const BufferDesc&)> callback) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    assert(local_desc_->type == SegmentType::Memory);
+    const auto& detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    for (const auto& buf : detail.buffers) {
+        auto status = callback(buf);
+        if (!status.ok()) return status;
+    }
+    return Status::OK();
+}
+
 }  // namespace tent
 }  // namespace mooncake

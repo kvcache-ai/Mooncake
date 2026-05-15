@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,12 @@
 #include <thread>
 #include <vector>
 
+#include <functional>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
+#include <ylt/util/tl/expected.hpp>
+
+#include "rpc_types.h"
 #include "transfer_engine.h"
 #include "types.h"
 #include "replica.h"
@@ -28,7 +35,8 @@ enum class TransferStrategy {
     LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
     TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
     FILE_READ = 2,        // File read operation
-    EMPTY = 3
+    EMPTY = 3,
+    GPU_IPC = 4
 };
 
 /**
@@ -43,6 +51,10 @@ inline std::ostream& operator<<(std::ostream& os,
             return os << "TRANSFER_ENGINE";
         case TransferStrategy::FILE_READ:
             return os << "FILE_READ";
+        case TransferStrategy::GPU_IPC:
+            return os << "GPU_IPC";
+        case TransferStrategy::EMPTY:
+            return os << "EMPTY";
         default:
             return os << "UNKNOWN";
     }
@@ -96,6 +108,82 @@ class OperationState {
     std::optional<ErrorCode> result_ = std::nullopt;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+};
+
+/**
+ * @brief Operation state for GPU IPC transfers (same-node GPU<->CPU)
+ *
+ * Uses async_simple::coro::Lazy to achieve true async: the RPC is submitted
+ * without blocking, and syncAwait happens only in wait_for_completion().
+ *
+ * B3 fix: awaiter extraction is mutex-protected to prevent race condition.
+ */
+class GpuIpcOperationState : public OperationState {
+   public:
+    // Lazy is move-only with no default ctor; wrap in optional.
+    std::optional<async_simple::coro::Lazy<
+        tl::expected<GpuIpcTransferResponse, ErrorCode>>>
+        awaiter;
+
+    void set_awaiter(async_simple::coro::Lazy<
+                     tl::expected<GpuIpcTransferResponse, ErrorCode>>
+                         a) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        awaiter.emplace(std::move(a));
+    }
+
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return result_.has_value();
+    }
+
+    void set_completed(ErrorCode error_code) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (result_.has_value()) {
+                LOG(ERROR) << "GpuIpcOperationState::set_completed called twice"
+                           << ", ignoring duplicate with code "
+                           << static_cast<int>(error_code);
+                return;
+            }
+            result_.emplace(error_code);
+        }
+        cv_.notify_all();
+    }
+
+    void wait_for_completion() override {
+        // B3 fix: extract awaiter under lock, then await outside lock
+        std::optional<async_simple::coro::Lazy<
+            tl::expected<GpuIpcTransferResponse, ErrorCode>>>
+            lazy;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (awaiter.has_value()) {
+                lazy.emplace(std::move(*awaiter));
+                awaiter.reset();
+            }
+        }
+        if (lazy) {
+            auto result = async_simple::coro::syncAwait(std::move(*lazy));
+            ErrorCode ec = (!result || result->overall_status != 0)
+                               ? ErrorCode::TRANSFER_FAIL
+                               : ErrorCode::OK;
+            set_completed(ec);
+        } else {
+            // Fallback: already completed synchronously (with timeout)
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (!cv_.wait_for(lock, std::chrono::seconds(60),
+                              [this] { return result_.has_value(); })) {
+                LOG(ERROR) << "GpuIpcOperationState::wait_for_completion"
+                           << " timed out after 60s";
+                result_.emplace(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::GPU_IPC;
+    }
 };
 
 /**

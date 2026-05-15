@@ -209,6 +209,22 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
 
+std::optional<TransferEngine::LocalGpuBufferInfo>
+TransferEngine::findLocalGpuBuffer(uint64_t addr) {
+    // Non-TENT: use legacy TransferMetadata
+    auto metadata = impl_->getMetadata();
+    if (!metadata) return std::nullopt;
+    auto seg_desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!seg_desc) return std::nullopt;
+    for (const auto& buf : seg_desc->buffers) {
+        if (addr >= buf.addr && addr < buf.addr + buf.length) {
+            if (buf.shm_name.empty()) return std::nullopt;
+            return LocalGpuBufferInfo{buf.shm_name, buf.addr, buf.length};
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace mooncake
 #else
 #include "transfer_engine.h"
@@ -602,6 +618,42 @@ std::shared_ptr<TransferMetadata> TransferEngine::getMetadata() {
         return nullptr;
     } else
         return impl_->getMetadata();
+}
+
+std::optional<TransferEngine::LocalGpuBufferInfo>
+TransferEngine::findLocalGpuBuffer(uint64_t addr) {
+    if (use_tent_) {
+        auto result = impl_tent_->findLocalBuffer(addr);
+        if (!result) return std::nullopt;
+        return LocalGpuBufferInfo{result->shm_path, result->base_addr,
+                                  result->length};
+    } else {
+        // Non-TENT: use legacy TransferMetadata
+        auto metadata = impl_->getMetadata();
+        if (!metadata) return std::nullopt;
+        auto seg_desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        if (!seg_desc) return std::nullopt;
+        for (const auto& buf : seg_desc->buffers) {
+            if (addr >= buf.addr && addr < buf.addr + buf.length) {
+                if (buf.shm_name.empty()) return std::nullopt;
+                return LocalGpuBufferInfo{buf.shm_name, buf.addr, buf.length};
+            }
+        }
+        return std::nullopt;
+    }
+}
+
+int TransferEngine::registerLocalMemoryNvlinkOnly(void* addr, size_t length) {
+    if (use_tent_) {
+        mooncake::tent::MemoryOptions option;
+        option.type = mooncake::tent::NVLINK;
+        auto status = impl_tent_->registerLocalMemory(addr, length, option);
+        return (int)status.code();
+    } else {
+        // Non-TENT: no NVLink transport available, fall through to regular
+        return registerLocalMemory(addr, length, kWildcardLocation, false,
+                                   true);
+    }
 }
 
 bool TransferEngine::checkOverlap(void* addr, uint64_t length) {

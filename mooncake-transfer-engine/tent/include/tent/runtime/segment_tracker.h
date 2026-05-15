@@ -56,10 +56,11 @@ class SegmentTracker {
                   std::function<Status(BufferDesc&)> callback);
 
     Status forEach(std::function<Status(BufferDesc&)> callback);
+    Status forEach(std::function<Status(const BufferDesc&)> callback) const;
 
    private:
     SegmentDescRef local_desc_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 };
 }  // namespace tent
 }  // namespace mooncake

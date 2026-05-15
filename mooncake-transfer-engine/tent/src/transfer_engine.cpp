@@ -169,5 +169,13 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
     return impl_->getTransferStatus(batch_id, overall_status);
 }
 
+std::optional<TransferEngine::LocalBufferResult>
+TransferEngine::findLocalBuffer(uint64_t addr) const {
+    auto result = impl_->findLocalBuffer(addr);
+    if (!result) return std::nullopt;
+    return LocalBufferResult{result->shm_path, result->base_addr,
+                             result->length};
+}
+
 }  // namespace tent
 }  // namespace mooncake
