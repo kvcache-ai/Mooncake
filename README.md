@@ -310,7 +310,7 @@ The following are additional dependencies for building Mooncake:
 - Go 1.20+, if you want to build with `-DWITH_P2P_STORE`, `-DUSE_ETCD` (enabled by default to use etcd as metadata servers), or `-DSTORE_USE_ETCD` (use etcd for the failover of the store master).
 - CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA`. *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 - Cambricon Neuware, if you want to build with `-DUSE_MLU`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `NEUWARE_HOME` or `/usr/local/neuware` by default, and also supports overriding `MLU_INCLUDE_DIR` / `MLU_LIB_DIR` during CMake configure.
-- [Optional] Rust Toolchain, if you want to build with `-DWITH_RUST_EXAMPLE`. *This is NOT included in the `dependencies.sh` script.*
+- [Optional] Rust Toolchain and libclang, if you want to build Transfer Engine Rust examples with `-DWITH_RUST_EXAMPLE=ON` or Mooncake Store Rust bindings with `-DWITH_STORE_RUST=ON`. *This is NOT included in the `dependencies.sh` script.*
 - [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers.
 - [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.
 
