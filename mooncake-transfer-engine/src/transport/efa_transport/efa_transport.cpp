@@ -23,6 +23,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <set>
@@ -107,6 +108,11 @@ void EfaTransport::startWorkerThreads() {
     worker_running_ = true;
     // One poller thread per context for responsive CQ draining under load
     size_t num_threads = context_list_.size();
+    const char* cq_env = std::getenv("MC_EFA_CQ_THREADS");
+    if (cq_env) {
+        size_t cq_val = std::stoull(cq_env);
+        if (cq_val > 0 && cq_val < num_threads) num_threads = cq_val;
+    }
     for (size_t i = 0; i < num_threads; i++) {
         worker_threads_.emplace_back(&EfaTransport::workerThreadFunc, this, i);
     }
@@ -154,7 +160,7 @@ void EfaTransport::workerThreadFunc(int thread_id) {
 
         // If no work was done, yield CPU briefly
         if (!did_work) {
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
     }
 }
