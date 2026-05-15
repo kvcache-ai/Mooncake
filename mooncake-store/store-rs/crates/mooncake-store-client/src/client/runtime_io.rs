@@ -2431,40 +2431,54 @@ impl StoreClient {
             .map(|buffer| buffer.as_mut_ptr().cast::<c_void>())
             .collect::<Vec<_>>();
 
-        let local_paths = {
+        // Phase 1: single lock — classify local/remote, gather cached metadata,
+        // and pre-compute copy instructions for cache-hit segments.
+        let (local_paths, mut copy_instructions, cache_miss_segments) = {
             let state = self.state.lock();
             let memory = state.memory_ref()?;
-            resolved
+
+            let local_paths: Vec<bool> = resolved
                 .iter()
                 .map(|entry| {
                     entry.replica.owner == self.lease.runtime
                         && memory.has_storage_segment(&entry.replica.segment_name)
                 })
-                .collect::<Vec<_>>()
-        };
-        let local_items = local_paths.iter().filter(|local| **local).count();
-        let local_bytes = local_paths
-            .iter()
-            .zip(lengths.iter())
-            .filter_map(|(local, length)| (*local).then_some(*length as u64))
-            .sum::<u64>();
-        let mut local_segment_infos = BTreeMap::new();
-        for (entry, local) in resolved.iter().zip(local_paths.iter()) {
-            if !*local || local_segment_infos.contains_key(&entry.replica.segment_name) {
-                continue;
-            }
-            let open_segment_name =
-                self.local_transport_open_segment_name(&entry.replica.segment_name);
-            let (_, info) = {
-                let mut state = self.state.lock();
-                state.open_segment_with_info(transport, &open_segment_name)?
-            };
-            local_segment_infos.insert(entry.replica.segment_name.clone(), info);
-        }
+                .collect();
 
-        {
-            let state = self.state.lock();
-            let memory = state.memory_ref()?;
+            let mut segment_metadata: BTreeMap<
+                SegmentName,
+                (SegmentInfo, Vec<SegmentTargetChunk>),
+            > = BTreeMap::new();
+            let mut cache_miss_segments: Vec<SegmentName> = Vec::new();
+
+            for (entry, local) in resolved.iter().zip(local_paths.iter()) {
+                if !*local
+                    || segment_metadata.contains_key(&entry.replica.segment_name)
+                    || cache_miss_segments.contains(&entry.replica.segment_name)
+                {
+                    continue;
+                }
+                let open_segment_name =
+                    self.local_transport_open_segment_name(&entry.replica.segment_name);
+                let info = state.cached_segment_info(&open_segment_name);
+                let chunks = state.cached_segment_target_chunks(
+                    &entry.replica.owner,
+                    &entry.replica.segment_name,
+                );
+                match (info, chunks) {
+                    (Some(info), Some(chunks)) => {
+                        segment_metadata
+                            .insert(entry.replica.segment_name.clone(), (info, chunks));
+                    }
+                    _ => {
+                        cache_miss_segments.push(entry.replica.segment_name.clone());
+                    }
+                }
+            }
+
+            // Compute copy instructions for all cache-hit local items.
+            let max_reg = transport.max_registration_bytes();
+            let mut copy_instructions: Vec<(Vec<CopyInstruction>, *mut u8)> = Vec::new();
             for ((entry, buffer), local) in resolved
                 .iter()
                 .zip(buffers.iter_mut())
@@ -2473,22 +2487,97 @@ impl StoreClient {
                 if !*local {
                     continue;
                 }
-                let target_info = local_segment_infos.get(&entry.replica.segment_name).ok_or_else(|| {
+                if let Some((info, chunks)) = segment_metadata.get(&entry.replica.segment_name) {
+                    let target_offset =
+                        Self::replica_storage_target_offset(info, chunks, &entry.replica)?;
+                    let instructions = memory.prepare_storage_copy_instructions(
+                        &entry.replica.segment_name,
+                        info,
+                        target_offset,
+                        entry.replica.length as usize,
+                        max_reg,
+                    )?;
+                    copy_instructions.push((instructions, buffer.as_mut_ptr()));
+                }
+            }
+
+            (local_paths, copy_instructions, cache_miss_segments)
+        };
+
+        let local_items = local_paths.iter().filter(|local| **local).count();
+        let local_bytes = local_paths
+            .iter()
+            .zip(lengths.iter())
+            .filter_map(|(local, length)| (*local).then_some(*length as u64))
+            .sum::<u64>();
+
+        // Phase 2: handle cache misses — fall back to multi-lock path (rare in steady state).
+        if !cache_miss_segments.is_empty() {
+            let mut miss_segment_infos: BTreeMap<SegmentName, SegmentInfo> = BTreeMap::new();
+            let mut miss_target_chunks: BTreeMap<SegmentName, Vec<SegmentTargetChunk>> =
+                BTreeMap::new();
+
+            for (entry, local) in resolved.iter().zip(local_paths.iter()) {
+                if !*local || !cache_miss_segments.contains(&entry.replica.segment_name) {
+                    continue;
+                }
+                if miss_segment_infos.contains_key(&entry.replica.segment_name) {
+                    continue;
+                }
+                let open_segment_name =
+                    self.local_transport_open_segment_name(&entry.replica.segment_name);
+                let (_, info) = {
+                    let mut state = self.state.lock();
+                    state.open_segment_with_info(transport, &open_segment_name)?
+                };
+                miss_segment_infos.insert(entry.replica.segment_name.clone(), info);
+                miss_target_chunks.insert(
+                    entry.replica.segment_name.clone(),
+                    self.replica_target_chunks(&entry.replica)?,
+                );
+            }
+
+            // Compute copy instructions for miss items under one additional lock.
+            let max_reg = transport.max_registration_bytes();
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            for ((entry, buffer), local) in resolved
+                .iter()
+                .zip(buffers.iter_mut())
+                .zip(local_paths.iter())
+            {
+                if !*local || !cache_miss_segments.contains(&entry.replica.segment_name) {
+                    continue;
+                }
+                let info = miss_segment_infos.get(&entry.replica.segment_name).ok_or_else(|| {
                     StoreError::InvalidState(format!(
                         "local segment info for {} is missing",
                         entry.replica.segment_name.0
                     ))
                 })?;
-                let target_offset = Self::remote_replica_target_offset(target_info, &entry.replica)?;
-                memory.copy_storage_target_to(
+                let chunks =
+                    miss_target_chunks.get(&entry.replica.segment_name).ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "local segment target chunks for {} are missing",
+                            entry.replica.segment_name.0
+                        ))
+                    })?;
+                let target_offset =
+                    Self::replica_storage_target_offset(info, chunks, &entry.replica)?;
+                let instructions = memory.prepare_storage_copy_instructions(
                     &entry.replica.segment_name,
-                    target_info,
+                    info,
                     target_offset,
-                    buffer.as_mut_ptr(),
                     entry.replica.length as usize,
-                    transport.max_registration_bytes(),
+                    max_reg,
                 )?;
+                copy_instructions.push((instructions, buffer.as_mut_ptr()));
             }
+        }
+
+        // Phase 3: execute all local copies without holding any lock.
+        for (instructions, destination) in &copy_instructions {
+            execute_copy_instructions(instructions, *destination);
         }
         if local_bytes != 0 {
             record_success_metric("get_local_copy", 0, local_bytes);
@@ -3134,6 +3223,83 @@ impl StoreClient {
         Ok(target_offset)
     }
 
+    fn replica_storage_target_offset(
+        info: &SegmentInfo,
+        target_chunks: &[SegmentTargetChunk],
+        replica: &ReplicaRoute,
+    ) -> Result<u64> {
+        let resolved = Self::storage_target_offset(
+            target_chunks,
+            &replica.segment_name,
+            replica.segment_offset,
+            replica.length,
+        );
+        if let Ok(target_offset) = resolved {
+            if Self::segment_info_covers_target(info, target_offset, replica.length) {
+                return Ok(target_offset);
+            }
+            return Err(StoreError::Transport(format!(
+                "segment offset {} length {} maps outside segment {} transport buffers (target_offset={} num_buffers={})",
+                replica.segment_offset,
+                replica.length,
+                replica.segment_name.0,
+                target_offset,
+                info.buffers.len()
+            )));
+        }
+        warn!(
+            segment = %replica.segment_name.0,
+            segment_offset = replica.segment_offset,
+            length = replica.length,
+            num_buffers = info.buffers.len(),
+            buffers = ?info.buffers.iter().map(|buffer| (buffer.base, buffer.length)).collect::<Vec<_>>(),
+            "replica segment offset is outside segment storage target map"
+        );
+        resolved
+    }
+
+    fn replica_target_chunks(&self, replica: &ReplicaRoute) -> Result<Vec<SegmentTargetChunk>> {
+        {
+            let state = self.state.lock();
+            if let Some(target_chunks) =
+                state.cached_segment_target_chunks(&replica.owner, &replica.segment_name)
+            {
+                return Ok(target_chunks);
+            }
+        }
+
+        let segment = {
+            let local = self.allocator.lock().announcement(&replica.segment_name);
+            match local {
+                Some(segment) if segment.owner == replica.owner => segment,
+                _ => self
+                    .metadata
+                    .get_segment(&replica.owner, &replica.segment_name)?
+                    .ok_or_else(|| {
+                        StoreError::NotFound(format!(
+                            "segment {} for runtime {} not found",
+                            replica.segment_name.0, replica.owner
+                        ))
+                    })?,
+            }
+        };
+        if segment.target_chunks.is_empty() {
+            return Err(StoreError::Transport(format!(
+                "segment {} for runtime {} exposes no storage target chunks",
+                replica.segment_name.0, replica.owner
+            )));
+        }
+        let target_chunks = segment.target_chunks.clone();
+        self.state.lock().cache_segment_target_metadata(
+            &replica.owner,
+            &replica.segment_name,
+            &target_chunks,
+            segment.transport_endpoint.clone(),
+            segment.transport_segment_descriptor.clone(),
+        );
+        Ok(target_chunks)
+    }
+
     fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
         if let Some(offset) = replica.offset {
             if Self::segment_info_covers_target(info, offset, replica.length) {
@@ -3287,6 +3453,18 @@ impl StoreClient {
             .attribute_u64("mooncake.item_count", remote_indices.len() as u64)
             .attribute_u64("mooncake.remote_target_count", remote_indices.len() as u64);
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
+            let target_chunks = remote_indices
+                .iter()
+                .map(|index| {
+                    self.replica_target_chunks(&resolved[*index].replica)
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let requests = {
                 let mut batch = Vec::with_capacity(remote_indices.len());
                 for (position, index) in remote_indices.iter().enumerate() {
@@ -3307,11 +3485,15 @@ impl StoreClient {
                                 (
                                     error.clone(),
                                     Self::remote_read_failure_marks_runtime_suspect(&error),
-                                )
-                            })?
+                            )
+                        })?
                     };
-                    let target_offset = Self::remote_replica_target_offset(&info, &entry.replica)
-                        .map_err(|error| {
+                    let target_offset = Self::replica_storage_target_offset(
+                        &info,
+                        &target_chunks[position],
+                        &entry.replica,
+                    )
+                    .map_err(|error| {
                             (
                                 error.clone(),
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
@@ -3432,9 +3614,21 @@ impl StoreClient {
             .attribute_u64("mooncake.item_count", remote_indices.len() as u64)
             .attribute_u64("mooncake.remote_target_count", remote_indices.len() as u64);
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
+            let target_chunks = remote_indices
+                .iter()
+                .map(|index| {
+                    self.replica_target_chunks(&resolved[*index].replica)
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let requests = {
                 let mut batch = Vec::with_capacity(remote_indices.len());
-                for index in remote_indices {
+                for (position, index) in remote_indices.iter().enumerate() {
                     let entry = &resolved[*index];
                     let open_segment_name = self
                         .replica_transport_open_segment_name(&entry.replica)
@@ -3452,11 +3646,15 @@ impl StoreClient {
                                 (
                                     error.clone(),
                                     Self::remote_read_failure_marks_runtime_suspect(&error),
-                                )
-                            })?
+                            )
+                        })?
                     };
-                    let target_offset = Self::remote_replica_target_offset(&info, &entry.replica)
-                        .map_err(|error| {
+                    let target_offset = Self::replica_storage_target_offset(
+                        &info,
+                        &target_chunks[position],
+                        &entry.replica,
+                    )
+                    .map_err(|error| {
                             (
                                 error.clone(),
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
@@ -3581,6 +3779,13 @@ impl StoreClient {
                 }
             }
             let requests = {
+                let target_chunks =
+                    self.replica_target_chunks(&resolved.replica).map_err(|error| {
+                        (
+                            error.clone(),
+                            Self::remote_read_failure_marks_runtime_suspect(&error),
+                        )
+                    })?;
                 let open_segment_name = self
                     .replica_transport_open_segment_name(&resolved.replica)
                     .map_err(|error| {
@@ -3599,7 +3804,8 @@ impl StoreClient {
                         )
                     })?;
                 let target_offset =
-                    Self::remote_replica_target_offset(&info, &resolved.replica).map_err(
+                    Self::replica_storage_target_offset(&info, &target_chunks, &resolved.replica)
+                        .map_err(
                         |error| {
                             (
                                 error.clone(),
@@ -3745,14 +3951,14 @@ impl StoreClient {
             let mut state = self.state.lock();
             state.open_segment_with_info(transport, &open_segment_name)?
         };
+        let target_chunks = self.replica_target_chunks(replica)?;
         {
             let state = self.state.lock();
             let memory = state.memory_ref()?;
-            let target_offset = Self::remote_replica_target_offset(&target_info, replica)?;
             memory.copy_storage_target_to(
                 &replica.segment_name,
                 &target_info,
-                target_offset,
+                Self::replica_storage_target_offset(&target_info, &target_chunks, replica)?,
                 buffer.as_mut_ptr(),
                 length,
                 transport.max_registration_bytes(),

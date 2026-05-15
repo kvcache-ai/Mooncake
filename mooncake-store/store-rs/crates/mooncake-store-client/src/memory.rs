@@ -315,7 +315,7 @@ impl LocalMemoryState {
             segments.insert(
                 primary_segment.clone(),
                 StorageExtent {
-                    region: storage,
+                    region: Arc::new(storage),
                     state: SegmentLifecycleState::Active,
                     tags: config.tags.clone(),
                 },
@@ -358,7 +358,7 @@ impl LocalMemoryState {
         self.storage.insert(
             spec.segment_name,
             StorageExtent {
-                region,
+                region: Arc::new(region),
                 state: spec.state,
                 tags: spec.tags,
             },
@@ -382,7 +382,7 @@ impl LocalMemoryState {
         self.storage.insert(
             segment_name,
             StorageExtent {
-                region,
+                region: Arc::new(region),
                 state,
                 tags,
             },
@@ -443,6 +443,37 @@ impl LocalMemoryState {
             })
     }
 
+    pub(crate) fn prepare_storage_copy_instructions(
+        &self,
+        segment: &SegmentName,
+        target_info: &SegmentInfo,
+        target_offset: u64,
+        length: usize,
+        max_registration_bytes: Option<usize>,
+    ) -> Result<Vec<CopyInstruction>> {
+        let region = self
+            .storage
+            .get(segment)
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("storage segment {} not found", segment.0))
+            })?
+            .region
+            .clone();
+        region
+            .build_copy_instructions(
+                target_info,
+                target_offset,
+                length,
+                max_registration_bytes,
+            )
+            .map_err(|error| {
+                StoreError::Allocator(format!(
+                    "target offset {target_offset} length {length} is outside local storage segment {}: {error}",
+                    segment.0
+                ))
+            })
+    }
+
     pub fn update_storage_state(
         &mut self,
         segment: &SegmentName,
@@ -477,7 +508,23 @@ impl LocalMemoryState {
         let extent = self.storage.remove(segment).ok_or_else(|| {
             StoreError::NotFound(format!("storage segment {} not found", segment.0))
         })?;
-        extent.region.release(transport)
+        match Arc::try_unwrap(extent.region) {
+            Ok(region) => region.release(transport),
+            Err(region) => {
+                self.storage.insert(
+                    segment.clone(),
+                    StorageExtent {
+                        region,
+                        state: extent.state,
+                        tags: extent.tags,
+                    },
+                );
+                Err(StoreError::InvalidState(format!(
+                    "storage segment {} has active copy instructions",
+                    segment.0
+                )))
+            }
+        }
     }
 
     pub fn release_scratch(self, transport: &dyn StoreTransport) -> Result<()> {
@@ -518,7 +565,7 @@ impl StorageExtentInfo {
 
 #[derive(Debug)]
 struct StorageExtent {
-    region: RegisteredRegion,
+    region: Arc<RegisteredRegion>,
     state: SegmentLifecycleState,
     tags: Vec<String>,
 }
@@ -933,16 +980,15 @@ impl RegisteredRegion {
         Ok(unsafe { (self.base_addr as *mut u8).add(offset).cast::<c_void>() })
     }
 
-    fn copy_target_to(
-        &self,
+    fn build_copy_instructions(
+        self: &Arc<Self>,
         target_info: &SegmentInfo,
         target_offset: u64,
-        destination: *mut u8,
         length: usize,
         max_registration_bytes: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<Vec<CopyInstruction>> {
         if length == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut mappings =
             self.target_mappings(target_info, target_offset, length, max_registration_bytes)?;
@@ -954,6 +1000,7 @@ impl RegisteredRegion {
         let target_end = target_offset
             .checked_add(total_len)
             .ok_or_else(|| StoreError::Allocator("target range overflow".to_string()))?;
+        let mut instructions = Vec::new();
         let mut cursor = target_offset;
         let mut written = 0usize;
         while cursor < target_end {
@@ -976,9 +1023,12 @@ impl RegisteredRegion {
                 .checked_add(local_offset)
                 .ok_or_else(|| StoreError::Allocator("local source overflow".to_string()))?
                 as *const u8;
-            unsafe {
-                ptr::copy_nonoverlapping(source, destination.add(written), copy_len);
-            }
+            instructions.push(CopyInstruction {
+                _region: Arc::clone(self),
+                source,
+                dest_offset: written,
+                copy_len,
+            });
             written = written
                 .checked_add(copy_len)
                 .ok_or_else(|| StoreError::Allocator("destination offset overflow".to_string()))?;
@@ -986,6 +1036,24 @@ impl RegisteredRegion {
                 .checked_add(copy_len as u64)
                 .ok_or_else(|| StoreError::Allocator("target cursor overflow".to_string()))?;
         }
+        Ok(instructions)
+    }
+
+    fn copy_target_to(
+        self: &Arc<Self>,
+        target_info: &SegmentInfo,
+        target_offset: u64,
+        destination: *mut u8,
+        length: usize,
+        max_registration_bytes: Option<usize>,
+    ) -> Result<()> {
+        let instructions = self.build_copy_instructions(
+            target_info,
+            target_offset,
+            length,
+            max_registration_bytes,
+        )?;
+        execute_copy_instructions(&instructions, destination);
         Ok(())
     }
 
@@ -1047,6 +1115,31 @@ impl RegisteredRegion {
         let base = self.base_ptr();
         transport.unregister_memory(base, self.capacity)?;
         self.owner.release(transport, base)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CopyInstruction {
+    _region: Arc<RegisteredRegion>,
+    source: *const u8,
+    dest_offset: usize,
+    copy_len: usize,
+}
+
+/// Execute pre-computed copy instructions into `destination`.
+///
+/// # Safety
+/// Each instruction keeps its source region alive. Callers must ensure that
+/// `destination` is large enough for every instruction.
+pub(crate) fn execute_copy_instructions(instructions: &[CopyInstruction], destination: *mut u8) {
+    for instr in instructions {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                instr.source,
+                destination.add(instr.dest_offset),
+                instr.copy_len,
+            );
+        }
     }
 }
 
@@ -2005,13 +2098,13 @@ mod tests {
         let mut storage = vec![0u8; 64];
         let payload = b"mapped-target";
         storage[16..16 + payload.len()].copy_from_slice(payload);
-        let region = RegisteredRegion {
+        let region = Arc::new(RegisteredRegion {
             base_addr: storage.as_mut_ptr() as usize,
             capacity: storage.len(),
             alignment: 8,
             target_chunks: Vec::new(),
             owner: RegionOwner::Transport,
-        };
+        });
         let target_base = 0xabc0_0000u64;
         let target_info = SegmentInfo {
             kind: SegmentKind::Memory,
@@ -2041,6 +2134,62 @@ mod tests {
             .expect("target map should translate to local storage");
 
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn local_memory_state_does_not_release_segment_with_active_copy_instructions() {
+        let transport = RecordingTransport::default();
+        let primary = SegmentName::new("primary");
+        let mut state = LocalMemoryState::register(
+            &transport,
+            &primary,
+            &LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(128)
+                .scratch_bytes(64)
+                .alignment(8),
+        )
+        .expect("initial local memory registration should succeed");
+        let segment = state
+            .storage_segments()
+            .into_iter()
+            .find(|segment| segment.segment_name == primary)
+            .expect("primary segment should be present");
+        let target_info = SegmentInfo {
+            kind: SegmentKind::Memory,
+            buffers: segment
+                .target_chunks
+                .iter()
+                .map(|chunk| SegmentBuffer {
+                    base: chunk.target_offset,
+                    length: chunk.length_bytes,
+                    location: "cpu:0".to_string(),
+                })
+                .collect(),
+        };
+        let instructions = state
+            .prepare_storage_copy_instructions(
+                &primary,
+                &target_info,
+                segment.target_chunks[0].target_offset,
+                8,
+                transport.max_registration_bytes(),
+            )
+            .expect("copy instructions should keep the region alive");
+
+        let error = state
+            .remove_storage_segment(&transport, &primary)
+            .expect_err("active copy instructions must block segment release");
+        assert!(matches!(error, StoreError::InvalidState(_)));
+        assert!(state.has_storage_segment(&primary));
+
+        drop(instructions);
+        state
+            .remove_storage_segment(&transport, &primary)
+            .expect("segment release should succeed after copy instructions drop");
+        state
+            .release_scratch(&transport)
+            .expect("scratch release should succeed");
     }
 
     #[test]
