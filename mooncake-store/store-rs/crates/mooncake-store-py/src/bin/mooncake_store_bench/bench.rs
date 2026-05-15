@@ -329,6 +329,7 @@ fn is_retryable_prefill_error(message: &str) -> bool {
     message.contains("transport error")
         || message.contains("tent_get_segment_info")
         || message.contains("not connected")
+        || message.contains("is not available")
 }
 
 fn is_retryable_read_error(message: &str) -> bool {
@@ -393,6 +394,85 @@ impl LiveCounters {
             logged_errors: AtomicU64::new(0),
         }
     }
+}
+
+fn cleanup_keys(
+    client: &StoreClient,
+    tenant: &str,
+    concurrency: usize,
+    key_space_size: usize,
+    mode: BenchMode,
+    worker_id: usize,
+) -> Result<usize, String> {
+    let shard = worker_key_shard(worker_id, concurrency, key_space_size);
+    let (read_shard, write_shard) = split_mixed_shards(shard);
+
+    let keys_to_delete: Vec<String> = match mode {
+        BenchMode::Put => {
+            // Put mode: all keys in the shard are written
+            (0..shard.count)
+                .map(|ki| make_key("bench", worker_id, worker_key_index(shard, ki)))
+                .collect()
+        }
+        BenchMode::Get => {
+            // Get mode: all keys in the shard were pre-filled
+            (0..shard.count)
+                .map(|ki| make_key("bench", worker_id, worker_key_index(shard, ki)))
+                .collect()
+        }
+        BenchMode::Mixed => {
+            // Mixed mode: read_shard keys were pre-filled, write_shard keys were written during warmup/measured
+            let mut keys = Vec::new();
+            for ki in 0..read_shard.count {
+                keys.push(make_key(
+                    "bench",
+                    worker_id,
+                    worker_key_index(read_shard, ki),
+                ));
+            }
+            for ki in 0..write_shard.count {
+                keys.push(make_key(
+                    "bench",
+                    worker_id,
+                    worker_key_index(write_shard, ki),
+                ));
+            }
+            keys
+        }
+    };
+
+    let total = keys_to_delete.len();
+    let mut deleted = 0usize;
+    let mut last_logged = 0usize;
+
+    for (i, key) in keys_to_delete.iter().enumerate() {
+        match client.remove_in_tenant(tenant, key, true) {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                // NotFound is acceptable during cleanup (key may have been evicted)
+                let msg = e.to_string();
+                if !msg.contains("not found") && !msg.contains("NotFound") {
+                    warn!("cleanup failed for key {key}: {e}");
+                } else {
+                    deleted += 1; // Count as cleaned (already gone)
+                }
+            }
+        }
+
+        // Log progress every 1000 keys to show activity
+        if (i + 1) % 1000 == 0 || i + 1 == total {
+            if deleted != last_logged {
+                debug!(
+                    "worker {worker_id} cleanup progress: {}/{} keys cleaned",
+                    i + 1,
+                    total
+                );
+                last_logged = deleted;
+            }
+        }
+    }
+
+    Ok(deleted)
 }
 
 pub fn run_bench(
@@ -825,6 +905,68 @@ pub fn run_bench(
     report.print(&args.output_format);
 
     cluster.heartbeat_all().ok();
+
+    // Cleanup keys if requested
+    if args.cleanup {
+        info!("cleaning up bench keys...");
+        let cleanup_start = Instant::now();
+        let total_keys = concurrency * worker_key_shard(0, concurrency, key_space_size).count;
+        info!("total keys to clean up: ~{total_keys} across {concurrency} workers");
+
+        let writer_ptrs_cleanup: Vec<usize> = (0..concurrency)
+            .map(|i| cluster.writer(i) as *const StoreClient as usize)
+            .collect();
+
+        let cleanup_result = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for worker_id in 0..concurrency {
+                let writer_ptr = writer_ptrs_cleanup[worker_id];
+                let worker_tenant = tenant.clone();
+
+                let handle = scope.spawn(move || {
+                    // SAFETY: cluster (and its StoreClients) lives for the entire thread::scope.
+                    let client = unsafe { &*(writer_ptr as *const StoreClient) };
+                    cleanup_keys(
+                        client,
+                        &worker_tenant,
+                        concurrency,
+                        key_space_size,
+                        mode,
+                        worker_id,
+                    )
+                });
+                handles.push(handle);
+            }
+
+            let mut total_deleted = 0usize;
+            let mut failed_workers = Vec::new();
+            for (worker_id, handle) in handles.into_iter().enumerate() {
+                match handle.join() {
+                    Ok(Ok(deleted)) => {
+                        total_deleted += deleted;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("worker {worker_id} cleanup failed: {e}");
+                        failed_workers.push(worker_id);
+                    }
+                    Err(_) => {
+                        warn!("worker {worker_id} cleanup thread panicked");
+                        failed_workers.push(worker_id);
+                    }
+                }
+            }
+            (total_deleted, failed_workers)
+        });
+
+        let cleanup_elapsed = cleanup_start.elapsed();
+        info!(
+            "cleanup completed in {:.1}s: {} keys deleted, {} workers failed",
+            cleanup_elapsed.as_secs_f64(),
+            cleanup_result.0,
+            cleanup_result.1.len()
+        );
+    }
+
     if put_errors > 0 || get_errors > 0 {
         Err(std::io::Error::other(format!(
             "benchmark completed with errors: put_errors={put_errors} get_errors={get_errors}"
@@ -915,6 +1057,9 @@ mod tests {
         assert!(is_retryable_prefill_error(
             "RpcServiceError: message: not connected"
         ));
+        assert!(is_retryable_prefill_error(
+            "object not found: runtime iZbp17m9xjgv361zwlq0auZ:3 is not available"
+        ));
         assert!(!is_retryable_prefill_error(
             "invalid state: no placement candidates available"
         ));
@@ -941,5 +1086,33 @@ mod tests {
         assert!(is_heartbeat_tick(0));
         assert!(is_heartbeat_tick(64));
         assert!(!is_heartbeat_tick(65));
+    }
+
+    #[test]
+    fn cleanup_generates_correct_keys_for_mixed_mode() {
+        let concurrency = 4;
+        let key_space_size = 100;
+        let worker_id = 0;
+
+        let shard = worker_key_shard(worker_id, concurrency, key_space_size);
+        let (read_shard, write_shard) = split_mixed_shards(shard);
+
+        // Verify read and write shards partition the key space
+        assert_eq!(read_shard.start, shard.start);
+        assert_eq!(
+            write_shard.start + write_shard.count,
+            shard.start + shard.count
+        );
+        assert_eq!(read_shard.count + write_shard.count, shard.count);
+
+        // Verify key generation covers all keys
+        for ki in 0..read_shard.count {
+            let key_index = worker_key_index(read_shard, ki);
+            assert!(key_index >= shard.start && key_index < shard.start + shard.count);
+        }
+        for ki in 0..write_shard.count {
+            let key_index = worker_key_index(write_shard, ki);
+            assert!(key_index >= shard.start && key_index < shard.start + shard.count);
+        }
     }
 }
