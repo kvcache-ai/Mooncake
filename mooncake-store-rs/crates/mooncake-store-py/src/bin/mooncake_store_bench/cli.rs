@@ -112,6 +112,8 @@ pub struct BenchArgs {
     pub readers: usize,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text, env = "MC_BENCH_OUTPUT_FORMAT")]
     pub output_format: OutputFormat,
+    #[arg(long, default_value_t = false, env = "MC_BENCH_CLEANUP")]
+    pub cleanup: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -872,7 +874,39 @@ mod tests {
             writers: 1,
             readers: 1,
             output_format: OutputFormat::Text,
+            cleanup: false,
         };
         assert!(validate_bench_args(&args).is_err());
+    }
+
+    #[test]
+    fn bench_cleanup_flag_defaults_to_false() {
+        let cli = Cli::parse_from([
+            "mooncake-store-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "bench",
+        ]);
+        if let Command::Bench(args) = cli.command {
+            assert!(!args.cleanup, "cleanup should default to false");
+        } else {
+            panic!("expected bench command");
+        }
+    }
+
+    #[test]
+    fn bench_cleanup_flag_can_be_enabled() {
+        let cli = Cli::parse_from([
+            "mooncake-store-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "bench",
+            "--cleanup",
+        ]);
+        if let Command::Bench(args) = cli.command {
+            assert!(args.cleanup, "cleanup should be true when flag is set");
+        } else {
+            panic!("expected bench command");
+        }
     }
 }
