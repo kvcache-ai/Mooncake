@@ -85,6 +85,10 @@ impl StoreState {
         self.open_segment(transport, segment_name)
     }
 
+    fn cached_segment_info(&self, segment_name: &str) -> Option<SegmentInfo> {
+        self.remote_segment_infos.get(segment_name).cloned()
+    }
+
     fn cached_segment_target_metadata(
         &self,
         owner: &ClientRuntimeId,
@@ -93,6 +97,15 @@ impl StoreState {
         self.segment_target_metadata
             .get(&(owner.clone(), segment_name.clone()))
             .cloned()
+    }
+
+    fn cached_segment_target_chunks(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+    ) -> Option<Vec<SegmentTargetChunk>> {
+        self.cached_segment_target_metadata(owner, segment_name)
+            .map(|metadata| metadata.target_chunks)
     }
 
     fn cache_segment_target_metadata(
