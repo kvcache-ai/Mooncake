@@ -123,8 +123,8 @@ DEFINE_string(
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "Seconds a client stays considered alive after the last heartbeat."
-             "If it expires without refresh, the master may unmount "
-             "that client's segments and mark it NEED_REMOUNT.");
+             "If this TTL elapses without a refresh, the master treats the "
+             "client as disconnected and may unmount its segments");
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
