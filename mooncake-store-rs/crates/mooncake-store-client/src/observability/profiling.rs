@@ -901,6 +901,7 @@ fn operation_semantics(operation: &'static str) -> OperationSemantics {
         "batch_put" => api_semantics("store.batch_put", "put"),
         "batch_put_from" => api_semantics("store.batch_put_from", "put"),
         "batch_is_exist" => api_semantics("store.batch_is_exist", "get"),
+        "batch_is_readable" => api_semantics("store.batch_is_readable", "get"),
         "get_size" => api_semantics("store.get_size", "get"),
         "query_route" => api_semantics("store.query_route", "control"),
         "batch_put_from_multi_buffers" => {
@@ -1341,6 +1342,12 @@ mod tests {
         assert_eq!(put.phase, "api");
         assert_eq!(put.flow, "put");
         assert_eq!(put.role, "root");
+
+        let readable = operation_semantics("batch_is_readable");
+        assert_eq!(readable.span_name, "store.batch_is_readable");
+        assert_eq!(readable.phase, "api");
+        assert_eq!(readable.flow, "get");
+        assert_eq!(readable.role, "root");
 
         let reserve = operation_semantics("batch_put_stage_reserve");
         assert_eq!(reserve.span_name, "control.allocate");

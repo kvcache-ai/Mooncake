@@ -1096,9 +1096,9 @@ fn build_bottlenecks(
 
 fn operation_kind(operation: &str) -> &'static str {
     match operation {
-        "batch_put_from" | "batch_get_into" | "batch_is_exist" | "get_size" | "query_route"
-        | "register_buffer" | "unregister_buffer" | "put" | "put_from" | "batch_put"
-        | "batch_get" | "get" | "get_into" => "api",
+        "batch_put_from" | "batch_get_into" | "batch_is_exist" | "batch_is_readable"
+        | "get_size" | "query_route" | "register_buffer" | "unregister_buffer" | "put"
+        | "put_from" | "batch_put" | "batch_get" | "get" | "get_into" => "api",
         op if op.contains("stage")
             || op.starts_with("route_lookup")
             || op.starts_with("readable_replica_select")
@@ -1457,6 +1457,7 @@ mod tests {
         OperationTracker::new("batch_put_from")
             .input_bytes(1024)
             .finish(&result, 512);
+        OperationTracker::new("batch_is_readable").finish(&result, 1);
         OperationTracker::new("route_lookup_many")
             .scope("route_lookup")
             .finish(&result, 0);
@@ -1485,6 +1486,13 @@ mod tests {
             .any(|entry| entry["operation"] == "batch_put_from"
                 && entry["kind"] == "api"
                 && entry["bytes_in_total"] == 1024_u64));
+        assert!(value["operations"]
+            .as_array()
+            .expect("operations should be an array")
+            .iter()
+            .any(|entry| entry["operation"] == "batch_is_readable"
+                && entry["kind"] == "api"
+                && entry["calls_total"] == 1_u64));
         assert!(value["operations"]
             .as_array()
             .expect("operations should be an array")

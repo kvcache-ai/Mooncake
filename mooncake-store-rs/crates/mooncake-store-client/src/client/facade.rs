@@ -155,7 +155,7 @@ impl StoreClient {
     }
 
     pub fn batch_is_readable(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
-        let tracker = OperationTracker::new("batch_is_exist")
+        let tracker = OperationTracker::new("batch_is_readable")
             .attribute_u64("mooncake.item_count", objects.len() as u64);
         let result: Result<Vec<bool>> = (|| {
             let keys = objects
