@@ -24,6 +24,12 @@ add_executable(transfer_engine_bench_with_notify
                ${WORKSPACE}/transfer_engine_bench_with_notify.cpp)
 target_link_libraries(transfer_engine_bench_with_notify PUBLIC transfer_engine)
 
+if(USE_EFA)
+  add_executable(efa_first_submit_probe
+                 ${WORKSPACE}/efa_first_submit_probe.cpp)
+  target_link_libraries(efa_first_submit_probe PUBLIC transfer_engine)
+endif()
+
 add_executable(memory_pool ${WORKSPACE}/memory_pool.cpp)
 target_link_libraries(memory_pool PUBLIC transfer_engine)
 

@@ -161,8 +161,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      client_buffer_allocator_(
-          AlignedClientBufferAllocator::create(config.local_buffer_size, "")) {
+      client_buffer_allocator_(AlignedClientBufferAllocator::create(
+          config.local_buffer_size, client ? client->GetProtocol() : "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -223,6 +223,13 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return init_storage_backend_result;
     }
     auto enable_offloading_result = IsEnableOffloading();
+    if (enable_offloading_result.has_value()) {
+        LOG(INFO) << "IsEnableOffloading result: "
+                  << (enable_offloading_result.value() ? "true" : "false");
+    } else {
+        LOG(INFO) << "IsEnableOffloading result: error: "
+                  << enable_offloading_result.error();
+    }
     if (!enable_offloading_result) {
         LOG(ERROR) << "Failed to get enable persist result, error : "
                    << enable_offloading_result.error();
@@ -237,6 +244,17 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
             return mount_file_storage_result;
+        }
+    }
+    // Report configured SSD capacity to Master so it can populate
+    // file_total_capacity_ (the denominator in "SSD Storage: X / Y").
+    // Called once at init; old Masters that lack this RPC will log an error
+    // but FileStorage continues normally.
+    if (config_.total_size_limit > 0) {
+        auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);
+        if (!cap_result) {
+            LOG(WARNING) << "ReportSsdCapacity failed (old Master?): "
+                         << cap_result.error();
         }
     }
 
@@ -479,6 +497,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         LOG(ERROR) << "client is nullptr";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+
     std::unordered_map<std::string, int64_t>
         offloading_objects;  // Objects selected for offloading
 
@@ -573,7 +592,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
     auto error_code = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), config_.local_buffer_size,
-        kWildcardLocation, false, false);
+        kWildcardLocation, false, true);
     if (!error_code) {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;

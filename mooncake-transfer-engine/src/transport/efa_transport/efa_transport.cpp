@@ -147,12 +147,10 @@ void EfaTransport::workerThreadFunc(int thread_id) {
             }
         }
 
-        // Stale endpoint eviction happens on-demand in
-        // EfaEndpointStore::getOrInsert when the store is at capacity,
-        // not periodically here.  Periodic eviction is unsafe because
-        // target-side endpoints never get touchLastUsed() updates
-        // (the initiator writes remotely via fi_write, bypassing
-        // the target's endpoint code).
+        // Under the shared-endpoint model there is no per-peer QP to evict:
+        // a new peer costs one AV entry (~bytes), not an fi_endpoint slot.
+        // Stale peers are reclaimed when submitPostSend() drops a peer whose
+        // handshake failed.
 
         // If no work was done, yield CPU briefly
         if (!did_work) {
@@ -406,7 +404,10 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         size_t chunk_len = chunks[ci].second;
         const auto& assigned_nics = nic_assignments[ci];
 
-        bool do_pre_touch = context_list_.size() > 0 &&
+        // preTouchMemory does a CPU-side store to each page, which segfaults
+        // on GPU VRAM (cudaMalloc'd pointers). Restrict it to host memory.
+        bool is_host_mem = resolved_name.rfind("cpu", 0) == 0;
+        bool do_pre_touch = is_host_mem && context_list_.size() > 0 &&
                             std::thread::hardware_concurrency() >= 4 &&
                             chunk_len >= (size_t)4 * 1024 * 1024 * 1024;
         if (do_pre_touch) {
@@ -698,14 +699,32 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
         peer_paths.emplace_back(segment_name + "@" + dev.name);
     }
 
-    // Warm up every (local_ctx, peer_nic) pair concurrently. Each
-    // EfaContext::endpoint() + setupConnectionsByActive() is idempotent and
-    // takes its own lock, so parallel calls across distinct peer_nic_paths
-    // (and distinct contexts) are safe. We use std::async to get roughly
-    // per-pair parallelism — the critical path is now max(handshake RTT) not
-    // sum(handshake RTT).
     auto t0 = std::chrono::steady_clock::now();
     size_t n_pairs = context_list_.size() * peer_paths.size();
+
+    // Idempotent short-circuit: if every (local_ctx, peer_nic) pair already
+    // has a connected endpoint, skip the whole async dispatch. Matters for
+    // callers that invoke warmupSegment per request loop — without this the
+    // 256-thread fan-out runs every time even though there is no work to do.
+    size_t already_ready = 0;
+    for (auto& ctx : context_list_) {
+        for (const auto& path : peer_paths) {
+            auto ep = ctx->peekEndpoint(path);
+            if (ep && ep->connected()) ++already_ready;
+        }
+    }
+    if (already_ready == n_pairs) {
+        VLOG(1) << "EfaTransport::warmupSegment('" << segment_name << "'): all "
+                << n_pairs << " endpoints already connected, "
+                << "skipping";
+        return 0;
+    }
+
+    // Warm up every (local_ctx, peer_nic) pair concurrently.  Under the
+    // shared-endpoint model each warmup is just a handshake RPC +
+    // fi_av_insert (no fi_endpoint, no fi_enable), so the critical path is
+    // max(handshake RTT), not sum.  We still dispatch with std::async for
+    // concurrency, but total wall time is typically ms-level.
     std::vector<std::future<int>> futs;
     futs.reserve(n_pairs);
     for (auto& ctx : context_list_) {
@@ -720,7 +739,15 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
                         return -1;
                     }
                     if (ep->connected()) return 0;
-                    return ep->setupConnectionsByActive();
+                    int rc = ep->setupConnectionsByActive();
+                    if (rc != 0) {
+                        // Handshake failed: drop the peer handle so the AV
+                        // slot is freed and the next warmup retry starts
+                        // clean.  Cheap under the shared-endpoint model —
+                        // no fi_endpoint teardown required.
+                        ctx->deleteEndpoint(path);
+                    }
+                    return rc;
                 }));
         }
     }
@@ -767,15 +794,6 @@ Status EfaTransport::submitTransferTask(
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const int kMaxRetryCount = globalConfig().retry_cnt;
-    // Striping threshold: transfers larger than this stripe across all
-    // active local NICs (one chunk per NIC) instead of creating thousands
-    // of small slices.  This dramatically reduces per-slice overhead
-    // (spinlock acquisition, atomic ops, MR lookup, heap allocation).
-    // Configurable via GlobalConfig (MC_EFA_STRIPING_THRESHOLD env var).
-    // Default 2MB: below this, single-NIC is faster (avoids endpoint overhead
-    // for 16 tiny chunks); above this, multi-NIC striping with pre-resolved
-    // peer info gives up to +54% throughput.
-    const size_t kStripingThreshold = globalConfig().efa_striping_threshold;
 
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
@@ -794,97 +812,9 @@ Status EfaTransport::submitTransferTask(
             request_device_id = -1;
         }
 
-        if (request.length > kStripingThreshold && request_buffer_id >= 0) {
-            // LARGE TRANSFER: stripe across all active local NICs.
-            // Creates one slice per NIC instead of (length / 64KB) slices,
-            // e.g. 240MB transfer: 4-32 slices vs 3840 slices.
-            std::vector<std::pair<int, std::shared_ptr<EfaContext>>>
-                active_devs;
-            for (int d = 0; d < static_cast<int>(context_list_.size()); ++d) {
-                auto& ctx = context_list_[d];
-                if (!ctx || !ctx->active()) continue;
-                if (static_cast<size_t>(request_buffer_id) <
-                        local_segment_desc->buffers.size() &&
-                    local_segment_desc->buffers[request_buffer_id].lkey.size() >
-                        static_cast<size_t>(d) &&
-                    local_segment_desc->buffers[request_buffer_id].lkey[d] !=
-                        0) {
-                    active_devs.push_back({d, ctx});
-                }
-            }
-
-            if (active_devs.empty()) {
-                LOG(ERROR) << "No active EFA device for striping transfer of "
-                           << request.length << " bytes";
-                for (auto& entry : slices_to_post)
-                    for (auto s : entry.second) s->markFailed();
-                return Status::AddressNotRegistered(
-                    "No active EFA device found for striping");
-            }
-
-            size_t num_nics = active_devs.size();
-            size_t chunk_size = request.length / num_nics;
-
-            // Pre-resolve remote peer info ONCE for all striped slices.
-            // This eliminates per-slice overhead in submitPostSend:
-            //   - getSegmentDescByID lookup
-            //   - selectDevice() call
-            //   - string construction for peer_nic_path
-            // Using retry_count=i distributes slices across remote NICs.
-            auto peer_segment_desc =
-                metadata_->getSegmentDescByID(request.target_id);
-
-            for (size_t i = 0; i < num_nics; ++i) {
-                Slice* slice = getSliceCache().allocate();
-                assert(slice);
-                slice->peer_nic_path.clear();
-                slice->rdma.dest_rkey = 0;
-
-                size_t offset = i * chunk_size;
-                size_t len =
-                    (i == num_nics - 1) ? request.length - offset : chunk_size;
-
-                slice->source_addr = (char*)request.source + offset;
-                slice->length = len;
-                slice->opcode = request.opcode;
-                slice->rdma.dest_addr = request.target_offset + offset;
-                slice->rdma.retry_cnt = request.advise_retry_cnt;
-                slice->rdma.max_retry_cnt = kMaxRetryCount;
-                slice->task = &task;
-                slice->target_id = request.target_id;
-                slice->status = Slice::PENDING;
-                slice->ts = 0;
-                task.slice_list.push_back(slice);
-
-                int dev_id = active_devs[i].first;
-                auto& context = active_devs[i].second;
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[request_buffer_id].lkey[dev_id];
-
-                // Pre-resolve remote NIC: set dest_rkey and peer_nic_path
-                // so submitPostSend() can skip expensive per-slice lookups.
-                if (peer_segment_desc) {
-                    int remote_buffer_id = -1, remote_device_id = -1;
-                    if (selectDevice(peer_segment_desc.get(),
-                                     request.target_offset + offset, len,
-                                     remote_buffer_id, remote_device_id,
-                                     static_cast<int>(i)) == 0) {
-                        slice->rdma.dest_rkey =
-                            peer_segment_desc->buffers[remote_buffer_id]
-                                .rkey[remote_device_id];
-                        slice->peer_nic_path =
-                            peer_segment_desc->name + "@" +
-                            peer_segment_desc->devices[remote_device_id].name;
-                    }
-                }
-
-                slices_to_post[context].push_back(slice);
-                __sync_fetch_and_add(&task.total_bytes, slice->length);
-                __sync_fetch_and_add(&task.slice_count, 1);
-            }
-        } else if (request_buffer_id >= 0 && request_device_id >= 0) {
-            // SMALL TRANSFER (or single-NIC): one slice, no sub-slicing.
-            // Round-robin NIC selection is handled by selectDevice above.
+        if (request_buffer_id >= 0 && request_device_id >= 0) {
+            // One slice per request.  Round-robin NIC selection is
+            // handled by selectDevice above.
             auto& context = context_list_[request_device_id];
             if (!context || !context->active()) {
                 LOG(ERROR) << "EFA Device " << request_device_id
@@ -1093,10 +1023,8 @@ int EfaTransport::initializeEfaResources() {
     for (auto& device_name : efa_devices) {
         auto context = std::make_shared<EfaContext>(*this, device_name);
         auto& config = globalConfig();
-        int ret = context->construct(config.num_cq_per_ctx,
-                                     config.num_comp_channels_per_ctx,
-                                     config.port, config.gid_index,
-                                     config.max_cqe, config.max_ep_per_ctx);
+        int ret = context->construct(config.num_cq_per_ctx, config.max_cqe,
+                                     config.max_ep_per_ctx);
         if (ret) {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "EfaTransport: Disable device " << device_name;

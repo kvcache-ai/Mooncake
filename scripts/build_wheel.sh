@@ -25,6 +25,9 @@ rm -f mooncake-wheel/mooncake/*.so
 
 echo "Creating directory structure..."
 
+# Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
+cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric_allocator_utils.py
+
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 

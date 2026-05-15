@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -379,11 +380,24 @@ class TransferEngineImpl {
         bool remote_accessible;
     };
 
+    using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
+
+    MemoryRegionMap::iterator findMemoryRegionContaining(uintptr_t addr);
+
+    MemoryRegionMap::const_iterator findMemoryRegionContaining(
+        uintptr_t addr) const;
+
+    bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
+
+    void insertMemoryRegionLocked(const MemoryRegion& region);
+
+    void eraseMemoryRegionLocked(void* addr);
+
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
-    std::vector<MemoryRegion> local_memory_regions_;
+    MemoryRegionMap local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
 
     RWSpinlock send_notifies_lock_;

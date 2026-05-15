@@ -158,6 +158,18 @@ class TransferEngineImpl {
 
     Status unlockStageBuffer(uint64_t addr);
 
+    // Test-only hook: replace the transport in a given slot after construct().
+    // Production code never calls this. Used by failover integration tests to
+    // inject a FaultProxyTransport without bypassing resubmitTransferTask,
+    // resolveTransport, or any other engine state. Not thread-safe with any
+    // in-flight transfer on that slot.
+    void swapTransportForTest(TransportType type,
+                              std::shared_ptr<Transport> xport) {
+        if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
+            transport_list_[type] = std::move(xport);
+        }
+    }
+
    private:
     Status construct();
 

@@ -8,6 +8,7 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "utils.h"
+#include "master_service.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
@@ -509,6 +510,105 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
     ASSERT_EQ(metrics.get_batch_put_start_items(), 7);
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Tests for local SSD metrics (Bug 1 fix)
+// ---------------------------------------------------------------------------
+
+// Helper: put a key into a mem segment and immediately notify offload success,
+// simulating the client-side SSD write completing.
+static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
+                                    const std::string& segment_name,
+                                    uint64_t value_size,
+                                    const std::string& key) {
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto put_start = svc.PutStart(client_id, key, value_size, cfg);
+    if (!put_start) return "";
+    svc.PutEnd(client_id, key, ReplicaType::MEMORY);
+
+    StorageObjectMetadata meta;
+    meta.data_size = static_cast<int64_t>(value_size);
+    meta.transport_endpoint = "127.0.0.1:9999";
+    svc.NotifyOffloadSuccess(client_id, {key}, {meta});
+    return key;
+}
+
+// Verify that creating a LocalDiskReplica (via NotifyOffloadSuccess) increments
+// file_allocated_size, and that removing the key decrements it back to zero.
+TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
+    auto& metrics = MasterMetricManager::instance();
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService svc(config);
+
+    constexpr size_t kBuf = 0x400000000;
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+    constexpr uint64_t kValueSize = 4096;
+
+    UUID client_id = generate_uuid();
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = "ssd_alloc_test_segment";
+    seg.base = kBuf;
+    seg.size = kSegSize;
+    seg.te_endpoint = seg.name;
+
+    ASSERT_TRUE(svc.MountSegment(seg, client_id).has_value());
+    ASSERT_TRUE(svc.MountLocalDiskSegment(client_id, true).has_value());
+
+    const int64_t baseline = metrics.get_allocated_file_size();
+
+    // After NotifyOffloadSuccess, a LocalDiskReplica is created.
+    std::string key = PutKeyAndOffload(svc, client_id, seg.name, kValueSize,
+                                       "ssd_alloc_test_key");
+    ASSERT_FALSE(key.empty());
+    EXPECT_EQ(metrics.get_allocated_file_size(), baseline + kValueSize);
+
+    // After removing the key the LocalDiskReplica is destroyed; gauge resets.
+    ASSERT_TRUE(svc.Remove(key).has_value());
+    EXPECT_EQ(metrics.get_allocated_file_size(), baseline);
+}
+
+// Verify that OffloadObjectHeartbeat updates total_file_capacity correctly,
+// including when a client reports a changed capacity on a subsequent heartbeat.
+TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
+    auto& metrics = MasterMetricManager::instance();
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService svc(config);
+
+    constexpr size_t kBuf = 0x500000000;
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+    constexpr int64_t kCap1 = 800LL * 1024 * 1024 * 1024;  // 800 GB
+    constexpr int64_t kCap2 = 400LL * 1024 * 1024 * 1024;  // 400 GB
+
+    UUID client_id = generate_uuid();
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = "ssd_capacity_test_segment";
+    seg.base = kBuf;
+    seg.size = kSegSize;
+    seg.te_endpoint = seg.name;
+
+    ASSERT_TRUE(svc.MountSegment(seg, client_id).has_value());
+    ASSERT_TRUE(svc.MountLocalDiskSegment(client_id, true).has_value());
+
+    const int64_t baseline = metrics.get_total_file_capacity();
+
+    // ReportSsdCapacity: client reports 800 GB.
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap1).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap1);
+
+    // Client reports 400 GB (e.g. config changed).
+    // Gauge must be updated to reflect the new value, not double-counted.
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+
+    // Idempotent: same capacity reported again — gauge must not change.
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
 }
 
 }  // namespace mooncake::test

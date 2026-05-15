@@ -32,13 +32,6 @@ sudo ./dependencies.sh -y
 
 This installs all system packages, git submodules (including pybind11 and yalantinglibs), and Go.
 
-**Additional EFA-specific dependencies** (not covered by `dependencies.sh`):
-
-```bash
-# gflags is needed by transfer_engine_bench and EFA unit tests
-sudo apt-get install -y libgflags-dev
-```
-
 > **Note:** The EFA driver and libfabric are **not** installed by `dependencies.sh`. They must be pre-installed on the instance (see section 1 above).
 
 ## Building Mooncake with EFA Support
@@ -119,34 +112,53 @@ The test suite includes:
 | `WriteAndRead` | Write then read with data integrity check |
 | `MultiWrite` | Batch write (16 requests) |
 | `StressMultipleBatches` | Stress test (20 batches x 8 requests) |
+| `WarmupSegmentLoopback` | `warmupSegment()` handshake path + idempotent re-call |
+| `WarmupSegmentNotFound` | `warmupSegment()` fails cleanly for an unknown segment |
+| `RegisterMemoryBatch` | `registerLocalMemoryBatch` / `unregisterLocalMemoryBatch` round-trip |
+| `LargeTransfer` | 128 MB buffer, 64 x 1 MB slices — exercises WR / CQ pacing |
+| `RepeatedOpenSegment` | `openSegment()` on the same peer repeatedly still transfers correctly |
 
-You can also run all unit tests via CTest:
+You can also run the EFA tests via CTest:
 
 ```bash
-cd build && ctest --output-on-failure
+cd build && ctest --output-on-failure -R 'efa'
 ```
 
-Environment variables for test configuration:
-
-```bash
-export MC_METADATA_SERVER=P2PHANDSHAKE     # default
-export MC_LOCAL_SERVER_NAME=127.0.0.1:12345  # default
-```
+> **Note:** `ctest --output-on-failure` without a filter runs every test in the build, including TCP / metadata / master-service suites that require an etcd server or a running `mooncake_master`. Those will fail or hang on a machine that is only provisioned for EFA testing — the failures are not EFA-specific. Use `-R 'efa'` to restrict the run to the EFA tests.
 
 ## Performance Benchmark
 
 Use `transfer_engine_bench` to measure EFA transport throughput between two nodes.
 
-### Target Node (receiver)
+The following commands are the GPU-to-GPU configuration that produces
+the headline numbers in the [Benchmark Results](#benchmark-results)
+tables (≈ 350 GB/s write on a p5en.48xlarge pair, ≈ 302 GB/s on
+p6-b200.48xlarge). Two things matter the most:
+
+- `--gpu_id=-1` on **both** sides — this fans buffers across every GPU,
+  which in turn lets both NUMA nodes' NICs saturate. Pinning a single
+  GPU (the default `--gpu_id=0`) halves throughput because half the
+  NICs end up cross-NUMA.
+- `--block_size=1048576` (1MB, not the 64 KB default) — each block
+  becomes one `fi_write` / `fi_read`, so larger blocks amortize
+  per-op overhead and are the main knob for hitting line rate.
+
+### 1. Target Node (receiver)
 
 ```bash
 ./build/mooncake-transfer-engine/example/transfer_engine_bench \
     --mode=target \
     --protocol=efa \
-    --metadata_server=P2PHANDSHAKE
+    --metadata_server=P2PHANDSHAKE \
+    --buffer_size=4294967296 \
+    --gpu_id=-1
 ```
 
-### Initiator Node (sender)
+`--buffer_size` must be at least as large as the initiator's
+`--buffer_size` — the initiator writes into offsets `[0, buffer_size)`
+on the target, so keep these in sync.
+
+### 2. Initiator Node (sender)
 
 ```bash
 ./build/mooncake-transfer-engine/example/transfer_engine_bench \
@@ -156,77 +168,56 @@ Use `transfer_engine_bench` to measure EFA transport throughput between two node
     --segment_id=<target_hostname>:<target_port> \
     --operation=write \
     --duration=10 \
-    --threads=8 \
-    --block_size=65536 \
+    --threads=16 \
+    --block_size=1048576 \
     --batch_size=128 \
-    --buffer_size=1073741824 \
+    --buffer_size=4294967296 \
+    --gpu_id=-1 \
     --report_unit=GB
 ```
 
-> **Tip:** For CPU-to-CPU benchmarks, prepend `CUDA_VISIBLE_DEVICES=""` to prevent the CUDA runtime from being initialized. Without it, `nvidia-smi` may show GPU memory usage (due to CUDA context initialization) even though the benchmark only uses DRAM.
+Replace `<target_hostname>:<target_port>` with the target node's
+address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
-Replace `<target_hostname>:<target_port>` with the target node's address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
+> **CPU-to-CPU** (no GPUs): build with `-DUSE_CUDA=OFF`, **or** pass `--use_vram=false` to a CUDA-enabled binary. Drop `--gpu_id=-1` in that case — the bench will spread buffers across NUMA nodes instead.
+
+> **Why `threads=16` and not 32:** the SRD shared endpoint caps outstanding WRs per NIC (default 256 — see `MC_MAX_WR`). With `threads × batch ≤ NICs × max_wr` the CQ never saturates; going higher triggers backoff and times out. 32 threads × 128 batch = 4096 slices chasing 16 × 256 = 4096 WRs has no headroom, so the steady-state config settles at 16 threads.
 
 ### Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--block_size` | 65536 | Bytes per transfer request |
+| `--mode` | initiator | `initiator` (sender) or `target` (receiver) |
+| `--protocol` | rdma | Transport protocol; use `efa` here |
+| `--metadata_server` | `192.168.3.77:2379` | etcd address or `P2PHANDSHAKE` for standalone use |
+| `--segment_id` | `192.168.3.76` | Initiator only: `<target_host>:<target_port>` from the target's startup log |
+| `--operation` | read | `read` or `write` |
+| `--block_size` | 65536 | Bytes per transfer request; **1 MB (1048576) is the main knob for EFA throughput** |
 | `--batch_size` | 128 | Requests per batch |
-| `--threads` | 12 | Concurrent submission threads |
-| `--buffer_size` | 1 GB | Total buffer size (per GPU when `--gpu_id=-1`) |
+| `--threads` | 12 | Concurrent submission threads (initiator) |
+| `--buffer_size` | 1 GB | Buffer size (per GPU when `--gpu_id=-1`, otherwise total) |
 | `--duration` | 10 | Test duration in seconds |
-| `--operation` | write | `read` or `write` |
-| `--report_unit` | GB | `GB\|GiB\|Gb\|MB\|MiB\|Mb` |
-| `--gpu_id` | 0 | GPU device ID; `-1` to use all GPUs (requires `-DUSE_CUDA=ON`) |
+| `--report_unit` | GB | `GB\|GiB\|Gb\|MB\|MiB\|Mb\|KB\|KiB\|Kb` |
+| `--use_vram` | true | Allocate from GPU VRAM (requires `-DUSE_CUDA=ON`); pass `--use_vram=false` for CPU-to-CPU on a CUDA build |
+| `--gpu_id` | 0 | GPU device ID when `--use_vram=true`; `-1` fans buffers across every GPU and is what actually saturates all NICs in a GPU-to-GPU run |
+| `--init_mem` | true | Zero-fill the allocated buffer; rarely needs to change |
+| `--auto_discovery` | false | Auto-discover topology on init; off for reproducible runs |
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `MC_SLICE_SIZE` | 65536 | Slice size for RDMA transport. **Not used by EFA transport** (see note below). |
-| `MC_EFA_STRIPING_THRESHOLD` | 2097152 | Transfers larger than this (bytes) are striped across all NICs |
-
-> **Note on EFA slicing:** Unlike RDMA transport which splits every transfer into fixed `MC_SLICE_SIZE` chunks, EFA transport uses a different strategy: transfers ≤ `MC_EFA_STRIPING_THRESHOLD` (default 2MB) are sent as a **single `fi_write`/`fi_read`** whose size equals `block_size`; transfers larger than the threshold are striped across all NICs (one chunk per NIC). This means **`block_size` directly determines per-operation size** and is the key tuning parameter for EFA, while `MC_SLICE_SIZE` has no effect.
+> **Note on EFA slicing:** EFA transport does not split each transfer
+> into fixed-size slices the way RDMA transport does — each transfer
+> is sent as a single `fi_write` / `fi_read` whose size equals
+> `block_size`, round-robin'd across NICs per request. **`block_size`
+> is the key tuning parameter** for EFA throughput.
 
 > **Note:** `buffer_size` must be >= `block_size * batch_size * threads`. The benchmark auto-adjusts if too small.
 
 ### Benchmark Results
 
-#### p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
-
-Tested on two p6-b200.48xlarge instances in the same AWS placement group.
-
-**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
-
-| Configuration | Write | Read |
-|---------------|-------|------|
-| block=1MB, threads=32, batch=64, buf=2GB/GPU | 285-296 GB/s | 312 GB/s |
-| **block=1MB, threads=16, batch=128, buf=2GB/GPU** | **302 GB/s** | **313 GB/s** |
-
-**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
-
-| Configuration | Write | Read |
-|---------------|-------|------|
-| block=1MB, threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
-
-<details>
-<summary>CPU Parameter Tuning History (p6-b200)</summary>
-
-Earlier CPU-to-CPU tuning results (before EFA striping optimization, when `MC_SLICE_SIZE` was still used by EFA):
-
-| block_size | threads | batch_size | MC_SLICE_SIZE | Throughput |
-|-----------|---------|------------|---------------|-----------|
-| 64KB  | 8  | 128 | default (64KB) | 69.47 GB/s |
-| 128KB | 32 | 128 | default        | 92.33 GB/s |
-| 128KB | 32 | 128 | 256KB          | 156.18 GB/s |
-| 128KB | 48 | 128 | 256KB          | 160.34 GB/s |
-
-> **Note:** These results predate the EFA striping optimization. With the current code, `MC_SLICE_SIZE` no longer affects EFA performance. Use `--block_size=1048576` (1MB) instead, which achieves 222 GB/s.
-
-</details>
-
-#### p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
+#### 1. p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
 
 Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
+
+> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and current EFA tuning work. They are a lower bound for the current code; we will re-sweep and update when the hardware is available again.
 
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=2147483648`):
 
@@ -244,85 +235,178 @@ Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 1
 | Configuration | Write | Read |
 |---------------|-------|------|
 | **block=1MB, threads=32, batch=128, buf=4GB** | **230 GB/s** | 180 GB/s |
-| block=16MB, threads=32, batch=8, buf=8GB (striping off) | 233 GB/s | - |
 
 > CPU-to-CPU is bounded by DRAM bandwidth (~250 GB/s/socket on Xeon 8559C). Per-NIC sampling shows NUMA-0 NICs at 90 Gbps and NUMA-1 NICs at 53 Gbps, confirming DRAM controller saturation rather than NIC limit.
 
-#### p5en.48xlarge (H200, 16 EFA × 200 Gbps)
+#### 2. p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
 
-Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA devices) in the same AWS placement group.
+Tested on two p6-b200.48xlarge instances in the same AWS placement group.
+
+> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and
+> current EFA tuning work. They are a lower bound for the current
+> code; we will re-sweep and update when a B200 pair is available
+> again.
 
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| block=1MB, threads=8, batch=128, buf=1GB/GPU | 236 GB/s | 271 GB/s |
-| block=1MB, threads=16, batch=128, buf=2GB/GPU | 271 GB/s | **297-308 GB/s** |
-| **block=1MB, threads=32, batch=64, buf=2GB/GPU** | **337-347 GB/s** | 274 GB/s |
-
-> GPU HBM bandwidth (>3 TB/s) eliminates the memory bottleneck, allowing full EFA utilization. Write and read have different optimal thread counts: write peaks at 32 threads, read peaks at 16 threads.
-
-> **Note:** EFA memory region registration (fi_mr_reg) for GPU memory segfaults at 4GB+ per GPU. Use `--buffer_size=2147483648` (2GB) as the maximum per-GPU buffer.
+| block=1MB, threads=32, batch=64, buf=2GB/GPU | 285-296 GB/s | 312 GB/s |
+| **block=1MB, threads=16, batch=128, buf=2GB/GPU** | **302 GB/s** | **313 GB/s** |
 
 **CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| Single instance (block=1MB, threads=32, batch=128, buf=4GB) | 179 GB/s | 185 GB/s |
-| NUMA-split (block=1MB, 2 instances, 8 NICs each, threads=16, buf=2GB) | **192 GB/s** | **182 GB/s** |
+| block=1MB, threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
 
-> CPU-to-CPU throughput is bottlenecked by DRAM bandwidth (~155 GB/s per NUMA node, measured with STREAM Copy).
+#### 3. p5en.48xlarge (H200, 16 EFA × 200 Gbps)
 
-#### Cross-Transport Comparison
+Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA devices) in the same AWS placement group.
 
-| Transport | Throughput | Notes |
-|-----------|-----------|-------|
-| **EFA GPU-to-GPU (B300)** | **752 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, ~94% line rate |
-| **EFA GPU-to-GPU (H200)** | **347 GB/s** | p5en.48xlarge, 16×200G, block=1MB |
-| **EFA GPU-to-GPU (B200)** | **313 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB |
-| **EFA CPU-to-CPU (B300)** | **230 GB/s** | p6-b300.48xlarge, 16×400G, block=1MB, DRAM-limited |
-| **EFA CPU-to-CPU (B200)** | **222 GB/s** | p6-b200.48xlarge, 8×400G, block=1MB, DRAM-limited |
-| **EFA CPU-to-CPU (H200)** | **192 GB/s** | p5en.48xlarge, block=1MB, NUMA-split, DRAM-limited |
-| EFA (default params) | 69.47 GB/s | Default block=64KB |
-| TCP (iperf3 baseline) | 9.5 GB/s | Kernel TCP stack, 8 parallel streams |
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=4294967296`):
 
-**EFA vs RoCE RDMA**: On comparable 8×400 Gbps RoCE networks, Mooncake's RDMA transport achieves ~190 GB/s. Tuned EFA **exceeds** RoCE performance with GPU memory (313-347 GB/s) and on CPU-to-CPU (222 GB/s).
+| Configuration | Write | Read |
+|---------------|-------|------|
+| block=1MB, threads=8, batch=128 | 318.71 GB/s | 277.06 GB/s |
+| **block=1MB, threads=16, batch=128** | **365.66 GB/s** | 284.22 GB/s |
+| **block=1MB, threads=16, batch=32** | 297.23 GB/s | **303.78 GB/s** |
+| block=1MB, threads=32, batch=64 | 357.12 GB/s | 279.61 GB/s |
+| block=1MB, threads=32, batch=128 | 364.21 GB/s | 250.90 GB/s |
+| block=1MB, threads=48, batch=64 | 363.47 GB/s | 268.43 GB/s |
+
+> **Peak write: 365 GB/s** at `threads=16, batch=128` — ~91% of the 400 GB/s theoretical line rate (16×200 Gbps). Write saturates on batch size, so `batch=128` outperforms smaller batches as long as `threads × batch ≤ 16 × 256 = 4096` (the shared-endpoint WR cap). **Peak read: 304 GB/s** at `threads=16, batch=32` — reads tolerate smaller in-flight queues, and throughput drops as batch grows.
+
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`, or `--use_vram=false` on a CUDA build, `--buffer_size=4294967296`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| block=1MB, threads=8, batch=128 | 210.76 GB/s | 209.93 GB/s |
+| block=1MB, threads=16, batch=128 | 212.71 GB/s | 211.21 GB/s |
+| **block=1MB, threads=16, batch=32** | 211.67 GB/s | **212.18 GB/s** |
+| block=1MB, threads=32, batch=128 | 212.99 GB/s | 210.33 GB/s |
+| **block=1MB, threads=48, batch=32** | **213.57 GB/s** | 206.92 GB/s |
+
+> CPU-to-CPU is DRAM-bound — throughput is essentially flat (~205–214 GB/s) across every thread / batch combination that doesn't hit the WR cap. Peak write 213.57 GB/s, peak read 212.18 GB/s.
+
+**block_size sweep** (p5en GPU-to-GPU, `threads=16 batch=128 buf=4GB --gpu_id=-1`):
+
+| block | Write | Read |
+|-------|-------|------|
+| 64 KB (default) | 97.11 GB/s | 96.87 GB/s |
+| 128 KB | 190.82 GB/s | 203.88 GB/s |
+| 256 KB | 324.90 GB/s | 296.19 GB/s |
+| 512 KB | 357.62 GB/s | 289.47 GB/s |
+| **1 MB (recommended)** | **352.59 GB/s** | **301.14 GB/s** |
+| 2 MB | 366.87 GB/s | 302.25 GB/s |
+
+> The 64 KB default only reaches ~26% of peak. Write throughput climbs steeply up to ~512 KB and plateaus between 1 MB and 2 MB; read saturates at ~256 KB. 1 MB is the recommended value — within a few percent of the 2 MB peak with more headroom for `batch_size` under the shared-endpoint WR cap.
+
+**buffer_size sweep** (p5en GPU-to-GPU, `threads=16 batch=128 block=1MB --gpu_id=-1`):
+
+| buffer_size | Write | Read |
+|-------------|-------|------|
+| 2 GB (min: `block × batch × threads`) | 353.51 GB/s | 297.03 GB/s |
+| 4 GB | 364.86 GB/s | 293.79 GB/s |
+
+> `buffer_size` only needs to satisfy `buffer_size ≥ block_size × batch_size × threads` (the bench auto-adjusts if smaller, but silently). Anything larger than that minimum does not change throughput — 2 GB vs 4 GB differs by ~3% on write, read is flat within noise. The example commands use 4 GB because it is safe for any reasonable threads/batch combination without having to recompute the minimum.
 
 ### Tuning Tips
 
-- **Use `--block_size=1048576` (1MB)** — this is the most important tuning parameter for EFA. Each `block_size`-sized transfer becomes a single `fi_write`/`fi_read` call, so larger blocks amortize per-operation overhead. 1MB gives ~2× throughput over the 64KB default.
-- `MC_SLICE_SIZE` has **no effect** on EFA transport (it only applies to RDMA transport). Use `block_size` instead.
-- Increase `--threads` to 32-48 to saturate multiple EFA devices (2-4 threads per device is a good starting point)
-- For **CPU-to-CPU**: use `--block_size=1048576` (1MB) with NUMA-split (separate instances per NUMA node) for best results
-- For **GPU-to-GPU**: use `--block_size=1048576` (1MB), `--gpu_id=-1` (all GPUs), and `--buffer_size=2147483648` (2GB max per GPU). Write peaks at threads=32, read at threads=16
-- Keep `--batch_size` such that `block_size * batch_size * threads <= buffer_size`
-- Allocate buffers on both NUMA nodes for balanced NIC utilization (the bench tool does this by default for CPU mode)
-- On 16-NIC instances (p5en), writes are NUMA-sensitive: 8 local-NUMA NICs reach 90 Gbps each, while 8 cross-NUMA NICs only reach ~20 Gbps without NUMA-split
+- **Use `--block_size=1048576` (1MB)** — the single most important knob. The 64 KB default reaches only ~26% of peak. 1 MB is within a few percent of the 2 MB plateau while leaving headroom for `batch_size` under the shared-endpoint WR cap.
+- **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD shared endpoint each NIC carries one `fid_ep` with a 256 WR cap (`MC_MAX_WR`), giving `16 NICs × 256 = 4096` in-flight slots on a 16-NIC host. Exceeding this trips "timed out waiting for CQ drain". In practice `threads=16, batch=128` is a solid baseline; going higher rarely adds throughput and routinely hits the cap.
+- **Write vs read:** write benefits from larger batches (peak at `batch=128`); read prefers smaller in-flight queues (peak at `batch=32` on p5en).
+- For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU halves throughput because half the NICs end up cross-NUMA.
+- For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split (separate initiator/target instances per NUMA node) can help reduce contention when one instance can't saturate both nodes.
+- `--buffer_size` only needs `≥ block × batch × threads`; larger
+  values do not improve throughput. The example commands use 4 GB
+  because that is safe for any reasonable config.
 
-### Eager endpoint warmup (first-request latency)
+### First-request latency
 
-libfabric `FI_EP_RDM` endpoints resolve peer addresses lazily: `fi_av_insert()` and the metadata handshake fire on the first send to each `(local_ctx, peer_nic)` pair. On 16-NIC instances that gives `16 × N_peer_NICs` serial handshakes inside the first `submitTransfer`, which shows up as a single-digit-second first-batch stall (measured ~4 s on p6-B300 for a 100 × 0.5 MB batch; the first batch runs at <0.1 GB/s while the CQ drains, steady-state afterwards is unaffected).
+Peer addressing resolves lazily: `fi_av_insert()` and the metadata handshake fire on the first send to each `(local_NIC, peer_NIC)` pair. On 16-NIC hosts, the first few `submitTransfer` calls carry this cost before steady state.
 
-Mooncake exposes an explicit eager-warmup API to eliminate the stall:
+**Measured on p5en (16 × 16 NICs, cross-node, 1 MB write, 3 reps, median):**
 
-- C++: `EfaTransport::warmupSegment(const std::string& segment_name)`
-- C: `int warmupEfaSegment(transfer_engine_t engine, const char *segment_name)`
-- Rust: `TransferEngine::warmup_efa_segment(name: &str)`
-
-Call it once per peer segment, right after `openSegment` (or after any metadata change that adds a new peer). Every `(local_ctx, peer_nic)` endpoint is connected concurrently via `std::async`; the critical path becomes `max(handshake RTT)` instead of `sum(handshake RTT)`. The call is idempotent — safe to re-run.
-
-Measured on p6-B300 (16 local NICs × 16 peer NICs, dual-NUMA initiator, 100 × 0.5 MB batch):
-
-| | first-batch latency | steady-state |
+| | cold submit #0 (no warmup) | `warmupSegment()` (all 256 pairs) |
 |---|---:|---:|
-| No warmup | 4,043 ms | 141 GB/s |
-| `warmup_efa_segment` (256 endpoints connected in 4.1 s) | **13.5 ms** (~300×) | 230 GB/s |
+| SRD shared endpoint (#1944) | **26 ms** | **1.1 s** |
+| Per-peer `fid_ep` (upstream main) | 99 ms | 17 s |
+| Speedup | **~4×** | **~15×** |
 
-The warmup call itself takes roughly the same wall time as the stall it replaces — the win is that it's a one-time setup cost decoupled from the critical path of the first real transfer, not paid inside your latency budget.
+The SRD shared-endpoint refactor (#1944) speeds up first-request latency two different ways:
+
+- **Without any code change from callers** — the cold `submitTransfer` is ~4× faster (26 ms vs 99 ms), because the shared endpoint removes the per-peer `fi_endpoint` / `fi_enable` that used to dominate. This is what existing Mooncake callers (vLLM, SGLang, etc.) will see.
+- **For callers that want sub-10 ms first-request latency**, an explicit eager-warmup API lets you pay the handshake cost up front, outside the critical path:
+  - C++: `EfaTransport::warmupSegment(const std::string& segment_name)`
+  - C: `int warmupEfaSegment(transfer_engine_t engine, const char *segment_name)`
+  - Rust: `TransferEngine::warmup_efa_segment(name: &str)`
+  - Python: `engine.warmup_efa_segment(segment_name)`
+
+  Call once per peer right after `openSegment`. The call is idempotent. Under this refactor `warmupSegment` itself is ~15× faster than the pre-#1944 code (1.1 s vs 17 s), bounded by the peer's single-threaded handshake RPC daemon (`accept` + JSON parse serialized on one thread), so it scales linearly with the number of fresh NIC pairs.
+
+vLLM and SGLang do not currently call `warmupSegment` — they go through the generic `TransferEngine` interface and pick up the 4× cold-submit speedup automatically. The API is there for direct Mooncake callers that want the larger win.
+
+#### Reproducing the numbers — `efa_first_submit_probe`
+
+`mooncake-transfer-engine/example/efa_first_submit_probe.cpp` is a two-host probe that isolates the two latency costs `transfer_engine_bench` hides inside its 10-second throughput average:
+
+1. **Cold first-submit** — the handshake + `fi_av_insert()` that fires on the first send to each `(local_NIC, peer_NIC)` pair.
+2. **Eager warmup** — how much of that is paid up front by an explicit `warmupSegment()` call.
+
+It is EFA-specific (there is no `warmupSegment` on the RDMA / TCP transports — they establish connections at `connect` time, so "pre-warming" has no meaning there) and intentionally not wired into `ctest`: it needs two hosts.
+
+**Run**:
+
+```bash
+# On the target host:
+./build/mooncake-transfer-engine/example/efa_first_submit_probe \
+    --mode=target \
+    --metadata_server=P2PHANDSHAKE \
+    --local_server_name=$(hostname):12345
+
+# Note the "[target] ready, addr=<ip>:<port>" line, then on the initiator:
+./build/mooncake-transfer-engine/example/efa_first_submit_probe \
+    --mode=initiator \
+    --metadata_server=P2PHANDSHAKE \
+    --local_server_name=$(hostname):12346 \
+    --segment_id=<target_ip>:<target_port> \
+    --warmup=1 \
+    --iters=5
+```
+
+**What it prints**:
+
+```
+warmup:   1094.74 ms (rc=0)           # present only with --warmup=1
+submit #0:   6.95 ms                   # first user-visible submit
+submit #1:   5.45 ms                   # steady state
+submit #2:   5.92 ms
+submit #3:   5.67 ms
+submit #4:   0.09 ms
+```
+
+- `warmup:` is the wall time of `EfaTransport::warmupSegment()` — it opens every `(local_NIC, peer_NIC)` pair (16 × 16 = 256 on p5en) up front.
+- `submit #0` through `#N-1` are the timings of single 1 MB `submitTransfer + poll`. With `--warmup=1` they are all in the steady-state regime. With `--warmup=0`, `#0` pays the handshake cost, `#1+` are steady state.
+
+**Flags**:
+
+| Flag | Default | What it controls |
+|---|---|---|
+| `--warmup` | `true` | Call `warmupSegment()` before the first submit |
+| `--iters` | `5` | How many timed submits after warmup |
+| `--xfer_size` | `1<<20` (1 MB) | Bytes per submit |
+| `--buffer_size` | `1<<30` (1 GB) | Registered buffer size |
+| `--local_server_name` | `hostname:12345` | Local metadata advertise name |
+
+**Use cases**:
+
+- **Deciding whether your application needs `warmupSegment()`**: if `submit #0` in the `--warmup=0` run is acceptable for your use case, you don't need to call `warmupSegment` at all.
+- **Comparing PR branches**: run the probe on the same hardware on this PR's branch vs `main` (or whatever upstream you're benchmarking against) to see per-NIC-pair handshake cost directly, without having the number drowned in a 10-second throughput average.
 
 ## Usage with vLLM
 
-### Prefill Instance
+### 1. Prefill Instance
 
 ```bash
 VLLM_MOONCAKE_BOOTSTRAP_PORT=8998 \
@@ -332,7 +416,7 @@ vllm serve <model_path> -tp 8 \
    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"mooncake_protocol":"efa"}}'
 ```
 
-### Decode Instance
+### 2. Decode Instance
 
 ```bash
 vllm serve <model_path> -tp 8 \
@@ -398,32 +482,35 @@ AWS EFA exposes RDMA-like devices through the ibverbs interface, but does not su
 
 ### EFA Transport Architecture
 
+Under the SRD shared-endpoint model every peer is addressed through one `fid_ep` per local NIC — peers are AV-slot entries, not separate endpoints.
+
 ```
-┌─────────────────────────────────────────────────────┐
-│                   EfaTransport                       │
-├─────────────────────────────────────────────────────┤
-│  EfaContext (per device)                            │
-│  ├── fi_info      (fabric info)                     │
-│  ├── fid_fabric   (fabric handle)                   │
-│  ├── fid_domain   (protection domain)               │
-│  ├── fid_av       (address vector for peer lookup)  │
-│  ├── fid_cq       (completion queues)               │
-│  └── fid_mr       (memory regions)                  │
-├─────────────────────────────────────────────────────┤
-│  EfaEndpoint (per connection)                       │
-│  ├── fid_ep       (RDM endpoint)                    │
-│  ├── fi_addr_t    (peer address)                    │
-│  └── local_addr   (local endpoint address)          │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│                   EfaTransport                            │
+├───────────────────────────────────────────────────────────┤
+│  EfaContext (per local NIC)                               │
+│  ├── fid_fabric     (fabric handle)                       │
+│  ├── fid_domain     (protection domain)                   │
+│  ├── fid_av         (address vector — one slot per peer)  │
+│  ├── fid_cq         (completion queues)                   │
+│  ├── fid_mr         (memory regions)                      │
+│  ├── shared_ep_     (the single fid_ep that serves every  │
+│  │                   peer via fi_addr_t lookup in the AV) │
+│  └── peer_map_      (normalized nic_path -> EfaEndPoint)  │
+├───────────────────────────────────────────────────────────┤
+│  EfaEndPoint (per peer)                                   │
+│  └── peer_fi_addr_  (AV slot index for this peer; sends   │
+│                      route through the owning context's    │
+│                      shared_ep_ with this fi_addr_t)      │
+└───────────────────────────────────────────────────────────┘
 ```
 
 ### Thread Safety
 
-The EFA transport requests `FI_THREAD_SAFE` from the libfabric provider and adds per-endpoint spinlocks to serialize `fi_write`/`fi_read` calls. This is necessary because:
+The EFA transport requests `FI_THREAD_SAFE` at the domain level and guards the shared endpoint with a single `post_lock_` spinlock (one per `EfaContext`, i.e. one per local NIC) to serialize `fi_write`/`fi_read` calls. This is necessary because:
 
-- Multiple submission threads may route slices to the same endpoint concurrently
-- libfabric RDM endpoints default to `FI_THREAD_UNSPEC` (no thread safety guarantees)
-- Concurrent `fi_write`/`fi_read` without serialization corrupts provider internals, causing completions to silently vanish
+- Multiple submission threads may route slices through the same shared endpoint concurrently.
+- libfabric's EFA RDM endpoints are not thread-safe for concurrent `fi_write`/`fi_read` even under `FI_THREAD_SAFE` at the domain level — concurrent posts corrupt provider internals and completions silently vanish.
 
 CQ completion queues are polled by dedicated worker threads (one per EFA device) that run independently of submission threads.
 
@@ -435,9 +522,8 @@ CQ completion queues are polled by dedicated worker threads (one per EFA device)
 | Endpoint type | `FI_EP_RDM` (message-based) | Queue Pairs (true RDMA) |
 | Write operation | Software-emulated via messages + ACKs | Hardware-offloaded one-sided RDMA |
 | CPU overhead | Moderate (provider processes ACKs) | Minimal (NIC handles everything) |
-| Throughput CPU-to-CPU (8×400G) | 222 GB/s (tuned) | ~190 GB/s |
-| Throughput GPU-to-GPU (16×200G) | 347 GB/s (tuned) | N/A |
-| Throughput GPU-to-GPU (8×400G) | 313 GB/s (tuned) | N/A |
+| Throughput GPU-to-GPU (16×200G, p5en) | 365 GB/s (tuned) | N/A |
+| Throughput CPU-to-CPU (16×200G, p5en) | 213 GB/s (tuned) | — |
 | AWS availability | All EFA-enabled instances | Not available on AWS |
 
 ### Supported AWS Instance Types

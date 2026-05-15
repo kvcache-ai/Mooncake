@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace mooncake {
 
@@ -34,7 +35,8 @@ struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
     uint8_t port = 1;
-    int gid_index = -1;  // -1 for auto-selection, >=0 for user-specified
+    int gid_index = -1;       // -1 for auto-selection, >=0 for user-specified
+    uint16_t pkey_index = 0;  // QP attr.pkey_index; override via MC_PKEY_INDEX
     uint64_t max_mr_size = 0x10000000000;
     size_t max_cqe = 4096;
     int max_ep_per_ctx = 65536;
@@ -65,7 +67,6 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
-    size_t efa_striping_threshold = 2 * 1024 * 1024;  // 2MB default
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;
@@ -91,6 +92,11 @@ void updateGlobalConfig(ibv_device_attr& device_attr);
 GlobalConfig& globalConfig();
 
 uint16_t getDefaultHandshakePort();
+
+// Validates a port range. Returns {default_min, default_max} on invalid input.
+// Rejects: min > max, well-known ports (0-1023), ephemeral ports (32768-60999).
+std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                      int default_min, int default_max);
 
 }  // namespace mooncake
 

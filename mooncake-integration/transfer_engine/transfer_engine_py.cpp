@@ -21,6 +21,10 @@
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
 
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_transport.h"
+#endif
+
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
 #endif
@@ -951,6 +955,20 @@ void TransferEnginePy::batchTransferReadOnCuda(
 }
 #endif
 
+int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
+#ifdef USE_EFA
+    pybind11::gil_scoped_release release;
+    auto* t = engine_->getTransport("efa");
+    if (!t) return 0;  // EFA transport not installed; nothing to do.
+    auto* efa = dynamic_cast<EfaTransport*>(t);
+    if (!efa) return 0;
+    return efa->warmupSegment(segment_name);
+#else
+    (void)segment_name;
+    return 0;
+#endif
+}
+
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string& segment_name) {
     Transport::SegmentHandle segment_id =
@@ -1086,6 +1104,8 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("device_name") = nullptr)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress)
+            .def("warmup_efa_segment", &TransferEnginePy::warmupEfaSegment,
+                 py::arg("segment_name"))
             .def("get_notifies", &TransferEnginePy::getNotifies)
             .def("get_engine", &TransferEnginePy::getEngine)
             .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);

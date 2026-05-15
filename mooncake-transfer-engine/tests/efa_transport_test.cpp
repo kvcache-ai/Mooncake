@@ -21,6 +21,7 @@
 #include <memory>
 
 #include "transfer_engine.h"
+#include "transport/efa_transport/efa_transport.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -324,6 +325,176 @@ TEST_F(EFATransportTest, StressMultipleBatches) {
 
         s = setup.engine->freeBatchID(batch_id);
         ASSERT_TRUE(s.ok());
+    }
+
+    destroyEngine(setup);
+}
+
+// Test 6: warmupSegment on loopback peer
+//
+// Exercises EfaTransport::warmupSegment() which is the C++ entry point
+// behind the warmup_efa_segment() Python binding / warmupEfaSegment() C API.
+// Loopback is enough to cover the handshake + fi_av_insert path AND the
+// idempotent short-circuit on the second call.
+TEST_F(EFATransportTest, WarmupSegmentLoopback) {
+    auto setup = createEngine();
+
+    auto *efa = dynamic_cast<EfaTransport *>(setup.xport);
+    ASSERT_NE(efa, nullptr)
+        << "installTransport did not return an EfaTransport";
+
+    // First call: should connect every (local NIC x peer NIC) pair.
+    int rc = efa->warmupSegment(setup.engine->getLocalIpAndPort());
+    EXPECT_EQ(rc, 0) << "warmupSegment should succeed on loopback";
+
+    // Second call: should short-circuit (all endpoints already connected).
+    rc = efa->warmupSegment(setup.engine->getLocalIpAndPort());
+    EXPECT_EQ(rc, 0) << "warmupSegment should be idempotent";
+
+    // Empty / self-name: short-circuit path returning 0 without touching AV.
+    rc = efa->warmupSegment("");
+    EXPECT_EQ(rc, 0) << "warmupSegment(\"\") should be a no-op";
+
+    destroyEngine(setup);
+}
+
+// Test 7: warmupSegment on a non-existent segment name should fail cleanly
+// (no crash, no hang) rather than blocking for the poll timeout.
+TEST_F(EFATransportTest, WarmupSegmentNotFound) {
+    auto setup = createEngine();
+
+    auto *efa = dynamic_cast<EfaTransport *>(setup.xport);
+    ASSERT_NE(efa, nullptr);
+
+    int rc = efa->warmupSegment("127.0.0.1:1");  // not openSegment'd
+    EXPECT_NE(rc, 0) << "warmupSegment should fail for unknown segment";
+
+    destroyEngine(setup);
+}
+
+// Test 8: registerLocalMemoryBatch / unregisterLocalMemoryBatch round-trip.
+// Covers the batched MR path which the single-buffer tests above never hit.
+TEST_F(EFATransportTest, RegisterMemoryBatch) {
+    auto engine = std::make_unique<TransferEngine>(false);
+    engine->getLocalTopology()->discover({});
+    auto hp = parseHostNameWithPort(local_server_name_);
+    int rc = engine->init(metadata_server_, local_server_name_,
+                          hp.first.c_str(), hp.second);
+    ASSERT_EQ(rc, 0);
+
+    Transport *xport = engine->installTransport("efa", nullptr);
+    ASSERT_NE(xport, nullptr);
+
+    const size_t kBufSize = 4ull << 20;  // 4 MB each
+    const int kNumBufs = 4;
+    std::vector<void *> addrs;
+    std::vector<BufferEntry> entries;
+    for (int i = 0; i < kNumBufs; ++i) {
+        void *a = allocateMemoryPool(kBufSize, 0);
+        ASSERT_NE(a, nullptr);
+        addrs.push_back(a);
+        entries.push_back({a, kBufSize});
+    }
+
+    rc = engine->registerLocalMemoryBatch(entries, "cpu:0");
+    EXPECT_EQ(rc, 0) << "registerLocalMemoryBatch should succeed";
+
+    rc = engine->unregisterLocalMemoryBatch(addrs);
+    EXPECT_EQ(rc, 0) << "unregisterLocalMemoryBatch should succeed";
+
+    for (void *a : addrs) freeMemoryPool(a, kBufSize);
+}
+
+// Test 9: Larger transfer (64 MB total split into 1 MB slices) to exercise
+// the WR / CQ pacing logic in EfaContext::submitSlicesOnPeer beyond what the
+// 16 x 64 KB MultiWrite test reaches.
+TEST_F(EFATransportTest, LargeTransfer) {
+    const size_t kBufSize = 128ull << 20;  // 128 MB
+    auto setup = createEngine(kBufSize);
+
+    auto segment_desc =
+        setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+
+    const size_t kSliceLen = 1ull << 20;  // 1 MB per slice
+    const int kNumSlices = 64;            // 64 MB total
+    ASSERT_LE(static_cast<size_t>(kNumSlices) * kSliceLen, kBufSize / 2);
+
+    // Fill first half with known data
+    uint8_t *buf = (uint8_t *)setup.addr;
+    for (size_t i = 0; i < static_cast<size_t>(kNumSlices) * kSliceLen; ++i)
+        buf[i] = (uint8_t)(i & 0xFF);
+
+    auto batch_id = setup.engine->allocateBatchID(kNumSlices);
+    std::vector<TransferRequest> requests;
+    requests.reserve(kNumSlices);
+    for (int i = 0; i < kNumSlices; ++i) {
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = kSliceLen;
+        entry.source = buf + i * kSliceLen;
+        entry.target_id = setup.segment_id;
+        entry.target_offset = remote_base + (kBufSize / 2) + i * kSliceLen;
+        requests.push_back(entry);
+    }
+
+    Status s = setup.engine->submitTransfer(batch_id, requests);
+    ASSERT_TRUE(s.ok()) << "submitTransfer failed: " << s.ToString();
+
+    for (int task_id = 0; task_id < kNumSlices; ++task_id) {
+        TransferStatus status;
+        const int kMaxPollIterations = 2000000;
+        int i = 0;
+        for (; i < kMaxPollIterations; ++i) {
+            s = setup.engine->getTransferStatus(batch_id, task_id, status);
+            ASSERT_TRUE(s.ok());
+            if (status.s == TransferStatusEnum::COMPLETED) break;
+            ASSERT_NE(status.s, TransferStatusEnum::FAILED);
+        }
+        ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED)
+            << "task " << task_id << " did not complete";
+    }
+
+    s = setup.engine->freeBatchID(batch_id);
+    ASSERT_TRUE(s.ok());
+
+    // Verify byte-level integrity of the last slice (spot check).
+    EXPECT_EQ(0, memcmp(buf + (kNumSlices - 1) * kSliceLen,
+                        buf + (kBufSize / 2) + (kNumSlices - 1) * kSliceLen,
+                        kSliceLen));
+
+    destroyEngine(setup);
+}
+
+// Test 10: Repeated open/close of the same remote segment must not leak AV
+// slots or break loopback transfers — this is the setPeerNicPath-detach path
+// that target restarts depend on under the SRD shared-endpoint model.
+TEST_F(EFATransportTest, RepeatedOpenSegment) {
+    auto setup = createEngine();
+
+    auto actual_addr = setup.engine->getLocalIpAndPort();
+
+    // First write via setup.segment_id (from createEngine()).
+    auto segment_desc =
+        setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+    memset(setup.addr, 0xCD, 4096);
+    EXPECT_TRUE(submitAndWait(setup.engine.get(), setup.segment_id, setup.addr,
+                              remote_base, 4096, TransferRequest::WRITE));
+
+    // Re-open same segment several times; each should return a working handle
+    // and subsequent writes should still succeed.
+    for (int i = 0; i < 5; ++i) {
+        SegmentID sid = setup.engine->openSegment(actual_addr);
+        ASSERT_NE(sid, (SegmentID)-1);
+        auto desc = setup.engine->getMetadata()->getSegmentDescByID(sid);
+        ASSERT_NE(desc, nullptr);
+        uint64_t base = (uint64_t)desc->buffers[0].addr;
+        ASSERT_TRUE(submitAndWait(setup.engine.get(), sid, setup.addr, base,
+                                  4096, TransferRequest::WRITE))
+            << "write #" << i << " after re-open failed";
     }
 
     destroyEngine(setup);

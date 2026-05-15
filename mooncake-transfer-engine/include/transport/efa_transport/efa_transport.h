@@ -70,18 +70,15 @@ class EfaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void*>& addr_list) override;
 
-    // Eagerly establish EFA endpoints to every NIC of `segment_name`.
+    // Eagerly populate the address vector with every (local_ctx, peer_nic)
+    // handshake for `segment_name`.
     //
-    // Rationale: libfabric FI_EP_RDM endpoints resolve peer addresses lazily
-    // via fi_av_insert() on first send. With 16 local NICs × N peer NICs,
-    // the first submitTransfer() of a batch serializes ~N*16
-    // handshake+fi_av_insert round-trips, producing a single-digit-second
-    // stall (observed ~6 s on B300 for the first 100 × 0.5 MB batch). After
-    // this call returns, every (local_ctx, peer_nic) endpoint is CONNECTED
-    // and the first real submitTransfer() goes straight to fi_write/fi_read.
+    // Under the shared-endpoint model each warmup is handshake RPC +
+    // fi_av_insert — no fi_endpoint/fi_enable.  This removes the first-
+    // submit stall (handshakes on the data path) without consuming QPs.
     //
     // Safe to call multiple times (idempotent: endpoint() + setup are both
-    // idempotent). Re-run after any openSegment() on a new peer.
+    // idempotent).  Re-run after any openSegment() on a new peer.
     int warmupSegment(const std::string& segment_name);
 
    private:

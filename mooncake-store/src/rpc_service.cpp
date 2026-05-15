@@ -1651,6 +1651,15 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
+    const UUID& client_id, int64_t ssd_total_capacity_bytes) {
+    ScopedVLogTimer timer(1, "ReportSsdCapacity");
+    timer.LogRequest("client_id=", client_id,
+                     ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
+    return master_service_.ReportSsdCapacity(client_id,
+                                             ssd_total_capacity_bytes);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -1753,6 +1762,8 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(

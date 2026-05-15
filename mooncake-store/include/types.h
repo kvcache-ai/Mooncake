@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <limits>
 #include <unordered_map>
 #include <utility>
@@ -122,6 +123,46 @@ static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
 static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
 static constexpr uint32_t DEFAULT_MAX_RETRY_ATTEMPTS = 10;
+
+/**
+ * @brief Data type classification for objects stored in Mooncake Store.
+ *
+ * This allows the store to track what kind of data each object holds,
+ * enabling future type-aware policies (eviction priority, replication
+ * strategies, etc.). Defaults to UNKNOWN for backward compatibility.
+ */
+enum class ObjectDataType : uint8_t {
+    UNKNOWN = 0,
+    KVCACHE = 1,
+    TENSOR = 2,
+    WEIGHT = 3,
+    SAMPLE = 4,
+    ACTIVATION = 5,
+    GRADIENT = 6,
+    OPTIMIZER_STATE = 7,
+    METADATA = 8,
+    GENERAL = 9,
+    // 10-255 reserved for future types
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const ObjectDataType& type) noexcept {
+    static const std::unordered_map<ObjectDataType, std::string_view>
+        type_strings{{ObjectDataType::UNKNOWN, "UNKNOWN"},
+                     {ObjectDataType::KVCACHE, "KVCACHE"},
+                     {ObjectDataType::TENSOR, "TENSOR"},
+                     {ObjectDataType::WEIGHT, "WEIGHT"},
+                     {ObjectDataType::SAMPLE, "SAMPLE"},
+                     {ObjectDataType::ACTIVATION, "ACTIVATION"},
+                     {ObjectDataType::GRADIENT, "GRADIENT"},
+                     {ObjectDataType::OPTIMIZER_STATE, "OPTIMIZER_STATE"},
+                     {ObjectDataType::METADATA, "METADATA"},
+                     {ObjectDataType::GENERAL, "GENERAL"}};
+
+    auto it = type_strings.find(type);
+    os << (it != type_strings.end() ? it->second : "UNKNOWN");
+    return os;
+}
 
 // Forward declarations
 class BufferAllocatorBase;
