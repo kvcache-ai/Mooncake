@@ -40,7 +40,11 @@ DUMMY_TEST_PID_2=$!
 wait $DUMMY_TEST_PID_1 $DUMMY_TEST_PID_2
 kill $CLIENT_PID || true
 
-pip install torch numpy safetensors packaging
+pip install numpy safetensors packaging
+# Keep the test torch aligned with the EP/PG variants packaged into the CI wheel.
+pip install "${MOONCAKE_TEST_TORCH_SPEC:-torch==2.11.0+cu128}" \
+    --index-url "${MOONCAKE_TEST_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}" \
+    --extra-index-url https://pypi.org/simple
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 kill $MASTER_PID || true

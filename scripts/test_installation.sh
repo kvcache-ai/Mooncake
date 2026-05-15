@@ -37,7 +37,11 @@ echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
 cd test_env
-pip install torch numpy
+pip install numpy
+# Keep the test torch aligned with the EP/PG variants packaged into the CI wheel.
+pip install "${MOONCAKE_TEST_TORCH_SPEC:-torch==2.11.0+cu128}" \
+    --index-url "${MOONCAKE_TEST_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}" \
+    --extra-index-url https://pypi.org/simple
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."
