@@ -38,6 +38,11 @@ tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    auto availability = ValidateHABackendAvailability(backend_type.value());
+    if (availability != ErrorCode::OK) {
+        return tl::make_unexpected(availability);
+    }
+
     auto connstring = ResolveHABackendConnstring(config);
     if (connstring.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
