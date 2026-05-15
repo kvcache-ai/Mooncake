@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <string>
 #include <vector>
 #include "gpu_staging_utils.h"
 #include "transfer_engine.h"
@@ -447,10 +448,12 @@ TransferStrategy TransferFuture::strategy() const {
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      std::shared_ptr<StorageBackend>& backend,
+                                     const std::string& local_hostname,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
+      local_hostname_(local_hostname),
       transfer_metric_(transfer_metric) {
     // Read MC_STORE_MEMCPY environment variable.
     // When not set, auto-detect based on transport type:
@@ -815,11 +818,20 @@ TransferStrategy TransferSubmitter::selectStrategy(
 
 bool TransferSubmitter::isLocalTransfer(
     const AllocatedBuffer::Descriptor& handle) const {
-    std::string local_ep = engine_.getLocalIpAndPort();
+    if (handle.transport_endpoint_.empty()) return false;
 
-    if (!local_ep.empty()) {
-        return !handle.transport_endpoint_.empty() &&
-               handle.transport_endpoint_ == local_ep;
+    // Metadata-service descriptors use the client hostname as the segment ID.
+    // If it matches this client's hostname, the buffer address is local.
+    if (!local_hostname_.empty() &&
+        local_hostname_ == handle.transport_endpoint_) {
+        return true;
+    }
+
+    // P2P descriptors use the transfer engine endpoint as the segment ID.
+    // If it matches this engine's endpoint, the buffer address is local.
+    std::string local_ep = engine_.getLocalIpAndPort();
+    if (!local_ep.empty() && handle.transport_endpoint_ == local_ep) {
+        return true;
     }
 
     // Without a local endpoint we cannot prove locality; disable memcpy.

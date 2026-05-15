@@ -845,7 +845,8 @@ auto MasterService::AllocateAndInsertMetadata(
     shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin));
+                              config.with_soft_pin, config.with_hard_pin,
+                              config.data_type));
     shard->processing_keys.insert(key);
 
     return replica_list;
@@ -4322,7 +4323,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned()));
+                metadata_ptr->IsHardPinned(), metadata_ptr->data_type));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -4337,12 +4338,12 @@ MasterService::MetadataSerializer::SerializeMetadata(
     MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, replicas...,
-    // hard_pinned]
+    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
+    // replicas..., hard_pinned]
 
-    size_t array_size = 8;  // client_id, put_start_time, size, lease_timeout,
+    size_t array_size = 9;  // client_id, put_start_time, size, lease_timeout,
                             // has_soft_pin_timeout, soft_pin_timeout,
-                            // replicas_count + hard_pinned
+                            // replicas_count, data_type, hard_pinned
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -4382,6 +4383,9 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
 
+    // Serialize data_type
+    packer.pack(static_cast<uint8_t>(metadata.data_type));
+
     // Serialize replicas
     for (const auto& replica : metadata.GetAllReplicas()) {
         auto result = Serializer<Replica>::serialize(
@@ -4408,7 +4412,6 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
     // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count
-    // (8th element = hard_pinned is optional for backward compat)
     if (obj.via.array.size < 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -4441,13 +4444,33 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // Array size: 7 + replicas_count (old format) or 8 + replicas_count (new
-    // format with hard_pinned)
-    if (obj.via.array.size != 7 + replicas_count &&
-        obj.via.array.size != 8 + replicas_count) {
+    // Format detection:
+    //   v1: 7 + replicas_count, no data_type or hard_pinned
+    //   v2: 8 + replicas_count, either data_type or trailing hard_pinned
+    //   v3: 9 + replicas_count, data_type plus trailing hard_pinned
+    constexpr uint32_t kOldFieldCount = 7;
+    constexpr uint32_t kOneExtraFieldCount = 8;
+    constexpr uint32_t kCurrentFieldCount = 9;
+    const uint32_t total_elements = obj.via.array.size;
+    const bool is_old_format =
+        (total_elements == kOldFieldCount + replicas_count);
+    const bool is_one_extra_format =
+        (total_elements == kOneExtraFieldCount + replicas_count);
+    const bool is_current_format =
+        (total_elements == kCurrentFieldCount + replicas_count);
+
+    if (!is_current_format && !is_one_extra_format && !is_old_format) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size mismatch"));
+    }
+
+    ObjectDataType data_type = ObjectDataType::UNKNOWN;
+    if (is_current_format) {
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+    } else if (is_one_extra_format &&
+               array[index].type == msgpack::type::POSITIVE_INTEGER) {
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     }
 
     // Deserialize replicas
@@ -4475,7 +4498,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned);
+        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 

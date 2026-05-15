@@ -1574,6 +1574,20 @@ class MooncakeHostMemAllocatorPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    // Object data type classification
+    py::enum_<ObjectDataType>(m, "ObjectDataType")
+        .value("UNKNOWN", ObjectDataType::UNKNOWN)
+        .value("KVCACHE", ObjectDataType::KVCACHE)
+        .value("TENSOR", ObjectDataType::TENSOR)
+        .value("WEIGHT", ObjectDataType::WEIGHT)
+        .value("SAMPLE", ObjectDataType::SAMPLE)
+        .value("ACTIVATION", ObjectDataType::ACTIVATION)
+        .value("GRADIENT", ObjectDataType::GRADIENT)
+        .value("OPTIMIZER_STATE", ObjectDataType::OPTIMIZER_STATE)
+        .value("METADATA", ObjectDataType::METADATA)
+        .value("GENERAL", ObjectDataType::GENERAL)
+        .export_values();
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -1585,6 +1599,7 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
@@ -1616,6 +1631,9 @@ PYBIND11_MODULE(store, m) {
         .def("is_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_disk_replica))
+        .def("is_local_disk_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_local_disk_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()

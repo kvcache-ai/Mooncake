@@ -161,8 +161,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      client_buffer_allocator_(
-          AlignedClientBufferAllocator::create(config.local_buffer_size, "")) {
+      client_buffer_allocator_(AlignedClientBufferAllocator::create(
+          config.local_buffer_size, client ? client->GetProtocol() : "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }

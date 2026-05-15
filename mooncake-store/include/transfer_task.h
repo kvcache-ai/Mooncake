@@ -370,6 +370,7 @@ class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
+                               const std::string& local_hostname,
                                TransferMetric* transfer_metric = nullptr);
 
     /**
@@ -414,6 +415,7 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    const std::string local_hostname_;
     TransferMetric* transfer_metric_;
 
     /**

@@ -492,6 +492,8 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
     /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).

@@ -93,6 +93,7 @@ struct ReplicateConfig {
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -110,7 +111,8 @@ struct ReplicateConfig {
                << config.preferred_segment;
         }
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node << " }";
+           << config.prefer_alloc_in_same_node
+           << ", data_type: " << config.data_type << " }";
         return os;
     }
 };

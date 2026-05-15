@@ -538,7 +538,7 @@ void Client::InitTransferSubmitter() {
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        *transfer_engine_, storage_backend_,
+        *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 }
 
