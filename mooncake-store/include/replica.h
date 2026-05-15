@@ -94,6 +94,19 @@ struct ReplicateConfig {
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    // Per-tenant quota / isolation tag. Empty string is normalized to
+    // "default" by the master so that single-tenant clients (which leave
+    // this field unset) all share one bucket and observe behavior identical
+    // to the pre-multitenant master.
+    //
+    // Known limitation: at the master, the per-shard metadata map is still
+    // keyed by the raw key string, so two clients writing the same key with
+    // different tenant_id values will overwrite each other in the underlying
+    // map. Quota accounting is correct (bytes are charged to / released from
+    // the right tenant), but full namespace isolation between tenants
+    // requires the LogicalObjectId-keyed master rework and is therefore not
+    // provided by this revision.
+    std::string tenant_id{"default"};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -112,7 +125,8 @@ struct ReplicateConfig {
         }
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
-           << ", data_type: " << config.data_type << " }";
+           << ", data_type: " << config.data_type
+           << ", tenant_id: " << config.tenant_id << " }";
         return os;
     }
 };

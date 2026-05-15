@@ -66,7 +66,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"},
         {ErrorCode::TASK_NOT_FOUND, "TASK_NOT_FOUND"},
         {ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, "TASK_PENDING_LIMIT_EXCEEDED"},
-        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"}};
+        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"},
+        {ErrorCode::TENANT_QUOTA_NOT_FOUND, "TENANT_QUOTA_NOT_FOUND"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

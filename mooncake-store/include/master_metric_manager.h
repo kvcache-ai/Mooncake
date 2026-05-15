@@ -285,6 +285,29 @@ class MasterMetricManager {
     int64_t get_update_task_requests();
     int64_t get_update_task_failures();
 
+    // Per-Tenant Quota Metrics
+    // Absolute-value setters (used by HTTP admin snapshot refresh)
+    void set_tenant_quota_max_bytes(const std::string& tenant_id,
+                                    int64_t bytes);
+    void set_tenant_quota_used_bytes(const std::string& tenant_id,
+                                     int64_t bytes);
+    void set_tenant_quota_reserved_bytes(const std::string& tenant_id,
+                                         int64_t bytes);
+    // Delta-based updates (used by Reserve/Commit/Abort/Release hot path)
+    void inc_tenant_quota_used_bytes(const std::string& tenant_id,
+                                     int64_t bytes);
+    void dec_tenant_quota_used_bytes(const std::string& tenant_id,
+                                     int64_t bytes);
+    void inc_tenant_quota_reserved_bytes(const std::string& tenant_id,
+                                         int64_t bytes);
+    void dec_tenant_quota_reserved_bytes(const std::string& tenant_id,
+                                         int64_t bytes);
+    // Counters
+    void inc_tenant_quota_reject_total(const std::string& tenant_id,
+                                       int64_t val = 1);
+    void inc_tenant_evict_bytes_total(const std::string& tenant_id,
+                                      int64_t bytes);
+
     // --- Serialization ---
     /**
      * @brief Serializes all managed metrics into Prometheus text format.
@@ -458,6 +481,13 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    // Per-Tenant Quota Metrics (dynamic, label = tenant_id)
+    ylt::metric::dynamic_gauge_1t tenant_quota_max_bytes_;
+    ylt::metric::dynamic_gauge_1t tenant_quota_used_bytes_;
+    ylt::metric::dynamic_gauge_1t tenant_quota_reserved_bytes_;
+    ylt::metric::dynamic_counter_1t tenant_quota_reject_total_;
+    ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
 };
 
 }  // namespace mooncake

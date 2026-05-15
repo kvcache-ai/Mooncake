@@ -187,6 +187,9 @@ class SCOPED_CAPABILITY MutexLocker {
 struct shared_lock_t {
 } inline constexpr shared_lock = {};
 
+struct defer_lock_t {
+} inline constexpr defer_lock = {};
+
 // SharedMutexLocker is an RAII class that acquires a shared mutex in its
 // constructor, and releases it in its destructor.
 class SCOPED_CAPABILITY SharedMutexLocker {
@@ -211,6 +214,14 @@ class SCOPED_CAPABILITY SharedMutexLocker {
             mut->lock_shared();
         }
     }
+
+    // Constructor: Associate with mu but do NOT acquire it yet.
+    // Caller must follow up with try_lock() or lock().
+    SharedMutexLocker(SharedMutex* mu,
+                      const defer_lock_t&) NO_THREAD_SAFETY_ANALYSIS
+        : mut(mu),
+          is_exclusive(false),
+          locked(false) {}
 
     // Destructor: Automatically release the mutex
     ~SharedMutexLocker() RELEASE() {
@@ -258,6 +269,9 @@ class SCOPED_CAPABILITY SharedMutexLocker {
         if (locked) is_exclusive = false;
         return locked;
     }
+
+    // Query whether the lock is currently held.
+    bool is_locked() const NO_THREAD_SAFETY_ANALYSIS { return locked; }
 
     // Release the mutex according to the current mode (exclusive or shared)
     void unlock() RELEASE() {

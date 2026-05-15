@@ -19,6 +19,7 @@
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "rpc_helper.h"
+#include "tenant_quota_http.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
@@ -729,6 +730,12 @@ void MasterAdminServer::InitHttpServer() {
             }
             resp.set_status_and_content(status_type::ok, std::move(body));
         });
+
+    // ---- Tenant Quota Admin Endpoints ----
+    //
+    // Implementation lives in tenant_quota_http.cpp; see header for
+    // the endpoint list and request/response shapes.
+    RegisterTenantQuotaAdminEndpoints(this);
 }
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
