@@ -900,7 +900,7 @@ impl StoreClient {
         };
         let deadline = self.request_deadline_for_transfer(source.length, 1);
         let length = source.length as usize;
-        if !self.copy_local_replica_direct(transport, source, &mut payload, length)? {
+        if !self.copy_local_replica_direct(source, &mut payload, length)? {
             self.ensure_explicit_source_reachable(source)?;
             self.execute_remote_get_direct(transport, &resolved, &mut payload, length, deadline)?;
         }
@@ -2333,18 +2333,6 @@ impl StoreClient {
             .zip(lengths.iter())
             .filter_map(|(local, length)| (*local).then_some(*length as u64))
             .sum::<u64>();
-        let mut local_segment_infos = BTreeMap::new();
-        for (entry, local) in resolved.iter().zip(local_paths.iter()) {
-            if !*local || local_segment_infos.contains_key(&entry.replica.segment_name) {
-                continue;
-            }
-            let (_, info) = {
-                let mut state = self.state.lock();
-                state.open_segment_with_info(transport, &entry.replica.segment_name.0)?
-            };
-            local_segment_infos.insert(entry.replica.segment_name.clone(), info);
-        }
-
         {
             let state = self.state.lock();
             let memory = state.memory_ref()?;
@@ -2356,20 +2344,17 @@ impl StoreClient {
                 if !*local {
                     continue;
                 }
-                let target_info = local_segment_infos.get(&entry.replica.segment_name).ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "local segment info for {} is missing",
-                        entry.replica.segment_name.0
-                    ))
-                })?;
-                memory.copy_storage_target_to(
+                let source = memory.storage_address(
                     &entry.replica.segment_name,
-                    target_info,
-                    entry.replica.offset,
-                    buffer.as_mut_ptr(),
-                    entry.replica.length as usize,
-                    transport.max_registration_bytes(),
+                    entry.replica.segment_offset as usize,
                 )?;
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        source.cast::<u8>(),
+                        buffer.as_mut_ptr(),
+                        entry.replica.length as usize,
+                    );
+                }
             }
         }
         if local_bytes != 0 {
@@ -2909,88 +2894,6 @@ impl StoreClient {
              (total_capacity={}, num_buffers={})",
             segment_offset, length, segment_name.0, total_capacity, buffers.len()
         )))
-    }
-
-    fn storage_target_offset(
-        target_chunks: &[SegmentTargetChunk],
-        segment_name: &SegmentName,
-        segment_offset: u64,
-        length: u64,
-    ) -> Result<u64> {
-        let end = segment_offset
-            .checked_add(length)
-            .ok_or_else(|| StoreError::Transport("storage offset range overflow".to_string()))?;
-        if target_chunks.is_empty() {
-            return Err(StoreError::Transport(format!(
-                "segment {} has no published storage target chunks",
-                segment_name.0
-            )));
-        }
-
-        let mut chunks = target_chunks.to_vec();
-        chunks.sort_by_key(|chunk| chunk.logical_offset);
-        let first = chunks
-            .iter()
-            .find(|chunk| {
-                let chunk_end = chunk.logical_offset.saturating_add(chunk.length_bytes);
-                segment_offset >= chunk.logical_offset && segment_offset < chunk_end
-            })
-            .ok_or_else(|| {
-                StoreError::Transport(format!(
-                    "storage offset {} length {} is outside segment {} target chunks {:?}",
-                    segment_offset, length, segment_name.0, target_chunks
-                ))
-            })?;
-        let first_delta = segment_offset
-            .checked_sub(first.logical_offset)
-            .ok_or_else(|| StoreError::Transport("storage target chunk underflow".to_string()))?;
-        let target_offset = first.target_offset.checked_add(first_delta).ok_or_else(|| {
-            StoreError::Transport("storage target offset overflow".to_string())
-        })?;
-        let mut cursor = segment_offset;
-        while cursor < end {
-            let chunk = chunks
-                .iter()
-                .find(|chunk| {
-                    let chunk_end = chunk.logical_offset.saturating_add(chunk.length_bytes);
-                    cursor >= chunk.logical_offset && cursor < chunk_end
-                })
-                .ok_or_else(|| {
-                    StoreError::Transport(format!(
-                        "storage range [{segment_offset}, {end}) crosses an unpublished target chunk for segment {}",
-                        segment_name.0
-                    ))
-                })?;
-            let chunk_delta = cursor.checked_sub(chunk.logical_offset).ok_or_else(|| {
-                StoreError::Transport("storage target chunk underflow".to_string())
-            })?;
-            let expected = target_offset
-                .checked_add(cursor.checked_sub(segment_offset).ok_or_else(|| {
-                    StoreError::Transport("storage offset cursor underflow".to_string())
-                })?)
-                .ok_or_else(|| StoreError::Transport("storage target offset overflow".to_string()))?;
-            let actual = chunk.target_offset.checked_add(chunk_delta).ok_or_else(|| {
-                StoreError::Transport("storage target chunk offset overflow".to_string())
-            })?;
-            if actual != expected {
-                return Err(StoreError::Transport(format!(
-                    "segment {} target chunks are not contiguous at logical offset {}",
-                    segment_name.0, cursor
-                )));
-            }
-            let chunk_end = chunk
-                .logical_offset
-                .checked_add(chunk.length_bytes)
-                .ok_or_else(|| StoreError::Transport("storage target chunk overflow".to_string()))?;
-            cursor = chunk_end.min(end);
-            if chunk.length_bytes == 0 {
-                return Err(StoreError::Transport(format!(
-                    "segment {} target chunk has zero length",
-                    segment_name.0
-                )));
-            }
-        }
-        Ok(target_offset)
     }
 
     fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
@@ -3540,7 +3443,7 @@ impl StoreClient {
                 buffer.len()
             )));
         }
-        if !self.copy_local_replica_direct(transport, &resolved.replica, buffer, length)? {
+        if !self.copy_local_replica_direct(&resolved.replica, buffer, length)? {
             self.ensure_remote_replica_reachable_once(&resolved.replica, checked_runtimes)?;
             self.execute_remote_get_direct(transport, resolved, buffer, length, request_deadline)?;
         }
@@ -3549,7 +3452,6 @@ impl StoreClient {
 
     fn copy_local_replica_direct(
         &self,
-        transport: &dyn StoreTransport,
         replica: &ReplicaRoute,
         buffer: &mut [u8],
         length: usize,
@@ -3562,22 +3464,16 @@ impl StoreClient {
         if !local {
             return Ok(false);
         }
-        let (_, target_info) = {
-            let mut state = self.state.lock();
-            state.open_segment_with_info(transport, &replica.segment_name.0)?
-        };
-        {
+        let source = {
             let state = self.state.lock();
-            let memory = state.memory_ref()?;
-            memory.copy_storage_target_to(
+            state.memory_ref()?.storage_address(
                 &replica.segment_name,
-                &target_info,
-                replica.offset,
-                buffer.as_mut_ptr(),
-                length,
-                transport.max_registration_bytes(),
-            )?;
+                replica.segment_offset as usize,
+            )?
         };
+        unsafe {
+            ptr::copy_nonoverlapping(source.cast::<u8>(), buffer.as_mut_ptr(), length);
+        }
         Ok(true)
     }
 
@@ -3703,61 +3599,6 @@ mod runtime_io_tests {
             StoreClient::segment_relative_target_offset(&info, &segment, 60, 8)
                 .expect("logical range should cross into the next ordered buffer"),
             1060
-        );
-    }
-
-    #[test]
-    fn storage_target_offset_uses_explicit_chunks_when_scratch_matches_storage() {
-        let segment = SegmentName::new("seg-storage-window");
-        let chunks = vec![SegmentTargetChunk {
-            logical_offset: 0,
-            target_offset: 2000,
-            length_bytes: 1024,
-        }];
-
-        let result = StoreClient::storage_target_offset(&chunks, &segment, 0, 64);
-        assert_eq!(
-            result.expect("storage mapping should use the published storage chunk"),
-            2000
-        );
-    }
-
-    #[test]
-    fn storage_target_offset_allows_contiguous_split_chunks() {
-        let segment = SegmentName::new("seg-split-storage");
-        let chunks = vec![
-            SegmentTargetChunk {
-                logical_offset: 0,
-                target_offset: 10_000,
-                length_bytes: 64,
-            },
-            SegmentTargetChunk {
-                logical_offset: 64,
-                target_offset: 10_064,
-                length_bytes: 64,
-            },
-        ];
-
-        assert_eq!(
-            StoreClient::storage_target_offset(&chunks, &segment, 60, 8)
-                .expect("range may cross contiguous registration chunks"),
-            10_060
-        );
-    }
-
-    #[test]
-    fn storage_target_offset_rejects_unpublished_range() {
-        let segment = SegmentName::new("seg-storage-overrun");
-        let chunks = vec![SegmentTargetChunk {
-            logical_offset: 0,
-            target_offset: 2000,
-            length_bytes: 1024,
-        }];
-
-        let result = StoreClient::storage_target_offset(&chunks, &segment, 1000, 64);
-        assert!(
-            result.is_err(),
-            "storage allocator offset must stay inside published target chunks"
         );
     }
 

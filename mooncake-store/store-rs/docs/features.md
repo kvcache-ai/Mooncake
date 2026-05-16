@@ -54,8 +54,7 @@ Remote read behavior:
 - `put_from` and `batch_put_from` now preserve the same registered-buffer zero-copy contract for remote writes: the transport request sources point at the caller-registered buffer ranges instead of a scratch copy
 - routed `batch_put_from` handles concurrent cache writers per key by treating route-CAS conflicts as successful cache insert races without adding a metadata recheck
 - Python compatibility `batch_put_from` reports best-effort per-key statuses; route-CAS conflicts are success, while true per-key write failures stay isolated to the affected item
-- remote storage segment announcements publish explicit storage target chunks, and writers translate allocator segment offsets through those chunks instead of inferring storage from backend buffer ordering
-- local reads and drain migration translate the published replica transport target offset through the storage target map before copying from local storage; allocator segment offsets remain reclaim bookkeeping only
+- remote storage segment buffers are interpreted in address order before translating segment-relative allocation offsets into transport target addresses, so chunked RDMA registrations do not depend on backend buffer listing order
 - scratch buffers are registered for local transfer staging only and are not published as remote storage extents
 - local replicas still copy into owned local segment memory; the zero-copy contract applies to the remote transport source buffer, not to local placement
 - payload integrity uses a fast stable 64-bit checksum, and large batch validation fans out across multiple CPU workers so registered-buffer restore traffic does not serialize the verification tail on one core
