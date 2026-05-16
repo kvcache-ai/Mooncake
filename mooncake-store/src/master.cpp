@@ -807,7 +807,7 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
-    gflags::SetVersionString(mooncake::MOONCAKE_STORE_VERSION);
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     if (!FLAGS_log_dir.empty()) {
