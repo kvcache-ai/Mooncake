@@ -98,6 +98,7 @@ pub enum SegmentLifecycleState {
 pub struct ReplicaRoute {
     pub owner: ClientRuntimeId,
     pub segment_name: SegmentName,
+    pub offset: u64,
     #[serde(default)]
     pub segment_offset: u64,
     pub length: u64,
@@ -1065,6 +1066,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("node", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg"),
+                offset: 0,
                 segment_offset: 0,
                 length: 1024,
                 checksum: None,

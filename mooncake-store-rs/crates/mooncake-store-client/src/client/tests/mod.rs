@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
-    CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+    ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
     NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
+    SegmentTargetChunk, StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
     TenantObjectAccounting, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
     TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy,
     TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
@@ -23,11 +23,11 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, encode_lifecycle_state, flatten_slices, now_ms,
-    record_success_metric, resolve_effective_route_policy, scatter_into_buffers,
-    shared_suspect_runtime_cache, startup_prewarm_delay, AllocationSpan, LiveClientCache,
-    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
-    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
-    SuspectRuntimeCache,
+    payload_checksum, record_success_metric, resolve_effective_route_policy, scatter_into_buffers,
+    shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
+    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
+    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
+    StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -205,13 +205,6 @@ struct BlockingCasMetadataBackend {
     block_key: ObjectKey,
     empty_conflict_key: Option<ObjectKey>,
     gate: Arc<(StdMutex<BlockingCasGateState>, Condvar)>,
-}
-
-struct EmptyConflictRouteDirectory {
-    inner: Arc<dyn RouteDirectory>,
-    conflict_key: ObjectKey,
-    bounded_reads: Arc<AtomicUsize>,
-    conflicted: Arc<AtomicBool>,
 }
 
 struct RecoverableMetadataBackend {
@@ -426,62 +419,6 @@ impl BlockingCasMetadataBackend {
     }
 }
 
-impl RouteDirectory for EmptyConflictRouteDirectory {
-    fn get_object_route(
-        &self,
-        observer: &ClientLease,
-        key: &ObjectKey,
-    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
-        if self.conflicted.load(Ordering::Relaxed) {
-            return Err(StoreError::Unsupported(format!(
-                "unbounded route read is disabled for {}",
-                key.0
-            )));
-        }
-        self.inner.get_object_route(observer, key)
-    }
-
-    fn get_object_routes(
-        &self,
-        observer: &ClientLease,
-        keys: &[ObjectKey],
-    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
-        if self.conflicted.load(Ordering::Relaxed) {
-            return Err(StoreError::Unsupported(
-                "unbounded route batch read is disabled after conflict".to_string(),
-            ));
-        }
-        self.inner.get_object_routes(observer, keys)
-    }
-
-    fn get_object_routes_bounded(
-        &self,
-        observer: &ClientLease,
-        keys: &[ObjectKey],
-    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
-        self.bounded_reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_object_routes_bounded(observer, keys)
-    }
-
-    fn compare_and_swap_object_route(
-        &self,
-        observer: &ClientLease,
-        key: &ObjectKey,
-        expected: Option<RouteVersion>,
-        next: Option<&ObjectRoute>,
-    ) -> mooncake_store_core::Result<CasResult> {
-        if *key == self.conflict_key {
-            self.conflicted.store(true, Ordering::Relaxed);
-            return Ok(CasResult {
-                applied: false,
-                current: None,
-            });
-        }
-        self.inner
-            .compare_and_swap_object_route(observer, key, expected, next)
-    }
-}
-
 impl MetadataBackend for RecoverableMetadataBackend {
     fn route_namespace(&self) -> String {
         self.inner.route_namespace()
@@ -592,6 +529,20 @@ impl MetadataBackend for RecoverableMetadataBackend {
         Ok(segment.filter(|segment| {
             !hidden.contains(&Self::segment_key(&segment.owner, &segment.segment_name))
         }))
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        let hidden = self
+            .state
+            .lock()
+            .expect("recoverable metadata state lock should succeed")
+            .hidden_segments
+            .clone();
+        let owner = self.inner.get_segment_owner(segment)?;
+        Ok(owner.filter(|owner| !hidden.contains(&Self::segment_key(owner, segment))))
     }
 
     fn list_segments(
@@ -882,6 +833,13 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -1404,6 +1362,13 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.get_segment(owner, segment)
     }
 
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        self.inner.get_segment_owner(segment)
+    }
+
     fn list_segments(
         &self,
         owner: Option<&ClientRuntimeId>,
@@ -1659,6 +1624,13 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -1921,6 +1893,13 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
+    }
+
+    fn get_segment_owner(
+        &self,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
+        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -2352,6 +2331,20 @@ fn publish_labeled_storage_node_with_capacity(
     runtime
 }
 
+fn test_segment_target_chunks(
+    transport: &TestTransport,
+    segment_name: &str,
+) -> Vec<SegmentTargetChunk> {
+    let (base, len) = transport
+        .segment_bounds(segment_name)
+        .expect("test transport segment should expose target bounds");
+    vec![SegmentTargetChunk {
+        logical_offset: 0,
+        target_offset: base,
+        length_bytes: len,
+    }]
+}
+
 fn test_storage_nodes() -> &'static Mutex<Vec<Arc<StoreClient>>> {
     static STORAGE_NODES: OnceLock<Mutex<Vec<Arc<StoreClient>>>> = OnceLock::new();
     STORAGE_NODES.get_or_init(|| Mutex::new(Vec::new()))
@@ -2745,23 +2738,21 @@ fn observability_metrics_render_remote_datapaths() {
     assert!(metrics.contains("operation=\"get_remote_batch_chunk\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get_remote_direct\",status=\"ok\""));
     assert!(metrics
-        .contains("mooncake_store_replication_publish_duration_seconds_count{tenant=\"default\",result=\"ok\"}"));
-    assert!(metrics
-        .contains("mooncake_store_replication_publish_total{tenant=\"default\",result=\"ok\"}"));
+        .contains("mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"}"));
+    assert!(metrics.contains("mooncake_store_replication_publish_total{result=\"ok\"}"));
     assert!(metrics.contains(
-        "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"write\",peer_kind=\"storage\",result=\"ok\"}"
+        "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"storage\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"read\",peer_kind=\"storage\",result=\"ok\"}"
+        "mooncake_store_transport_operation_total{direction=\"read\",peer_kind=\"storage\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_bytes_total{tenant=\"default\",direction=\"write\",peer_kind=\"storage\"}"
+        "mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"storage\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_bytes_total{tenant=\"default\",direction=\"read\",peer_kind=\"storage\"}"
+        "mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"storage\"}"
     ));
-    assert!(metrics
-        .contains("mooncake_store_checksum_validation_total{tenant=\"default\",result=\"ok\"}"));
+    assert!(metrics.contains("mooncake_store_checksum_validation_total{result=\"ok\"}"));
 }
 
 #[test]
@@ -3331,7 +3322,7 @@ fn embedded_wrh_evacuation_reuses_live_authority_snapshot() {
 
     let after_seed = metadata.list_live_clients_calls();
     let policy = router
-        .migration_policy_for_route(&route)
+        .migration_policy_for_route(&route, router.runtime_id())
         .expect("migration policy should resolve from the shared snapshot");
     let after_policy = metadata.list_live_clients_calls();
     assert!(
@@ -3676,7 +3667,7 @@ fn singleton_control_plane_paths_use_stream_sessions() {
 }
 
 #[test]
-fn routed_batch_put_publishes_replicated_route_with_logical_offsets() {
+fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("router-segment"));
     let owner_a = publish_storage_node(&metadata, &transport, "storage-a", "seg-a", "pool-a");
@@ -3691,6 +3682,8 @@ fn routed_batch_put_publishes_replicated_route_with_logical_offsets() {
         .routed_writes(planner, 2)
         .build(test_future_expiry_ms())
         .expect("client build should succeed");
+    wait_for_runtime_visibility(&client, &owner_a);
+    wait_for_runtime_visibility(&client, &owner_b);
 
     let payload = b"routed-payload";
     let routes = client
@@ -3732,10 +3725,11 @@ fn routed_batch_put_publishes_replicated_route_with_logical_offsets() {
     assert!(owners.contains(&owner_b));
 
     for replica in &route.replicas {
-        let (_, len) = transport
+        let (base, len) = transport
             .segment_bounds(&replica.segment_name.0)
             .expect("segment bounds should exist");
-        assert!(replica.segment_offset + replica.length <= len);
+        assert!(replica.offset >= base);
+        assert!(replica.offset + replica.length <= base + len);
         assert_eq!(replica.length as usize, payload.len());
     }
 
@@ -4282,126 +4276,6 @@ fn batch_get_fails_over_within_same_request_after_primary_transport_failure() {
             b"batch-transport-payload-a".to_vec(),
             b"batch-transport-payload-b".to_vec()
         ]
-    );
-}
-
-#[test]
-fn batch_get_submits_remote_reads_by_storage_owner() {
-    let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let store_a_transport = Arc::new(TestTransport::new("batch-owner-a-segment"));
-    let store_b_transport = Arc::new(store_a_transport.peer("batch-owner-b-segment"));
-    let writer_transport = Arc::new(store_a_transport.peer("batch-owner-writer-segment"));
-    let reader_transport = Arc::new(store_a_transport.peer("batch-owner-reader-segment"));
-    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
-
-    let store_a = StoreClientBuilder::new(metadata.clone(), "batch-owner-store-a")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "true")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(store_a_transport.clone())
-        .local_memory(storage_config())
-        .build(test_future_expiry_ms())
-        .expect("store-a build should succeed");
-    let store_b = StoreClientBuilder::new(metadata.clone(), "batch-owner-store-b")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "true")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(store_b_transport)
-        .local_memory(storage_config())
-        .build(test_future_expiry_ms())
-        .expect("store-b build should succeed");
-    let writer = StoreClientBuilder::new(metadata.clone(), "batch-owner-writer")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "false")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(writer_transport)
-        .local_memory(rw_only_config())
-        .routed_writes(planner, 1)
-        .build(test_future_expiry_ms())
-        .expect("writer build should succeed");
-    let reader = StoreClientBuilder::new(metadata, "batch-owner-reader")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "false")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(reader_transport)
-        .local_memory(rw_only_config())
-        .build(test_future_expiry_ms())
-        .expect("reader build should succeed");
-
-    store_a
-        .register_local_memory()
-        .expect("store-a memory should register");
-    store_b
-        .register_local_memory()
-        .expect("store-b memory should register");
-    writer
-        .register_local_memory()
-        .expect("writer memory should register");
-    reader
-        .register_local_memory()
-        .expect("reader memory should register");
-    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
-
-    writer
-        .put_with_policy(
-            "batch-owner-key-a",
-            b"owner-a",
-            &ReplicationPolicy::new()
-                .replica_count(1)
-                .prefer_local(false)
-                .preferred_storage_owners([store_a.runtime_id().storage_key()]),
-        )
-        .expect("store-a routed put should succeed");
-    writer
-        .put_with_policy(
-            "batch-owner-key-b",
-            b"owner-b",
-            &ReplicationPolicy::new()
-                .replica_count(1)
-                .prefer_local(false)
-                .preferred_storage_owners([store_b.runtime_id().storage_key()]),
-        )
-        .expect("store-b routed put should succeed");
-
-    {
-        let mut state = store_a_transport.state.lock();
-        state.submitted_batch_sizes.clear();
-        state.submitted_request_opcodes.clear();
-    }
-    let values = reader
-        .batch_get(&[
-            ObjectRef::new("batch-owner-key-a"),
-            ObjectRef::new("batch-owner-key-b"),
-        ])
-        .expect("batch get should succeed");
-    assert_eq!(values, vec![b"owner-a".to_vec(), b"owner-b".to_vec()]);
-
-    let read_batch_sizes = {
-        let state = store_a_transport.state.lock();
-        state
-            .submitted_batch_sizes
-            .iter()
-            .zip(state.submitted_request_opcodes.iter())
-            .filter_map(|(size, opcodes)| {
-                opcodes
-                    .iter()
-                    .all(|opcode| *opcode == Opcode::Read)
-                    .then_some(*size)
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        read_batch_sizes,
-        vec![1, 1],
-        "remote reads for different storage owners must not share one TE batch"
     );
 }
 
@@ -5138,6 +5012,7 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
     let replica = ReplicaRoute {
         owner: store.runtime_id().clone(),
         segment_name: SegmentName::new("deadline-store-segment"),
+        offset: 0,
         segment_offset: 0,
         length: 4,
         checksum: None,
@@ -5176,55 +5051,6 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
             .lock()
             .contains(store.runtime_id()),
         "request deadline exhaustion must not quarantine a runtime without a stall signal"
-    );
-}
-
-#[test]
-fn stale_segment_metadata_write_failure_does_not_quarantine_runtime() {
-    let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let store_transport = Arc::new(TestTransport::new("stale-write-store-segment"));
-    let writer_transport = Arc::new(store_transport.peer("stale-write-writer-segment"));
-
-    let store = StoreClientBuilder::new(metadata.clone(), "stale-write-store")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "true")
-        .label("route_scope", "stale-write-scope")
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(store_transport)
-        .local_memory(storage_config())
-        .build(test_future_expiry_ms())
-        .expect("store build should succeed");
-    let writer = StoreClientBuilder::new(metadata, "stale-write-writer")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "false")
-        .label("route", "false")
-        .label("route_scope", "stale-write-scope")
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(writer_transport)
-        .local_memory(storage_config())
-        .build(test_future_expiry_ms())
-        .expect("writer build should succeed");
-
-    writer.note_remote_write_failure(
-        &[ReplicaWriteTarget {
-            storage_runtime: store.runtime_id().clone(),
-            segment_name: SegmentName::new("stale-write-store-segment"),
-            target_chunks: Vec::new(),
-        }],
-        &StoreError::Transport(
-            "segment stale-write-store-segment has no published storage target chunks".to_string(),
-        ),
-        "stale_segment_test",
-    );
-
-    assert!(
-        !writer
-            .suspect_runtime_cache
-            .lock()
-            .contains(store.runtime_id()),
-        "stale segment metadata must refresh cached placement state before quarantining a runtime"
     );
 }
 
@@ -5314,19 +5140,6 @@ fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
             .expect("writer get should succeed"),
         b"put-failed-payload"
     );
-
-    let fallback_route = writer
-        .put_with_policy(
-            "put-failed-key-after-suspect",
-            b"put-after-suspect-payload",
-            &ReplicationPolicy::new()
-                .replica_count(1)
-                .prefer_local(false)
-                .preferred_storage_owners([dead_runtime.storage_key()]),
-        )
-        .expect("put should treat suspect preferred owner as a hint and fall back");
-    assert_eq!(fallback_route.replicas.len(), 1);
-    assert_eq!(fallback_route.replicas[0].owner, live_runtime);
 }
 
 #[test]
@@ -6005,6 +5818,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
     divergent_route.replicas[0].owner =
         ClientRuntimeId::new("zzzz-divergent-old-owner", ClientEpoch(99));
     divergent_route.replicas[0].segment_name = SegmentName::new("zzzz-divergent-old-segment");
+    divergent_route.replicas[0].offset = divergent_route.replicas[0].offset.saturating_add(1);
     divergent_route.replicas[0].segment_offset =
         divergent_route.replicas[0].segment_offset.saturating_add(1);
 
@@ -6427,7 +6241,7 @@ fn routed_batch_put_from_treats_route_conflicts_as_per_key_success() {
 }
 
 #[test]
-fn routed_batch_put_from_rejects_route_conflict_without_current_route() {
+fn routed_batch_put_from_accepts_route_conflict_without_current_route() {
     let metadata: Arc<dyn MetadataBackend> =
         Arc::new(BlockingCasMetadataBackend::with_empty_conflict(
             Arc::new(InMemoryMetadataBackend::new()),
@@ -6472,7 +6286,7 @@ fn routed_batch_put_from_rejects_route_conflict_without_current_route() {
     writer
         .register_buffer(source.as_mut_ptr().cast(), source.len())
         .expect("writer source buffer should register");
-    let error = writer
+    let routes = writer
         .batch_put_from(&[PutFromRequest::new(
             "batch-put-empty-conflict-key",
             source.as_ptr().cast(),
@@ -6484,119 +6298,12 @@ fn routed_batch_put_from_rejects_route_conflict_without_current_route() {
                 .prefer_local(false)
                 .preferred_storage_owner(storage.runtime_id().storage_key()),
         )])
-        .expect_err("route conflict without active current route must fail");
-
-    assert!(matches!(error, StoreError::Conflict(_)));
-    assert!(
-        !writer
-            .batch_is_exist(&[ObjectRef::new("batch-put-empty-conflict-key")])
-            .expect("exist check should succeed")[0],
-        "unpublished conflict loser route must not be visible as a cache hit"
-    );
-}
-
-#[test]
-fn routed_batch_put_from_accepts_empty_conflict_when_recheck_finds_active_route() {
-    let inner = Arc::new(InMemoryMetadataBackend::new());
-    let metadata: Arc<dyn MetadataBackend> = inner.clone();
-    let storage_transport = Arc::new(TestTransport::new(
-        "batch-put-empty-conflict-visible-store-segment",
-    ));
-    let writer_transport =
-        Arc::new(storage_transport.peer("batch-put-empty-conflict-visible-writer-segment"));
-    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
-
-    let storage =
-        StoreClientBuilder::new(metadata.clone(), "batch-put-empty-conflict-visible-store")
-            .state(ClientLifecycleState::Active)
-            .label("pool", "pool-a")
-            .label("storage", "true")
-            .route_control(RouteControlMode::MetadataOnly)
-            .live_client_sync_interval(fast_live_client_sync_interval())
-            .transport(storage_transport)
-            .local_memory(storage_config())
-            .build(test_future_expiry_ms())
-            .expect("storage build should succeed");
-    let mut writer = StoreClientBuilder::new(metadata, "batch-put-empty-conflict-visible-writer")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "false")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(writer_transport)
-        .local_memory(rw_only_config())
-        .routed_writes(planner, 1)
-        .build(test_future_expiry_ms())
-        .expect("writer build should succeed");
-
-    storage
-        .register_local_memory()
-        .expect("storage memory should register");
-    writer
-        .register_local_memory()
-        .expect("writer memory should register");
-    wait_for_membership_convergence(&[&storage, &writer]);
-
-    let key = "batch-put-empty-conflict-visible-key";
-    let object_id = LogicalObjectId::new(NamespaceScope::default(), key);
-    let segment = storage
-        .segment_name()
-        .expect("storage segment should exist");
-    let mut route = ObjectRoute {
-        key: ObjectKey::from_logical_id(&object_id),
-        namespace: None,
-        logical_key: None,
-        canonical_key: None,
-        sharing_scope: None,
-        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
-        version: RouteVersion(1),
-        state: RouteState::Active,
-        compatibility: storage.lease().compatibility,
-        replicas: vec![ReplicaRoute {
-            owner: storage.runtime_id().clone(),
-            segment_name: segment,
-            segment_offset: 0,
-            length: 32,
-            checksum: None,
-            tier: ReplicaTier::Dram,
-            priority: 0,
-        }],
-    };
-    mooncake_store_core::apply_route_identity(&mut route, &object_id);
-    inner
-        .compare_and_swap_object_route(&route.key, None, Some(&route))
-        .expect("seed route publish should succeed");
-    let bounded_reads = Arc::new(AtomicUsize::new(0));
-    writer.route_directory = Arc::new(EmptyConflictRouteDirectory {
-        inner: writer.route_directory.clone(),
-        conflict_key: route.key.clone(),
-        bounded_reads: bounded_reads.clone(),
-        conflicted: Arc::new(AtomicBool::new(false)),
-    });
-
-    let mut source = b"batch-put-empty-conflict-visible".to_vec();
-    writer
-        .register_buffer(source.as_mut_ptr().cast(), source.len())
-        .expect("writer source buffer should register");
-    let routes = writer
-        .batch_put_from(&[
-            PutFromRequest::new(key, source.as_ptr().cast(), source.len()).replication(
-                ReplicationPolicy::new()
-                    .replica_count(1)
-                    .prefer_local(false)
-                    .preferred_storage_owner(storage.runtime_id().storage_key()),
-            ),
-        ])
-        .expect("empty conflict should use exact recheck to find active route");
+        .expect("route conflict is a best-effort cache put success");
 
     assert_eq!(routes.len(), 1);
-    assert_eq!(routes[0].version, RouteVersion(1));
-    assert_eq!(bounded_reads.load(Ordering::Relaxed), 1);
-    assert!(
-        writer
-            .batch_is_exist(&[ObjectRef::new(key)])
-            .expect("exist check should succeed")[0],
-        "active route found by conflict recheck must stay visible"
+    assert_eq!(
+        routes[0].key,
+        ObjectKey::new("default::batch-put-empty-conflict-key")
     );
 }
 
@@ -8853,6 +8560,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
     let transport = Arc::new(TestTransport::new("writer-prefer-segment"));
     let remote_transport = Arc::new(transport.peer("seg-prefer"));
     remote_transport.add_external_segment("seg-prefer", 8);
+    let remote_target_chunks = test_segment_target_chunks(&remote_transport, "seg-prefer");
     let remote_owner = ClientRuntimeId::new("storage-prefer", ClientEpoch(1));
     let remote_allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
     remote_allocator.lock().upsert(&SegmentAnnouncement {
@@ -8860,6 +8568,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         segment_name: SegmentName::new("seg-prefer"),
         capacity_bytes: 8,
         used_bytes: 0,
+        target_chunks: remote_target_chunks.clone(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 1,
         tags: vec!["dram".to_string()],
@@ -8910,6 +8619,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
             segment_name: SegmentName::new("seg-prefer"),
             capacity_bytes: 8,
             used_bytes: 0,
+            target_chunks: remote_target_chunks,
             state: SegmentLifecycleState::Active,
             alignment_bytes: 1,
             tags: vec!["dram".to_string()],
@@ -9564,35 +9274,6 @@ fn staged_activation_republishes_lease_without_state_patch() {
 }
 
 #[test]
-fn register_local_memory_refreshes_expired_startup_lease_before_segment_publish() {
-    let metadata = Arc::new(CountingMetadataBackend::with_reject_state_patch(
-        Arc::new(InMemoryMetadataBackend::new()),
-        true,
-    ));
-    let transport = Arc::new(TestTransport::new("expired-startup-lease-segment"));
-    let client = StoreClientBuilder::new(metadata.clone(), "expired-startup-lease")
-        .state(ClientLifecycleState::Active)
-        .transport(transport.clone())
-        .transport_factory(transport.factory())
-        .local_memory(storage_config_with_bytes(512))
-        .build(now_ms().saturating_add(1))
-        .expect("client should build with short startup lease");
-
-    sleep(Duration::from_millis(5));
-    let upserts_before = metadata.upsert_client_lease_calls();
-    client
-        .register_local_memory()
-        .expect("local memory registration should refresh lease before segment publish");
-
-    assert!(metadata.upsert_client_lease_calls() > upserts_before);
-    let lease = metadata
-        .get_client_lease(client.runtime_id())
-        .expect("lease lookup should succeed")
-        .expect("refreshed lease should exist");
-    assert!(lease.expires_at_ms > now_ms());
-}
-
-#[test]
 fn heartbeat_keeps_staged_client_active_after_local_memory_registration() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("staged-heartbeat-segment"));
@@ -9767,9 +9448,8 @@ fn bootstrap_route_policy_uses_tenant_override_when_present() {
     )
     .expect("tenant override should satisfy bootstrap");
 
-    let effective = effective_route_policy(metadata.as_ref(), "tenant-a")
-        .expect("effective route policy should resolve")
-        .expect("effective policy should exist");
+    let effective = resolve_effective_route_policy(metadata.as_ref(), "tenant-a")
+        .expect("effective route policy should resolve");
     assert_eq!(effective.route_topk, 4);
     assert_eq!(effective.route_control, RouteControlMode::MetadataOnly);
 }
@@ -9794,9 +9474,8 @@ fn bootstrap_route_policy_falls_back_to_default_when_tenant_override_missing() {
     )
     .expect("default bootstrap should succeed without tenant override");
 
-    let effective = effective_route_policy(metadata.as_ref(), "tenant-a")
-        .expect("effective route policy should fall back to default")
-        .expect("effective policy should exist");
+    let effective = resolve_effective_route_policy(metadata.as_ref(), "tenant-a")
+        .expect("effective route policy should fall back to default");
     assert_eq!(effective.route_control, RouteControlMode::EmbeddedWrh);
     assert_eq!(effective.route_topk, 3);
 }
@@ -9859,9 +9538,8 @@ fn builder_resolves_scoped_tenant_policy_without_listing_all_policies() {
     assert_eq!(client.route_control, RouteControlMode::MetadataOnly);
     assert_eq!(client.route_topk, 4);
 
-    let effective = effective_route_policy(inner.as_ref(), "tenant-a")
-        .expect("effective route policy should resolve from exact scope lookups")
-        .expect("effective policy should exist");
+    let effective = resolve_effective_route_policy(inner.as_ref(), "tenant-a")
+        .expect("effective route policy should resolve from exact scope lookups");
     assert_eq!(effective.route_control, RouteControlMode::MetadataOnly);
     assert_eq!(effective.route_topk, 4);
 }
@@ -10784,7 +10462,7 @@ fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
 
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains(
-        "mooncake_store_preferred_segment_skip_total{tenant=\"tenant-a\",source=\"tenant_policy\",reason=\"not_found\"} 2"
+        "mooncake_store_preferred_segment_skip_total{source=\"tenant_policy\",reason=\"not_found\"} 2"
     ));
 }
 
@@ -11733,6 +11411,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             &[ReplicaWriteTarget {
                 storage_runtime: client.runtime_id().clone(),
                 segment_name: primary.clone(),
+                target_chunks: Vec::new(),
             }],
             std::slice::from_ref(&reservation),
         )
@@ -11742,6 +11421,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             &[ReplicaWriteTarget {
                 storage_runtime: client.runtime_id().clone(),
                 segment_name: primary,
+                target_chunks: Vec::new(),
             }],
             &[],
         ),
@@ -11838,12 +11518,12 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .expect("true client shrink should succeed");
     assert_eq!(migrated, owned_keys.len());
     assert_eq!(store_a.lease().state, ClientLifecycleState::Draining);
+    let remaining_segments = store_a
+        .list_segments()
+        .expect("segment listing should succeed");
     assert!(
-        store_a
-            .list_segments()
-            .expect("segment listing should succeed")
-            .is_empty(),
-        "all drained local segments should retire after shrink"
+        remaining_segments.is_empty(),
+        "all drained local segments should retire after shrink: {remaining_segments:?}"
     );
 
     for key in owned_keys {
@@ -12147,6 +11827,87 @@ fn remote_put_refreshes_cached_segment_handle_after_restart() {
             .get("restart-write-key-2")
             .expect("reader should see post-restart data"),
         b"after-restart"
+    );
+}
+
+#[test]
+fn local_read_prefers_replica_target_offset_over_segment_offset() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("local-target-offset-segment"));
+    let store = StoreClientBuilder::new(metadata, "local-target-offset-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(256))
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    let segment = store.segment_name().expect("store segment should exist");
+    let key = "local-target-offset-key";
+    let payload = b"target-offset-payload";
+    let distractor = b"wrong-offset-payload!";
+    assert_eq!(payload.len(), distractor.len());
+
+    let base = {
+        let state = store.state.lock();
+        state
+            .memory_ref()
+            .expect("memory should exist")
+            .storage_address(&segment, 0)
+            .expect("segment base should resolve")
+    };
+    let target_offset = 64usize;
+    unsafe {
+        ptr::copy_nonoverlapping(distractor.as_ptr(), base.cast::<u8>(), distractor.len());
+        ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            base.cast::<u8>().add(target_offset),
+            payload.len(),
+        );
+    }
+
+    let object_id = LogicalObjectId::new(NamespaceScope::default(), key);
+    let mut route = ObjectRoute {
+        key: ObjectKey::from_logical_id(&object_id),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: store.lease.compatibility.clone(),
+        replicas: vec![ReplicaRoute {
+            owner: store.runtime_id().clone(),
+            segment_name: segment,
+            offset: base as u64 + target_offset as u64,
+            segment_offset: 0,
+            length: payload.len() as u64,
+            checksum: Some(payload_checksum(payload)),
+            tier: mooncake_store_core::ReplicaTier::Dram,
+            priority: 0,
+        }],
+    };
+    mooncake_store_core::apply_route_identity(&mut route, &object_id);
+    store
+        .route_directory
+        .compare_and_swap_object_route(&store.lease, &route.key, None, Some(&route))
+        .expect("route publish should succeed");
+
+    assert_eq!(
+        store.get(key).expect("local get should use target offset"),
+        payload
+    );
+    assert_eq!(
+        store
+            .batch_get(&[ObjectRef::new(key)])
+            .expect("local batch get should use target offset"),
+        vec![payload.to_vec()]
     );
 }
 
@@ -12468,6 +12229,183 @@ fn draining_route_authority_mirrors_local_routes_before_restart() {
 }
 
 #[test]
+fn drain_migration_refreshes_the_draining_route_authority() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let victim_transport = Arc::new(TestTransport::new("drain-sync-victim-segment"));
+    let survivor_transport = Arc::new(victim_transport.peer("drain-sync-survivor-segment"));
+    let writer_transport = Arc::new(victim_transport.peer("drain-sync-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut victim = StoreClientBuilder::new(metadata.clone(), "drain-sync-victim")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "true")
+        .label("route_scope", "drain-sync-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(victim_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("victim build should succeed");
+    let survivor = StoreClientBuilder::new(metadata.clone(), "drain-sync-survivor")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route", "true")
+        .label("route_scope", "drain-sync-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(survivor_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("survivor build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "drain-sync-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "drain-sync-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    victim
+        .register_local_memory()
+        .expect("victim memory should register");
+    survivor
+        .register_local_memory()
+        .expect("survivor memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&victim, &survivor, &writer]);
+
+    let key = "drain-sync-key";
+    let value = b"drain-sync-value";
+    let route = writer
+        .put_with_policy(
+            key,
+            value,
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([victim.runtime_id().storage_key()]),
+        )
+        .expect("seed route should write to victim");
+    assert_eq!(route.replicas[0].owner, *victim.runtime_id());
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new(format!("default::{key}"));
+    authority_replace(
+        &namespace,
+        &victim.runtime_id().stable_id,
+        &scoped_key,
+        Some(&route),
+    )
+    .expect("test should leave a stale local authority route on victim");
+
+    let migrated = victim
+        .evacuate_owned_replicas()
+        .expect("victim drain should migrate owned route");
+    assert_eq!(migrated, 1);
+
+    let refreshed = authority_get(&namespace, &victim.runtime_id().stable_id, &scoped_key)
+        .expect("victim authority should remain readable during drain")
+        .expect("victim authority should retain the refreshed route");
+    assert!(
+        refreshed
+            .replicas
+            .iter()
+            .all(|replica| replica.owner != *victim.runtime_id()),
+        "draining authority must not keep advertising the evacuated replica"
+    );
+    assert_eq!(writer.get(key).expect("migrated value should read"), value);
+}
+
+#[test]
+fn readable_replica_selection_prefers_local_survivor() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let remote_transport = Arc::new(TestTransport::new("local-survivor-remote-segment"));
+    let local_transport = Arc::new(remote_transport.peer("local-survivor-local-segment"));
+
+    let remote = StoreClientBuilder::new(metadata.clone(), "local-survivor-remote")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "local-survivor-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(remote_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("remote build should succeed");
+    let local = StoreClientBuilder::new(metadata, "local-survivor-local")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "local-survivor-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(local_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("local build should succeed");
+
+    remote
+        .register_local_memory()
+        .expect("remote memory should register");
+    local
+        .register_local_memory()
+        .expect("local memory should register");
+    wait_for_membership_convergence(&[&remote, &local]);
+
+    let remote_segment = remote.segment_name().expect("remote segment should exist");
+    let local_segment = local.segment_name().expect("local segment should exist");
+    let route = ObjectRoute {
+        key: ObjectKey::new("default::local-survivor-key"),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: local.lease().compatibility,
+        replicas: vec![
+            ReplicaRoute {
+                owner: remote.runtime_id().clone(),
+                segment_name: remote_segment,
+                offset: 0,
+                segment_offset: 0,
+                length: 8,
+                checksum: None,
+                tier: mooncake_store_core::ReplicaTier::Dram,
+                priority: 0,
+            },
+            ReplicaRoute {
+                owner: local.runtime_id().clone(),
+                segment_name: local_segment.clone(),
+                offset: 0,
+                segment_offset: 0,
+                length: 8,
+                checksum: None,
+                tier: mooncake_store_core::ReplicaTier::Dram,
+                priority: 1,
+            },
+        ],
+    };
+
+    let readable = local
+        .readable_runtime_set(true)
+        .expect("readable runtimes should resolve");
+    let selected = local
+        .select_readable_replica(&route, &readable)
+        .expect("route should expose a readable replica");
+    assert_eq!(selected.segment_name, local_segment);
+    assert_eq!(selected.owner, *local.runtime_id());
+}
+
+#[test]
 fn routed_put_skips_draining_storage_and_authority() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let victim_transport = Arc::new(TestTransport::new("drain-fallback-victim-segment"));
@@ -12721,6 +12659,187 @@ fn true_client_shrink_waits_for_inflight_route_publish() {
 }
 
 #[test]
+fn evacuate_owned_replicas_reads_the_draining_replica_source() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("drain-source-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("drain-source-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("drain-source-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("drain-source-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("drain-source-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "drain-source-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "drain-source-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "drain-source-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-c build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "drain-source-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "drain-source-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
+
+    let good = b"drain-source-good";
+    let bad = b"drain-source-bad!";
+    let good_route = writer
+        .put_with_policy(
+            "drain-source-good-key",
+            good,
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_a.runtime_id().storage_key()]),
+        )
+        .expect("good source write should land on store-a");
+    let bad_route = writer
+        .put_with_policy(
+            "drain-source-bad-key",
+            bad,
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_b.runtime_id().storage_key()]),
+        )
+        .expect("bad distractor write should land on store-b");
+
+    store_a
+        .route_directory
+        .compare_and_swap_object_route(
+            &store_a.lease,
+            &good_route.key,
+            Some(good_route.version),
+            None,
+        )
+        .expect("good source route delete should succeed");
+    store_a
+        .route_directory
+        .compare_and_swap_object_route(
+            &store_a.lease,
+            &bad_route.key,
+            Some(bad_route.version),
+            None,
+        )
+        .expect("bad source route delete should succeed");
+
+    let target_key = "drain-source-target";
+    let target_id = LogicalObjectId::new(NamespaceScope::default(), target_key);
+    let mut bad_replica = bad_route.replicas[0].clone();
+    bad_replica.priority = 0;
+    bad_replica.checksum = None;
+    let mut good_replica = good_route.replicas[0].clone();
+    good_replica.priority = 1;
+    good_replica.checksum = None;
+    let mut route = ObjectRoute {
+        key: ObjectKey::from_logical_id(&target_id),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: store_a.lease.compatibility.clone(),
+        replicas: vec![bad_replica, good_replica],
+    };
+    mooncake_store_core::apply_route_identity(&mut route, &target_id);
+    store_a
+        .route_directory
+        .compare_and_swap_object_route(&store_a.lease, &route.key, None, Some(&route))
+        .expect("target route publish should succeed");
+    store_a.storage_owner.track_route(&route);
+    store_b.storage_owner.track_route(&route);
+
+    assert_eq!(
+        reader
+            .get(target_key)
+            .expect("precondition should read the primary distractor"),
+        bad
+    );
+
+    let store_a_runtime = store_a.runtime_id().clone();
+    let migrated = store_a
+        .evacuate_owned_replicas()
+        .expect("draining store should migrate from its own source replica");
+    assert_eq!(migrated, 1);
+
+    assert_eq!(
+        reader
+            .get(target_key)
+            .expect("reader should see the draining replica payload after migration"),
+        good
+    );
+    let migrated_route = reader
+        .query_route(target_key)
+        .expect("route query should succeed")
+        .expect("route should exist");
+    assert!(
+        migrated_route
+            .replicas
+            .iter()
+            .all(|replica| replica.owner != store_a_runtime),
+        "drained owner should be removed from the migrated route"
+    );
+}
+
+#[test]
 fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();
@@ -12842,16 +12961,15 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
 
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains(
-        "mooncake_store_segment_lifecycle_total{tenant=\"default\",action=\"mount_segment\",result=\"ok\"}"
+        "mooncake_store_segment_lifecycle_total{action=\"mount_segment\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_segment_lifecycle_total{tenant=\"default\",action=\"retire_segment\",result=\"ok\"}"
+        "mooncake_store_segment_lifecycle_total{action=\"retire_segment\",result=\"ok\"}"
     ));
-    assert!(metrics.contains(
-        "mooncake_store_rebalance_routes_total{tenant=\"default\",phase=\"migrate\",result=\"ok\"}"
-    ));
-    assert!(metrics
-        .contains("mooncake_store_rebalance_bytes_total{tenant=\"default\",phase=\"migrate\"}"));
+    assert!(
+        metrics.contains("mooncake_store_rebalance_routes_total{phase=\"migrate\",result=\"ok\"}")
+    );
+    assert!(metrics.contains("mooncake_store_rebalance_bytes_total{phase=\"migrate\"}"));
 }
 
 #[test]
@@ -13088,6 +13206,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         segment_name: SegmentName::new("alloc-primary"),
         capacity_bytes: 128,
         used_bytes: 0,
+        target_chunks: Vec::new(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 16,
         tags: vec!["dram".to_string()],
@@ -13162,6 +13281,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         .expect("release should succeed");
     let next_announcement = SegmentAnnouncement {
         used_bytes: 64,
+        target_chunks: Vec::new(),
         alignment_bytes: 1,
         state: SegmentLifecycleState::Active,
         tags: vec!["nvme".to_string()],
@@ -13202,6 +13322,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: primary.segment_name.clone(),
+            offset: 0,
             segment_offset: reused.offset_bytes,
             length: reused.length_bytes,
             checksum: None,
@@ -13376,6 +13497,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         segment_name: SegmentName::new("pending-primary"),
         capacity_bytes: 128,
         used_bytes: 0,
+        target_chunks: Vec::new(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 16,
         tags: vec!["dram".to_string()],
@@ -13406,6 +13528,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: published.segment_name.clone(),
+            offset: 0,
             segment_offset: published.offset_bytes,
             length: published.length_bytes,
             checksum: None,

@@ -132,8 +132,12 @@ impl StoreClient {
     ) -> Result<Vec<Option<ObjectRoute>>> {
         let routes = self
             .route_directory
-            .get_object_routes_bounded(&self.lease, keys)?;
-        self.filter_routes_to_readable(routes)
+            .get_object_routes_bounded(&self.lease, keys)?
+            .into_iter()
+            .map(|route| route.filter(|route| route.state == RouteState::Active))
+            .collect::<Vec<_>>();
+        self.report_route_hits_best_effort(routes.iter().filter_map(Option::as_ref));
+        Ok(routes)
     }
 
     fn shared_batch_replication_policy(
@@ -251,18 +255,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("mount_segment").input_bytes(capacity_bytes);
-        let segment_name = self.segment_name()?;
-        let target_chunks = self
-            .allocator
-            .lock()
-            .announcement(&segment_name)
-            .map(|segment| segment.target_chunks)
-            .unwrap_or_default();
         let segment = SegmentAnnouncement {
             owner: self.lease.runtime.clone(),
-            segment_name,
+            segment_name: self.segment_name()?,
             capacity_bytes,
             used_bytes,
+            target_chunks: Vec::new(),
             state: SegmentLifecycleState::Active,
             alignment_bytes: self.local_memory.alignment as u64,
             tags,
@@ -357,15 +355,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                         segment_name.0
                     ))
                 })?;
-            let announcement = SegmentAnnouncement {
-                owner: self.lease.runtime.clone(),
-                segment_name,
-                capacity_bytes: segment_info.capacity_bytes,
-                used_bytes: 0,
-                state: SegmentLifecycleState::Active,
-                alignment_bytes: segment_info.alignment_bytes,
-                tags: segment_info.tags,
-            };
+            let announcement = segment_info.announcement(self.lease.runtime.clone(), 0);
             self.allocator.lock().upsert(&announcement);
             info!(
                 runtime = %self.lease.runtime,
@@ -610,12 +600,15 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn get_size_in_tenant(&self, tenant: &str, key: &str) -> Result<usize> {
-        let Some(route) = self.query_route_in_tenant(tenant, key)? else {
-            return Ok(0);
-        };
         Ok(self
-            .select_readable_replica_with_refresh(&route)?
-            .map(|replica| replica.length as usize)
+            .query_route_in_tenant(tenant, key)?
+            .and_then(|route| {
+                route
+                    .replicas
+                    .iter()
+                    .min_by_key(|replica| replica.priority)
+                    .map(|replica| replica.length as usize)
+            })
             .unwrap_or(0))
     }
 
@@ -624,10 +617,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn is_exist_in_tenant(&self, tenant: &str, key: &str) -> Result<bool> {
-        let Some(route) = self.query_route_in_tenant(tenant, key)? else {
-            return Ok(false);
-        };
-        Ok(self.select_readable_replica_with_refresh(&route)?.is_some())
+        Ok(self.query_route_in_tenant(tenant, key)?.is_some())
     }
 
     fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {

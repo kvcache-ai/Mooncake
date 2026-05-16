@@ -54,7 +54,10 @@ Remote read behavior:
 - `put_from` and `batch_put_from` now preserve the same registered-buffer zero-copy contract for remote writes: the transport request sources point at the caller-registered buffer ranges instead of a scratch copy
 - routed `batch_put_from` handles concurrent cache writers per key by treating route-CAS conflicts as successful cache insert races without adding a metadata recheck
 - Python compatibility `batch_put_from` reports best-effort per-key statuses; route-CAS conflicts are success, while true per-key write failures stay isolated to the affected item
-- remote storage segment buffers are interpreted in address order before translating segment-relative allocation offsets into transport target addresses, so chunked RDMA registrations do not depend on backend buffer listing order
+- remote storage segment announcements publish explicit storage target chunks, and writers translate allocator segment offsets through those chunks instead of inferring storage from backend buffer ordering
+- remote reads require the route's published `ReplicaRoute::offset` to be a readable transport target and do not remap bad routes through allocator `segment_offset`
+- local reads and drain migration translate the published replica transport target offset through the storage target map before copying from local storage; allocator segment offsets remain reclaim bookkeeping only
+- scratch buffers are registered for local transfer staging only and are not published as remote storage extents
 - local replicas still copy into owned local segment memory; the zero-copy contract applies to the remote transport source buffer, not to local placement
 - payload integrity uses a fast stable 64-bit checksum, and large batch validation fans out across multiple CPU workers so registered-buffer restore traffic does not serialize the verification tail on one core
 
@@ -155,7 +158,6 @@ A request can control placement behavior with:
 
 - replica count
 - preferred segment
-- preferred storage owner hints
 - preferred segment list
 - preferred storage owner
 - preferred storage owner list
@@ -174,22 +176,20 @@ What it provides:
 - continuous stateless cleanup through `mooncake-store-admin server`
 - optional tenant-quota reservation reconcile in that same admin server for an explicit tenant list
 - backend-native lease-expiry indexing for recoverable maintenance scheduling (`ZSET` in Redis, `by-runtime` + `by-time` keys in etcd)
-- Redis client resource hashes that store the lease and owned segment records under one TTL-backed key
-- owner-scoped cleanup for abnormal Redis leftovers and explicit etcd segment metadata
+- owner-scoped cleanup through backend-native owner metadata instead of a hidden global segment scan in the steady-state worker
 - same-epoch lease reclaim after a lease TTL gap when no higher live epoch exists, so heartbeat repair and predecessor drain pinning do not fail with stale-epoch rejection
 - `with_soft_pin`
 
 ## Observability
 
 The client Prometheus exporter reports both request-level and internal operation-level store
-health. Every exported sample carries the process-bound `tenant` label. Remote data-plane transfers
-now expose explicit transport operation outcomes through
-`mooncake_store_transport_operation_total{tenant,direction,peer_kind,result}` in addition to
-successful byte volume through `mooncake_store_transport_bytes_total{tenant,direction,peer_kind}`.
+health. Remote data-plane transfers now expose explicit transport operation outcomes through
+`mooncake_store_transport_operation_total{direction,peer_kind,result}` in addition to successful
+byte volume through `mooncake_store_transport_bytes_total{direction,peer_kind}`.
 
-Route publication also exposes `mooncake_store_replication_publish_total{tenant,result}` alongside
-the existing publish latency histogram. Operators can therefore distinguish publish failures from
-slow successful publishes without inferring result counts from histogram internals.
+Route publication also exposes `mooncake_store_replication_publish_total{result}` alongside the
+existing publish latency histogram. Operators can therefore distinguish publish failures from slow
+successful publishes without inferring result counts from histogram internals.
 
 ## Allocation and Segment Management
 
@@ -343,9 +343,11 @@ The client can publish handoff plans and participate in successor upgrade flows.
 
 ### Elastic capacity
 
-The client can expand local storage, drain segments, retire empty segments, and evacuate all replicas owned by a draining client. Full client shrink also refreshes membership before the final local route-authority mirror retry, so route handoff is not blocked by a stale cached live-client snapshot.
+The client can expand local storage, drain segments, retire empty segments, and evacuate all replicas owned by a draining client. Evacuation copies from the exact draining-owned replica that is being removed, then publishes a replacement route and releases the old allocation. Full client shrink also refreshes membership before the final local route-authority mirror retry, so route handoff is not blocked by a stale cached live-client snapshot.
 
 This allows segment-level shrink, full client shrink, and dynamic storage growth without changing the public API.
+
+During full-client drain, replacement routes are also written back to the draining route authority while it still serves reads. The draining authority is not counted as a protected live mirror, but stale readers that still include it in their membership snapshot no longer see routes pointing at evacuated allocations. Explicit drain migration reads the selected source replica through an exact readable lease lookup instead of the suspect-runtime placement cache, so allocator quarantine for new writes does not block copying the source bytes that are being evacuated. Migration placement excludes the draining source owner even when a separate writer performs the copy, and the source owner releases its old allocations after publication. Read selection also prefers a local readable replica before remote replicas with lower route priority, so replica-protected reads avoid a dead remote primary when the survivor already has the data locally.
 
 ## Control Plane
 

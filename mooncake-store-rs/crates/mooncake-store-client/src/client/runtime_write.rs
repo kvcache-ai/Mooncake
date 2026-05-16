@@ -62,7 +62,7 @@ impl StoreClient {
         reservations: &[mooncake_store_core::SegmentReservation],
         value: &[u8],
         registered_source: Option<*mut c_void>,
-    ) -> Result<()> {
+    ) -> Result<Vec<u64>> {
         if targets.len() != reservations.len() {
             return Err(StoreError::InvalidState(
                 "targets and reservations length mismatch".to_string(),
@@ -71,10 +71,13 @@ impl StoreClient {
         let transport = self.transport()?;
         let mut refreshed = false;
         loop {
+            let mut absolute_offsets = vec![0u64; targets.len()];
             let mut remote_requests = Vec::new();
             let mut local_writes = 0usize;
 
-            for (target, reservation) in targets.iter().zip(reservations.iter()) {
+            for (index, (target, reservation)) in
+                targets.iter().zip(reservations.iter()).enumerate()
+            {
                 if target.storage_runtime == self.lease.runtime
                     && self
                         .state
@@ -93,6 +96,7 @@ impl StoreClient {
                     unsafe {
                         ptr::copy_nonoverlapping(value.as_ptr(), addr.cast::<u8>(), value.len());
                     }
+                    absolute_offsets[index] = addr as u64;
                     local_writes += 1;
                     continue;
                 }
@@ -112,6 +116,7 @@ impl StoreClient {
                     value.len() as u64,
                 )?;
                 remote_requests.push((handle, target_offset, info));
+                absolute_offsets[index] = target_offset;
             }
 
             debug!(
@@ -240,7 +245,7 @@ impl StoreClient {
                             0,
                         );
                     }
-                    return Ok(());
+                    return Ok(absolute_offsets);
                 }
                 Err(error) if !refreshed && remote_segment_cache_stale(&error) => {
                     self.invalidate_remote_write_segments(targets);
@@ -769,7 +774,7 @@ impl StoreClient {
                             .memory_ref()
                             .map(|memory| memory.has_storage_segment(&target.segment_name))
                             .unwrap_or(false);
-                    if is_local {
+                    let offset = if is_local {
                         let addr = {
                             let state = self.state.lock();
                             state.memory_ref()?.storage_address(
@@ -784,6 +789,7 @@ impl StoreClient {
                                 entry.value.len(),
                             );
                         }
+                        addr as u64
                     } else {
                         if target.storage_runtime != self.lease.runtime
                             && checked_runtimes.insert(target.storage_runtime.clone())
@@ -811,10 +817,12 @@ impl StoreClient {
                             length: entry.value.len() as u64,
                             info,
                         });
+                        target_offset
                     };
                     replicas.push(ReplicaRoute {
                         owner: target.storage_runtime.clone(),
                         segment_name: target.segment_name.clone(),
+                        offset,
                         segment_offset: reservation.offset_bytes,
                         length: entry.value.len() as u64,
                         checksum: Some(checksum),

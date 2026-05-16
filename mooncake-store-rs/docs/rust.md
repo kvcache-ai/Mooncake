@@ -84,6 +84,8 @@ fn main() -> Result<()> {
 
 `rpc_server_port` is the TENT TCP data-plane port. Leaving it at `0` lets TENT choose a random local port, which is fine for single-host demos. For cross-host or cross-container deployments, set a fixed port and make sure peers can reach `rpc_server_hostname:rpc_server_port`.
 
+When a transport is supplied directly, its `segment_name()` must match any explicit builder `segment_name(...)`. If the builder omits `segment_name(...)`, the client adopts the transport segment name. This keeps the lease announcement, allocator metadata, and transport registration pointed at the same local segment.
+
 `tenant(...)` remains the normal way to select the default scope used for startup policy lookup and request builders. Startup policy resolution reads exact tenant-policy scopes for `tenant -> tenant/domain -> tenant/domain/object_set` instead of listing all tenant policies. `route_topk(...)`, `route_control(...)`, `namespace_quota(...)`, `execution_fairness(...)`, and `bandwidth_shaping(...)` are compatibility fallbacks; admin-managed tenant policy in metadata is the preferred authoring surface when those settings are tenant-scoped.
 
 When tenant quota policy is present, single-object `put` and `remove` now use metadata-backed reservation/finalize semantics instead of relying only on the older runtime-local preflight check. The write call returns success only after route publication and quota finalization both succeed. Overwrites are charged on committed byte delta, and deletes refund quota when the route delete CAS becomes authoritative rather than waiting for later segment reclaim.
@@ -156,10 +158,6 @@ Useful knobs:
 - `preferred_storage_owners(...)`
 - `with_soft_pin(...)`
 
-Preferred storage owners are placement hints. If a hinted owner is not in the compatible live
-snapshot or is locally quarantined as suspect, the writer skips it and continues with normal
-placement candidates instead of failing the cache write before fallback can run.
-
 ## Use Batch and Buffer-Oriented APIs
 
 The Rust client supports both object-oriented and buffer-oriented paths.
@@ -196,6 +194,7 @@ Behavior boundary:
 - `put_from` and `batch_put_from` send remote writes from the registered source buffer directly
 - `batch_get_into` reads remote payloads directly into registered destination buffers
 - routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races, releases its own temporary reservation, and returns a route entry for that key without failing the batch
+- `ReplicaRoute::offset` is the transport target address for the payload; `segment_offset` is allocator bookkeeping, so writers translate allocator reservations through the segment announcement's published storage target chunks, remote reads reject routes whose `offset` is not readable as a transport target, and local reads plus drain migration translate `offset` back through the same storage target map before copying from local storage
 - unregistered `get_into` targets and `batch_put_from_multi_buffers` still fall back to the staged copy paths
 
 ## Hugepage-Backed Local Memory
@@ -250,6 +249,9 @@ Common calls:
 
 `evacuate_owned_replicas()` drains the local client, rewrites every live route that still references it, immediately reclaims old allocations, and retires emptied local segments.
 
+During evacuation, payload copy is pinned to the exact local replica being removed. The writer does not satisfy the migration read from another live mirror, because that would publish the wrong bytes when replicas temporarily diverge during a shrink.
+The migration read uses the replica's transport target offset, not the allocator reservation offset, and maps that target coordinate through the storage target map before touching local memory.
+
 Before returning, the draining client also mirrors any route-authority records that were only present locally to active route authorities. If its cached live-client snapshot cannot find a mirror, it refreshes membership and retries the mirror pass.
 
 Use `evacuate_owned_replicas_via(writer)` when you want a separate routed client to publish replacement routes during shrink.
@@ -293,7 +295,7 @@ Key functions:
 - `start_metrics_http_server(...)`
 - `stop_metrics_http_server()`
 
-Every Prometheus sample exported by a `StoreClient` process includes `tenant="<default tenant>"`, matching the process-bound tenant selected by `StoreClientBuilder::tenant(...)`. The exported metrics also include strict tenant quota counters for reservation, finalize, abort, and reconcile outcomes, in addition to the existing request, route-CAS, replication, eviction, and process families. Sparse operational counters such as tenant quota, tenant-local eviction, preferred-segment skip, rebalance, and segment lifecycle are exported with zero-valued baseline series so dashboards show an explicit zero rate during steady state instead of `No data`.
+The exported metrics now include strict tenant quota counters for reservation, finalize, abort, and reconcile outcomes, in addition to the existing request, route-CAS, replication, eviction, and process families. Sparse operational counters such as tenant quota, tenant-local eviction, preferred-segment skip, rebalance, and segment lifecycle are exported with zero-valued baseline series so dashboards show an explicit zero rate during steady state instead of `No data`.
 
 ## Full Example
 
@@ -324,7 +326,7 @@ mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 verify
 # 30-second mixed benchmark, 8 concurrent workers
 # Defaults measure batch_put + batch_get; override interfaces when needed.
 # Start storage=true daemons first, and pass the same --keyspace they use
-# when you are not using the default `mc/store-rs/v2` namespace.
+# when you are not using the default `mc/store-rs/v1` namespace.
 mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 bench \
   --keyspace mc/store-rs/bench-prod \
   --mode mixed --concurrency 8 --duration 30
