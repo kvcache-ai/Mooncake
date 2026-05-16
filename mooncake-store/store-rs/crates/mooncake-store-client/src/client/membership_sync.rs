@@ -194,7 +194,7 @@ pub(crate) fn refresh_due_tenant_quota_policy_cache(
     tracker.finish(&result, 0);
     let policies = result?;
     let mut cache = live_client_cache.lock();
-    for (tenant, policy) in tenants.into_iter().zip(policies) {
+    for (tenant, policy) in tenants.into_iter().zip(policies.into_iter()) {
         let version = policy.as_ref().map(|policy| policy.version);
         let quota = policy.and_then(|policy| policy.spec.quota);
         cache.store_tenant_quota_policy(tenant, version, quota, now);

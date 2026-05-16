@@ -107,8 +107,8 @@ impl StoreClient {
                             .any_indices
                             .iter()
                             .copied()
-                            .zip(lengths)
-                            .zip(results)
+                            .zip(lengths.into_iter())
+                            .zip(results.into_iter())
                         {
                             let reservation = match result {
                                 Ok(reservation) => reservation,
@@ -168,7 +168,7 @@ impl StoreClient {
                             .iter()
                             .copied()
                             .zip(ops.iter())
-                            .zip(results)
+                            .zip(results.into_iter())
                         {
                             let reservation = match result {
                                 Ok(reservation) => reservation,
@@ -274,7 +274,7 @@ impl StoreClient {
                 .batch_release(&lease, &storage_runtime, &ops)
             {
                 Ok(results) => {
-                    for (index, result) in indices.iter().copied().zip(results) {
+                    for (index, result) in indices.iter().copied().zip(results.into_iter()) {
                         if let Err(error) = result {
                             if should_mark_runtime_suspect_after_allocator_error(&error) {
                                 self.mark_runtime_suspect(
@@ -503,7 +503,7 @@ impl StoreClient {
         for (plan, segment_name) in storage_segments
             .into_iter()
             .skip(1)
-            .zip(extra_names)
+            .zip(extra_names.into_iter())
         {
             let local_transport = self.transport_factory()?.create(&segment_name.0)?;
             extra_segments.push(StartupSegmentPlan {

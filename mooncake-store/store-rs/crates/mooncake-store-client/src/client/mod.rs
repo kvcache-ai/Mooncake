@@ -73,12 +73,6 @@ const REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_REQUEST_TIMEOUT_MS";
 type SharedLifecycleState = Arc<AtomicU8>;
 type SharedRouteWriteGate = Arc<Mutex<()>>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BatchPutRouteConflictPolicy {
-    Strict,
-    AcceptConflictAsSuccess,
-}
-
 #[derive(Clone, Debug)]
 struct TenantQuotaPolicyCacheEntry {
     version: Option<u64>,
