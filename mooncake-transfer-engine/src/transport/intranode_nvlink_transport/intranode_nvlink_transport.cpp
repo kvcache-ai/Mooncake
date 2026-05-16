@@ -209,7 +209,7 @@ Status IntraNodeNvlinkTransport::submitTransfer(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        slice->ts = 0;
+        slice->ts = getCurrentTimeInNano();
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         cudaStream_t stream = tl_nvlink_stream.stream_;
@@ -296,7 +296,7 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
-        slice->ts = 0;
+        slice->ts = getCurrentTimeInNano();
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         cudaStream_t stream = tl_nvlink_stream.stream_;
