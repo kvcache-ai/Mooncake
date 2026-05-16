@@ -144,6 +144,37 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
     }
 }
 
+// Test the locality decision used by TransferSubmitter::isLocalTransfer.
+// Same-host different-process pairs share an IP but have distinct ports;
+// they must NOT be treated as locally addressable, otherwise memcpy in the
+// caller process would dereference a virtual address belonging to a peer
+// process and segfault.
+TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
+    // Empty inputs -> not same-process (cannot prove locality).
+    EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint("", ""));
+    EXPECT_FALSE(
+        TransferSubmitter::isSameProcessEndpoint("", "192.168.1.10:12345"));
+    EXPECT_FALSE(
+        TransferSubmitter::isSameProcessEndpoint("192.168.1.10:12345", ""));
+
+    // Identical ip:port -> same process.
+    EXPECT_TRUE(TransferSubmitter::isSameProcessEndpoint("192.168.1.10:12345",
+                                                         "192.168.1.10:12345"));
+
+    // Same host, different port -> different process, NOT local.
+    // This is the regression case fixed by this change.
+    EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint(
+        "192.168.1.10:12345", "192.168.1.10:12346"));
+
+    // Different hosts -> not local.
+    EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint(
+        "192.168.1.10:12345", "192.168.1.11:12345"));
+
+    // Hostname endpoints (non-P2P metadata mode) compare as full strings.
+    EXPECT_TRUE(TransferSubmitter::isSameProcessEndpoint("host-a", "host-a"));
+    EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint("host-a", "host-b"));
+}
+
 // Test TransferStrategy enum and stream operator
 TEST_F(TransferTaskTest, TransferStrategyEnum) {
     // Test enum values
