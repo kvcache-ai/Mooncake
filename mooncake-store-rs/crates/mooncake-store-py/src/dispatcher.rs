@@ -1736,7 +1736,8 @@ fn run_heartbeat_loop(
                              failures={consecutive_failures}, last error: {error}"
                         );
                     } else if consecutive_failures == 3
-                        || (consecutive_failures > 3 && consecutive_failures % 10 == 0)
+                        || (consecutive_failures > 3
+                            && matches!(consecutive_failures.checked_rem(10), Some(0)))
                     {
                         eprintln!(
                             "[mooncake-store] [{runtime}] WARNING: heartbeat failed {consecutive_failures} times \

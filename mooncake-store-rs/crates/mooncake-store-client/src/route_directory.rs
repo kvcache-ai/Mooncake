@@ -1904,7 +1904,11 @@ fn stable_hash(parts: &[&str]) -> u64 {
 }
 
 fn sampled_per_key_debug_log(parts: &[&str]) -> bool {
-    stable_hash(parts).is_multiple_of(PER_KEY_DEBUG_SAMPLE_MODULUS)
+    is_per_key_debug_sample(stable_hash(parts), PER_KEY_DEBUG_SAMPLE_MODULUS)
+}
+
+fn is_per_key_debug_sample(hash: u64, modulus: u64) -> bool {
+    matches!(hash.checked_rem(modulus), Some(0))
 }
 
 #[cfg(test)]
