@@ -485,7 +485,7 @@ impl ScratchSpace {
         }
         let mut regions = Vec::with_capacity(plans.len());
         for plan in plans {
-            match RegisteredRegion::register_scratch(
+            match RegisteredRegion::register(
                 transport,
                 plan.capacity_bytes,
                 &plan.location,
@@ -745,7 +745,6 @@ impl RegisteredRegion {
         self.base_addr as *mut c_void
     }
 
-    #[cfg(test)]
     fn register(
         transport: &dyn StoreTransport,
         capacity: usize,
@@ -754,23 +753,6 @@ impl RegisteredRegion {
         hugepage: Option<HugePageConfig>,
     ) -> Result<Self> {
         Self::register_with_mode(transport, capacity, location, alignment, hugepage, false)
-    }
-
-    fn register_scratch(
-        transport: &dyn StoreTransport,
-        capacity: usize,
-        location: &str,
-        alignment: usize,
-        hugepage: Option<HugePageConfig>,
-    ) -> Result<Self> {
-        Self::register_with_access(
-            transport,
-            capacity,
-            location,
-            alignment,
-            hugepage,
-            RegistrationAccess::Scratch,
-        )
     }
 
     pub(crate) fn register_startup_storage(
@@ -791,24 +773,6 @@ impl RegisteredRegion {
         hugepage: Option<HugePageConfig>,
         startup_storage: bool,
     ) -> Result<Self> {
-        Self::register_with_access(
-            transport,
-            capacity,
-            location,
-            alignment,
-            hugepage,
-            RegistrationAccess::Storage { startup_storage },
-        )
-    }
-
-    fn register_with_access(
-        transport: &dyn StoreTransport,
-        capacity: usize,
-        location: &str,
-        alignment: usize,
-        hugepage: Option<HugePageConfig>,
-        access: RegistrationAccess,
-    ) -> Result<Self> {
         let alignment = alignment.max(1);
         let (base, capacity, owner) = match hugepage {
             Some(hugepage) => allocate_hugepage_region(capacity, alignment, location, hugepage)?,
@@ -826,12 +790,10 @@ impl RegisteredRegion {
             addr: base,
             size: capacity,
         }];
-        let registration_result = match access {
-            RegistrationAccess::Storage { startup_storage } if startup_storage => {
-                transport.register_startup_memory_batch(&registrations)
-            }
-            RegistrationAccess::Storage { .. } => transport.register_memory(base, capacity),
-            RegistrationAccess::Scratch => transport.register_scratch_memory(base, capacity),
+        let registration_result = if startup_storage {
+            transport.register_startup_memory_batch(&registrations)
+        } else {
+            transport.register_memory(base, capacity)
         };
         if let Err(error) = registration_result {
             let _ = owner.release(transport, base);
@@ -892,12 +854,6 @@ impl RegisteredRegion {
         transport.unregister_memory(base, self.capacity)?;
         self.owner.release(transport, base)
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum RegistrationAccess {
-    Storage { startup_storage: bool },
-    Scratch,
 }
 
 #[derive(Debug)]
@@ -1189,7 +1145,6 @@ mod tests {
         allocations: BTreeMap<usize, Box<[u8]>>,
         registered: BTreeMap<usize, usize>,
         register_calls: usize,
-        scratch_register_calls: usize,
         startup_batch_calls: usize,
         startup_batch_entry_sizes: Vec<usize>,
     }
@@ -1368,17 +1323,6 @@ mod tests {
         ) -> mooncake_store_core::Result<()> {
             let mut state = self.inner.lock();
             state.register_calls += 1;
-            state.registered.insert(addr as usize, size);
-            Ok(())
-        }
-
-        fn register_scratch_memory(
-            &self,
-            addr: *mut c_void,
-            size: usize,
-        ) -> mooncake_store_core::Result<()> {
-            let mut state = self.inner.lock();
-            state.scratch_register_calls += 1;
             state.registered.insert(addr as usize, size);
             Ok(())
         }
@@ -1830,7 +1774,6 @@ mod tests {
         assert_eq!(state.startup_batch_calls, 1);
         assert_eq!(state.startup_batch_entry_sizes, vec![64]);
         assert_eq!(state.register_calls, 0);
-        assert_eq!(state.scratch_register_calls, 0);
         drop(state);
         region
             .release(&transport)
@@ -1852,12 +1795,6 @@ mod tests {
                 .reclaim_grace_ms(0),
         )
         .expect("initial local memory registration should succeed");
-
-        {
-            let recorded = transport.inner.lock();
-            assert_eq!(recorded.register_calls, 1);
-            assert_eq!(recorded.scratch_register_calls, 1);
-        }
 
         assert!(state.has_storage_segment(&primary));
         let allocations = state
@@ -1938,7 +1875,6 @@ mod tests {
             .collect::<Vec<_>>();
         registered_sizes.sort_unstable();
         assert_eq!(registered_sizes, vec![32, 64, 64]);
-        assert_eq!(transport.inner.lock().scratch_register_calls, 3);
         assert!(state.plan_scratch(&[65]).is_err());
     }
 
