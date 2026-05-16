@@ -201,8 +201,6 @@ Behavior boundary:
 
 - `put_from` and `batch_put_from` send remote writes from the registered source buffer directly
 - `batch_get_into` reads remote payloads directly into registered destination buffers
-- routed batch writes publish active routes per completed remote write chunk instead of waiting for
-  the whole batch; route CAS for one completed chunk can overlap transfer of the next chunk
 - routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races when metadata returns or an exact bounded recheck finds an already published active route, releases its own temporary reservation, and returns that route entry without failing the batch
 - `StoreClient::batch_put_from_statuses(...)` exposes the same Rust batch writer with per-key status reporting for compatibility layers that can tolerate partial cache-write failures
 - `segment_offset` is the durable storage coordinate for the payload; remote reads, local reads, and drain migration all derive the live TE target offset from `segment_offset` and the segment's published storage target chunks, then verify the target range is present in the current TE segment buffers before touching storage
