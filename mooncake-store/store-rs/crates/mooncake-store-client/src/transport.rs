@@ -570,7 +570,6 @@ struct ClassicAllocationRecord {
     location: String,
     size: usize,
     owner: ClassicAllocationOwner,
-    remote_accessible: bool,
 }
 
 pub struct ClassicTeTransport {
@@ -618,21 +617,6 @@ impl ClassicTeTransport {
         engine.register_local_memory_batch(&chunks, location)
     }
 
-    fn register_scratch_memory_with_engine(
-        &self,
-        engine: &ClassicTransferEngine,
-        addr: *mut c_void,
-        size: usize,
-        location: &str,
-    ) -> Result<()> {
-        for_each_registration_chunk(
-            addr,
-            size,
-            self.max_registration_bytes,
-            |chunk_addr, len| engine.register_local_memory(chunk_addr, len, location, false),
-        )
-    }
-
     fn unregister_memory_with_engine(
         &self,
         engine: &ClassicTransferEngine,
@@ -657,26 +641,9 @@ impl ClassicTeTransport {
                 location: "cpu:0".to_string(),
                 size,
                 owner: ClassicAllocationOwner::Borrowed,
-                remote_accessible: true,
             })
             .location
             .clone()
-    }
-
-    fn set_registration_access(&self, addr: *mut c_void, size: usize, remote_accessible: bool) {
-        let mut allocations = self.allocations.lock();
-        allocations
-            .entry(addr as usize)
-            .and_modify(|record| {
-                record.size = size;
-                record.remote_accessible = remote_accessible;
-            })
-            .or_insert_with(|| ClassicAllocationRecord {
-                location: "cpu:0".to_string(),
-                size,
-                owner: ClassicAllocationOwner::Borrowed,
-                remote_accessible,
-            });
     }
 
     fn register_startup_entries_with_engine(
@@ -716,22 +683,12 @@ impl ClassicTeTransport {
             .collect::<Vec<_>>();
         let replacement = ClassicTransferEngine::new(&self.config, &self.segment_name)?;
         for (addr, record) in &allocations {
-            let addr = *addr as *mut c_void;
-            if record.remote_accessible {
-                self.register_memory_with_engine(
-                    &replacement,
-                    addr,
-                    record.size,
-                    &record.location,
-                )?;
-            } else {
-                self.register_scratch_memory_with_engine(
-                    &replacement,
-                    addr,
-                    record.size,
-                    &record.location,
-                )?;
-            }
+            self.register_memory_with_engine(
+                &replacement,
+                *addr as *mut c_void,
+                record.size,
+                &record.location,
+            )?;
         }
         let mut engine = self.engine.write();
         let previous = std::mem::replace(&mut *engine, replacement);
@@ -1093,7 +1050,6 @@ impl StoreTransport for ClassicTeTransport {
                 location: location.to_string(),
                 size: _size,
                 owner: ClassicAllocationOwner::Borrowed,
-                remote_accessible: true,
             });
         Ok(())
     }
@@ -1119,7 +1075,6 @@ impl StoreTransport for ClassicTeTransport {
                 location: location.to_string(),
                 size,
                 owner,
-                remote_accessible: true,
             },
         );
         Ok(addr)
@@ -1163,22 +1118,11 @@ impl StoreTransport for ClassicTeTransport {
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
         let location = self.registration_location(addr, size);
         let engine = self.engine.read();
-        self.set_registration_access(addr, size, true);
         self.register_memory_with_engine(&engine, addr, size, &location)
-    }
-
-    fn register_scratch_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
-        let location = self.registration_location(addr, size);
-        let engine = self.engine.read();
-        self.set_registration_access(addr, size, false);
-        self.register_scratch_memory_with_engine(&engine, addr, size, &location)
     }
 
     fn register_startup_memory_batch(&self, entries: &[MemoryRegistration]) -> Result<()> {
         let engine = self.engine.read();
-        for entry in entries {
-            self.set_registration_access(entry.addr, entry.size, true);
-        }
         self.register_startup_entries_with_engine(&engine, entries)
     }
 
@@ -2378,7 +2322,6 @@ mod tests {
                 location: "cpu:1".to_string(),
                 size: 0x100,
                 owner: ClassicAllocationOwner::Borrowed,
-                remote_accessible: true,
             },
         )]);
 
