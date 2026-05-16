@@ -184,6 +184,33 @@ TEST_F(RealClientTest, MountAndAllocateUnmountApisRejectForeignSegments) {
     EXPECT_EQ(std::remove(path.c_str()), 0);
 }
 
+TEST_F(RealClientTest, MountAndAllocateUnmountApisAcceptGracePeriod) {
+    StartMasterAndSetupClient();
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    std::vector<std::string> allocated_segment_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(
+        py_client_->allocateAndMountSegment(
+            1, FLAGS_protocol, "", allocated_segment_ids, &allocated_size),
+        0);
+    ASSERT_FALSE(allocated_segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_segment_ids, 1), 0);
+
+    std::string path = CreateTempSegmentFile(slab_size);
+    ASSERT_FALSE(path.empty());
+
+    std::vector<std::string> mounted_segment_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, slab_size, FLAGS_protocol, "",
+                                       mounted_segment_ids),
+              0);
+    ASSERT_FALSE(mounted_segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountSegment(mounted_segment_ids, 1), 0);
+
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
 // Test basic Put and Get operations
 TEST_F(RealClientTest, BasicPutGetOperations) {
     // Start in-proc master

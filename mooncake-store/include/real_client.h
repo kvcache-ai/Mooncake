@@ -695,8 +695,10 @@ class RealClient : public PyClient {
 
     /**
      * @brief Unmount segments by their ids and clean up local mmap/fd.
+     * @param grace_period_seconds 0 = immediate unmount (legacy behavior).
      */
-    int unmountSegment(const std::vector<std::string> &segment_ids);
+    int unmountSegment(const std::vector<std::string> &segment_ids,
+                       uint64_t grace_period_seconds = 0);
 
     /**
      * @brief Allocate memory internally and mount segments to master.
@@ -712,8 +714,10 @@ class RealClient : public PyClient {
 
     /**
      * @brief Unmount segments by their ids and free locally allocated memory.
+     * @param grace_period_seconds 0 = immediate unmount (legacy behavior).
      */
-    int unmountAndFreeSegment(const std::vector<std::string> &segment_ids);
+    int unmountAndFreeSegment(const std::vector<std::string> &segment_ids,
+                              uint64_t grace_period_seconds = 0);
 
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;
@@ -872,6 +876,11 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, AllocatedSegmentRecord>
         allocated_segment_records_;
     std::mutex allocated_segment_records_mutex_;
+
+    void ReleaseMountedSegmentRecord(const std::string &segment_id);
+    void ReleaseAllMountedSegmentRecords();
+    void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
+    void ReleaseAllAllocatedSegmentRecords();
 };
 
 }  // namespace mooncake

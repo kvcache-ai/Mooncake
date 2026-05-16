@@ -1375,6 +1375,29 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::GracefulUnmountSegment(
+    const UUID& segment_id, const UUID& client_id, uint64_t grace_period_ms) {
+    return execute_rpc(
+        "GracefulUnmountSegment",
+        [&] {
+            return master_service_.GracefulUnmountSegment(segment_id, client_id,
+                                                          grace_period_ms);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("segment_id=", segment_id,
+                             ", client_id=", client_id,
+                             ", grace_period_ms=", grace_period_ms);
+        },
+        [] {
+            MasterMetricManager::instance()
+                .inc_unmount_segment_requests();  // reuse metric or add new
+        },
+        [] {
+            MasterMetricManager::instance()
+                .inc_unmount_segment_failures();  // reuse metric or add new
+        });
+}
+
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
@@ -1692,6 +1715,11 @@ tl::expected<SegmentStatus, ErrorCode> WrappedMasterService::QuerySegmentStatus(
     return master_service_.QuerySegmentStatus(segment_name);
 }
 
+tl::expected<SegmentStatus, ErrorCode>
+WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
+    return master_service_.QuerySegmentStatusById(segment_id);
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -1747,9 +1775,18 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GracefulUnmountSegment>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::QuerySegmentStatus>(
+            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::QuerySegmentStatusById>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);
