@@ -2118,14 +2118,24 @@ fn resolved_object_for_route(
     key: &str,
     route: ObjectRoute,
 ) -> ResolvedObject {
+    let local_segments = reader.local_storage_segments();
     let readable_runtimes = reader
         .readable_runtime_set(true)
         .expect("readable runtime refresh should succeed");
-    let replica = reader
-        .select_readable_replica(&route, &readable_runtimes)
-        .expect("route should expose a readable replica");
-    let fallback_replicas =
-        reader.fallback_replicas_for_route(&route, &replica, &readable_runtimes);
+    let replica = StoreClient::select_readable_replica(
+        &route,
+        reader.runtime_id(),
+        &local_segments,
+        &readable_runtimes,
+    )
+    .expect("route should expose a readable replica");
+    let fallback_replicas = StoreClient::fallback_replicas_for_route(
+        &route,
+        &replica,
+        reader.runtime_id(),
+        &local_segments,
+        &readable_runtimes,
+    );
     ResolvedObject {
         tenant: tenant.to_string(),
         key: key.to_string(),
@@ -12660,12 +12670,17 @@ fn readable_replica_selection_prefers_local_survivor() {
         ],
     };
 
+    let local_segments = local.local_storage_segments();
     let readable = local
         .readable_runtime_set(true)
         .expect("readable runtimes should resolve");
-    let selected = local
-        .select_readable_replica(&route, &readable)
-        .expect("route should expose a readable replica");
+    let selected = StoreClient::select_readable_replica(
+        &route,
+        local.runtime_id(),
+        &local_segments,
+        &readable,
+    )
+    .expect("route should expose a readable replica");
     assert_eq!(selected.segment_name, local_segment);
     assert_eq!(selected.owner, *local.runtime_id());
 }

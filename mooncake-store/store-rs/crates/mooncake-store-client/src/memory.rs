@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr;
@@ -396,6 +396,10 @@ impl LocalMemoryState {
 
     pub fn has_storage_segment(&self, segment: &SegmentName) -> bool {
         self.storage.contains_key(segment)
+    }
+
+    pub(crate) fn all_storage_segment_names(&self) -> BTreeSet<SegmentName> {
+        self.storage.keys().cloned().collect()
     }
 
     pub fn storage_address(

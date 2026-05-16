@@ -1833,16 +1833,16 @@ impl StoreClient {
     }
 
     fn select_readable_replica(
-        &self,
         route: &ObjectRoute,
+        local_runtime: &ClientRuntimeId,
+        local_segments: &BTreeSet<SegmentName>,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
     ) -> Option<ReplicaRoute> {
-        let local_segments = self.local_readable_segments_for_route(route);
         route
             .replicas
             .iter()
             .filter(|replica| {
-                replica.owner == self.lease.runtime || readable_runtimes.contains(&replica.owner)
+                Self::replica_is_readable(replica, local_runtime, local_segments, readable_runtimes)
             })
             .min_by_key(|replica| {
                 (
@@ -1865,17 +1865,6 @@ impl StoreClient {
         readable_runtimes.contains(&replica.owner)
     }
 
-    fn route_has_readable_replica(
-        &self,
-        route: &ObjectRoute,
-        readable_runtimes: &BTreeSet<ClientRuntimeId>,
-    ) -> bool {
-        route.state == RouteState::Active
-            && self
-                .select_readable_replica(route, readable_runtimes)
-                .is_some()
-    }
-
     fn filter_routes_to_readable(
         &self,
         routes: Vec<Option<ObjectRoute>>,
@@ -1884,11 +1873,22 @@ impl StoreClient {
             .into_iter()
             .map(|route| route.filter(|route| route.state == RouteState::Active))
             .collect::<Vec<_>>();
+
+        let local_segments = self.local_storage_segments();
         let readable_runtimes = self.readable_runtime_set(false)?;
+
         let needs_refresh = routes
             .iter()
             .filter_map(Option::as_ref)
-            .any(|route| !self.route_has_readable_replica(route, &readable_runtimes));
+            .any(|route| {
+                Self::select_readable_replica(
+                    route,
+                    &self.lease.runtime,
+                    &local_segments,
+                    &readable_runtimes,
+                )
+                .is_none()
+            });
         let readable_runtimes = if needs_refresh {
             self.readable_runtime_set(true)?
         } else {
@@ -1899,21 +1899,30 @@ impl StoreClient {
             let Some(candidate) = route.as_ref() else {
                 continue;
             };
-            if let Some(replica) = self.select_readable_replica(candidate, &readable_runtimes) {
-                if candidate
-                    .replicas
-                    .iter()
-                    .min_by_key(|candidate| candidate.priority)
-                    .is_some_and(|primary| primary.owner != replica.owner)
-                {
-                    self.prune_unreadable_replicas_best_effort(candidate, &readable_runtimes);
-                }
+            let Some(replica) = Self::select_readable_replica(
+                candidate,
+                &self.lease.runtime,
+                &local_segments,
+                &readable_runtimes,
+            ) else {
+                *route = None;
                 continue;
+            };
+            if candidate
+                .replicas
+                .iter()
+                .min_by_key(|candidate| candidate.priority)
+                .is_some_and(|primary| primary.owner != replica.owner)
+            {
+                self.prune_unreadable_replicas_best_effort(candidate, &readable_runtimes);
             }
-            *route = None;
         }
 
-        self.report_route_hits_best_effort(routes.iter().filter_map(Option::as_ref));
+        self.report_readable_route_hits_best_effort(
+            routes.iter().filter_map(Option::as_ref),
+            &local_segments,
+            &readable_runtimes,
+        );
         Ok(routes)
     }
 
@@ -1927,12 +1936,20 @@ impl StoreClient {
             if route.state != RouteState::Active {
                 return Ok(None);
             }
+            let local_segments = self.local_storage_segments();
             let readable_runtimes = self.readable_runtime_set(false)?;
-            if let Some(replica) = self.select_readable_replica(route, &readable_runtimes) {
+            if let Some(replica) =
+                Self::select_readable_replica(route, &self.lease.runtime, &local_segments, &readable_runtimes)
+            {
                 return Ok(Some(replica));
             }
             let refreshed_readable = self.readable_runtime_set(true)?;
-            Ok(self.select_readable_replica(route, &refreshed_readable))
+            Ok(Self::select_readable_replica(
+                route,
+                &self.lease.runtime,
+                &local_segments,
+                &refreshed_readable,
+            ))
         })();
         tracker.finish(
             &result,
@@ -1960,6 +1977,15 @@ impl StoreClient {
                     .map(|replica| replica.segment_name.clone())
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    fn local_storage_segments(&self) -> BTreeSet<SegmentName> {
+        self.state
+            .lock()
+            .memory_ref()
+            .ok()
+            .map(|m| m.all_storage_segment_names())
             .unwrap_or_default()
     }
 
@@ -2072,18 +2098,18 @@ impl StoreClient {
     }
 
     fn fallback_replicas_for_route(
-        &self,
         route: &ObjectRoute,
         selected: &ReplicaRoute,
+        local_runtime: &ClientRuntimeId,
+        local_segments: &BTreeSet<SegmentName>,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
     ) -> VecDeque<ReplicaRoute> {
-        let local_segments = self.local_readable_segments_for_route(route);
         let mut replicas = route
             .replicas
             .iter()
             .filter(|replica| !Self::has_same_replica(replica, selected))
             .filter(|replica| {
-                replica.owner == self.lease.runtime || readable_runtimes.contains(&replica.owner)
+                Self::replica_is_readable(replica, local_runtime, local_segments, readable_runtimes)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2101,10 +2127,14 @@ impl StoreClient {
         entry: &mut ResolvedObject,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
     ) -> bool {
+        let local_segments = self.local_storage_segments();
         while let Some(candidate) = entry.fallback_replicas.pop_front() {
-            if candidate.owner != self.lease.runtime
-                && !readable_runtimes.contains(&candidate.owner)
-            {
+            if !Self::replica_is_readable(
+                &candidate,
+                &self.lease.runtime,
+                &local_segments,
+                readable_runtimes,
+            ) {
                 continue;
             }
             if candidate.length != entry.replica.length {
@@ -2157,6 +2187,7 @@ impl StoreClient {
             &self.live_client_cache,
             "live_client_snapshot_read_route_refresh",
         );
+        let local_segments = self.local_storage_segments();
         let readable_runtimes = self.readable_runtime_set(true)?;
         let Some(route) = self.query_route_in_tenant(&entry.tenant, &entry.key)? else {
             return Ok(false);
@@ -2164,7 +2195,12 @@ impl StoreClient {
         if route.state != RouteState::Active {
             return Ok(false);
         }
-        let Some(replica) = self.select_readable_replica(&route, &readable_runtimes) else {
+        let Some(replica) = Self::select_readable_replica(
+            &route,
+            &self.lease.runtime,
+            &local_segments,
+            &readable_runtimes,
+        ) else {
             return Ok(false);
         };
         let changed =
@@ -2172,8 +2208,13 @@ impl StoreClient {
         if !changed {
             return Ok(false);
         }
-        let fallback_replicas =
-            self.fallback_replicas_for_route(&route, &replica, &readable_runtimes);
+        let fallback_replicas = Self::fallback_replicas_for_route(
+            &route,
+            &replica,
+            &self.lease.runtime,
+            &local_segments,
+            &readable_runtimes,
+        );
         entry.route = route;
         entry.replica = replica;
         entry.fallback_replicas = fallback_replicas;
@@ -2217,6 +2258,7 @@ impl StoreClient {
                     .map(|(_, scoped)| scoped.clone())
                     .collect::<Vec<_>>(),
             )?;
+            let local_segments = self.local_storage_segments();
             let readable_runtimes = self.readable_runtime_set(false)?;
             let mut resolved = Vec::with_capacity(objects.len());
             for (((tenant, _scoped), object), route) in scoped
@@ -2233,22 +2275,30 @@ impl StoreClient {
                         object.key
                     )));
                 }
-                let (replica, readable_for_route) =
-                    match self.select_readable_replica(&route, &readable_runtimes) {
-                        Some(replica) => (replica, readable_runtimes.clone()),
-                        None => {
-                            let refreshed_readable = self.readable_runtime_set(true)?;
-                            let replica = self
-                                .select_readable_replica(&route, &refreshed_readable)
-                                .ok_or_else(|| {
-                                    StoreError::NotFound(format!(
-                                        "tenant={tenant} key={} has no readable replica owner",
-                                        object.key
-                                    ))
-                                })?;
-                            (replica, refreshed_readable)
-                        }
-                    };
+                let (replica, readable_for_route) = match Self::select_readable_replica(
+                    &route,
+                    &self.lease.runtime,
+                    &local_segments,
+                    &readable_runtimes,
+                ) {
+                    Some(replica) => (replica, readable_runtimes.clone()),
+                    None => {
+                        let refreshed_readable = self.readable_runtime_set(true)?;
+                        let replica = Self::select_readable_replica(
+                            &route,
+                            &self.lease.runtime,
+                            &local_segments,
+                            &refreshed_readable,
+                        )
+                        .ok_or_else(|| {
+                            StoreError::NotFound(format!(
+                                "tenant={tenant} key={} has no readable replica owner",
+                                object.key
+                            ))
+                        })?;
+                        (replica, refreshed_readable)
+                    }
+                };
                 if route
                     .replicas
                     .iter()
@@ -2257,8 +2307,13 @@ impl StoreClient {
                 {
                     self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
                 }
-                let fallback_replicas =
-                    self.fallback_replicas_for_route(&route, &replica, &readable_for_route);
+                let fallback_replicas = Self::fallback_replicas_for_route(
+                    &route,
+                    &replica,
+                    &self.lease.runtime,
+                    &local_segments,
+                    &readable_for_route,
+                );
                 resolved.push(ResolvedObject {
                     tenant: tenant.to_string(),
                     key: object.key.to_string(),
@@ -2838,6 +2893,19 @@ impl StoreClient {
         &self,
         routes: impl IntoIterator<Item = &'a ObjectRoute>,
     ) {
+        let Ok(readable_runtimes) = self.readable_runtime_set(false) else {
+            return;
+        };
+        let local_segments = self.local_storage_segments();
+        self.report_readable_route_hits_best_effort(routes, &local_segments, &readable_runtimes);
+    }
+
+    fn report_readable_route_hits_best_effort<'a>(
+        &self,
+        routes: impl IntoIterator<Item = &'a ObjectRoute>,
+        local_segments: &BTreeSet<SegmentName>,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) {
         let mut local_hits = BTreeSet::new();
         let mut remote_hits = BTreeMap::<ClientRuntimeId, BTreeSet<ObjectKey>>::new();
         for route in routes {
@@ -2845,6 +2913,14 @@ impl StoreClient {
                 continue;
             }
             for replica in &route.replicas {
+                if !Self::replica_is_readable(
+                    replica,
+                    &self.lease.runtime,
+                    local_segments,
+                    readable_runtimes,
+                ) {
+                    continue;
+                }
                 if replica.owner == self.lease.runtime {
                     local_hits.insert(route.key.clone());
                 } else {

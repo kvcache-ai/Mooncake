@@ -167,15 +167,10 @@ impl StoreClient {
                     ObjectKey::from_scope(&scope, object.key)
                 })
                 .collect::<Vec<_>>();
-            let readable_runtimes = self.readable_runtime_set(false)?;
             let result = self
                 .query_routes_by_object_keys_bounded(&keys)?
                 .into_iter()
-                .map(|route| {
-                    route.is_some_and(|route| {
-                        self.route_has_readable_replica(&route, &readable_runtimes)
-                    })
-                })
+                .map(|route| route.is_some())
                 .collect();
             Ok(result)
         })();
