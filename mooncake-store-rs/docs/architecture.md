@@ -136,11 +136,8 @@ layout.
 A write is split into route resolution, allocation, transfer, and route publication.
 
 For routed batch writes, remote replica transfers are coalesced by tenant and scratch-window
-capacity into bounded chunks. Each completed chunk publishes the routes for only the objects in
-that chunk, and the next transfer chunk is submitted before the previous chunk's routes are
-published. Large same-tenant batches therefore avoid a full-batch route-visibility barrier: keys
-become readable after their own replica writes finish and their route CAS succeeds, while later
-chunks can still be transferring.
+capacity before route publication. Large same-tenant batches therefore pay one transfer-completion
+wait per chunk instead of one wait per object.
 
 If a routed write fails during remote transfer before the object route is published, the client
 releases the prepared allocations, quarantines the failed remote storage runtime, refreshes its

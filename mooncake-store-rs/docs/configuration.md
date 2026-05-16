@@ -107,12 +107,6 @@ Server and migration knobs:
 | `migrate --max-retries` | `MC_STORE_ADMIN_MIGRATION_TASK_MAX_RETRIES` | admin queue default | per-task retry override |
 | `migrate task get --task-id` | `MC_STORE_ADMIN_TASK_ID` | required | route-migration task id |
 
-Python compatibility knobs:
-
-| Environment variable | Default | Meaning |
-|----------------------|---------|---------|
-| `MC_STORE_RS_PY_BATCH_PUT_FROM_FANOUT` | `8` | Maximum real-mode Python `batch_put_from(...)` shard fanout. The wrapper splits registered-buffer inputs into ordered native worker calls up to this cap and falls back to `8` when the value is unset, zero, or invalid. |
-
 Policy and quota knobs:
 
 | CLI flag | Environment variable | Default | Meaning |
