@@ -162,9 +162,6 @@ fn main() {
         .or_else(|_| env::var("CUDA_PATH"))
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
     println!("cargo:rustc-link-search=native={}/targets/x86_64-linux/lib", cuda_home);
-    // CUDA stubs (libcuda.so) needed for driver API symbols (cuInit, cuPointerGetAttribute, etc.)
-    println!("cargo:rustc-link-search=native={}/lib64/stubs", cuda_home);
-    println!("cargo:rustc-link-search=native={}/targets/x86_64-linux/lib/stubs", cuda_home);
 
     // cachelib_memory_allocator is a static library built alongside mooncake_store.
     println!(
