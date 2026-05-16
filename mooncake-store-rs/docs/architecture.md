@@ -145,11 +145,9 @@ storage target map. `segment_offset` belongs to the local allocator and reclaim 
 announcements publish the exact `logical_offset -> target_offset` storage chunks derived during
 local registration; writers use those chunks as the only allocator-to-transport mapping source.
 Scratch buffers are registered for staging only and are never published as object-addressable
-storage. Remote reads require `ReplicaRoute::offset` to already be a valid transport target
-coordinate; the read path does not repair bad routes from allocator `segment_offset`. Local direct
-reads, batch reads, and drain migration translate `offset` through the selected segment's storage
-target map before copying from local storage, so local and remote reads observe the same bytes even
-when the transport target coordinate is not the process virtual address.
+storage. Local direct reads, batch reads, and drain migration translate `offset` through the
+selected segment's storage target map before copying from local storage, so local and remote reads
+observe the same bytes even when the transport target coordinate is not the process virtual address.
 
 ```mermaid
 sequenceDiagram
