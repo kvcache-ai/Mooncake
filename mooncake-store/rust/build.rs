@@ -139,6 +139,11 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         build_dir.join("mooncake-common").display()
     );
+    // mooncake_common static library lives in the src/ subdirectory.
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("mooncake-common/src").display()
+    );
 
     // transfer_engine is built in a sibling directory.
     println!(
@@ -157,6 +162,9 @@ fn main() {
         .or_else(|_| env::var("CUDA_PATH"))
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
     println!("cargo:rustc-link-search=native={}/targets/x86_64-linux/lib", cuda_home);
+    // CUDA stubs (libcuda.so) needed for driver API symbols (cuInit, cuPointerGetAttribute, etc.)
+    println!("cargo:rustc-link-search=native={}/lib64/stubs", cuda_home);
+    println!("cargo:rustc-link-search=native={}/targets/x86_64-linux/lib/stubs", cuda_home);
 
     // cachelib_memory_allocator is a static library built alongside mooncake_store.
     println!(
@@ -169,6 +177,7 @@ fn main() {
     // Dependencies of mooncake_store that must be satisfied at link time.
     // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
     println!("cargo:rustc-link-lib=transfer_engine");
+    println!("cargo:rustc-link-lib=mooncake_common"); // Environ::Get() and other common utilities
     println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
     println!("cargo:rustc-link-lib=asio"); // shared library built by mooncake-common
     println!("cargo:rustc-link-lib=jsoncpp"); // transfer_engine dependency
@@ -225,6 +234,18 @@ fn main() {
 
     push_env_paths(&mut search_dirs, "LD_LIBRARY_PATH");
     push_env_paths(&mut search_dirs, "LIBRARY_PATH");
+
+    // CUDA stubs contain libcuda.so (driver API); add them so has_library() can
+    // detect the stub and emit -lcuda for cuInit/cuPointerGetAttribute etc.
+    let cuda_home_for_search = env::var("CUDA_HOME")
+        .or_else(|_| env::var("CUDA_PATH"))
+        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    for stubs_dir in [
+        PathBuf::from(format!("{}/lib64/stubs", cuda_home_for_search)),
+        PathBuf::from(format!("{}/targets/x86_64-linux/lib/stubs", cuda_home_for_search)),
+    ] {
+        push_existing_dir(&mut search_dirs, stubs_dir);
+    }
 
     let asan_runtime_so = compiler_runtime_library("libasan.so");
     if let Some(path) = asan_runtime_so.as_ref() {
