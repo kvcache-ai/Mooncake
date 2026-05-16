@@ -248,11 +248,6 @@ Common calls:
 
 `evacuate_owned_replicas()` drains the local client, rewrites every live route that still references it, immediately reclaims old allocations, and retires emptied local segments.
 
-During evacuation, payload copy is pinned to the exact local replica being removed. The writer does not satisfy the migration read from another live mirror, because that would publish the wrong bytes when replicas temporarily diverge during a shrink.
-The migration read uses the replica's transport target offset, not the allocator reservation offset, and maps that target coordinate through the storage target map before touching local memory.
-
-Before returning, the draining client also mirrors any route-authority records that were only present locally to active route authorities. If its cached live-client snapshot cannot find a mirror, it refreshes membership and retries the mirror pass.
-
 Use `evacuate_owned_replicas_via(writer)` when you want a separate routed client to publish replacement routes during shrink.
 
 These operations are the current control surface for hot-upgrade, elastic growth, segment drain/retire, and full client shrink flows.
