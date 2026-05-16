@@ -136,38 +136,6 @@ impl StoreClient {
         self.filter_routes_to_readable(routes)
     }
 
-    fn route_has_readable_replica(
-        &self,
-        route: &ObjectRoute,
-        readable_runtimes: &BTreeSet<ClientRuntimeId>,
-    ) -> bool {
-        self.select_readable_replica(route, readable_runtimes)
-            .is_some()
-    }
-
-    pub fn batch_is_readable(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
-        let keys = objects
-            .iter()
-            .map(|object| {
-                let tenant = object.tenant.unwrap_or(self.default_tenant());
-                let scope =
-                    NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
-                ObjectKey::from_scope(&scope, object.key)
-            })
-            .collect::<Vec<_>>();
-        let readable_runtimes = self.readable_runtime_set(false)?;
-        let result = self
-            .query_routes_by_object_keys_bounded(&keys)?
-            .into_iter()
-            .map(|route| {
-                route.is_some_and(|route| {
-                    self.route_has_readable_replica(&route, &readable_runtimes)
-                })
-            })
-            .collect();
-        Ok(result)
-    }
-
     fn shared_batch_replication_policy(
         requests: &[PutRequest<'_>],
     ) -> Option<Option<ReplicationPolicy>> {
