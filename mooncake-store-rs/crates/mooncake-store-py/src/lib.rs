@@ -795,45 +795,65 @@ impl PyMooncakeDistributedStore {
                             })
                             .collect::<Vec<_>>();
                         let batch_started = Instant::now();
-                        let results = client.batch_put_from_statuses(&requests);
-                        let elapsed_ms = batch_started.elapsed().as_millis();
-                        let mut failed = 0usize;
-                        let statuses = items
-                            .iter()
-                            .zip(results)
-                            .map(|((key, _, size), result)| match result {
-                                Ok(_) => 0,
-                                Err(error) => {
-                                    failed += 1;
-                                    eprintln!(
-                                        "[mooncake-store] batch_put_from per-key failed runtime={} key={} bytes={} batch_items={} batch_bytes={} elapsed_ms={} error={}",
-                                        client.runtime_id(),
-                                        key,
-                                        size,
-                                        item_count,
-                                        total_bytes,
-                                        elapsed_ms,
-                                        error
-                                    );
-                                    tracing::debug!(
-                                        key = %key,
-                                        error = %error,
-                                        "batch_put_from per-key write failed"
-                                    );
-                                    -1
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        if failed > 0 {
-                            tracing::debug!(
-                                failed,
-                                items = item_count,
-                                bytes = total_bytes,
-                                elapsed_ms,
-                                "batch_put_from completed with per-key failures"
-                            );
+                        match client.batch_put_from(&requests) {
+                            Ok(_) => Ok(vec![0; item_count]),
+                            Err(batch_error) => {
+                                eprintln!(
+                                    "[mooncake-store] batch_put_from failed runtime={} items={} bytes={} elapsed_ms={} error={}",
+                                    client.runtime_id(),
+                                    item_count,
+                                    total_bytes,
+                                    batch_started.elapsed().as_millis(),
+                                    batch_error
+                                );
+                                tracing::debug!(
+                                    error = %batch_error,
+                                    "batch_put_from falling back to per-key best-effort status"
+                                );
+                                let statuses = items
+                                    .iter()
+                                    .map(|(key, buffer_ptr, size)| {
+                                        let item_started = Instant::now();
+                                        let mut request = PutFromRequest::new(
+                                            key,
+                                            (*buffer_ptr as *const c_void).cast(),
+                                            *size,
+                                        )
+                                        .tenant(scope.tenant.as_str());
+                                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                            request = request.domain(scope.domain.as_str());
+                                        }
+                                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                                            request = request.object_set(scope.object_set.as_str());
+                                        }
+                                        if let Some(policy) = policy.clone() {
+                                            request = request.replication(policy);
+                                        }
+                                        let result = client.batch_put_from(&[request]);
+                                        match result {
+                                            Ok(_) => 0,
+                                            Err(error) => {
+                                                eprintln!(
+                                                    "[mooncake-store] batch_put_from per-key failed runtime={} key={} bytes={} elapsed_ms={} error={}",
+                                                    client.runtime_id(),
+                                                    key,
+                                                    size,
+                                                    item_started.elapsed().as_millis(),
+                                                    error
+                                                );
+                                                tracing::debug!(
+                                                    key = %key,
+                                                    error = %error,
+                                                    "batch_put_from per-key write failed"
+                                                );
+                                                -1
+                                            }
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                Ok(statuses)
+                            }
                         }
-                        Ok(statuses)
                     })
                 })
                 .map_err(store_error_to_py)?;

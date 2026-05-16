@@ -53,7 +53,7 @@ Remote read behavior:
 - unregistered destination buffers still use the existing scratch-window planner and direct single-object fallback path when needed
 - `put_from` and `batch_put_from` now preserve the same registered-buffer zero-copy contract for remote writes: the transport request sources point at the caller-registered buffer ranges instead of a scratch copy
 - routed `batch_put_from` handles concurrent cache writers per key by treating route-CAS conflicts with an already published active route as successful cache insert races, using only an exact bounded recheck when the CAS response omits that route
-- Python compatibility `batch_put_from` reports best-effort per-key statuses produced by the Rust batch writer; route-CAS conflicts with an active published route are success, while true per-key write failures stay isolated to the affected item without replaying the batch serially in Python
+- Python compatibility `batch_put_from` reports best-effort per-key statuses; route-CAS conflicts with an active published route are success, while true per-key write failures stay isolated to the affected item
 - Python compatibility registered-buffer batch restores also report best-effort per-key statuses; a route miss or dead storage owner for one entry does not poison other entries in the same restore batch
 - remote storage segment announcements publish explicit storage target chunks, and writers translate allocator segment offsets through those chunks instead of inferring storage from backend buffer ordering
 - remote reads derive the live transport target offset from the replica's durable `segment_offset` and the segment's published storage target chunks, then verify the range against the current TE segment buffers
