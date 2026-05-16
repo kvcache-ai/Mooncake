@@ -48,7 +48,7 @@
 #include <cufile.h>
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
 
@@ -175,7 +175,7 @@ void setBackendDevice(const std::string &backend) {
     if (!usesDeviceMemory(backend)) {
         return;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
     checkCudaError(cudaSetDevice(pickDevId(backend)), "Failed to set device");
@@ -187,7 +187,7 @@ void setBackendDevice(const std::string &backend) {
 void *allocateMemoryPool(size_t size, int socket_id,
                          const std::string &backend) {
     if (usesDeviceMemory(backend)) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         setBackendDevice(backend);
@@ -205,7 +205,7 @@ void *allocateMemoryPool(size_t size, int socket_id,
 
 void freeMemoryPool(void *addr, size_t size, const std::string &backend) {
     if (usesDeviceMemory(backend)) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         cudaFree(addr);
@@ -220,7 +220,7 @@ void freeMemoryPool(void *addr, size_t size, const std::string &backend) {
 void copyFromHost(void *dst, const void *src, size_t size,
                   const std::string &backend) {
     if (usesDeviceMemory(backend)) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice),
@@ -236,7 +236,7 @@ void copyFromHost(void *dst, const void *src, size_t size,
 void copyToHost(void *dst, const void *src, size_t size,
                 const std::string &backend) {
     if (usesDeviceMemory(backend)) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost),

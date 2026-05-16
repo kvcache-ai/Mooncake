@@ -337,7 +337,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
 
@@ -395,7 +395,8 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
+            ;
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
@@ -477,7 +478,7 @@ int Topology::discover(const std::vector<std::string> &filter) {
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
     for (auto &ent : discoverCudaTopology(all_hca)) {
