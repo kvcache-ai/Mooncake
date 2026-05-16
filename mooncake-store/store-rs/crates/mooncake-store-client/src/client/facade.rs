@@ -286,7 +286,6 @@ impl MooncakeCompatibilityFacade for StoreClient {
             segment_name,
             capacity_bytes,
             used_bytes,
-            target_chunks,
             state: SegmentLifecycleState::Active,
             alignment_bytes: self.local_memory.alignment as u64,
             tags,
@@ -381,7 +380,15 @@ impl MooncakeCompatibilityFacade for StoreClient {
                         segment_name.0
                     ))
                 })?;
-            let announcement = segment_info.announcement(self.lease.runtime.clone(), 0);
+            let announcement = SegmentAnnouncement {
+                owner: self.lease.runtime.clone(),
+                segment_name,
+                capacity_bytes: segment_info.capacity_bytes,
+                used_bytes: 0,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: segment_info.alignment_bytes,
+                tags: segment_info.tags,
+            };
             self.allocator.lock().upsert(&announcement);
             info!(
                 runtime = %self.lease.runtime,

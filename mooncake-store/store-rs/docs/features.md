@@ -52,12 +52,9 @@ Remote read behavior:
 - when a `batch_get_into` destination range is already registered, the runtime issues direct remote batch reads into that buffer instead of staging through local scratch first
 - unregistered destination buffers still use the existing scratch-window planner and direct single-object fallback path when needed
 - `put_from` and `batch_put_from` now preserve the same registered-buffer zero-copy contract for remote writes: the transport request sources point at the caller-registered buffer ranges instead of a scratch copy
-- routed `batch_put_from` handles concurrent cache writers per key by treating route-CAS conflicts with an already published active route as successful cache insert races, using only an exact bounded recheck when the CAS response omits that route
-- Python compatibility `batch_put_from` reports best-effort per-key statuses; route-CAS conflicts with an active published route are success, while true per-key write failures stay isolated to the affected item
-- Python compatibility registered-buffer batch restores also report best-effort per-key statuses; a route miss or dead storage owner for one entry does not poison other entries in the same restore batch
-- remote storage segment announcements publish explicit storage target chunks, and writers translate allocator segment offsets through those chunks instead of inferring storage from backend buffer ordering
-- remote reads derive the live transport target offset from the replica's durable `segment_offset` and the segment's published storage target chunks, then verify the range against the current TE segment buffers
-- local reads and drain migration use the same `segment_offset` resolver before copying from local storage, so every read path has one storage-coordinate source of truth
+- routed `batch_put_from` handles concurrent cache writers per key by treating route-CAS conflicts as successful cache insert races without adding a metadata recheck
+- Python compatibility `batch_put_from` reports best-effort per-key statuses; route-CAS conflicts are success, while true per-key write failures stay isolated to the affected item
+- remote storage segment buffers are interpreted in address order before translating segment-relative allocation offsets into transport target addresses, so chunked RDMA registrations do not depend on backend buffer listing order
 - scratch buffers are registered for local transfer staging only and are not published as remote storage extents
 - local replicas still copy into owned local segment memory; the zero-copy contract applies to the remote transport source buffer, not to local placement
 - payload integrity uses a fast stable 64-bit checksum, and large batch validation fans out across multiple CPU workers so registered-buffer restore traffic does not serialize the verification tail on one core
