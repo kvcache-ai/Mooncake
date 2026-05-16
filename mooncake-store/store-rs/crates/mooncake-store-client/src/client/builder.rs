@@ -317,16 +317,8 @@ impl StoreClientBuilder {
                     format!("{host}:{port}")
                 };
             }
-            let transport_segment = SegmentName::new(transport.segment_name()?);
-            if let Some(endpoint_segment) = endpoints.segment_name.as_ref() {
-                if endpoint_segment != &transport_segment {
-                    return Err(StoreError::InvalidState(format!(
-                        "configured segment_name {} does not match transport segment_name {}",
-                        endpoint_segment.0, transport_segment.0
-                    )));
-                }
-            } else {
-                endpoints.segment_name = Some(transport_segment);
+            if endpoints.segment_name.is_none() {
+                endpoints.segment_name = Some(SegmentName::new(transport.segment_name()?));
             }
         }
 
