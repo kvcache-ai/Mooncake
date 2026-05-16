@@ -119,18 +119,6 @@ The membership snapshot is runtime cache, not protocol configuration:
 - route policy is durable cluster configuration stored in metadata
 - request-level tenants affect scoped object keys, not the cluster-wide route-authority policy
 
-Segment metadata is scoped under its owning `ClientRuntimeId`. The client lease is the liveness
-truth; segment records are child resources that describe buffers owned by that live runtime. In
-Redis, the lease payload and owned segment records live in the same client resource hash, so the
-lease TTL expires the whole resource bucket. Write placement and preferred-segment resolution start
-from live compatible leases and then do exact `get_segment(owner, segment)` lookups for those
-owners. A stale segment record without a live client lease cannot make a runtime eligible for
-allocation.
-
-The default Redis metadata keyspace is `mc/store-rs/v2`. That namespace is the schema boundary for
-client resource hashes, keeping old `v1` lease-string data from colliding with the current hash
-layout.
-
 ## Write Path
 
 A write is split into route resolution, allocation, transfer, and route publication.
@@ -145,10 +133,23 @@ membership snapshot, and retries placement when the request is not pinned to a h
 segment. This keeps transient storage-owner transport failures from escaping into Python backup
 threads as fatal exceptions.
 
-Remote transfer planning splits each request at both local registration limits and remote segment
-buffer boundaries. The route still records one logical replica, but the transport only receives
-slices that fit inside one registered target buffer, matching classic RDMA transfer-engine
-requirements when a segment is backed by multiple contiguous registrations.
+Remote transfer planning splits each request at both local registration limits and the storage
+target chunks published in the target segment announcement. The route still records one logical
+replica, but the transport only receives slices that fit inside one registered storage target
+chunk, matching classic RDMA transfer-engine requirements when a segment is backed by multiple
+contiguous registrations.
+
+Replica routes keep two separate coordinates. `ReplicaRoute::offset` is the actual transport
+target address used by TE/TENT and is the byte location of the stored payload in the segment
+storage target map. `segment_offset` belongs to the local allocator and reclaim path. Segment
+announcements publish the exact `logical_offset -> target_offset` storage chunks derived during
+local registration; writers use those chunks as the only allocator-to-transport mapping source.
+Scratch buffers are registered for staging only and are never published as object-addressable
+storage. Remote reads require `ReplicaRoute::offset` to already be a valid transport target
+coordinate; the read path does not repair bad routes from allocator `segment_offset`. Local direct
+reads, batch reads, and drain migration translate `offset` through the selected segment's storage
+target map before copying from local storage, so local and remote reads observe the same bytes even
+when the transport target coordinate is not the process virtual address.
 
 ```mermaid
 sequenceDiagram
@@ -184,10 +185,6 @@ The current implementation supports:
 - multi-replica placement
 
 The default request policy prefers local storage when available. When local capacity is insufficient, the client allocates on remote storage nodes selected by the planner and the replication policy.
-Routed writes use the same live membership snapshot as route-authority selection, then resolve
-segment metadata under each live storage runtime. Scratch-only writers, including Python clients
-with `storage_bytes=0` and routed writes enabled, never become storage candidates just because
-old segment metadata remains in the backend.
 
 ### Remote storage-owner tracking
 
@@ -203,6 +200,12 @@ This lets each storage owner update its local eviction clock from the published 
 ## Read Path
 
 For reads, the client first resolves the object route, then groups reads by remote segment and submits transfer requests through TE/TENT.
+When the selected replica is local, the client still resolves the same `ReplicaRoute::offset` target coordinate that remote TE reads use, then maps that coordinate back to the local storage registration.
+Successful route lookup APIs are also access signals: `query_route`, `get_size`, `is_exist`,
+and `batch_is_exist` report active route hits to the storage owners best-effort, using the same
+local/CLOCK and control-plane hit-report path as completed reads. This keeps prefix-probe
+workloads from letting recently observed replicas age out before the caller issues the matching
+restore read, without adding metadata-backend traffic to the request path.
 
 ```mermaid
 sequenceDiagram
@@ -340,12 +343,7 @@ Metadata backends store four persistent categories of data:
 
 For membership specifically, metadata is the authoritative lease store, while the client runtime keeps a prewarmed and background-refreshed snapshot for request-path reads.
 
-Client-lease registration uses `allocate_client_lease`: the metadata backend atomically derives the next epoch from `max(active epochs for stable_id, lease-scoped HWM) + 1`, writes the lease under that epoch, and returns the assigned `ClientRuntimeId`. Republishing the same `(stable_id, epoch)` through `upsert_client_lease` is a refresh and extends the lease TTL in place — heartbeat and lifecycle-state updates use that path, including `Draining` during hot upgrade. Redis stores the lease as the `lease` field in the client resource hash and stores owned segments as `segment:*` fields in that same hash, so lease refresh extends the TTL for all client-owned resource metadata. Redis also TTL-bounds the per-stable-id epoch HWM and `by-stable` helper index to the live lease horizon, so dead client IDs do not leave permanent per-client state. The in-memory backend holds the active-epoch set and HWM under its write lock, Redis uses a dedicated Lua script over a `by-stable` set and an HWM key, and etcd uses a txn loop over per-epoch marker keys and the HWM key. Callers never supply an epoch; the `ClientEpoch` type remains internal to serialization, handoff plans, and metadata keys.
-
-Local memory registration refreshes the runtime lease immediately before publishing local segment
-metadata. Large memory registration can consume most of the startup lease TTL; refreshing at the
-publication boundary keeps Redis' TTL-backed client resource hash present before `segment:*` fields
-are written.
+Client-lease registration uses `allocate_client_lease`: the metadata backend atomically derives the next epoch from `max(active epochs for stable_id, persistent HWM) + 1`, writes the lease under that epoch, and returns the assigned `ClientRuntimeId`. Republishing the same `(stable_id, epoch)` through `upsert_client_lease` is a refresh and extends the lease TTL in place — heartbeat and lifecycle-state updates use that path. The backends implement the allocation differently: the in-memory backend holds the active-epoch set and HWM under its write lock, Redis uses a dedicated Lua script over a `by-stable` set and an HWM key, and etcd uses a txn loop over per-epoch marker keys and the HWM key. Callers never supply an epoch; the `ClientEpoch` type remains internal to serialization, handoff plans, and metadata keys.
 
 For strict quota rollout, the metadata model now also includes tenant-root quota primitives:
 
@@ -399,9 +397,6 @@ This avoids continuing to grow one branchy `operation -> counters` map and keeps
 ### Metrics
 
 Metrics are recorded per operation and status.
-Each Prometheus sample carries the process-bound tenant label selected by the
-runtime's default tenant, so dashboards can filter a fully isolated tenant
-without inferring it from pod or process identity.
 
 Examples include:
 

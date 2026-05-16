@@ -91,9 +91,9 @@ enum MigrationExecutionState {
 }
 
 message ReplicaRoute {
-  reserved 3;
   ClientRuntimeId owner = 1;
   string segment_name = 2;
+  uint64 offset = 3;
   uint64 segment_offset = 4;
   uint64 length = 5;
   optional uint64 checksum = 6;

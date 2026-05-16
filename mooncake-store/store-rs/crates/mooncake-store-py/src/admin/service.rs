@@ -2561,6 +2561,7 @@ mod tests {
             replicas.push(ReplicaRoute {
                 owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
                 segment_name: SegmentName::new(source_segment),
+                offset: 0,
                 segment_offset: 0,
                 length: 12,
                 checksum: None,
@@ -2572,6 +2573,7 @@ mod tests {
             replicas.push(ReplicaRoute {
                 owner: ClientRuntimeId::new("storage-b", ClientEpoch(1)),
                 segment_name: SegmentName::new(*segment),
+                offset: 64 * (index as u64 + 1),
                 segment_offset: 64 * (index as u64 + 1),
                 length: 12,
                 checksum: None,
@@ -2909,6 +2911,7 @@ mod tests {
                     replicas: vec![ReplicaRoute {
                         owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
                         segment_name: SegmentName::new("segment-a"),
+                        offset: 0,
                         segment_offset: 0,
                         length: 12,
                         checksum: None,
