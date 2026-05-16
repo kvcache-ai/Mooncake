@@ -2863,6 +2863,54 @@ impl StoreClient {
         true
     }
 
+    fn segment_relative_target_offset(
+        info: &SegmentInfo,
+        segment_name: &SegmentName,
+        segment_offset: u64,
+        length: u64,
+    ) -> Result<u64> {
+        if info.buffers.is_empty() {
+            return Err(StoreError::Transport(format!(
+                "segment {} exposes no buffers",
+                segment_name.0
+            )));
+        }
+        let mut buffers = info.buffers.iter().collect::<Vec<_>>();
+        buffers.sort_by_key(|buffer| buffer.base);
+        let total_capacity: u64 = buffers
+            .iter()
+            .fold(0u64, |acc, buffer| acc.saturating_add(buffer.length));
+        let mut remaining_offset = segment_offset;
+        for buffer in &buffers {
+            if remaining_offset >= buffer.length {
+                remaining_offset -= buffer.length;
+                continue;
+            }
+            let Some(target_offset) = buffer.base.checked_add(remaining_offset) else {
+                break;
+            };
+            if Self::segment_info_covers_target(info, target_offset, length) {
+                return Ok(target_offset);
+            }
+            break;
+        }
+        warn!(
+            segment = %segment_name.0,
+            segment_offset,
+            length,
+            total_capacity,
+            num_buffers = buffers.len(),
+            buffers = ?buffers.iter().map(|b| (b.base, b.length)).collect::<Vec<_>>(),
+            "segment offset is outside segment — possible allocator/registration size mismatch \
+             or stale segment info cache after segment extension"
+        );
+        Err(StoreError::Transport(format!(
+            "segment offset {} length {} is outside segment {} \
+             (total_capacity={}, num_buffers={})",
+            segment_offset, length, segment_name.0, total_capacity, buffers.len()
+        )))
+    }
+
     fn storage_target_offset(
         target_chunks: &[SegmentTargetChunk],
         segment_name: &SegmentName,
@@ -2949,22 +2997,12 @@ impl StoreClient {
         if Self::segment_info_covers_target(info, replica.offset, replica.length) {
             return Ok(replica.offset);
         }
-        warn!(
-            segment = %replica.segment_name.0,
-            target_offset = replica.offset,
-            segment_offset = replica.segment_offset,
-            length = replica.length,
-            num_buffers = info.buffers.len(),
-            buffers = ?info.buffers.iter().map(|buffer| (buffer.base, buffer.length)).collect::<Vec<_>>(),
-            "replica target offset is outside segment; route metadata is not readable"
-        );
-        Err(StoreError::Transport(format!(
-            "replica target offset {} length {} is outside segment {} (num_buffers={})",
-            replica.offset,
+        Self::segment_relative_target_offset(
+            info,
+            &replica.segment_name,
+            replica.segment_offset,
             replica.length,
-            replica.segment_name.0,
-            info.buffers.len()
-        )))
+        )
     }
 
     fn target_buffer_transfer_requests(
@@ -3628,6 +3666,47 @@ mod runtime_io_tests {
     }
 
     #[test]
+    fn segment_relative_target_offset_walks_chunked_buffers() {
+        let info = memory_segment(&[(1000, 64), (1064, 64), (1128, 32)]);
+        let segment = SegmentName::new("seg");
+
+        assert_eq!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 80, 16)
+                .expect("offset in second chunk should map"),
+            1080
+        );
+        assert_eq!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 120, 24)
+                .expect("contiguous chunks should cover the transfer"),
+            1120
+        );
+    }
+
+    #[test]
+    fn segment_relative_target_offset_orders_chunked_buffers() {
+        let info = memory_segment(&[(1064, 64), (1000, 64), (1128, 32)]);
+        let segment = SegmentName::new("seg");
+
+        assert_eq!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 80, 16)
+                .expect("logical offset should use buffer address order"),
+            1080
+        );
+    }
+
+    #[test]
+    fn segment_relative_target_offset_orders_tail_crossing_buffers() {
+        let info = memory_segment(&[(1128, 64), (1000, 64), (1064, 64)]);
+        let segment = SegmentName::new("seg");
+
+        assert_eq!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 60, 8)
+                .expect("logical range should cross into the next ordered buffer"),
+            1060
+        );
+    }
+
+    #[test]
     fn storage_target_offset_uses_explicit_chunks_when_scratch_matches_storage() {
         let segment = SegmentName::new("seg-storage-window");
         let chunks = vec![SegmentTargetChunk {
@@ -3683,6 +3762,17 @@ mod runtime_io_tests {
     }
 
     #[test]
+    fn segment_relative_target_offset_rejects_holes() {
+        let info = memory_segment(&[(1000, 64), (2000, 64)]);
+        let segment = SegmentName::new("seg");
+
+        assert!(
+            StoreClient::segment_relative_target_offset(&info, &segment, 60, 8).is_err(),
+            "logical ranges crossing non-contiguous buffers must not map"
+        );
+    }
+
+    #[test]
     fn direct_buffer_transfer_requests_split_by_registration_limit() {
         let info = memory_segment(&[(900, 1024)]);
         let requests = StoreClient::target_buffer_transfer_requests(
@@ -3730,6 +3820,185 @@ mod runtime_io_tests {
         assert_eq!(requests[1].length, 0x80);
     }
 
+    // -----------------------------------------------------------------------
+    // Segment offset boundary tests — reproduce and characterise the
+    // "segment offset N length M is outside segment S" error observed in
+    // production when sglang's KV cache backup thread calls batch_put_from
+    // with a logical offset exceeding the segment's registered buffer size.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_offset_exactly_at_boundary_is_rejected() {
+        let four_gb: u64 = 4 * 1024 * 1024 * 1024;
+        let info = memory_segment(&[(0x1_0000_0000, four_gb)]);
+        let segment = SegmentName::new("seg-boundary");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, four_gb, 1);
+        assert!(
+            result.is_err(),
+            "offset equal to buffer length must be rejected"
+        );
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("is outside segment"),
+            "error should mention 'outside segment', got: {error_message}"
+        );
+    }
+
+    #[test]
+    fn segment_offset_exceeds_single_buffer_capacity() {
+        // Reproduces the production scenario: segment has ~32 GB buffer but
+        // the allocator handed out a ~50 GB offset (53686206464 bytes).
+        let buffer_size: u64 = 32 * 1024 * 1024 * 1024;
+        let info = memory_segment(&[(0x7f00_0000_0000, buffer_size)]);
+        let segment = SegmentName::new(
+            "sm-16--487fdbe0-1556-4ffb-a105-d6c5a7970cd5-segment-1777028012895-ext-1",
+        );
+
+        let overflowing_offset: u64 = 53_686_206_464; // ~50 GB
+        let request_length: u64 = 1_540_096; // ~1.5 MB
+
+        let result = StoreClient::segment_relative_target_offset(
+            &info,
+            &segment,
+            overflowing_offset,
+            request_length,
+        );
+        assert!(
+            result.is_err(),
+            "offset 50 GB into a 32 GB buffer must fail"
+        );
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("is outside segment"),
+            "error should contain 'outside segment', got: {error_message}"
+        );
+        assert!(
+            error_message.contains("total_capacity="),
+            "error should include total_capacity diagnostic, got: {error_message}"
+        );
+    }
+
+    #[test]
+    fn segment_offset_valid_within_large_buffer() {
+        let buffer_size: u64 = 64 * 1024 * 1024 * 1024;
+        let base: u64 = 0x7f00_0000_0000;
+        let info = memory_segment(&[(base, buffer_size)]);
+        let segment = SegmentName::new("seg-large");
+
+        let offset: u64 = 53_686_206_464; // ~50 GB — fits in 64 GB
+        let length: u64 = 1_540_096;
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, offset, length);
+        assert!(
+            result.is_ok(),
+            "50 GB offset into 64 GB buffer should succeed, got: {:?}",
+            result.unwrap_err()
+        );
+        assert_eq!(result.unwrap(), base + offset);
+    }
+
+    #[test]
+    fn segment_offset_spans_across_buffer_tail_is_rejected() {
+        let buffer_size: u64 = 1024 * 1024;
+        let base: u64 = 0x1000_0000;
+        let info = memory_segment(&[(base, buffer_size)]);
+        let segment = SegmentName::new("seg-tail-overflow");
+
+        let result = StoreClient::segment_relative_target_offset(
+            &info,
+            &segment,
+            buffer_size - 1,
+            2,
+        );
+        assert!(
+            result.is_err(),
+            "transfer crossing buffer tail must be rejected"
+        );
+    }
+
+    #[test]
+    fn segment_offset_multi_buffer_total_exceeded() {
+        let sixteen_gb: u64 = 16 * 1024 * 1024 * 1024;
+        let base1: u64 = 0x7f00_0000_0000;
+        let base2: u64 = base1 + sixteen_gb;
+        let info = memory_segment(&[(base1, sixteen_gb), (base2, sixteen_gb)]);
+        let segment = SegmentName::new("seg-multi-overflow");
+
+        let overflowing_offset: u64 = 53_686_206_464;
+        let result = StoreClient::segment_relative_target_offset(
+            &info,
+            &segment,
+            overflowing_offset,
+            1_540_096,
+        );
+        assert!(
+            result.is_err(),
+            "offset exceeding multi-buffer total capacity must fail"
+        );
+    }
+
+    #[test]
+    fn segment_offset_multi_buffer_spans_correctly() {
+        let thirty_two_gb: u64 = 32 * 1024 * 1024 * 1024;
+        let base1: u64 = 0x7f00_0000_0000;
+        let base2: u64 = base1 + thirty_two_gb;
+        let info = memory_segment(&[(base1, thirty_two_gb), (base2, thirty_two_gb)]);
+        let segment = SegmentName::new("seg-multi-valid");
+
+        let offset: u64 = 53_686_206_464;
+        let length: u64 = 1_540_096;
+
+        let result =
+            StoreClient::segment_relative_target_offset(&info, &segment, offset, length);
+        assert!(
+            result.is_ok(),
+            "50 GB offset into 64 GB (2x32 GB) should succeed, got: {:?}",
+            result.unwrap_err()
+        );
+        let expected_offset_in_second = offset - thirty_two_gb;
+        assert_eq!(result.unwrap(), base2 + expected_offset_in_second);
+    }
+
+    #[test]
+    fn segment_offset_empty_buffers_rejected() {
+        let info = memory_segment(&[]);
+        let segment = SegmentName::new("seg-empty");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 1);
+        assert!(result.is_err(), "empty buffer list must be rejected");
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("no buffers"),
+            "error should mention 'no buffers', got: {error_message}"
+        );
+    }
+
+    #[test]
+    fn segment_offset_error_includes_capacity_diagnostic() {
+        // Verify the improved error message includes total_capacity info.
+        let buffer_size: u64 = 8 * 1024 * 1024 * 1024;
+        let info = memory_segment(&[(0x1000, buffer_size)]);
+        let segment = SegmentName::new("seg-diag");
+
+        let result = StoreClient::segment_relative_target_offset(
+            &info,
+            &segment,
+            buffer_size + 100,
+            64,
+        );
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains(&format!("total_capacity={buffer_size}")),
+            "error should include total_capacity={buffer_size}, got: {error_message}"
+        );
+        assert!(
+            error_message.contains("num_buffers=1"),
+            "error should include num_buffers=1, got: {error_message}"
+        );
+    }
+
     #[test]
     fn segment_info_covers_target_rejects_gap_between_buffers() {
         let info = memory_segment(&[(1000, 64), (2000, 64)]);
@@ -3758,10 +4027,30 @@ mod runtime_io_tests {
         );
     }
 
+    #[test]
+    fn segment_offset_u64_max_does_not_panic() {
+        let info = memory_segment(&[(0, 1024)]);
+        let segment = SegmentName::new("seg-u64max");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, u64::MAX, 1);
+        assert!(result.is_err(), "u64::MAX offset must be rejected");
+    }
+
+    #[test]
+    fn segment_offset_addition_overflow_does_not_panic() {
+        let info = memory_segment(&[(u64::MAX - 100, 200)]);
+        let segment = SegmentName::new("seg-add-overflow");
+
+        // Must not panic — either Ok or Err is acceptable.
+        let _ = StoreClient::segment_relative_target_offset(&info, &segment, 50, 64);
+    }
+
     // -----------------------------------------------------------------------
-    // remote_replica_target_offset tests — read-path offset resolution accepts
-    // only the published transport target coordinate in ReplicaRoute::offset.
-    // segment_offset is allocator bookkeeping and must never repair a bad route.
+    // remote_replica_target_offset tests — this function is the entry point
+    // for all read-path offset resolution and has two code paths:
+    //   1. Fast path: replica.offset is already covered by buffers → return it
+    //   2. Fallback: re-map via segment_relative_target_offset using
+    //      replica.segment_offset
     // -----------------------------------------------------------------------
 
     fn make_replica(
@@ -3783,45 +4072,43 @@ mod runtime_io_tests {
     }
 
     #[test]
-    fn remote_replica_target_offset_returns_published_target_offset() {
+    fn remote_replica_target_offset_fast_path_returns_absolute_offset() {
         let info = memory_segment(&[(1000, 128)]);
         let replica = make_replica("seg", 1024, 24, 32);
 
         let result = StoreClient::remote_replica_target_offset(&info, &replica);
         assert_eq!(
-            result.expect("published target offset should be readable"),
+            result.expect("fast path should succeed when offset is within buffer"),
             1024,
-            "read path must return ReplicaRoute::offset directly"
+            "fast path must return replica.offset directly"
         );
     }
 
     #[test]
-    fn remote_replica_target_offset_rejects_uncovered_published_target() {
+    fn remote_replica_target_offset_fallback_remaps_via_segment_offset() {
+        // replica.offset is NOT covered by any buffer, so the function
+        // should fall back to segment_relative_target_offset using
+        // replica.segment_offset.
         let info = memory_segment(&[(1000, 128)]);
         let replica = make_replica("seg", 9999, 24, 32);
 
         let result = StoreClient::remote_replica_target_offset(&info, &replica);
-        let error = result.expect_err("bad published target offset must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("replica target offset"),
-            "error must name the route target coordinate, got: {message}"
-        );
-        assert!(
-            !message.contains("segment offset"),
-            "read path must not expose the removed allocator-offset fallback, got: {message}"
+        assert_eq!(
+            result.expect("fallback should remap using segment_offset"),
+            1024,
+            "fallback must compute base + segment_offset"
         );
     }
 
     #[test]
-    fn remote_replica_target_offset_ignores_segment_offset_when_target_is_valid() {
-        let info = memory_segment(&[(1000, 128)]);
-        let replica = make_replica("seg", 1024, u64::MAX, 16);
+    fn remote_replica_target_offset_fallback_fails_when_segment_offset_out_of_range() {
+        let info = memory_segment(&[(1000, 64)]);
+        let replica = make_replica("seg", 9999, 100, 16);
 
         let result = StoreClient::remote_replica_target_offset(&info, &replica);
-        assert_eq!(
-            result.expect("valid published target must not consult segment_offset"),
-            1024
+        assert!(
+            result.is_err(),
+            "fallback must fail when segment_offset exceeds buffer capacity"
         );
     }
 
@@ -3832,9 +4119,9 @@ mod runtime_io_tests {
 
         let result = StoreClient::remote_replica_target_offset(&info, &replica);
         assert_eq!(
-            result.expect("published target should work across contiguous buffers"),
+            result.expect("fast path should work across contiguous buffers"),
             1080,
-            "read path should accept target offset spanning contiguous buffers"
+            "fast path should accept offset spanning contiguous buffers"
         );
     }
 
@@ -3845,19 +4132,27 @@ mod runtime_io_tests {
         let replica = make_replica("seg", 1060, 60, 16);
 
         let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        // Fast path should reject because covers_target fails for gap
+        // Fallback should also fail because logical mapping crosses gap
         assert!(
             result.is_err(),
-            "published target transfer that crosses a buffer gap must be rejected"
+            "both paths must reject transfer that crosses buffer gap"
         );
     }
 
     #[test]
-    fn remote_replica_target_offset_rejects_empty_segment_info() {
-        let info = memory_segment(&[]);
-        let replica = make_replica("seg-empty", 0, 0, 1);
+    fn remote_replica_target_offset_prefers_fast_path_over_fallback() {
+        // Both paths are valid; the function should use the fast path
+        // (returning replica.offset) rather than recomputing.
+        let info = memory_segment(&[(1000, 128)]);
+        let replica = make_replica("seg", 1024, 24, 16);
 
         let result = StoreClient::remote_replica_target_offset(&info, &replica);
-        assert!(result.is_err(), "empty segment info cannot satisfy a read");
+        assert_eq!(
+            result.expect("should prefer fast path"),
+            1024,
+            "when both paths are valid, fast path (replica.offset) wins"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3957,4 +4252,104 @@ mod runtime_io_tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // segment_relative_target_offset — transfer length crossing gap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_offset_transfer_length_crosses_non_contiguous_gap() {
+        // Two non-contiguous buffers with a gap at [1064, 2000).
+        // Logical offset 60 maps to base + 60 = 1060 in the first buffer.
+        // The transfer length of 16 extends to 1076, which is in the gap.
+        let info = memory_segment(&[(1000, 64), (2000, 64)]);
+        let segment = SegmentName::new("seg-gap-cross");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 60, 16);
+        assert!(
+            result.is_err(),
+            "transfer whose length crosses into a gap must be rejected"
+        );
+    }
+
+    #[test]
+    fn segment_offset_transfer_exactly_fills_first_buffer() {
+        // Transfer starts near the end of the first buffer and exactly
+        // fills it — no crossing needed.
+        let info = memory_segment(&[(1000, 64), (2000, 64)]);
+        let segment = SegmentName::new("seg-exact-fill");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 60, 4);
+        assert_eq!(
+            result.expect("transfer exactly filling first buffer should succeed"),
+            1060
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // total_capacity saturating protection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_offset_total_capacity_saturates_on_overflow() {
+        // Two buffers whose lengths sum to more than u64::MAX.
+        let info = memory_segment(&[(0, u64::MAX), (u64::MAX, u64::MAX)]);
+        let segment = SegmentName::new("seg-saturate");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 1);
+        // Should not panic due to overflow; the result is either Ok or Err.
+        // The important thing is that total_capacity in the error message
+        // is u64::MAX (saturated), not 0 or a wrapped value.
+        match result {
+            Ok(_) => {} // acceptable if the buffer layout allows it
+            Err(error) => {
+                let message = format!("{error}");
+                assert!(
+                    !message.contains("total_capacity=0"),
+                    "total_capacity must not wrap to 0, got: {message}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // segment_relative_target_offset — single buffer start boundary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn segment_offset_zero_offset_zero_length() {
+        let info = memory_segment(&[(5000, 128)]);
+        let segment = SegmentName::new("seg-zero");
+
+        // length=0 is a degenerate case; segment_info_covers_target
+        // returns true for length=0, so this should succeed.
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 0);
+        assert_eq!(
+            result.expect("zero offset + zero length should map to buffer base"),
+            5000
+        );
+    }
+
+    #[test]
+    fn segment_offset_at_start_with_exact_buffer_length() {
+        let info = memory_segment(&[(5000, 128)]);
+        let segment = SegmentName::new("seg-exact");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 128);
+        assert_eq!(
+            result.expect("transfer exactly filling buffer from offset 0 should succeed"),
+            5000
+        );
+    }
+
+    #[test]
+    fn segment_offset_at_start_exceeding_buffer_length() {
+        let info = memory_segment(&[(5000, 128)]);
+        let segment = SegmentName::new("seg-exceed");
+
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, 0, 129);
+        assert!(
+            result.is_err(),
+            "transfer exceeding buffer length from offset 0 must fail"
+        );
+    }
 }

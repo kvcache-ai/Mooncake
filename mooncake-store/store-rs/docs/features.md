@@ -55,7 +55,6 @@ Remote read behavior:
 - routed `batch_put_from` handles concurrent cache writers per key by treating route-CAS conflicts as successful cache insert races without adding a metadata recheck
 - Python compatibility `batch_put_from` reports best-effort per-key statuses; route-CAS conflicts are success, while true per-key write failures stay isolated to the affected item
 - remote storage segment announcements publish explicit storage target chunks, and writers translate allocator segment offsets through those chunks instead of inferring storage from backend buffer ordering
-- remote reads require the route's published `ReplicaRoute::offset` to be a readable transport target and do not remap bad routes through allocator `segment_offset`
 - local reads and drain migration translate the published replica transport target offset through the storage target map before copying from local storage; allocator segment offsets remain reclaim bookkeeping only
 - scratch buffers are registered for local transfer staging only and are not published as remote storage extents
 - local replicas still copy into owned local segment memory; the zero-copy contract applies to the remote transport source buffer, not to local placement
