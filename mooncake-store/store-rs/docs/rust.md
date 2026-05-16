@@ -176,10 +176,6 @@ best-effort through the same CLOCK hit-report path used by reads, so application
 probe keys before restore do not lose hot pages to background eviction between the probe
 and the later read.
 
-`StoreClient::batch_is_readable` is the cache-facing variant used by the Python
-compatibility layer. It keeps the same bounded route lookup but returns `true` only
-when at least one route replica belongs to a live, non-suspect readable runtime.
-
 ### Registered-buffer APIs
 
 - `register_buffer`
