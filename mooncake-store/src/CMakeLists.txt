@@ -140,6 +140,13 @@ if(STORE_USE_REDIS)
   list(APPEND EXTRA_LIBS ${MOONCAKE_STORE_HIREDIS_LIBRARY})
 endif()
 
+if(STORE_USE_K8S_LEASE)
+  list(APPEND MOONCAKE_STORE_SOURCES
+    k8s_lease_helper.cpp
+    ha/leadership/backends/k8s/k8s_leader_coordinator.cpp)
+  list(APPEND EXTRA_LIBS ${K8S_LEASE_WRAPPER_LIB})
+endif()
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
@@ -159,6 +166,9 @@ target_link_libraries(
   PRIVATE transfer_engine)
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
+endif()
+if(STORE_USE_K8S_LEASE)
+    add_dependencies(mooncake_store build_k8s_lease_wrapper)
 endif()
 
 if(URING_LIB AND URING_INCLUDE)

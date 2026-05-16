@@ -452,6 +452,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      const std::string& local_hostname,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
+      local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       local_hostname_(local_hostname),
@@ -816,26 +817,65 @@ TransferStrategy TransferSubmitter::selectStrategy(
     return TransferStrategy::TRANSFER_ENGINE;
 }
 
+namespace {
+// Helper function to extract IP address from endpoint string (ip:port format).
+// Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats.
+std::string extractIpAddress(const std::string& endpoint) {
+    if (endpoint.empty()) {
+        return "";
+    }
+
+    // Handle IPv6 format: [ipv6]:port
+    if (endpoint[0] == '[') {
+        size_t closing_bracket = endpoint.find(']');
+        if (closing_bracket == std::string::npos) {
+            LOG(WARNING) << "Invalid IPv6 endpoint format: " << endpoint;
+            return "";
+        }
+        return endpoint.substr(1, closing_bracket - 1);
+    }
+
+    // Handle IPv4 or hostname:port format.
+    size_t colon_pos = endpoint.rfind(':');
+    if (colon_pos != std::string::npos) {
+        return endpoint.substr(0, colon_pos);
+    }
+
+    // No colon found, return the whole string (might be just IP or hostname).
+    return endpoint;
+}
+}  // namespace
+
+bool TransferSubmitter::isSameProcessEndpoint(
+    const std::string& handle_endpoint, const std::string& local_endpoint) {
+    // Local memcpy requires that handle.buffer_address_ is a virtual address
+    // valid in THIS process. Same host is not enough: two processes on the
+    // same host share an IP but have distinct virtual address spaces, so a
+    // memcpy on a peer process's address would segfault. Require the full
+    // transport endpoint to match, which uniquely identifies the owning
+    // process.
+    if (handle_endpoint.empty() || local_endpoint.empty()) {
+        return false;
+    }
+    if (handle_endpoint == local_endpoint) {
+        return true;
+    }
+
+    const std::string handle_ip = extractIpAddress(handle_endpoint);
+    const std::string local_ip = extractIpAddress(local_endpoint);
+    if (!handle_ip.empty() && handle_ip == local_ip) {
+        VLOG(2) << "Disabling local memcpy for same-host endpoints with "
+                   "different process endpoints: handle="
+                << handle_endpoint << ", local=" << local_endpoint;
+    }
+
+    return false;
+}
+
 bool TransferSubmitter::isLocalTransfer(
     const AllocatedBuffer::Descriptor& handle) const {
-    if (handle.transport_endpoint_.empty()) return false;
-
-    // Metadata-service descriptors use the client hostname as the segment ID.
-    // If it matches this client's hostname, the buffer address is local.
-    if (!local_hostname_.empty() &&
-        local_hostname_ == handle.transport_endpoint_) {
-        return true;
-    }
-
-    // P2P descriptors use the transfer engine endpoint as the segment ID.
-    // If it matches this engine's endpoint, the buffer address is local.
-    std::string local_ep = engine_.getLocalIpAndPort();
-    if (!local_ep.empty() && handle.transport_endpoint_ == local_ep) {
-        return true;
-    }
-
-    // Without a local endpoint we cannot prove locality; disable memcpy.
-    return false;
+    return isSameProcessEndpoint(handle.transport_endpoint_, local_hostname_) ||
+           isSameProcessEndpoint(handle.transport_endpoint_, local_endpoint_);
 }
 
 bool TransferSubmitter::validateTransferParams(

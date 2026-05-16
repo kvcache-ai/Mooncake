@@ -18,6 +18,7 @@
 #include "utils.h"
 
 #include "master_config.h"
+#include "version.h"
 
 using namespace coro_rpc;
 using namespace async_simple;
@@ -108,7 +109,7 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     return true;
 });
 DEFINE_bool(enable_ha, false,
-            "Enable high availability, which depends on etcd");
+            "Enable high availability using the configured HA backend");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
@@ -117,14 +118,15 @@ DEFINE_bool(offload_force_evict, false,
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
-              "HA backend connection string. If unset, fallback to "
-              "etcd_endpoints for backward compatibility");
+              "HA backend connection string. If unset, only backend_type=etcd "
+              "falls back to etcd_endpoints for backward compatibility");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-             "How long a client is considered alive after the last ping, only "
-             "used in HA mode");
+             "Seconds a client stays considered alive after the last heartbeat."
+             "If this TTL elapses without a refresh, the master treats the "
+             "client as disconnected and may unmount its segments");
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
@@ -215,10 +217,9 @@ namespace {
 
 std::string ResolveHABackendConnstring(
     const mooncake::MasterConfig& master_config) {
-    if (!master_config.ha_backend_connstring.empty()) {
-        return master_config.ha_backend_connstring;
-    }
-    return master_config.etcd_endpoints;
+    return mooncake::ResolveConfiguredHABackendConnstring(
+        master_config.ha_backend_type, master_config.ha_backend_connstring,
+        master_config.etcd_endpoints);
 }
 
 void ResolveRpcAddressFromInterfaceOrDie(
@@ -806,6 +807,7 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     if (!FLAGS_log_dir.empty()) {
@@ -833,7 +835,10 @@ int main(int argc, char* argv[]) {
         ResolveHABackendConnstring(master_config);
     if (master_config.enable_ha && ha_backend_connstring.empty()) {
         LOG(FATAL) << "HA backend connection string must be set when "
-                   << "enable_ha is true";
+                   << "enable_ha is true, backend_type="
+                   << master_config.ha_backend_type
+                   << ". Only backend_type=etcd may fall back to "
+                   << "etcd_endpoints";
         return 1;
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||

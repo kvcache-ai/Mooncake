@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -26,6 +27,54 @@ fn push_env_paths(search_dirs: &mut Vec<PathBuf>, name: &str) {
     if let Some(value) = env::var_os(name) {
         for dir in env::split_paths(&value) {
             push_existing_dir(search_dirs, dir);
+        }
+    }
+}
+
+fn push_cmake_prefix_lib_dirs(search_dirs: &mut Vec<PathBuf>, prefix: PathBuf) {
+    push_existing_dir(search_dirs, prefix.join("lib"));
+    push_existing_dir(search_dirs, prefix.join("lib64"));
+}
+
+fn push_cmake_prefix_paths(search_dirs: &mut Vec<PathBuf>, value: &str) {
+    for prefix in value.split(';').filter(|prefix| !prefix.is_empty()) {
+        push_cmake_prefix_lib_dirs(search_dirs, PathBuf::from(prefix));
+    }
+}
+
+fn push_cmake_cache_library_dirs(search_dirs: &mut Vec<PathBuf>, build_dir: &PathBuf) {
+    let cache_path = build_dir.join("CMakeCache.txt");
+    let Ok(cache) = fs::read_to_string(cache_path) else {
+        return;
+    };
+
+    for line in cache.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        if key == "CMAKE_PREFIX_PATH:PATH" {
+            push_cmake_prefix_paths(search_dirs, value);
+            continue;
+        }
+
+        if key.ends_with("_DIR:PATH") {
+            let package_dir = PathBuf::from(value);
+            if package_dir.parent().and_then(|dir| dir.file_name())
+                == Some(std::ffi::OsStr::new("cmake"))
+            {
+                if let Some(lib_dir) = package_dir.ancestors().nth(2) {
+                    push_existing_dir(search_dirs, lib_dir.to_path_buf());
+                }
+            }
+            continue;
+        }
+
+        if key.ends_with("_LIBRARY:FILEPATH") || key.ends_with("_LIBRARIES:FILEPATH") {
+            let library_path = PathBuf::from(value);
+            if let Some(parent) = library_path.parent() {
+                push_existing_dir(search_dirs, parent.to_path_buf());
+            }
         }
     }
 }
@@ -201,6 +250,7 @@ fn main() {
 
     if let Ok(build_dir) = env::var("MOONCAKE_BUILD_DIR") {
         let build_dir = PathBuf::from(build_dir);
+        push_cmake_cache_library_dirs(&mut search_dirs, &build_dir);
         for dir in [
             build_dir.join("mooncake-store/src"),
             build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
@@ -216,6 +266,7 @@ fn main() {
     }
 
     let default_build_dir = manifest_dir.join("../../build");
+    push_cmake_cache_library_dirs(&mut search_dirs, &default_build_dir);
     for dir in [
         default_build_dir.join("mooncake-store/src"),
         default_build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
@@ -230,6 +281,10 @@ fn main() {
         PathBuf::from("/lib/x86_64-linux-gnu"),
     ] {
         push_existing_dir(&mut search_dirs, dir);
+    }
+
+    if let Ok(cmake_prefix_path) = env::var("CMAKE_PREFIX_PATH") {
+        push_cmake_prefix_paths(&mut search_dirs, &cmake_prefix_path);
     }
 
     push_env_paths(&mut search_dirs, "LD_LIBRARY_PATH");
