@@ -136,6 +136,15 @@ impl StoreClient {
         self.filter_routes_to_readable(routes)
     }
 
+    fn route_has_readable_replica(
+        &self,
+        route: &ObjectRoute,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) -> bool {
+        self.select_readable_replica(route, readable_runtimes)
+            .is_some()
+    }
+
     pub fn batch_is_readable(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
         let keys = objects
             .iter()
