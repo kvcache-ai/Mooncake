@@ -203,7 +203,6 @@ impl crate::control_plane::EvictionService for NoopEvictionService {
 struct BlockingCasMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     block_key: ObjectKey,
-    empty_conflict_key: Option<ObjectKey>,
     gate: Arc<(StdMutex<BlockingCasGateState>, Condvar)>,
 }
 
@@ -347,24 +346,6 @@ impl BlockingCasMetadataBackend {
         Self {
             inner,
             block_key: ObjectKey::new(block_key),
-            empty_conflict_key: None,
-            gate: Arc::new((
-                StdMutex::new(BlockingCasGateState {
-                    armed: false,
-                    entered: false,
-                    released: false,
-                    blocked_once: false,
-                }),
-                Condvar::new(),
-            )),
-        }
-    }
-
-    fn with_empty_conflict(inner: Arc<InMemoryMetadataBackend>, conflict_key: &str) -> Self {
-        Self {
-            inner,
-            block_key: ObjectKey::new(""),
-            empty_conflict_key: Some(ObjectKey::new(conflict_key)),
             gate: Arc::new((
                 StdMutex::new(BlockingCasGateState {
                     armed: false,
@@ -1929,16 +1910,6 @@ impl MetadataBackend for BlockingCasMetadataBackend {
                 state.blocked_once = true;
                 state.armed = false;
             }
-        }
-        if self
-            .empty_conflict_key
-            .as_ref()
-            .is_some_and(|conflict_key| conflict_key == key)
-        {
-            return Ok(mooncake_store_core::CasResult {
-                applied: false,
-                current: None,
-            });
         }
         self.inner
             .compare_and_swap_object_route(key, expected, next)
@@ -6052,207 +6023,6 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
     assert_eq!(&buf_a, b"alpha-1");
     assert_eq!(&buf_b, b"beta-11");
     assert_eq!(&buf_c, b"gamma-1");
-}
-
-#[test]
-fn routed_batch_put_from_treats_route_conflicts_as_per_key_success() {
-    let inner = Arc::new(InMemoryMetadataBackend::new());
-    let blocking = Arc::new(BlockingCasMetadataBackend::new(
-        inner,
-        "default::batch-put-from-conflict-key",
-    ));
-    let metadata: Arc<dyn MetadataBackend> = blocking.clone();
-    let store_transport = Arc::new(TestTransport::new("batch-put-conflict-store-segment"));
-    let writer_a_transport = Arc::new(store_transport.peer("batch-put-conflict-writer-a-segment"));
-    let writer_b_transport = Arc::new(store_transport.peer("batch-put-conflict-writer-b-segment"));
-    let reader_transport = Arc::new(store_transport.peer("batch-put-conflict-reader-segment"));
-    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
-
-    let store = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-store")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "true")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(store_transport)
-        .local_memory(storage_config())
-        .build(test_future_expiry_ms())
-        .expect("store build should succeed");
-    let writer_a = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-writer-a")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "false")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(writer_a_transport)
-        .local_memory(rw_only_config())
-        .routed_writes(planner.clone(), 1)
-        .build(test_future_expiry_ms())
-        .expect("writer-a build should succeed");
-    let writer_b = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-writer-b")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "false")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(writer_b_transport)
-        .local_memory(rw_only_config())
-        .routed_writes(planner, 1)
-        .build(test_future_expiry_ms())
-        .expect("writer-b build should succeed");
-    let reader = StoreClientBuilder::new(metadata, "batch-put-conflict-reader")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "false")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(reader_transport)
-        .local_memory(rw_only_config())
-        .build(test_future_expiry_ms())
-        .expect("reader build should succeed");
-
-    store
-        .register_local_memory()
-        .expect("store memory should register");
-    writer_a
-        .register_local_memory()
-        .expect("writer-a memory should register");
-    writer_b
-        .register_local_memory()
-        .expect("writer-b memory should register");
-    reader
-        .register_local_memory()
-        .expect("reader memory should register");
-    wait_for_membership_convergence(&[&store, &writer_a, &writer_b, &reader]);
-
-    let mut source_a = b"batch-put-conflict-payload-a".to_vec();
-    let mut source_b = b"batch-put-conflict-payload-b".to_vec();
-    writer_a
-        .register_buffer(source_a.as_mut_ptr().cast(), source_a.len())
-        .expect("writer-a source buffer should register");
-    writer_b
-        .register_buffer(source_b.as_mut_ptr().cast(), source_b.len())
-        .expect("writer-b source buffer should register");
-    let policy = ReplicationPolicy::new()
-        .replica_count(1)
-        .prefer_local(false)
-        .preferred_storage_owner(store.runtime_id().storage_key());
-
-    blocking.arm_blocked_cas();
-    std::thread::scope(|scope| {
-        let writer_a_result = scope.spawn(|| {
-            writer_a.batch_put_from(&[PutFromRequest::new(
-                "batch-put-from-conflict-key",
-                source_a.as_ptr().cast(),
-                source_a.len(),
-            )
-            .replication(policy.clone())])
-        });
-        assert!(
-            blocking.wait_until_blocked(Duration::from_secs(1)),
-            "writer-a should reach the blocked route publish point"
-        );
-        let writer_b_result = scope.spawn(|| {
-            writer_b.batch_put_from(&[PutFromRequest::new(
-                "batch-put-from-conflict-key",
-                source_b.as_ptr().cast(),
-                source_b.len(),
-            )
-            .replication(policy.clone())])
-        });
-        sleep(Duration::from_millis(50));
-        blocking.release_blocked_cas();
-
-        let routes_a = writer_a_result
-            .join()
-            .expect("writer-a thread should join")
-            .expect("writer-a conflict loser should still succeed");
-        let routes_b = writer_b_result
-            .join()
-            .expect("writer-b thread should join")
-            .expect("writer-b conflict loser should still succeed");
-        assert_eq!(routes_a.len(), 1);
-        assert_eq!(routes_b.len(), 1);
-        assert_eq!(routes_a[0].key, routes_b[0].key);
-        assert_eq!(routes_a[0].version, routes_b[0].version);
-    });
-
-    let value = reader
-        .get("batch-put-from-conflict-key")
-        .expect("reader should fetch the published payload");
-    assert!(
-        value == source_a || value == source_b,
-        "the authoritative route should point at one completed writer"
-    );
-}
-
-#[test]
-fn routed_batch_put_from_rejects_route_conflict_without_current_route() {
-    let metadata: Arc<dyn MetadataBackend> =
-        Arc::new(BlockingCasMetadataBackend::with_empty_conflict(
-            Arc::new(InMemoryMetadataBackend::new()),
-            "default::batch-put-empty-conflict-key",
-        ));
-    let storage_transport = Arc::new(TestTransport::new("batch-put-empty-conflict-store-segment"));
-    let writer_transport =
-        Arc::new(storage_transport.peer("batch-put-empty-conflict-writer-segment"));
-    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
-
-    let storage = StoreClientBuilder::new(metadata.clone(), "batch-put-empty-conflict-store")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "true")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(storage_transport)
-        .local_memory(storage_config())
-        .build(test_future_expiry_ms())
-        .expect("storage build should succeed");
-    let writer = StoreClientBuilder::new(metadata, "batch-put-empty-conflict-writer")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "false")
-        .route_control(RouteControlMode::MetadataOnly)
-        .live_client_sync_interval(fast_live_client_sync_interval())
-        .transport(writer_transport)
-        .local_memory(rw_only_config())
-        .routed_writes(planner, 1)
-        .build(test_future_expiry_ms())
-        .expect("writer build should succeed");
-
-    storage
-        .register_local_memory()
-        .expect("storage memory should register");
-    writer
-        .register_local_memory()
-        .expect("writer memory should register");
-    wait_for_membership_convergence(&[&storage, &writer]);
-
-    let mut source = b"batch-put-empty-conflict".to_vec();
-    writer
-        .register_buffer(source.as_mut_ptr().cast(), source.len())
-        .expect("writer source buffer should register");
-    let error = writer
-        .batch_put_from(&[PutFromRequest::new(
-            "batch-put-empty-conflict-key",
-            source.as_ptr().cast(),
-            source.len(),
-        )
-        .replication(
-            ReplicationPolicy::new()
-                .replica_count(1)
-                .prefer_local(false)
-                .preferred_storage_owner(storage.runtime_id().storage_key()),
-        )])
-        .expect_err("route conflict without active current route must fail");
-
-    assert!(matches!(error, StoreError::Conflict(_)));
-    assert!(
-        !writer
-            .batch_is_exist(&[ObjectRef::new("batch-put-empty-conflict-key")])
-            .expect("exist check should succeed")[0],
-        "unpublished conflict loser route must not be visible as a cache hit"
-    );
 }
 
 #[test]

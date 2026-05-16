@@ -553,7 +553,7 @@ impl TenantPolicySpec {
             .into_iter()
             .filter(|policy| policy.scope.matches_namespace(scope))
             .collect::<Vec<_>>();
-        matching.sort_by_key(|policy| policy.scope.specificity());
+        matching.sort_by(|left, right| left.scope.specificity().cmp(&right.scope.specificity()));
         for policy in matching {
             resolved = resolved.merged_with(&policy.spec);
         }
