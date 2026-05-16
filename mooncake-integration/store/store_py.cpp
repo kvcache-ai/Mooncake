@@ -2,8 +2,15 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <limits>
+#include <mutex>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -846,72 +853,65 @@ class MooncakeStorePyWrapper {
     // Zero-copy put from pre-allocated buffer (layout: [TensorMetadata][data])
     int put_tensor_from(const std::string &key, uintptr_t buffer_ptr,
                         size_t size) {
-        if (buffer_ptr == 0) {
-            LOG(ERROR) << "Buffer pointer cannot be null";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        void *buffer = reinterpret_cast<void *>(buffer_ptr);
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (use_dummy_client_) {
-            LOG(ERROR) << "put_tensor_from is not supported for dummy client";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (size <= sizeof(TensorMetadata)) {
-            LOG(ERROR) << "Buffer size too small for tensor metadata";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        py::gil_scoped_release release_gil;
-        return store_->put_from(key, buffer, size, ReplicateConfig{});
+        return execute_single_tensor_write_from(
+            "put_tensor_from", key, buffer_ptr, size, ReplicateConfig{},
+            [this](const std::string &write_key, void *buffer,
+                   size_t write_size, const ReplicateConfig &config) {
+                py::gil_scoped_release release_gil;
+                return store_->put_from(write_key, buffer, write_size, config);
+            });
+    }
+
+    int pub_tensor_from(const std::string &key, uintptr_t buffer_ptr,
+                        size_t size,
+                        const ReplicateConfig &config = ReplicateConfig{}) {
+        return execute_single_tensor_write_from(
+            "pub_tensor_from", key, buffer_ptr, size, config,
+            [this](const std::string &write_key, void *buffer,
+                   size_t write_size, const ReplicateConfig &write_config) {
+                py::gil_scoped_release release_gil;
+                return store_->put_from(write_key, buffer, write_size,
+                                        write_config);
+            });
     }
 
     std::vector<int> batch_put_tensor_from(
         const std::vector<std::string> &keys,
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (use_dummy_client_) {
-            LOG(ERROR)
-                << "batch_put_tensor_from is not supported for dummy client";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (keys.empty()) {
-            return std::vector<int>();
-        }
-        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
-            LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
-                          "have the same length";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        for (size_t i = 0; i < sizes.size(); ++i) {
-            if (buffer_ptrs[i] == 0) {
-                LOG(ERROR) << "Buffer pointer at index " << i
-                           << " cannot be null";
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            if (sizes[i] <= sizeof(TensorMetadata)) {
-                LOG(ERROR) << "Buffer size at index " << i
-                           << " too small for tensor metadata";
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-        }
-        std::vector<void *> buffers;
-        buffers.reserve(buffer_ptrs.size());
-        for (uintptr_t ptr : buffer_ptrs) {
-            buffers.push_back(reinterpret_cast<void *>(ptr));
-        }
-        py::gil_scoped_release release_gil;
-        return store_->batch_put_from(keys, buffers, sizes, ReplicateConfig{});
+        return execute_batch_tensor_write_from(
+            "batch_put_tensor_from",
+            "Size mismatch: keys, buffer_ptrs, and sizes must have the same "
+            "length",
+            keys, buffer_ptrs, sizes, ReplicateConfig{},
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &buffers,
+                   const std::vector<size_t> &write_sizes,
+                   const ReplicateConfig &config) {
+                py::gil_scoped_release release_gil;
+                return store_->batch_put_from(write_keys, buffers, write_sizes,
+                                              config);
+            });
+    }
+
+    std::vector<int> batch_pub_tensor_from(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        return execute_batch_tensor_write_from(
+            "batch_pub_tensor_from",
+            "Size mismatch: keys, buffer_ptrs, and sizes must have the same "
+            "length",
+            keys, buffer_ptrs, sizes, config,
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &buffers,
+                   const std::vector<size_t> &write_sizes,
+                   const ReplicateConfig &write_config) {
+                py::gil_scoped_release release_gil;
+                return store_->batch_put_from(write_keys, buffers, write_sizes,
+                                              write_config);
+            });
     }
 
     int put_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
@@ -1085,14 +1085,15 @@ class MooncakeStorePyWrapper {
             return std::nullopt;
         }
 
-        auto region = real_client->resolve_registered_buffer(
+        auto guard = real_client->resolve_registered_buffer_guard(
             reinterpret_cast<void *>(buffer_ptr));
-        if (!region.has_value()) {
+        if (!guard.has_value()) {
             LOG(ERROR) << context << ": buffer is not registered";
             return std::nullopt;
         }
 
-        if (region->offset + size > region->size) {
+        auto region = guard->region();
+        if (region.offset > region.size || size > region.size - region.offset) {
             LOG(ERROR) << context << ": buffer range exceeds registered region";
             return std::nullopt;
         }
@@ -1573,6 +1574,637 @@ class MooncakeHostMemAllocatorPyWrapper {
     ~MooncakeHostMemAllocatorPyWrapper() { shm_helper_ = nullptr; }
 };
 
+std::optional<size_t> dtype_byte_size_for_pybind(
+    const std::string &dtype_name) {
+    std::string normalized;
+    normalized.reserve(dtype_name.size());
+    for (char ch : dtype_name) {
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    const std::string torch_prefix = "torch.";
+    if (normalized.rfind(torch_prefix, 0) == 0) {
+        normalized = normalized.substr(torch_prefix.size());
+    }
+    static const std::unordered_map<std::string, size_t> kDtypeByteSizes = {
+        {"bool", 1},        {"uint8", 1},  {"int8", 1},    {"float8_e4m3fn", 1},
+        {"float8_e5m2", 1}, {"int16", 2},  {"uint16", 2},  {"float16", 2},
+        {"bfloat16", 2},    {"int32", 4},  {"uint32", 4},  {"float32", 4},
+        {"int64", 8},       {"uint64", 8}, {"float64", 8},
+    };
+    auto it = kDtypeByteSizes.find(normalized);
+    if (it == kDtypeByteSizes.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+struct RegisteredBufferPoolStatsPy {
+    std::unordered_map<size_t, size_t> size_classes;
+    size_t free_regions = 0;
+    size_t in_use_regions = 0;
+    size_t total_regions = 0;
+    size_t total_bytes = 0;
+    size_t free_bytes = 0;
+    size_t in_use_bytes = 0;
+    size_t acquire_count = 0;
+    size_t reuse_count = 0;
+    size_t allocate_count = 0;
+    size_t oversize_allocate_count = 0;
+    size_t wait_count = 0;
+    size_t release_count = 0;
+    double register_s = 0.0;
+    double unregister_s = 0.0;
+};
+
+class RegisteredBufferPoolPyWrapper;
+
+class RegisteredBufferLeasePyWrapper {
+   public:
+    RegisteredBufferLeasePyWrapper() = default;
+    RegisteredBufferLeasePyWrapper(RegisteredBufferPoolPyWrapper *pool,
+                                   uintptr_t ptr, size_t capacity,
+                                   size_t requested_size,
+                                   std::shared_ptr<BufferHandle> handle);
+
+    uintptr_t ptr() const { return ptr_; }
+    size_t size() const { return requested_size_; }
+    py::object buffer() const;
+    void release();
+
+   private:
+    RegisteredBufferPoolPyWrapper *pool_ = nullptr;
+    uintptr_t ptr_ = 0;
+    size_t capacity_ = 0;
+    size_t requested_size_ = 0;
+    std::shared_ptr<BufferHandle> handle_;
+    bool closed_ = false;
+};
+
+class ExternalRegisteredBufferLeasePyWrapper {
+   public:
+    ExternalRegisteredBufferLeasePyWrapper() = default;
+    ExternalRegisteredBufferLeasePyWrapper(RegisteredBufferPoolPyWrapper *pool,
+                                           uintptr_t ptr, size_t size)
+        : pool_(pool), ptr_(ptr), size_(size) {}
+
+    uintptr_t ptr() const { return ptr_; }
+    size_t size() const { return size_; }
+    void release();
+
+   private:
+    RegisteredBufferPoolPyWrapper *pool_ = nullptr;
+    uintptr_t ptr_ = 0;
+    size_t size_ = 0;
+    bool closed_ = false;
+};
+
+class RegisteredBufferPoolPyWrapper {
+   public:
+    RegisteredBufferPoolPyWrapper(MooncakeStorePyWrapper &store,
+                                  size_t max_bytes, size_t min_size_class,
+                                  std::optional<size_t> max_size_class,
+                                  size_t alignment, bool block_on_exhaustion,
+                                  std::optional<double> default_timeout,
+                                  std::optional<size_t> max_regions)
+        : store_(store.store_),
+          max_bytes_(max_bytes),
+          min_size_class_(min_size_class),
+          max_size_class_(
+              std::min(max_size_class.value_or(max_bytes), max_bytes)),
+          alignment_(alignment),
+          block_on_exhaustion_(block_on_exhaustion),
+          default_timeout_(default_timeout),
+          max_regions_(max_regions) {
+        if (!store_) {
+            throw py::value_error("store is not initialized");
+        }
+        if (max_bytes == 0) {
+            throw py::value_error("max_bytes must be positive");
+        }
+        if (min_size_class == 0 || alignment == 0) {
+            throw py::value_error(
+                "min_size_class and alignment must be positive");
+        }
+    }
+
+    RegisteredBufferLeasePyWrapper acquire(size_t size,
+                                           std::optional<bool> block,
+                                           std::optional<double> timeout) {
+        const bool should_block = block.value_or(block_on_exhaustion_);
+        const std::optional<double> timeout_s =
+            timeout.has_value() ? timeout : default_timeout_;
+        const auto start = std::chrono::steady_clock::now();
+        raise_if_impossible(size);
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true) {
+            raise_if_closed_locked();
+            auto lease = try_acquire_locked(size, lock);
+            if (lease.has_value()) {
+                return std::move(*lease);
+            }
+            if (!should_block) {
+                throw std::runtime_error("registered buffer pool is exhausted");
+            }
+            wait_count_ += 1;
+            if (!timeout_s.has_value()) {
+                condition_.wait(lock);
+                continue;
+            }
+            const auto elapsed = std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count();
+            const double remaining = *timeout_s - elapsed;
+            if (remaining <= 0.0) {
+                throw py::value_error(
+                    "timed out waiting for registered buffer");
+            }
+            condition_.wait_for(lock, std::chrono::duration<double>(remaining));
+        }
+    }
+
+    RegisteredBufferLeasePyWrapper try_acquire(size_t size) {
+        return acquire(size, false, std::nullopt);
+    }
+
+    std::optional<ExternalRegisteredBufferLeasePyWrapper> try_register_external(
+        uintptr_t ptr, size_t size) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            raise_if_closed_locked();
+            if (size == 0) {
+                return ExternalRegisteredBufferLeasePyWrapper(this, ptr, size);
+            }
+            if (external_in_use_.count(ptr)) {
+                throw std::runtime_error(
+                    "external buffer is already registered through this pool");
+            }
+        }
+        auto begin = std::chrono::steady_clock::now();
+        int ret;
+        {
+            py::gil_scoped_release release;
+            ret = store_->register_buffer(reinterpret_cast<void *>(ptr), size);
+        }
+        auto elapsed = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - begin)
+                           .count();
+        std::unique_lock<std::mutex> lock(mutex_);
+        register_s_ += elapsed;
+        if (ret != 0) {
+            return std::nullopt;
+        }
+        if (!closed_) {
+            external_in_use_.insert(ptr);
+            condition_.notify_all();
+            return ExternalRegisteredBufferLeasePyWrapper(this, ptr, size);
+        }
+        lock.unlock();
+        begin = std::chrono::steady_clock::now();
+        {
+            py::gil_scoped_release release;
+            ret = store_->unregister_buffer(reinterpret_cast<void *>(ptr));
+        }
+        elapsed = std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - begin)
+                      .count();
+        lock.lock();
+        unregister_s_ += elapsed;
+        if (ret != 0) {
+            throw std::runtime_error("unregister_buffer failed with retcode " +
+                                     std::to_string(ret));
+        }
+        throw std::runtime_error("registered buffer pool is closed");
+    }
+
+    void unregister_external(ExternalRegisteredBufferLeasePyWrapper &lease,
+                             uintptr_t ptr, size_t size, bool &closed) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (closed) {
+            throw std::runtime_error(
+                "external registered buffer lease released twice");
+        }
+        closed = true;
+        if (size == 0) {
+            return;
+        }
+        if (!external_in_use_.erase(ptr)) {
+            closed = false;
+            throw std::runtime_error(
+                "external registered buffer lease does not belong to this pool "
+                "or is not active");
+        }
+        lock.unlock();
+        auto begin = std::chrono::steady_clock::now();
+        int ret;
+        {
+            py::gil_scoped_release release;
+            ret = store_->unregister_buffer(reinterpret_cast<void *>(ptr));
+        }
+        auto elapsed = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - begin)
+                           .count();
+        lock.lock();
+        unregister_s_ += elapsed;
+        if (ret != 0) {
+            external_in_use_.insert(ptr);
+            closed = false;
+            condition_.notify_all();
+            throw std::runtime_error("unregister_buffer failed with retcode " +
+                                     std::to_string(ret));
+        }
+        condition_.notify_all();
+    }
+
+    std::vector<std::vector<size_t>> iter_transfer_groups(
+        const std::vector<size_t> &sizes) const {
+        std::vector<std::vector<size_t>> groups;
+        std::vector<size_t> current_group;
+        size_t current_bytes = 0;
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            const size_t item_size = sizes[i];
+            if (item_size == 0) {
+                continue;
+            }
+            if (!current_group.empty() &&
+                current_bytes + item_size > max_size_class_) {
+                groups.push_back(current_group);
+                current_group.clear();
+                current_bytes = 0;
+            }
+            current_group.push_back(i);
+            current_bytes += item_size;
+        }
+        if (!current_group.empty()) {
+            groups.push_back(current_group);
+        }
+        return groups;
+    }
+
+    void release(uintptr_t ptr, size_t capacity,
+                 std::shared_ptr<BufferHandle> handle, bool &closed) {
+        if (closed) {
+            throw std::runtime_error("registered buffer lease released twice");
+        }
+        closed = true;
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!in_use_.erase(ptr)) {
+            closed = false;
+            throw std::runtime_error(
+                "registered buffer lease does not belong to this pool or is "
+                "not active");
+        }
+        const bool should_drop = closed_ || capacity > max_size_class_;
+        if (should_drop) {
+            regions_.erase(ptr);
+            region_sizes_.erase(ptr);
+            total_bytes_ -= capacity;
+        } else {
+            free_[capacity].push_back(handle);
+        }
+        release_count_ += 1;
+        condition_.notify_all();
+    }
+
+    void prewarm(size_t size, size_t count) {
+        const size_t size_class = size_class_for(size);
+        for (size_t i = 0; i < count; ++i) {
+            auto handle = allocate_registered_region(size_class);
+            std::lock_guard<std::mutex> lock(mutex_);
+            raise_if_closed_locked();
+            if (closing_) {
+                throw std::runtime_error("registered buffer pool is closing");
+            }
+            free_[size_class].push_back(handle);
+            condition_.notify_all();
+        }
+    }
+
+    void ensure_prewarmed(size_t size, size_t count) {
+        const size_t size_class = size_class_for(size);
+        while (true) {
+            size_t missing = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const size_t free_count =
+                    free_.count(size_class) ? free_.at(size_class).size() : 0;
+                missing = count > free_count ? count - free_count : 0;
+            }
+            if (missing == 0) {
+                return;
+            }
+            prewarm(size, 1);
+        }
+    }
+
+    RegisteredBufferPoolStatsPy stats() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        RegisteredBufferPoolStatsPy stats;
+        for (const auto &item : free_) {
+            if (!item.second.empty()) {
+                stats.size_classes[item.first] = item.second.size();
+                stats.free_regions += item.second.size();
+                stats.free_bytes += item.first * item.second.size();
+            }
+        }
+        for (uintptr_t ptr : in_use_) {
+            stats.in_use_bytes += region_sizes_.at(ptr);
+        }
+        stats.in_use_regions = in_use_.size() + external_in_use_.size();
+        stats.total_regions = regions_.size();
+        stats.total_bytes = total_bytes_;
+        stats.acquire_count = acquire_count_;
+        stats.reuse_count = reuse_count_;
+        stats.allocate_count = allocate_count_;
+        stats.oversize_allocate_count = oversize_allocate_count_;
+        stats.wait_count = wait_count_;
+        stats.release_count = release_count_;
+        stats.register_s = register_s_;
+        stats.unregister_s = unregister_s_;
+        return stats;
+    }
+
+    void close() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (closed_) {
+            return;
+        }
+        while (reserved_bytes_ != 0) {
+            condition_.wait(lock);
+        }
+        closing_ = true;
+        const size_t active_count = in_use_.size() + external_in_use_.size();
+        if (active_count != 0) {
+            closing_ = false;
+            throw std::runtime_error(
+                "cannot close registered buffer pool with " +
+                std::to_string(active_count) + " active leases");
+        }
+        free_.clear();
+        regions_.clear();
+        region_sizes_.clear();
+        total_bytes_ = 0;
+        closed_ = true;
+        closing_ = false;
+        condition_.notify_all();
+    }
+
+   private:
+    std::optional<RegisteredBufferLeasePyWrapper> try_acquire_locked(
+        size_t requested_size, std::unique_lock<std::mutex> &lock) {
+        const auto oversize_class = oversize_size_class(requested_size);
+        if (oversize_class.has_value()) {
+            return allocate_acquire_locked(*oversize_class, requested_size,
+                                           true, lock);
+        }
+        const size_t size_class = size_class_for(requested_size);
+        auto free_it = free_.find(size_class);
+        if (free_it != free_.end() && !free_it->second.empty()) {
+            auto handle = free_it->second.back();
+            free_it->second.pop_back();
+            const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
+            in_use_.insert(ptr);
+            acquire_count_ += 1;
+            reuse_count_ += 1;
+            return RegisteredBufferLeasePyWrapper(this, ptr, size_class,
+                                                  requested_size, handle);
+        }
+        if (has_capacity_for(size_class)) {
+            return allocate_acquire_locked(size_class, requested_size, false,
+                                           lock);
+        }
+        return std::nullopt;
+    }
+
+    RegisteredBufferLeasePyWrapper allocate_acquire_locked(
+        size_t size_class, size_t requested_size, bool oversize,
+        std::unique_lock<std::mutex> &lock) {
+        reserve_region_locked(size_class);
+        lock.unlock();
+        std::shared_ptr<BufferHandle> handle;
+        try {
+            handle = allocate_registered_region(size_class);
+        } catch (...) {
+            lock.lock();
+            reserved_bytes_ -= size_class;
+            condition_.notify_all();
+            throw;
+        }
+        lock.lock();
+        reserved_bytes_ -= size_class;
+        condition_.notify_all();
+        if (closed_) {
+            const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
+            regions_.erase(ptr);
+            region_sizes_.erase(ptr);
+            total_bytes_ -= size_class;
+            lock.unlock();
+            handle.reset();
+            throw std::runtime_error("registered buffer pool is closed");
+        }
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
+        in_use_.insert(ptr);
+        acquire_count_ += 1;
+        if (oversize) {
+            oversize_allocate_count_ += 1;
+        } else {
+            allocate_count_ += 1;
+        }
+        return RegisteredBufferLeasePyWrapper(this, ptr, size_class,
+                                              requested_size, handle);
+    }
+
+    std::shared_ptr<BufferHandle> allocate_registered_region(
+        size_t size_class) {
+        char *buffer = new char[size_class];
+        auto begin = std::chrono::steady_clock::now();
+        int register_ret;
+        {
+            py::gil_scoped_release release;
+            register_ret = store_->register_buffer(buffer, size_class);
+        }
+        auto elapsed = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - begin)
+                           .count();
+        if (register_ret != 0) {
+            delete[] buffer;
+            throw std::runtime_error("register_buffer failed with retcode " +
+                                     std::to_string(register_ret));
+        }
+        auto handle = std::shared_ptr<BufferHandle>(
+            new BufferHandle(buffer, size_class, [this, buffer]() {
+                store_->unregister_buffer(buffer);
+                delete[] buffer;
+            }));
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(buffer);
+        std::lock_guard<std::mutex> lock(mutex_);
+        register_s_ += elapsed;
+        regions_[ptr] = handle;
+        region_sizes_[ptr] = size_class;
+        total_bytes_ += size_class;
+        return handle;
+    }
+
+    bool has_capacity_for(size_t size_class) const {
+        if (size_class > max_bytes_) {
+            return false;
+        }
+        if (total_bytes_ + reserved_bytes_ + size_class > max_bytes_) {
+            return false;
+        }
+        if (!max_regions_.has_value()) {
+            return true;
+        }
+        const size_t reserved_regions =
+            size_class == 0 ? 0
+                            : (reserved_bytes_ + size_class - 1) / size_class;
+        return regions_.size() + reserved_regions < *max_regions_;
+    }
+
+    void raise_if_impossible(size_t size) const {
+        const size_t size_class =
+            oversize_size_class_for_empty_pool(size).value_or(
+                size_class_for(size));
+        if (size_class > max_bytes_) {
+            throw py::value_error(
+                "requested buffer size exceeds pool capacity: " +
+                std::to_string(size) + " > " + std::to_string(max_bytes_));
+        }
+        if (max_regions_.has_value() && *max_regions_ == 0) {
+            throw py::value_error("registered buffer pool max_regions is zero");
+        }
+    }
+
+    std::optional<size_t> oversize_size_class_for_empty_pool(
+        size_t size) const {
+        if (size <= max_size_class_) {
+            return std::nullopt;
+        }
+        return round_up(size, alignment_);
+    }
+
+    std::optional<size_t> oversize_size_class(size_t size) const {
+        if (size <= max_size_class_) {
+            return std::nullopt;
+        }
+        const size_t rounded = round_up(size, alignment_);
+        if (total_bytes_ + reserved_bytes_ + rounded > max_bytes_) {
+            return std::nullopt;
+        }
+        if (max_regions_.has_value()) {
+            const size_t reserved_regions = reserved_bytes_ ? 1 : 0;
+            if (regions_.size() + reserved_regions >= *max_regions_) {
+                return std::nullopt;
+            }
+        }
+        return rounded;
+    }
+
+    void reserve_region_locked(size_t size_class) {
+        raise_if_closed_locked();
+        if (closing_) {
+            throw std::runtime_error("registered buffer pool is closing");
+        }
+        if (!has_capacity_for(size_class)) {
+            throw std::runtime_error(
+                "registered buffer pool capacity exceeded");
+        }
+        reserved_bytes_ += size_class;
+    }
+
+    size_t size_class_for(size_t size) const {
+        size = std::max<size_t>(size, 1);
+        const size_t capped = std::min(size, max_size_class_);
+        if (capped <= min_size_class_) {
+            return min_size_class_;
+        }
+        if (capped <= alignment_) {
+            return next_power_of_two(capped);
+        }
+        return round_up(capped, alignment_);
+    }
+
+    static size_t next_power_of_two(size_t value) {
+        size_t result = 1;
+        while (result < value) {
+            result <<= 1;
+        }
+        return result;
+    }
+
+    static size_t round_up(size_t value, size_t alignment) {
+        return ((value + alignment - 1) / alignment) * alignment;
+    }
+
+    void raise_if_closed_locked() const {
+        if (closed_) {
+            throw std::runtime_error("registered buffer pool is closed");
+        }
+    }
+
+    std::shared_ptr<PyClient> store_;
+    size_t max_bytes_;
+    size_t min_size_class_;
+    size_t max_size_class_;
+    size_t alignment_;
+    bool block_on_exhaustion_;
+    std::optional<double> default_timeout_;
+    std::optional<size_t> max_regions_;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::unordered_map<size_t, std::deque<std::shared_ptr<BufferHandle>>> free_;
+    std::unordered_set<uintptr_t> in_use_;
+    std::unordered_set<uintptr_t> external_in_use_;
+    std::unordered_map<uintptr_t, std::shared_ptr<BufferHandle>> regions_;
+    std::unordered_map<uintptr_t, size_t> region_sizes_;
+    bool closed_ = false;
+    bool closing_ = false;
+    size_t total_bytes_ = 0;
+    size_t reserved_bytes_ = 0;
+    size_t acquire_count_ = 0;
+    size_t reuse_count_ = 0;
+    size_t allocate_count_ = 0;
+    size_t oversize_allocate_count_ = 0;
+    size_t wait_count_ = 0;
+    size_t release_count_ = 0;
+    double register_s_ = 0.0;
+    double unregister_s_ = 0.0;
+};
+
+RegisteredBufferLeasePyWrapper::RegisteredBufferLeasePyWrapper(
+    RegisteredBufferPoolPyWrapper *pool, uintptr_t ptr, size_t capacity,
+    size_t requested_size, std::shared_ptr<BufferHandle> handle)
+    : pool_(pool),
+      ptr_(ptr),
+      capacity_(capacity),
+      requested_size_(requested_size),
+      handle_(std::move(handle)) {}
+
+py::object RegisteredBufferLeasePyWrapper::buffer() const {
+    if (!handle_) {
+        return py::none();
+    }
+    return py::memoryview::from_buffer(static_cast<char *>(handle_->ptr()),
+                                       {requested_size_}, {sizeof(char)});
+}
+
+void RegisteredBufferLeasePyWrapper::release() {
+    if (!pool_) {
+        throw std::runtime_error("registered buffer lease released twice");
+    }
+    pool_->release(ptr_, capacity_, handle_, closed_);
+    handle_.reset();
+    pool_ = nullptr;
+}
+
+void ExternalRegisteredBufferLeasePyWrapper::release() {
+    if (!pool_) {
+        throw std::runtime_error(
+            "external registered buffer lease released twice");
+    }
+    pool_->unregister_external(*this, ptr_, size_, closed_);
+    pool_ = nullptr;
+}
+
 PYBIND11_MODULE(store, m) {
     // Object data type classification
     py::enum_<ObjectDataType>(m, "ObjectDataType")
@@ -1734,6 +2366,104 @@ PYBIND11_MODULE(store, m) {
                 );
             }
         });
+
+    m.def("dtype_byte_size", [](const std::string &dtype) -> size_t {
+        auto size = dtype_byte_size_for_pybind(dtype);
+        if (!size.has_value()) {
+            throw py::value_error("unsupported dtype: " + dtype);
+        }
+        return *size;
+    });
+
+    py::class_<RegisteredBufferPoolStatsPy>(m, "RegisteredBufferPoolStats")
+        .def_readonly("size_classes",
+                      &RegisteredBufferPoolStatsPy::size_classes)
+        .def_readonly("free_regions",
+                      &RegisteredBufferPoolStatsPy::free_regions)
+        .def_readonly("in_use_regions",
+                      &RegisteredBufferPoolStatsPy::in_use_regions)
+        .def_readonly("total_regions",
+                      &RegisteredBufferPoolStatsPy::total_regions)
+        .def_readonly("total_bytes", &RegisteredBufferPoolStatsPy::total_bytes)
+        .def_readonly("free_bytes", &RegisteredBufferPoolStatsPy::free_bytes)
+        .def_readonly("in_use_bytes",
+                      &RegisteredBufferPoolStatsPy::in_use_bytes)
+        .def_readonly("acquire_count",
+                      &RegisteredBufferPoolStatsPy::acquire_count)
+        .def_readonly("reuse_count", &RegisteredBufferPoolStatsPy::reuse_count)
+        .def_readonly("allocate_count",
+                      &RegisteredBufferPoolStatsPy::allocate_count)
+        .def_readonly("oversize_allocate_count",
+                      &RegisteredBufferPoolStatsPy::oversize_allocate_count)
+        .def_readonly("wait_count", &RegisteredBufferPoolStatsPy::wait_count)
+        .def_readonly("release_count",
+                      &RegisteredBufferPoolStatsPy::release_count)
+        .def_readonly("register_s", &RegisteredBufferPoolStatsPy::register_s)
+        .def_readonly("unregister_s",
+                      &RegisteredBufferPoolStatsPy::unregister_s);
+
+    py::class_<RegisteredBufferLeasePyWrapper>(m, "RegisteredBufferLease")
+        .def_property_readonly("buffer",
+                               &RegisteredBufferLeasePyWrapper::buffer)
+        .def_property_readonly("ptr", &RegisteredBufferLeasePyWrapper::ptr)
+        .def_property_readonly("size", &RegisteredBufferLeasePyWrapper::size)
+        .def("release", &RegisteredBufferLeasePyWrapper::release)
+        .def("__enter__",
+             [](RegisteredBufferLeasePyWrapper &self)
+                 -> RegisteredBufferLeasePyWrapper & { return self; })
+        .def("__exit__", [](RegisteredBufferLeasePyWrapper &self, py::object,
+                            py::object, py::object) { self.release(); });
+
+    py::class_<ExternalRegisteredBufferLeasePyWrapper>(
+        m, "ExternalRegisteredBufferLease")
+        .def_property_readonly("ptr",
+                               &ExternalRegisteredBufferLeasePyWrapper::ptr)
+        .def_property_readonly("size",
+                               &ExternalRegisteredBufferLeasePyWrapper::size)
+        .def("release", &ExternalRegisteredBufferLeasePyWrapper::release)
+        .def("__enter__",
+             [](ExternalRegisteredBufferLeasePyWrapper &self)
+                 -> ExternalRegisteredBufferLeasePyWrapper & { return self; })
+        .def("__exit__",
+             [](ExternalRegisteredBufferLeasePyWrapper &self, py::object,
+                py::object, py::object) { self.release(); });
+
+    py::class_<RegisteredBufferPoolPyWrapper>(m, "RegisteredBufferPool")
+        .def(py::init<MooncakeStorePyWrapper &, size_t, size_t,
+                      std::optional<size_t>, size_t, bool,
+                      std::optional<double>, std::optional<size_t>>(),
+             py::arg("store"), py::arg("max_bytes"),
+             py::arg("min_size_class") = 64 * 1024,
+             py::arg("max_size_class") = py::none(),
+             py::arg("alignment") = 8 * 1024 * 1024,
+             py::arg("block_on_exhaustion") = true,
+             py::arg("default_timeout") = py::none(),
+             py::arg("max_regions") = py::none())
+        .def("acquire", &RegisteredBufferPoolPyWrapper::acquire,
+             py::arg("size"), py::arg("block") = py::none(),
+             py::arg("timeout") = py::none())
+        .def("try_acquire", &RegisteredBufferPoolPyWrapper::try_acquire,
+             py::arg("size"))
+        .def("buffer", &RegisteredBufferPoolPyWrapper::acquire, py::arg("size"),
+             py::arg("block") = py::none(), py::arg("timeout") = py::none())
+        .def("try_register_external",
+             &RegisteredBufferPoolPyWrapper::try_register_external,
+             py::arg("ptr"), py::arg("size"))
+        .def("iter_transfer_groups",
+             &RegisteredBufferPoolPyWrapper::iter_transfer_groups,
+             py::arg("sizes"))
+        .def("prewarm", &RegisteredBufferPoolPyWrapper::prewarm,
+             py::arg("size"), py::arg("count"))
+        .def("ensure_prewarmed",
+             &RegisteredBufferPoolPyWrapper::ensure_prewarmed, py::arg("size"),
+             py::arg("count"))
+        .def("stats", &RegisteredBufferPoolPyWrapper::stats)
+        .def("close", &RegisteredBufferPoolPyWrapper::close)
+        .def("__enter__",
+             [](RegisteredBufferPoolPyWrapper &self)
+                 -> RegisteredBufferPoolPyWrapper & { return self; })
+        .def("__exit__", [](RegisteredBufferPoolPyWrapper &self, py::object,
+                            py::object, py::object) { self.close(); });
 
     py::class_<MooncakeHostMemAllocatorPyWrapper>(m, "MooncakeHostMemAllocator")
         .def(py::init<>())
@@ -2144,11 +2874,24 @@ PYBIND11_MODULE(store, m) {
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
              "Put a tensor directly from a pre-allocated buffer. Buffer layout "
              "must be [TensorMetadata][tensor data], same as get_tensor_into.")
+        .def("pub_tensor_from", &MooncakeStorePyWrapper::pub_tensor_from,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             py::arg("config") = ReplicateConfig{},
+             "Publish a tensor directly from a pre-allocated buffer with "
+             "configurable replication settings. Buffer layout must be "
+             "[TensorMetadata][tensor data].")
         .def("batch_put_tensor_from",
              &MooncakeStorePyWrapper::batch_put_tensor_from, py::arg("keys"),
              py::arg("buffer_ptrs"), py::arg("sizes"),
              "Put tensors directly from pre-allocated buffers for multiple "
              "keys. Each buffer layout: [TensorMetadata][tensor data].")
+        .def("batch_pub_tensor_from",
+             &MooncakeStorePyWrapper::batch_pub_tensor_from, py::arg("keys"),
+             py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("config") = ReplicateConfig{},
+             "Publish tensors directly from pre-allocated buffers with "
+             "configurable replication settings. Each buffer layout: "
+             "[TensorMetadata][tensor data].")
         .def("put_tensor_with_tp_from",
              &MooncakeStorePyWrapper::put_tensor_with_tp_from, py::arg("key"),
              py::arg("buffer_ptr"), py::arg("size"), py::arg("tp_rank") = 0,
@@ -2206,6 +2949,30 @@ PYBIND11_MODULE(store, m) {
              py::arg("target") = py::none(),
              "Get a PyTorch tensor from the store directly into a "
              "pre-allocated buffer using a ReadTarget request.")
+        .def(
+            "get_tensor_dim_selection_into",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size,
+               const std::vector<int64_t> &shape, const std::string &dtype,
+               int64_t dim, const py::object &selections = py::none(),
+               size_t data_offset = 0) -> int64_t {
+                auto plan = self.build_tensor_dim_selection_into_plan(
+                    key, buffer_ptr, size, shape, dtype, dim, selections,
+                    data_offset, "get_tensor_dim_selection_into");
+                if (!plan.has_value()) {
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+                auto success = self.execute_tensor_into_plan_transfers({*plan});
+                if (success.empty() || !success[0]) {
+                    return to_py_ret(ErrorCode::TRANSFER_FAIL);
+                }
+                return static_cast<int64_t>(plan->total_length);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            py::arg("shape"), py::arg("dtype"), py::arg("dim"),
+            py::arg("selections") = py::none(), py::arg("data_offset") = 0,
+            "Materialize fixed-shape tensor dimension selections into a "
+            "registered buffer using Mooncake TensorIntoPlan and range reads.")
         .def("batch_get_tensor_with_parallelism_into",
              &MooncakeStorePyWrapper::batch_get_tensor_with_parallelism_into,
              py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),

@@ -100,6 +100,7 @@ performance/ssd-offload-benchmark-results
 
 python-api-reference/mooncake-store
 python-api-reference/transfer-engine
+python-api-reference/dataproto-transfer
 http-api-reference/http-service
 python-api-reference/ep-backend
 :::

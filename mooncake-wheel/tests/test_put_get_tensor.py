@@ -1,38 +1,47 @@
 import ctypes
-import struct
-import unittest
 import os
+import struct
 import time
-import threading
-import random
+import unittest
+
+import numpy as np
+from mooncake.registered_buffer_pool import writable_buffer_region
+from mooncake.remote_tensor_batch import (
+    RemoteTensorBatch,
+    TensorDimSelection,
+    TensorFieldRef,
+    TensorReadRequest,
+    dtype_byte_size,
+    selection_output_shape,
+    tensor_nbytes,
+)
 from mooncake.store import MooncakeDistributedStore
+
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
-DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
+DEFAULT_DEFAULT_KV_LEASE_TTL = 5000  # 5000 milliseconds
 # Use environment variable if set, otherwise use default
 default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
+
 
 # Define a test class for serialization
 class TestClass:
     def __init__(self, version=1, shape=(1, 2, 3)):
         self.version = version
         self.shape = shape
-    
-    def serialize_into(self, buffer):
-        struct.pack_into("i", buffer, 0, self.version)
-        struct.pack_into("3i", buffer, 4, *self.shape)
-        
+
     def serialize_into(self):
         version_bytes = struct.pack("i", self.version)
         shape_bytes = struct.pack("3i", *self.shape)
         return (version_bytes, shape_bytes)
-        
+
     def deserialize_from(buffer):
         version = struct.unpack_from("i", buffer, 0)[0]
         shape = struct.unpack_from("3i", buffer, 4)
         return TestClass(version, shape)
-         
+
+
 def get_client(store):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -40,21 +49,113 @@ def get_client(store):
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
-    local_buffer_size = 512 * 1024 * 1024     # 512 MB
+    local_buffer_size = 512 * 1024 * 1024  # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-    
+
     retcode = store.setup(
-        local_hostname, 
-        metadata_server, 
+        local_hostname,
+        metadata_server,
         global_segment_size,
-        local_buffer_size, 
-        protocol, 
+        local_buffer_size,
+        protocol,
         device_name,
-        master_server_address
+        master_server_address,
     )
-    
+
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
+
+
+class TestRemoteTensorBatchHelpers(unittest.TestCase):
+    def test_field_ref_and_size_helpers(self):
+        ref = TensorFieldRef("batch/input_ids", (4, 2), "torch.int64", 128)
+
+        self.assertEqual(dtype_byte_size("torch.int64"), 8)
+        self.assertEqual(tensor_nbytes(ref.shape, ref.dtype), 64)
+        self.assertEqual(ref.nbytes(), 64)
+
+    def test_selection_shape_helpers(self):
+        selections = (
+            TensorDimSelection.select_idxs([3, 1]),
+            TensorDimSelection.repeat(2, True),
+        )
+
+        self.assertEqual(selection_output_shape((4, 2), selections), (4, 2))
+        request = TensorReadRequest(
+            "input_ids",
+            TensorFieldRef("batch/input_ids", (4, 2), "int64"),
+            selections=selections,
+        )
+        self.assertEqual(request.output_shape(), (4, 2))
+        self.assertEqual(request.output_nbytes(), 64)
+        self.assertEqual(request.store_selections(), [("select_idxs", [3, 1]), ("repeat", (2, True))])
+
+    def test_remote_batch_records_lazy_operations(self):
+        remote = RemoteTensorBatch(
+            fields={
+                "input_ids": TensorFieldRef("batch/input_ids", (4, 2), "int64"),
+                "attention_mask": TensorFieldRef("batch/attention_mask", (4, 2), "int64"),
+            },
+            batch_size=4,
+        )
+
+        selected = remote.select_fields(["input_ids"]).select_indices([True, False, True, False]).slice(0, 1, None)
+        repeated = selected.repeat(3, False)
+
+        self.assertEqual(selected.keys(), ["input_ids"])
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(len(repeated), 3)
+        self.assertEqual(
+            [selection.as_tuple() for selection in repeated.selections],
+            [
+                ("select_idxs", [True, False, True, False]),
+                ("slice", (0, 1, None)),
+                ("repeat", (3, False)),
+            ],
+        )
+
+    def test_union_rejects_duplicate_fields(self):
+        lhs = RemoteTensorBatch({"input_ids": TensorFieldRef("batch/input_ids", (2,), "int64")}, 2)
+        rhs = RemoteTensorBatch({"input_ids": TensorFieldRef("other/input_ids", (2,), "int64")}, 2)
+
+        with self.assertRaises(ValueError):
+            lhs.union(rhs)
+
+    def test_cat_records_selection_groups(self):
+        remote = RemoteTensorBatch({"input_ids": TensorFieldRef("batch/input_ids", (4,), "int64")}, 4)
+        lhs = remote.select_indices([3, 1])
+        rhs = remote.slice(0, 2, None)
+
+        concatenated = RemoteTensorBatch.cat([lhs, rhs])
+
+        self.assertEqual(len(concatenated), 4)
+        self.assertEqual([selection.op for selection in concatenated.selections], ["cat"])
+        self.assertEqual(selection_output_shape((4,), concatenated.selections), (4,))
+        self.assertEqual(
+            [[selection.op for selection in group] for group in concatenated.selections[0].value],
+            [["select_idxs"], ["slice"]],
+        )
+        self.assertEqual(
+            concatenated.read_requests(["input_ids"])[0].store_selections(),
+            [("cat", ((("select_idxs", [3, 1]),), (("slice", (0, 2, None)),)))],
+        )
+
+    def test_writable_buffer_region_releases_cast_source_view(self):
+        buffer = memoryview(bytearray(8)).cast("H")
+
+        with writable_buffer_region(buffer) as region:
+            self.assertEqual(region.size, 8)
+
+        buffer.release()
+
+    def test_writable_buffer_region_close_is_idempotent(self):
+        with writable_buffer_region(bytearray(8)) as region:
+            region.close()
+            region.close()
+
+    def test_bool_mask_length_must_match(self):
+        with self.assertRaises(IndexError):
+            selection_output_shape((4, 2), (TensorDimSelection.select_idxs([True, False]),))
 
 
 class TestDistributedObjectStore(unittest.TestCase):
@@ -80,7 +181,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.allclose(tensor, retrieved))
 
         # Int tensor
-        tensor_int = torch.tensor([1,2,3,4], dtype=torch.int32)
+        tensor_int = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
         key_int = "test_tensor_int"
         result = self.store.put_tensor(key_int, tensor_int)
         self.assertEqual(result, 0)
@@ -138,7 +239,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Test with 3D int tensor
         tensor_3d = torch.tensor([[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.int64)
         key_3d = "test_tensor_with_metadata_3d"
-        
+
         result = self.store.put_tensor(key_3d, tensor_3d)
         self.assertEqual(result, 0)
 
@@ -152,6 +253,84 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_2d)
         self.store.remove(key_3d)
 
-             
-if __name__ == '__main__':
+    def test_tensor_dim_selection_into(self):
+        source = np.arange(4 * 2, dtype=np.int64).reshape(4, 2)
+        output = self._materialize_selection(
+            "test_tensor_dim_selection_into_input_ids",
+            source,
+            0,
+            [("select_idxs", [3, 1]), ("repeat", (2, True))],
+            (4, 2),
+        )
+        np.testing.assert_array_equal(output, source[[3, 3, 1, 1]])
+
+        source = np.arange(2 * 4 * 3, dtype=np.int64).reshape(2, 4, 3)
+        output = self._materialize_selection(
+            "test_tensor_dim_selection_into_tokens",
+            source,
+            1,
+            [("slice", (1, 4, 2))],
+            (2, 2, 3),
+        )
+        np.testing.assert_array_equal(output, source[:, 1:4:2, :])
+
+        source = np.arange(2 * 3 * 4, dtype=np.int64).reshape(2, 3, 4)
+        output = self._materialize_selection(
+            "test_tensor_dim_selection_into_hidden",
+            source,
+            -1,
+            [("select_idxs", [3, 1])],
+            (2, 3, 2),
+        )
+        np.testing.assert_array_equal(output, source[:, :, [3, 1]])
+
+        source = np.arange(4, dtype=np.int64)
+        output = self._materialize_selection(
+            "test_tensor_dim_selection_into_cat",
+            source,
+            0,
+            [("cat", [[("select_idxs", [3, 1])], [("slice", (0, 2, None))]])],
+            (4,),
+        )
+        np.testing.assert_array_equal(output, source[[3, 1, 0, 1]])
+
+        source = np.arange(6, dtype=np.int64)
+        output = self._materialize_selection(
+            "test_tensor_dim_selection_into_cat_after_slice",
+            source,
+            0,
+            [
+                ("slice", (1, 5, None)),
+                ("cat", [[("select_idxs", [2, 0])], [("slice", (1, 3, None))]]),
+            ],
+            (4,),
+        )
+        np.testing.assert_array_equal(output, source[[3, 1, 2, 3]])
+
+    def _materialize_selection(self, key, source, dim, selections, output_shape):
+        output_size = int(np.prod(output_shape)) * source.dtype.itemsize
+        buffer = (ctypes.c_ubyte * output_size)()
+        buffer_ptr = ctypes.addressof(buffer)
+
+        self.assertEqual(self.store.put(key, source.tobytes()), 0)
+        self.assertEqual(self.store.register_buffer(buffer_ptr, output_size), 0)
+
+        try:
+            ret = self.store.get_tensor_dim_selection_into(
+                key,
+                buffer_ptr,
+                output_size,
+                list(source.shape),
+                "int64",
+                dim,
+                selections,
+            )
+            self.assertEqual(ret, output_size)
+            return np.frombuffer(bytes(buffer), dtype=np.int64).reshape(output_shape)
+        finally:
+            self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+            self.assertEqual(self.store.remove(key, True), 0)
+
+
+if __name__ == "__main__":
     unittest.main()
