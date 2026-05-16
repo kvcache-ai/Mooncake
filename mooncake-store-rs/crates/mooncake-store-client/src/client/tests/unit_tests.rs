@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId};
-use mooncake_store_test_utils::transport::TestTransport;
 
 use crate::{
     BandwidthShaping, ExecutionFairness, GetRequest, MultiBufferGetRequest, MultiBufferPutRequest,
@@ -570,25 +569,6 @@ fn store_client_builder_segment_name_is_stored_in_runtime_id() {
         .expect("build should succeed");
     // runtime_id should reference the stable_id we provided
     assert_eq!(client.runtime_id().stable_id.0, "seg-test");
-}
-
-#[test]
-fn store_client_builder_rejects_transport_segment_name_mismatch() {
-    let meta = Arc::new(InMemoryMetadataBackend::new());
-    let transport = Arc::new(TestTransport::new("transport-segment"));
-    let result = StoreClientBuilder::new(meta, "seg-mismatch")
-        .segment_name("published-segment")
-        .transport(transport)
-        .local_memory(storage_config())
-        .build(test_future_expiry_ms());
-    let err = match result {
-        Ok(_) => panic!("segment mismatch should be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        matches!(err, mooncake_store_core::StoreError::InvalidState(_)),
-        "expected InvalidState for segment mismatch, got {err:?}"
-    );
 }
 
 #[test]

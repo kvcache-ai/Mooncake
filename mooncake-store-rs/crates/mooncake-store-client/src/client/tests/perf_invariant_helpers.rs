@@ -38,15 +38,13 @@ pub(super) fn build_perf_client(
     stable_id: &str,
     tenant: &str,
 ) -> StoreClient {
-    let segment_name = format!("{stable_id}-segment");
-    let local_transport = Arc::new(transport.peer(&segment_name));
     let client = StoreClientBuilder::new(metadata, stable_id)
         .state(ClientLifecycleState::Active)
         .tenant(tenant)
         .label("pool", "perf-pool")
         .label("storage", "true")
-        .segment_name(&segment_name)
-        .transport(local_transport)
+        .segment_name(format!("{stable_id}-segment"))
+        .transport(transport)
         .local_memory(perf_storage_config())
         .build(test_future_expiry_ms())
         .expect("perf-test client build should succeed");
