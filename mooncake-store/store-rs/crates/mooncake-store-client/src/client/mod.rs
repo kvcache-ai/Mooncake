@@ -50,9 +50,6 @@ const DEFAULT_TENANT: &str = "default";
 const DEFAULT_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LIVE_CLIENT_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_SUSPECT_RUNTIME_TTL: Duration = Duration::from_secs(5);
-const DEFAULT_REMOTE_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
-const DEFAULT_REMOTE_RUNTIME_PROBE_REACHABLE_TTL: Duration = Duration::from_millis(500);
-const DEFAULT_REMOTE_RUNTIME_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_ROUTE_TOPK: usize = 2;
 const DEFAULT_REQUEST_TIMEOUT_BASE: Duration = Duration::from_secs(1);
 const DEFAULT_REQUEST_TIMEOUT_CAP: Duration = Duration::from_secs(60);
@@ -109,7 +106,6 @@ pub struct StoreClient {
     lease_ttl_ms: u64,
     live_client_cache: SharedLiveClientCache,
     suspect_runtime_cache: SharedSuspectRuntimeCache,
-    remote_runtime_probe_cache: SharedRemoteRuntimeProbeCache,
     membership_sync: MembershipSyncHandle,
     _async_eviction: AsyncEvictionHandle,
     default_tenant: String,
