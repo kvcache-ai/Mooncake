@@ -1056,6 +1056,128 @@ When to bump the version:
 
 ---
 
+
+## Cost-Aware Routing
+
+> Forge RL design 02. Independent from prefix matching (LPM); routers
+> typically use the LPM result as the candidate set, then call
+> `QueryCost` to pick the cheapest replica.
+
+### Motivation
+
+In a multi-host / multi-zone deployment, a KV-cache block is often
+replicated on several segments. A naive replica picker (round-robin or
+hash-based) may route the fetch across a slow link or onto a hot
+segment, inflating tail latency. Cost-aware routing scores every
+candidate using a simple linear cost function:
+
+```
+cost = link_weight  * link_class_penalty
+     + tier_weight  * storage_tier_penalty
+     + inflight_weight * current_inflight
+     + size_weight  * (request_size_bytes / 1 MiB)
+```
+
+The router calls one new RPC, `QueryCost`, with the candidate set
+returned by LPM (or any other source) plus its own host / zone, and
+gets back the same set sorted ascending by cost.
+
+### Components
+
+- **`CostEstimator`** (`mooncake-store/include/cost_estimator.h`):
+  pure compute. Combines `LinkClass` (`LOCAL_HOST` / `SAME_ZONE` /
+  `CROSS_ZONE` / `UNKNOWN`), `StorageTier` (`DRAM` / `SSD` / `FILE`),
+  in-flight count and request size into a single double.
+
+- **`SegmentInflightTracker`**: shared-mutex + map of atomic counters
+  keyed by `segment_name`. Bumped via the `InflightBegin` /
+  `InflightEnd` RPCs (the router brackets every fetch).
+
+- **`ClusterTopology`**: parsed from
+  `MasterConfig::cluster_topology_json`
+  (`{"zone_a": ["10.0.0.1", ...], ...}`). Empty topology ⇒ every
+  cross-host link reports `UNKNOWN`.
+
+- **Wiring**: `MasterService` snapshots the segment table once via
+  `ScopedSegmentAccess::GetAllSegments`, drops the segment mutex,
+  then scores against the snapshot + the in-flight tracker. The
+  scoring loop holds **no global locks**.
+
+### New RPCs
+
+| RPC | Request | Response |
+|---|---|---|
+| `QueryCost` | `candidate_segment_names`, `client_host?`, `client_zone?`, `request_size_bytes?`, `include_unmounted?` | `candidates[]` sorted by cost ascending, plus `topology_zone_count` and `total_inflight` |
+| `InflightBegin` | `segment_name` | `new_value` |
+| `InflightEnd`   | `segment_name` | `new_value` |
+
+`CostCandidate`: `{segment_name, cost_score, link_class, storage_tier, inflight, found}`.
+
+### Configuration
+
+`MasterServiceConfig` (and the whole config chain
+`MasterConfig` → `MasterServiceSupervisorConfig` →
+`WrappedMasterServiceConfig` → `MasterServiceConfig`) gained:
+
+```cpp
+bool        enable_cost_aware           = true;
+std::string cluster_topology_json;     // empty ⇒ no topology
+double      cost_link_weight            = 100.0;
+double      cost_tier_weight            =  50.0;
+double      cost_inflight_weight        =  10.0;
+double      cost_size_weight_per_mib    =   0.001;
+```
+
+`enable_cost_aware = false` ⇒ `QueryCost` short-circuits to
+`COST_QUERY_DISABLED`; `InflightBegin/End` become no-ops.
+
+`kMaxCostCandidates = 1024` caps a single `QueryCost` request.
+
+### Error codes (`mooncake/types.h`, range −1700…−1799)
+
+| Code | Name | Meaning |
+|---|---|---|
+| −1700 | `COST_QUERY_DISABLED` | Feature flag is off. |
+| −1701 | `COST_REQUEST_EMPTY` | Empty candidate list / empty segment_name. |
+| −1702 | `COST_REQUEST_TOO_LARGE` | More than `kMaxCostCandidates`. |
+| −1703 | `COST_INVALID_TOPOLOGY` | Reserved for future use. |
+
+### Prometheus metrics
+
+- `master_query_cost_requests_total`
+- `master_query_cost_failures_total`
+- `master_query_cost_disabled_total`
+- `master_query_cost_candidate_count` (histogram)
+- `master_inflight_begin_requests_total`
+- `master_inflight_end_requests_total`
+- `master_total_inflight_segments` (gauge)
+
+### Python API
+
+`store.query_cost(candidate_segment_names, client_host="", client_zone="",
+request_size_bytes=0, include_unmounted=False)` returns
+`list[(segment_name, cost_score, link_class, storage_tier, inflight, found)]`
+sorted ascending. `store.inflight_begin(segment_name)` /
+`store.inflight_end(segment_name)` return the new in-flight count.
+
+### Performance
+
+`mooncake-store/benchmarks/query_cost_bench` exercises the in-process
+`QueryCost` path. Reference numbers on a single host with 64 candidates /
+8 worker threads / 5 s:
+
+| metric | value |
+|---|---|
+| total RPCs | 8.96 M |
+| aggregate QPS | 1.79 M |
+| p50 latency | 3.4 µs |
+| p99 latency | 12.0 µs |
+| p999 latency | 17.4 µs |
+
+The hot path is a snapshot copy + a single `unordered_map` lookup per
+candidate + a `stable_sort`, so the cost is dominated by snapshot
+copy and is ~linear in the candidate count.
+
 :::{toctree}
 :caption: Related Design Docs
 :maxdepth: 1

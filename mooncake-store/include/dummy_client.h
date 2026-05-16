@@ -147,6 +147,17 @@ class DummyClient : public PyClient {
 
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
+    // Cost-aware routing (Forge RL design 02) -- DummyClient has no master
+    // to talk to, so every cost-aware hook reports COST_QUERY_DISABLED.
+    tl::expected<std::vector<CostCandidateTuple>, ErrorCode> queryCost(
+        const std::vector<std::string> &candidate_segment_names,
+        const std::string &client_host, const std::string &client_zone,
+        uint64_t request_size_bytes, bool include_unmounted) override;
+    tl::expected<uint32_t, ErrorCode> inflightBegin(
+        const std::string &segment_name) override;
+    tl::expected<uint32_t, ErrorCode> inflightEnd(
+        const std::string &segment_name) override;
+
     int64_t getSize(const std::string &key);
 
     std::map<std::string, std::vector<Replica::Descriptor>>

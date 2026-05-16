@@ -326,6 +326,31 @@ class PyClient {
     virtual std::vector<int> batchIsExist(
         const std::vector<std::string> &keys) = 0;
 
+    // ---- Cost-aware routing (Forge RL design 02) ----
+    // Score+rank a caller-supplied candidate set by ascending fetch cost.
+    // Each ranked entry is the tuple:
+    //   (segment_name, cost_score, link_class, storage_tier, inflight, found)
+    using CostCandidateTuple =
+        std::tuple<std::string, double, int32_t, int32_t, uint32_t, bool>;
+
+    // tl::expected is used so callers can disambiguate "empty result" from
+    // "RPC failed"; the Python binding maps the unexpected error into
+    // (None, err_code) the same way LPM does.
+    virtual tl::expected<std::vector<CostCandidateTuple>, ErrorCode> queryCost(
+        const std::vector<std::string> &candidate_segment_names,
+        const std::string &client_host, const std::string &client_zone,
+        uint64_t request_size_bytes, bool include_unmounted) = 0;
+
+    /// Tell the master a fetch is starting against `segment_name`. Returns
+    /// the new in-flight count, or an ErrorCode on failure.
+    virtual tl::expected<uint32_t, ErrorCode> inflightBegin(
+        const std::string &segment_name) = 0;
+
+    /// Tell the master a fetch finished. Returns the new in-flight count,
+    /// or an ErrorCode on failure.
+    virtual tl::expected<uint32_t, ErrorCode> inflightEnd(
+        const std::string &segment_name) = 0;
+
     virtual int64_t getSize(const std::string &key) = 0;
 
     virtual std::map<std::string, std::vector<Replica::Descriptor>>

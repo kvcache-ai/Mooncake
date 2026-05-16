@@ -118,7 +118,30 @@ MasterService::MasterService(const MasterServiceConfig& config)
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      // Cost-aware members below are listed in the same order as their
+      // declarations in master_service.h so -Wreorder stays quiet.
+      // enable_cost_aware_ / cluster_topology_ / inflight_tracker_ are
+      // default-initialised here and assigned in the ctor body below.
+      cost_estimator_(
+          CostWeights{/*link_weight*/ config.cost_link_weight,
+                      /*tier_weight*/ config.cost_tier_weight,
+                      /*inflight_weight*/ config.cost_inflight_weight,
+                      /*size_weight*/ config.cost_size_weight_per_mib}) {
+    enable_cost_aware_.store(config.enable_cost_aware,
+                             std::memory_order_relaxed);
+    if (!config.cluster_topology_json.empty()) {
+        if (!ClusterTopology::ParseFromJson(config.cluster_topology_json,
+                                            &cluster_topology_)) {
+            LOG(ERROR) << "Failed to parse cluster_topology_json; cost-aware "
+                          "routing will treat every cross-host segment as "
+                          "UNKNOWN link class.";
+        } else {
+            LOG(INFO) << "Loaded cluster topology with "
+                      << cluster_topology_.zone_to_hosts.size() << " zones / "
+                      << cluster_topology_.host_to_zone.size() << " hosts.";
+        }
+    }
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
@@ -5250,6 +5273,177 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing (Forge RL design 02)
+//
+// Implementation notes
+//
+// 1. We snapshot the segment table exactly once via ScopedSegmentAccess and
+//    drop the segment mutex before any per-candidate computation, mirroring
+//    the pattern used by the LPM / GetReplicaList paths. The snapshot is
+//    cheap (a vector of (Segment, UUID) pairs) and small (1 entry per
+//    mounted segment, typically O(10s)).
+//
+// 2. Cost scoring is a pure function of the snapshot + the in-flight tracker
+//    + caller-provided context (client_host / client_zone / size_bytes), so
+//    no global locks are held during the scoring loop.
+//
+// 3. Candidates absent from the snapshot are reported with `found=false`.
+//    By default we drop those entries from the response (a typical router
+//    just wants the routable subset). Setting `include_unmounted=true`
+//    surfaces them for diagnostics / routing fallbacks.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a quick lookup from segment_name -> Segment metadata. The snapshot
+// can contain duplicate names (history shows multiple clients can mount the
+// same logical name); we keep the first occurrence, which matches the
+// behaviour of QuerySegments (see segment.cpp:335). The index stores raw
+// pointers into the caller-owned snapshot; never outlive the snapshot.
+std::unordered_map<std::string, const Segment*> BuildSegmentNameIndex(
+    const std::vector<std::pair<Segment, UUID>>& snapshot) {
+    std::unordered_map<std::string, const Segment*> index;
+    index.reserve(snapshot.size());
+    for (const auto& entry : snapshot) {
+        index.try_emplace(entry.first.name, &entry.first);
+    }
+    return index;
+}
+
+}  // namespace
+
+auto MasterService::QueryCost(const QueryCostRequest& request)
+    -> tl::expected<QueryCostResponse, ErrorCode> {
+    MasterMetricManager::instance().inc_query_cost_requests();
+
+    if (!enable_cost_aware_.load(std::memory_order_relaxed)) {
+        MasterMetricManager::instance().inc_query_cost_disabled();
+        return tl::make_unexpected(ErrorCode::COST_QUERY_DISABLED);
+    }
+
+    if (request.candidate_segment_names.empty()) {
+        MasterMetricManager::instance().inc_query_cost_failures();
+        return tl::make_unexpected(ErrorCode::COST_REQUEST_EMPTY);
+    }
+    if (request.candidate_segment_names.size() > kMaxCostCandidates) {
+        MasterMetricManager::instance().inc_query_cost_failures();
+        return tl::make_unexpected(ErrorCode::COST_REQUEST_TOO_LARGE);
+    }
+
+    MasterMetricManager::instance().observe_query_cost_candidate_count(
+        static_cast<int64_t>(request.candidate_segment_names.size()));
+
+    // 1. Snapshot the segment table; drop the mutex before scoring.
+    std::vector<std::pair<Segment, UUID>> snapshot;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        auto err = segment_access.GetAllSegments(snapshot);
+        if (err != ErrorCode::OK) {
+            MasterMetricManager::instance().inc_query_cost_failures();
+            return tl::make_unexpected(err);
+        }
+    }
+    auto name_index = BuildSegmentNameIndex(snapshot);
+
+    // 2. Score each candidate against the snapshot + in-flight tracker.
+    QueryCostResponse response;
+    response.candidates.reserve(request.candidate_segment_names.size());
+    response.topology_zone_count =
+        static_cast<uint32_t>(cluster_topology_.zone_to_hosts.size());
+
+    for (const auto& name : request.candidate_segment_names) {
+        CostCandidate cc;
+        cc.segment_name = name;
+
+        auto it = name_index.find(name);
+        if (it == name_index.end()) {
+            // Unmounted candidate — report with sentinel cost.
+            cc.found = false;
+            cc.cost_score = std::numeric_limits<double>::max();
+            cc.link_class = static_cast<int32_t>(LinkClass::UNKNOWN);
+            cc.storage_tier = static_cast<int32_t>(StorageTier::DRAM);
+            cc.inflight = 0;
+            if (request.include_unmounted) {
+                response.candidates.push_back(std::move(cc));
+            }
+            continue;
+        }
+
+        const Segment& seg = *it->second;
+        const LinkClass link_class =
+            CostEstimator::ClassifyLink(seg.te_endpoint, request.client_host,
+                                        request.client_zone, cluster_topology_);
+        const StorageTier storage_tier =
+            CostEstimator::ClassifyTier(seg.protocol);
+        const uint32_t inflight = inflight_tracker_.Get(name);
+
+        CostInputs inputs;
+        inputs.link_class = link_class;
+        inputs.storage_tier = storage_tier;
+        inputs.inflight = inflight;
+        inputs.request_size_bytes = request.request_size_bytes;
+
+        cc.found = true;
+        cc.cost_score = cost_estimator_.Score(inputs);
+        cc.link_class = static_cast<int32_t>(link_class);
+        cc.storage_tier = static_cast<int32_t>(storage_tier);
+        cc.inflight = inflight;
+        response.candidates.push_back(std::move(cc));
+    }
+
+    // 3. Sort by ascending cost; unmounted entries (cost=DBL_MAX) sink to the
+    // bottom naturally.
+    std::stable_sort(response.candidates.begin(), response.candidates.end(),
+                     [](const CostCandidate& a, const CostCandidate& b) {
+                         return a.cost_score < b.cost_score;
+                     });
+
+    response.total_inflight = inflight_tracker_.TotalInflight();
+    return response;
+}
+
+auto MasterService::InflightBegin(const std::string& segment_name)
+    -> tl::expected<uint32_t, ErrorCode> {
+    if (!enable_cost_aware_.load(std::memory_order_relaxed)) {
+        // Disabled: do not pollute requests_total counters.
+        return tl::make_unexpected(ErrorCode::COST_QUERY_DISABLED);
+    }
+    MasterMetricManager::instance().inc_inflight_begin_requests();
+    if (segment_name.empty()) {
+        return tl::make_unexpected(ErrorCode::COST_REQUEST_EMPTY);
+    }
+    const uint32_t new_value = inflight_tracker_.Begin(segment_name);
+    MasterMetricManager::instance().set_total_inflight_fetches(
+        static_cast<int64_t>(inflight_tracker_.TotalInflight()));
+    return new_value;
+}
+
+auto MasterService::InflightEnd(const std::string& segment_name)
+    -> tl::expected<uint32_t, ErrorCode> {
+    if (!enable_cost_aware_.load(std::memory_order_relaxed)) {
+        // Disabled: do not pollute requests_total counters.
+        return tl::make_unexpected(ErrorCode::COST_QUERY_DISABLED);
+    }
+    MasterMetricManager::instance().inc_inflight_end_requests();
+    if (segment_name.empty()) {
+        return tl::make_unexpected(ErrorCode::COST_REQUEST_EMPTY);
+    }
+    const uint32_t new_value = inflight_tracker_.End(segment_name);
+    MasterMetricManager::instance().set_total_inflight_fetches(
+        static_cast<int64_t>(inflight_tracker_.TotalInflight()));
+    return new_value;
+}
+
+void MasterService::SetCostAwareEnabledForTesting(bool enabled) {
+    enable_cost_aware_.store(enabled, std::memory_order_relaxed);
+}
+
+void MasterService::ResetInflightTrackerForTesting() {
+    inflight_tracker_.ResetForTesting();
 }
 
 }  // namespace mooncake

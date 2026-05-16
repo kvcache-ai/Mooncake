@@ -2012,6 +2012,78 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
+        .def(
+            "query_cost",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &candidate_segment_names,
+               const std::string &client_host, const std::string &client_zone,
+               uint64_t request_size_bytes,
+               bool include_unmounted) -> py::tuple {
+                tl::expected<std::vector<PyClient::CostCandidateTuple>,
+                             ErrorCode>
+                    rc;
+                {
+                    py::gil_scoped_release release;
+                    rc = self.store_->queryCost(
+                        candidate_segment_names, client_host, client_zone,
+                        request_size_bytes, include_unmounted);
+                }
+                if (!rc.has_value()) {
+                    return py::make_tuple(py::none(),
+                                          static_cast<int>(rc.error()));
+                }
+                return py::make_tuple(py::cast(*rc), 0);
+            },
+            py::arg("candidate_segment_names"),
+            py::arg("client_host") = std::string{},
+            py::arg("client_zone") = std::string{},
+            py::arg("request_size_bytes") = uint64_t{0},
+            py::arg("include_unmounted") = false,
+            "Cost-aware routing -- score and rank candidate segments. "
+            "Returns (ranked_list_or_None, err_code). On success err_code "
+            "== 0 and ranked_list is a list of tuples sorted by ascending "
+            "cost: (segment_name, cost_score, link_class, storage_tier, "
+            "inflight, found). On failure ranked_list is None and err_code "
+            "is a negative ErrorCode (e.g. COST_QUERY_DISABLED=-1700, "
+            "COST_REQUEST_EMPTY=-1701, COST_REQUEST_TOO_LARGE=-1702). "
+            "link_class: 0=LOCAL_HOST, 1=SAME_ZONE, 2=CROSS_ZONE, "
+            "3=UNKNOWN. storage_tier: 0=DRAM, 1=SSD, 2=FILE.")
+        .def(
+            "inflight_begin",
+            [](MooncakeStorePyWrapper &self,
+               const std::string &segment_name) -> py::tuple {
+                tl::expected<uint32_t, ErrorCode> rc;
+                {
+                    py::gil_scoped_release release;
+                    rc = self.store_->inflightBegin(segment_name);
+                }
+                if (!rc.has_value()) {
+                    return py::make_tuple(py::none(),
+                                          static_cast<int>(rc.error()));
+                }
+                return py::make_tuple(py::cast(*rc), 0);
+            },
+            py::arg("segment_name"),
+            "Tell the master a fetch is starting against segment_name. "
+            "Returns (new_inflight_count_or_None, err_code).")
+        .def(
+            "inflight_end",
+            [](MooncakeStorePyWrapper &self,
+               const std::string &segment_name) -> py::tuple {
+                tl::expected<uint32_t, ErrorCode> rc;
+                {
+                    py::gil_scoped_release release;
+                    rc = self.store_->inflightEnd(segment_name);
+                }
+                if (!rc.has_value()) {
+                    return py::make_tuple(py::none(),
+                                          static_cast<int>(rc.error()));
+                }
+                return py::make_tuple(py::cast(*rc), 0);
+            },
+            py::arg("segment_name"),
+            "Tell the master a fetch finished against segment_name. "
+            "Returns (new_inflight_count_or_None, err_code).")
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;

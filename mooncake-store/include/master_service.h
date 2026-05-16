@@ -19,6 +19,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "cost_estimator.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -139,6 +140,27 @@ class MasterService {
      */
     auto QueryIp(const UUID& client_id)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    // ---- Cost-aware routing (Forge RL design 02) ----
+    // QueryCost takes a candidate set of segment names supplied by the caller
+    // (LPM router) and returns them sorted by ascending fetch cost. The
+    // master never holds the segment mutex across the scoring loop - it
+    // snapshots once via ScopedSegmentAccess::GetAllSegments, then scores
+    // purely against that snapshot + the in-flight tracker.
+    auto QueryCost(const QueryCostRequest& request)
+        -> tl::expected<QueryCostResponse, ErrorCode>;
+
+    // Tiny telemetry RPCs the LPM router calls when it dispatches / finishes
+    // a fetch so QueryCost can shed load. Pure counters; no business logic.
+    auto InflightBegin(const std::string& segment_name)
+        -> tl::expected<uint32_t, ErrorCode>;
+
+    auto InflightEnd(const std::string& segment_name)
+        -> tl::expected<uint32_t, ErrorCode>;
+
+    // Test-only knobs.
+    void SetCostAwareEnabledForTesting(bool enabled);
+    void ResetInflightTrackerForTesting();
 
     /**
      * @brief Batch query IP addresses for multiple client IDs.
@@ -1203,6 +1225,14 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
+
+    // ---- Cost-aware routing (Forge RL design 02) ----
+    std::atomic<bool> enable_cost_aware_{true};
+    // Mutated only at construction; subsequent reads are unsynchronized.
+    ClusterTopology cluster_topology_;
+    CostEstimator cost_estimator_;
+    SegmentInflightTracker inflight_tracker_;
+
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;

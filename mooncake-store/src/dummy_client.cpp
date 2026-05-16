@@ -1385,4 +1385,25 @@ int DummyClient::request_hot_cache_fd() {
     return 0;
 }
 
+// ---- Cost-aware routing (Forge RL design 02) ----
+// DummyClient never reaches a real master, so cost-aware routing is
+// meaningless here -- report COST_QUERY_DISABLED on every hook.
+tl::expected<std::vector<PyClient::CostCandidateTuple>, ErrorCode>
+DummyClient::queryCost(
+    const std::vector<std::string>& /*candidate_segment_names*/,
+    const std::string& /*client_host*/, const std::string& /*client_zone*/,
+    uint64_t /*request_size_bytes*/, bool /*include_unmounted*/) {
+    return tl::make_unexpected(ErrorCode::COST_QUERY_DISABLED);
+}
+
+tl::expected<uint32_t, ErrorCode> DummyClient::inflightBegin(
+    const std::string& /*segment_name*/) {
+    return tl::make_unexpected(ErrorCode::COST_QUERY_DISABLED);
+}
+
+tl::expected<uint32_t, ErrorCode> DummyClient::inflightEnd(
+    const std::string& /*segment_name*/) {
+    return tl::make_unexpected(ErrorCode::COST_QUERY_DISABLED);
+}
+
 }  // namespace mooncake

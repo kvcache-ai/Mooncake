@@ -122,6 +122,15 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+
+    // -------- Cost-aware (forwarded down to MasterServiceConfig) --------
+    bool enable_cost_aware = true;
+    std::string cluster_topology_json;
+    double cost_link_weight = 100.0;
+    double cost_tier_weight = 50.0;
+    double cost_inflight_weight = 10.0;
+    double cost_size_weight_per_mib = 0.001;
+
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
@@ -796,6 +805,15 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // -------- Cost-aware routing (Forge RL design 02) --------
+    bool enable_cost_aware = true;
+    std::string cluster_topology_json;
+    double cost_link_weight = 100.0;
+    double cost_tier_weight = 50.0;
+    double cost_inflight_weight = 10.0;
+    double cost_size_weight_per_mib = 0.001;
+
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig

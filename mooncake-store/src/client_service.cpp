@@ -2242,6 +2242,21 @@ tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     return result;
 }
 
+tl::expected<QueryCostResponse, ErrorCode> Client::QueryCost(
+    const QueryCostRequest& request) {
+    return master_client_.QueryCost(request);
+}
+
+tl::expected<InflightUpdateResponse, ErrorCode> Client::InflightBegin(
+    const std::string& segment_name) {
+    return master_client_.InflightBegin(segment_name);
+}
+
+tl::expected<InflightUpdateResponse, ErrorCode> Client::InflightEnd(
+    const std::string& segment_name) {
+    return master_client_.InflightEnd(segment_name);
+}
+
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     const std::vector<std::string>& keys) {
     auto response = master_client_.BatchExistKey(keys);

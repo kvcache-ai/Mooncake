@@ -745,6 +745,47 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
         [] { MasterMetricManager::instance().inc_exist_key_failures(); });
 }
 
+// ---- Cost-aware routing (Forge RL design 02) ----
+tl::expected<QueryCostResponse, ErrorCode> WrappedMasterService::QueryCost(
+    const QueryCostRequest& request) {
+    ScopedVLogTimer timer(1, "QueryCost");
+    timer.LogRequest("candidates=", request.candidate_segment_names.size(),
+                     " client_host=", request.client_host,
+                     " client_zone=", request.client_zone,
+                     " size_bytes=", request.request_size_bytes);
+    auto result = master_service_.QueryCost(request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<InflightUpdateResponse, ErrorCode>
+WrappedMasterService::InflightBegin(const InflightUpdateRequest& request) {
+    ScopedVLogTimer timer(1, "InflightBegin");
+    timer.LogRequest("segment_name=", request.segment_name);
+    auto result = master_service_.InflightBegin(request.segment_name);
+    if (!result.has_value()) {
+        timer.LogResponse("err=", static_cast<int>(result.error()));
+        return tl::make_unexpected(result.error());
+    }
+    InflightUpdateResponse resp(*result);
+    timer.LogResponse("new_value=", resp.new_value);
+    return resp;
+}
+
+tl::expected<InflightUpdateResponse, ErrorCode>
+WrappedMasterService::InflightEnd(const InflightUpdateRequest& request) {
+    ScopedVLogTimer timer(1, "InflightEnd");
+    timer.LogRequest("segment_name=", request.segment_name);
+    auto result = master_service_.InflightEnd(request.segment_name);
+    if (!result.has_value()) {
+        timer.LogResponse("err=", static_cast<int>(result.error()));
+        return tl::make_unexpected(result.error());
+    }
+    InflightUpdateResponse resp(*result);
+    timer.LogResponse("new_value=", resp.new_value);
+    return resp;
+}
+
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchExistKey");
@@ -1696,6 +1737,12 @@ void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::QueryCost>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::InflightBegin>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::InflightEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);

@@ -1885,6 +1885,64 @@ std::vector<int> RealClient::batchIsExist(
     return results;
 }
 
+// ---------- Cost-aware routing (Forge RL design 02) ----------
+tl::expected<std::vector<PyClient::CostCandidateTuple>, ErrorCode>
+RealClient::queryCost(const std::vector<std::string> &candidate_segment_names,
+                      const std::string &client_host,
+                      const std::string &client_zone,
+                      uint64_t request_size_bytes, bool include_unmounted) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    QueryCostRequest request;
+    request.candidate_segment_names = candidate_segment_names;
+    request.client_host = client_host;
+    request.client_zone = client_zone;
+    request.request_size_bytes = request_size_bytes;
+    request.include_unmounted = include_unmounted;
+
+    auto rpc = client_->QueryCost(request);
+    if (!rpc.has_value()) {
+        LOG(WARNING) << "QueryCost RPC failed: "
+                     << static_cast<int>(rpc.error());
+        return tl::make_unexpected(rpc.error());
+    }
+    std::vector<PyClient::CostCandidateTuple> results;
+    results.reserve(rpc->candidates.size());
+    for (const auto &cc : rpc->candidates) {
+        results.emplace_back(cc.segment_name, cc.cost_score, cc.link_class,
+                             cc.storage_tier, cc.inflight, cc.found);
+    }
+    return results;
+}
+
+tl::expected<uint32_t, ErrorCode> RealClient::inflightBegin(
+    const std::string &segment_name) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto rpc = client_->InflightBegin(segment_name);
+    if (!rpc.has_value()) {
+        return tl::make_unexpected(rpc.error());
+    }
+    return rpc->new_value;
+}
+
+tl::expected<uint32_t, ErrorCode> RealClient::inflightEnd(
+    const std::string &segment_name) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto rpc = client_->InflightEnd(segment_name);
+    if (!rpc.has_value()) {
+        return tl::make_unexpected(rpc.error());
+    }
+    return rpc->new_value;
+}
+
 tl::expected<int64_t, ErrorCode> RealClient::getSize_internal(
     const std::string &key) {
     if (!client_) {

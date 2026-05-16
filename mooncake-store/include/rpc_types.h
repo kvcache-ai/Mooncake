@@ -239,4 +239,70 @@ struct BatchGetOffloadObjectResponse {
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
 
+// ---------------------------------------------------------------------------
+// Cost-aware routing (Forge RL design 02)
+//
+// kMaxCostCandidates: hard cap on a single QueryCost request to bound
+// per-RPC CPU / lock work. The router is expected to chunk requests larger
+// than this client-side.
+//
+// QueryCost takes a candidate set of segment_names supplied by the router
+// (the router is the only thing that knows which segments hold its prefix
+// blocks; that decoupling keeps cost-aware orthogonal to LPM) and returns
+// the same set sorted by ascending cost score, with the breakdown of every
+// term that fed each score so the router can log / debug routing decisions.
+//
+// InflightBegin / InflightEnd are tiny telemetry RPCs the router calls when
+// it dispatches / finishes a fetch; they keep the master's per-segment
+// in-flight counter in sync so subsequent QueryCost calls can shed load.
+// ---------------------------------------------------------------------------
+
+inline constexpr size_t kMaxCostCandidates = 1024;
+
+struct QueryCostRequest {
+    std::vector<std::string> candidate_segment_names;
+    std::string client_host;         // optional; empty == unknown host
+    std::string client_zone;         // optional; empty == unknown zone
+    uint64_t request_size_bytes{0};  // 0 disables the size term
+    bool include_unmounted{false};   // true => keep entries with found=false
+    QueryCostRequest() = default;
+};
+YLT_REFL(QueryCostRequest, candidate_segment_names, client_host, client_zone,
+         request_size_bytes, include_unmounted);
+
+struct CostCandidate {
+    std::string segment_name;
+    double cost_score{0.0};
+    int32_t link_class{3};    // see LinkClass enum (3 == UNKNOWN)
+    int32_t storage_tier{0};  // see StorageTier enum
+    uint32_t inflight{0};
+    bool found{false};  // false => segment not currently mounted
+    CostCandidate() = default;
+};
+YLT_REFL(CostCandidate, segment_name, cost_score, link_class, storage_tier,
+         inflight, found);
+
+struct QueryCostResponse {
+    std::vector<CostCandidate> candidates;  // sorted by cost_score ascending
+    uint32_t topology_zone_count{0};
+    uint64_t total_inflight{0};
+    QueryCostResponse() = default;
+};
+YLT_REFL(QueryCostResponse, candidates, topology_zone_count, total_inflight);
+
+struct InflightUpdateRequest {
+    std::string segment_name;
+    InflightUpdateRequest() = default;
+    explicit InflightUpdateRequest(std::string n)
+        : segment_name(std::move(n)) {}
+};
+YLT_REFL(InflightUpdateRequest, segment_name);
+
+struct InflightUpdateResponse {
+    uint32_t new_value{0};
+    InflightUpdateResponse() = default;
+    explicit InflightUpdateResponse(uint32_t v) : new_value(v) {}
+};
+YLT_REFL(InflightUpdateResponse, new_value);
+
 }  // namespace mooncake

@@ -27,3 +27,20 @@ add_executable(allocation_strategy_bench allocation_strategy_bench.cpp)
 target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
+
+# Cost-aware routing benchmark (Forge RL design 02)
+add_executable(query_cost_bench query_cost_bench.cpp)
+target_link_libraries(query_cost_bench
+    PRIVATE mooncake_store
+            cachelib_memory_allocator
+            glog::glog
+            pthread)
+
+# Smoke-run the bench so accidental ABI breaks in master_service surface in
+# CI without anybody having to remember to manually run benchmarks/.
+add_test(NAME query_cost_bench_smoke
+         COMMAND query_cost_bench --candidates=1 --workers=1 --seconds=1
+         WORKING_DIRECTORY $<TARGET_FILE_DIR:query_cost_bench>)
+set_tests_properties(query_cost_bench_smoke PROPERTIES
+                     LABELS "smoke;benchmark"
+                     TIMEOUT 30)

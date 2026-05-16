@@ -114,6 +114,18 @@ class MasterMetricManager {
     void inc_remove_all_failures(int64_t val = 1);
     void inc_mount_segment_requests(int64_t val = 1);
     void inc_mount_segment_failures(int64_t val = 1);
+    // Cost-aware routing
+    void inc_query_cost_requests(int64_t val = 1);
+    void inc_query_cost_failures(int64_t val = 1);
+    void inc_query_cost_disabled(int64_t val = 1);
+    void observe_query_cost_candidate_count(int64_t count);
+    void inc_inflight_begin_requests(int64_t val = 1);
+    void inc_inflight_end_requests(int64_t val = 1);
+    void set_total_inflight_fetches(int64_t total);
+    int64_t get_query_cost_requests();
+    int64_t get_query_cost_failures();
+    int64_t get_query_cost_disabled();
+
     void inc_unmount_segment_requests(int64_t val = 1);
     void inc_unmount_segment_failures(int64_t val = 1);
     void inc_remount_segment_requests(int64_t val = 1);
@@ -458,6 +470,15 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    // Cost-aware routing (Forge RL design 02)
+    ylt::metric::counter_t query_cost_requests_;
+    ylt::metric::counter_t query_cost_failures_;
+    ylt::metric::counter_t query_cost_disabled_;
+    ylt::metric::histogram_t query_cost_candidate_count_;
+    ylt::metric::counter_t inflight_begin_requests_;
+    ylt::metric::counter_t inflight_end_requests_;
+    ylt::metric::gauge_t total_inflight_fetches_;
 };
 
 }  // namespace mooncake
